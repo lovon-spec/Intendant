@@ -12,6 +12,7 @@ pub struct Command {
     pub return_stderr: Option<bool>,
     pub display: Option<i32>,
     pub status_type: Option<String>,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
