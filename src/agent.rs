@@ -421,21 +421,26 @@ impl Agent {
             AgentError::Process("status_type is required for fetchStatus".to_string())
         })?;
 
+        // Use depending_nonce as the target if present, otherwise use the command's own nonce.
+        // This allows the LLM to assign fetchStatus its own unique nonce while referencing
+        // the target command via depending_nonce.
+        let target_nonce = cmd.depending_nonce.unwrap_or(cmd.nonce);
+
         match status_type.as_str() {
             "status" => {
-                let info = self.get_process_info(cmd.nonce)?;
+                let info = self.get_process_info(target_nonce)?;
                 Ok((info.status as u8 as char).to_string())
             }
             "stdout" => {
-                let path = self.log_dir.join(format!("{}_stdout.log", cmd.nonce));
+                let path = self.log_dir.join(format!("{}_stdout.log", target_nonce));
                 self.read_log_partial(&path, cmd.offset, cmd.limit)
             }
             "stderr" => {
-                let path = self.log_dir.join(format!("{}_stderr.log", cmd.nonce));
+                let path = self.log_dir.join(format!("{}_stderr.log", target_nonce));
                 self.read_log_partial(&path, cmd.offset, cmd.limit)
             }
             "exit_code" => {
-                let info = self.get_process_info(cmd.nonce)?;
+                let info = self.get_process_info(target_nonce)?;
                 Ok(info.exit_code.to_string())
             }
             _ => Err(AgentError::Process(format!(
@@ -1058,14 +1063,11 @@ impl Agent {
     pub async fn process_input(&self, input: AgentInput) -> Result<Vec<String>, AgentError> {
         let mut results = Vec::new();
 
-        // Pre-register all async command nonces to avoid dependency race conditions
+        // Pre-register all command nonces to avoid dependency race conditions.
+        // Synchronous commands (editFile, inspectPath, etc.) must also be registered
+        // so that downstream execAsAgent commands with depending_nonce can find them.
         for cmd in &input.commands {
-            match cmd.function.as_str() {
-                "execAsAgent" | "captureScreen" => {
-                    self.update_process_info(cmd.nonce, 0, ProcessStatus::Waiting, 0)?;
-                }
-                _ => {}
-            }
+            self.update_process_info(cmd.nonce, 0, ProcessStatus::Waiting, 0)?;
         }
 
         // Start all commands asynchronously without waiting for completion
@@ -1100,58 +1102,119 @@ impl Agent {
                     }
                 }
                 "fetchStatus" => {
-                    // fetchStatus is synchronous and immediate
+                    // Wait for dependency if specified
+                    if let Some(dep_nonce) = cmd.depending_nonce {
+                        let wait = cmd.wait.unwrap_or(false);
+                        let expected_status = cmd.expected_status.unwrap_or(0);
+                        if wait {
+                            self.check_dependency(dep_nonce, expected_status, true).await?;
+                        }
+                    }
                     match self.fetch_status(&cmd) {
-                        Ok(status) => results.push(status),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(status) => {
+                            results.push(status);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 "inspectPath" => {
                     match self.inspect_path(&cmd) {
-                        Ok(result) => results.push(result),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(result) => {
+                            results.push(result);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 "editFile" => {
                     match self.edit_file(&cmd) {
-                        Ok(result) => results.push(result),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(result) => {
+                            results.push(result);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 "browse" => {
                     match self.browse(&cmd).await {
-                        Ok(result) => results.push(result),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(result) => {
+                            results.push(result);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 "askHuman" => {
                     match self.ask_human(&cmd).await {
-                        Ok(result) => results.push(result),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(result) => {
+                            results.push(result);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 "execPty" => {
                     match self.exec_pty(&cmd).await {
-                        Ok(result) => results.push(result),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(result) => {
+                            results.push(result);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 "storeSkill" => {
                     match self.store_skill(&cmd) {
-                        Ok(result) => results.push(result),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(result) => {
+                            results.push(result);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 "storeMemory" => {
                     match self.store_memory(&cmd) {
-                        Ok(result) => results.push(result),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(result) => {
+                            results.push(result);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 "recallMemory" => {
                     match self.recall_memory(&cmd) {
-                        Ok(result) => results.push(result),
-                        Err(e) => results.push(format!("Error: {}", e)),
+                        Ok(result) => {
+                            results.push(result);
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                        }
+                        Err(e) => {
+                            results.push(format!("Error: {}", e));
+                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                        }
                     }
                 }
                 _ => {
@@ -1484,6 +1547,45 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"], "hello world");
         assert_eq!(parsed["total_size"], 11);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_uses_depending_nonce_as_target() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        agent
+            .update_process_info(100, 5000, ProcessStatus::Completed, 0)
+            .unwrap();
+        // Log file is named after the exec command's nonce (100)
+        fs::write(log_dir.path().join("100_stdout.log"), "target output").unwrap();
+        // fetchStatus has its own nonce (101) but references target via depending_nonce
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 101,
+            depending_nonce: Some(100),
+            status_type: Some("stdout".to_string()),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "target output");
+        assert_eq!(parsed["total_size"], 13);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_depending_nonce_status() {
+        let (agent, _shm, _log) = create_test_agent();
+        agent
+            .update_process_info(100, 5000, ProcessStatus::Completed, 42)
+            .unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 101,
+            depending_nonce: Some(100),
+            status_type: Some("exit_code".to_string()),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        assert_eq!(result, "42");
     }
 
     #[tokio::test]
@@ -3025,5 +3127,148 @@ mod tests {
         assert_eq!(results.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
         assert_eq!(parsed["success"], true);
+    }
+
+    // --- Synchronous command shared memory registration tests ---
+
+    #[tokio::test]
+    async fn sync_command_registers_completed_in_shared_memory() {
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "inspectPath".to_string(),
+                nonce: 42,
+                path: Some("/tmp".to_string()),
+                ..Default::default()
+            }],
+            wait_for_status: None,
+        };
+        agent.process_input(input).await.unwrap();
+
+        // The synchronous command should now be registered as Completed
+        let info = agent.get_process_info(42).unwrap();
+        assert_eq!(info.status, ProcessStatus::Completed);
+        assert_eq!(info.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_command_registers_failed_in_shared_memory() {
+        let (agent, _shm, _log) = create_test_agent();
+        // editFile without required fields will fail
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "editFile".to_string(),
+                nonce: 43,
+                // Missing file_path and operation -> error
+                ..Default::default()
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert!(results[0].starts_with("Error:"));
+
+        // The synchronous command should now be registered as Failed
+        let info = agent.get_process_info(43).unwrap();
+        assert_eq!(info.status, ProcessStatus::Failed);
+        assert_eq!(info.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn exec_depends_on_sync_command_runs() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("dep_test.txt");
+
+        let input = AgentInput {
+            commands: vec![
+                // Synchronous command: editFile (nonce 10)
+                AgentCommand {
+                    function: "editFile".to_string(),
+                    nonce: 10,
+                    file_path: Some(fp.to_string_lossy().to_string()),
+                    operation: Some("write".to_string()),
+                    content: Some("created by editFile".to_string()),
+                    ..Default::default()
+                },
+                // Async command depending on editFile (nonce 10)
+                AgentCommand {
+                    function: "execAsAgent".to_string(),
+                    command: Some("echo chained".to_string()),
+                    nonce: 11,
+                    depending_nonce: Some(10),
+                    expected_status: Some(0),
+                    wait: Some(true),
+                    display: Some(1),
+                    ..Default::default()
+                },
+            ],
+            wait_for_status: None,
+        };
+
+        let results = agent.process_input(input).await.unwrap();
+
+        // editFile should have succeeded
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["success"], true);
+
+        // The editFile nonce should be Completed in shared memory
+        let info = agent.get_process_info(10).unwrap();
+        assert_eq!(info.status, ProcessStatus::Completed);
+
+        // The execAsAgent should report waiting (it's async, spawned with dependency)
+        // but crucially it was NOT skipped — the dependency was found
+        assert_eq!(results[1], "11w0");
+
+        // Give the spawned command time to complete and verify it ran
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let exec_info = agent.get_process_info(11).unwrap();
+        assert_eq!(exec_info.status, ProcessStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn exec_depends_on_failed_sync_command_is_skipped() {
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![
+                // Synchronous command that will fail (missing file_path)
+                AgentCommand {
+                    function: "editFile".to_string(),
+                    nonce: 20,
+                    // Missing required fields -> error
+                    ..Default::default()
+                },
+                // Async command depending on the failed editFile
+                AgentCommand {
+                    function: "execAsAgent".to_string(),
+                    command: Some("echo should_not_run".to_string()),
+                    nonce: 21,
+                    depending_nonce: Some(20),
+                    expected_status: Some(0),
+                    wait: Some(true),
+                    display: Some(1),
+                    ..Default::default()
+                },
+            ],
+            wait_for_status: None,
+        };
+
+        let results = agent.process_input(input).await.unwrap();
+
+        // editFile failed
+        assert!(results[0].starts_with("Error:"));
+
+        // The failed editFile should be Failed in shared memory
+        let info = agent.get_process_info(20).unwrap();
+        assert_eq!(info.status, ProcessStatus::Failed);
+
+        // The execAsAgent reports waiting (spawned async)
+        assert_eq!(results[1], "21w0");
+
+        // Give the spawned command time to process dependency check
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The exec should be skipped since its dependency failed (exit_code 1 != expected 0)
+        let exec_info = agent.get_process_info(21).unwrap();
+        assert_eq!(exec_info.status, ProcessStatus::Skipped);
     }
 }
