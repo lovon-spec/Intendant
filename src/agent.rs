@@ -1,10 +1,11 @@
 use crate::error::AgentError;
 use crate::models::{AgentInput, Command as AgentCommand, ProcessInfo, ProcessStatus, StatusUpdate};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::MetadataExt;
 
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     mem::size_of,
     path::PathBuf,
     process::Stdio,
@@ -20,6 +21,7 @@ use tokio::process::Command;
 const MAX_PROCESSES: usize = 1024;
 const SHARED_MEM_SIZE: usize = size_of::<ProcessInfo>() * MAX_PROCESSES;
 const SHARED_MEM_PATH: &str = "/dev/shm/agent_processes";
+const SESSION_FILE_PATH: &str = "/dev/shm/agent_session";
 
 #[derive(Clone)]
 pub struct Agent {
@@ -42,19 +44,19 @@ impl Agent {
 
         // Map shared memory
         let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        let process_map = Self::rebuild_process_map(&mmap);
         let shared_mem = Arc::new(RwLock::new(mmap));
+        let process_map = Arc::new(RwLock::new(process_map));
 
-        // Create log directory
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let log_dir = PathBuf::from(format!("/var/log/agent/{}", timestamp));
-        fs::create_dir_all(&log_dir)?;
+        // Resolve log directory (reuse existing session or create new)
+        let log_dir = Self::resolve_log_dir()?;
 
         // Setup status channel
-        let (status_tx, mut status_rx) = mpsc::channel(1024);
-        let status_tx_clone: mpsc::Sender<StatusUpdate> = status_tx.clone();
+        let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(1024);
 
         // Start status monitor thread
         let shared_mem_clone = shared_mem.clone();
+        let process_map_clone = process_map.clone();
         tokio::spawn(async move {
             while let Some(update) = status_rx.recv().await {
                 if let Err(e) = Self::update_process_status(
@@ -65,15 +67,48 @@ impl Agent {
                 ) {
                     eprintln!("Failed to update process status: {}", e);
                 }
+                // Update process_map so StatusMonitor can see this nonce
+                let info_size = size_of::<ProcessInfo>();
+                let offset = (update.nonce as usize % MAX_PROCESSES) * info_size;
+                process_map_clone.write().unwrap().insert(update.nonce, offset);
             }
         });
 
         Ok(Self {
             shared_mem,
-            process_map: Arc::new(RwLock::new(HashMap::new())),
+            process_map,
             log_dir,
-            status_tx: status_tx_clone,
+            status_tx,
         })
+    }
+
+    fn resolve_log_dir() -> Result<PathBuf, AgentError> {
+        if let Ok(existing) = fs::read_to_string(SESSION_FILE_PATH) {
+            let path = PathBuf::from(existing.trim());
+            if path.is_dir() {
+                return Ok(path);
+            }
+        }
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let log_dir = PathBuf::from(format!("/var/log/agent/{}", timestamp));
+        fs::create_dir_all(&log_dir)?;
+        fs::write(SESSION_FILE_PATH, log_dir.to_string_lossy().as_bytes())?;
+        Ok(log_dir)
+    }
+
+    fn rebuild_process_map(mmap: &MmapMut) -> HashMap<u64, usize> {
+        let mut map = HashMap::new();
+        let info_size = size_of::<ProcessInfo>();
+        for i in 0..MAX_PROCESSES {
+            let offset = i * info_size;
+            let info = unsafe {
+                std::ptr::read(mmap[offset..offset + info_size].as_ptr() as *const ProcessInfo)
+            };
+            if info.nonce != 0 {
+                map.insert(info.nonce, offset);
+            }
+        }
+        map
     }
 
     fn update_process_status(
@@ -147,9 +182,11 @@ impl Agent {
             .open(&stderr_path)?;
     
         // Execute command
+        let display_id = cmd.display.unwrap_or(1);
         let mut child = Command::new("bash")
             .arg("-c")
             .arg(&command)
+            .env("DISPLAY", format!(":{}", display_id))
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file))
             .spawn()?;
@@ -281,9 +318,63 @@ impl Agent {
         }
     }
 
+    fn inspect_path(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        let path_str = cmd.path.as_ref().ok_or_else(|| {
+            AgentError::Process("path is required for inspectPath".to_string())
+        })?;
+        let path = std::path::Path::new(path_str);
+
+        if !path.exists() {
+            return Ok(serde_json::json!({
+                "exists": false,
+                "path": path_str
+            }).to_string());
+        }
+
+        let symlink_meta = fs::symlink_metadata(path)?;
+        let file_type = if symlink_meta.file_type().is_symlink() {
+            "symlink"
+        } else if symlink_meta.is_dir() {
+            "directory"
+        } else if symlink_meta.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+
+        let meta = fs::metadata(path)?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        Ok(serde_json::json!({
+            "exists": true,
+            "path": path_str,
+            "type": file_type,
+            "size": meta.len(),
+            "permissions": format!("{:o}", meta.mode() & 0o7777),
+            "modified": modified,
+            "uid": meta.uid(),
+            "gid": meta.gid()
+        }).to_string())
+    }
+
     pub async fn process_input(&self, input: AgentInput) -> Result<Vec<String>, AgentError> {
         let mut results = Vec::new();
-        
+
+        // Pre-register all async command nonces to avoid dependency race conditions
+        for cmd in &input.commands {
+            match cmd.function.as_str() {
+                "execAsAgent" | "captureScreen" => {
+                    self.update_process_info(cmd.nonce, 0, ProcessStatus::Waiting, 0)?;
+                }
+                _ => {}
+            }
+        }
+
         // Start all commands asynchronously without waiting for completion
         for cmd in input.commands {
             match cmd.function.as_str() {
@@ -295,8 +386,11 @@ impl Agent {
                             eprintln!("Error executing command {}: {}", cmd_clone.nonce, e);
                         }
                     });
-                    // Immediately return initial running status
-                    results.push(format!("{}r0", cmd.nonce));
+                    if cmd.depending_nonce.is_some() {
+                        results.push(format!("{}w0", cmd.nonce));
+                    } else {
+                        results.push(format!("{}r0", cmd.nonce));
+                    }
                 }
                 "captureScreen" => {
                     let agent = self.clone();
@@ -306,12 +400,22 @@ impl Agent {
                             eprintln!("Error capturing screen {}: {}", cmd_clone.nonce, e);
                         }
                     });
-                    results.push(format!("{}r0", cmd.nonce));
+                    if cmd.depending_nonce.is_some() {
+                        results.push(format!("{}w0", cmd.nonce));
+                    } else {
+                        results.push(format!("{}r0", cmd.nonce));
+                    }
                 }
                 "fetchStatus" => {
                     // fetchStatus is synchronous and immediate
                     match self.fetch_status(&cmd) {
                         Ok(status) => results.push(status),
+                        Err(e) => results.push(format!("Error: {}", e)),
+                    }
+                }
+                "inspectPath" => {
+                    match self.inspect_path(&cmd) {
+                        Ok(result) => results.push(result),
                         Err(e) => results.push(format!("Error: {}", e)),
                     }
                 }
@@ -413,6 +517,13 @@ impl Agent {
                             continue;
                         }
                     }
+                }
+                Err(AgentError::InvalidNonce(_)) => {
+                    if !wait {
+                        return Ok(false);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    retries -= 1;
                 }
                 Err(_) if !wait => return Ok(false),
                 Err(e) => {
