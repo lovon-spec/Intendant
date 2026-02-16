@@ -1,6 +1,6 @@
 # Agent
 
-A Rust runtime that executes commands on behalf of an AI agent. It manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI caller that drives the agent via the OpenAI API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts.
 
 ## Architecture
 
@@ -25,7 +25,9 @@ stdin (JSON) --> Agent --> spawns bash commands
 cargo build --release
 ```
 
-The binary is produced at `./target/release/agent`.
+Two binaries are produced:
+- `./target/release/agent` — the command runtime
+- `./target/release/caller` — the AI caller
 
 ## Usage
 
@@ -100,6 +102,38 @@ To reset all state (start a fresh session):
 ```bash
 rm -f /dev/shm/agent_processes /dev/shm/agent_session
 ```
+
+## AI Caller
+
+The caller binary reads a task, sends it to an OpenAI model alongside the system prompt (`SysPrompt.md`), and feeds the model's JSON output to the agent binary in a loop.
+
+### Setup
+
+Create a `.env` file (or export the variables):
+
+```bash
+OPENAI_API_KEY=sk-...    # or OPENAI=sk-...
+MODEL_NAME=gpt-4o        # optional, defaults to gpt-4o
+```
+
+### Running
+
+```bash
+# With a task as CLI argument
+./target/release/caller "List the files in /tmp"
+
+# Interactive mode (prompts for task on stdin)
+./target/release/caller
+```
+
+### How it works
+
+1. Loads `.env` and reads `SysPrompt.md` as the system message
+2. Sends the task to the OpenAI chat completions API
+3. Extracts JSON from the model's response (handles code fences and bare JSON)
+4. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s)
+5. Feeds the agent output back as the next user message
+6. Repeats until the model responds with no JSON (task complete) or 50 turns are reached
 
 ## Environment
 
