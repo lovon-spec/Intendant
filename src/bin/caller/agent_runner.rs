@@ -31,10 +31,20 @@ pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
     let mut stdout_buf = String::new();
     let mut stderr_buf = String::new();
 
-    // Read stdout with idle timeout (3s) and hard timeout (30s)
+    // Read stdout with idle timeout and hard timeout (configurable via env vars)
     if let Some(mut stdout) = child.stdout.take() {
-        let idle_timeout = Duration::from_secs(3);
-        let hard_timeout = Duration::from_secs(30);
+        let idle_timeout = Duration::from_secs(
+            std::env::var("AGENT_IDLE_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+        );
+        let hard_timeout = Duration::from_secs(
+            std::env::var("AGENT_HARD_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        );
 
         let _ = timeout(hard_timeout, async {
             let mut temp = [0u8; 4096];

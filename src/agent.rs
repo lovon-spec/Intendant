@@ -6,8 +6,9 @@ use std::os::unix::fs::MetadataExt;
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
+    io::{Read as _, Seek, SeekFrom},
     mem::size_of,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,6 +18,20 @@ use chrono::Local;
 use memmap2::{MmapMut, MmapOptions};
 use tokio::sync::mpsc;
 use tokio::process::Command;
+
+use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, PtySize};
+
+struct PtySession {
+    writer: Box<dyn std::io::Write + Send>,
+    reader: Box<dyn std::io::Read + Send>,
+    // Keep master alive to prevent EOF
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+const HUMAN_QUESTION_PATH: &str = "/dev/shm/agent_human_question";
+const HUMAN_RESPONSE_PATH: &str = "/dev/shm/agent_human_response";
+const HUMAN_TIMEOUT_MS: u64 = 5 * 60 * 1000; // 5 minutes
+const HUMAN_POLL_MS: u64 = 500;
 
 const MAX_PROCESSES: usize = 1024;
 const SHARED_MEM_SIZE: usize = size_of::<ProcessInfo>() * MAX_PROCESSES;
@@ -29,6 +44,7 @@ pub struct Agent {
     pub process_map: Arc<RwLock<HashMap<u64, usize>>>,
     log_dir: PathBuf,
     status_tx: mpsc::Sender<StatusUpdate>,
+    pty_sessions: Arc<tokio::sync::Mutex<HashMap<String, PtySession>>>,
 }
 
 impl Agent {
@@ -78,6 +94,7 @@ impl Agent {
             process_map,
             log_dir,
             status_tx,
+            pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -128,6 +145,7 @@ impl Agent {
             process_map,
             log_dir,
             status_tx,
+            pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -219,9 +237,24 @@ impl Agent {
             }
         }
     
+        // Wait for port if requested
+        if let Some(port) = cmd.wait_for_port {
+            if !self.wait_for_port(port).await? {
+                self.status_tx
+                    .send(StatusUpdate {
+                        nonce: cmd.nonce,
+                        status: ProcessStatus::Failed,
+                        exit_code: -2,
+                    })
+                    .await
+                    .map_err(|e| AgentError::Process(e.to_string()))?;
+                return Ok(());
+            }
+        }
+
         // Replace $NONCE references
         let command = self.replace_nonce_refs(command)?;
-    
+
         // Setup output files with append mode to prevent truncation
         let stdout_path = self.log_dir.join(format!("{}_stdout.log", cmd.nonce));
         let stderr_path = self.log_dir.join(format!("{}_stderr.log", cmd.nonce));
@@ -343,6 +376,46 @@ impl Agent {
         Ok(())
     }
 
+    fn read_log_partial(&self, path: &Path, offset: Option<u64>, limit: Option<u64>) -> Result<String, AgentError> {
+        if !path.exists() {
+            return Ok(serde_json::json!({
+                "content": "",
+                "total_size": 0
+            }).to_string());
+        }
+
+        let mut file = std::fs::File::open(path)?;
+        let total_size = file.metadata()?.len();
+
+        let (read_offset, read_limit) = match (offset, limit) {
+            (Some(o), Some(l)) => (o, l),
+            (Some(o), None) => (o, total_size.saturating_sub(o)),
+            (None, Some(l)) => (total_size.saturating_sub(l), l),
+            (None, None) => {
+                // Default: tail last 10KB
+                let default_tail = 10 * 1024u64;
+                (total_size.saturating_sub(default_tail), default_tail.min(total_size))
+            }
+        };
+
+        let actual_offset = read_offset.min(total_size);
+        let actual_limit = read_limit.min(total_size.saturating_sub(actual_offset));
+
+        file.seek(SeekFrom::Start(actual_offset))?;
+        let mut buf = vec![0u8; actual_limit as usize];
+        let bytes_read = file.read(&mut buf)?;
+        buf.truncate(bytes_read);
+
+        let content = String::from_utf8_lossy(&buf).to_string();
+
+        Ok(serde_json::json!({
+            "content": content,
+            "total_size": total_size,
+            "offset": actual_offset,
+            "bytes_read": bytes_read
+        }).to_string())
+    }
+
     fn fetch_status(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
         let status_type = cmd.status_type.as_ref().ok_or_else(|| {
             AgentError::Process("status_type is required for fetchStatus".to_string())
@@ -355,11 +428,11 @@ impl Agent {
             }
             "stdout" => {
                 let path = self.log_dir.join(format!("{}_stdout.log", cmd.nonce));
-                Ok(fs::read_to_string(path).unwrap_or_default())
+                self.read_log_partial(&path, cmd.offset, cmd.limit)
             }
             "stderr" => {
                 let path = self.log_dir.join(format!("{}_stderr.log", cmd.nonce));
-                Ok(fs::read_to_string(path).unwrap_or_default())
+                self.read_log_partial(&path, cmd.offset, cmd.limit)
             }
             "exit_code" => {
                 let info = self.get_process_info(cmd.nonce)?;
@@ -416,6 +489,413 @@ impl Agent {
         }).to_string())
     }
 
+    async fn exec_pty(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        let command = cmd.command.as_ref().ok_or_else(|| {
+            AgentError::Process("command is required for execPty".to_string())
+        })?;
+        let shell_id = cmd.shell_id.as_deref().unwrap_or("default").to_string();
+
+        let mut sessions = self.pty_sessions.lock().await;
+
+        // Lazily create PTY session
+        if !sessions.contains_key(&shell_id) {
+            let pty_system = native_pty_system();
+            let pair = pty_system.openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }).map_err(|e| AgentError::Process(format!("Failed to open PTY: {}", e)))?;
+
+            let mut pty_cmd = PtyCommandBuilder::new("bash");
+            pty_cmd.args(["--norc", "--noprofile"]);
+            pair.slave.spawn_command(pty_cmd)
+                .map_err(|e| AgentError::Process(format!("Failed to spawn shell: {}", e)))?;
+
+            let reader = pair.master.try_clone_reader()
+                .map_err(|e| AgentError::Process(format!("Failed to clone reader: {}", e)))?;
+            let writer = pair.master.take_writer()
+                .map_err(|e| AgentError::Process(format!("Failed to take writer: {}", e)))?;
+
+            sessions.insert(shell_id.clone(), PtySession {
+                writer,
+                reader,
+                _master: pair.master,
+            });
+        }
+
+        let session = sessions.get_mut(&shell_id)
+            .ok_or_else(|| AgentError::Process("PTY session not found".to_string()))?;
+
+        // Generate unique start and end markers
+        let start_marker = format!("__PTY_START_{}__", cmd.nonce);
+        let marker = format!("__PTY_END_{}__", cmd.nonce);
+
+        // Write: echo start-marker, then command, then echo end-marker
+        let pty_input = format!("echo '{}'\n{}\necho '{}'\n", start_marker, command, marker);
+        session.writer.write_all(pty_input.as_bytes())
+            .map_err(|e| AgentError::Process(format!("Failed to write to PTY: {}", e)))?;
+        session.writer.flush()
+            .map_err(|e| AgentError::Process(format!("Failed to flush PTY: {}", e)))?;
+
+        // Read from PTY until end marker appears, with timeout
+        let mut output = String::new();
+        let timeout_duration = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 4096];
+
+        loop {
+            if start.elapsed() >= timeout_duration {
+                break;
+            }
+
+            match session.reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if output.contains(&marker) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Clean output: strip ANSI escapes and carriage returns
+        let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\r").unwrap();
+        let cleaned = ansi_re.replace_all(&output, "").to_string();
+
+        // Extract content between start_marker and end_marker
+        let content = if let Some(start_pos) = cleaned.find(&start_marker) {
+            let after_start = &cleaned[start_pos + start_marker.len()..];
+            if let Some(end_pos) = after_start.find(&marker) {
+                after_start[..end_pos].to_string()
+            } else {
+                after_start.to_string()
+            }
+        } else {
+            cleaned
+        };
+
+        // Split into lines and clean
+        let mut lines: Vec<&str> = content.lines().collect();
+
+        // Remove empty lines (we'll keep meaningful content)
+        lines.retain(|line| !line.trim().is_empty());
+
+        // Remove the first line if it's the echoed command
+        if !lines.is_empty() {
+            let first = lines[0].trim();
+            if first == command.trim() || first.ends_with(command.trim()) {
+                lines.remove(0);
+            }
+        }
+
+        // Remove leading empty lines
+        while lines.first().map_or(false, |l| l.trim().is_empty()) {
+            lines.remove(0);
+        }
+
+        // Remove trailing empty lines and bash prompt lines
+        while lines.last().map_or(false, |l| {
+            let t = l.trim();
+            t.is_empty() || t.starts_with("bash-") || t.starts_with("$ ")
+        }) {
+            lines.pop();
+        }
+
+        // Remove lines that are echo commands for the markers
+        lines.retain(|line| {
+            let trimmed = line.trim();
+            !trimmed.contains(&format!("echo '{}'", start_marker)) &&
+            !trimmed.contains(&format!("echo '{}'", marker)) &&
+            !trimmed.contains(&start_marker) &&
+            !trimmed.contains(&marker)
+        });
+
+        let final_output = lines.join("\n");
+
+        Ok(serde_json::json!({
+            "success": true,
+            "shell_id": shell_id,
+            "output": final_output
+        }).to_string())
+    }
+
+    async fn ask_human_with_paths(
+        &self,
+        cmd: &AgentCommand,
+        question_path: &Path,
+        response_path: &Path,
+        timeout_ms: u64,
+        poll_ms: u64,
+    ) -> Result<String, AgentError> {
+        let question = cmd.question.as_ref().ok_or_else(|| {
+            AgentError::Process("question is required for askHuman".to_string())
+        })?;
+
+        // Write question to file
+        fs::write(question_path, question)?;
+        // Also write to stderr so caller/user sees it
+        eprintln!("[askHuman] {}", question);
+
+        // Poll for response
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        let poll_interval = Duration::from_millis(poll_ms);
+
+        loop {
+            if response_path.exists() {
+                let response = fs::read_to_string(response_path)?;
+                // Cleanup
+                let _ = fs::remove_file(question_path);
+                let _ = fs::remove_file(response_path);
+                return Ok(serde_json::json!({
+                    "success": true,
+                    "question": question,
+                    "response": response
+                }).to_string());
+            }
+
+            if start.elapsed() >= timeout {
+                // Cleanup
+                let _ = fs::remove_file(question_path);
+                let _ = fs::remove_file(response_path);
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "error": "Timed out waiting for human response"
+                }).to_string());
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    async fn ask_human(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        self.ask_human_with_paths(
+            cmd,
+            Path::new(HUMAN_QUESTION_PATH),
+            Path::new(HUMAN_RESPONSE_PATH),
+            HUMAN_TIMEOUT_MS,
+            HUMAN_POLL_MS,
+        )
+        .await
+    }
+
+    async fn wait_for_port_with_retries(&self, port: u16, max_retries: u32, interval_ms: u64) -> Result<bool, AgentError> {
+        for _ in 0..max_retries {
+            match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+                Ok(_) => return Ok(true),
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn wait_for_port(&self, port: u16) -> Result<bool, AgentError> {
+        self.wait_for_port_with_retries(port, 60, 500).await
+    }
+
+    async fn browse(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        let url = cmd.url.as_ref().ok_or_else(|| {
+            AgentError::Process("url is required for browse".to_string())
+        })?;
+
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(AgentError::Process(
+                "url must start with http:// or https://".to_string(),
+            ));
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .user_agent("Agent/1.0")
+            .build()
+            .map_err(|e| AgentError::Process(format!("Failed to create HTTP client: {}", e)))?;
+
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| AgentError::Process(format!("HTTP request failed: {}", e)))?;
+
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body = response
+            .text()
+            .await
+            .map_err(|e| AgentError::Process(format!("Failed to read response body: {}", e)))?;
+
+        let content = if content_type.contains("text/html") {
+            html2text::from_read(body.as_bytes(), 120)
+        } else {
+            body
+        };
+
+        let max_size = 50 * 1024;
+        let truncated = content.len() > max_size;
+        let content = if truncated {
+            content[..max_size].to_string()
+        } else {
+            content
+        };
+
+        Ok(serde_json::json!({
+            "success": true,
+            "url": url,
+            "status": status,
+            "content": content,
+            "truncated": truncated
+        }).to_string())
+    }
+
+    fn edit_file(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
+        let file_path = cmd.file_path.as_ref().ok_or_else(|| {
+            AgentError::Process("file_path is required for editFile".to_string())
+        })?;
+        let operation = cmd.operation.as_ref().ok_or_else(|| {
+            AgentError::Process("operation is required for editFile".to_string())
+        })?;
+
+        let path = Path::new(file_path);
+
+        match operation.as_str() {
+            "write" => {
+                let content = cmd.content.as_ref().ok_or_else(|| {
+                    AgentError::Process("content is required for write operation".to_string())
+                })?;
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, content)?;
+                Ok(serde_json::json!({
+                    "success": true,
+                    "operation": "write",
+                    "file_path": file_path,
+                    "bytes_written": content.len()
+                }).to_string())
+            }
+            "append" => {
+                let content = cmd.content.as_ref().ok_or_else(|| {
+                    AgentError::Process("content is required for append operation".to_string())
+                })?;
+                use std::io::Write;
+                let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+                file.write_all(content.as_bytes())?;
+                Ok(serde_json::json!({
+                    "success": true,
+                    "operation": "append",
+                    "file_path": file_path,
+                    "bytes_written": content.len()
+                }).to_string())
+            }
+            "replace" => {
+                let match_content = cmd.match_content.as_ref().ok_or_else(|| {
+                    AgentError::Process("match_content is required for replace operation".to_string())
+                })?;
+                let content = cmd.content.as_ref().ok_or_else(|| {
+                    AgentError::Process("content is required for replace operation".to_string())
+                })?;
+                let original = fs::read_to_string(path)?;
+                let count = original.matches(match_content.as_str()).count();
+                if count == 0 {
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "operation": "replace",
+                        "file_path": file_path,
+                        "error": "match_content not found in file"
+                    }).to_string());
+                }
+                let replaced = original.replace(match_content.as_str(), content);
+                fs::write(path, &replaced)?;
+                Ok(serde_json::json!({
+                    "success": true,
+                    "operation": "replace",
+                    "file_path": file_path,
+                    "replacements": count
+                }).to_string())
+            }
+            "insert_at" => {
+                let content = cmd.content.as_ref().ok_or_else(|| {
+                    AgentError::Process("content is required for insert_at operation".to_string())
+                })?;
+                let line_number = cmd.line_number.ok_or_else(|| {
+                    AgentError::Process("line_number is required for insert_at operation".to_string())
+                })?;
+                let original = if path.exists() {
+                    fs::read_to_string(path)?
+                } else {
+                    String::new()
+                };
+                let mut lines: Vec<&str> = original.lines().collect();
+                let insert_at = line_number.min(lines.len());
+                lines.insert(insert_at, content);
+                let result = lines.join("\n");
+                // Preserve trailing newline if original had one
+                let result = if original.ends_with('\n') || original.is_empty() {
+                    format!("{}\n", result)
+                } else {
+                    result
+                };
+                fs::write(path, &result)?;
+                Ok(serde_json::json!({
+                    "success": true,
+                    "operation": "insert_at",
+                    "file_path": file_path,
+                    "line_number": insert_at
+                }).to_string())
+            }
+            "replace_lines" => {
+                let content = cmd.content.as_ref().ok_or_else(|| {
+                    AgentError::Process("content is required for replace_lines operation".to_string())
+                })?;
+                let line_number = cmd.line_number.ok_or_else(|| {
+                    AgentError::Process("line_number is required for replace_lines operation".to_string())
+                })?;
+                let end_line = cmd.end_line.ok_or_else(|| {
+                    AgentError::Process("end_line is required for replace_lines operation".to_string())
+                })?;
+                if end_line < line_number {
+                    return Err(AgentError::Process(
+                        "end_line must be >= line_number".to_string(),
+                    ));
+                }
+                let original = fs::read_to_string(path)?;
+                let mut lines: Vec<&str> = original.lines().collect();
+                let start = line_number.min(lines.len());
+                let end = end_line.min(lines.len());
+                lines.splice(start..end, std::iter::once(content.as_str()));
+                let result = lines.join("\n");
+                let result = if original.ends_with('\n') {
+                    format!("{}\n", result)
+                } else {
+                    result
+                };
+                fs::write(path, &result)?;
+                Ok(serde_json::json!({
+                    "success": true,
+                    "operation": "replace_lines",
+                    "file_path": file_path,
+                    "line_number": start,
+                    "end_line": end
+                }).to_string())
+            }
+            _ => Err(AgentError::Process(format!(
+                "Unknown editFile operation: {}",
+                operation
+            ))),
+        }
+    }
+
     pub async fn process_input(&self, input: AgentInput) -> Result<Vec<String>, AgentError> {
         let mut results = Vec::new();
 
@@ -469,6 +949,30 @@ impl Agent {
                 }
                 "inspectPath" => {
                     match self.inspect_path(&cmd) {
+                        Ok(result) => results.push(result),
+                        Err(e) => results.push(format!("Error: {}", e)),
+                    }
+                }
+                "editFile" => {
+                    match self.edit_file(&cmd) {
+                        Ok(result) => results.push(result),
+                        Err(e) => results.push(format!("Error: {}", e)),
+                    }
+                }
+                "browse" => {
+                    match self.browse(&cmd).await {
+                        Ok(result) => results.push(result),
+                        Err(e) => results.push(format!("Error: {}", e)),
+                    }
+                }
+                "askHuman" => {
+                    match self.ask_human(&cmd).await {
+                        Ok(result) => results.push(result),
+                        Err(e) => results.push(format!("Error: {}", e)),
+                    }
+                }
+                "execPty" => {
+                    match self.exec_pty(&cmd).await {
                         Ok(result) => results.push(result),
                         Err(e) => results.push(format!("Error: {}", e)),
                     }
@@ -700,16 +1204,9 @@ mod tests {
 
         let cmd = AgentCommand {
             function: "inspectPath".to_string(),
-            command: None,
             nonce: 1,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
-            status_type: None,
             path: Some(file_path.to_string_lossy().to_string()),
+            ..Default::default()
         };
         let result = agent.inspect_path(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -723,16 +1220,9 @@ mod tests {
         let (agent, _shm, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "inspectPath".to_string(),
-            command: None,
             nonce: 1,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
-            status_type: None,
             path: Some("/nonexistent/path/xyz".to_string()),
+            ..Default::default()
         };
         let result = agent.inspect_path(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -745,16 +1235,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cmd = AgentCommand {
             function: "inspectPath".to_string(),
-            command: None,
             nonce: 1,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
-            status_type: None,
             path: Some(tmp.path().to_string_lossy().to_string()),
+            ..Default::default()
         };
         let result = agent.inspect_path(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -767,16 +1250,8 @@ mod tests {
         let (agent, _shm, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "inspectPath".to_string(),
-            command: None,
             nonce: 1,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
-            status_type: None,
-            path: None,
+            ..Default::default()
         };
         let result = agent.inspect_path(&cmd);
         assert!(result.is_err());
@@ -790,16 +1265,9 @@ mod tests {
             .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
-            command: None,
             nonce: 5,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
             status_type: Some("status".to_string()),
-            path: None,
+            ..Default::default()
         };
         let result = agent.fetch_status(&cmd).unwrap();
         assert_eq!(result, "r");
@@ -813,16 +1281,9 @@ mod tests {
             .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
-            command: None,
             nonce: 5,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
             status_type: Some("exit_code".to_string()),
-            path: None,
+            ..Default::default()
         };
         let result = agent.fetch_status(&cmd).unwrap();
         assert_eq!(result, "127");
@@ -838,19 +1299,14 @@ mod tests {
         fs::write(log_dir.path().join("3_stdout.log"), "hello world").unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
-            command: None,
             nonce: 3,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
             status_type: Some("stdout".to_string()),
-            path: None,
+            ..Default::default()
         };
         let result = agent.fetch_status(&cmd).unwrap();
-        assert_eq!(result, "hello world");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "hello world");
+        assert_eq!(parsed["total_size"], 11);
     }
 
     #[tokio::test]
@@ -858,16 +1314,8 @@ mod tests {
         let (agent, _shm, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
-            command: None,
             nonce: 1,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
-            status_type: None,
-            path: None,
+            ..Default::default()
         };
         let result = agent.fetch_status(&cmd);
         assert!(result.is_err());
@@ -881,16 +1329,9 @@ mod tests {
             .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
-            command: None,
             nonce: 1,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
             status_type: Some("invalid".to_string()),
-            path: None,
+            ..Default::default()
         };
         let result = agent.fetch_status(&cmd);
         assert!(result.is_err());
@@ -905,19 +1346,14 @@ mod tests {
         // Don't create the log file - it doesn't exist for Waiting processes
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
-            command: None,
             nonce: 99,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
             status_type: Some("stdout".to_string()),
-            path: None,
+            ..Default::default()
         };
         let result = agent.fetch_status(&cmd).unwrap();
-        assert_eq!(result, "", "should return empty string for missing log file");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "");
+        assert_eq!(parsed["total_size"], 0);
     }
 
     #[tokio::test]
@@ -993,14 +1429,8 @@ mod tests {
                 function: "execAsAgent".to_string(),
                 command: Some("echo hello".to_string()),
                 nonce: 1,
-                depending_nonce: None,
-                expected_status: None,
-                wait: None,
-                return_stdout: None,
-                return_stderr: None,
                 display: Some(1),
-                status_type: None,
-                path: None,
+                ..Default::default()
             }],
             wait_for_status: None,
         };
@@ -1020,11 +1450,8 @@ mod tests {
                 depending_nonce: Some(1),
                 expected_status: Some(0),
                 wait: Some(true),
-                return_stdout: None,
-                return_stderr: None,
                 display: Some(1),
-                status_type: None,
-                path: None,
+                ..Default::default()
             }],
             wait_for_status: None,
         };
@@ -1039,16 +1466,8 @@ mod tests {
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "unknownFunc".to_string(),
-                command: None,
                 nonce: 1,
-                depending_nonce: None,
-                expected_status: None,
-                wait: None,
-                return_stdout: None,
-                return_stderr: None,
-                display: None,
-                status_type: None,
-                path: None,
+                ..Default::default()
             }],
             wait_for_status: None,
         };
@@ -1062,16 +1481,9 @@ mod tests {
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "inspectPath".to_string(),
-                command: None,
                 nonce: 1,
-                depending_nonce: None,
-                expected_status: None,
-                wait: None,
-                return_stdout: None,
-                return_stderr: None,
-                display: None,
-                status_type: None,
                 path: Some("/tmp".to_string()),
+                ..Default::default()
             }],
             wait_for_status: None,
         };
@@ -1090,14 +1502,8 @@ mod tests {
                 function: "execAsAgent".to_string(),
                 command: Some("echo fast".to_string()),
                 nonce: 1,
-                depending_nonce: None,
-                expected_status: None,
-                wait: None,
-                return_stdout: None,
-                return_stderr: None,
                 display: Some(1),
-                status_type: None,
-                path: None,
+                ..Default::default()
             }],
             wait_for_status: Some(200),
         };
@@ -1116,14 +1522,8 @@ mod tests {
             function: "execAsAgent".to_string(),
             command: Some("echo test_output".to_string()),
             nonce: 10,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
             display: Some(1),
-            status_type: None,
-            path: None,
+            ..Default::default()
         };
         agent.exec_as_agent(&cmd).await.unwrap();
         // Give the command time to complete
@@ -1142,16 +1542,8 @@ mod tests {
         let (agent, _shm, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "execAsAgent".to_string(),
-            command: None,
             nonce: 1,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
-            status_type: None,
-            path: None,
+            ..Default::default()
         };
         let result = agent.exec_as_agent(&cmd).await;
         assert!(result.is_err());
@@ -1198,5 +1590,920 @@ mod tests {
         assert!(map.contains_key(&10));
         assert!(map.contains_key(&20));
         assert!(!map.contains_key(&30));
+    }
+
+    // --- Log Tail tests ---
+
+    #[tokio::test]
+    async fn fetch_status_default_tail() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        // Create a small file (< 10KB)
+        let content = "a".repeat(500);
+        fs::write(log_dir.path().join("1_stdout.log"), &content).unwrap();
+        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 1,
+            status_type: Some("stdout".to_string()),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap().len(), 500);
+        assert_eq!(parsed["total_size"], 500);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_default_tail_large_file() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        // Create a file larger than 10KB
+        let content = "x".repeat(20_000);
+        fs::write(log_dir.path().join("1_stdout.log"), &content).unwrap();
+        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 1,
+            status_type: Some("stdout".to_string()),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // Default tail is 10KB = 10240 bytes
+        assert_eq!(parsed["bytes_read"], 10240);
+        assert_eq!(parsed["total_size"], 20000);
+        assert_eq!(parsed["offset"], 20000 - 10240);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_offset_and_limit() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
+        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 1,
+            status_type: Some("stdout".to_string()),
+            offset: Some(3),
+            limit: Some(4),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "3456");
+        assert_eq!(parsed["offset"], 3);
+        assert_eq!(parsed["bytes_read"], 4);
+        assert_eq!(parsed["total_size"], 10);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_offset_only() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
+        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 1,
+            status_type: Some("stdout".to_string()),
+            offset: Some(7),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "789");
+        assert_eq!(parsed["offset"], 7);
+        assert_eq!(parsed["bytes_read"], 3);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_limit_only() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
+        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 1,
+            status_type: Some("stdout".to_string()),
+            limit: Some(3),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "789");
+        assert_eq!(parsed["offset"], 7);
+        assert_eq!(parsed["bytes_read"], 3);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_offset_beyond_file() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        fs::write(log_dir.path().join("1_stdout.log"), "short").unwrap();
+        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 1,
+            status_type: Some("stdout".to_string()),
+            offset: Some(1000),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "");
+        assert_eq!(parsed["bytes_read"], 0);
+        assert_eq!(parsed["total_size"], 5);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_stderr_partial() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        fs::write(log_dir.path().join("1_stderr.log"), "error output here").unwrap();
+        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 1,
+            status_type: Some("stderr".to_string()),
+            offset: Some(6),
+            limit: Some(6),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "output");
+    }
+
+    // --- editFile tests ---
+
+    #[tokio::test]
+    async fn edit_file_write_creates_file() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("new.txt");
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("write".to_string()),
+            content: Some("hello world".to_string()),
+            ..Default::default()
+        };
+        let result = agent.edit_file(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["bytes_written"], 11);
+        assert_eq!(fs::read_to_string(&fp).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn edit_file_write_creates_parent_dirs() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("a/b/c/file.txt");
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("write".to_string()),
+            content: Some("deep".to_string()),
+            ..Default::default()
+        };
+        let result = agent.edit_file(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(fs::read_to_string(&fp).unwrap(), "deep");
+    }
+
+    #[tokio::test]
+    async fn edit_file_write_overwrites() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("existing.txt");
+        fs::write(&fp, "old content").unwrap();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("write".to_string()),
+            content: Some("new content".to_string()),
+            ..Default::default()
+        };
+        agent.edit_file(&cmd).unwrap();
+        assert_eq!(fs::read_to_string(&fp).unwrap(), "new content");
+    }
+
+    #[tokio::test]
+    async fn edit_file_append() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("append.txt");
+        fs::write(&fp, "first").unwrap();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("append".to_string()),
+            content: Some("_second".to_string()),
+            ..Default::default()
+        };
+        let result = agent.edit_file(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(fs::read_to_string(&fp).unwrap(), "first_second");
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_found() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("replace.txt");
+        fs::write(&fp, "hello world hello").unwrap();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("replace".to_string()),
+            match_content: Some("hello".to_string()),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        };
+        let result = agent.edit_file(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["replacements"], 2);
+        assert_eq!(fs::read_to_string(&fp).unwrap(), "hi world hi");
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_not_found() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("replace.txt");
+        fs::write(&fp, "hello world").unwrap();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("replace".to_string()),
+            match_content: Some("xyz".to_string()),
+            content: Some("abc".to_string()),
+            ..Default::default()
+        };
+        let result = agent.edit_file(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], false);
+    }
+
+    #[tokio::test]
+    async fn edit_file_insert_at_beginning() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("insert.txt");
+        fs::write(&fp, "line1\nline2\n").unwrap();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("insert_at".to_string()),
+            content: Some("line0".to_string()),
+            line_number: Some(0),
+            ..Default::default()
+        };
+        let result = agent.edit_file(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        let content = fs::read_to_string(&fp).unwrap();
+        assert!(content.starts_with("line0\n"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_insert_at_end() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("insert.txt");
+        fs::write(&fp, "line1\nline2").unwrap();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("insert_at".to_string()),
+            content: Some("line3".to_string()),
+            line_number: Some(100),
+            ..Default::default()
+        };
+        agent.edit_file(&cmd).unwrap();
+        let content = fs::read_to_string(&fp).unwrap();
+        assert!(content.contains("line2\nline3"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_lines() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("rlines.txt");
+        fs::write(&fp, "a\nb\nc\nd\ne").unwrap();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("replace_lines".to_string()),
+            content: Some("X".to_string()),
+            line_number: Some(1),
+            end_line: Some(3),
+            ..Default::default()
+        };
+        let result = agent.edit_file(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        let content = fs::read_to_string(&fp).unwrap();
+        assert_eq!(content, "a\nX\nd\ne");
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_lines_end_before_start() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("rlines.txt");
+        fs::write(&fp, "a\nb\nc").unwrap();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some(fp.to_string_lossy().to_string()),
+            operation: Some("replace_lines".to_string()),
+            content: Some("X".to_string()),
+            line_number: Some(3),
+            end_line: Some(1),
+            ..Default::default()
+        };
+        let result = agent.edit_file(&cmd);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_file_missing_fields() {
+        let (agent, _shm, _log) = create_test_agent();
+        // Missing file_path
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            operation: Some("write".to_string()),
+            ..Default::default()
+        };
+        assert!(agent.edit_file(&cmd).is_err());
+
+        // Missing operation
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some("/tmp/test".to_string()),
+            ..Default::default()
+        };
+        assert!(agent.edit_file(&cmd).is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_file_unknown_operation() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "editFile".to_string(),
+            nonce: 1,
+            file_path: Some("/tmp/test".to_string()),
+            operation: Some("unknown_op".to_string()),
+            ..Default::default()
+        };
+        assert!(agent.edit_file(&cmd).is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_file_process_input_integration() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let fp = tmp.path().join("integration.txt");
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "editFile".to_string(),
+                nonce: 1,
+                file_path: Some(fp.to_string_lossy().to_string()),
+                operation: Some("write".to_string()),
+                content: Some("via process_input".to_string()),
+                ..Default::default()
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(fs::read_to_string(&fp).unwrap(), "via process_input");
+    }
+
+    // --- browse tests ---
+
+    #[tokio::test]
+    async fn browse_missing_url() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "browse".to_string(),
+            nonce: 1,
+            ..Default::default()
+        };
+        let result = agent.browse(&cmd).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn browse_invalid_scheme() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "browse".to_string(),
+            nonce: 1,
+            url: Some("ftp://example.com".to_string()),
+            ..Default::default()
+        };
+        let result = agent.browse(&cmd).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn browse_html_conversion() {
+        // Start a simple HTTP server that returns HTML
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let html = "<html><body><h1>Hello</h1><p>World</p></body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+        });
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "browse".to_string(),
+            nonce: 1,
+            url: Some(format!("http://{}", addr)),
+            ..Default::default()
+        };
+        let result = agent.browse(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["status"], 200);
+        let content = parsed["content"].as_str().unwrap();
+        assert!(content.contains("Hello"), "should contain converted text, got: {}", content);
+        assert!(content.contains("World"), "should contain converted text, got: {}", content);
+    }
+
+    #[tokio::test]
+    async fn browse_plain_text_passthrough() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let body = "plain text content";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+        });
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "browse".to_string(),
+            nonce: 1,
+            url: Some(format!("http://{}", addr)),
+            ..Default::default()
+        };
+        let result = agent.browse(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "plain text content");
+    }
+
+    #[tokio::test]
+    async fn browse_http_error_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let body = "Not Found";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+        });
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "browse".to_string(),
+            nonce: 1,
+            url: Some(format!("http://{}", addr)),
+            ..Default::default()
+        };
+        let result = agent.browse(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["status"], 404);
+    }
+
+    #[tokio::test]
+    async fn browse_large_content_truncation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let body = "x".repeat(60_000);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+        });
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "browse".to_string(),
+            nonce: 1,
+            url: Some(format!("http://{}", addr)),
+            ..Default::default()
+        };
+        let result = agent.browse(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["content"].as_str().unwrap().len(), 50 * 1024);
+    }
+
+    #[tokio::test]
+    async fn browse_process_input_integration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+        });
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "browse".to_string(),
+                nonce: 1,
+                url: Some(format!("http://{}", addr)),
+                ..Default::default()
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["success"], true);
+    }
+
+    // --- wait_for_port tests ---
+
+    #[tokio::test]
+    async fn wait_for_port_already_open() {
+        let (agent, _shm, _log) = create_test_agent();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let result = agent.wait_for_port_with_retries(port, 3, 100).await.unwrap();
+        assert!(result, "should succeed when port is already open");
+    }
+
+    #[tokio::test]
+    async fn wait_for_port_opens_during_wait() {
+        let (agent, _shm, _log) = create_test_agent();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Drop listener to close port, then reopen after a delay
+        drop(listener);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let result = agent.wait_for_port_with_retries(port, 20, 100).await.unwrap();
+        assert!(result, "should succeed when port opens during wait");
+    }
+
+    #[tokio::test]
+    async fn wait_for_port_timeout() {
+        let (agent, _shm, _log) = create_test_agent();
+        // Use a port that is very likely not open
+        let result = agent.wait_for_port_with_retries(19999, 3, 50).await.unwrap();
+        assert!(!result, "should fail when port never opens");
+    }
+
+    #[tokio::test]
+    async fn exec_as_agent_wait_for_port_success() {
+        let (agent, _shm, log_dir) = create_test_agent();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmd = AgentCommand {
+            function: "execAsAgent".to_string(),
+            command: Some("echo port_ready".to_string()),
+            nonce: 1,
+            wait_for_port: Some(port),
+            display: Some(1),
+            ..Default::default()
+        };
+        agent.exec_as_agent(&cmd).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The command should have run since the port was open
+        let stdout_path = log_dir.path().join("1_stdout.log");
+        assert!(stdout_path.exists(), "stdout log should exist");
+        let content = fs::read_to_string(stdout_path).unwrap();
+        assert_eq!(content.trim(), "port_ready");
+    }
+
+    // --- askHuman tests ---
+
+    #[tokio::test]
+    async fn ask_human_missing_question() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "askHuman".to_string(),
+            nonce: 1,
+            ..Default::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let q_path = tmp.path().join("question");
+        let r_path = tmp.path().join("response");
+        let result = agent.ask_human_with_paths(&cmd, &q_path, &r_path, 1000, 100).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ask_human_response_already_available() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let q_path = tmp.path().join("question");
+        let r_path = tmp.path().join("response");
+        // Pre-create response file
+        fs::write(&r_path, "the answer").unwrap();
+        let cmd = AgentCommand {
+            function: "askHuman".to_string(),
+            nonce: 1,
+            question: Some("what is the answer?".to_string()),
+            ..Default::default()
+        };
+        let result = agent.ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["question"], "what is the answer?");
+        assert_eq!(parsed["response"], "the answer");
+        // Files should be cleaned up
+        assert!(!q_path.exists());
+        assert!(!r_path.exists());
+    }
+
+    #[tokio::test]
+    async fn ask_human_response_after_delay() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let q_path = tmp.path().join("question");
+        let r_path = tmp.path().join("response");
+        let r_path_clone = r_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            fs::write(&r_path_clone, "delayed answer").unwrap();
+        });
+        let cmd = AgentCommand {
+            function: "askHuman".to_string(),
+            nonce: 1,
+            question: Some("waiting for answer".to_string()),
+            ..Default::default()
+        };
+        let result = agent.ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["response"], "delayed answer");
+    }
+
+    #[tokio::test]
+    async fn ask_human_timeout() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let q_path = tmp.path().join("question");
+        let r_path = tmp.path().join("response");
+        let cmd = AgentCommand {
+            function: "askHuman".to_string(),
+            nonce: 1,
+            question: Some("will time out".to_string()),
+            ..Default::default()
+        };
+        let result = agent.ask_human_with_paths(&cmd, &q_path, &r_path, 300, 100).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], false);
+        assert!(parsed["error"].as_str().unwrap().contains("Timed out"));
+    }
+
+    #[tokio::test]
+    async fn ask_human_question_file_content() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let q_path = tmp.path().join("question");
+        let r_path = tmp.path().join("response");
+        // Pre-create response so it returns immediately
+        fs::write(&r_path, "ok").unwrap();
+        let cmd = AgentCommand {
+            function: "askHuman".to_string(),
+            nonce: 1,
+            question: Some("my question here".to_string()),
+            ..Default::default()
+        };
+        agent.ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100).await.unwrap();
+        // Question file should have been cleaned up, but we can verify the write happened
+        // by checking the response worked (question was written first, then response read)
+    }
+
+    #[tokio::test]
+    async fn ask_human_file_cleanup_on_timeout() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let q_path = tmp.path().join("question");
+        let r_path = tmp.path().join("response");
+        let cmd = AgentCommand {
+            function: "askHuman".to_string(),
+            nonce: 1,
+            question: Some("cleanup test".to_string()),
+            ..Default::default()
+        };
+        agent.ask_human_with_paths(&cmd, &q_path, &r_path, 200, 50).await.unwrap();
+        assert!(!q_path.exists(), "question file should be cleaned up after timeout");
+        assert!(!r_path.exists(), "response file should be cleaned up after timeout");
+    }
+
+    // --- execPty tests ---
+
+    #[tokio::test]
+    async fn exec_pty_simple_echo() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some("echo hello_pty".to_string()),
+            nonce: 1,
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["shell_id"], "default");
+        let output = parsed["output"].as_str().unwrap();
+        assert!(output.contains("hello_pty"), "output should contain echo result, got: {}", output);
+    }
+
+    #[tokio::test]
+    async fn exec_pty_state_persistence() {
+        let (agent, _shm, _log) = create_test_agent();
+        // Set an env var in the first command
+        let cmd1 = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some("export MY_TEST_VAR=persistent_value".to_string()),
+            nonce: 1,
+            shell_id: Some("persist".to_string()),
+            ..Default::default()
+        };
+        agent.exec_pty(&cmd1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Read it back in the second command (same shell)
+        let cmd2 = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some("echo $MY_TEST_VAR".to_string()),
+            nonce: 2,
+            shell_id: Some("persist".to_string()),
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&cmd2).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        let output = parsed["output"].as_str().unwrap();
+        assert!(output.contains("persistent_value"), "env var should persist, got: {}", output);
+    }
+
+    #[tokio::test]
+    async fn exec_pty_cd_persistence() {
+        let (agent, _shm, _log) = create_test_agent();
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let cmd1 = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some(format!("cd {}", tmp_path)),
+            nonce: 1,
+            shell_id: Some("cd_test".to_string()),
+            ..Default::default()
+        };
+        agent.exec_pty(&cmd1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let cmd2 = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some("pwd".to_string()),
+            nonce: 2,
+            shell_id: Some("cd_test".to_string()),
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&cmd2).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let output = parsed["output"].as_str().unwrap();
+        assert!(output.contains(&tmp_path), "cd should persist, got: {}", output);
+    }
+
+    #[tokio::test]
+    async fn exec_pty_multiple_sessions() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd1 = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some("export S=session_a".to_string()),
+            nonce: 1,
+            shell_id: Some("a".to_string()),
+            ..Default::default()
+        };
+        agent.exec_pty(&cmd1).await.unwrap();
+
+        let cmd2 = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some("export S=session_b".to_string()),
+            nonce: 2,
+            shell_id: Some("b".to_string()),
+            ..Default::default()
+        };
+        agent.exec_pty(&cmd2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Read from session a
+        let cmd3 = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some("echo $S".to_string()),
+            nonce: 3,
+            shell_id: Some("a".to_string()),
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&cmd3).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let output = parsed["output"].as_str().unwrap();
+        assert!(output.contains("session_a"), "session a should have its own state, got: {}", output);
+    }
+
+    #[tokio::test]
+    async fn exec_pty_default_shell_id() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "execPty".to_string(),
+            command: Some("echo default_test".to_string()),
+            nonce: 1,
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["shell_id"], "default");
+    }
+
+    #[tokio::test]
+    async fn exec_pty_missing_command() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "execPty".to_string(),
+            nonce: 1,
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&cmd).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn exec_pty_process_input_integration() {
+        let (agent, _shm, _log) = create_test_agent();
+        let input = AgentInput {
+            commands: vec![AgentCommand {
+                function: "execPty".to_string(),
+                command: Some("echo integration_test".to_string()),
+                nonce: 1,
+                ..Default::default()
+            }],
+            wait_for_status: None,
+        };
+        let results = agent.process_input(input).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["success"], true);
+        let output = parsed["output"].as_str().unwrap();
+        assert!(output.contains("integration_test"), "got: {}", output);
     }
 }

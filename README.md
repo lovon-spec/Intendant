@@ -45,10 +45,17 @@ Output:
 1c0        # nonce 1, completed, exit code 0
 ```
 
-Retrieve results in a subsequent run:
+Retrieve results in a subsequent run (returns JSON with `content`, `total_size`, `offset`, `bytes_read`):
 
 ```bash
 echo '{"commands":[{"function":"fetchStatus","nonce":1,"status_type":"stdout"}]}' \
+  | ./target/release/agent
+```
+
+Read only the last 1024 bytes of a log:
+
+```bash
+echo '{"commands":[{"function":"fetchStatus","nonce":1,"status_type":"stdout","limit":1024}]}' \
   | ./target/release/agent
 ```
 
@@ -59,16 +66,41 @@ echo '{"commands":[{"function":"inspectPath","nonce":1,"path":"/etc/hosts"}]}' \
   | ./target/release/agent
 ```
 
+Edit a file:
+
+```bash
+echo '{"commands":[{"function":"editFile","nonce":1,"file_path":"/tmp/test.txt","operation":"write","content":"hello"}]}' \
+  | ./target/release/agent
+```
+
+Fetch a web page as text:
+
+```bash
+echo '{"commands":[{"function":"browse","nonce":1,"url":"https://example.com"}]}' \
+  | ./target/release/agent
+```
+
+Run stateful commands in a persistent PTY:
+
+```bash
+echo '{"commands":[{"function":"execPty","nonce":1,"command":"cd /tmp"},{"function":"execPty","nonce":2,"command":"pwd"}]}' \
+  | ./target/release/agent
+```
+
 ## Protocol
 
 ### Functions
 
 | Function | Description | Key Fields |
 |----------|-------------|------------|
-| `execAsAgent` | Run a bash command in the background | `command`, `display`, `depending_nonce`, `wait`, `expected_status` |
+| `execAsAgent` | Run a bash command in the background | `command`, `display`, `depending_nonce`, `wait`, `expected_status`, `wait_for_port` |
 | `captureScreen` | Screenshot a display via ImageMagick | `display` |
-| `fetchStatus` | Read process state/logs | `status_type` (`status`, `stdout`, `stderr`, `exit_code`) |
+| `fetchStatus` | Read process state/logs (JSON with offset/limit) | `status_type` (`status`, `stdout`, `stderr`, `exit_code`), `offset`, `limit` |
 | `inspectPath` | Inspect filesystem path metadata | `path` |
+| `editFile` | Structured file editing without shell commands | `file_path`, `operation`, `content`, `match_content`, `line_number`, `end_line` |
+| `browse` | Fetch URL and convert HTML to text | `url` |
+| `askHuman` | Ask the operator a question and wait for response | `question` |
+| `execPty` | Run command in a persistent PTY session | `command`, `shell_id` |
 
 ### Status Codes
 
@@ -142,7 +174,7 @@ MODEL_NAME=gpt-4o        # optional, defaults to gpt-4o
 1. Loads `.env` and reads `SysPrompt.md` as the system message
 2. Sends the task to the OpenAI chat completions API
 3. Extracts JSON from the model's response (handles code fences and bare JSON)
-4. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s)
+4. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s), configurable via `AGENT_IDLE_TIMEOUT` and `AGENT_HARD_TIMEOUT` env vars
 5. Feeds the agent output back as the next user message
 6. Repeats until the model responds with no JSON (task complete) or 50 turns are reached
 
@@ -152,3 +184,14 @@ MODEL_NAME=gpt-4o        # optional, defaults to gpt-4o
 - **Runtime:** Tokio async
 - **Display:** DISPLAY is automatically set to `:1` (configurable via `display` field) for GUI commands
 - **Permissions:** Runs as root with full system access
+
+### Caller Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` / `OPENAI` | (required) | OpenAI API key |
+| `MODEL_NAME` | `gpt-4o` | Model to use |
+| `AGENT_IDLE_TIMEOUT` | `3` | Seconds to wait for agent output before assuming idle |
+| `AGENT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
+
+Increase timeouts when using `askHuman` (e.g., `AGENT_HARD_TIMEOUT=600`).

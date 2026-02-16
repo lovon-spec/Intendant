@@ -13,6 +13,54 @@ pub struct Command {
     pub display: Option<i32>,
     pub status_type: Option<String>,
     pub path: Option<String>,
+    // Log tail fields
+    pub offset: Option<u64>,
+    pub limit: Option<u64>,
+    // editFile fields
+    pub file_path: Option<String>,
+    pub operation: Option<String>,
+    pub content: Option<String>,
+    pub match_content: Option<String>,
+    pub line_number: Option<usize>,
+    pub end_line: Option<usize>,
+    // browse field
+    pub url: Option<String>,
+    // wait_for_port field
+    pub wait_for_port: Option<u16>,
+    // askHuman field
+    pub question: Option<String>,
+    // execPty field
+    pub shell_id: Option<String>,
+}
+
+impl Default for Command {
+    fn default() -> Self {
+        Self {
+            function: String::new(),
+            nonce: 0,
+            command: None,
+            depending_nonce: None,
+            expected_status: None,
+            wait: None,
+            return_stdout: None,
+            return_stderr: None,
+            display: None,
+            status_type: None,
+            path: None,
+            offset: None,
+            limit: None,
+            file_path: None,
+            operation: None,
+            content: None,
+            match_content: None,
+            line_number: None,
+            end_line: None,
+            url: None,
+            wait_for_port: None,
+            question: None,
+            shell_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,16 +209,9 @@ mod tests {
     fn command_serialize_roundtrip() {
         let cmd = Command {
             function: "inspectPath".to_string(),
-            command: None,
             nonce: 5,
-            depending_nonce: None,
-            expected_status: None,
-            wait: None,
-            return_stdout: None,
-            return_stderr: None,
-            display: None,
-            status_type: None,
             path: Some("/tmp/test".to_string()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let deserialized: Command = serde_json::from_str(&json).unwrap();

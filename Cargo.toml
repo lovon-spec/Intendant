@@ -21,6 +21,8 @@ chrono = "0.4"
 env_logger = "0.9"
 regex = "1.5"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+html2text = "0.12"
+portable-pty = "0.8"
 dotenvy = "0.15"
 
 [dev-dependencies]
