@@ -20,9 +20,28 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+pub struct ModelConfig {
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+pub struct OrchestratorConfig {
+    pub max_parallel_agents: Option<usize>,
+    pub sub_agent_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct ProjectConfig {
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub model: ModelConfig,
+    #[serde(default)]
+    pub orchestrator: OrchestratorConfig,
 }
 
 #[derive(Debug)]
@@ -50,8 +69,16 @@ impl Project {
         self.root.join(".agent").join("memory.json")
     }
 
+    #[allow(dead_code)]
     pub fn agent_dir(&self) -> PathBuf {
         self.root.join(".agent")
+    }
+
+    pub fn sub_agent_dir(&self) -> PathBuf {
+        match &self.config.orchestrator.sub_agent_dir {
+            Some(dir) => self.root.join(dir),
+            None => self.root.join(".agent").join("subagents"),
+        }
     }
 }
 
@@ -81,6 +108,10 @@ mod tests {
     fn default_project_config() {
         let config = ProjectConfig::default();
         assert!(config.memory.enabled);
+        assert!(config.model.context_window.is_none());
+        assert!(config.model.max_output_tokens.is_none());
+        assert!(config.orchestrator.max_parallel_agents.is_none());
+        assert!(config.orchestrator.sub_agent_dir.is_none());
     }
 
     #[test]
@@ -88,15 +119,28 @@ mod tests {
         let toml_str = r#"
 [memory]
 enabled = true
+
+[model]
+context_window = 200000
+max_output_tokens = 16384
+
+[orchestrator]
+max_parallel_agents = 4
+sub_agent_dir = ".custom/agents"
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(config.memory.enabled);
+        assert_eq!(config.model.context_window, Some(200_000));
+        assert_eq!(config.model.max_output_tokens, Some(16_384));
+        assert_eq!(config.orchestrator.max_parallel_agents, Some(4));
+        assert_eq!(config.orchestrator.sub_agent_dir.as_deref(), Some(".custom/agents"));
     }
 
     #[test]
     fn parse_empty_config() {
         let config: ProjectConfig = toml::from_str("").unwrap();
         assert!(config.memory.enabled); // default_true
+        assert!(config.model.context_window.is_none());
     }
 
     #[test]
@@ -107,6 +151,19 @@ enabled = false
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.memory.enabled);
+        assert!(config.model.context_window.is_none());
+    }
+
+    #[test]
+    fn parse_model_config_only() {
+        let toml_str = r#"
+[model]
+context_window = 128000
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.memory.enabled); // default
+        assert_eq!(config.model.context_window, Some(128_000));
+        assert!(config.model.max_output_tokens.is_none());
     }
 
     #[test]
@@ -117,5 +174,31 @@ enabled = false
         };
         assert_eq!(project.memory_path(), PathBuf::from("/tmp/myproject/.agent/memory.json"));
         assert_eq!(project.agent_dir(), PathBuf::from("/tmp/myproject/.agent"));
+        assert_eq!(project.sub_agent_dir(), PathBuf::from("/tmp/myproject/.agent/subagents"));
+    }
+
+    #[test]
+    fn sub_agent_dir_custom() {
+        let toml_str = r#"
+[orchestrator]
+sub_agent_dir = ".custom/agents"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let project = Project {
+            root: PathBuf::from("/tmp/myproject"),
+            config,
+        };
+        assert_eq!(project.sub_agent_dir(), PathBuf::from("/tmp/myproject/.custom/agents"));
+    }
+
+    #[test]
+    fn parse_orchestrator_config() {
+        let toml_str = r#"
+[orchestrator]
+max_parallel_agents = 8
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.orchestrator.max_parallel_agents, Some(8));
+        assert!(config.orchestrator.sub_agent_dir.is_none());
     }
 }

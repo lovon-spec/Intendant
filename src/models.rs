@@ -36,6 +36,11 @@ pub struct Command {
     pub memory_summary: Option<String>,
     pub memory_query: Option<String>,
     pub memory_file: Option<String>,
+    // Knowledge system fields
+    pub memory_tags: Option<String>,
+    pub memory_channel: Option<String>,
+    pub memory_source: Option<String>,
+    pub memory_since: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

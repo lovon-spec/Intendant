@@ -104,6 +104,7 @@ impl Agent {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(SHARED_MEM_PATH)?;
         file.set_len(SHARED_MEM_SIZE as u64)?;
@@ -598,12 +599,12 @@ impl Agent {
         }
 
         // Remove leading empty lines
-        while lines.first().map_or(false, |l| l.trim().is_empty()) {
+        while lines.first().is_some_and(|l| l.trim().is_empty()) {
             lines.remove(0);
         }
 
         // Remove trailing empty lines and bash prompt lines
-        while lines.last().map_or(false, |l| {
+        while lines.last().is_some_and(|l| {
             let t = l.trim();
             t.is_empty() || t.starts_with("bash-") || t.starts_with("$ ")
         }) {
@@ -918,6 +919,18 @@ impl Agent {
             fs::create_dir_all(parent)?;
         }
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let tags: Vec<String> = cmd.memory_tags.as_deref()
+            .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        let channel = cmd.memory_channel.as_deref().unwrap_or("default").to_string();
+        let source = cmd.memory_source.as_deref().unwrap_or("agent").to_string();
+
+        // Try to read as new KnowledgeStore format first, fall back to old format
         let mut data: serde_json::Value = if path.exists() {
             let content = fs::read_to_string(&path)?;
             serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({"entries": {}}))
@@ -925,34 +938,76 @@ impl Agent {
             serde_json::json!({"entries": {}})
         };
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        // Detect format: old format has entries as object, new format has entries as array
+        let is_new_format = data.get("entries").is_some_and(|e| e.is_array());
 
-        let already_exists = data.get("entries")
-            .and_then(|e| e.get(key.as_str()))
-            .is_some();
+        if is_new_format {
+            // New KnowledgeStore format (Vec)
+            let entries = data["entries"].as_array_mut().unwrap();
+            let existing_idx = entries.iter().position(|e| {
+                e.get("key").and_then(|k| k.as_str()) == Some(key.as_str())
+                    && e.get("source").and_then(|s| s.as_str()) == Some(source.as_str())
+            });
 
-        let created_at = data.get("entries")
-            .and_then(|e| e.get(key.as_str()))
-            .and_then(|e| e.get("created_at"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(now);
+            let already_exists = existing_idx.is_some();
+            if let Some(idx) = existing_idx {
+                let created_at = entries[idx].get("created_at").and_then(|v| v.as_u64()).unwrap_or(now);
+                entries[idx] = serde_json::json!({
+                    "id": key,
+                    "key": key,
+                    "summary": summary,
+                    "tags": tags,
+                    "source": source,
+                    "channel": channel,
+                    "created_at": created_at,
+                    "updated_at": now
+                });
+            } else {
+                entries.push(serde_json::json!({
+                    "id": key,
+                    "key": key,
+                    "summary": summary,
+                    "tags": tags,
+                    "source": source,
+                    "channel": channel,
+                    "created_at": now,
+                    "updated_at": now
+                }));
+            }
 
-        data["entries"][key.as_str()] = serde_json::json!({
-            "summary": summary,
-            "created_at": created_at,
-            "updated_at": now
-        });
+            fs::write(&path, serde_json::to_string_pretty(&data).unwrap())?;
 
-        fs::write(&path, serde_json::to_string_pretty(&data).unwrap())?;
+            Ok(serde_json::json!({
+                "success": true,
+                "key": key,
+                "action": if already_exists { "updated" } else { "created" }
+            }).to_string())
+        } else {
+            // Old format (HashMap) — maintain backward compatibility
+            let already_exists = data.get("entries")
+                .and_then(|e| e.get(key.as_str()))
+                .is_some();
 
-        Ok(serde_json::json!({
-            "success": true,
-            "key": key,
-            "action": if already_exists { "updated" } else { "created" }
-        }).to_string())
+            let created_at = data.get("entries")
+                .and_then(|e| e.get(key.as_str()))
+                .and_then(|e| e.get("created_at"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(now);
+
+            data["entries"][key.as_str()] = serde_json::json!({
+                "summary": summary,
+                "created_at": created_at,
+                "updated_at": now
+            });
+
+            fs::write(&path, serde_json::to_string_pretty(&data).unwrap())?;
+
+            Ok(serde_json::json!({
+                "success": true,
+                "key": key,
+                "action": if already_exists { "updated" } else { "created" }
+            }).to_string())
+        }
     }
 
     fn recall_memory(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
@@ -978,27 +1033,94 @@ impl Agent {
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower.split_whitespace().collect();
 
+        // Parse optional filter parameters
+        let filter_tags: Option<Vec<String>> = cmd.memory_tags.as_deref()
+            .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+        let filter_channel = cmd.memory_channel.as_deref();
+        let filter_source = cmd.memory_source.as_deref();
+        let filter_since = cmd.memory_since;
+
         let mut results: Vec<serde_json::Value> = Vec::new();
 
-        if let Some(entries) = data.get("entries").and_then(|e| e.as_object()) {
-            for (key, value) in entries {
-                let key_lower = key.to_lowercase();
-                let summary_lower = value.get("summary")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
+        // Detect format: new (array) or old (object)
+        let is_new_format = data.get("entries").is_some_and(|e| e.is_array());
 
-                let score: usize = keywords.iter()
-                    .filter(|kw| key_lower.contains(*kw) || summary_lower.contains(*kw))
-                    .count();
+        if is_new_format {
+            // New KnowledgeStore format
+            if let Some(entries) = data.get("entries").and_then(|e| e.as_array()) {
+                for entry in entries {
+                    let key = entry.get("key").and_then(|k| k.as_str()).unwrap_or("");
+                    let summary = entry.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+                    let updated_at = entry.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0);
 
-                if score > 0 {
-                    results.push(serde_json::json!({
-                        "key": key,
-                        "summary": value.get("summary").and_then(|s| s.as_str()).unwrap_or(""),
-                        "score": score,
-                        "updated_at": value.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0)
-                    }));
+                    // Apply filters
+                    if let Some(ref tags) = filter_tags {
+                        let entry_tags: Vec<String> = entry.get("tags")
+                            .and_then(|t| t.as_array())
+                            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        if !tags.iter().any(|t| entry_tags.contains(t)) {
+                            continue;
+                        }
+                    }
+                    if let Some(channel) = filter_channel {
+                        if entry.get("channel").and_then(|c| c.as_str()) != Some(channel) {
+                            continue;
+                        }
+                    }
+                    if let Some(source) = filter_source {
+                        if entry.get("source").and_then(|s| s.as_str()) != Some(source) {
+                            continue;
+                        }
+                    }
+                    if let Some(since) = filter_since {
+                        if updated_at < since {
+                            continue;
+                        }
+                    }
+
+                    let key_lower = key.to_lowercase();
+                    let summary_lower = summary.to_lowercase();
+
+                    let score: usize = keywords.iter()
+                        .filter(|kw| key_lower.contains(*kw) || summary_lower.contains(*kw))
+                        .count();
+
+                    if score > 0 {
+                        results.push(serde_json::json!({
+                            "key": key,
+                            "summary": summary,
+                            "score": score,
+                            "updated_at": updated_at,
+                            "tags": entry.get("tags").cloned().unwrap_or(serde_json::json!([])),
+                            "channel": entry.get("channel").and_then(|c| c.as_str()).unwrap_or("default"),
+                            "source": entry.get("source").and_then(|s| s.as_str()).unwrap_or("")
+                        }));
+                    }
+                }
+            }
+        } else {
+            // Old format (HashMap)
+            if let Some(entries) = data.get("entries").and_then(|e| e.as_object()) {
+                for (key, value) in entries {
+                    let key_lower = key.to_lowercase();
+                    let summary_lower = value.get("summary")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+
+                    let score: usize = keywords.iter()
+                        .filter(|kw| key_lower.contains(*kw) || summary_lower.contains(*kw))
+                        .count();
+
+                    if score > 0 {
+                        results.push(serde_json::json!({
+                            "key": key,
+                            "summary": value.get("summary").and_then(|s| s.as_str()).unwrap_or(""),
+                            "score": score,
+                            "updated_at": value.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0)
+                        }));
+                    }
                 }
             }
         }
@@ -1220,7 +1342,7 @@ impl Agent {
         let map = self.process_map.read().unwrap();
         let offset = *map
             .get(&nonce)
-            .ok_or_else(|| AgentError::InvalidNonce(nonce))?;
+            .ok_or(AgentError::InvalidNonce(nonce))?;
 
         let mmap = self.shared_mem.read().unwrap();
         let info_slice = &mmap[offset..offset + size_of::<ProcessInfo>()];
@@ -2947,6 +3069,152 @@ mod tests {
         assert_eq!(results.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
         assert_eq!(parsed["success"], true);
+    }
+
+    // --- Knowledge system field tests ---
+
+    #[tokio::test]
+    async fn store_memory_with_tags_and_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("knowledge.json");
+
+        // First, create a new-format file
+        std::fs::write(&memory_file, r#"{"entries":[],"subscriptions":{},"cursors":{}}"#).unwrap();
+
+        let cmd = AgentCommand {
+            function: "storeMemory".to_string(),
+            nonce: 1,
+            memory_key: Some("db-schema".to_string()),
+            memory_summary: Some("PostgreSQL with 5 tables".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            memory_tags: Some("database, schema".to_string()),
+            memory_channel: Some("findings".to_string()),
+            memory_source: Some("research-1".to_string()),
+            ..Default::default()
+        };
+        let result = agent.store_memory(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["action"], "created");
+
+        // Verify the file contains tags and channel
+        let content = std::fs::read_to_string(&memory_file).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let entry = &data["entries"][0];
+        assert_eq!(entry["key"], "db-schema");
+        assert_eq!(entry["channel"], "findings");
+        assert_eq!(entry["source"], "research-1");
+        let tags = entry["tags"].as_array().unwrap();
+        assert!(tags.contains(&serde_json::json!("database")));
+        assert!(tags.contains(&serde_json::json!("schema")));
+    }
+
+    #[tokio::test]
+    async fn recall_memory_with_tag_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("knowledge.json");
+
+        // Create knowledge store with tagged entries
+        let content = r#"{
+            "entries": [
+                {"id":"1","key":"db-schema","summary":"PostgreSQL tables","tags":["database"],"source":"agent","channel":"findings","created_at":1000,"updated_at":1000},
+                {"id":"2","key":"api-routes","summary":"REST endpoints","tags":["api"],"source":"agent","channel":"findings","created_at":1000,"updated_at":1000}
+            ],
+            "subscriptions": {},
+            "cursors": {}
+        }"#;
+        std::fs::write(&memory_file, content).unwrap();
+
+        // Recall with tag filter
+        let cmd = AgentCommand {
+            function: "recallMemory".to_string(),
+            nonce: 1,
+            memory_query: Some("schema endpoints".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            memory_tags: Some("database".to_string()),
+            ..Default::default()
+        };
+        let result = agent.recall_memory(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["key"], "db-schema");
+    }
+
+    #[tokio::test]
+    async fn recall_memory_with_channel_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("knowledge.json");
+
+        let content = r#"{
+            "entries": [
+                {"id":"1","key":"finding-1","summary":"Found something","tags":[],"source":"agent","channel":"findings","created_at":1000,"updated_at":1000},
+                {"id":"2","key":"decision-1","summary":"Decided something","tags":[],"source":"agent","channel":"decisions","created_at":1000,"updated_at":1000}
+            ],
+            "subscriptions": {},
+            "cursors": {}
+        }"#;
+        std::fs::write(&memory_file, content).unwrap();
+
+        let cmd = AgentCommand {
+            function: "recallMemory".to_string(),
+            nonce: 1,
+            memory_query: Some("something".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            memory_channel: Some("findings".to_string()),
+            ..Default::default()
+        };
+        let result = agent.recall_memory(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["key"], "finding-1");
+    }
+
+    #[tokio::test]
+    async fn store_memory_backward_compat_old_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let shm = dir.path().join("shm");
+        let log = dir.path().join("log");
+        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+
+        let memory_file = dir.path().join("old_mem.json");
+        // Pre-populate with old format
+        std::fs::write(&memory_file, r#"{"entries":{"existing":{"summary":"old data","created_at":100,"updated_at":200}}}"#).unwrap();
+
+        // Store in old format (no tags/channel/source)
+        let cmd = AgentCommand {
+            function: "storeMemory".to_string(),
+            nonce: 1,
+            memory_key: Some("new-key".to_string()),
+            memory_summary: Some("new data".to_string()),
+            memory_file: Some(memory_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let result = agent.store_memory(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["action"], "created");
+
+        // Verify old format is maintained
+        let content = std::fs::read_to_string(&memory_file).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(data["entries"].is_object());
+        assert!(data["entries"]["existing"].is_object());
+        assert!(data["entries"]["new-key"].is_object());
     }
 
     // --- Synchronous command shared memory registration tests ---

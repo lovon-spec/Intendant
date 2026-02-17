@@ -4,6 +4,7 @@ use std::fmt;
 pub enum CallerError {
     Provider(String),
     Agent(String),
+    SubAgent(String),
     Io(std::io::Error),
     Json(serde_json::Error),
     Http(reqwest::Error),
@@ -16,6 +17,7 @@ impl fmt::Display for CallerError {
         match self {
             CallerError::Provider(msg) => write!(f, "Provider error: {}", msg),
             CallerError::Agent(msg) => write!(f, "Agent error: {}", msg),
+            CallerError::SubAgent(msg) => write!(f, "Sub-agent error: {}", msg),
             CallerError::Io(e) => write!(f, "IO error: {}", e),
             CallerError::Json(e) => write!(f, "JSON error: {}", e),
             CallerError::Http(e) => write!(f, "HTTP error: {}", e),
@@ -59,6 +61,12 @@ mod tests {
     fn agent_error_display() {
         let err = CallerError::Agent("spawn failed".to_string());
         assert_eq!(format!("{}", err), "Agent error: spawn failed");
+    }
+
+    #[test]
+    fn sub_agent_error_display() {
+        let err = CallerError::SubAgent("spawn failed".to_string());
+        assert_eq!(format!("{}", err), "Sub-agent error: spawn failed");
     }
 
     #[test]

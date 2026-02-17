@@ -23,7 +23,7 @@ src/
 │                        #   - Web browsing (browse)
 │                        #   - Human interaction (askHuman)
 │                        #   - PTY sessions (execPty)
-│                        #   - Memory storage/recall (storeMemory, recallMemory)
+│                        #   - Memory storage/recall with tagged knowledge (storeMemory, recallMemory)
 │                        #   - Dependency checking and nonce replacement
 ├── models.rs            # Data structures: Command, AgentInput, ProcessInfo, ProcessStatus, StatusUpdate
 ├── error.rs             # AgentError enum (Io, Json, Process, InvalidNonce)
@@ -31,13 +31,22 @@ src/
 ├── status_monitor.rs    # Background task polling shared memory every 100ms
 └── bin/
     └── caller/
-        ├── main.rs          # Caller entry point, JSON extraction, context directives, main loop (max 50 turns)
-        ├── provider.rs      # Multi-provider API client (OpenAI + Anthropic) with ChatProvider trait
-        ├── conversation.rs  # Message management (system/user/assistant roles), drop/summarize
+        ├── main.rs          # Caller entry point: 3 modes (user/sub-agent/direct), budget-aware loop
+        ├── provider.rs      # Multi-provider API client with token usage tracking, ChatProvider trait
+        ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
         ├── agent_runner.rs  # Spawns agent subprocess, manages I/O with timeouts
-        ├── memory.rs        # Project memory loading and formatting for conversation injection
+        ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
+        ├── memory.rs        # Backward-compatible memory wrapper delegating to knowledge.rs
+        ├── sub_agent.rs     # Sub-agent spawning, result/progress I/O, role-specific configuration
+        ├── worktree.rs      # Git worktree management for isolated implementation agents
+        ├── user_mode.rs     # User-mode orchestrator spawning, progress monitoring, input relay
         ├── project.rs       # Project detection (git root), config parsing (agent.toml)
         └── error.rs         # CallerError enum
+SysPrompt.md                 # Default system prompt (direct mode)
+SysPrompt_user.md            # User-facing mode prompt
+SysPrompt_orchestrator.md    # Orchestrator agent prompt
+SysPrompt_research.md        # Research sub-agent prompt
+SysPrompt_implementation.md  # Implementation sub-agent prompt
 ```
 
 ## Build and Run
@@ -61,22 +70,26 @@ Running the caller (requires `.env` with API key):
 ## Testing
 
 ```bash
-cargo test                # Run all 161 tests
+cargo test                # Run all 267 tests
 cargo test -- --list      # List all test names
 ```
 
 All tests are inline `#[cfg(test)]` modules in the same files as the code they test. Async tests use `#[tokio::test]`. The `tempfile` crate provides isolated temporary directories for tests that touch the filesystem or shared memory.
 
 Test coverage includes:
-- **agent.rs** (110 tests): Process info operations, dependency checking, command execution, status fetching with log tail, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall, synchronous command shared memory registration, cross-command-type dependency chaining
+- **agent.rs** (114 tests): Process info operations, dependency checking, command execution, status fetching with log tail, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters, synchronous command shared memory registration, cross-command-type dependency chaining
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity, status output formatting
-- **caller/main.rs** (51 tests total across caller modules): JSON extraction from code fences and bare text, context directives (drop/summarize), project context injection
-- **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns
-- **caller/project.rs**: Config parsing, project paths
-- **caller/memory.rs**: Memory loading, formatting
-- **caller/provider.rs**: Provider selection, message formatting
+- **caller/main.rs** (153 tests total across caller modules): JSON extraction, context directives, budget constants, task classification
+- **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
+- **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
+- **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
+- **caller/worktree.rs**: Full lifecycle (create/list/merge/remove), conflict handling
+- **caller/user_mode.rs**: Orchestrator spec generation, progress formatting, input relay, prompt resolution
+- **caller/project.rs**: Config parsing, project paths, sub-agent directory
+- **caller/memory.rs**: Memory/knowledge loading, formatting, format migration
+- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults
 - **caller/error.rs**: Display formatting, type conversions
 
 ## Architecture Details
@@ -109,11 +122,18 @@ Commands chain via `depending_nonce`, `wait`, and `expected_status`. When `wait`
 
 ### Caller Flow
 
+The caller operates in three modes based on environment:
+
+**Sub-Agent Mode** (`AGENT_ROLE` set): Runs with scoped task, writes progress/results to files, uses role-specific system prompt.
+
+**User Mode** (complex task, no `AGENT_ROLE`): Spawns orchestrator sub-agent, monitors progress, relays to user. User-layer messages are protected from auto-pruning.
+
+**Direct Mode** (simple task, no `AGENT_ROLE`): Single-loop execution:
 1. Selects API provider (OpenAI or Anthropic) from env
 2. Detects project root via git, loads `agent.toml` config
-3. Loads `SysPrompt.md` as system message
-4. Injects project memory into conversation
-5. Main loop (max 50 turns): send to model -> extract JSON -> apply context directives -> inject project context -> pipe to agent -> feed output back
+3. Reads role-appropriate system prompt
+4. Injects project knowledge into conversation
+5. Budget-aware loop (stops at context exhaustion or 500-turn safety cap): send to model -> extract JSON -> apply context directives -> inject project context -> pipe to agent -> append budget summary -> feed output back
 
 ## Code Conventions
 

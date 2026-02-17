@@ -1,6 +1,6 @@
 # Agent
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI caller that drives the agent via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The caller includes persistent project memory, active context management, and multi-provider support.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI caller that drives the agent via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The caller supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
@@ -13,11 +13,16 @@ stdin (JSON) --> Agent --> spawns bash commands
                   |
                   +--> StatusMonitor --> stdout (status lines)
 
-Caller --> detects project root (git) --> loads memory
+Caller (3 modes) --> detects project root (git) --> loads memory/knowledge
   |
-  +--> selects provider (OpenAI / Anthropic)
-  +--> injects memory into conversation
-  +--> main loop: model -> extract JSON -> apply context directives -> agent -> repeat
+  +--> User Mode:       spawns orchestrator, monitors progress, relays to user
+  +--> Sub-Agent Mode:  scoped task, writes results/progress, isolated context
+  +--> Direct Mode:     single-loop execution for simple tasks
+  |
+  +--> Token budget tracking (context-window-aware loop termination)
+  +--> Sub-agent spawning via env vars (AGENT_ROLE, AGENT_ID, etc.)
+  +--> Git worktree isolation for implementation agents
+  +--> Tagged knowledge store with pub/sub channels between agents
 ```
 
 - **Shared Memory (`/dev/shm/agent_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Survives binary restarts since it lives on tmpfs.
@@ -93,13 +98,19 @@ echo '{"commands":[{"function":"execPty","nonce":1,"command":"cd /tmp"},{"functi
   | ./target/release/agent
 ```
 
-Store and recall memory:
+Store and recall memory (supports tagged knowledge with channels):
 
 ```bash
+# Basic store
 echo '{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"db-config","memory_summary":"PostgreSQL on port 5432","memory_file":"/path/to/.agent/memory.json"}]}' \
   | ./target/release/agent
 
-echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database","memory_file":"/path/to/.agent/memory.json"}]}' \
+# Store with tags and channel
+echo '{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"db-config","memory_summary":"PostgreSQL on port 5432","memory_tags":"database,config","memory_channel":"findings","memory_source":"research-1","memory_file":"/path/to/.agent/memory.json"}]}' \
+  | ./target/release/agent
+
+# Recall with filters
+echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database","memory_tags":"config","memory_channel":"findings","memory_file":"/path/to/.agent/memory.json"}]}' \
   | ./target/release/agent
 ```
 
@@ -117,8 +128,8 @@ echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database
 | `browse` | Fetch URL and convert HTML to text | `url` |
 | `askHuman` | Ask the operator a question and wait for response | `question` |
 | `execPty` | Run command in a persistent PTY session | `command`, `shell_id` |
-| `storeMemory` | Store a key-value memory entry for the project | `memory_key`, `memory_summary`, `memory_file` |
-| `recallMemory` | Search project memory by keyword | `memory_query`, `memory_file` |
+| `storeMemory` | Store a knowledge entry with optional tags/channel | `memory_key`, `memory_summary`, `memory_file`, `memory_tags`, `memory_channel`, `memory_source` |
+| `recallMemory` | Search knowledge by keyword with optional filters | `memory_query`, `memory_file`, `memory_tags`, `memory_channel`, `memory_source`, `memory_since` |
 
 ### Status Codes
 
@@ -158,13 +169,17 @@ The model can include a `context` field alongside `commands` to manage conversat
 - **`summarize`**: Replace a range of messages with a single summary.
 - Context-only turns (empty commands) are supported for pruning without executing anything.
 
-## Memory System
+## Knowledge System
 
-Project memory persists key-value entries across sessions in `<project>/.agent/memory.json`.
+Project knowledge persists tagged entries across sessions in `<project>/.agent/memory.json`. The system supports both the legacy key-value format and the new tagged knowledge format with automatic migration.
 
-- **`storeMemory`**: Creates or updates an entry with a key and summary.
-- **`recallMemory`**: Searches entries by keyword, returns results ranked by relevance.
-- Memory is loaded and injected into the conversation at session start.
+- **`storeMemory`**: Creates or updates an entry with key, summary, tags, channel, and source. Backward-compatible with old format.
+- **`recallMemory`**: Searches entries by keyword with optional filters (tags, channel, source, since timestamp).
+- Knowledge is loaded and injected into the conversation at session start.
+- Supports pub/sub channels for inter-agent knowledge sharing:
+  - Agents publish findings to named channels (e.g., `"findings"`, `"decisions"`)
+  - The orchestrator routes knowledge between sibling agents via subscriptions
+  - Cursor-based tracking ensures agents only see new entries
 - Can be disabled in `agent.toml`:
 
 ```toml
@@ -178,10 +193,10 @@ enabled = false  # default: true
 cargo test
 ```
 
-161 tests cover both binaries:
+267 tests cover both binaries:
 
-- **Agent binary:** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage, and memory recall.
-- **Caller binary:** JSON extraction, conversation management, context directives (drop/summarize), error types, project detection, config parsing, memory loading/formatting, and provider selection.
+- **Agent binary (114 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
+- **Caller binary (153 tests):** JSON extraction, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing, memory/knowledge loading and formatting, provider selection with token usage tracking, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, and knowledge pub/sub system.
 
 ## Session Management
 
@@ -227,19 +242,39 @@ MODEL_NAME=gpt-4o        # optional, provider-specific default used if omitted
 ./target/release/caller
 ```
 
+### Execution Modes
+
+The caller operates in one of three modes, selected automatically:
+
+**Sub-Agent Mode** (when `AGENT_ROLE` env var is set):
+- Runs as a child agent with a scoped task
+- Writes periodic progress to `AGENT_PROGRESS_FILE`
+- Writes final results (summary, findings, artifacts, token usage) to `AGENT_RESULT_FILE`
+- Uses role-specific system prompts (`SysPrompt_research.md`, `SysPrompt_implementation.md`, etc.)
+
+**User Mode** (complex tasks without `AGENT_ROLE`):
+- Spawns an orchestrator sub-agent to handle the task
+- Monitors orchestrator progress, relays status to user
+- User conversation is protected from auto-pruning (message layer protection)
+- Supports relaying user input to the orchestrator
+
+**Direct Mode** (simple tasks without `AGENT_ROLE`):
+- Single-loop execution similar to the original behavior
+- Used for short, single-line tasks that don't need orchestration
+
 ### How it works
 
 1. Loads `.env` and selects the API provider (OpenAI or Anthropic)
 2. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
-3. Reads `SysPrompt.md` as the system message
-4. Loads memory from `<project>/.agent/memory.json`, injects into conversation
+3. Reads role-appropriate system prompt (e.g., `SysPrompt.md`, `SysPrompt_orchestrator.md`)
+4. Loads knowledge from `<project>/.agent/memory.json`, injects into conversation
 5. Sends the task to the chat API
 6. Extracts JSON from the model's response (handles code fences and bare JSON)
 7. Applies context directives (`drop_turns`, `summarize`) to the conversation
 8. Injects project context (`memory_file`) into relevant commands
 9. Pipes the JSON to the agent binary, reads stdout/stderr with idle timeout (3s) and hard timeout (30s)
-10. Feeds the agent output back as the next user message
-11. Repeats until the model responds with no JSON (task complete) or 50 turns are reached
+10. Feeds the agent output back as the next user message, appending a token budget summary
+11. Repeats until the model responds with no JSON (task complete) or the context budget is exhausted
 
 ## Environment
 
@@ -258,6 +293,14 @@ MODEL_NAME=gpt-4o        # optional, provider-specific default used if omitted
 | `MODEL_NAME` | `gpt-4o` / `claude-sonnet-4-5-20250929` | Model to use (default depends on provider) |
 | `AGENT_IDLE_TIMEOUT` | `3` | Seconds to wait for agent output before assuming idle |
 | `AGENT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
+| `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
+| `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call |
+| `AGENT_ROLE` | — | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |
+| `AGENT_ID` | — | Unique sub-agent identifier |
+| `AGENT_RESULT_FILE` | — | Path for sub-agent to write final results |
+| `AGENT_PROGRESS_FILE` | — | Path for sub-agent to write periodic progress |
+| `AGENT_TASK` | — | Task description for sub-agent mode |
+| `AGENT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
 
 Increase timeouts when using `askHuman` (e.g., `AGENT_HARD_TIMEOUT=600`).
 
@@ -268,4 +311,12 @@ Create `agent.toml` in the project root:
 ```toml
 [memory]
 enabled = true  # default: true
+
+[model]
+context_window = 200000       # override per-model default
+max_output_tokens = 8192      # override per-model default
+
+[orchestrator]
+max_parallel_agents = 4       # max concurrent sub-agents
+sub_agent_dir = ".agent/subagents"  # where sub-agent workspaces are created
 ```
