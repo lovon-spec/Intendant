@@ -43,6 +43,14 @@ Two binaries are produced:
 - `./target/release/agent` — the command runtime
 - `./target/release/caller` — the AI caller
 
+### Installing
+
+```bash
+cargo install --path .
+```
+
+Both binaries are installed to `~/.cargo/bin/`. The caller embeds default system prompts at compile time, so it works immediately from any directory without needing the source tree.
+
 ## Usage
 
 The agent reads a single JSON object from stdin and writes status lines to stdout.
@@ -196,10 +204,10 @@ enabled = false  # default: true
 cargo test
 ```
 
-395 tests cover both binaries:
+406 tests cover both binaries:
 
 - **Agent binary (114 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary (281 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, and control socket serialization.
+- **Caller binary (292 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, and control socket serialization.
 
 ## Session Management
 
@@ -296,7 +304,7 @@ The caller operates in one of three modes, selected automatically:
 1. Loads `.env` and selects the API provider (OpenAI or Anthropic). All OpenAI models use the Responses API (`/v1/responses`)
 2. Configures structured output (JSON mode), reasoning controls, and max output tokens based on model capabilities and env vars
 3. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
-4. Reads role-appropriate system prompt (e.g., `SysPrompt.md`, `SysPrompt_orchestrator.md`)
+4. Resolves role-appropriate system prompt via cascade: project root → `~/.config/agent/` → compiled-in default
 5. Loads knowledge from `<project>/.agent/memory.json`, injects into conversation
 6. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, and optional JSON format)
 7. Extracts JSON from the model's response (handles structured output, code fences, and bare JSON)
@@ -364,6 +372,18 @@ command_exec = "auto"         # auto-approve command execution
 network = "auto"              # auto-approve network requests
 destructive = "ask"           # ask before destructive commands (default)
 ```
+
+### System Prompts
+
+System prompts (`SysPrompt.md` and role-specific variants) are compiled into the binary at build time, so the caller works from any directory without needing the source tree. Prompts are resolved using a 3-layer cascade (highest priority first):
+
+1. **Project root** — `<git-root>/SysPrompt.md` (per-project customization)
+2. **Global config** — `~/.config/agent/SysPrompt.md` (user-wide customization)
+3. **Compiled-in default** — always available, zero-config
+
+Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`, `SysPrompt_implementation.md`) follow the same cascade and are appended to the base prompt.
+
+To customize prompts for a specific project, place your modified `.md` files in the project's git root. For user-wide customization, place them in `~/.config/agent/`.
 
 ## TUI
 

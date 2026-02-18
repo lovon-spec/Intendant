@@ -40,6 +40,7 @@ src/
         ├── sub_agent.rs     # Sub-agent spawning, result/progress I/O, role-specific configuration
         ├── worktree.rs      # Git worktree management for isolated implementation agents
         ├── user_mode.rs     # User-mode orchestrator spawning, progress monitoring, input relay
+        ├── prompts.rs       # System prompt resolution: compile-time defaults (include_str!) + 3-layer cascade
         ├── project.rs       # Project detection (git root), config parsing (agent.toml + [approval])
         ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
         ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/agent-<pid>.sock)
@@ -83,7 +84,7 @@ echo "task" | ./target/release/caller                   # Auto-detects non-TTY, 
 ## Testing
 
 ```bash
-cargo test                # Run all 395 tests (114 agent + 281 caller)
+cargo test                # Run all 406 tests (114 agent + 292 caller)
 cargo test -- --list      # List all test names
 ```
 
@@ -94,7 +95,7 @@ Test coverage includes:
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity, status output formatting
-- **caller/main.rs** (281 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit
+- **caller/main.rs** (292 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
@@ -102,6 +103,7 @@ Test coverage includes:
 - **caller/user_mode.rs**: Orchestrator spec generation, progress formatting, input relay, prompt resolution
 - **caller/project.rs**: Config parsing, project paths, sub-agent directory, approval config parsing
 - **caller/memory.rs**: Memory/knowledge loading, formatting, format migration
+- **caller/prompts.rs**: Compiled-in defaults non-empty, cascade resolution (project root, global config, compiled default), role-specific prompt appending (orchestrator, research, implementation, testing, direct), project override combinations
 - **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types, structured output, reasoning controls, role mapping
 - **caller/error.rs**: Display formatting, type conversions (including Tui variant)
 - **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
