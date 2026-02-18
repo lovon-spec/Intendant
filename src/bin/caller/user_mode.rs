@@ -60,28 +60,6 @@ pub fn get_caller_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./target/debug/caller"))
 }
 
-pub fn resolve_system_prompt(role: &SubAgentRole) -> Result<String, CallerError> {
-    // Always load the base prompt (contains JSON protocol)
-    let base_prompt = std::fs::read_to_string("SysPrompt.md")
-        .map_err(|e| CallerError::Config(format!("Failed to read SysPrompt.md: {}", e)))?;
-
-    let role_file = match role {
-        SubAgentRole::Orchestrator => Some("SysPrompt_orchestrator.md"),
-        SubAgentRole::Research => Some("SysPrompt_research.md"),
-        SubAgentRole::Implementation => Some("SysPrompt_implementation.md"),
-        _ => None,
-    };
-
-    // Append role-specific instructions if available
-    match role_file {
-        Some(file) => match std::fs::read_to_string(file) {
-            Ok(role_prompt) => Ok(format!("{}\n\n{}", base_prompt, role_prompt)),
-            Err(_) => Ok(base_prompt),
-        },
-        None => Ok(base_prompt),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,16 +153,6 @@ mod tests {
 
         let content = std::fs::read_to_string(dir.path().join(".agent/user_input.txt")).unwrap();
         assert_eq!(content, "Use PostgreSQL");
-    }
-
-    #[test]
-    fn resolve_system_prompt_fallback() {
-        // When role-specific prompt doesn't exist, falls back to SysPrompt.md
-        // In test context, neither might exist, so we just verify it returns an error
-        // rather than panicking
-        let result = resolve_system_prompt(&SubAgentRole::Testing);
-        // Either succeeds (if SysPrompt.md exists in cwd) or returns CallerError
-        assert!(result.is_ok() || result.is_err());
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod error;
 mod knowledge;
 mod memory;
 mod project;
+mod prompts;
 mod provider;
 mod sub_agent;
 mod tui;
@@ -859,8 +860,8 @@ async fn run_sub_agent_mode(
     id: String,
     role: sub_agent::SubAgentRole,
 ) -> Result<(), CallerError> {
-    let system_prompt = user_mode::resolve_system_prompt(&role)?;
     let project = Project::detect()?;
+    let system_prompt = prompts::resolve_system_prompt(&role, Some(&project.root))?;
     let task = get_task()?;
 
     if task.is_empty() {
@@ -935,7 +936,7 @@ async fn run_user_mode(
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
 ) -> Result<(), CallerError> {
-    let system_prompt = user_mode::resolve_system_prompt(&sub_agent::SubAgentRole::Custom("user".to_string()))?;
+    let system_prompt = prompts::resolve_system_prompt(&sub_agent::SubAgentRole::Custom("user".to_string()), Some(&project.root))?;
 
     if bus.is_none() {
         println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
@@ -976,8 +977,7 @@ async fn run_direct_mode(
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
 ) -> Result<(), CallerError> {
-    let system_prompt = std::fs::read_to_string("SysPrompt.md")
-        .map_err(|e| CallerError::Config(format!("Failed to read SysPrompt.md: {}", e)))?;
+    let system_prompt = prompts::resolve_system_prompt(&sub_agent::SubAgentRole::Custom("direct".to_string()), Some(&project.root))?;
 
     if bus.is_none() {
         println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
