@@ -1035,7 +1035,13 @@ fn is_simple_task(task: &str) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), CallerError> {
+    // Load .env: cwd (+ parents) first, then project root, then ~/.config/agent/
     dotenvy::dotenv().ok();
+    let project = Project::detect()?;
+    dotenvy::from_path(project.root.join(".env")).ok();
+    if let Some(config_dir) = dirs::config_dir() {
+        dotenvy::from_path(config_dir.join("agent").join(".env")).ok();
+    }
 
     // Override env vars from CLI flags before provider selection
     let flags = parse_cli_flags();
@@ -1052,8 +1058,6 @@ async fn main() -> Result<(), CallerError> {
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
         return run_sub_agent_mode(provider, id, role).await;
     }
-
-    let project = Project::detect()?;
     let task = get_task_from_flags_or_env(&flags)?;
 
     if task.is_empty() {

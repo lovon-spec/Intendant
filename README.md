@@ -228,7 +228,13 @@ The caller binary detects the project, loads memory, sends the task to an AI mod
 
 ### Setup
 
-Create a `.env` file (or export the variables):
+Create a `.env` file or export the variables. The caller searches for `.env` in this order:
+
+1. **Current directory** (and parent directories)
+2. **Project root** (git root)
+3. **Global config** (`~/.config/agent/.env`)
+
+For global use after `cargo install`, put your keys in `~/.config/agent/.env`:
 
 ```bash
 # OpenAI
