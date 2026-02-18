@@ -264,7 +264,7 @@ The caller operates in one of three modes, selected automatically:
 
 ### How it works
 
-1. Loads `.env` and selects the API provider (OpenAI or Anthropic). OpenAI gpt-5+/o3/o4 models use the Responses API (`/v1/responses`); legacy models use Chat Completions
+1. Loads `.env` and selects the API provider (OpenAI or Anthropic). All OpenAI models use the Responses API (`/v1/responses`)
 2. Configures structured output (JSON mode), reasoning controls, and max output tokens based on model capabilities and env vars
 3. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
 4. Reads role-appropriate system prompt (e.g., `SysPrompt.md`, `SysPrompt_orchestrator.md`)
@@ -297,7 +297,7 @@ The caller operates in one of three modes, selected automatically:
 | `AGENT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
 | `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call (sent to API) |
-| `STRUCTURED_OUTPUT` | `true` for gpt-5+/gpt-4o/o3/o4 | Enable JSON object mode for deterministic parsing |
+| `STRUCTURED_OUTPUT` | `true` for gpt-5+/o3/o4 | Enable JSON object mode for deterministic parsing |
 | `REASONING_EFFORT` | — | Reasoning effort for GPT-5/o3/o4 models (`low`, `medium`, `high`) |
 | `REASONING_SUMMARY` | — | Reasoning summary mode (`auto`, `concise`, `detailed`) |
 | `AGENT_ROLE` | — | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |

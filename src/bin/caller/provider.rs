@@ -23,52 +23,11 @@ pub trait ChatProvider: Send + Sync {
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError>;
     fn name(&self) -> &str;
     fn context_window(&self) -> u64;
+    #[allow(dead_code)]
     fn max_output_tokens(&self) -> u64;
 }
 
-// --- OpenAI ---
-
-// Chat Completions API types (gpt-4o and older)
-
-#[derive(Serialize)]
-struct OpenAIChatRequest {
-    model: String,
-    messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<ResponseFormat>,
-}
-
-#[derive(Serialize)]
-struct ResponseFormat {
-    r#type: String,
-}
-
-#[derive(Deserialize)]
-struct OpenAIChatResponse {
-    choices: Vec<OpenAIChoice>,
-    usage: Option<OpenAIUsage>,
-}
-
-#[derive(Deserialize)]
-struct OpenAIChoice {
-    message: OpenAIResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct OpenAIResponseMessage {
-    content: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OpenAIUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-}
-
-// Responses API types (gpt-5+ models)
+// --- OpenAI (Responses API) ---
 
 #[derive(Serialize)]
 struct OpenAIResponsesRequest {
@@ -131,10 +90,6 @@ struct ResponsesUsage {
     total_tokens: u64,
 }
 
-fn uses_responses_api(model: &str) -> bool {
-    model.starts_with("gpt-5") || model.starts_with("o3") || model.starts_with("o4")
-}
-
 pub struct OpenAIProvider {
     client: Client,
     api_key: String,
@@ -160,57 +115,11 @@ impl OpenAIProvider {
             reasoning,
         }
     }
+}
 
-    async fn chat_completions(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        let response_format = if self.structured_output {
-            Some(ResponseFormat {
-                r#type: "json_object".to_string(),
-            })
-        } else {
-            None
-        };
-
-        let request = OpenAIChatRequest {
-            model: self.model.clone(),
-            messages: messages.to_vec(),
-            max_tokens: Some(self.max_output_tokens),
-            response_format,
-        };
-
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(CallerError::Provider(format!("{}: {}", status, body)));
-        }
-
-        let chat_response: OpenAIChatResponse = response.json().await?;
-        let content = chat_response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-            .ok_or_else(|| CallerError::Provider("No response content".to_string()))?;
-
-        let usage = chat_response
-            .usage
-            .map(|u| TokenUsage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-            })
-            .unwrap_or_default();
-
-        Ok(ChatResponse { content, usage })
-    }
-
-    async fn responses_api(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
+#[async_trait]
+impl ChatProvider for OpenAIProvider {
+    async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
         // Extract system instructions
         let instructions = messages
             .iter()
@@ -218,7 +127,7 @@ impl OpenAIProvider {
             .map(|m| m.content.clone());
 
         // Pass through all non-system roles (user, assistant, developer, tool)
-        let input: Vec<ResponsesInputMessage> = messages
+        let mut input: Vec<ResponsesInputMessage> = messages
             .iter()
             .filter(|m| m.role != "system")
             .map(|m| ResponsesInputMessage {
@@ -226,6 +135,15 @@ impl OpenAIProvider {
                 content: m.content.clone(),
             })
             .collect();
+
+        // When structured output is enabled, OpenAI requires the word "json" in the
+        // input messages (instructions alone don't count). Inject a developer message.
+        if self.structured_output {
+            input.insert(0, ResponsesInputMessage {
+                role: "developer".to_string(),
+                content: "Always respond with valid JSON matching the command schema.".to_string(),
+            });
+        }
 
         let text = if self.structured_output {
             Some(TextConfig {
@@ -286,17 +204,6 @@ impl OpenAIProvider {
             .unwrap_or_default();
 
         Ok(ChatResponse { content, usage })
-    }
-}
-
-#[async_trait]
-impl ChatProvider for OpenAIProvider {
-    async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        if uses_responses_api(&self.model) {
-            self.responses_api(messages).await
-        } else {
-            self.chat_completions(messages).await
-        }
     }
 
     fn name(&self) -> &str {
@@ -444,26 +351,18 @@ impl ChatProvider for AnthropicProvider {
 fn default_context_window(model: &str) -> u64 {
     match model {
         m if m.starts_with("gpt-5") => 400_000,
-        m if m.starts_with("gpt-4o") => 128_000,
-        m if m.starts_with("gpt-4-turbo") => 128_000,
-        m if m.starts_with("gpt-4") => 8_192,
-        m if m.starts_with("gpt-3.5") => 16_385,
         m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 200_000,
         m if m.contains("claude") => 200_000,
-        _ => 128_000,
+        _ => 200_000,
     }
 }
 
 fn default_max_output_tokens(model: &str) -> u64 {
     match model {
         m if m.starts_with("gpt-5") => 128_000,
-        m if m.starts_with("gpt-4o") => 16_384,
-        m if m.starts_with("gpt-4-turbo") => 4_096,
-        m if m.starts_with("gpt-4") => 8_192,
-        m if m.starts_with("gpt-3.5") => 4_096,
         m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 100_000,
         m if m.contains("claude") => 8_192,
-        _ => 8_192,
+        _ => 16_384,
     }
 }
 
@@ -483,7 +382,6 @@ fn resolve_max_output_tokens(model: &str) -> u64 {
 
 fn supports_structured_output(model: &str) -> bool {
     model.starts_with("gpt-5")
-        || model.starts_with("gpt-4o")
         || model.starts_with("o3")
         || model.starts_with("o4")
 }
@@ -657,29 +555,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_usage_deserialization() {
-        let json = r#"{
-            "choices": [{"message": {"content": "Hello"}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-        }"#;
-        let resp: OpenAIChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello"));
-        let usage = resp.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 5);
-        assert_eq!(usage.total_tokens, 15);
-    }
-
-    #[test]
-    fn openai_usage_missing() {
-        let json = r#"{
-            "choices": [{"message": {"content": "Hello"}}]
-        }"#;
-        let resp: OpenAIChatResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.usage.is_none());
-    }
-
-    #[test]
     fn anthropic_usage_deserialization() {
         let json = r#"{
             "content": [{"text": "Hi", "type": "text"}],
@@ -705,9 +580,6 @@ mod tests {
     fn default_context_window_known_models() {
         assert_eq!(default_context_window("gpt-5.2-codex"), 400_000);
         assert_eq!(default_context_window("gpt-5"), 400_000);
-        assert_eq!(default_context_window("gpt-4o"), 128_000);
-        assert_eq!(default_context_window("gpt-4o-mini"), 128_000);
-        assert_eq!(default_context_window("gpt-4-turbo-preview"), 128_000);
         assert_eq!(default_context_window("claude-sonnet-4-5-20250929"), 200_000);
         assert_eq!(default_context_window("o1-preview"), 200_000);
         assert_eq!(default_context_window("o3-mini"), 200_000);
@@ -715,14 +587,13 @@ mod tests {
 
     #[test]
     fn default_context_window_unknown_model() {
-        assert_eq!(default_context_window("some-unknown-model"), 128_000);
+        assert_eq!(default_context_window("some-unknown-model"), 200_000);
     }
 
     #[test]
     fn default_max_output_known_models() {
         assert_eq!(default_max_output_tokens("gpt-5.2-codex"), 128_000);
         assert_eq!(default_max_output_tokens("gpt-5"), 128_000);
-        assert_eq!(default_max_output_tokens("gpt-4o"), 16_384);
         assert_eq!(default_max_output_tokens("claude-sonnet-4-5-20250929"), 8_192);
         assert_eq!(default_max_output_tokens("o1-preview"), 100_000);
     }
@@ -736,25 +607,6 @@ mod tests {
         let provider = AnthropicProvider::new("key".to_string(), "claude-sonnet-4-5-20250929".to_string(), 200_000, 8_192);
         assert_eq!(provider.context_window(), 200_000);
         assert_eq!(provider.max_output_tokens(), 8_192);
-    }
-
-    #[test]
-    fn uses_responses_api_gpt5_models() {
-        assert!(uses_responses_api("gpt-5.2-codex"));
-        assert!(uses_responses_api("gpt-5"));
-        assert!(uses_responses_api("gpt-5.1-codex"));
-        assert!(uses_responses_api("gpt-5-mini"));
-        assert!(uses_responses_api("o3"));
-        assert!(uses_responses_api("o3-mini"));
-        assert!(uses_responses_api("o4-mini"));
-    }
-
-    #[test]
-    fn uses_chat_completions_legacy_models() {
-        assert!(!uses_responses_api("gpt-4o"));
-        assert!(!uses_responses_api("gpt-4o-mini"));
-        assert!(!uses_responses_api("gpt-4-turbo"));
-        assert!(!uses_responses_api("gpt-3.5-turbo"));
     }
 
     #[test]
@@ -917,46 +769,13 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_request_serialization() {
-        let request = OpenAIChatRequest {
-            model: "gpt-4o".to_string(),
-            messages: vec![
-                Message { role: "user".to_string(), content: "Hello".to_string(), ..Default::default() },
-            ],
-            max_tokens: Some(16_384),
-            response_format: Some(ResponseFormat { r#type: "json_object".to_string() }),
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"max_tokens\":16384"));
-        assert!(json.contains("\"json_object\""));
-    }
-
-    #[test]
-    fn chat_completions_request_omits_optional_fields() {
-        let request = OpenAIChatRequest {
-            model: "gpt-3.5-turbo".to_string(),
-            messages: vec![
-                Message { role: "user".to_string(), content: "Hi".to_string(), ..Default::default() },
-            ],
-            max_tokens: None,
-            response_format: None,
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(!json.contains("max_tokens"));
-        assert!(!json.contains("response_format"));
-    }
-
-    #[test]
     fn supports_structured_output_models() {
         assert!(supports_structured_output("gpt-5.2-codex"));
         assert!(supports_structured_output("gpt-5"));
-        assert!(supports_structured_output("gpt-4o"));
-        assert!(supports_structured_output("gpt-4o-mini"));
         assert!(supports_structured_output("o3-mini"));
         assert!(supports_structured_output("o4-mini"));
-        assert!(!supports_structured_output("gpt-4-turbo"));
-        assert!(!supports_structured_output("gpt-3.5-turbo"));
         assert!(!supports_structured_output("claude-sonnet-4-5-20250929"));
+        assert!(!supports_structured_output("some-unknown-model"));
     }
 
     #[test]
@@ -965,8 +784,6 @@ mod tests {
         assert!(supports_reasoning("gpt-5"));
         assert!(supports_reasoning("o3-mini"));
         assert!(supports_reasoning("o4-mini"));
-        assert!(!supports_reasoning("gpt-4o"));
-        assert!(!supports_reasoning("gpt-4-turbo"));
         assert!(!supports_reasoning("claude-sonnet-4-5-20250929"));
     }
 
@@ -1015,11 +832,5 @@ mod tests {
         assert_eq!(provider.max_output_tokens(), 128_000);
         // gpt-5 supports structured output by default
         assert!(provider.structured_output);
-    }
-
-    #[test]
-    fn openai_provider_legacy_model_no_structured_output() {
-        let provider = OpenAIProvider::new("key".to_string(), "gpt-3.5-turbo".to_string(), 16_385, 4_096);
-        assert!(!provider.structured_output);
     }
 }
