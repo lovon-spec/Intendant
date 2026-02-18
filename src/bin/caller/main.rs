@@ -480,6 +480,8 @@ async fn run_agent_loop(
 fn get_task() -> Result<String, CallerError> {
     if env::args().len() > 1 {
         Ok(env::args().skip(1).collect::<Vec<_>>().join(" "))
+    } else if let Ok(task) = env::var("AGENT_TASK") {
+        Ok(task)
     } else {
         print!("Enter task: ");
         io::stdout().flush()?;

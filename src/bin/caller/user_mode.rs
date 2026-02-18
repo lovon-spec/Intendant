@@ -61,18 +61,25 @@ pub fn get_caller_path() -> PathBuf {
 }
 
 pub fn resolve_system_prompt(role: &SubAgentRole) -> Result<String, CallerError> {
-    let prompt_file = match role {
-        SubAgentRole::Orchestrator => "SysPrompt_orchestrator.md",
-        SubAgentRole::Research => "SysPrompt_research.md",
-        SubAgentRole::Implementation => "SysPrompt_implementation.md",
-        _ => "SysPrompt.md",
+    // Always load the base prompt (contains JSON protocol)
+    let base_prompt = std::fs::read_to_string("SysPrompt.md")
+        .map_err(|e| CallerError::Config(format!("Failed to read SysPrompt.md: {}", e)))?;
+
+    let role_file = match role {
+        SubAgentRole::Orchestrator => Some("SysPrompt_orchestrator.md"),
+        SubAgentRole::Research => Some("SysPrompt_research.md"),
+        SubAgentRole::Implementation => Some("SysPrompt_implementation.md"),
+        _ => None,
     };
 
-    // Try role-specific prompt first, fall back to default
-    std::fs::read_to_string(prompt_file).or_else(|_| {
-        std::fs::read_to_string("SysPrompt.md")
-            .map_err(|e| CallerError::Config(format!("Failed to read system prompt: {}", e)))
-    })
+    // Append role-specific instructions if available
+    match role_file {
+        Some(file) => match std::fs::read_to_string(file) {
+            Ok(role_prompt) => Ok(format!("{}\n\n{}", base_prompt, role_prompt)),
+            Err(_) => Ok(base_prompt),
+        },
+        None => Ok(base_prompt),
+    }
 }
 
 #[cfg(test)]

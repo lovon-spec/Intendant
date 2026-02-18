@@ -99,12 +99,12 @@ impl Agent {
     }
 
     pub fn new() -> Result<Self, AgentError> {
-        // Create shared memory file
+        // Open/create shared memory file — truncate(false) preserves existing content across restarts
+        #[allow(clippy::suspicious_open_options)]
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
             .mode(0o600)
             .open(SHARED_MEM_PATH)?;
         file.set_len(SHARED_MEM_SIZE as u64)?;
@@ -930,10 +930,16 @@ impl Agent {
         let channel = cmd.memory_channel.as_deref().unwrap_or("default").to_string();
         let source = cmd.memory_source.as_deref().unwrap_or("agent").to_string();
 
-        // Try to read as new KnowledgeStore format first, fall back to old format
+        // Determine if we should use new format: if tags/channel/source are provided, use new format
+        let has_knowledge_fields = cmd.memory_tags.is_some() || cmd.memory_channel.is_some() || cmd.memory_source.is_some();
+
+        // Try to read existing file, auto-detect format
         let mut data: serde_json::Value = if path.exists() {
             let content = fs::read_to_string(&path)?;
             serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({"entries": {}}))
+        } else if has_knowledge_fields {
+            // New file with knowledge fields — use new format
+            serde_json::json!({"entries": [], "subscriptions": {}, "cursors": {}})
         } else {
             serde_json::json!({"entries": {}})
         };
@@ -1086,7 +1092,8 @@ impl Agent {
                         .filter(|kw| key_lower.contains(*kw) || summary_lower.contains(*kw))
                         .count();
 
-                    if score > 0 {
+                    // Include entry if: keywords match, OR no keywords were given (filter-only query)
+                    if score > 0 || keywords.is_empty() {
                         results.push(serde_json::json!({
                             "key": key,
                             "summary": summary,
