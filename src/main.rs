@@ -4,12 +4,16 @@ use crate::models::AgentInput;
 use crate::status_monitor::StatusMonitor;
 use std::io::{self, Write, Read};
 
-
 mod agent;
 mod error;
 mod models;
 mod status_monitor;
 mod utils;
+
+/// Write a line to stdout, returning false on broken pipe (caller killed us).
+fn write_line(stdout: &mut io::StdoutLock, line: &str) -> bool {
+    writeln!(stdout, "{}", line).is_ok() && stdout.flush().is_ok()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), AgentError> {
@@ -18,13 +22,13 @@ async fn main() -> Result<(), AgentError> {
 
     // Create agent instance
     let agent = Agent::new()?;
-    
+
     // Create and start status monitor
     let (monitor, mut status_rx) = StatusMonitor::new(
         agent.shared_mem.clone(),
         agent.process_map.clone()
     );
-    
+
     // Spawn status monitor task
     tokio::spawn(async move {
         monitor.run().await;
@@ -46,17 +50,21 @@ async fn main() -> Result<(), AgentError> {
 
     // Process commands and get initial results
     let results = agent.process_input(input).await?;
-    
-    // Print initial results
+
+    // Print initial results; exit gracefully on broken pipe (caller killed us)
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
     for result in results {
-        println!("{}", result);
+        if !write_line(&mut stdout, &result) {
+            return Ok(());
+        }
     }
-    io::stdout().flush()?;
 
     // Continue monitoring for status updates
     while let Some(status) = status_rx.recv().await {
-        println!("{}", status);
-        io::stdout().flush()?;
+        if !write_line(&mut stdout, &status) {
+            return Ok(());
+        }
     }
 
     Ok(())

@@ -6,7 +6,7 @@ This is **Agent**, a Rust runtime for autonomous AI agents with process lifecycl
 
 The project produces two binaries:
 - **agent** — Command runtime that reads JSON from stdin, spawns bash commands, and writes status lines to stdout
-- **caller** — AI integration layer that drives the agent via the OpenAI or Anthropic chat completions API in a loop
+- **caller** — AI integration layer that drives the agent via the OpenAI Responses API or Anthropic Messages API in a loop
 
 ## Repository Structure
 
@@ -32,7 +32,7 @@ src/
 └── bin/
     └── caller/
         ├── main.rs          # Caller entry point: 3 modes (user/sub-agent/direct), budget-aware loop
-        ├── provider.rs      # Multi-provider API client (Chat Completions + Responses API), structured output, reasoning controls
+        ├── provider.rs      # Multi-provider API client (OpenAI Responses API + Anthropic), structured output, reasoning controls
         ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
         ├── agent_runner.rs  # Spawns agent subprocess, manages I/O with timeouts
         ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
@@ -89,7 +89,7 @@ Test coverage includes:
 - **caller/user_mode.rs**: Orchestrator spec generation, progress formatting, input relay, prompt resolution
 - **caller/project.rs**: Config parsing, project paths, sub-agent directory
 - **caller/memory.rs**: Memory/knowledge loading, formatting, format migration
-- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types and routing, structured output, reasoning controls, role mapping
+- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types, structured output, reasoning controls, role mapping
 - **caller/error.rs**: Display formatting, type conversions
 
 ## Architecture Details
@@ -137,9 +137,9 @@ The caller operates in three modes based on environment:
 
 ### OpenAI API Features
 
-- **Structured output**: JSON object mode (`response_format`/`text.format`) is enabled by default for capable models (gpt-5+, gpt-4o, o3, o4). Controlled via `STRUCTURED_OUTPUT` env var. Eliminates brittle free-text JSON extraction.
+- **Structured output**: JSON object mode (`text.format`) is enabled by default for capable models (gpt-5+, o3, o4). Controlled via `STRUCTURED_OUTPUT` env var. Eliminates brittle free-text JSON extraction.
 - **Reasoning controls**: For reasoning models (gpt-5+, o3, o4), `REASONING_EFFORT` ("low"/"medium"/"high") and `REASONING_SUMMARY` ("auto"/"concise"/"detailed") tune quality/cost tradeoffs.
-- **Max output tokens**: Sent on all OpenAI requests (`max_tokens` for Chat Completions, `max_output_tokens` for Responses API).
+- **Max output tokens**: Sent as `max_output_tokens` on all OpenAI Responses API requests.
 - **Role mapping**: Responses API passes through all non-system roles (user, assistant, developer, tool) instead of filtering to user/assistant only.
 - **Done signal**: With structured output enabled, models signal task completion via `{"commands": [], "done": true}` instead of prose responses.
 
