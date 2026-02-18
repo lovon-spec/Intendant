@@ -162,7 +162,7 @@ impl App {
     /// Get the height available for the bottom panel (0 if none active).
     pub fn bottom_panel_height(&self) -> u16 {
         match self.mode {
-            AppMode::Approval => 4,
+            AppMode::Approval => 6,
             AppMode::AskHuman => 5,
             _ => 0,
         }
@@ -695,7 +695,7 @@ mod tests {
     fn bottom_panel_height_approval() {
         let mut app = test_app();
         app.mode = AppMode::Approval;
-        assert_eq!(app.bottom_panel_height(), 4);
+        assert_eq!(app.bottom_panel_height(), 6);
     }
 
     #[test]

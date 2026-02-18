@@ -8,6 +8,7 @@ mod memory;
 mod project;
 mod prompts;
 mod provider;
+mod session_log;
 mod sub_agent;
 mod tui;
 mod user_mode;
@@ -19,7 +20,17 @@ use error::CallerError;
 use project::Project;
 use std::env;
 use std::io::{self, BufRead, Write, IsTerminal};
+use std::sync::{Arc, Mutex};
 use tui::event::{AppEvent, EventBus};
+
+type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
+
+/// Helper to write to the session log without propagating errors.
+fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
+    if let Ok(mut l) = log.lock() {
+        f(&mut l);
+    }
+}
 
 const SAFETY_CAP: usize = 500;
 const MIN_BUDGET_TOKENS: u64 = 4096;
@@ -35,6 +46,43 @@ struct CliFlags {
     autonomy: AutonomyLevel,
     log_file: Option<String>,
     control_socket: bool,
+}
+
+fn print_help() {
+    println!("intendant - AI agent runtime with process lifecycle management");
+    println!();
+    println!("USAGE:");
+    println!("    intendant [OPTIONS] [TASK]");
+    println!("    echo \"task\" | intendant [OPTIONS]");
+    println!();
+    println!("OPTIONS:");
+    println!("    --provider <NAME>     API provider (openai or anthropic)");
+    println!("    --model <NAME>        Model name to use");
+    println!("    --autonomy <LEVEL>    Autonomy level: low, medium, high, full");
+    println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<ts>/)");
+    println!("    --no-tui              Disable TUI, run headless");
+    println!("    --verbose, -v         Enable verbose output");
+    println!("    --control-socket      Enable Unix control socket");
+    println!("    --help, -h            Show this help message");
+    println!();
+    println!("SESSION LOGS:");
+    println!("    Logs are always written to ~/.intendant/logs/<timestamp>/ (override with --log-file).");
+    println!("    The log directory contains:");
+    println!("      session.jsonl           Structured JSONL event log (one JSON object per line)");
+    println!("      turns/turn_NNN_*.txt    Full model responses, agent I/O per turn");
+    println!("      summary.json            Post-session summary");
+    println!();
+    println!("    AI agents can grep session.jsonl by event type, turn number, or level,");
+    println!("    then read specific turn files for full content.");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("    OPENAI_API_KEY        OpenAI API key (for openai provider)");
+    println!("    ANTHROPIC_API_KEY     Anthropic API key (for anthropic provider)");
+    println!("    PROVIDER              Default provider (openai or anthropic)");
+    println!("    MODEL_NAME            Default model name");
+    println!("    STRUCTURED_OUTPUT     Enable JSON structured output (true/false)");
+    println!("    REASONING_EFFORT      Reasoning effort: low, medium, high");
+    println!("    REASONING_SUMMARY     Reasoning summary: auto, concise, detailed");
 }
 
 fn parse_cli_flags() -> CliFlags {
@@ -54,6 +102,10 @@ fn parse_cli_flags() -> CliFlags {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
             "--provider" => {
                 if i + 1 < args.len() {
                     flags.provider = Some(args[i + 1].clone());
@@ -235,6 +287,66 @@ fn inject_project_context(
     }
 
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
+}
+
+/// Format a human-readable command preview from raw JSON (for approval display).
+fn format_command_preview(json_str: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+        if let Some(commands) = parsed.get("commands").and_then(|c| c.as_array()) {
+            let summaries: Vec<String> = commands
+                .iter()
+                .map(|cmd| {
+                    let func = cmd
+                        .get("function")
+                        .and_then(|f| f.as_str())
+                        .unwrap_or("?");
+                    match func {
+                        "execAsAgent" => {
+                            let command = cmd
+                                .get("command")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("?");
+                            format!("exec: {}", command)
+                        }
+                        "writeFile" | "editFile" => {
+                            let path = cmd
+                                .get("file_path")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("?");
+                            format!("{}: {}", func, path)
+                        }
+                        "inspectPath" => {
+                            let path = cmd
+                                .get("path")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("?");
+                            format!("inspect: {}", path)
+                        }
+                        "fetchStatus" => {
+                            let nonce = cmd
+                                .get("nonce")
+                                .and_then(|n| n.as_u64())
+                                .unwrap_or(0);
+                            format!("fetchStatus(nonce={})", nonce)
+                        }
+                        "browse" => {
+                            let url = cmd
+                                .get("url")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("?");
+                            format!("browse: {}", url)
+                        }
+                        _ => func.to_string(),
+                    }
+                })
+                .collect();
+            if !summaries.is_empty() {
+                return summaries.join(" | ");
+            }
+        }
+    }
+    // Fallback: first 200 chars of raw JSON
+    json_str.chars().take(200).collect()
 }
 
 /// Macro-like helper for conditional output: TUI event bus or println.
@@ -532,6 +644,50 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn format_command_preview_exec() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls -la /tmp"}]}"#;
+        let preview = format_command_preview(json);
+        assert!(preview.contains("exec: ls -la /tmp"));
+    }
+
+    #[test]
+    fn format_command_preview_write_file() {
+        let json = r#"{"commands":[{"function":"writeFile","nonce":1,"file_path":"/home/user/test.rs","content":"fn main(){}"}]}"#;
+        let preview = format_command_preview(json);
+        assert!(preview.contains("writeFile: /home/user/test.rs"));
+    }
+
+    #[test]
+    fn format_command_preview_multiple() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"cargo build"},{"function":"fetchStatus","nonce":2}]}"#;
+        let preview = format_command_preview(json);
+        assert!(preview.contains("exec: cargo build"));
+        assert!(preview.contains("fetchStatus(nonce=2)"));
+        assert!(preview.contains(" | "));
+    }
+
+    #[test]
+    fn format_command_preview_inspect() {
+        let json = r#"{"commands":[{"function":"inspectPath","nonce":1,"path":"/tmp/dir"}]}"#;
+        let preview = format_command_preview(json);
+        assert!(preview.contains("inspect: /tmp/dir"));
+    }
+
+    #[test]
+    fn format_command_preview_browse() {
+        let json = r#"{"commands":[{"function":"browse","nonce":1,"url":"https://example.com"}]}"#;
+        let preview = format_command_preview(json);
+        assert!(preview.contains("browse: https://example.com"));
+    }
+
+    #[test]
+    fn format_command_preview_invalid_json() {
+        let json = "not json at all";
+        let preview = format_command_preview(json);
+        assert_eq!(preview, "not json at all");
+    }
+
+    #[test]
     fn emit_with_bus() {
         let (bus, mut rx) = EventBus::new();
         let bus_opt = Some(bus);
@@ -563,6 +719,7 @@ async fn run_agent_loop(
     sub_agent_mode: Option<&(String, sub_agent::SubAgentRole)>,
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
+    session_log: SharedSessionLog,
 ) -> Result<(), CallerError> {
     let mut budget_warning_shown = false;
 
@@ -570,6 +727,7 @@ async fn run_agent_loop(
         // Check budget before sending
         if conversation.remaining_budget() <= MIN_BUDGET_TOKENS {
             let remaining = conversation.remaining_budget();
+            slog(&session_log, |l| l.warn(&format!("Budget exhausted ({} tokens remaining)", remaining)));
             emit(
                 &bus,
                 || AppEvent::BudgetExhausted { remaining },
@@ -582,6 +740,8 @@ async fn run_agent_loop(
         let budget_pct = conversation.usage_fraction() * 100.0;
         let remaining = conversation.remaining_budget();
 
+        slog(&session_log, |l| l.turn_start(turn, budget_pct, remaining));
+
         emit(
             &bus,
             || AppEvent::TurnStarted { turn, budget_pct, remaining },
@@ -591,6 +751,7 @@ async fn run_agent_loop(
         let response = match provider.chat(conversation.messages()).await {
             Ok(r) => r,
             Err(e) => {
+                slog(&session_log, |l| l.error(&format!("API error: {}", e)));
                 emit(
                     &bus,
                     || AppEvent::LoopError(e.to_string()),
@@ -602,10 +763,21 @@ async fn run_agent_loop(
         conversation.set_usage(response.usage.clone());
         conversation.add_assistant(response.content.clone());
 
+        // Log the full model response (no truncation)
+        slog(&session_log, |l| l.model_response(
+            &response.content,
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+            response.usage.total_tokens,
+        ));
+
         // Check budget warning
         if !budget_warning_shown && conversation.usage_fraction() >= BUDGET_WARNING_THRESHOLD {
             let pct = conversation.usage_fraction() * 100.0;
             let remaining = conversation.remaining_budget();
+            slog(&session_log, |l| l.warn(&format!(
+                "Budget warning: {:.0}% used, {} remaining", pct, remaining
+            )));
             emit(
                 &bus,
                 || AppEvent::BudgetWarning { pct, remaining },
@@ -650,6 +822,7 @@ async fn run_agent_loop(
         let json_str = match extract_json(&response.content) {
             Some(json) => json.to_string(),
             None => {
+                slog(&session_log, |l| l.info("No JSON found in response — task complete"));
                 emit(
                     &bus,
                     || AppEvent::TaskComplete { reason: "Task complete".to_string() },
@@ -658,6 +831,8 @@ async fn run_agent_loop(
                 break;
             }
         };
+
+        slog(&session_log, |l| l.json_extracted(&json_str));
 
         emit(
             &bus,
@@ -671,6 +846,10 @@ async fn run_agent_loop(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
             if parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
                 let message = parsed.get("message").and_then(|m| m.as_str()).map(String::from);
+                slog(&session_log, |l| l.info(&format!(
+                    "Done signal received: {}",
+                    message.as_deref().unwrap_or("(no message)")
+                )));
                 emit(
                     &bus,
                     || AppEvent::DoneSignal { message: message.clone() },
@@ -688,10 +867,15 @@ async fn run_agent_loop(
         // Apply context directives (drop_turns, summarize) before sending to agent
         let (json_str, had_context) = apply_context_directives(&json_str, conversation);
 
+        if had_context {
+            slog(&session_log, |l| l.debug("Context directives applied"));
+        }
+
         // No commands to execute
         if json_str.is_empty() {
             if had_context {
                 // Context directives were applied, but no commands — context management turn
+                slog(&session_log, |l| l.debug(&format!("Turn {}: context management only", turn)));
                 emit(
                     &bus,
                     || AppEvent::ContextManagement { turn },
@@ -701,6 +885,7 @@ async fn run_agent_loop(
                 continue;
             } else {
                 // No commands and no context directives — task complete
+                slog(&session_log, |l| l.info("No commands and no context directives — task complete"));
                 emit(
                     &bus,
                     || AppEvent::TaskComplete { reason: "Task complete".to_string() },
@@ -734,25 +919,32 @@ async fn run_agent_loop(
 
         let mut should_skip = false;
         if let Some(cat) = needs_approval {
+            let preview = format_command_preview(&json_str);
+            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "waiting"));
+
             if let Some(ref bus_ref) = bus {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let preview = json_str.chars().take(200).collect::<String>();
                 bus_ref.send(AppEvent::ApprovalRequired {
                     id: turn as u64,
-                    command_preview: preview,
+                    command_preview: preview.clone(),
                     category: cat,
                     responder: tx,
                 });
                 match rx.await {
-                    Ok(tui::event::ApprovalResponse::Approve) => {}
+                    Ok(tui::event::ApprovalResponse::Approve) => {
+                        slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "approved"));
+                    }
                     Ok(tui::event::ApprovalResponse::ApproveAll) => {
+                        slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "approve-all"));
                         let mut state = autonomy.write().await;
                         state.level = AutonomyLevel::Full;
                     }
                     Ok(tui::event::ApprovalResponse::Skip) => {
+                        slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "skipped"));
                         should_skip = true;
                     }
                     Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
+                        slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "denied"));
                         emit(
                             &bus,
                             || AppEvent::TaskComplete { reason: "Denied by user".to_string() },
@@ -770,6 +962,9 @@ async fn run_agent_loop(
             continue;
         }
 
+        // Log the full JSON being sent to the agent
+        slog(&session_log, |l| l.agent_input(&json_str));
+
         emit(
             &bus,
             || AppEvent::AgentStarted { turn },
@@ -777,6 +972,9 @@ async fn run_agent_loop(
         );
 
         let output = agent_runner::run_agent(&json_str).await?;
+
+        // Log full agent output (no truncation)
+        slog(&session_log, |l| l.agent_output(&output.stdout, &output.stderr));
 
         emit(
             &bus,
@@ -798,6 +996,7 @@ async fn run_agent_loop(
             let results = sub_agent::scan_completed_results(&sub_agent_dir);
             for result in &results {
                 let msg = sub_agent::format_result_message(result);
+                slog(&session_log, |l| l.info(&format!("Sub-agent result: {}", msg)));
                 emit(
                     &bus,
                     || AppEvent::SubAgentResult { formatted: msg.clone() },
@@ -815,6 +1014,7 @@ async fn run_agent_loop(
         conversation.add_user(user_msg);
 
         if turn == SAFETY_CAP {
+            slog(&session_log, |l| l.warn(&format!("Safety cap ({}) reached", SAFETY_CAP)));
             emit(
                 &bus,
                 || AppEvent::SafetyCapReached,
@@ -823,6 +1023,7 @@ async fn run_agent_loop(
         }
     }
 
+    slog(&session_log, |l| l.info("Agent loop finished"));
     Ok(())
 }
 
@@ -859,6 +1060,7 @@ async fn run_sub_agent_mode(
     provider: Box<dyn provider::ChatProvider>,
     id: String,
     role: sub_agent::SubAgentRole,
+    session_log: SharedSessionLog,
 ) -> Result<(), CallerError> {
     let project = Project::detect()?;
     let system_prompt = prompts::resolve_system_prompt(&role, Some(&project.root))?;
@@ -868,6 +1070,10 @@ async fn run_sub_agent_mode(
         return Err(CallerError::Config("No task provided".to_string()));
     }
 
+    slog(&session_log, |l| {
+        l.info(&format!("Sub-agent mode: {} (role: {})", id, role.as_str()));
+        l.info(&format!("Provider: {} (context window: {})", provider.name(), provider.context_window()));
+    });
     println!("Running as sub-agent: {} (role: {})", id, role.as_str());
     println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
 
@@ -884,6 +1090,7 @@ async fn run_sub_agent_mode(
     }
 
     conversation.add_user(task.clone());
+    slog(&session_log, |l| l.info(&format!("Task: {}", task)));
     println!("Task: {}", task);
     println!("---");
 
@@ -900,6 +1107,7 @@ async fn run_sub_agent_mode(
         Some(&sub_agent_info),
         None, // no TUI for sub-agents
         autonomy,
+        session_log,
     ).await;
 
     // Write result file
@@ -935,9 +1143,13 @@ async fn run_user_mode(
     project: Project,
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
+    session_log: SharedSessionLog,
 ) -> Result<(), CallerError> {
     let system_prompt = prompts::resolve_system_prompt(&sub_agent::SubAgentRole::Custom("user".to_string()), Some(&project.root))?;
 
+    slog(&session_log, |l| {
+        l.info(&format!("Mode: user (provider: {}, context: {})", provider.name(), provider.context_window()));
+    });
     if bus.is_none() {
         println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
         println!("Mode: user (orchestrator will be spawned for complex tasks)");
@@ -967,6 +1179,7 @@ async fn run_user_mode(
         None,
         bus,
         autonomy,
+        session_log,
     ).await
 }
 
@@ -976,9 +1189,13 @@ async fn run_direct_mode(
     project: Project,
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
+    session_log: SharedSessionLog,
 ) -> Result<(), CallerError> {
     let system_prompt = prompts::resolve_system_prompt(&sub_agent::SubAgentRole::Custom("direct".to_string()), Some(&project.root))?;
 
+    slog(&session_log, |l| {
+        l.info(&format!("Mode: direct (provider: {}, context: {})", provider.name(), provider.context_window()));
+    });
     if bus.is_none() {
         println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
     }
@@ -1006,6 +1223,7 @@ async fn run_direct_mode(
         None,
         bus,
         autonomy,
+        session_log,
     ).await
 }
 
@@ -1052,17 +1270,43 @@ async fn main() -> Result<(), CallerError> {
         env::set_var("MODEL_NAME", m);
     }
 
+    // Create session log (always enabled; --log-file overrides directory)
+    let log_dir = session_log::SessionLog::resolve_path(flags.log_file.as_deref());
+    let session_log: SharedSessionLog = match session_log::SessionLog::open(log_dir.clone()) {
+        Ok(log) => {
+            eprintln!("Session log: {}/session.jsonl", log.dir().display());
+            Arc::new(Mutex::new(log))
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not create session log at {}: {}", log_dir.display(), e);
+            // Fallback to /tmp
+            let fallback = std::path::PathBuf::from("/tmp/intendant_session");
+            let log = session_log::SessionLog::open(fallback)
+                .map_err(|e| CallerError::Config(format!("Cannot create session log: {}", e)))?;
+            eprintln!("Session log (fallback): {}/session.jsonl", log.dir().display());
+            Arc::new(Mutex::new(log))
+        }
+    };
+
     let provider = provider::select_provider()?;
+    slog(&session_log, |l| {
+        l.info(&format!("Provider: {}", provider.name()));
+        l.info(&format!("Model: {}", env::var("MODEL_NAME").unwrap_or_else(|_| "default".to_string())));
+        l.info(&format!("Project root: {}", project.root.display()));
+        l.info(&format!("Autonomy: {}", flags.autonomy));
+    });
 
     // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
-        return run_sub_agent_mode(provider, id, role).await;
+        return run_sub_agent_mode(provider, id, role, session_log).await;
     }
     let task = get_task_from_flags_or_env(&flags)?;
 
     if task.is_empty() {
         return Err(CallerError::Config("No task provided".to_string()));
     }
+
+    slog(&session_log, |l| l.info(&format!("Task: {}", task)));
 
     // Determine whether to use TUI
     let use_tui = !flags.no_tui && io::stdin().is_terminal();
@@ -1104,20 +1348,25 @@ async fn main() -> Result<(), CallerError> {
         let bus_clone = bus.clone();
         let autonomy_clone = autonomy.clone();
         let task_clone = task.clone();
+        let task_for_summary = task.clone();
+        let session_log_clone = session_log.clone();
+        let session_log_summary = session_log.clone();
         let loop_handle = tokio::spawn(async move {
             let result = if is_simple_task(&task_clone) {
-                run_direct_mode(provider, task_clone, project, Some(bus_clone.clone()), autonomy_clone).await
+                run_direct_mode(provider, task_clone, project, Some(bus_clone.clone()), autonomy_clone, session_log_clone).await
             } else {
-                run_user_mode(provider, task_clone, project, Some(bus_clone.clone()), autonomy_clone).await
+                run_user_mode(provider, task_clone, project, Some(bus_clone.clone()), autonomy_clone, session_log_clone).await
             };
 
             match result {
                 Ok(()) => {
+                    slog(&session_log_summary, |l| l.write_summary(&task_for_summary, "completed", 0));
                     bus_clone.send(AppEvent::TaskComplete {
                         reason: "Task complete".to_string(),
                     });
                 }
                 Err(e) => {
+                    slog(&session_log_summary, |l| l.write_summary(&task_for_summary, &format!("error: {}", e), 0));
                     bus_clone.send(AppEvent::LoopError(e.to_string()));
                 }
             }
@@ -1132,11 +1381,16 @@ async fn main() -> Result<(), CallerError> {
         terminal.restore().map_err(|e| CallerError::Tui(e.to_string()))?;
     } else {
         // Headless mode (--no-tui or non-TTY)
-        if is_simple_task(&task) {
-            run_direct_mode(provider, task, project, None, autonomy).await?;
+        let result = if is_simple_task(&task) {
+            run_direct_mode(provider, task.clone(), project, None, autonomy, session_log.clone()).await
         } else {
-            run_user_mode(provider, task, project, None, autonomy).await?;
+            run_user_mode(provider, task.clone(), project, None, autonomy, session_log.clone()).await
+        };
+        match &result {
+            Ok(()) => slog(&session_log, |l| l.write_summary(&task, "completed", 0)),
+            Err(e) => slog(&session_log, |l| l.write_summary(&task, &format!("error: {}", e), 0)),
         }
+        result?;
     }
 
     Ok(())

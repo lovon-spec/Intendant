@@ -174,29 +174,52 @@ fn format_log_entry(entry: &LogEntry, verbose: bool) -> Line<'static> {
 
 /// Render the approval panel (conditional, at bottom).
 pub fn render_approval_panel(f: &mut Frame, area: Rect, command: &str, category: &str) {
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(" Approval required: ", Style::default().fg(theme::APPROVAL_FG).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("[{}]", category), Style::default().fg(theme::APPROVAL_FG)),
-        ]),
-        Line::from(vec![
-            Span::styled(format!(" {}", truncate(command, (area.width as usize).saturating_sub(4))), Style::default().fg(theme::APPROVAL_CMD_FG)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                " [y]approve  [s]skip  [a]approve-all  [n]deny",
-                Style::default().fg(theme::APPROVAL_HINT_FG),
-            ),
-        ]),
-    ];
-
     let block = Block::default()
-        .borders(Borders::TOP)
+        .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::APPROVAL_FG))
+        .title(Span::styled(
+            format!(" Approval required [{}] ", category),
+            Style::default().fg(theme::APPROVAL_FG).add_modifier(Modifier::BOLD),
+        ))
         .style(Style::default().bg(theme::APPROVAL_BG));
 
-    let widget = Paragraph::new(lines).block(block);
-    f.render_widget(widget, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Split inner area: command text (flexible) + hint line (fixed 1 line)
+    let chunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Min(1),
+            ratatui::layout::Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Command preview (with word wrap)
+    let cmd_lines = vec![Line::from(vec![
+        Span::styled(
+            format!(" {}", command),
+            Style::default().fg(theme::APPROVAL_CMD_FG),
+        ),
+    ])];
+    let cmd_widget = Paragraph::new(cmd_lines)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(theme::APPROVAL_BG));
+    f.render_widget(cmd_widget, chunks[0]);
+
+    // Key hints (always visible at bottom)
+    let hint = Line::from(vec![Span::styled(
+        " [y]approve  [s]skip  [a]approve-all  [n]deny",
+        Style::default()
+            .fg(theme::APPROVAL_HINT_FG)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    let hint_widget = Paragraph::new(hint).style(Style::default().bg(theme::APPROVAL_BG));
+    f.render_widget(hint_widget, chunks[1]);
 }
 
 /// Render the human input panel (conditional, at bottom).
