@@ -1,7 +1,9 @@
 use crate::error::AgentError;
-use crate::models::{AgentInput, Command as AgentCommand, ProcessInfo, ProcessStatus, StatusUpdate};
-use std::os::unix::fs::OpenOptionsExt;
+use crate::models::{
+    AgentInput, Command as AgentCommand, ProcessInfo, ProcessStatus, StatusUpdate,
+};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 
 use std::{
     collections::HashMap,
@@ -16,8 +18,8 @@ use std::{
 
 use chrono::Local;
 use memmap2::{MmapMut, MmapOptions};
-use tokio::sync::mpsc;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, PtySize};
 
@@ -28,32 +30,34 @@ struct PtySession {
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-const HUMAN_QUESTION_PATH: &str = "/dev/shm/intendant_human_question";
-const HUMAN_RESPONSE_PATH: &str = "/dev/shm/intendant_human_response";
 const HUMAN_TIMEOUT_MS: u64 = 5 * 60 * 1000; // 5 minutes
 const HUMAN_POLL_MS: u64 = 500;
 
 const MAX_PROCESSES: usize = 1024;
 const SHARED_MEM_SIZE: usize = size_of::<ProcessInfo>() * MAX_PROCESSES;
-const SHARED_MEM_PATH: &str = "/dev/shm/intendant_processes";
-const SESSION_FILE_PATH: &str = "/dev/shm/intendant_session";
-
 #[derive(Clone)]
 pub struct Agent {
     pub shared_mem: Arc<RwLock<MmapMut>>,
     pub process_map: Arc<RwLock<HashMap<u64, usize>>>,
+    scope_to_nonce: Arc<RwLock<HashMap<String, u64>>>,
+    nonce_to_scope: Arc<RwLock<HashMap<u64, String>>>,
     log_dir: PathBuf,
     status_tx: mpsc::Sender<StatusUpdate>,
     pty_sessions: Arc<tokio::sync::Mutex<HashMap<String, PtySession>>>,
+    source_generation: u64,
 }
 
 impl Agent {
+    fn current_session_id() -> Option<String> {
+        fs::read_to_string(session_file_path())
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
     /// Create an agent with custom paths, used for testing.
     #[cfg(test)]
-    pub fn new_with_paths(
-        shared_mem_path: &str,
-        log_dir: PathBuf,
-    ) -> Result<Self, AgentError> {
+    pub fn new_with_paths(shared_mem_path: &str, log_dir: PathBuf) -> Result<Self, AgentError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -85,16 +89,25 @@ impl Agent {
                 }
                 let info_size = size_of::<ProcessInfo>();
                 let offset = (update.nonce as usize % MAX_PROCESSES) * info_size;
-                process_map_clone.write().unwrap().insert(update.nonce, offset);
+                process_map_clone
+                    .write()
+                    .unwrap()
+                    .insert(update.nonce, offset);
             }
         });
 
         Ok(Self {
             shared_mem,
             process_map,
+            scope_to_nonce: Arc::new(RwLock::new(HashMap::new())),
+            nonce_to_scope: Arc::new(RwLock::new(HashMap::new())),
             log_dir,
             status_tx,
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            source_generation: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         })
     }
 
@@ -106,12 +119,39 @@ impl Agent {
             .write(true)
             .create(true)
             .mode(0o600)
-            .open(SHARED_MEM_PATH)?;
+            .open(shared_mem_path())?;
         file.set_len(SHARED_MEM_SIZE as u64)?;
 
-        // Map shared memory
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        let process_map = Self::rebuild_process_map(&mmap);
+        let resume_session = std::env::var("INTENDANT_RESUME_SESSION")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // Map shared memory. Preserve state across turns in the same caller session,
+        // but reset when a new top-level session starts (unless explicitly resuming).
+        let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        let session_id = Self::current_session_id();
+        let marker_id = fs::read_to_string(runtime_session_marker_path())
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let preserve_state = if resume_session {
+            true
+        } else if let Some(ref sid) = session_id {
+            marker_id.as_deref() == Some(sid.as_str())
+        } else {
+            false
+        };
+
+        let process_map = if preserve_state {
+            Self::rebuild_process_map(&mmap)
+        } else {
+            Self::reset_shared_mem(&mut mmap);
+            HashMap::new()
+        };
+        if let Some(sid) = session_id {
+            let _ = fs::write(runtime_session_marker_path(), sid);
+        }
         let shared_mem = Arc::new(RwLock::new(mmap));
         let process_map = Arc::new(RwLock::new(process_map));
 
@@ -137,21 +177,30 @@ impl Agent {
                 // Update process_map so StatusMonitor can see this nonce
                 let info_size = size_of::<ProcessInfo>();
                 let offset = (update.nonce as usize % MAX_PROCESSES) * info_size;
-                process_map_clone.write().unwrap().insert(update.nonce, offset);
+                process_map_clone
+                    .write()
+                    .unwrap()
+                    .insert(update.nonce, offset);
             }
         });
 
         Ok(Self {
             shared_mem,
             process_map,
+            scope_to_nonce: Arc::new(RwLock::new(HashMap::new())),
+            nonce_to_scope: Arc::new(RwLock::new(HashMap::new())),
             log_dir,
             status_tx,
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            source_generation: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         })
     }
 
     fn resolve_log_dir() -> Result<PathBuf, AgentError> {
-        if let Ok(existing) = fs::read_to_string(SESSION_FILE_PATH) {
+        if let Ok(existing) = fs::read_to_string(session_file_path()) {
             let path = PathBuf::from(existing.trim());
             if path.is_dir() {
                 return Ok(path);
@@ -161,7 +210,7 @@ impl Agent {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let log_dir = PathBuf::from(format!("{}/.intendant/logs/{}", home, timestamp));
         fs::create_dir_all(&log_dir)?;
-        fs::write(SESSION_FILE_PATH, log_dir.to_string_lossy().as_bytes())?;
+        fs::write(session_file_path(), log_dir.to_string_lossy().as_bytes())?;
         Ok(log_dir)
     }
 
@@ -178,6 +227,60 @@ impl Agent {
             }
         }
         map
+    }
+
+    fn reset_shared_mem(mmap: &mut MmapMut) {
+        mmap.fill(0);
+    }
+
+    fn scope_key(run_id: &str, agent_id: &str, attempt_id: &str, command_id: &str) -> String {
+        format!("{}|{}|{}|{}", run_id, agent_id, attempt_id, command_id)
+    }
+
+    fn scope_parts(
+        &self,
+        cmd: &AgentCommand,
+        default_command_id: String,
+    ) -> (String, String, String, String) {
+        let run_id = cmd
+            .run_id
+            .clone()
+            .or_else(|| std::env::var("INTENDANT_RUN_ID").ok())
+            .or_else(Self::current_session_id)
+            .unwrap_or_else(|| "default".to_string());
+        let agent_id = cmd
+            .agent_id
+            .clone()
+            .or_else(|| std::env::var("INTENDANT_AGENT_ID").ok())
+            .unwrap_or_else(|| "runtime".to_string());
+        let attempt_id = cmd
+            .attempt_id
+            .clone()
+            .or_else(|| std::env::var("INTENDANT_ATTEMPT_ID").ok())
+            .unwrap_or_else(|| "0".to_string());
+        let command_id = cmd.command_id.clone().unwrap_or(default_command_id);
+        (run_id, agent_id, attempt_id, command_id)
+    }
+
+    fn register_command_scope(&self, cmd: &AgentCommand) {
+        let (run_id, agent_id, attempt_id, command_id) =
+            self.scope_parts(cmd, format!("nonce:{}", cmd.nonce));
+        let key = Self::scope_key(&run_id, &agent_id, &attempt_id, &command_id);
+        self.scope_to_nonce
+            .write()
+            .unwrap()
+            .insert(key.clone(), cmd.nonce);
+        self.nonce_to_scope.write().unwrap().insert(cmd.nonce, key);
+    }
+
+    fn lookup_scope_by_nonce(&self, nonce: u64) -> Option<(String, String, String, String)> {
+        let key = self.nonce_to_scope.read().unwrap().get(&nonce).cloned()?;
+        let mut parts = key.split('|');
+        let run_id = parts.next()?.to_string();
+        let agent_id = parts.next()?.to_string();
+        let attempt_id = parts.next()?.to_string();
+        let command_id = parts.next()?.to_string();
+        Some((run_id, agent_id, attempt_id, command_id))
     }
 
     fn update_process_status(
@@ -220,13 +323,16 @@ impl Agent {
         let command = cmd.command.as_ref().ok_or_else(|| {
             AgentError::Process("Command string is required for execAsAgent".to_string())
         })?;
-    
+
         // Handle dependencies if any
         if let Some(dep_nonce) = cmd.depending_nonce {
             let wait = cmd.wait.unwrap_or(false);
             let expected_status = cmd.expected_status.unwrap_or(0);
-    
-            if !self.check_dependency(dep_nonce, expected_status, wait).await? {
+
+            if !self
+                .check_dependency(dep_nonce, expected_status, wait)
+                .await?
+            {
                 self.status_tx
                     .send(StatusUpdate {
                         nonce: cmd.nonce,
@@ -238,7 +344,7 @@ impl Agent {
                 return Ok(());
             }
         }
-    
+
         // Wait for port if requested
         if let Some(port) = cmd.wait_for_port {
             if !self.wait_for_port(port).await? {
@@ -257,19 +363,22 @@ impl Agent {
         // Replace $NONCE references
         let command = self.replace_nonce_refs(command)?;
 
-        // Setup output files with append mode to prevent truncation
+        // Setup output files for this command attempt.
+        // Truncate old content to avoid stale log mixing between different runs/attempts.
         let stdout_path = self.log_dir.join(format!("{}_stdout.log", cmd.nonce));
         let stderr_path = self.log_dir.join(format!("{}_stderr.log", cmd.nonce));
-    
+
         let stdout_file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&stdout_path)?;
         let stderr_file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&stderr_path)?;
-    
+
         // Execute command
         let display_id = cmd.display.unwrap_or(1);
         let mut child = Command::new("bash")
@@ -279,11 +388,11 @@ impl Agent {
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file))
             .spawn()?;
-    
+
         // Update process info in shared memory
         let pid = child.id().unwrap_or(0) as i32;
         self.update_process_info(cmd.nonce, pid, ProcessStatus::Running, 0)?;
-    
+
         // Monitor process in background
         let nonce = cmd.nonce;
         let status_tx = self.status_tx.clone();
@@ -322,7 +431,7 @@ impl Agent {
                 }
             }
         });
-    
+
         Ok(())
     }
 
@@ -335,7 +444,10 @@ impl Agent {
             let wait = cmd.wait.unwrap_or(false);
             let expected_status = cmd.expected_status.unwrap_or(0);
 
-            if !self.check_dependency(dep_nonce, expected_status, wait).await? {
+            if !self
+                .check_dependency(dep_nonce, expected_status, wait)
+                .await?
+            {
                 self.status_tx
                     .send(StatusUpdate {
                         nonce: cmd.nonce,
@@ -358,7 +470,7 @@ impl Agent {
                 &screenshot_path.to_string_lossy(),
             ])
             .status()
-	    .await?;
+            .await?;
         let exit_code = status.code().unwrap_or(-1);
         let process_status = if status.success() {
             ProcessStatus::Completed
@@ -378,12 +490,20 @@ impl Agent {
         Ok(())
     }
 
-    fn read_log_partial(&self, path: &Path, offset: Option<u64>, limit: Option<u64>) -> Result<String, AgentError> {
+    fn read_log_partial(
+        &self,
+        path: &Path,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<String, AgentError> {
         if !path.exists() {
             return Ok(serde_json::json!({
                 "content": "",
-                "total_size": 0
-            }).to_string());
+                "total_size": 0,
+                "offset": 0,
+                "bytes_read": 0
+            })
+            .to_string());
         }
 
         let mut file = std::fs::File::open(path)?;
@@ -396,7 +516,10 @@ impl Agent {
             (None, None) => {
                 // Default: tail last 10KB
                 let default_tail = 10 * 1024u64;
-                (total_size.saturating_sub(default_tail), default_tail.min(total_size))
+                (
+                    total_size.saturating_sub(default_tail),
+                    default_tail.min(total_size),
+                )
             }
         };
 
@@ -415,7 +538,8 @@ impl Agent {
             "total_size": total_size,
             "offset": actual_offset,
             "bytes_read": bytes_read
-        }).to_string())
+        })
+        .to_string())
     }
 
     fn fetch_status(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
@@ -423,28 +547,237 @@ impl Agent {
             AgentError::Process("status_type is required for fetchStatus".to_string())
         })?;
 
-        // Use depending_nonce as the target if present, otherwise use the command's own nonce.
-        // This allows the LLM to assign fetchStatus its own unique nonce while referencing
-        // the target command via depending_nonce.
-        let target_nonce = cmd.depending_nonce.unwrap_or(cmd.nonce);
+        // Resolve target command using scoped identity when provided, otherwise fallback to nonce.
+        let (req_run_id, req_agent_id, req_attempt_id, req_command_id) = self.scope_parts(
+            cmd,
+            format!("nonce:{}", cmd.depending_nonce.unwrap_or(cmd.nonce)),
+        );
+        let req_scope_key =
+            Self::scope_key(&req_run_id, &req_agent_id, &req_attempt_id, &req_command_id);
+
+        let target_nonce = if let Some(dep_nonce) = cmd.depending_nonce {
+            dep_nonce
+        } else if cmd.command_id.is_some() {
+            match self
+                .scope_to_nonce
+                .read()
+                .unwrap()
+                .get(&req_scope_key)
+                .copied()
+            {
+                Some(n) => n,
+                None => {
+                    return Ok(serde_json::json!({
+                        "ok": false,
+                        "status_type": status_type,
+                        "run_id": req_run_id,
+                        "agent_id": req_agent_id,
+                        "attempt_id": req_attempt_id,
+                        "command_id": req_command_id,
+                        "error": "COMMAND_NOT_FOUND",
+                        "complete": false,
+                        "events": [],
+                        "next_cursor": cmd.cursor.or(cmd.offset).unwrap_or(0),
+                        "source_generation": self.source_generation
+                    })
+                    .to_string());
+                }
+            }
+        } else {
+            cmd.nonce
+        };
+
+        let (run_id, agent_id, attempt_id, command_id) =
+            self.lookup_scope_by_nonce(target_nonce).unwrap_or((
+                req_run_id.clone(),
+                req_agent_id.clone(),
+                req_attempt_id.clone(),
+                format!("nonce:{}", target_nonce),
+            ));
+        let stream_id = cmd.stream_id.clone().unwrap_or_else(|| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                run_id, agent_id, attempt_id, command_id, status_type
+            )
+        });
+        let cursor = cmd.cursor.or(cmd.offset).unwrap_or(0);
+        let info = self.get_process_info(target_nonce).ok();
+        let is_terminal = |s: ProcessStatus| {
+            matches!(
+                s,
+                ProcessStatus::Completed | ProcessStatus::Failed | ProcessStatus::Skipped
+            )
+        };
+        let mut consistency_flags: Vec<String> = Vec::new();
+        if run_id != req_run_id || agent_id != req_agent_id || attempt_id != req_attempt_id {
+            consistency_flags.push("scope_mismatch".to_string());
+        }
+        if cmd.command_id.is_some() && command_id != req_command_id {
+            consistency_flags.push("command_mismatch".to_string());
+        }
 
         match status_type.as_str() {
-            "status" => {
-                let info = self.get_process_info(target_nonce)?;
-                Ok((info.status as u8 as char).to_string())
+            "status" => Ok(match info {
+                Some(i) => serde_json::json!({
+                    "ok": true,
+                    "status_type": "status",
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "attempt_id": attempt_id,
+                    "command_id": command_id,
+                    "target_nonce": target_nonce,
+                    "value": (i.status as u8 as char).to_string(),
+                    "exit_code": i.exit_code,
+                    "complete": is_terminal(i.status),
+                    "events": [{
+                        "event_seq": cursor + 1,
+                        "ts": i.timestamp,
+                        "type": "status",
+                        "payload": {"value": (i.status as u8 as char).to_string(), "exit_code": i.exit_code}
+                    }],
+                    "next_cursor": cursor + 1,
+                    "source_generation": self.source_generation,
+                    "consistency_flags": consistency_flags.clone()
+                })
+                .to_string(),
+                None => serde_json::json!({
+                    "ok": false,
+                    "status_type": "status",
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "attempt_id": attempt_id,
+                    "command_id": command_id,
+                    "target_nonce": target_nonce,
+                    "error": format!("nonce_not_found:{}", target_nonce),
+                    "error_code": "COMMAND_NOT_FOUND",
+                    "complete": false,
+                    "events": [],
+                    "next_cursor": cursor,
+                    "source_generation": self.source_generation,
+                    "consistency_flags": consistency_flags.clone()
+                })
+                .to_string(),
+            }),
+            "stdout" | "stderr" => {
+                let path = self.log_dir.join(format!("{}_{}.log", target_nonce, status_type));
+                if info.is_none() && !path.exists() {
+                    return Ok(serde_json::json!({
+                        "ok": false,
+                        "status_type": status_type,
+                        "run_id": run_id,
+                        "agent_id": agent_id,
+                        "attempt_id": attempt_id,
+                        "command_id": command_id,
+                        "stream_id": stream_id,
+                        "target_nonce": target_nonce,
+                        "error": format!("nonce_not_found:{}", target_nonce),
+                        "error_code": "COMMAND_NOT_FOUND",
+                        "complete": false,
+                        "next_offset": cursor,
+                        "next_cursor": cursor,
+                        "stream_closed": false,
+                        "events": [],
+                        "source_generation": self.source_generation,
+                        "consistency_flags": consistency_flags.clone(),
+                        "data": {
+                            "content": "",
+                            "total_size": 0,
+                            "offset": 0,
+                            "bytes_read": 0
+                        }
+                    })
+                    .to_string());
+                }
+
+                let read_offset = cmd.cursor.or(cmd.offset);
+                let chunk = self.read_log_partial(&path, read_offset, cmd.limit)?;
+                let data: serde_json::Value = serde_json::from_str(&chunk).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "content": "",
+                        "total_size": 0,
+                        "offset": 0,
+                        "bytes_read": 0
+                    })
+                });
+                let next_offset =
+                    data["offset"].as_u64().unwrap_or(0) + data["bytes_read"].as_u64().unwrap_or(0);
+                let complete = info.map(|i| is_terminal(i.status)).unwrap_or(false);
+                let event_seq = next_offset.max(cursor);
+                let event_ts = info.map(|i| i.timestamp).unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                });
+                let mut payload = serde_json::json!({
+                    "ok": true,
+                    "status_type": status_type,
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "attempt_id": attempt_id,
+                    "command_id": command_id,
+                    "stream_id": stream_id,
+                    "target_nonce": target_nonce,
+                    "complete": complete,
+                    "next_offset": next_offset,
+                    "next_cursor": event_seq,
+                    "stream_closed": complete,
+                    "events": [{
+                        "event_seq": event_seq,
+                        "ts": event_ts,
+                        "type": status_type,
+                        "payload": data
+                    }],
+                    "source_generation": self.source_generation,
+                    "consistency_flags": consistency_flags.clone(),
+                    "data": data
+                });
+                if info.is_none() {
+                    payload["warning"] =
+                        serde_json::Value::String(format!("nonce_not_found:{}", target_nonce));
+                }
+                Ok(payload.to_string())
             }
-            "stdout" => {
-                let path = self.log_dir.join(format!("{}_stdout.log", target_nonce));
-                self.read_log_partial(&path, cmd.offset, cmd.limit)
-            }
-            "stderr" => {
-                let path = self.log_dir.join(format!("{}_stderr.log", target_nonce));
-                self.read_log_partial(&path, cmd.offset, cmd.limit)
-            }
-            "exit_code" => {
-                let info = self.get_process_info(target_nonce)?;
-                Ok(info.exit_code.to_string())
-            }
+            "exit_code" => Ok(match info {
+                Some(i) => serde_json::json!({
+                    "ok": true,
+                    "status_type": "exit_code",
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "attempt_id": attempt_id,
+                    "command_id": command_id,
+                    "target_nonce": target_nonce,
+                    "value": i.exit_code,
+                    "complete": is_terminal(i.status),
+                    "events": [{
+                        "event_seq": cursor + 1,
+                        "ts": i.timestamp,
+                        "type": "exit_code",
+                        "payload": {"value": i.exit_code}
+                    }],
+                    "next_cursor": cursor + 1,
+                    "source_generation": self.source_generation,
+                    "consistency_flags": consistency_flags.clone()
+                })
+                .to_string(),
+                None => serde_json::json!({
+                    "ok": false,
+                    "status_type": "exit_code",
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "attempt_id": attempt_id,
+                    "command_id": command_id,
+                    "target_nonce": target_nonce,
+                    "error": format!("nonce_not_found:{}", target_nonce),
+                    "error_code": "COMMAND_NOT_FOUND",
+                    "complete": false,
+                    "events": [],
+                    "next_cursor": cursor,
+                    "source_generation": self.source_generation,
+                    "consistency_flags": consistency_flags
+                })
+                .to_string(),
+            }),
             _ => Err(AgentError::Process(format!(
                 "Invalid status_type: {}",
                 status_type
@@ -453,16 +786,18 @@ impl Agent {
     }
 
     fn inspect_path(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let path_str = cmd.path.as_ref().ok_or_else(|| {
-            AgentError::Process("path is required for inspectPath".to_string())
-        })?;
+        let path_str = cmd
+            .path
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("path is required for inspectPath".to_string()))?;
         let path = std::path::Path::new(path_str);
 
         if !path.exists() {
             return Ok(serde_json::json!({
                 "exists": false,
                 "path": path_str
-            }).to_string());
+            })
+            .to_string());
         }
 
         let symlink_meta = fs::symlink_metadata(path)?;
@@ -493,13 +828,15 @@ impl Agent {
             "modified": modified,
             "uid": meta.uid(),
             "gid": meta.gid()
-        }).to_string())
+        })
+        .to_string())
     }
 
     async fn exec_pty(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let command = cmd.command.as_ref().ok_or_else(|| {
-            AgentError::Process("command is required for execPty".to_string())
-        })?;
+        let command = cmd
+            .command
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("command is required for execPty".to_string()))?;
         let shell_id = cmd.shell_id.as_deref().unwrap_or("default").to_string();
 
         let mut sessions = self.pty_sessions.lock().await;
@@ -507,31 +844,42 @@ impl Agent {
         // Lazily create PTY session
         if !sessions.contains_key(&shell_id) {
             let pty_system = native_pty_system();
-            let pair = pty_system.openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            }).map_err(|e| AgentError::Process(format!("Failed to open PTY: {}", e)))?;
+            let pair = pty_system
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| AgentError::Process(format!("Failed to open PTY: {}", e)))?;
 
             let mut pty_cmd = PtyCommandBuilder::new("bash");
             pty_cmd.args(["--norc", "--noprofile"]);
-            pair.slave.spawn_command(pty_cmd)
+            pair.slave
+                .spawn_command(pty_cmd)
                 .map_err(|e| AgentError::Process(format!("Failed to spawn shell: {}", e)))?;
 
-            let reader = pair.master.try_clone_reader()
+            let reader = pair
+                .master
+                .try_clone_reader()
                 .map_err(|e| AgentError::Process(format!("Failed to clone reader: {}", e)))?;
-            let writer = pair.master.take_writer()
+            let writer = pair
+                .master
+                .take_writer()
                 .map_err(|e| AgentError::Process(format!("Failed to take writer: {}", e)))?;
 
-            sessions.insert(shell_id.clone(), PtySession {
-                writer,
-                reader,
-                _master: pair.master,
-            });
+            sessions.insert(
+                shell_id.clone(),
+                PtySession {
+                    writer,
+                    reader,
+                    _master: pair.master,
+                },
+            );
         }
 
-        let session = sessions.get_mut(&shell_id)
+        let session = sessions
+            .get_mut(&shell_id)
             .ok_or_else(|| AgentError::Process("PTY session not found".to_string()))?;
 
         // Generate unique start and end markers
@@ -540,9 +888,13 @@ impl Agent {
 
         // Write: echo start-marker, then command, then echo end-marker
         let pty_input = format!("echo '{}'\n{}\necho '{}'\n", start_marker, command, marker);
-        session.writer.write_all(pty_input.as_bytes())
+        session
+            .writer
+            .write_all(pty_input.as_bytes())
             .map_err(|e| AgentError::Process(format!("Failed to write to PTY: {}", e)))?;
-        session.writer.flush()
+        session
+            .writer
+            .flush()
             .map_err(|e| AgentError::Process(format!("Failed to flush PTY: {}", e)))?;
 
         // Read from PTY until end marker appears, with timeout
@@ -614,10 +966,10 @@ impl Agent {
         // Remove lines that are echo commands for the markers
         lines.retain(|line| {
             let trimmed = line.trim();
-            !trimmed.contains(&format!("echo '{}'", start_marker)) &&
-            !trimmed.contains(&format!("echo '{}'", marker)) &&
-            !trimmed.contains(&start_marker) &&
-            !trimmed.contains(&marker)
+            !trimmed.contains(&format!("echo '{}'", start_marker))
+                && !trimmed.contains(&format!("echo '{}'", marker))
+                && !trimmed.contains(&start_marker)
+                && !trimmed.contains(&marker)
         });
 
         let final_output = lines.join("\n");
@@ -626,7 +978,8 @@ impl Agent {
             "success": true,
             "shell_id": shell_id,
             "output": final_output
-        }).to_string())
+        })
+        .to_string())
     }
 
     async fn ask_human_with_paths(
@@ -637,9 +990,10 @@ impl Agent {
         timeout_ms: u64,
         poll_ms: u64,
     ) -> Result<String, AgentError> {
-        let question = cmd.question.as_ref().ok_or_else(|| {
-            AgentError::Process("question is required for askHuman".to_string())
-        })?;
+        let question = cmd
+            .question
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("question is required for askHuman".to_string()))?;
 
         // Write question to file
         fs::write(question_path, question)?;
@@ -661,7 +1015,8 @@ impl Agent {
                     "success": true,
                     "question": question,
                     "response": response
-                }).to_string());
+                })
+                .to_string());
             }
 
             if start.elapsed() >= timeout {
@@ -671,7 +1026,8 @@ impl Agent {
                 return Ok(serde_json::json!({
                     "success": false,
                     "error": "Timed out waiting for human response"
-                }).to_string());
+                })
+                .to_string());
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -681,15 +1037,20 @@ impl Agent {
     async fn ask_human(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
         self.ask_human_with_paths(
             cmd,
-            Path::new(HUMAN_QUESTION_PATH),
-            Path::new(HUMAN_RESPONSE_PATH),
+            &human_question_path(),
+            &human_response_path(),
             HUMAN_TIMEOUT_MS,
             HUMAN_POLL_MS,
         )
         .await
     }
 
-    async fn wait_for_port_with_retries(&self, port: u16, max_retries: u32, interval_ms: u64) -> Result<bool, AgentError> {
+    async fn wait_for_port_with_retries(
+        &self,
+        port: u16,
+        max_retries: u32,
+        interval_ms: u64,
+    ) -> Result<bool, AgentError> {
         for _ in 0..max_retries {
             match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await {
                 Ok(_) => return Ok(true),
@@ -706,9 +1067,10 @@ impl Agent {
     }
 
     async fn browse(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let url = cmd.url.as_ref().ok_or_else(|| {
-            AgentError::Process("url is required for browse".to_string())
-        })?;
+        let url = cmd
+            .url
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("url is required for browse".to_string()))?;
 
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(AgentError::Process(
@@ -751,7 +1113,7 @@ impl Agent {
         let max_size = 50 * 1024;
         let truncated = content.len() > max_size;
         let content = if truncated {
-            content[..max_size].to_string()
+            truncate_utf8_by_bytes(&content, max_size).to_string()
         } else {
             content
         };
@@ -762,16 +1124,19 @@ impl Agent {
             "status": status,
             "content": content,
             "truncated": truncated
-        }).to_string())
+        })
+        .to_string())
     }
 
     fn edit_file(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let file_path = cmd.file_path.as_ref().ok_or_else(|| {
-            AgentError::Process("file_path is required for editFile".to_string())
-        })?;
-        let operation = cmd.operation.as_ref().ok_or_else(|| {
-            AgentError::Process("operation is required for editFile".to_string())
-        })?;
+        let file_path = cmd
+            .file_path
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("file_path is required for editFile".to_string()))?;
+        let operation = cmd
+            .operation
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("operation is required for editFile".to_string()))?;
 
         let path = Path::new(file_path);
 
@@ -789,7 +1154,8 @@ impl Agent {
                     "operation": "write",
                     "file_path": file_path,
                     "bytes_written": content.len()
-                }).to_string())
+                })
+                .to_string())
             }
             "append" => {
                 let content = cmd.content.as_ref().ok_or_else(|| {
@@ -803,11 +1169,14 @@ impl Agent {
                     "operation": "append",
                     "file_path": file_path,
                     "bytes_written": content.len()
-                }).to_string())
+                })
+                .to_string())
             }
             "replace" => {
                 let match_content = cmd.match_content.as_ref().ok_or_else(|| {
-                    AgentError::Process("match_content is required for replace operation".to_string())
+                    AgentError::Process(
+                        "match_content is required for replace operation".to_string(),
+                    )
                 })?;
                 let content = cmd.content.as_ref().ok_or_else(|| {
                     AgentError::Process("content is required for replace operation".to_string())
@@ -820,7 +1189,8 @@ impl Agent {
                         "operation": "replace",
                         "file_path": file_path,
                         "error": "match_content not found in file"
-                    }).to_string());
+                    })
+                    .to_string());
                 }
                 let replaced = original.replace(match_content.as_str(), content);
                 fs::write(path, &replaced)?;
@@ -829,14 +1199,17 @@ impl Agent {
                     "operation": "replace",
                     "file_path": file_path,
                     "replacements": count
-                }).to_string())
+                })
+                .to_string())
             }
             "insert_at" => {
                 let content = cmd.content.as_ref().ok_or_else(|| {
                     AgentError::Process("content is required for insert_at operation".to_string())
                 })?;
                 let line_number = cmd.line_number.ok_or_else(|| {
-                    AgentError::Process("line_number is required for insert_at operation".to_string())
+                    AgentError::Process(
+                        "line_number is required for insert_at operation".to_string(),
+                    )
                 })?;
                 let original = if path.exists() {
                     fs::read_to_string(path)?
@@ -859,17 +1232,24 @@ impl Agent {
                     "operation": "insert_at",
                     "file_path": file_path,
                     "line_number": insert_at
-                }).to_string())
+                })
+                .to_string())
             }
             "replace_lines" => {
                 let content = cmd.content.as_ref().ok_or_else(|| {
-                    AgentError::Process("content is required for replace_lines operation".to_string())
+                    AgentError::Process(
+                        "content is required for replace_lines operation".to_string(),
+                    )
                 })?;
                 let line_number = cmd.line_number.ok_or_else(|| {
-                    AgentError::Process("line_number is required for replace_lines operation".to_string())
+                    AgentError::Process(
+                        "line_number is required for replace_lines operation".to_string(),
+                    )
                 })?;
                 let end_line = cmd.end_line.ok_or_else(|| {
-                    AgentError::Process("end_line is required for replace_lines operation".to_string())
+                    AgentError::Process(
+                        "end_line is required for replace_lines operation".to_string(),
+                    )
                 })?;
                 if end_line < line_number {
                     return Err(AgentError::Process(
@@ -894,7 +1274,8 @@ impl Agent {
                     "file_path": file_path,
                     "line_number": start,
                     "end_line": end
-                }).to_string())
+                })
+                .to_string())
             }
             _ => Err(AgentError::Process(format!(
                 "Unknown editFile operation: {}",
@@ -904,15 +1285,17 @@ impl Agent {
     }
 
     fn store_memory(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let key = cmd.memory_key.as_ref().ok_or_else(|| {
-            AgentError::Process("storeMemory requires memory_key".to_string())
-        })?;
+        let key = cmd
+            .memory_key
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("storeMemory requires memory_key".to_string()))?;
         let summary = cmd.memory_summary.as_ref().ok_or_else(|| {
             AgentError::Process("storeMemory requires memory_summary".to_string())
         })?;
-        let memory_file = cmd.memory_file.as_ref().ok_or_else(|| {
-            AgentError::Process("storeMemory requires memory_file".to_string())
-        })?;
+        let memory_file = cmd
+            .memory_file
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("storeMemory requires memory_file".to_string()))?;
 
         let path = PathBuf::from(memory_file);
         if let Some(parent) = path.parent() {
@@ -924,14 +1307,27 @@ impl Agent {
             .unwrap()
             .as_secs();
 
-        let tags: Vec<String> = cmd.memory_tags.as_deref()
-            .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        let tags: Vec<String> = cmd
+            .memory_tags
+            .as_deref()
+            .map(|t| {
+                t.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
-        let channel = cmd.memory_channel.as_deref().unwrap_or("default").to_string();
+        let channel = cmd
+            .memory_channel
+            .as_deref()
+            .unwrap_or("default")
+            .to_string();
         let source = cmd.memory_source.as_deref().unwrap_or("agent").to_string();
 
         // Determine if we should use new format: if tags/channel/source are provided, use new format
-        let has_knowledge_fields = cmd.memory_tags.is_some() || cmd.memory_channel.is_some() || cmd.memory_source.is_some();
+        let has_knowledge_fields = cmd.memory_tags.is_some()
+            || cmd.memory_channel.is_some()
+            || cmd.memory_source.is_some();
 
         // Try to read existing file, auto-detect format
         let mut data: serde_json::Value = if path.exists() {
@@ -957,7 +1353,10 @@ impl Agent {
 
             let already_exists = existing_idx.is_some();
             if let Some(idx) = existing_idx {
-                let created_at = entries[idx].get("created_at").and_then(|v| v.as_u64()).unwrap_or(now);
+                let created_at = entries[idx]
+                    .get("created_at")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(now);
                 entries[idx] = serde_json::json!({
                     "id": key,
                     "key": key,
@@ -987,14 +1386,17 @@ impl Agent {
                 "success": true,
                 "key": key,
                 "action": if already_exists { "updated" } else { "created" }
-            }).to_string())
+            })
+            .to_string())
         } else {
             // Old format (HashMap) — maintain backward compatibility
-            let already_exists = data.get("entries")
+            let already_exists = data
+                .get("entries")
                 .and_then(|e| e.get(key.as_str()))
                 .is_some();
 
-            let created_at = data.get("entries")
+            let created_at = data
+                .get("entries")
                 .and_then(|e| e.get(key.as_str()))
                 .and_then(|e| e.get("created_at"))
                 .and_then(|v| v.as_u64())
@@ -1012,36 +1414,44 @@ impl Agent {
                 "success": true,
                 "key": key,
                 "action": if already_exists { "updated" } else { "created" }
-            }).to_string())
+            })
+            .to_string())
         }
     }
 
     fn recall_memory(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let query = cmd.memory_query.as_ref().ok_or_else(|| {
-            AgentError::Process("recallMemory requires memory_query".to_string())
-        })?;
-        let memory_file = cmd.memory_file.as_ref().ok_or_else(|| {
-            AgentError::Process("recallMemory requires memory_file".to_string())
-        })?;
+        let query = cmd
+            .memory_query
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("recallMemory requires memory_query".to_string()))?;
+        let memory_file = cmd
+            .memory_file
+            .as_ref()
+            .ok_or_else(|| AgentError::Process("recallMemory requires memory_file".to_string()))?;
 
         let path = PathBuf::from(memory_file);
         if !path.exists() {
             return Ok(serde_json::json!({
                 "success": true,
                 "results": []
-            }).to_string());
+            })
+            .to_string());
         }
 
         let content = fs::read_to_string(&path)?;
-        let data: serde_json::Value = serde_json::from_str(&content)
-            .unwrap_or_else(|_| serde_json::json!({"entries": {}}));
+        let data: serde_json::Value =
+            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({"entries": {}}));
 
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower.split_whitespace().collect();
 
         // Parse optional filter parameters
-        let filter_tags: Option<Vec<String>> = cmd.memory_tags.as_deref()
-            .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+        let filter_tags: Option<Vec<String>> = cmd.memory_tags.as_deref().map(|t| {
+            t.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
         let filter_channel = cmd.memory_channel.as_deref();
         let filter_source = cmd.memory_source.as_deref();
         let filter_since = cmd.memory_since;
@@ -1057,13 +1467,21 @@ impl Agent {
                 for entry in entries {
                     let key = entry.get("key").and_then(|k| k.as_str()).unwrap_or("");
                     let summary = entry.get("summary").and_then(|s| s.as_str()).unwrap_or("");
-                    let updated_at = entry.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let updated_at = entry
+                        .get("updated_at")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
 
                     // Apply filters
                     if let Some(ref tags) = filter_tags {
-                        let entry_tags: Vec<String> = entry.get("tags")
+                        let entry_tags: Vec<String> = entry
+                            .get("tags")
                             .and_then(|t| t.as_array())
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         if !tags.iter().any(|t| entry_tags.contains(t)) {
                             continue;
@@ -1088,7 +1506,8 @@ impl Agent {
                     let key_lower = key.to_lowercase();
                     let summary_lower = summary.to_lowercase();
 
-                    let score: usize = keywords.iter()
+                    let score: usize = keywords
+                        .iter()
                         .filter(|kw| key_lower.contains(*kw) || summary_lower.contains(*kw))
                         .count();
 
@@ -1111,12 +1530,14 @@ impl Agent {
             if let Some(entries) = data.get("entries").and_then(|e| e.as_object()) {
                 for (key, value) in entries {
                     let key_lower = key.to_lowercase();
-                    let summary_lower = value.get("summary")
+                    let summary_lower = value
+                        .get("summary")
                         .and_then(|s| s.as_str())
                         .unwrap_or("")
                         .to_lowercase();
 
-                    let score: usize = keywords.iter()
+                    let score: usize = keywords
+                        .iter()
                         .filter(|kw| key_lower.contains(*kw) || summary_lower.contains(*kw))
                         .count();
 
@@ -1141,7 +1562,8 @@ impl Agent {
         Ok(serde_json::json!({
             "success": true,
             "results": results
-        }).to_string())
+        })
+        .to_string())
     }
 
     pub async fn process_input(&self, input: AgentInput) -> Result<Vec<String>, AgentError> {
@@ -1152,6 +1574,7 @@ impl Agent {
         // so that downstream execAsAgent commands with depending_nonce can find them.
         for cmd in &input.commands {
             self.update_process_info(cmd.nonce, 0, ProcessStatus::Waiting, 0)?;
+            self.register_command_scope(cmd);
         }
 
         // Start all commands asynchronously without waiting for completion
@@ -1191,7 +1614,8 @@ impl Agent {
                         let wait = cmd.wait.unwrap_or(false);
                         let expected_status = cmd.expected_status.unwrap_or(0);
                         if wait {
-                            self.check_dependency(dep_nonce, expected_status, true).await?;
+                            self.check_dependency(dep_nonce, expected_status, true)
+                                .await?;
                         }
                     }
                     match self.fetch_status(&cmd) {
@@ -1205,8 +1629,33 @@ impl Agent {
                         }
                     }
                 }
-                "inspectPath" => {
-                    match self.inspect_path(&cmd) {
+                "inspectPath" => match self.inspect_path(&cmd) {
+                    Ok(result) => {
+                        results.push(result);
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                    }
+                    Err(e) => {
+                        results.push(format!("Error: {}", e));
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                    }
+                },
+                "editFile" => match self.edit_file(&cmd) {
+                    Ok(result) => {
+                        results.push(result);
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                    }
+                    Err(e) => {
+                        results.push(format!("Error: {}", e));
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                    }
+                },
+                "writeFile" => {
+                    let mut edit_cmd = cmd.clone();
+                    edit_cmd.function = "editFile".to_string();
+                    if edit_cmd.operation.is_none() {
+                        edit_cmd.operation = Some("write".to_string());
+                    }
+                    match self.edit_file(&edit_cmd) {
                         Ok(result) => {
                             results.push(result);
                             self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
@@ -1217,78 +1666,56 @@ impl Agent {
                         }
                     }
                 }
-                "editFile" => {
-                    match self.edit_file(&cmd) {
-                        Ok(result) => {
-                            results.push(result);
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
-                        }
-                        Err(e) => {
-                            results.push(format!("Error: {}", e));
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
-                        }
+                "browse" => match self.browse(&cmd).await {
+                    Ok(result) => {
+                        results.push(result);
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
-                }
-                "browse" => {
-                    match self.browse(&cmd).await {
-                        Ok(result) => {
-                            results.push(result);
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
-                        }
-                        Err(e) => {
-                            results.push(format!("Error: {}", e));
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
-                        }
+                    Err(e) => {
+                        results.push(format!("Error: {}", e));
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
-                }
-                "askHuman" => {
-                    match self.ask_human(&cmd).await {
-                        Ok(result) => {
-                            results.push(result);
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
-                        }
-                        Err(e) => {
-                            results.push(format!("Error: {}", e));
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
-                        }
+                },
+                "askHuman" => match self.ask_human(&cmd).await {
+                    Ok(result) => {
+                        results.push(result);
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
-                }
-                "execPty" => {
-                    match self.exec_pty(&cmd).await {
-                        Ok(result) => {
-                            results.push(result);
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
-                        }
-                        Err(e) => {
-                            results.push(format!("Error: {}", e));
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
-                        }
+                    Err(e) => {
+                        results.push(format!("Error: {}", e));
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
-                }
-                "storeMemory" => {
-                    match self.store_memory(&cmd) {
-                        Ok(result) => {
-                            results.push(result);
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
-                        }
-                        Err(e) => {
-                            results.push(format!("Error: {}", e));
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
-                        }
+                },
+                "execPty" => match self.exec_pty(&cmd).await {
+                    Ok(result) => {
+                        results.push(result);
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
-                }
-                "recallMemory" => {
-                    match self.recall_memory(&cmd) {
-                        Ok(result) => {
-                            results.push(result);
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
-                        }
-                        Err(e) => {
-                            results.push(format!("Error: {}", e));
-                            self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
-                        }
+                    Err(e) => {
+                        results.push(format!("Error: {}", e));
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
-                }
+                },
+                "storeMemory" => match self.store_memory(&cmd) {
+                    Ok(result) => {
+                        results.push(result);
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                    }
+                    Err(e) => {
+                        results.push(format!("Error: {}", e));
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                    }
+                },
+                "recallMemory" => match self.recall_memory(&cmd) {
+                    Ok(result) => {
+                        results.push(result);
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
+                    }
+                    Err(e) => {
+                        results.push(format!("Error: {}", e));
+                        self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
+                    }
+                },
                 _ => {
                     return Err(AgentError::Process(format!(
                         "Unknown function: {}",
@@ -1297,12 +1724,12 @@ impl Agent {
                 }
             }
         }
-    
+
         // Wait for the specified duration if requested
         if let Some(wait_time) = input.wait_for_status {
             tokio::time::sleep(Duration::from_millis(wait_time)).await;
         }
-    
+
         // Return current results without waiting for completion
         Ok(results)
     }
@@ -1337,27 +1764,23 @@ impl Agent {
             )
         };
         mmap[offset..offset + info_size].copy_from_slice(bytes);
-        
+
         // Update process map
         let mut map = self.process_map.write().unwrap();
         map.insert(nonce, offset);
-        
+
         Ok(())
     }
 
     fn get_process_info(&self, nonce: u64) -> Result<ProcessInfo, AgentError> {
         let map = self.process_map.read().unwrap();
-        let offset = *map
-            .get(&nonce)
-            .ok_or(AgentError::InvalidNonce(nonce))?;
+        let offset = *map.get(&nonce).ok_or(AgentError::InvalidNonce(nonce))?;
 
         let mmap = self.shared_mem.read().unwrap();
         let info_slice = &mmap[offset..offset + size_of::<ProcessInfo>()];
-        
-        let info = unsafe {
-            std::ptr::read(info_slice.as_ptr() as *const ProcessInfo)
-        };
-        
+
+        let info = unsafe { std::ptr::read(info_slice.as_ptr() as *const ProcessInfo) };
+
         Ok(info)
     }
 
@@ -1376,13 +1799,13 @@ impl Agent {
                         ProcessStatus::Completed if info.exit_code == expected_status => {
                             return Ok(true)
                         }
-                        ProcessStatus::Completed | ProcessStatus::Failed | ProcessStatus::Skipped => {
+                        ProcessStatus::Completed
+                        | ProcessStatus::Failed
+                        | ProcessStatus::Skipped => {
                             // Terminal states - no point retrying
-                            return Ok(false)
+                            return Ok(false);
                         }
-                        _ if !wait => {
-                            return Ok(false)
-                        }
+                        _ if !wait => return Ok(false),
                         _ => {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             retries -= 1;
@@ -1426,6 +1849,57 @@ impl Agent {
     }
 }
 
+fn shared_dir() -> PathBuf {
+    std::env::var("INTENDANT_SHARED_DIR")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            let shm = PathBuf::from("/dev/shm");
+            if shm.exists() {
+                Some(shm)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn shared_path(name: &str) -> PathBuf {
+    shared_dir().join(name)
+}
+
+fn shared_mem_path() -> PathBuf {
+    shared_path("intendant_processes")
+}
+
+fn session_file_path() -> PathBuf {
+    shared_path("intendant_session")
+}
+
+fn runtime_session_marker_path() -> PathBuf {
+    shared_path("intendant_runtime_session")
+}
+
+fn human_question_path() -> PathBuf {
+    shared_path("intendant_human_question")
+}
+
+fn human_response_path() -> PathBuf {
+    shared_path("intendant_human_response")
+}
+
+fn truncate_utf8_by_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,11 +1910,8 @@ mod tests {
         let shm_dir = TempDir::new().unwrap();
         let log_dir = TempDir::new().unwrap();
         let shm_path = shm_dir.path().join("test_processes");
-        let agent = Agent::new_with_paths(
-            shm_path.to_str().unwrap(),
-            log_dir.path().to_path_buf(),
-        )
-        .unwrap();
+        let agent = Agent::new_with_paths(shm_path.to_str().unwrap(), log_dir.path().to_path_buf())
+            .unwrap();
         (agent, shm_dir, log_dir)
     }
 
@@ -1582,7 +2053,10 @@ mod tests {
             ..Default::default()
         };
         let result = agent.fetch_status(&cmd).unwrap();
-        assert_eq!(result, "r");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["value"], "r");
+        assert_eq!(parsed["target_nonce"], 5);
     }
 
     #[tokio::test]
@@ -1598,7 +2072,10 @@ mod tests {
             ..Default::default()
         };
         let result = agent.fetch_status(&cmd).unwrap();
-        assert_eq!(result, "127");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["value"], 127);
+        assert_eq!(parsed["target_nonce"], 5);
     }
 
     #[tokio::test]
@@ -1617,8 +2094,9 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"], "hello world");
-        assert_eq!(parsed["total_size"], 11);
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["data"]["content"], "hello world");
+        assert_eq!(parsed["data"]["total_size"], 11);
     }
 
     #[tokio::test]
@@ -1639,8 +2117,10 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"], "target output");
-        assert_eq!(parsed["total_size"], 13);
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["target_nonce"], 100);
+        assert_eq!(parsed["data"]["content"], "target output");
+        assert_eq!(parsed["data"]["total_size"], 13);
     }
 
     #[tokio::test]
@@ -1657,7 +2137,10 @@ mod tests {
             ..Default::default()
         };
         let result = agent.fetch_status(&cmd).unwrap();
-        assert_eq!(result, "42");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["value"], 42);
+        assert_eq!(parsed["target_nonce"], 100);
     }
 
     #[tokio::test]
@@ -1689,6 +2172,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_status_unknown_nonce_returns_structured_error() {
+        let (agent, _shm, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "fetchStatus".to_string(),
+            nonce: 4242,
+            status_type: Some("status".to_string()),
+            ..Default::default()
+        };
+        let result = agent.fetch_status(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["target_nonce"], 4242);
+        assert!(parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("nonce_not_found"));
+    }
+
+    #[tokio::test]
     async fn fetch_status_stdout_missing_log_file() {
         let (agent, _shm, _log) = create_test_agent();
         agent
@@ -1703,8 +2205,10 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"], "");
-        assert_eq!(parsed["total_size"], 0);
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["data"]["content"], "");
+        assert_eq!(parsed["data"]["total_size"], 0);
+        assert_eq!(parsed["data"]["bytes_read"], 0);
     }
 
     #[tokio::test]
@@ -1863,7 +2367,11 @@ mod tests {
         let elapsed = start.elapsed();
         assert_eq!(results.len(), 1);
         // Should have waited at least 200ms
-        assert!(elapsed.as_millis() >= 150, "should have waited ~200ms, took {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() >= 150,
+            "should have waited ~200ms, took {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -1909,13 +2417,8 @@ mod tests {
             .unwrap();
 
         // Simulate status update (what happens when process completes)
-        Agent::update_process_status(
-            agent.shared_mem.clone(),
-            1,
-            ProcessStatus::Completed,
-            0,
-        )
-        .unwrap();
+        Agent::update_process_status(agent.shared_mem.clone(), 1, ProcessStatus::Completed, 0)
+            .unwrap();
 
         // Read the process info back - PID should still be 9999
         let info = agent.get_process_info(1).unwrap();
@@ -1951,7 +2454,9 @@ mod tests {
         // Create a small file (< 10KB)
         let content = "a".repeat(500);
         fs::write(log_dir.path().join("1_stdout.log"), &content).unwrap();
-        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 0)
+            .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 1,
@@ -1960,8 +2465,8 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"].as_str().unwrap().len(), 500);
-        assert_eq!(parsed["total_size"], 500);
+        assert_eq!(parsed["data"]["content"].as_str().unwrap().len(), 500);
+        assert_eq!(parsed["data"]["total_size"], 500);
     }
 
     #[tokio::test]
@@ -1970,7 +2475,9 @@ mod tests {
         // Create a file larger than 10KB
         let content = "x".repeat(20_000);
         fs::write(log_dir.path().join("1_stdout.log"), &content).unwrap();
-        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 0)
+            .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 1,
@@ -1980,16 +2487,18 @@ mod tests {
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         // Default tail is 10KB = 10240 bytes
-        assert_eq!(parsed["bytes_read"], 10240);
-        assert_eq!(parsed["total_size"], 20000);
-        assert_eq!(parsed["offset"], 20000 - 10240);
+        assert_eq!(parsed["data"]["bytes_read"], 10240);
+        assert_eq!(parsed["data"]["total_size"], 20000);
+        assert_eq!(parsed["data"]["offset"], 20000 - 10240);
     }
 
     #[tokio::test]
     async fn fetch_status_offset_and_limit() {
         let (agent, _shm, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
-        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 0)
+            .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 1,
@@ -2000,17 +2509,19 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"], "3456");
-        assert_eq!(parsed["offset"], 3);
-        assert_eq!(parsed["bytes_read"], 4);
-        assert_eq!(parsed["total_size"], 10);
+        assert_eq!(parsed["data"]["content"], "3456");
+        assert_eq!(parsed["data"]["offset"], 3);
+        assert_eq!(parsed["data"]["bytes_read"], 4);
+        assert_eq!(parsed["data"]["total_size"], 10);
     }
 
     #[tokio::test]
     async fn fetch_status_offset_only() {
         let (agent, _shm, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
-        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 0)
+            .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 1,
@@ -2020,16 +2531,18 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"], "789");
-        assert_eq!(parsed["offset"], 7);
-        assert_eq!(parsed["bytes_read"], 3);
+        assert_eq!(parsed["data"]["content"], "789");
+        assert_eq!(parsed["data"]["offset"], 7);
+        assert_eq!(parsed["data"]["bytes_read"], 3);
     }
 
     #[tokio::test]
     async fn fetch_status_limit_only() {
         let (agent, _shm, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
-        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 0)
+            .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 1,
@@ -2039,16 +2552,18 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"], "789");
-        assert_eq!(parsed["offset"], 7);
-        assert_eq!(parsed["bytes_read"], 3);
+        assert_eq!(parsed["data"]["content"], "789");
+        assert_eq!(parsed["data"]["offset"], 7);
+        assert_eq!(parsed["data"]["bytes_read"], 3);
     }
 
     #[tokio::test]
     async fn fetch_status_offset_beyond_file() {
         let (agent, _shm, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stdout.log"), "short").unwrap();
-        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 0)
+            .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 1,
@@ -2058,16 +2573,18 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"], "");
-        assert_eq!(parsed["bytes_read"], 0);
-        assert_eq!(parsed["total_size"], 5);
+        assert_eq!(parsed["data"]["content"], "");
+        assert_eq!(parsed["data"]["bytes_read"], 0);
+        assert_eq!(parsed["data"]["total_size"], 5);
     }
 
     #[tokio::test]
     async fn fetch_status_stderr_partial() {
         let (agent, _shm, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stderr.log"), "error output here").unwrap();
-        agent.update_process_info(1, 100, ProcessStatus::Completed, 0).unwrap();
+        agent
+            .update_process_info(1, 100, ProcessStatus::Completed, 0)
+            .unwrap();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 1,
@@ -2078,7 +2595,7 @@ mod tests {
         };
         let result = agent.fetch_status(&cmd).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["content"], "output");
+        assert_eq!(parsed["data"]["content"], "output");
     }
 
     // --- editFile tests ---
@@ -2401,8 +2918,16 @@ mod tests {
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["status"], 200);
         let content = parsed["content"].as_str().unwrap();
-        assert!(content.contains("Hello"), "should contain converted text, got: {}", content);
-        assert!(content.contains("World"), "should contain converted text, got: {}", content);
+        assert!(
+            content.contains("Hello"),
+            "should contain converted text, got: {}",
+            content
+        );
+        assert!(
+            content.contains("World"),
+            "should contain converted text, got: {}",
+            content
+        );
     }
 
     #[tokio::test]
@@ -2529,7 +3054,10 @@ mod tests {
         let (agent, _shm, _log) = create_test_agent();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let result = agent.wait_for_port_with_retries(port, 3, 100).await.unwrap();
+        let result = agent
+            .wait_for_port_with_retries(port, 3, 100)
+            .await
+            .unwrap();
         assert!(result, "should succeed when port is already open");
     }
 
@@ -2547,7 +3075,10 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
-        let result = agent.wait_for_port_with_retries(port, 20, 100).await.unwrap();
+        let result = agent
+            .wait_for_port_with_retries(port, 20, 100)
+            .await
+            .unwrap();
         assert!(result, "should succeed when port opens during wait");
     }
 
@@ -2555,7 +3086,10 @@ mod tests {
     async fn wait_for_port_timeout() {
         let (agent, _shm, _log) = create_test_agent();
         // Use a port that is very likely not open
-        let result = agent.wait_for_port_with_retries(19999, 3, 50).await.unwrap();
+        let result = agent
+            .wait_for_port_with_retries(19999, 3, 50)
+            .await
+            .unwrap();
         assert!(!result, "should fail when port never opens");
     }
 
@@ -2594,7 +3128,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let q_path = tmp.path().join("question");
         let r_path = tmp.path().join("response");
-        let result = agent.ask_human_with_paths(&cmd, &q_path, &r_path, 1000, 100).await;
+        let result = agent
+            .ask_human_with_paths(&cmd, &q_path, &r_path, 1000, 100)
+            .await;
         assert!(result.is_err());
     }
 
@@ -2612,7 +3148,10 @@ mod tests {
             question: Some("what is the answer?".to_string()),
             ..Default::default()
         };
-        let result = agent.ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100).await.unwrap();
+        let result = agent
+            .ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["question"], "what is the answer?");
@@ -2639,7 +3178,10 @@ mod tests {
             question: Some("waiting for answer".to_string()),
             ..Default::default()
         };
-        let result = agent.ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100).await.unwrap();
+        let result = agent
+            .ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["response"], "delayed answer");
@@ -2657,7 +3199,10 @@ mod tests {
             question: Some("will time out".to_string()),
             ..Default::default()
         };
-        let result = agent.ask_human_with_paths(&cmd, &q_path, &r_path, 300, 100).await.unwrap();
+        let result = agent
+            .ask_human_with_paths(&cmd, &q_path, &r_path, 300, 100)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], false);
         assert!(parsed["error"].as_str().unwrap().contains("Timed out"));
@@ -2677,7 +3222,10 @@ mod tests {
             question: Some("my question here".to_string()),
             ..Default::default()
         };
-        agent.ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100).await.unwrap();
+        agent
+            .ask_human_with_paths(&cmd, &q_path, &r_path, 5000, 100)
+            .await
+            .unwrap();
         // Question file should have been cleaned up, but we can verify the write happened
         // by checking the response worked (question was written first, then response read)
     }
@@ -2694,9 +3242,18 @@ mod tests {
             question: Some("cleanup test".to_string()),
             ..Default::default()
         };
-        agent.ask_human_with_paths(&cmd, &q_path, &r_path, 200, 50).await.unwrap();
-        assert!(!q_path.exists(), "question file should be cleaned up after timeout");
-        assert!(!r_path.exists(), "response file should be cleaned up after timeout");
+        agent
+            .ask_human_with_paths(&cmd, &q_path, &r_path, 200, 50)
+            .await
+            .unwrap();
+        assert!(
+            !q_path.exists(),
+            "question file should be cleaned up after timeout"
+        );
+        assert!(
+            !r_path.exists(),
+            "response file should be cleaned up after timeout"
+        );
     }
 
     // --- execPty tests ---
@@ -2715,7 +3272,11 @@ mod tests {
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["shell_id"], "default");
         let output = parsed["output"].as_str().unwrap();
-        assert!(output.contains("hello_pty"), "output should contain echo result, got: {}", output);
+        assert!(
+            output.contains("hello_pty"),
+            "output should contain echo result, got: {}",
+            output
+        );
     }
 
     #[tokio::test]
@@ -2744,7 +3305,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
         let output = parsed["output"].as_str().unwrap();
-        assert!(output.contains("persistent_value"), "env var should persist, got: {}", output);
+        assert!(
+            output.contains("persistent_value"),
+            "env var should persist, got: {}",
+            output
+        );
     }
 
     #[tokio::test]
@@ -2773,7 +3338,11 @@ mod tests {
         let result = agent.exec_pty(&cmd2).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let output = parsed["output"].as_str().unwrap();
-        assert!(output.contains(&tmp_path), "cd should persist, got: {}", output);
+        assert!(
+            output.contains(&tmp_path),
+            "cd should persist, got: {}",
+            output
+        );
     }
 
     #[tokio::test]
@@ -2809,7 +3378,11 @@ mod tests {
         let result = agent.exec_pty(&cmd3).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let output = parsed["output"].as_str().unwrap();
-        assert!(output.contains("session_a"), "session a should have its own state, got: {}", output);
+        assert!(
+            output.contains("session_a"),
+            "session a should have its own state, got: {}",
+            output
+        );
     }
 
     #[tokio::test]
@@ -3090,7 +3663,11 @@ mod tests {
         let memory_file = dir.path().join("knowledge.json");
 
         // First, create a new-format file
-        std::fs::write(&memory_file, r#"{"entries":[],"subscriptions":{},"cursors":{}}"#).unwrap();
+        std::fs::write(
+            &memory_file,
+            r#"{"entries":[],"subscriptions":{},"cursors":{}}"#,
+        )
+        .unwrap();
 
         let cmd = AgentCommand {
             function: "storeMemory".to_string(),
@@ -3200,7 +3777,11 @@ mod tests {
 
         let memory_file = dir.path().join("old_mem.json");
         // Pre-populate with old format
-        std::fs::write(&memory_file, r#"{"entries":{"existing":{"summary":"old data","created_at":100,"updated_at":200}}}"#).unwrap();
+        std::fs::write(
+            &memory_file,
+            r#"{"entries":{"existing":{"summary":"old data","created_at":100,"updated_at":200}}}"#,
+        )
+        .unwrap();
 
         // Store in old format (no tags/channel/source)
         let cmd = AgentCommand {

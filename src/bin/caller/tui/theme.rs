@@ -8,9 +8,9 @@ pub const STATUS_MODEL_FG: Color = Color::Rgb(166, 227, 161);
 pub const STATUS_TURN_FG: Color = Color::Rgb(249, 226, 175);
 
 // Budget bar
-pub const BUDGET_LOW_FG: Color = Color::Rgb(166, 227, 161);   // green <50%
-pub const BUDGET_MED_FG: Color = Color::Rgb(249, 226, 175);   // yellow 50-85%
-pub const BUDGET_HIGH_FG: Color = Color::Rgb(243, 139, 168);  // red >85%
+pub const BUDGET_LOW_FG: Color = Color::Rgb(166, 227, 161); // green <50%
+pub const BUDGET_MED_FG: Color = Color::Rgb(249, 226, 175); // yellow 50-85%
+pub const BUDGET_HIGH_FG: Color = Color::Rgb(243, 139, 168); // red >85%
 
 // Action panel
 pub const ACTION_BG: Color = Color::Rgb(24, 24, 37);

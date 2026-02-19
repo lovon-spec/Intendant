@@ -1,12 +1,12 @@
 use crate::models::ProcessInfo;
 use crate::models::ProcessStatus;
+use memmap2::MmapMut;
 use std::{
     collections::HashMap,
     mem::size_of,
     sync::{Arc, RwLock},
     time::Duration,
 };
-use memmap2::MmapMut;
 use tokio::sync::mpsc;
 
 pub struct StatusMonitor {
@@ -34,22 +34,22 @@ impl StatusMonitor {
     pub async fn run(&self) {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         let mut last_status: HashMap<u64, (ProcessStatus, i32)> = HashMap::new();
-    
+
         loop {
             interval.tick().await;
-            
+
             // Collect all nonces and offsets first
             let entries: Vec<(u64, usize)> = {
                 let map = self.process_map.read().unwrap();
                 map.iter().map(|(&k, &v)| (k, v)).collect()
             };
-    
+
             for (nonce, offset) in entries {
                 let status_str = {
                     let mmap = self.shared_mem.read().unwrap();
                     let info_slice = &mmap[offset..offset + size_of::<ProcessInfo>()];
                     let info = unsafe { std::ptr::read(info_slice.as_ptr() as *const ProcessInfo) };
-                    
+
                     let status_key = (info.status, info.exit_code);
                     if last_status.get(&nonce) != Some(&status_key) {
                         last_status.insert(nonce, status_key);
@@ -58,7 +58,7 @@ impl StatusMonitor {
                         continue;
                     }
                 };
-    
+
                 if let Err(e) = self.output_tx.send(status_str).await {
                     eprintln!("Failed to send status update: {}", e);
                 }

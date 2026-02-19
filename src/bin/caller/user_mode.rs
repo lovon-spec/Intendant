@@ -5,11 +5,7 @@ use crate::project::Project;
 use crate::sub_agent::{SubAgentProgress, SubAgentRole, SubAgentSpec};
 use std::path::{Path, PathBuf};
 
-pub fn spawn_orchestrator_spec(
-    task: &str,
-    project: &Project,
-    _caller_path: &Path,
-) -> SubAgentSpec {
+pub fn spawn_orchestrator_spec(task: &str, project: &Project, _caller_path: &Path) -> SubAgentSpec {
     let sub_agent_dir = project.sub_agent_dir();
     let orch_dir = sub_agent_dir.join("orchestrator");
 
@@ -30,7 +26,7 @@ pub fn format_progress_for_user(progress: &SubAgentProgress) -> String {
 
     if !progress.last_action.is_empty() {
         let action = if progress.last_action.len() > 100 {
-            format!("{}...", &progress.last_action[..100])
+            format!("{}...", truncate_utf8(&progress.last_action, 100))
         } else {
             progress.last_action.clone()
         };
@@ -60,6 +56,17 @@ pub fn get_caller_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./target/debug/intendant"))
 }
 
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,7 +94,10 @@ mod tests {
         assert_eq!(spec.working_dir, PathBuf::from("/tmp/proj"));
         assert!(spec.inherit_memory);
         assert!(spec.result_file.to_string_lossy().contains("orchestrator"));
-        assert!(spec.progress_file.to_string_lossy().contains("orchestrator"));
+        assert!(spec
+            .progress_file
+            .to_string_lossy()
+            .contains("orchestrator"));
     }
 
     #[test]
@@ -151,7 +161,8 @@ mod tests {
 
         relay_user_input(&spec, "Use PostgreSQL").unwrap();
 
-        let content = std::fs::read_to_string(dir.path().join(".intendant/user_input.txt")).unwrap();
+        let content =
+            std::fs::read_to_string(dir.path().join(".intendant/user_input.txt")).unwrap();
         assert_eq!(content, "Use PostgreSQL");
     }
 

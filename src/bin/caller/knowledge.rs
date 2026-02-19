@@ -54,7 +54,11 @@ pub struct KnowledgeQuery {
 
 pub fn publish(store: &mut KnowledgeStore, entry: KnowledgeEntry) {
     // Check if entry with same key and source exists
-    if let Some(existing) = store.entries.iter_mut().find(|e| e.key == entry.key && e.source == entry.source) {
+    if let Some(existing) = store
+        .entries
+        .iter_mut()
+        .find(|e| e.key == entry.key && e.source == entry.source)
+    {
         existing.summary = entry.summary;
         existing.tags = entry.tags;
         existing.channel = entry.channel;
@@ -132,7 +136,9 @@ pub fn get_unseen<'a>(store: &'a KnowledgeStore, agent_id: &str) -> Vec<&'a Know
 }
 
 pub fn advance_cursor(store: &mut KnowledgeStore, agent_id: &str) {
-    store.cursors.insert(agent_id.to_string(), store.entries.len());
+    store
+        .cursors
+        .insert(agent_id.to_string(), store.entries.len());
 }
 
 pub fn load(path: &Path) -> Result<KnowledgeStore, CallerError> {
@@ -164,8 +170,7 @@ fn migrate_from_old_format(content: &str) -> Result<KnowledgeStore, CallerError>
         entries: HashMap<String, OldMemoryEntry>,
     }
 
-    let old_store: OldMemoryStore = serde_json::from_str(content)
-        .map_err(CallerError::Json)?;
+    let old_store: OldMemoryStore = serde_json::from_str(content).map_err(CallerError::Json)?;
 
     let mut new_store = KnowledgeStore::new();
     let mut id_counter = 0u64;
@@ -191,8 +196,9 @@ pub fn save(store: &KnowledgeStore, path: &Path) -> Result<(), CallerError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = serde_json::to_string_pretty(store)
-        .map_err(|e| CallerError::SubAgent(format!("Failed to serialize knowledge store: {}", e)))?;
+    let content = serde_json::to_string_pretty(store).map_err(|e| {
+        CallerError::SubAgent(format!("Failed to serialize knowledge store: {}", e))
+    })?;
     std::fs::write(path, content)?;
     Ok(())
 }
@@ -204,7 +210,10 @@ pub fn format_for_injection(entries: &[&KnowledgeEntry]) -> String {
 
     let mut msg = String::from("[Knowledge Update]\n\n");
     for entry in entries {
-        msg.push_str(&format!("- **{}** ({}): {}", entry.key, entry.channel, entry.summary));
+        msg.push_str(&format!(
+            "- **{}** ({}): {}",
+            entry.key, entry.channel, entry.summary
+        ));
         if !entry.tags.is_empty() {
             msg.push_str(&format!(" [tags: {}]", entry.tags.join(", ")));
         }
@@ -264,7 +273,12 @@ mod tests {
     #[test]
     fn publish_new_entry() {
         let mut store = KnowledgeStore::new();
-        let entry = make_entry("db-schema", "PostgreSQL with 5 tables", "findings", &["database"]);
+        let entry = make_entry(
+            "db-schema",
+            "PostgreSQL with 5 tables",
+            "findings",
+            &["database"],
+        );
         publish(&mut store, entry);
         assert_eq!(store.entries.len(), 1);
         assert_eq!(store.entries[0].key, "db-schema");
@@ -273,10 +287,20 @@ mod tests {
     #[test]
     fn publish_updates_existing() {
         let mut store = KnowledgeStore::new();
-        let entry1 = make_entry("db-schema", "PostgreSQL with 5 tables", "findings", &["database"]);
+        let entry1 = make_entry(
+            "db-schema",
+            "PostgreSQL with 5 tables",
+            "findings",
+            &["database"],
+        );
         publish(&mut store, entry1);
 
-        let mut entry2 = make_entry("db-schema", "PostgreSQL with 7 tables", "findings", &["database"]);
+        let mut entry2 = make_entry(
+            "db-schema",
+            "PostgreSQL with 7 tables",
+            "findings",
+            &["database"],
+        );
         entry2.updated_at = 2000;
         publish(&mut store, entry2);
 
@@ -288,14 +312,26 @@ mod tests {
     #[test]
     fn query_by_tags() {
         let mut store = KnowledgeStore::new();
-        publish(&mut store, make_entry("e1", "db stuff", "findings", &["database"]));
-        publish(&mut store, make_entry("e2", "api stuff", "findings", &["api"]));
-        publish(&mut store, make_entry("e3", "db api", "findings", &["database", "api"]));
+        publish(
+            &mut store,
+            make_entry("e1", "db stuff", "findings", &["database"]),
+        );
+        publish(
+            &mut store,
+            make_entry("e2", "api stuff", "findings", &["api"]),
+        );
+        publish(
+            &mut store,
+            make_entry("e3", "db api", "findings", &["database", "api"]),
+        );
 
-        let results = query(&store, &KnowledgeQuery {
-            tags: Some(vec!["database".to_string()]),
-            ..Default::default()
-        });
+        let results = query(
+            &store,
+            &KnowledgeQuery {
+                tags: Some(vec!["database".to_string()]),
+                ..Default::default()
+            },
+        );
         assert_eq!(results.len(), 2);
     }
 
@@ -305,10 +341,13 @@ mod tests {
         publish(&mut store, make_entry("e1", "finding", "findings", &[]));
         publish(&mut store, make_entry("e2", "decision", "decisions", &[]));
 
-        let results = query(&store, &KnowledgeQuery {
-            channel: Some("findings".to_string()),
-            ..Default::default()
-        });
+        let results = query(
+            &store,
+            &KnowledgeQuery {
+                channel: Some("findings".to_string()),
+                ..Default::default()
+            },
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "e1");
     }
@@ -324,10 +363,13 @@ mod tests {
         e2.source = "agent-2".to_string();
         publish(&mut store, e2);
 
-        let results = query(&store, &KnowledgeQuery {
-            source: Some("agent-1".to_string()),
-            ..Default::default()
-        });
+        let results = query(
+            &store,
+            &KnowledgeQuery {
+                source: Some("agent-1".to_string()),
+                ..Default::default()
+            },
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "e1");
     }
@@ -335,13 +377,22 @@ mod tests {
     #[test]
     fn query_by_keywords() {
         let mut store = KnowledgeStore::new();
-        publish(&mut store, make_entry("db-schema", "PostgreSQL tables", "findings", &[]));
-        publish(&mut store, make_entry("api-routes", "REST endpoints", "findings", &[]));
+        publish(
+            &mut store,
+            make_entry("db-schema", "PostgreSQL tables", "findings", &[]),
+        );
+        publish(
+            &mut store,
+            make_entry("api-routes", "REST endpoints", "findings", &[]),
+        );
 
-        let results = query(&store, &KnowledgeQuery {
-            keywords: Some(vec!["postgresql".to_string()]),
-            ..Default::default()
-        });
+        let results = query(
+            &store,
+            &KnowledgeQuery {
+                keywords: Some(vec!["postgresql".to_string()]),
+                ..Default::default()
+            },
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "db-schema");
     }
@@ -357,10 +408,13 @@ mod tests {
         e2.updated_at = 200;
         publish(&mut store, e2);
 
-        let results = query(&store, &KnowledgeQuery {
-            since: Some(150),
-            ..Default::default()
-        });
+        let results = query(
+            &store,
+            &KnowledgeQuery {
+                since: Some(150),
+                ..Default::default()
+            },
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "new");
     }
@@ -368,15 +422,27 @@ mod tests {
     #[test]
     fn query_combined_filters() {
         let mut store = KnowledgeStore::new();
-        publish(&mut store, make_entry("e1", "db tables", "findings", &["database"]));
-        publish(&mut store, make_entry("e2", "api routes", "findings", &["api"]));
-        publish(&mut store, make_entry("e3", "db backup", "decisions", &["database"]));
+        publish(
+            &mut store,
+            make_entry("e1", "db tables", "findings", &["database"]),
+        );
+        publish(
+            &mut store,
+            make_entry("e2", "api routes", "findings", &["api"]),
+        );
+        publish(
+            &mut store,
+            make_entry("e3", "db backup", "decisions", &["database"]),
+        );
 
-        let results = query(&store, &KnowledgeQuery {
-            tags: Some(vec!["database".to_string()]),
-            channel: Some("findings".to_string()),
-            ..Default::default()
-        });
+        let results = query(
+            &store,
+            &KnowledgeQuery {
+                tags: Some(vec!["database".to_string()]),
+                channel: Some("findings".to_string()),
+                ..Default::default()
+            },
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "e1");
     }
@@ -453,7 +519,10 @@ mod tests {
         let path = dir.path().join("knowledge.json");
 
         let mut store = KnowledgeStore::new();
-        publish(&mut store, make_entry("db", "PostgreSQL", "findings", &["database"]));
+        publish(
+            &mut store,
+            make_entry("db", "PostgreSQL", "findings", &["database"]),
+        );
         subscribe(&mut store, "agent-1", "findings");
         advance_cursor(&mut store, "agent-1");
 
@@ -462,7 +531,10 @@ mod tests {
 
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].key, "db");
-        assert_eq!(loaded.subscriptions["agent-1"], vec!["findings".to_string()]);
+        assert_eq!(
+            loaded.subscriptions["agent-1"],
+            vec!["findings".to_string()]
+        );
         assert_eq!(loaded.cursors["agent-1"], 1);
     }
 

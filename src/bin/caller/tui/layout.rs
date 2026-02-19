@@ -29,11 +29,7 @@ pub struct AppLayout {
 
 /// Calculate the layout for the TUI given terminal size and panel config.
 /// `bottom_height` is non-zero when approval or input panel is active.
-pub fn calculate_layout(
-    area: Rect,
-    config: &PanelConfig,
-    bottom_height: u16,
-) -> AppLayout {
+pub fn calculate_layout(area: Rect, config: &PanelConfig, bottom_height: u16) -> AppLayout {
     let mut constraints = Vec::new();
     let mut slot_names: Vec<&str> = Vec::new();
 

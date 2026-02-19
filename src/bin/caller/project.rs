@@ -58,8 +58,9 @@ impl Project {
         let root = detect_project_root()?;
         let config_path = root.join("intendant.toml");
         let config = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)
-                .map_err(|e| CallerError::Config(format!("Failed to read intendant.toml: {}", e)))?;
+            let content = std::fs::read_to_string(&config_path).map_err(|e| {
+                CallerError::Config(format!("Failed to read intendant.toml: {}", e))
+            })?;
             toml::from_str(&content)
                 .map_err(|e| CallerError::Toml(format!("Failed to parse intendant.toml: {}", e)))?
         } else {
@@ -136,7 +137,10 @@ sub_agent_dir = ".custom/agents"
         assert_eq!(config.model.context_window, Some(200_000));
         assert_eq!(config.model.max_output_tokens, Some(16_384));
         assert_eq!(config.orchestrator.max_parallel_agents, Some(4));
-        assert_eq!(config.orchestrator.sub_agent_dir.as_deref(), Some(".custom/agents"));
+        assert_eq!(
+            config.orchestrator.sub_agent_dir.as_deref(),
+            Some(".custom/agents")
+        );
     }
 
     #[test]
@@ -175,9 +179,18 @@ context_window = 128000
             root: PathBuf::from("/tmp/myproject"),
             config: ProjectConfig::default(),
         };
-        assert_eq!(project.memory_path(), PathBuf::from("/tmp/myproject/.intendant/memory.json"));
-        assert_eq!(project.agent_dir(), PathBuf::from("/tmp/myproject/.intendant"));
-        assert_eq!(project.sub_agent_dir(), PathBuf::from("/tmp/myproject/.intendant/subagents"));
+        assert_eq!(
+            project.memory_path(),
+            PathBuf::from("/tmp/myproject/.intendant/memory.json")
+        );
+        assert_eq!(
+            project.agent_dir(),
+            PathBuf::from("/tmp/myproject/.intendant")
+        );
+        assert_eq!(
+            project.sub_agent_dir(),
+            PathBuf::from("/tmp/myproject/.intendant/subagents")
+        );
     }
 
     #[test]
@@ -191,7 +204,10 @@ sub_agent_dir = ".custom/agents"
             root: PathBuf::from("/tmp/myproject"),
             config,
         };
-        assert_eq!(project.sub_agent_dir(), PathBuf::from("/tmp/myproject/.custom/agents"));
+        assert_eq!(
+            project.sub_agent_dir(),
+            PathBuf::from("/tmp/myproject/.custom/agents")
+        );
     }
 
     #[test]
@@ -217,17 +233,38 @@ network = "ask"
 destructive = "deny"
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.approval.file_read, crate::autonomy::ApprovalRule::Auto);
-        assert_eq!(config.approval.file_write, crate::autonomy::ApprovalRule::Ask);
-        assert_eq!(config.approval.file_delete, crate::autonomy::ApprovalRule::Deny);
-        assert_eq!(config.approval.destructive, crate::autonomy::ApprovalRule::Deny);
+        assert_eq!(
+            config.approval.file_read,
+            crate::autonomy::ApprovalRule::Auto
+        );
+        assert_eq!(
+            config.approval.file_write,
+            crate::autonomy::ApprovalRule::Ask
+        );
+        assert_eq!(
+            config.approval.file_delete,
+            crate::autonomy::ApprovalRule::Deny
+        );
+        assert_eq!(
+            config.approval.destructive,
+            crate::autonomy::ApprovalRule::Deny
+        );
     }
 
     #[test]
     fn parse_approval_config_defaults() {
         let config: ProjectConfig = toml::from_str("").unwrap();
-        assert_eq!(config.approval.file_read, crate::autonomy::ApprovalRule::Auto);
-        assert_eq!(config.approval.file_write, crate::autonomy::ApprovalRule::Ask);
-        assert_eq!(config.approval.command_exec, crate::autonomy::ApprovalRule::Auto);
+        assert_eq!(
+            config.approval.file_read,
+            crate::autonomy::ApprovalRule::Auto
+        );
+        assert_eq!(
+            config.approval.file_write,
+            crate::autonomy::ApprovalRule::Ask
+        );
+        assert_eq!(
+            config.approval.command_exec,
+            crate::autonomy::ApprovalRule::Auto
+        );
     }
 }

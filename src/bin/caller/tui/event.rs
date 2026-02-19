@@ -23,8 +23,10 @@ pub enum AppEvent {
         remaining: u64,
     },
     ModelResponse {
+        turn: usize,
         content: String,
         usage: TokenUsage,
+        reasoning: Option<String>,
     },
     JsonExtracted {
         preview: String,
@@ -159,11 +161,10 @@ pub fn spawn_tick_timer(bus: EventBus, interval_ms: u64) -> tokio::task::JoinHan
 
 /// Spawns a file monitor for askHuman question files.
 pub fn spawn_human_question_monitor(bus: EventBus) -> tokio::task::JoinHandle<()> {
-    use std::path::Path;
     use tokio::time::{interval, Duration};
 
     tokio::spawn(async move {
-        let question_path = Path::new("/dev/shm/intendant_human_question");
+        let question_path = shared_file_path("intendant_human_question");
         let mut interval = interval(Duration::from_millis(250));
         let mut last_seen = false;
 
@@ -172,7 +173,7 @@ pub fn spawn_human_question_monitor(bus: EventBus) -> tokio::task::JoinHandle<()
 
             if question_path.exists() {
                 if !last_seen {
-                    if let Ok(question) = tokio::fs::read_to_string(question_path).await {
+                    if let Ok(question) = tokio::fs::read_to_string(&question_path).await {
                         let question = question.trim().to_string();
                         if !question.is_empty() {
                             bus.send(AppEvent::HumanQuestionDetected { question });
@@ -188,6 +189,23 @@ pub fn spawn_human_question_monitor(bus: EventBus) -> tokio::task::JoinHandle<()
             }
         }
     })
+}
+
+fn shared_file_path(name: &str) -> std::path::PathBuf {
+    let base = std::env::var("INTENDANT_SHARED_DIR")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            let shm = std::path::PathBuf::from("/dev/shm");
+            if shm.exists() {
+                Some(shm)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(name)
 }
 
 #[cfg(test)]
@@ -305,8 +323,12 @@ mod tests {
             ControlMsg::Status,
             ControlMsg::Approve { id: 1 },
             ControlMsg::Deny { id: 2 },
-            ControlMsg::Input { text: "hello".to_string() },
-            ControlMsg::SetAutonomy { level: "low".to_string() },
+            ControlMsg::Input {
+                text: "hello".to_string(),
+            },
+            ControlMsg::SetAutonomy {
+                level: "low".to_string(),
+            },
             ControlMsg::Quit,
         ];
         for msg in msgs {

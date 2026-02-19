@@ -104,8 +104,7 @@ mod tests {
 
     #[test]
     fn resolve_system_prompt_direct_role() {
-        let result =
-            resolve_system_prompt(&SubAgentRole::Custom("direct".into()), None).unwrap();
+        let result = resolve_system_prompt(&SubAgentRole::Custom("direct".into()), None).unwrap();
         // Direct role should return just the base prompt (compiled-in default)
         assert_eq!(result, DEFAULT_PROMPT);
     }
@@ -144,11 +143,9 @@ mod tests {
         let custom_base = "Custom base prompt";
         std::fs::write(dir.path().join("SysPrompt.md"), custom_base).unwrap();
 
-        let result = resolve_system_prompt(
-            &SubAgentRole::Custom("direct".into()),
-            Some(dir.path()),
-        )
-        .unwrap();
+        let result =
+            resolve_system_prompt(&SubAgentRole::Custom("direct".into()), Some(dir.path()))
+                .unwrap();
         assert_eq!(result, custom_base);
     }
 
@@ -159,8 +156,7 @@ mod tests {
         std::fs::write(dir.path().join("SysPrompt_orchestrator.md"), custom_orch).unwrap();
         // Base prompt not overridden — should use compiled-in default
 
-        let result =
-            resolve_system_prompt(&SubAgentRole::Orchestrator, Some(dir.path())).unwrap();
+        let result = resolve_system_prompt(&SubAgentRole::Orchestrator, Some(dir.path())).unwrap();
         assert!(result.contains(DEFAULT_PROMPT));
         assert!(result.contains(custom_orch));
         assert!(!result.contains(DEFAULT_ORCHESTRATOR_PROMPT));
@@ -174,8 +170,7 @@ mod tests {
         std::fs::write(dir.path().join("SysPrompt.md"), custom_base).unwrap();
         std::fs::write(dir.path().join("SysPrompt_research.md"), custom_research).unwrap();
 
-        let result =
-            resolve_system_prompt(&SubAgentRole::Research, Some(dir.path())).unwrap();
+        let result = resolve_system_prompt(&SubAgentRole::Research, Some(dir.path())).unwrap();
         assert_eq!(result, format!("{}\n\n{}", custom_base, custom_research));
     }
 }

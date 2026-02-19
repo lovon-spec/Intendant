@@ -78,8 +78,14 @@ pub fn build_spawn_command(spec: &SubAgentSpec, caller_path: &Path) -> String {
     let mut env_parts = vec![
         format!("INTENDANT_ROLE={}", spec.role.as_str()),
         format!("INTENDANT_ID={}", spec.id),
-        format!("INTENDANT_RESULT_FILE={}", spec.result_file.to_string_lossy()),
-        format!("INTENDANT_PROGRESS_FILE={}", spec.progress_file.to_string_lossy()),
+        format!(
+            "INTENDANT_RESULT_FILE={}",
+            spec.result_file.to_string_lossy()
+        ),
+        format!(
+            "INTENDANT_PROGRESS_FILE={}",
+            spec.progress_file.to_string_lossy()
+        ),
     ];
 
     if spec.inherit_memory {
@@ -103,17 +109,27 @@ pub fn build_spawn_command(spec: &SubAgentSpec, caller_path: &Path) -> String {
 }
 
 pub fn read_result(path: &Path) -> Result<SubAgentResult, CallerError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| CallerError::SubAgent(format!("Failed to read result file {:?}: {}", path, e)))?;
-    serde_json::from_str(&content)
-        .map_err(|e| CallerError::SubAgent(format!("Failed to parse result JSON from {:?}: {}", path, e)))
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        CallerError::SubAgent(format!("Failed to read result file {:?}: {}", path, e))
+    })?;
+    serde_json::from_str(&content).map_err(|e| {
+        CallerError::SubAgent(format!(
+            "Failed to parse result JSON from {:?}: {}",
+            path, e
+        ))
+    })
 }
 
 pub fn read_progress(path: &Path) -> Result<SubAgentProgress, CallerError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| CallerError::SubAgent(format!("Failed to read progress file {:?}: {}", path, e)))?;
-    serde_json::from_str(&content)
-        .map_err(|e| CallerError::SubAgent(format!("Failed to parse progress JSON from {:?}: {}", path, e)))
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        CallerError::SubAgent(format!("Failed to read progress file {:?}: {}", path, e))
+    })?;
+    serde_json::from_str(&content).map_err(|e| {
+        CallerError::SubAgent(format!(
+            "Failed to parse progress JSON from {:?}: {}",
+            path, e
+        ))
+    })
 }
 
 pub fn write_result(path: &Path, result: &SubAgentResult) -> Result<(), CallerError> {
@@ -162,8 +178,8 @@ pub fn format_result_message(result: &SubAgentResult) -> String {
     }
 
     msg.push_str(&format!(
-        "\nTokens used: {}",
-        result.usage.total_tokens
+        "\nTokens used: prompt={} completion={} total={}",
+        result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens
     ));
 
     msg
@@ -180,10 +196,16 @@ pub fn scan_completed_results(sub_agent_dir: &Path) -> Vec<SubAgentResult> {
 
     if let Ok(entries) = std::fs::read_dir(sub_agent_dir) {
         for entry in entries.flatten() {
-            let result_file = entry.path().join("result.json");
+            let agent_dir = entry.path();
+            let result_file = agent_dir.join("result.json");
+            let reported_marker = agent_dir.join(".reported");
+            if reported_marker.exists() {
+                continue;
+            }
             if result_file.exists() {
                 if let Ok(result) = read_result(&result_file) {
                     results.push(result);
+                    let _ = std::fs::write(reported_marker, b"reported");
                 }
             }
         }
@@ -193,7 +215,8 @@ pub fn scan_completed_results(sub_agent_dir: &Path) -> Vec<SubAgentResult> {
 }
 
 fn shell_escape(s: &str) -> String {
-    if s.contains(' ') || s.contains('\'') || s.contains('"') || s.contains('$') || s.contains('\\') {
+    if s.contains(' ') || s.contains('\'') || s.contains('"') || s.contains('$') || s.contains('\\')
+    {
         format!("'{}'", s.replace('\'', "'\\''"))
     } else {
         s.to_string()
@@ -211,7 +234,9 @@ mod tests {
             role: SubAgentRole::Research,
             working_dir: PathBuf::from("/tmp/project"),
             result_file: PathBuf::from("/tmp/project/.intendant/subagents/research-1/result.json"),
-            progress_file: PathBuf::from("/tmp/project/.intendant/subagents/research-1/progress.json"),
+            progress_file: PathBuf::from(
+                "/tmp/project/.intendant/subagents/research-1/progress.json",
+            ),
             system_prompt: None,
             inherit_memory: true,
         }
@@ -220,10 +245,19 @@ mod tests {
     #[test]
     fn sub_agent_role_roundtrip() {
         assert_eq!(SubAgentRole::from_str("research"), SubAgentRole::Research);
-        assert_eq!(SubAgentRole::from_str("implementation"), SubAgentRole::Implementation);
+        assert_eq!(
+            SubAgentRole::from_str("implementation"),
+            SubAgentRole::Implementation
+        );
         assert_eq!(SubAgentRole::from_str("testing"), SubAgentRole::Testing);
-        assert_eq!(SubAgentRole::from_str("orchestrator"), SubAgentRole::Orchestrator);
-        assert_eq!(SubAgentRole::from_str("custom_role"), SubAgentRole::Custom("custom_role".to_string()));
+        assert_eq!(
+            SubAgentRole::from_str("orchestrator"),
+            SubAgentRole::Orchestrator
+        );
+        assert_eq!(
+            SubAgentRole::from_str("custom_role"),
+            SubAgentRole::Custom("custom_role".to_string())
+        );
 
         assert_eq!(SubAgentRole::Research.as_str(), "research");
         assert_eq!(SubAgentRole::Implementation.as_str(), "implementation");
@@ -332,7 +366,10 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&progress).unwrap()).unwrap();
 
         let parsed = read_progress(&path).unwrap();
-        assert_eq!(parsed.question.as_deref(), Some("Which database should I use?"));
+        assert_eq!(
+            parsed.question.as_deref(),
+            Some("Which database should I use?")
+        );
     }
 
     #[test]
@@ -376,7 +413,10 @@ mod tests {
             id: "research-1".to_string(),
             status: SubAgentStatus::Completed,
             summary: "Found the database schema".to_string(),
-            findings: vec!["3 tables found".to_string(), "No migrations pending".to_string()],
+            findings: vec![
+                "3 tables found".to_string(),
+                "No migrations pending".to_string(),
+            ],
             artifacts: vec![PathBuf::from("/tmp/schema.sql")],
             usage: TokenUsage {
                 prompt_tokens: 1000,
@@ -447,11 +487,15 @@ mod tests {
         std::fs::write(
             agent_dir.join("result.json"),
             serde_json::to_string(&result).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let results = scan_completed_results(dir.path());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "agent-1");
+
+        let results_again = scan_completed_results(dir.path());
+        assert!(results_again.is_empty());
     }
 
     #[test]
@@ -485,7 +529,11 @@ mod tests {
             summary: "Timed out".to_string(),
             findings: vec!["partial result".to_string()],
             artifacts: vec![],
-            usage: TokenUsage { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+            usage: TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+            },
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: SubAgentResult = serde_json::from_str(&json).unwrap();

@@ -88,6 +88,9 @@ impl Tui {
             if app.mode == app::AppMode::Help {
                 widgets::render_help_overlay(f, area);
             }
+            if app.mode == app::AppMode::Inspect {
+                widgets::render_inspect_overlay(f, area, app);
+            }
         })?;
         Ok(())
     }
@@ -191,7 +194,12 @@ mod tests {
                 let area = f.area();
                 let app_layout = layout::calculate_layout(area, &app.panels, 4);
                 if let Some(bottom_area) = app_layout.bottom_panel {
-                    widgets::render_approval_panel(f, bottom_area, "rm -rf /tmp/test", "destructive");
+                    widgets::render_approval_panel(
+                        f,
+                        bottom_area,
+                        "rm -rf /tmp/test",
+                        "destructive",
+                    );
                 }
             })
             .unwrap();
@@ -244,8 +252,8 @@ mod tests {
         app.log(app::LogLevel::Debug, "debug only".to_string());
         app.log(app::LogLevel::Info, "always visible".to_string());
 
-        // Non-verbose
-        app.verbose = false;
+        // Normal verbosity (debug hidden)
+        app.verbosity = app::Verbosity::Normal;
         terminal
             .draw(|f| {
                 let area = f.area();
@@ -256,8 +264,8 @@ mod tests {
             })
             .unwrap();
 
-        // Verbose
-        app.verbose = true;
+        // Debug verbosity (debug shown)
+        app.verbosity = app::Verbosity::Debug;
         terminal
             .draw(|f| {
                 let area = f.area();

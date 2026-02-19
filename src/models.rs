@@ -16,6 +16,14 @@ pub struct Command {
     // Log tail fields
     pub offset: Option<u64>,
     pub limit: Option<u64>,
+    pub cursor: Option<u64>,
+    pub timeout_ms: Option<u64>,
+    // Execution identity fields (preferred over nonce-only fetch semantics)
+    pub run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub command_id: Option<String>,
+    pub stream_id: Option<String>,
     // editFile fields
     pub file_path: Option<String>,
     pub operation: Option<String>,

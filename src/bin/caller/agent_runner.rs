@@ -9,8 +9,24 @@ pub struct AgentOutput {
     pub stderr: String,
 }
 
+fn allow_extended_first_byte_wait(ask_human: bool, waiting_fetch: bool) -> bool {
+    ask_human || waiting_fetch
+}
+
 fn has_ask_human(json_input: &str) -> bool {
-    json_input.contains("\"askHuman\"")
+    let parsed: serde_json::Value = match serde_json::from_str(json_input) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    parsed
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .map(|commands| {
+            commands
+                .iter()
+                .any(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman"))
+        })
+        .unwrap_or(false)
 }
 
 fn has_waiting_fetch_status(json_input: &str) -> bool {
@@ -59,6 +75,7 @@ pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
     if let Some(mut stdout) = child.stdout.take() {
         let ask_human = has_ask_human(json_input);
         let waiting_fetch = has_waiting_fetch_status(json_input);
+        let extended_first_byte_wait = allow_extended_first_byte_wait(ask_human, waiting_fetch);
         let default_idle_before_first = if ask_human {
             330
         } else if waiting_fetch {
@@ -111,6 +128,11 @@ pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
                         // Wait longer for first byte on delayed fetchStatus results.
                         if saw_output {
                             break;
+                        } else if !extended_first_byte_wait {
+                            stderr_buf.push_str(
+                                "[caller] idle timeout before first runtime stdout byte\n",
+                            );
+                            break;
                         }
                     }
                 }
@@ -127,7 +149,7 @@ pub async fn run_agent(json_input: &str) -> Result<AgentOutput, CallerError> {
     if let Some(mut stderr) = child.stderr.take() {
         let mut temp = Vec::new();
         let _ = timeout(Duration::from_secs(1), stderr.read_to_end(&mut temp)).await;
-        stderr_buf = String::from_utf8_lossy(&temp).to_string();
+        stderr_buf.push_str(&String::from_utf8_lossy(&temp));
     }
 
     // Kill the runtime only if still running.
@@ -165,6 +187,13 @@ mod tests {
     }
 
     #[test]
+    fn has_ask_human_false_for_text_only() {
+        let json =
+            r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo \"askHuman\""}]}"#;
+        assert!(!has_ask_human(json));
+    }
+
+    #[test]
     fn has_waiting_fetch_status_detects_wait_true() {
         let json = r#"{"commands":[{"function":"fetchStatus","nonce":2,"depending_nonce":1,"wait":true,"status_type":"stdout"}]}"#;
         assert!(has_waiting_fetch_status(json));
@@ -174,5 +203,12 @@ mod tests {
     fn has_waiting_fetch_status_false_without_wait() {
         let json = r#"{"commands":[{"function":"fetchStatus","nonce":2,"depending_nonce":1,"status_type":"stdout"}]}"#;
         assert!(!has_waiting_fetch_status(json));
+    }
+
+    #[test]
+    fn allow_extended_first_byte_wait_policy() {
+        assert!(allow_extended_first_byte_wait(true, false));
+        assert!(allow_extended_first_byte_wait(false, true));
+        assert!(!allow_extended_first_byte_wait(false, false));
     }
 }

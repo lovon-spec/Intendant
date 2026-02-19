@@ -2,7 +2,7 @@ use crate::agent::Agent;
 use crate::error::AgentError;
 use crate::models::AgentInput;
 use crate::status_monitor::StatusMonitor;
-use std::io::{self, Write, Read};
+use std::io::{self, Read, Write};
 
 mod agent;
 mod error;
@@ -24,10 +24,8 @@ async fn main() -> Result<(), AgentError> {
     let agent = Agent::new()?;
 
     // Create and start status monitor
-    let (monitor, mut status_rx) = StatusMonitor::new(
-        agent.shared_mem.clone(),
-        agent.process_map.clone()
-    );
+    let (monitor, mut status_rx) =
+        StatusMonitor::new(agent.shared_mem.clone(), agent.process_map.clone());
 
     // Spawn status monitor task
     tokio::spawn(async move {

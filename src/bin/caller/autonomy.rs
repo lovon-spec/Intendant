@@ -223,22 +223,16 @@ pub fn shared_autonomy(state: AutonomyState) -> SharedAutonomy {
 
 /// Classify an agent command JSON into action categories.
 pub fn classify_command(cmd: &serde_json::Value) -> Vec<ActionCategory> {
-    let function = cmd
-        .get("function")
-        .and_then(|f| f.as_str())
-        .unwrap_or("");
+    let function = cmd.get("function").and_then(|f| f.as_str()).unwrap_or("");
 
     match function {
         "inspectPath" | "fetchStatus" | "recallMemory" => vec![ActionCategory::FileRead],
-        "editFile" | "storeMemory" => vec![ActionCategory::FileWrite],
+        "writeFile" | "editFile" | "storeMemory" => vec![ActionCategory::FileWrite],
         "captureScreen" => vec![ActionCategory::FileRead],
         "askHuman" => vec![ActionCategory::HumanInput],
         "browse" => vec![ActionCategory::NetworkRequest],
         "execAsAgent" | "execPty" => {
-            let command_str = cmd
-                .get("command")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let command_str = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("");
             classify_shell_command(command_str)
         }
         _ => vec![ActionCategory::CommandExec],
@@ -255,27 +249,39 @@ fn classify_shell_command(cmd: &str) -> Vec<ActionCategory> {
 
     // Destructive commands
     let destructive_commands = [
-        "rm", "rmdir", "kill", "killall", "pkill",
-        "shutdown", "reboot", "mkfs", "dd",
+        "rm", "rmdir", "kill", "killall", "pkill", "shutdown", "reboot", "mkfs", "dd",
     ];
-    if destructive_commands.contains(&first)
-        || lower.contains("rm -rf")
-        || lower.contains("rm -r")
+    if destructive_commands.contains(&first) || lower.contains("rm -rf") || lower.contains("rm -r")
     {
         categories.push(ActionCategory::Destructive);
     }
 
     // Network commands
     let network_commands = [
-        "curl", "wget", "ssh", "scp", "rsync", "nc", "ncat",
-        "ping", "traceroute", "dig", "nslookup", "git",
+        "curl",
+        "wget",
+        "ssh",
+        "scp",
+        "rsync",
+        "nc",
+        "ncat",
+        "ping",
+        "traceroute",
+        "dig",
+        "nslookup",
+        "git",
     ];
     if network_commands.contains(&first) || lower.contains("apt") || lower.contains("pip install") {
         categories.push(ActionCategory::NetworkRequest);
     }
 
     // File write indicators
-    if lower.contains(" > ") || lower.contains(" >> ") || first == "tee" || first == "mv" || first == "cp" {
+    if lower.contains(" > ")
+        || lower.contains(" >> ")
+        || first == "tee"
+        || first == "mv"
+        || first == "cp"
+    {
         categories.push(ActionCategory::FileWrite);
     }
 
@@ -318,7 +324,10 @@ mod tests {
         assert_eq!(AutonomyLevel::from_str_loose("low"), AutonomyLevel::Low);
         assert_eq!(AutonomyLevel::from_str_loose("HIGH"), AutonomyLevel::High);
         assert_eq!(AutonomyLevel::from_str_loose("f"), AutonomyLevel::Full);
-        assert_eq!(AutonomyLevel::from_str_loose("unknown"), AutonomyLevel::Medium);
+        assert_eq!(
+            AutonomyLevel::from_str_loose("unknown"),
+            AutonomyLevel::Medium
+        );
         assert_eq!(AutonomyLevel::from_str_loose("0"), AutonomyLevel::Low);
         assert_eq!(AutonomyLevel::from_str_loose("3"), AutonomyLevel::Full);
     }

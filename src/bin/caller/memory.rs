@@ -96,7 +96,7 @@ pub fn format_knowledge_message(store: &KnowledgeStore) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::{ProjectConfig, Project};
+    use crate::project::{Project, ProjectConfig};
     use std::path::PathBuf;
 
     fn make_project(root: PathBuf) -> Project {
@@ -215,7 +215,8 @@ mod tests {
         let mem_path = project.memory_path();
         fs::create_dir_all(mem_path.parent().unwrap()).unwrap();
 
-        let old_content = r#"{"entries":{"db":{"summary":"PostgreSQL","created_at":1000,"updated_at":2000}}}"#;
+        let old_content =
+            r#"{"entries":{"db":{"summary":"PostgreSQL","created_at":1000,"updated_at":2000}}}"#;
         fs::write(&mem_path, old_content).unwrap();
 
         let kstore = load_knowledge(&project).unwrap();

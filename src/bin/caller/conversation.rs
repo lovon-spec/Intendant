@@ -224,7 +224,12 @@ impl Conversation {
 
 fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
-        format!("{},{:03},{:03}", n / 1_000_000, (n / 1_000) % 1_000, n % 1_000)
+        format!(
+            "{},{:03},{:03}",
+            n / 1_000_000,
+            (n / 1_000) % 1_000,
+            n % 1_000
+        )
     } else if n >= 1_000 {
         format!("{},{:03}", n / 1_000, n % 1_000)
     } else {
@@ -306,11 +311,11 @@ mod tests {
     #[test]
     fn drop_turns_protects_system_and_last_two() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());     // 1
+        conv.add_user("u1".to_string()); // 1
         conv.add_assistant("a1".to_string()); // 2
-        conv.add_user("u2".to_string());     // 3
+        conv.add_user("u2".to_string()); // 3
         conv.add_assistant("a2".to_string()); // 4
-        conv.add_user("u3".to_string());     // 5
+        conv.add_user("u3".to_string()); // 5
         conv.add_assistant("a3".to_string()); // 6
 
         // Try to drop system (0), middle messages (1,2), and last two (5,6)
@@ -346,11 +351,11 @@ mod tests {
     #[test]
     fn summarize_turns_replaces_range() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());     // 1
+        conv.add_user("u1".to_string()); // 1
         conv.add_assistant("a1".to_string()); // 2
-        conv.add_user("u2".to_string());     // 3
+        conv.add_user("u2".to_string()); // 3
         conv.add_assistant("a2".to_string()); // 4
-        conv.add_user("u3".to_string());     // 5
+        conv.add_user("u3".to_string()); // 5
         conv.add_assistant("a3".to_string()); // 6
 
         conv.summarize_turns(&[1, 2, 3, 4], "Set up the environment");
@@ -359,7 +364,9 @@ mod tests {
         assert_eq!(conv.len(), 4);
         assert_eq!(conv.messages()[0].content, "sys");
         assert!(conv.messages()[1].content.contains("[Context Summary]"));
-        assert!(conv.messages()[1].content.contains("Set up the environment"));
+        assert!(conv.messages()[1]
+            .content
+            .contains("Set up the environment"));
         assert_eq!(conv.messages()[2].content, "u3");
         assert_eq!(conv.messages()[3].content, "a3");
     }
@@ -375,7 +382,7 @@ mod tests {
     #[test]
     fn summarize_turns_protects_system_and_last_two() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());     // 1
+        conv.add_user("u1".to_string()); // 1
         conv.add_assistant("a1".to_string()); // 2
 
         // Try to summarize all — system (0) and last two (1,2) are protected
@@ -416,12 +423,12 @@ mod tests {
     fn drop_turns_protects_user_layer() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
         conv.set_protect_user_layer(true);
-        conv.add_user_with_layer("user msg".to_string(), MessageLayer::User);   // 1
-        conv.add_assistant("orch status".to_string());                            // 2
-        conv.add_user("orch output".to_string());                                 // 3
-        conv.add_assistant("more output".to_string());                            // 4
-        conv.add_user("final".to_string());                                       // 5
-        conv.add_assistant("done".to_string());                                   // 6
+        conv.add_user_with_layer("user msg".to_string(), MessageLayer::User); // 1
+        conv.add_assistant("orch status".to_string()); // 2
+        conv.add_user("orch output".to_string()); // 3
+        conv.add_assistant("more output".to_string()); // 4
+        conv.add_user("final".to_string()); // 5
+        conv.add_assistant("done".to_string()); // 6
 
         // Try to drop index 1 (User-layer) and 2 (no layer)
         conv.drop_turns(&[1, 2]);
@@ -435,10 +442,10 @@ mod tests {
     fn drop_turns_without_protection_removes_user_layer() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
         // protect_user_layer is false by default
-        conv.add_user_with_layer("user msg".to_string(), MessageLayer::User);   // 1
-        conv.add_assistant("response".to_string());                               // 2
-        conv.add_user("msg".to_string());                                         // 3
-        conv.add_assistant("resp".to_string());                                   // 4
+        conv.add_user_with_layer("user msg".to_string(), MessageLayer::User); // 1
+        conv.add_assistant("response".to_string()); // 2
+        conv.add_user("msg".to_string()); // 3
+        conv.add_assistant("resp".to_string()); // 4
 
         conv.drop_turns(&[1]);
         assert_eq!(conv.len(), 4); // index 1 removed
@@ -448,12 +455,12 @@ mod tests {
     fn summarize_turns_protects_user_layer() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
         conv.set_protect_user_layer(true);
-        conv.add_user_with_layer("user task".to_string(), MessageLayer::User);  // 1
-        conv.add_assistant("status 1".to_string());                               // 2
-        conv.add_user("agent output 1".to_string());                              // 3
-        conv.add_assistant("status 2".to_string());                               // 4
-        conv.add_user("latest".to_string());                                      // 5
-        conv.add_assistant("done".to_string());                                   // 6
+        conv.add_user_with_layer("user task".to_string(), MessageLayer::User); // 1
+        conv.add_assistant("status 1".to_string()); // 2
+        conv.add_user("agent output 1".to_string()); // 3
+        conv.add_assistant("status 2".to_string()); // 4
+        conv.add_user("latest".to_string()); // 5
+        conv.add_assistant("done".to_string()); // 6
 
         conv.summarize_turns(&[1, 2, 3], "Early progress");
 
