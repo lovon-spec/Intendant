@@ -20,6 +20,12 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     };
     let budget_color = theme::budget_color(app.budget_pct);
 
+    let session_tokens_display = if app.session_tokens > 0 {
+        format!(" {}", format_token_count(app.session_tokens))
+    } else {
+        String::new()
+    };
+
     let spans = vec![
         Span::styled(
             " Agent ",
@@ -49,6 +55,12 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             budget_pct_display,
             Style::default().fg(budget_color).bg(theme::STATUS_BAR_BG),
+        ),
+        Span::styled(
+            session_tokens_display,
+            Style::default()
+                .fg(theme::STATUS_TURN_FG)
+                .bg(theme::STATUS_BAR_BG),
         ),
         Span::styled(
             format!(" [{}:{}]", autonomy_str, app.verbosity.label()),
@@ -415,6 +427,16 @@ pub fn render_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(widget, centered);
 }
 
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M tok", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K tok", tokens as f64 / 1_000.0)
+    } else {
+        format!("{} tok", tokens)
+    }
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
@@ -512,5 +534,25 @@ mod tests {
             };
             let _ = format_log_entry(&entry);
         }
+    }
+
+    #[test]
+    fn format_token_count_small() {
+        assert_eq!(format_token_count(500), "500 tok");
+    }
+
+    #[test]
+    fn format_token_count_thousands() {
+        assert_eq!(format_token_count(15_200), "15.2K tok");
+    }
+
+    #[test]
+    fn format_token_count_millions() {
+        assert_eq!(format_token_count(2_500_000), "2.5M tok");
+    }
+
+    #[test]
+    fn format_token_count_exact_k() {
+        assert_eq!(format_token_count(1_000), "1.0K tok");
     }
 }

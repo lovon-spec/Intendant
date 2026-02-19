@@ -136,6 +136,9 @@ pub struct App {
     pub autonomy: SharedAutonomy,
     pub control_tx: Option<tokio::sync::broadcast::Sender<String>>,
 
+    // Token tracking
+    pub session_tokens: u64,
+
     // Animation
     pub tick_count: usize,
 }
@@ -162,6 +165,7 @@ impl App {
             pending_approval: None,
             autonomy,
             control_tx: None,
+            session_tokens: 0,
             tick_count: 0,
         }
     }
@@ -623,6 +627,7 @@ impl App {
                 reasoning,
             } => {
                 self.turn = turn;
+                self.session_tokens += usage.total_tokens;
                 // Show human-readable command summary at Model level (visible at Normal verbosity)
                 let summary = format_model_summary(&content);
                 self.log(
@@ -924,6 +929,7 @@ mod tests {
         let app = test_app();
         assert_eq!(app.turn, 0);
         assert_eq!(app.budget_pct, 0.0);
+        assert_eq!(app.session_tokens, 0);
         assert_eq!(app.current_phase, Phase::Idle);
         assert_eq!(app.mode, AppMode::Normal);
         assert!(!app.should_quit);
