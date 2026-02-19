@@ -1,14 +1,14 @@
 # Intendant
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory (SHM), streams status updates, and persists logs across binary restarts. The CLI features a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory-style state files, streams status updates, and persists logs across binary restarts. The CLI features a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
 ```
 stdin (JSON) --> intendant-runtime --> spawns bash commands
                   |
-                  +--> /dev/shm/intendant_processes  (process state, survives restarts)
-                  +--> /dev/shm/intendant_session     (log directory path, survives restarts)
+                  +--> $INTENDANT_SHARED_DIR/intendant_processes (or /dev/shm, or temp dir)
+                  +--> $INTENDANT_SHARED_DIR/intendant_session   (or /dev/shm, or temp dir)
                   +--> ~/.intendant/logs/<timestamp>/  (stdout/stderr logs per nonce)
                   |
                   +--> StatusMonitor --> stdout (status lines)
@@ -21,15 +21,15 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   |
   +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
   +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
-  +--> Control socket:  /tmp/intendant-<pid>.sock (JSON-line protocol)
+  +--> Optional control socket (--control-socket): /tmp/intendant-<pid>.sock (JSON-line protocol)
   +--> Token budget tracking (context-window-aware loop termination)
   +--> Sub-agent spawning via env vars (INTENDANT_ROLE, INTENDANT_ID, etc.)
   +--> Git worktree isolation for implementation agents
   +--> Tagged knowledge store with pub/sub channels between agents
 ```
 
-- **Shared Memory (`/dev/shm/intendant_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Survives binary restarts since it lives on tmpfs.
-- **Session File (`/dev/shm/intendant_session`):** Stores the log directory path so consecutive runs reuse the same directory.
+- **Shared Process State (`intendant_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Path resolves via `INTENDANT_SHARED_DIR`, then `/dev/shm` if available, else OS temp dir.
+- **Session File (`intendant_session`):** Stores the log directory path so consecutive runs reuse the same directory. Uses the same shared-dir resolution.
 - **Log Directory (`~/.intendant/logs/<timestamp>/`):** Per-nonce stdout and stderr log files. Created once per session.
 - **Status Monitor:** Background task that polls SHM for status changes and writes update lines to stdout.
 
@@ -136,6 +136,7 @@ echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database
 | `fetchStatus` | Read process state/logs (JSON with offset/limit) | `status_type` (`status`, `stdout`, `stderr`, `exit_code`), `offset`, `limit` |
 | `inspectPath` | Inspect filesystem path metadata | `path` |
 | `editFile` | Structured file editing without shell commands | `file_path`, `operation`, `content`, `match_content`, `line_number`, `end_line` |
+| `writeFile` | Alias for `editFile` write operation | `file_path`, `content` |
 | `browse` | Fetch URL and convert HTML to text | `url` |
 | `askHuman` | Ask the operator a question and wait for response | `question` |
 | `execPty` | Run command in a persistent PTY session | `command`, `shell_id` |
@@ -211,15 +212,17 @@ The test suite covers both binaries with several hundred unit/integration tests:
 
 ## Session Management
 
-State persists across binary restarts via `/dev/shm/`:
+State persists across binary restarts via the shared state directory:
 
-- **Process state** is stored in `/dev/shm/intendant_processes` — the process map is rebuilt from SHM on each startup.
-- **Log directory** is stored in `/dev/shm/intendant_session` — subsequent runs reuse the same log directory.
+- **Process state** is stored in `intendant_processes`.
+- **Log directory marker** is stored in `intendant_session`.
+- Shared path resolution: `INTENDANT_SHARED_DIR` -> `/dev/shm` (if present) -> system temp dir.
 
 To reset all state (start a fresh session):
 
 ```bash
-rm -f /dev/shm/intendant_processes /dev/shm/intendant_session
+rm -f "${INTENDANT_SHARED_DIR:-/dev/shm}/intendant_processes" \
+      "${INTENDANT_SHARED_DIR:-/dev/shm}/intendant_session"
 ```
 
 ## AI Caller
@@ -280,10 +283,10 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--verbose` | Show debug-level log entries in TUI |
 | `--no-tui` | Disable TUI, use plain text output |
 | `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
-| `--log-file <path>` | Write log output to file |
-| `--control-socket` | Reserved for headless socket control (currently only TUI mode opens the socket) |
+| `--log-file <dir>` | Override session log directory |
+| `--control-socket` | Enable Unix control socket (TUI mode) |
 
-The TUI launches automatically when stdin is a terminal. When piping input or in sub-agent mode, `intendant` falls back to headless mode.
+The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
 
 ### Execution Modes
 
@@ -307,7 +310,7 @@ The TUI launches automatically when stdin is a terminal. When piping input or in
 
 ### `askHuman` Behavior (Important)
 
-- In **TUI mode**, `askHuman` opens the input panel and writes your answer to `/dev/shm/intendant_human_response`.
+- In **TUI mode**, `askHuman` opens the input panel and writes your answer to the shared response file (`intendant_human_response` in the shared state dir).
 - Empty submit is rejected in the TUI; you must provide non-empty input or press `Esc` to cancel.
 - In **headless mode** (`--no-tui` or non-interactive stdin), `askHuman` cannot be answered interactively. The loop now tells the model to continue with explicit assumptions instead of waiting for the runtime timeout.
 - Runtime-level timeout for unanswered `askHuman` remains `5 minutes`.
@@ -325,7 +328,9 @@ The TUI launches automatically when stdin is a terminal. When piping input or in
 9. Applies context directives (`drop_turns`, `summarize`) to the conversation
 10. Injects project context (`memory_file`) into relevant commands
 11. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
-12. If approval is required, emits an approval request to the TUI and waits for user response
+12. If approval is required:
+    - TUI mode: emits an approval request and waits for user response
+    - Headless mode: denies execution (no implicit auto-approve fallback)
 13. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with adaptive timeouts:
     - Default: idle-before-first `2s`, idle-after-first `1s`, hard `30s`
     - `fetchStatus(wait=true)`: idle-before-first `15s`, hard `45s`
@@ -362,6 +367,7 @@ The TUI launches automatically when stdin is a terminal. When piping input or in
 | `INTENDANT_PROGRESS_FILE` | — | Path for sub-agent to write periodic progress |
 | `INTENDANT_TASK` | — | Task description for sub-agent mode |
 | `INTENDANT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
+| `INTENDANT_SHARED_DIR` | auto | Shared state directory for process/session/human I/O files (`/dev/shm` if available, else temp dir) |
 
 Timeouts are automatically extended for slow-start workflows (`askHuman`, `fetchStatus(wait=true)`). Manual override via env vars is still supported.
 
@@ -404,7 +410,7 @@ To customize prompts for a specific project, place your modified `.md` files in 
 
 ## TUI
 
-`intendant` includes a ratatui-based terminal UI that launches automatically when stdin is a terminal. The TUI provides real-time monitoring and control of the agent loop.
+`intendant` includes a ratatui-based terminal UI that launches automatically when both stdin and stdout are terminals. The TUI provides real-time monitoring and control of the agent loop.
 
 ### Layout
 
@@ -461,12 +467,12 @@ Action categories are determined by analyzing command JSON: shell commands are c
 
 ## Control Socket
 
-When the TUI is active, a Unix domain socket is created at `/tmp/intendant-<pid>.sock`.
+When `--control-socket` is enabled in TUI mode, a Unix domain socket is created at `/tmp/intendant-<pid>.sock`.
 
 Current status:
 - Outbound event broadcast is implemented.
-- Inbound command transport is implemented, but command handling is currently minimal (messages are surfaced to the TUI event stream; full remote-control actions are still being expanded).
-- `--control-socket` is currently a reserved headless flag.
+- Inbound command handling is implemented for status, approval, denial, human input, autonomy change, and quit.
+- Socket server is opt-in via `--control-socket`.
 
 ### Inbound Commands (JSON-line)
 
