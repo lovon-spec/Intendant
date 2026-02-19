@@ -1,6 +1,7 @@
 use crate::autonomy::SharedAutonomy;
 use crate::tui::event::{AppEvent, ApprovalResponse};
 use crate::tui::layout::PanelConfig;
+use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::oneshot;
 
@@ -24,6 +25,7 @@ pub enum AppMode {
     AskHuman,
     Help,
     Approval,
+    Inspect,
 }
 
 /// Log entry severity / source.
@@ -38,9 +40,55 @@ pub enum LogLevel {
     Debug,
 }
 
+/// Log verbosity profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verbosity {
+    Quiet,
+    Normal,
+    Verbose,
+    Debug,
+}
+
+impl Verbosity {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Quiet => Self::Normal,
+            Self::Normal => Self::Verbose,
+            Self::Verbose => Self::Debug,
+            Self::Debug => Self::Quiet,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Quiet => "Quiet",
+            Self::Normal => "Normal",
+            Self::Verbose => "Verbose",
+            Self::Debug => "Debug",
+        }
+    }
+
+    pub fn includes(self, level: &LogLevel) -> bool {
+        match self {
+            Self::Quiet => matches!(level, LogLevel::Warn | LogLevel::Error),
+            Self::Normal => matches!(
+                level,
+                LogLevel::Info
+                    | LogLevel::Model
+                    | LogLevel::Warn
+                    | LogLevel::Error
+                    | LogLevel::SubAgent
+            ),
+            Self::Verbose => !matches!(level, LogLevel::Debug),
+            Self::Debug => true,
+        }
+    }
+}
+
 /// A single log entry.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
+    pub ts: String,
     pub level: LogLevel,
     pub content: String,
 }
@@ -60,7 +108,8 @@ pub struct App {
     pub log_entries: Vec<LogEntry>,
     pub scroll_offset: usize,
     pub auto_scroll: bool,
-    pub verbose: bool,
+    pub verbosity: Verbosity,
+    pub inspect_index: Option<usize>,
 
     // Status
     pub provider_name: String,
@@ -90,16 +139,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        provider_name: String,
-        model_name: String,
-        autonomy: SharedAutonomy,
-    ) -> Self {
+    pub fn new(provider_name: String, model_name: String, autonomy: SharedAutonomy) -> Self {
         Self {
             log_entries: Vec::new(),
             scroll_offset: 0,
             auto_scroll: true,
-            verbose: false,
+            verbosity: Verbosity::Normal,
+            inspect_index: None,
             provider_name,
             model_name,
             turn: 0,
@@ -118,17 +164,31 @@ impl App {
     }
 
     pub fn log(&mut self, level: LogLevel, content: String) {
-        self.log_entries.push(LogEntry { level, content });
+        self.log_entries.push(LogEntry {
+            ts: Local::now().format("%H:%M:%S").to_string(),
+            level,
+            content,
+        });
         if self.log_entries.len() > MAX_LOG_ENTRIES {
-            self.log_entries.drain(..self.log_entries.len() - MAX_LOG_ENTRIES);
+            self.log_entries
+                .drain(..self.log_entries.len() - MAX_LOG_ENTRIES);
         }
         if self.auto_scroll {
             self.scroll_to_bottom();
         }
     }
 
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        self.log_entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| self.verbosity.includes(&entry.level).then_some(idx))
+            .collect()
+    }
+
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = self.log_entries.len().saturating_sub(1);
+        let total = self.filtered_indices().len();
+        self.scroll_offset = total.saturating_sub(1);
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -138,7 +198,8 @@ impl App {
 
     pub fn scroll_down(&mut self, n: usize) {
         self.auto_scroll = false;
-        self.scroll_offset = (self.scroll_offset + n).min(self.log_entries.len().saturating_sub(1));
+        let total = self.filtered_indices().len();
+        self.scroll_offset = (self.scroll_offset + n).min(total.saturating_sub(1));
     }
 
     pub fn scroll_page_up(&mut self, page_size: usize) {
@@ -184,6 +245,7 @@ impl App {
             }
             AppMode::Approval => self.handle_approval_key(key),
             AppMode::AskHuman => self.handle_human_key(key),
+            AppMode::Inspect => self.handle_inspect_key(key),
             AppMode::Normal => self.handle_normal_key(key),
         }
     }
@@ -195,8 +257,16 @@ impl App {
                 true
             }
             KeyCode::Char('v') => {
-                self.verbose = !self.verbose;
+                self.verbosity = self.verbosity.next();
+                self.clamp_view_to_filtered();
                 true
+            }
+            KeyCode::Char('i') | KeyCode::Enter => {
+                if self.open_inspect_mode() {
+                    true
+                } else {
+                    false
+                }
             }
             KeyCode::Char('?') => {
                 self.mode = AppMode::Help;
@@ -238,6 +308,126 @@ impl App {
         }
     }
 
+    fn handle_inspect_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Enter => {
+                self.mode = AppMode::Normal;
+                true
+            }
+            KeyCode::Up => {
+                self.move_inspect(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.move_inspect(1);
+                true
+            }
+            KeyCode::PageUp => {
+                self.move_inspect(-20);
+                true
+            }
+            KeyCode::PageDown => {
+                self.move_inspect(20);
+                true
+            }
+            KeyCode::Home => {
+                self.jump_inspect_to_edge(true);
+                true
+            }
+            KeyCode::End => {
+                self.jump_inspect_to_edge(false);
+                true
+            }
+            KeyCode::Char('v') => {
+                self.verbosity = self.verbosity.next();
+                self.clamp_view_to_filtered();
+                self.ensure_inspect_index();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn clamp_view_to_filtered(&mut self) {
+        let total = self.filtered_indices().len();
+        if total == 0 {
+            self.scroll_offset = 0;
+            self.inspect_index = None;
+            return;
+        }
+        self.scroll_offset = self.scroll_offset.min(total.saturating_sub(1));
+    }
+
+    fn focus_index(&self) -> Option<usize> {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            return None;
+        }
+        if self.auto_scroll {
+            return filtered.last().copied();
+        }
+        filtered.get(self.scroll_offset).copied()
+    }
+
+    fn open_inspect_mode(&mut self) -> bool {
+        self.inspect_index = self.focus_index();
+        if self.inspect_index.is_some() {
+            self.mode = AppMode::Inspect;
+            return true;
+        }
+        false
+    }
+
+    fn ensure_inspect_index(&mut self) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            self.inspect_index = None;
+            return;
+        }
+        if let Some(current) = self.inspect_index {
+            if filtered.contains(&current) {
+                return;
+            }
+        }
+        self.inspect_index = filtered.last().copied();
+    }
+
+    fn move_inspect(&mut self, delta: isize) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            self.inspect_index = None;
+            return;
+        }
+
+        let current_pos = self
+            .inspect_index
+            .and_then(|idx| filtered.iter().position(|&i| i == idx))
+            .unwrap_or(filtered.len().saturating_sub(1));
+
+        let next_pos = (current_pos as isize + delta)
+            .clamp(0, filtered.len().saturating_sub(1) as isize) as usize;
+        self.inspect_index = Some(filtered[next_pos]);
+        self.auto_scroll = false;
+        self.scroll_offset = next_pos.saturating_sub(2);
+    }
+
+    fn jump_inspect_to_edge(&mut self, start: bool) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            self.inspect_index = None;
+            return;
+        }
+
+        let pos = if start {
+            0
+        } else {
+            filtered.len().saturating_sub(1)
+        };
+        self.inspect_index = Some(filtered[pos]);
+        self.auto_scroll = !start;
+        self.scroll_offset = if start { 0 } else { pos.saturating_sub(2) };
+    }
+
     fn handle_approval_key(&mut self, key: KeyEvent) -> bool {
         let response = match key.code {
             KeyCode::Char('y') | KeyCode::Enter => Some(ApprovalResponse::Approve),
@@ -272,9 +462,29 @@ impl App {
                 // Submit the response
                 if let Some(ref textarea) = self.human_textarea {
                     let response = textarea.lines().join("\n");
-                    if !response.trim().is_empty() {
-                        let _ = std::fs::write("/dev/shm/intendant_human_response", &response);
-                        self.log(LogLevel::Info, format!("Human response sent: {}", truncate_str(&response, 80)));
+                    if response.trim().is_empty() {
+                        self.log(
+                            LogLevel::Warn,
+                            "Response cannot be empty. Enter text or press Esc to cancel."
+                                .to_string(),
+                        );
+                        return true;
+                    }
+
+                    match std::fs::write("/dev/shm/intendant_human_response", &response) {
+                        Ok(_) => {
+                            self.log(
+                                LogLevel::Info,
+                                format!("Human response sent: {}", truncate_str(&response, 80)),
+                            );
+                        }
+                        Err(e) => {
+                            self.log(
+                                LogLevel::Error,
+                                format!("Failed to send human response: {}", e),
+                            );
+                            return true;
+                        }
                     }
                 }
                 self.human_textarea = None;
@@ -318,19 +528,42 @@ impl App {
     /// Process an AppEvent and update state accordingly.
     pub fn handle_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::TurnStarted { turn, budget_pct, .. } => {
+            AppEvent::TurnStarted {
+                turn, budget_pct, ..
+            } => {
                 self.turn = turn;
                 self.budget_pct = budget_pct;
                 self.current_phase = Phase::Thinking;
-                self.log(LogLevel::Debug, format!("Turn {} started ({:.0}% budget)", turn, budget_pct));
+                self.log(
+                    LogLevel::Debug,
+                    format!("Turn {} started ({:.0}% budget)", turn, budget_pct),
+                );
             }
-            AppEvent::ModelResponse { content, usage } => {
+            AppEvent::ModelResponse {
+                turn,
+                content,
+                usage,
+                reasoning,
+            } => {
+                self.turn = turn;
                 let preview = truncate_str(&content, 200);
                 self.log(LogLevel::Model, preview.to_string());
-                self.log(LogLevel::Debug, format!(
-                    "Tokens: {} prompt + {} completion = {} total",
-                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-                ));
+                if let Some(summary) = reasoning {
+                    self.log(LogLevel::Model, format!("Reasoning: {}", summary));
+                } else {
+                    self.log(
+                        LogLevel::Debug,
+                        "Reasoning summary unavailable for this response".to_string(),
+                    );
+                }
+                self.log(
+                    LogLevel::Model,
+                    format!(
+                        "T{} tokens: prompt={} completion={} total={}",
+                        turn, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                    ),
+                );
+                self.log(LogLevel::Debug, format!("Raw model response: {}", content));
             }
             AppEvent::JsonExtracted { preview } => {
                 self.log(LogLevel::Debug, format!("JSON: {}", preview));
@@ -361,7 +594,10 @@ impl App {
                 self.log(LogLevel::SubAgent, formatted);
             }
             AppEvent::ContextManagement { turn } => {
-                self.log(LogLevel::Debug, format!("Context management (turn {})", turn));
+                self.log(
+                    LogLevel::Debug,
+                    format!("Context management (turn {})", turn),
+                );
             }
             AppEvent::TaskComplete { reason } => {
                 self.current_phase = Phase::Done;
@@ -369,14 +605,17 @@ impl App {
             }
             AppEvent::BudgetWarning { pct, remaining } => {
                 self.budget_pct = pct;
-                self.log(LogLevel::Warn, format!(
-                    "Budget warning: {:.0}% used, {} remaining",
-                    pct, remaining
-                ));
+                self.log(
+                    LogLevel::Warn,
+                    format!("Budget warning: {:.0}% used, {} remaining", pct, remaining),
+                );
             }
             AppEvent::BudgetExhausted { remaining } => {
                 self.budget_pct = 100.0;
-                self.log(LogLevel::Error, format!("Budget exhausted ({} remaining)", remaining));
+                self.log(
+                    LogLevel::Error,
+                    format!("Budget exhausted ({} remaining)", remaining),
+                );
                 self.current_phase = Phase::Done;
             }
             AppEvent::SafetyCapReached => {
@@ -397,9 +636,14 @@ impl App {
                 self.log(LogLevel::Info, format!("Human question: {}", question));
             }
             AppEvent::HumanResponseSent => {
-                self.log(LogLevel::Info, "Human response acknowledged".to_string());
+                self.log(LogLevel::Info, "Human prompt closed by runtime".to_string());
             }
-            AppEvent::ApprovalRequired { id, command_preview, category, responder } => {
+            AppEvent::ApprovalRequired {
+                id,
+                command_preview,
+                category,
+                responder,
+            } => {
                 self.current_phase = Phase::WaitingApproval;
                 self.mode = AppMode::Approval;
                 self.pending_approval = Some(PendingApproval {
@@ -408,7 +652,14 @@ impl App {
                     category: category.to_string(),
                     responder,
                 });
-                self.log(LogLevel::Warn, format!("Approval needed [{}]: {}", category, truncate_str(&command_preview, 80)));
+                self.log(
+                    LogLevel::Warn,
+                    format!(
+                        "Approval needed [{}]: {}",
+                        category,
+                        truncate_str(&command_preview, 80)
+                    ),
+                );
             }
             AppEvent::ControlCommand(msg) => {
                 self.log(LogLevel::Debug, format!("Control: {:?}", msg));
@@ -458,7 +709,7 @@ mod tests {
         assert_eq!(app.current_phase, Phase::Idle);
         assert_eq!(app.mode, AppMode::Normal);
         assert!(!app.should_quit);
-        assert!(!app.verbose);
+        assert_eq!(app.verbosity, Verbosity::Normal);
         assert!(app.auto_scroll);
         assert!(app.log_entries.is_empty());
     }
@@ -539,14 +790,16 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_verbose() {
+    fn handle_key_verbosity_cycle() {
         let mut app = test_app();
-        assert!(!app.verbose);
+        assert_eq!(app.verbosity, Verbosity::Normal);
         let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
         app.handle_key(key);
-        assert!(app.verbose);
+        assert_eq!(app.verbosity, Verbosity::Verbose);
         app.handle_key(key);
-        assert!(!app.verbose);
+        assert_eq!(app.verbosity, Verbosity::Debug);
+        app.handle_key(key);
+        assert_eq!(app.verbosity, Verbosity::Quiet);
     }
 
     #[test]
@@ -624,6 +877,24 @@ mod tests {
         assert_eq!(app.current_phase, Phase::WaitingHuman);
         assert!(app.human_textarea.is_some());
         assert_eq!(app.human_question.as_deref(), Some("Which database?"));
+    }
+
+    #[test]
+    fn handle_key_human_enter_empty_keeps_mode() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::HumanQuestionDetected {
+            question: "Which database?".to_string(),
+        });
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.handle_key(key));
+        assert_eq!(app.mode, AppMode::AskHuman);
+        assert_eq!(app.current_phase, Phase::WaitingHuman);
+        assert!(app.human_textarea.is_some());
+        assert!(app
+            .log_entries
+            .iter()
+            .any(|e| e.content.contains("Response cannot be empty")));
     }
 
     #[test]
@@ -737,7 +1008,9 @@ mod tests {
         assert!(app.handle_key(key));
         assert_eq!(app.mode, AppMode::Normal);
 
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let resp = rt.block_on(async { rx.await.unwrap() });
         assert_eq!(resp, ApprovalResponse::Approve);
     }
@@ -757,7 +1030,9 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
         assert!(app.handle_key(key));
 
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let resp = rt.block_on(async { rx.await.unwrap() });
         assert_eq!(resp, ApprovalResponse::Deny);
     }
@@ -777,7 +1052,9 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(app.handle_key(key));
 
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let resp = rt.block_on(async { rx.await.unwrap() });
         assert_eq!(resp, ApprovalResponse::Skip);
     }
@@ -797,7 +1074,9 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(app.handle_key(key));
 
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let resp = rt.block_on(async { rx.await.unwrap() });
         assert_eq!(resp, ApprovalResponse::ApproveAll);
     }

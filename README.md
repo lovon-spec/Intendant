@@ -9,7 +9,7 @@ stdin (JSON) --> intendant-runtime --> spawns bash commands
                   |
                   +--> /dev/shm/intendant_processes  (process state, survives restarts)
                   +--> /dev/shm/intendant_session     (log directory path, survives restarts)
-                  +--> /var/log/intendant/<timestamp>/ (stdout/stderr logs per nonce)
+                  +--> ~/.intendant/logs/<timestamp>/  (stdout/stderr logs per nonce)
                   |
                   +--> StatusMonitor --> stdout (status lines)
 
@@ -30,7 +30,7 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
 
 - **Shared Memory (`/dev/shm/intendant_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Survives binary restarts since it lives on tmpfs.
 - **Session File (`/dev/shm/intendant_session`):** Stores the log directory path so consecutive runs reuse the same directory.
-- **Log Directory (`/var/log/intendant/<timestamp>/`):** Per-nonce stdout and stderr log files. Created once per session.
+- **Log Directory (`~/.intendant/logs/<timestamp>/`):** Per-nonce stdout and stderr log files. Created once per session.
 - **Status Monitor:** Background task that polls SHM for status changes and writes update lines to stdout.
 
 ## Building
@@ -204,7 +204,7 @@ enabled = false  # default: true
 cargo test
 ```
 
-406 tests cover both binaries:
+The test suite covers both binaries with several hundred unit/integration tests:
 
 - **Agent binary (114 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
 - **Caller binary (292 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, and control socket serialization.
@@ -281,7 +281,7 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--no-tui` | Disable TUI, use plain text output |
 | `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
 | `--log-file <path>` | Write log output to file |
-| `--control-socket` | Enable control socket in headless mode |
+| `--control-socket` | Reserved for headless socket control (currently only TUI mode opens the socket) |
 
 The TUI launches automatically when stdin is a terminal. When piping input or in sub-agent mode, `intendant` falls back to headless mode.
 
@@ -305,6 +305,13 @@ The TUI launches automatically when stdin is a terminal. When piping input or in
 - Single-loop execution similar to the original behavior
 - Used for short, single-line tasks that don't need orchestration
 
+### `askHuman` Behavior (Important)
+
+- In **TUI mode**, `askHuman` opens the input panel and writes your answer to `/dev/shm/intendant_human_response`.
+- Empty submit is rejected in the TUI; you must provide non-empty input or press `Esc` to cancel.
+- In **headless mode** (`--no-tui` or non-interactive stdin), `askHuman` cannot be answered interactively. The loop now tells the model to continue with explicit assumptions instead of waiting for the runtime timeout.
+- Runtime-level timeout for unanswered `askHuman` remains `5 minutes`.
+
 ### How it works
 
 1. Loads `.env` and selects the API provider (OpenAI or Anthropic). All OpenAI models use the Responses API (`/v1/responses`)
@@ -319,9 +326,13 @@ The TUI launches automatically when stdin is a terminal. When piping input or in
 10. Injects project context (`memory_file`) into relevant commands
 11. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
 12. If approval is required, emits an approval request to the TUI and waits for user response
-13. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with idle timeout (3s, or 330s for askHuman) and hard timeout (30s, or 600s for askHuman)
+13. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with adaptive timeouts:
+    - Default: idle-before-first `2s`, idle-after-first `1s`, hard `30s`
+    - `fetchStatus(wait=true)`: idle-before-first `15s`, hard `45s`
+    - `askHuman`: idle-before-first `330s`, idle-after-first `1s`, hard `600s`
 14. Feeds the agent output back as the next user message, appending a token budget summary
 15. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
+16. In headless mode, if the model emits `askHuman`, the loop now sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
 
 ## Environment
 
@@ -338,7 +349,7 @@ The TUI launches automatically when stdin is a terminal. When piping input or in
 | `ANTHROPIC_API_KEY` / `ANTHROPIC` | — | Anthropic API key |
 | `PROVIDER` | auto-detect | `"openai"` or `"anthropic"` (used when both keys are set) |
 | `MODEL_NAME` | `gpt-5.2-codex` / `claude-sonnet-4-5-20250929` | Model to use (default depends on provider) |
-| `INTENDANT_IDLE_TIMEOUT` | `3` | Seconds to wait for agent output before assuming idle |
+| `INTENDANT_IDLE_TIMEOUT` | `2` | Seconds to wait for first agent stdout byte before assuming idle (baseline mode) |
 | `INTENDANT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
 | `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call (sent to API) |
@@ -352,7 +363,7 @@ The TUI launches automatically when stdin is a terminal. When piping input or in
 | `INTENDANT_TASK` | — | Task description for sub-agent mode |
 | `INTENDANT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
 
-Timeouts are automatically extended when `askHuman` is detected in the command batch (idle: 330s, hard: 600s). Manual override via env vars is still supported.
+Timeouts are automatically extended for slow-start workflows (`askHuman`, `fetchStatus(wait=true)`). Manual override via env vars is still supported.
 
 ### Project Configuration
 
@@ -450,7 +461,12 @@ Action categories are determined by analyzing command JSON: shell commands are c
 
 ## Control Socket
 
-When the TUI is active, a Unix domain socket is created at `/tmp/intendant-<pid>.sock` for programmatic control. Use `--control-socket` to enable in headless mode.
+When the TUI is active, a Unix domain socket is created at `/tmp/intendant-<pid>.sock`.
+
+Current status:
+- Outbound event broadcast is implemented.
+- Inbound command transport is implemented, but command handling is currently minimal (messages are surfaced to the TUI event stream; full remote-control actions are still being expanded).
+- `--control-socket` is currently a reserved headless flag.
 
 ### Inbound Commands (JSON-line)
 

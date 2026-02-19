@@ -19,7 +19,7 @@ use conversation::Conversation;
 use error::CallerError;
 use project::Project;
 use std::env;
-use std::io::{self, BufRead, Write, IsTerminal};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use tui::event::{AppEvent, EventBus};
 
@@ -36,6 +36,12 @@ const SAFETY_CAP: usize = 500;
 const MIN_BUDGET_TOKENS: u64 = 4096;
 const BUDGET_WARNING_THRESHOLD: f64 = 0.85;
 
+#[derive(Debug, Clone, Default)]
+struct LoopStats {
+    turns: usize,
+    usage: provider::TokenUsage,
+}
+
 /// CLI flags parsed from command-line arguments.
 struct CliFlags {
     task: Option<String>,
@@ -45,6 +51,7 @@ struct CliFlags {
     no_tui: bool,
     autonomy: AutonomyLevel,
     log_file: Option<String>,
+    resume: bool,
     control_socket: bool,
 }
 
@@ -60,13 +67,16 @@ fn print_help() {
     println!("    --model <NAME>        Model name to use");
     println!("    --autonomy <LEVEL>    Autonomy level: low, medium, high, full");
     println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<ts>/)");
+    println!("    --resume [DIR]        Resume previous session (or specific log dir)");
     println!("    --no-tui              Disable TUI, run headless");
     println!("    --verbose, -v         Enable verbose output");
     println!("    --control-socket      Enable Unix control socket");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
-    println!("    Logs are always written to ~/.intendant/logs/<timestamp>/ (override with --log-file).");
+    println!(
+        "    Logs are always written to ~/.intendant/logs/<timestamp>/ (override with --log-file)."
+    );
     println!("    The log directory contains:");
     println!("      session.jsonl           Structured JSONL event log (one JSON object per line)");
     println!("      turns/turn_NNN_*.txt    Full model responses, agent I/O per turn");
@@ -95,6 +105,7 @@ fn parse_cli_flags() -> CliFlags {
         no_tui: false,
         autonomy: AutonomyLevel::Medium,
         log_file: None,
+        resume: false,
         control_socket: false,
     };
 
@@ -140,6 +151,15 @@ fn parse_cli_flags() -> CliFlags {
             }
             "--log-file" => {
                 if i + 1 < args.len() {
+                    flags.log_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--resume" => {
+                flags.resume = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     flags.log_file = Some(args[i + 1].clone());
                     i += 2;
                 } else {
@@ -209,10 +229,7 @@ fn extract_json(text: &str) -> Option<&str> {
 
 /// Returns (json_string, had_context_directives).
 /// Empty json_string means no commands to execute.
-fn apply_context_directives(
-    json_str: &str,
-    conversation: &mut Conversation,
-) -> (String, bool) {
+fn apply_context_directives(json_str: &str, conversation: &mut Conversation) -> (String, bool) {
     let mut value: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return (json_str.to_string(), false),
@@ -262,13 +279,13 @@ fn apply_context_directives(
         return (String::new(), had_context);
     }
 
-    (serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string()), had_context)
+    (
+        serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string()),
+        had_context,
+    )
 }
 
-fn inject_project_context(
-    json_str: &str,
-    project: &Project,
-) -> String {
+fn inject_project_context(json_str: &str, project: &Project) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return json_str.to_string(),
@@ -278,7 +295,9 @@ fn inject_project_context(
         let memory_file = project.memory_path().to_string_lossy().to_string();
 
         for cmd in commands.iter_mut() {
-            if let Some("storeMemory" | "recallMemory") = cmd.get("function").and_then(|f| f.as_str()) {
+            if let Some("storeMemory" | "recallMemory") =
+                cmd.get("function").and_then(|f| f.as_str())
+            {
                 if cmd.get("memory_file").is_none() {
                     cmd["memory_file"] = serde_json::Value::String(memory_file.clone());
                 }
@@ -289,6 +308,23 @@ fn inject_project_context(
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
 
+fn has_ask_human_command(json_str: &str) -> bool {
+    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    parsed
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .map(|commands| {
+            commands
+                .iter()
+                .any(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman"))
+        })
+        .unwrap_or(false)
+}
+
 /// Format a human-readable command preview from raw JSON (for approval display).
 fn format_command_preview(json_str: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
@@ -296,44 +332,27 @@ fn format_command_preview(json_str: &str) -> String {
             let summaries: Vec<String> = commands
                 .iter()
                 .map(|cmd| {
-                    let func = cmd
-                        .get("function")
-                        .and_then(|f| f.as_str())
-                        .unwrap_or("?");
+                    let func = cmd.get("function").and_then(|f| f.as_str()).unwrap_or("?");
                     match func {
                         "execAsAgent" => {
-                            let command = cmd
-                                .get("command")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("?");
+                            let command =
+                                cmd.get("command").and_then(|c| c.as_str()).unwrap_or("?");
                             format!("exec: {}", command)
                         }
                         "writeFile" | "editFile" => {
-                            let path = cmd
-                                .get("file_path")
-                                .and_then(|p| p.as_str())
-                                .unwrap_or("?");
+                            let path = cmd.get("file_path").and_then(|p| p.as_str()).unwrap_or("?");
                             format!("{}: {}", func, path)
                         }
                         "inspectPath" => {
-                            let path = cmd
-                                .get("path")
-                                .and_then(|p| p.as_str())
-                                .unwrap_or("?");
+                            let path = cmd.get("path").and_then(|p| p.as_str()).unwrap_or("?");
                             format!("inspect: {}", path)
                         }
                         "fetchStatus" => {
-                            let nonce = cmd
-                                .get("nonce")
-                                .and_then(|n| n.as_u64())
-                                .unwrap_or(0);
+                            let nonce = cmd.get("nonce").and_then(|n| n.as_u64()).unwrap_or(0);
                             format!("fetchStatus(nonce={})", nonce)
                         }
                         "browse" => {
-                            let url = cmd
-                                .get("url")
-                                .and_then(|u| u.as_str())
-                                .unwrap_or("?");
+                            let url = cmd.get("url").and_then(|u| u.as_str()).unwrap_or("?");
                             format!("browse: {}", url)
                         }
                         _ => func.to_string(),
@@ -528,15 +547,24 @@ Also: {"source": "bare"}"#;
     fn done_signal_detected() {
         let json = r#"{"commands":[],"done":true,"message":"All tasks completed"}"#;
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert!(parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
-        assert_eq!(parsed.get("message").and_then(|m| m.as_str()), Some("All tasks completed"));
+        assert!(parsed
+            .get("done")
+            .and_then(|d| d.as_bool())
+            .unwrap_or(false));
+        assert_eq!(
+            parsed.get("message").and_then(|m| m.as_str()),
+            Some("All tasks completed")
+        );
     }
 
     #[test]
     fn done_signal_without_message() {
         let json = r#"{"commands":[],"done":true}"#;
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert!(parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
+        assert!(parsed
+            .get("done")
+            .and_then(|d| d.as_bool())
+            .unwrap_or(false));
         assert!(parsed.get("message").and_then(|m| m.as_str()).is_none());
     }
 
@@ -544,7 +572,10 @@ Also: {"source": "bare"}"#;
     fn no_done_signal_continues() {
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert!(!parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
+        assert!(!parsed
+            .get("done")
+            .and_then(|d| d.as_bool())
+            .unwrap_or(false));
     }
 
     #[test]
@@ -606,7 +637,9 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn is_simple_task_complex_keywords() {
-        assert!(!is_simple_task("research the database schema and document findings"));
+        assert!(!is_simple_task(
+            "research the database schema and document findings"
+        ));
         assert!(!is_simple_task("implement a new authentication system"));
         assert!(!is_simple_task("refactor the payment module"));
         assert!(!is_simple_task("build and deploy the application"));
@@ -636,10 +669,12 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             autonomy: AutonomyLevel::Medium,
             log_file: None,
+            resume: false,
             control_socket: false,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
+        assert!(!flags.resume);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
     }
 
@@ -688,11 +723,35 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn has_ask_human_command_true() {
+        let json =
+            r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"askHuman","nonce":2}]}"#;
+        assert!(has_ask_human_command(json));
+    }
+
+    #[test]
+    fn has_ask_human_command_false() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#;
+        assert!(!has_ask_human_command(json));
+    }
+
+    #[test]
+    fn has_ask_human_command_invalid_json() {
+        assert!(!has_ask_human_command("not json"));
+    }
+
+    #[test]
     fn emit_with_bus() {
         let (bus, mut rx) = EventBus::new();
         let bus_opt = Some(bus);
-        emit(&bus_opt, || AppEvent::Tick, || panic!("should not be called"));
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        emit(
+            &bus_opt,
+            || AppEvent::Tick,
+            || panic!("should not be called"),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         rt.block_on(async {
             match rx.recv().await.unwrap() {
                 AppEvent::Tick => {}
@@ -720,18 +779,30 @@ async fn run_agent_loop(
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
-) -> Result<(), CallerError> {
+) -> Result<LoopStats, CallerError> {
     let mut budget_warning_shown = false;
+    let mut empty_command_streak = 0usize;
+    let mut loop_stats = LoopStats::default();
 
     for turn in 1..=SAFETY_CAP {
         // Check budget before sending
         if conversation.remaining_budget() <= MIN_BUDGET_TOKENS {
             let remaining = conversation.remaining_budget();
-            slog(&session_log, |l| l.warn(&format!("Budget exhausted ({} tokens remaining)", remaining)));
+            slog(&session_log, |l| {
+                l.warn(&format!(
+                    "Budget exhausted ({} tokens remaining)",
+                    remaining
+                ))
+            });
             emit(
                 &bus,
                 || AppEvent::BudgetExhausted { remaining },
-                || println!("--- Context budget exhausted ({} tokens remaining) ---", remaining),
+                || {
+                    println!(
+                        "--- Context budget exhausted ({} tokens remaining) ---",
+                        remaining
+                    )
+                },
             );
             break;
         }
@@ -744,8 +815,18 @@ async fn run_agent_loop(
 
         emit(
             &bus,
-            || AppEvent::TurnStarted { turn, budget_pct, remaining },
-            || println!("[Turn {}] Sending to model... {}", turn, conversation.budget_summary()),
+            || AppEvent::TurnStarted {
+                turn,
+                budget_pct,
+                remaining,
+            },
+            || {
+                println!(
+                    "[Turn {}] Sending to model... {}",
+                    turn,
+                    conversation.budget_summary()
+                )
+            },
         );
 
         let response = match provider.chat(conversation.messages()).await {
@@ -761,30 +842,41 @@ async fn run_agent_loop(
             }
         };
         conversation.set_usage(response.usage.clone());
+        loop_stats.turns = turn;
+        loop_stats.usage.prompt_tokens += response.usage.prompt_tokens;
+        loop_stats.usage.completion_tokens += response.usage.completion_tokens;
+        loop_stats.usage.total_tokens += response.usage.total_tokens;
         conversation.add_assistant(response.content.clone());
 
         // Log the full model response (no truncation)
-        slog(&session_log, |l| l.model_response(
-            &response.content,
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens,
-            response.usage.total_tokens,
-        ));
+        slog(&session_log, |l| {
+            l.model_response(
+                &response.content,
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+                response.usage.total_tokens,
+            )
+        });
 
         // Check budget warning
         if !budget_warning_shown && conversation.usage_fraction() >= BUDGET_WARNING_THRESHOLD {
             let pct = conversation.usage_fraction() * 100.0;
             let remaining = conversation.remaining_budget();
-            slog(&session_log, |l| l.warn(&format!(
-                "Budget warning: {:.0}% used, {} remaining", pct, remaining
-            )));
+            slog(&session_log, |l| {
+                l.warn(&format!(
+                    "Budget warning: {:.0}% used, {} remaining",
+                    pct, remaining
+                ))
+            });
             emit(
                 &bus,
                 || AppEvent::BudgetWarning { pct, remaining },
-                || eprintln!(
-                    "WARNING: Context budget is running low ({:.0}% used, {} tokens remaining)",
-                    pct, remaining,
-                ),
+                || {
+                    eprintln!(
+                        "WARNING: Context budget is running low ({:.0}% used, {} tokens remaining)",
+                        pct, remaining,
+                    )
+                },
             );
             budget_warning_shown = true;
         }
@@ -801,7 +893,8 @@ async fn run_agent_loop(
                         last_action,
                         question: None,
                     };
-                    let _ = sub_agent::write_progress(std::path::Path::new(&progress_path), &progress);
+                    let _ =
+                        sub_agent::write_progress(std::path::Path::new(&progress_path), &progress);
                 }
             }
         }
@@ -809,8 +902,10 @@ async fn run_agent_loop(
         emit(
             &bus,
             || AppEvent::ModelResponse {
+                turn,
                 content: response.content.clone(),
                 usage: response.usage.clone(),
+                reasoning: response.reasoning_summary.clone(),
             },
             || {
                 println!("Model response:\n{}", response.content);
@@ -822,10 +917,14 @@ async fn run_agent_loop(
         let json_str = match extract_json(&response.content) {
             Some(json) => json.to_string(),
             None => {
-                slog(&session_log, |l| l.info("No JSON found in response — task complete"));
+                slog(&session_log, |l| {
+                    l.info("No JSON found in response — task complete")
+                });
                 emit(
                     &bus,
-                    || AppEvent::TaskComplete { reason: "Task complete".to_string() },
+                    || AppEvent::TaskComplete {
+                        reason: "Task complete".to_string(),
+                    },
                     || println!("--- Task complete ---"),
                 );
                 break;
@@ -844,15 +943,26 @@ async fn run_agent_loop(
 
         // Check for explicit done signal (used in structured output / JSON mode)
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
-            if parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-                let message = parsed.get("message").and_then(|m| m.as_str()).map(String::from);
-                slog(&session_log, |l| l.info(&format!(
-                    "Done signal received: {}",
-                    message.as_deref().unwrap_or("(no message)")
-                )));
+            if parsed
+                .get("done")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false)
+            {
+                let message = parsed
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(String::from);
+                slog(&session_log, |l| {
+                    l.info(&format!(
+                        "Done signal received: {}",
+                        message.as_deref().unwrap_or("(no message)")
+                    ))
+                });
                 emit(
                     &bus,
-                    || AppEvent::DoneSignal { message: message.clone() },
+                    || AppEvent::DoneSignal {
+                        message: message.clone(),
+                    },
                     || {
                         if let Some(ref msg) = message {
                             println!("{}", msg);
@@ -874,8 +984,11 @@ async fn run_agent_loop(
         // No commands to execute
         if json_str.is_empty() {
             if had_context {
+                empty_command_streak = 0;
                 // Context directives were applied, but no commands — context management turn
-                slog(&session_log, |l| l.debug(&format!("Turn {}: context management only", turn)));
+                slog(&session_log, |l| {
+                    l.debug(&format!("Turn {}: context management only", turn))
+                });
                 emit(
                     &bus,
                     || AppEvent::ContextManagement { turn },
@@ -884,19 +997,51 @@ async fn run_agent_loop(
                 conversation.add_user("Context updated.".to_string());
                 continue;
             } else {
-                // No commands and no context directives — task complete
-                slog(&session_log, |l| l.info("No commands and no context directives — task complete"));
-                emit(
-                    &bus,
-                    || AppEvent::TaskComplete { reason: "Task complete".to_string() },
-                    || println!("--- Task complete ---"),
+                // Do not complete immediately on an empty command turn.
+                // Require explicit done=true, or two consecutive empty-command turns.
+                empty_command_streak += 1;
+                if empty_command_streak >= 2 {
+                    slog(&session_log, |l| {
+                        l.info("No commands across consecutive turns — task complete")
+                    });
+                    emit(
+                        &bus,
+                        || AppEvent::TaskComplete {
+                            reason: "Task complete".to_string(),
+                        },
+                        || println!("--- Task complete ---"),
+                    );
+                    break;
+                }
+                slog(&session_log, |l| {
+                    l.warn(
+                        "No commands and no context directives — requesting explicit done signal",
+                    )
+                });
+                conversation.add_user(
+                    "No commands were produced. If the task is complete, respond with JSON containing done=true. Otherwise provide commands.".to_string(),
                 );
-                break;
+                continue;
             }
         }
+        empty_command_streak = 0;
 
         // Inject project context (memory_file) into commands
         let json_str = inject_project_context(&json_str, project);
+
+        // In headless mode there is no askHuman input panel.
+        // Avoid blocking on runtime human-input timeout; ask the model to continue with assumptions.
+        if bus.is_none() && has_ask_human_command(&json_str) {
+            slog(&session_log, |l| {
+                l.warn("askHuman requested in headless mode; prompting model to continue")
+            });
+            conversation.add_user(
+                "askHuman is unavailable in headless mode (--no-tui or non-interactive stdin). \
+Proceed with explicit assumptions and continue without additional questions."
+                    .to_string(),
+            );
+            continue;
+        }
 
         // Check autonomy / approval for commands
         let needs_approval = {
@@ -905,6 +1050,10 @@ async fn run_agent_loop(
             let mut need = None;
             for (_idx, categories) in &classifications {
                 for &cat in categories {
+                    // askHuman is handled via the dedicated TUI input flow, not approval buttons.
+                    if cat == autonomy::ActionCategory::HumanInput {
+                        continue;
+                    }
                     if autonomy_state.needs_approval(cat) {
                         need = Some(cat);
                         break;
@@ -920,7 +1069,9 @@ async fn run_agent_loop(
         let mut should_skip = false;
         if let Some(cat) = needs_approval {
             let preview = format_command_preview(&json_str);
-            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "waiting"));
+            slog(&session_log, |l| {
+                l.approval(&cat.to_string(), &preview, "waiting")
+            });
 
             if let Some(ref bus_ref) = bus {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -932,25 +1083,35 @@ async fn run_agent_loop(
                 });
                 match rx.await {
                     Ok(tui::event::ApprovalResponse::Approve) => {
-                        slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "approved"));
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "approved")
+                        });
                     }
                     Ok(tui::event::ApprovalResponse::ApproveAll) => {
-                        slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "approve-all"));
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "approve-all")
+                        });
                         let mut state = autonomy.write().await;
                         state.level = AutonomyLevel::Full;
                     }
                     Ok(tui::event::ApprovalResponse::Skip) => {
-                        slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "skipped"));
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "skipped")
+                        });
                         should_skip = true;
                     }
                     Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
-                        slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "denied"));
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied")
+                        });
                         emit(
                             &bus,
-                            || AppEvent::TaskComplete { reason: "Denied by user".to_string() },
+                            || AppEvent::TaskComplete {
+                                reason: "Denied by user".to_string(),
+                            },
                             || println!("--- Denied by user ---"),
                         );
-                        return Ok(());
+                        return Ok(loop_stats);
                     }
                 }
             }
@@ -974,7 +1135,9 @@ async fn run_agent_loop(
         let output = agent_runner::run_agent(&json_str).await?;
 
         // Log full agent output (no truncation)
-        slog(&session_log, |l| l.agent_output(&output.stdout, &output.stderr));
+        slog(&session_log, |l| {
+            l.agent_output(&output.stdout, &output.stderr)
+        });
 
         emit(
             &bus,
@@ -996,10 +1159,14 @@ async fn run_agent_loop(
             let results = sub_agent::scan_completed_results(&sub_agent_dir);
             for result in &results {
                 let msg = sub_agent::format_result_message(result);
-                slog(&session_log, |l| l.info(&format!("Sub-agent result: {}", msg)));
+                slog(&session_log, |l| {
+                    l.info(&format!("Sub-agent result: {}", msg))
+                });
                 emit(
                     &bus,
-                    || AppEvent::SubAgentResult { formatted: msg.clone() },
+                    || AppEvent::SubAgentResult {
+                        formatted: msg.clone(),
+                    },
                     || println!("{}", msg),
                 );
             }
@@ -1014,7 +1181,9 @@ async fn run_agent_loop(
         conversation.add_user(user_msg);
 
         if turn == SAFETY_CAP {
-            slog(&session_log, |l| l.warn(&format!("Safety cap ({}) reached", SAFETY_CAP)));
+            slog(&session_log, |l| {
+                l.warn(&format!("Safety cap ({}) reached", SAFETY_CAP))
+            });
             emit(
                 &bus,
                 || AppEvent::SafetyCapReached,
@@ -1024,7 +1193,7 @@ async fn run_agent_loop(
     }
 
     slog(&session_log, |l| l.info("Agent loop finished"));
-    Ok(())
+    Ok(loop_stats)
 }
 
 fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
@@ -1061,7 +1230,7 @@ async fn run_sub_agent_mode(
     id: String,
     role: sub_agent::SubAgentRole,
     session_log: SharedSessionLog,
-) -> Result<(), CallerError> {
+) -> Result<LoopStats, CallerError> {
     let project = Project::detect()?;
     let system_prompt = prompts::resolve_system_prompt(&role, Some(&project.root))?;
     let task = get_task()?;
@@ -1072,10 +1241,18 @@ async fn run_sub_agent_mode(
 
     slog(&session_log, |l| {
         l.info(&format!("Sub-agent mode: {} (role: {})", id, role.as_str()));
-        l.info(&format!("Provider: {} (context window: {})", provider.name(), provider.context_window()));
+        l.info(&format!(
+            "Provider: {} (context window: {})",
+            provider.name(),
+            provider.context_window()
+        ));
     });
     println!("Running as sub-agent: {} (role: {})", id, role.as_str());
-    println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
+    println!(
+        "Provider: {} (context window: {})",
+        provider.name(),
+        provider.context_window()
+    );
 
     let mut conversation = Conversation::new(system_prompt, provider.context_window());
 
@@ -1084,7 +1261,8 @@ async fn run_sub_agent_mode(
         if let Some(store) = memory::load_memory(&project) {
             if let Some(memory_msg) = memory::format_memory_message(&store) {
                 conversation.add_user(memory_msg);
-                conversation.add_assistant("Acknowledged. I have loaded the project memory.".to_string());
+                conversation
+                    .add_assistant("Acknowledged. I have loaded the project memory.".to_string());
             }
         }
     }
@@ -1108,18 +1286,21 @@ async fn run_sub_agent_mode(
         None, // no TUI for sub-agents
         autonomy,
         session_log,
-    ).await;
+    )
+    .await;
 
     // Write result file
     if let Ok(result_path) = env::var("INTENDANT_RESULT_FILE") {
-        let (status, summary) = match &result {
-            Ok(()) => (
+        let (status, summary, usage) = match &result {
+            Ok(stats) => (
                 sub_agent::SubAgentStatus::Completed,
                 "Task completed successfully".to_string(),
+                stats.usage.clone(),
             ),
             Err(e) => (
                 sub_agent::SubAgentStatus::Failed(e.to_string()),
                 format!("Task failed: {}", e),
+                provider::TokenUsage::default(),
             ),
         };
 
@@ -1129,7 +1310,7 @@ async fn run_sub_agent_mode(
             summary,
             findings: vec![],
             artifacts: vec![],
-            usage: provider::TokenUsage::default(),
+            usage,
         };
         let _ = sub_agent::write_result(std::path::Path::new(&result_path), &agent_result);
     }
@@ -1144,14 +1325,25 @@ async fn run_user_mode(
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
-) -> Result<(), CallerError> {
-    let system_prompt = prompts::resolve_system_prompt(&sub_agent::SubAgentRole::Custom("user".to_string()), Some(&project.root))?;
+) -> Result<LoopStats, CallerError> {
+    let system_prompt = prompts::resolve_system_prompt(
+        &sub_agent::SubAgentRole::Custom("user".to_string()),
+        Some(&project.root),
+    )?;
 
     slog(&session_log, |l| {
-        l.info(&format!("Mode: user (provider: {}, context: {})", provider.name(), provider.context_window()));
+        l.info(&format!(
+            "Mode: user (provider: {}, context: {})",
+            provider.name(),
+            provider.context_window()
+        ));
     });
     if bus.is_none() {
-        println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
+        println!(
+            "Provider: {} (context window: {})",
+            provider.name(),
+            provider.context_window()
+        );
         println!("Mode: user (orchestrator will be spawned for complex tasks)");
     }
 
@@ -1162,7 +1354,8 @@ async fn run_user_mode(
     if let Some(store) = memory::load_memory(&project) {
         if let Some(memory_msg) = memory::format_memory_message(&store) {
             conversation.add_user_with_layer(memory_msg, conversation::MessageLayer::User);
-            conversation.add_assistant("Acknowledged. I have loaded the project memory.".to_string());
+            conversation
+                .add_assistant("Acknowledged. I have loaded the project memory.".to_string());
         }
     }
 
@@ -1180,7 +1373,8 @@ async fn run_user_mode(
         bus,
         autonomy,
         session_log,
-    ).await
+    )
+    .await
 }
 
 async fn run_direct_mode(
@@ -1190,14 +1384,25 @@ async fn run_direct_mode(
     bus: Option<EventBus>,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
-) -> Result<(), CallerError> {
-    let system_prompt = prompts::resolve_system_prompt(&sub_agent::SubAgentRole::Custom("direct".to_string()), Some(&project.root))?;
+) -> Result<LoopStats, CallerError> {
+    let system_prompt = prompts::resolve_system_prompt(
+        &sub_agent::SubAgentRole::Custom("direct".to_string()),
+        Some(&project.root),
+    )?;
 
     slog(&session_log, |l| {
-        l.info(&format!("Mode: direct (provider: {}, context: {})", provider.name(), provider.context_window()));
+        l.info(&format!(
+            "Mode: direct (provider: {}, context: {})",
+            provider.name(),
+            provider.context_window()
+        ));
     });
     if bus.is_none() {
-        println!("Provider: {} (context window: {})", provider.name(), provider.context_window());
+        println!(
+            "Provider: {} (context window: {})",
+            provider.name(),
+            provider.context_window()
+        );
     }
 
     let mut conversation = Conversation::new(system_prompt, provider.context_window());
@@ -1206,7 +1411,8 @@ async fn run_direct_mode(
     if let Some(store) = memory::load_memory(&project) {
         if let Some(memory_msg) = memory::format_memory_message(&store) {
             conversation.add_user(memory_msg);
-            conversation.add_assistant("Acknowledged. I have loaded the project memory.".to_string());
+            conversation
+                .add_assistant("Acknowledged. I have loaded the project memory.".to_string());
         }
     }
 
@@ -1224,7 +1430,8 @@ async fn run_direct_mode(
         bus,
         autonomy,
         session_log,
-    ).await
+    )
+    .await
 }
 
 fn is_simple_task(task: &str) -> bool {
@@ -1236,9 +1443,18 @@ fn is_simple_task(task: &str) -> bool {
 
     let lower = task.to_lowercase();
     let complex_indicators = [
-        "research", "investigate", "implement", "build",
-        "refactor", "migrate", "deploy", "set up",
-        "analyze", "compare", "design", "create a",
+        "research",
+        "investigate",
+        "implement",
+        "build",
+        "refactor",
+        "migrate",
+        "deploy",
+        "set up",
+        "analyze",
+        "compare",
+        "design",
+        "create a",
     ];
 
     for indicator in &complex_indicators {
@@ -1270,20 +1486,39 @@ async fn main() -> Result<(), CallerError> {
         env::set_var("MODEL_NAME", m);
     }
 
-    // Create session log (always enabled; --log-file overrides directory)
-    let log_dir = session_log::SessionLog::resolve_path(flags.log_file.as_deref());
+    // Create or resume session log.
+    let log_dir = if flags.resume {
+        let dir = session_log::SessionLog::resolve_resume_path(flags.log_file.as_deref())
+            .ok_or_else(|| {
+                CallerError::Config(
+                    "Resume requested, but no existing session directory was found".to_string(),
+                )
+            })?;
+        env::set_var("INTENDANT_RESUME_SESSION", "1");
+        dir
+    } else {
+        env::remove_var("INTENDANT_RESUME_SESSION");
+        session_log::SessionLog::resolve_path(flags.log_file.as_deref())
+    };
     let session_log: SharedSessionLog = match session_log::SessionLog::open(log_dir.clone()) {
         Ok(log) => {
             eprintln!("Session log: {}/session.jsonl", log.dir().display());
             Arc::new(Mutex::new(log))
         }
         Err(e) => {
-            eprintln!("Warning: Could not create session log at {}: {}", log_dir.display(), e);
+            eprintln!(
+                "Warning: Could not create session log at {}: {}",
+                log_dir.display(),
+                e
+            );
             // Fallback to /tmp
             let fallback = std::path::PathBuf::from("/tmp/intendant_session");
             let log = session_log::SessionLog::open(fallback)
                 .map_err(|e| CallerError::Config(format!("Cannot create session log: {}", e)))?;
-            eprintln!("Session log (fallback): {}/session.jsonl", log.dir().display());
+            eprintln!(
+                "Session log (fallback): {}/session.jsonl",
+                log.dir().display()
+            );
             Arc::new(Mutex::new(log))
         }
     };
@@ -1291,14 +1526,15 @@ async fn main() -> Result<(), CallerError> {
     let provider = provider::select_provider()?;
     slog(&session_log, |l| {
         l.info(&format!("Provider: {}", provider.name()));
-        l.info(&format!("Model: {}", env::var("MODEL_NAME").unwrap_or_else(|_| "default".to_string())));
+        l.info(&format!("Model: {}", provider.model()));
         l.info(&format!("Project root: {}", project.root.display()));
         l.info(&format!("Autonomy: {}", flags.autonomy));
     });
 
     // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
-        return run_sub_agent_mode(provider, id, role, session_log).await;
+        run_sub_agent_mode(provider, id, role, session_log).await?;
+        return Ok(());
     }
     let task = get_task_from_flags_or_env(&flags)?;
 
@@ -1312,10 +1548,7 @@ async fn main() -> Result<(), CallerError> {
     let use_tui = !flags.no_tui && io::stdin().is_terminal();
 
     // Build autonomy state from project config + CLI flags
-    let autonomy_state = AutonomyState::new(
-        flags.autonomy,
-        project.config.approval.clone(),
-    );
+    let autonomy_state = AutonomyState::new(flags.autonomy, project.config.approval.clone());
     let autonomy = autonomy::shared_autonomy(autonomy_state);
 
     if use_tui {
@@ -1337,10 +1570,14 @@ async fn main() -> Result<(), CallerError> {
         // Create app state
         let mut app = tui::app::App::new(
             provider.name().to_string(),
-            format!("{}", env::var("MODEL_NAME").unwrap_or_else(|_| "default".to_string())),
+            provider.model().to_string(),
             autonomy.clone(),
         );
-        app.verbose = flags.verbose;
+        app.verbosity = if flags.verbose {
+            tui::app::Verbosity::Debug
+        } else {
+            tui::app::Verbosity::Normal
+        };
 
         app.log(tui::app::LogLevel::Info, format!("Task: {}", task));
 
@@ -1353,20 +1590,40 @@ async fn main() -> Result<(), CallerError> {
         let session_log_summary = session_log.clone();
         let loop_handle = tokio::spawn(async move {
             let result = if is_simple_task(&task_clone) {
-                run_direct_mode(provider, task_clone, project, Some(bus_clone.clone()), autonomy_clone, session_log_clone).await
+                run_direct_mode(
+                    provider,
+                    task_clone,
+                    project,
+                    Some(bus_clone.clone()),
+                    autonomy_clone,
+                    session_log_clone,
+                )
+                .await
             } else {
-                run_user_mode(provider, task_clone, project, Some(bus_clone.clone()), autonomy_clone, session_log_clone).await
+                run_user_mode(
+                    provider,
+                    task_clone,
+                    project,
+                    Some(bus_clone.clone()),
+                    autonomy_clone,
+                    session_log_clone,
+                )
+                .await
             };
 
             match result {
-                Ok(()) => {
-                    slog(&session_log_summary, |l| l.write_summary(&task_for_summary, "completed", 0));
+                Ok(stats) => {
+                    slog(&session_log_summary, |l| {
+                        l.write_summary(&task_for_summary, "completed", stats.turns)
+                    });
                     bus_clone.send(AppEvent::TaskComplete {
                         reason: "Task complete".to_string(),
                     });
                 }
                 Err(e) => {
-                    slog(&session_log_summary, |l| l.write_summary(&task_for_summary, &format!("error: {}", e), 0));
+                    slog(&session_log_summary, |l| {
+                        l.write_summary(&task_for_summary, &format!("error: {}", e), 0)
+                    });
                     bus_clone.send(AppEvent::LoopError(e.to_string()));
                 }
             }
@@ -1378,17 +1635,39 @@ async fn main() -> Result<(), CallerError> {
         // Clean up
         loop_handle.abort();
         control::cleanup();
-        terminal.restore().map_err(|e| CallerError::Tui(e.to_string()))?;
+        terminal
+            .restore()
+            .map_err(|e| CallerError::Tui(e.to_string()))?;
     } else {
         // Headless mode (--no-tui or non-TTY)
         let result = if is_simple_task(&task) {
-            run_direct_mode(provider, task.clone(), project, None, autonomy, session_log.clone()).await
+            run_direct_mode(
+                provider,
+                task.clone(),
+                project,
+                None,
+                autonomy,
+                session_log.clone(),
+            )
+            .await
         } else {
-            run_user_mode(provider, task.clone(), project, None, autonomy, session_log.clone()).await
+            run_user_mode(
+                provider,
+                task.clone(),
+                project,
+                None,
+                autonomy,
+                session_log.clone(),
+            )
+            .await
         };
         match &result {
-            Ok(()) => slog(&session_log, |l| l.write_summary(&task, "completed", 0)),
-            Err(e) => slog(&session_log, |l| l.write_summary(&task, &format!("error: {}", e), 0)),
+            Ok(stats) => slog(&session_log, |l| {
+                l.write_summary(&task, "completed", stats.turns)
+            }),
+            Err(e) => slog(&session_log, |l| {
+                l.write_summary(&task, &format!("error: {}", e), 0)
+            }),
         }
         result?;
     }
