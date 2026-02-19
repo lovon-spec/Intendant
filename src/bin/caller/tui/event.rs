@@ -44,6 +44,11 @@ pub enum AppEvent {
     SubAgentResult {
         formatted: String,
     },
+    OrchestratorProgress {
+        turn: usize,
+        status: String,
+        last_action: String,
+    },
     ContextManagement {
         turn: usize,
     },

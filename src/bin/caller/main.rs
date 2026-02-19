@@ -1591,83 +1591,174 @@ All relative paths and commands execute from this directory.",
 }
 
 async fn run_user_mode(
-    provider: Box<dyn provider::ChatProvider>,
+    _provider: Box<dyn provider::ChatProvider>,
     task: String,
     project: Project,
     bus: Option<EventBus>,
-    autonomy: SharedAutonomy,
+    _autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
 ) -> Result<LoopStats, CallerError> {
-    let system_prompt = prompts::resolve_system_prompt(
-        &sub_agent::SubAgentRole::Custom("user".to_string()),
-        Some(&project.root),
-    )?;
+    slog(&session_log, |l| {
+        l.info("Mode: user (orchestrator subprocess)");
+    });
+    emit(
+        &bus,
+        || AppEvent::OrchestratorProgress {
+            turn: 0,
+            status: "spawning".to_string(),
+            last_action: String::new(),
+        },
+        || println!("Mode: user (spawning orchestrator subprocess)"),
+    );
+
+    // Build orchestrator spec
+    let caller_path = user_mode::get_caller_path();
+    let spec = user_mode::spawn_orchestrator_spec(&task, &project, &caller_path);
+
+    // Create directories for result/progress files
+    if let Some(parent) = spec.result_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Build and spawn the orchestrator subprocess
+    let spawn_cmd = sub_agent::build_spawn_command(&spec, &caller_path);
+    slog(&session_log, |l| {
+        l.info(&format!("Spawning orchestrator: {}", spawn_cmd));
+    });
+
+    let mut child = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(&spawn_cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| CallerError::SubAgent(format!("Failed to spawn orchestrator: {}", e)))?;
+
+    // Capture stderr in a background task
+    let stderr = child.stderr.take();
+    let bus_stderr = bus.clone();
+    let session_log_stderr = session_log.clone();
+    let stderr_handle = tokio::spawn(async move {
+        if let Some(stderr) = stderr {
+            use tokio::io::AsyncBufReadExt;
+            let reader = tokio::io::BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                slog(&session_log_stderr, |l| {
+                    l.debug(&format!("orchestrator stderr: {}", line));
+                });
+                emit(
+                    &bus_stderr,
+                    || AppEvent::AgentOutput {
+                        stdout: String::new(),
+                        stderr: line.clone(),
+                    },
+                    || eprintln!("orchestrator: {}", line),
+                );
+            }
+        }
+    });
+
+    // Monitor loop: poll progress file and wait for process exit
+    let mut last_progress_turn: usize = 0;
+    let poll_interval = tokio::time::Duration::from_millis(500);
+    let mut poll_timer = tokio::time::interval(poll_interval);
+    poll_timer.tick().await; // consume the immediate first tick
+
+    let exit_status = loop {
+        tokio::select! {
+            status = child.wait() => {
+                break status.map_err(|e| CallerError::SubAgent(format!("Orchestrator wait error: {}", e)))?;
+            }
+            _ = poll_timer.tick() => {
+                // Check progress file
+                if let Ok(progress) = sub_agent::read_progress(&spec.progress_file) {
+                    if progress.turn > last_progress_turn {
+                        last_progress_turn = progress.turn;
+                        let user_msg = user_mode::format_progress_for_user(&progress);
+                        slog(&session_log, |l| {
+                            l.info(&format!("Orchestrator progress: {}", user_msg));
+                        });
+                        emit(
+                            &bus,
+                            || AppEvent::OrchestratorProgress {
+                                turn: progress.turn,
+                                status: progress.status.clone(),
+                                last_action: progress.last_action.clone(),
+                            },
+                            || println!("{}", user_msg),
+                        );
+                    }
+                }
+            }
+        }
+    };
+
+    // Wait for stderr task to finish
+    let _ = stderr_handle.await;
 
     slog(&session_log, |l| {
         l.info(&format!(
-            "Mode: user (provider: {}, context: {})",
-            provider.name(),
-            provider.context_window()
+            "Orchestrator exited with status: {}",
+            exit_status
         ));
     });
-    if bus.is_none() {
-        println!(
-            "Provider: {} (context window: {})",
-            provider.name(),
-            provider.context_window()
-        );
-        println!("Mode: user (orchestrator will be spawned for complex tasks)");
-    }
 
-    let mut conversation = Conversation::new(system_prompt, provider.context_window());
-    conversation.set_protect_user_layer(true);
-
-    // Inject project root so the model knows which directory to work in
-    conversation.add_user_with_layer(
-        format!(
-            "Working directory: {}\nThis is the project you should examine and modify. \
-All relative paths and commands execute from this directory.",
-            project.root.display()
-        ),
-        conversation::MessageLayer::User,
-    );
-    conversation.add_assistant("Understood. I will work within the specified project directory.".to_string());
-
-    if let Some(max_parallel) = project.config.orchestrator.max_parallel_agents {
-        conversation.add_user_with_layer(
-            format!(
-                "Orchestrator constraint: at most {} sub-agents may run in parallel.",
-                max_parallel
-            ),
-            conversation::MessageLayer::User,
-        );
-    }
-
-    // Inject memory
-    if let Some(store) = memory::load_memory(&project) {
-        if let Some(memory_msg) = memory::format_memory_message(&store) {
-            conversation.add_user_with_layer(memory_msg, conversation::MessageLayer::User);
-            conversation
-                .add_assistant("Acknowledged. I have loaded the project memory.".to_string());
+    // Read result from result file, or synthesize a failure
+    let mut loop_stats = LoopStats::default();
+    let result = if spec.result_file.exists() {
+        match sub_agent::read_result(&spec.result_file) {
+            Ok(r) => r,
+            Err(e) => sub_agent::SubAgentResult {
+                id: spec.id.clone(),
+                status: sub_agent::SubAgentStatus::Failed(format!("Result parse error: {}", e)),
+                summary: "Orchestrator finished but result could not be parsed".to_string(),
+                findings: vec![],
+                artifacts: vec![],
+                usage: provider::TokenUsage::default(),
+            },
         }
-    }
+    } else {
+        sub_agent::SubAgentResult {
+            id: spec.id.clone(),
+            status: sub_agent::SubAgentStatus::Failed(format!("exit code: {}", exit_status)),
+            summary: "Orchestrator exited without writing a result file".to_string(),
+            findings: vec![],
+            artifacts: vec![],
+            usage: provider::TokenUsage::default(),
+        }
+    };
 
-    conversation.add_user_with_layer(task.clone(), conversation::MessageLayer::User);
-    if bus.is_none() {
-        println!("Task: {}", task);
-        println!("---");
-    }
+    loop_stats.usage = result.usage.clone();
+    loop_stats.turns = last_progress_turn;
 
-    run_agent_loop(
-        provider.as_ref(),
-        &mut conversation,
-        &project,
-        None,
-        bus,
-        autonomy,
-        session_log,
-    )
-    .await
+    let result_msg = sub_agent::format_result_message(&result);
+    slog(&session_log, |l| {
+        l.info(&format!("Orchestrator result: {}", result_msg));
+    });
+    emit(
+        &bus,
+        || AppEvent::SubAgentResult {
+            formatted: result_msg.clone(),
+        },
+        || println!("{}", result_msg),
+    );
+
+    let reason = match &result.status {
+        sub_agent::SubAgentStatus::Completed => "Task complete".to_string(),
+        sub_agent::SubAgentStatus::Failed(reason) => format!("Orchestrator failed: {}", reason),
+    };
+    emit(
+        &bus,
+        || AppEvent::TaskComplete {
+            reason: reason.clone(),
+        },
+        || println!("--- {} ---", reason),
+    );
+
+    Ok(loop_stats)
 }
 
 async fn run_direct_mode(

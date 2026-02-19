@@ -90,6 +90,7 @@ pub fn render_action_panel(f: &mut Frame, area: Rect, app: &App) {
     let (phase_text, phase_key) = match &app.current_phase {
         Phase::Thinking => ("Thinking...".to_string(), "thinking"),
         Phase::RunningAgent => ("Running agent...".to_string(), "running"),
+        Phase::Orchestrating => ("Orchestrating...".to_string(), "running"),
         Phase::WaitingApproval => ("Waiting for approval...".to_string(), "waiting"),
         Phase::WaitingHuman => ("Waiting for human input...".to_string(), "waiting"),
         Phase::Idle => ("Idle".to_string(), "done"),

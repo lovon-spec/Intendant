@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::error::CallerError;
 use crate::project::Project;
 use crate::sub_agent::{SubAgentProgress, SubAgentRole, SubAgentSpec};
@@ -40,6 +38,7 @@ pub fn format_progress_for_user(progress: &SubAgentProgress) -> String {
     msg
 }
 
+#[allow(dead_code)]
 pub fn relay_user_input(spec: &SubAgentSpec, input: &str) -> Result<(), CallerError> {
     let command_file = spec.working_dir.join(".intendant").join("user_input.txt");
     if let Some(parent) = command_file.parent() {

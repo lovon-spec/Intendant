@@ -84,7 +84,7 @@ echo "task" | ./target/release/intendant                   # Auto-detects non-TT
 ## Testing
 
 ```bash
-cargo test                # Run all 453 tests (115 agent + 338 caller)
+cargo test                # Run all 459 tests (115 agent + 344 caller)
 cargo test -- --list      # List all test names
 ```
 
@@ -95,7 +95,7 @@ Test coverage includes:
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity, status output formatting
-- **caller/main.rs** (338 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit, status line filtering, auto-fetch nonce detection, batch nonce extraction
+- **caller/main.rs** (344 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit, status line filtering, auto-fetch nonce detection, batch nonce extraction
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
@@ -108,7 +108,7 @@ Test coverage includes:
 - **caller/error.rs**: Display formatting, type conversions (including Tui variant)
 - **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
 - **caller/control.rs**: Socket path, outbound event serialization, broadcast, server lifecycle
-- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants), bottom panel heights, model summary formatting (exec, fetch, edit, multiple commands, done signal, askHuman, invalid JSON)
+- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants including OrchestratorProgress), bottom panel heights, model summary formatting (exec, fetch, edit, multiple commands, done signal, askHuman, invalid JSON)
 - **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
 - **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
 - **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
@@ -151,7 +151,7 @@ Commands chain via `depending_nonce`, `wait`, and `expected_status`. When `wait`
 
 **Sub-Agent Mode** (`INTENDANT_ROLE` set): Runs with scoped task, writes progress/results to files, uses role-specific system prompt.
 
-**User Mode** (complex task, no `INTENDANT_ROLE`): Spawns orchestrator sub-agent, monitors progress, relays to user. User-layer messages are protected from auto-pruning.
+**User Mode** (complex task, no `INTENDANT_ROLE`): Pure subprocess monitor — makes zero model API calls. Spawns orchestrator as a child process, polls its progress file every 500ms, reads its result file on exit. `kill_on_drop(true)` ensures cleanup on TUI quit.
 
 **Direct Mode** (simple task, no `INTENDANT_ROLE`): Single-loop execution:
 1. Selects API provider (OpenAI or Anthropic) from env, configures structured output and reasoning controls
@@ -164,7 +164,7 @@ Commands chain via `depending_nonce`, `wait`, and `expected_status`. When `wait`
 
 When stdin is a TTY and `--no-tui` is not set, `intendant` launches a ratatui-based terminal UI:
 - **Status bar**: Provider, model, turn count, budget percentage, autonomy level
-- **Action panel**: Current phase (Thinking/RunningAgent/WaitingApproval/WaitingHuman/Done) with spinner
+- **Action panel**: Current phase (Thinking/RunningAgent/Orchestrating/WaitingApproval/WaitingHuman/Done) with spinner
 - **Log panel**: Scrollable chronological log of all events with color-coded levels
 - **Approval panel**: Shown when an action needs user approval (y/s/a/n keys)
 - **Input panel**: Shown when askHuman is triggered (tui-textarea for response)

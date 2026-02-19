@@ -40,6 +40,7 @@ impl Conversation {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_protect_user_layer(&mut self, protect: bool) {
         self.protect_user_layer = protect;
     }
@@ -52,6 +53,7 @@ impl Conversation {
         });
     }
 
+    #[allow(dead_code)]
     pub fn add_user_with_layer(&mut self, content: String, layer: MessageLayer) {
         self.messages.push(Message {
             role: "user".to_string(),

@@ -15,7 +15,7 @@ stdin (JSON) --> intendant-runtime --> spawns bash commands
 
 intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   |
-  +--> User Mode:       spawns orchestrator, monitors progress, relays to user
+  +--> User Mode:       spawns orchestrator subprocess, monitors progress (no API calls)
   +--> Sub-Agent Mode:  scoped task, writes results/progress, isolated context
   +--> Direct Mode:     single-loop execution for simple tasks
   |
@@ -208,7 +208,7 @@ cargo test
 The test suite covers both binaries with several hundred unit/integration tests:
 
 - **Agent binary (115 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary (338 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, status line filtering, auto-fetch detection, session log file creation, and model summary formatting.
+- **Caller binary (344 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, status line filtering, auto-fetch detection, session log file creation, and model summary formatting.
 
 ## Session Logging
 
@@ -351,10 +351,11 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 - Uses role-specific system prompts (`SysPrompt_research.md`, `SysPrompt_implementation.md`, etc.)
 
 **User Mode** (complex tasks without `INTENDANT_ROLE`):
-- Spawns an orchestrator sub-agent to handle the task
-- Monitors orchestrator progress, relays status to user
-- User conversation is protected from auto-pruning (message layer protection)
-- Supports relaying user input to the orchestrator
+- Pure subprocess monitor — makes zero model API calls at Layer 0
+- Spawns an orchestrator sub-agent as a child process via `tokio::process::Command`
+- Polls the orchestrator's progress file every 500ms, relays status to the TUI or stdout
+- Reads the orchestrator's result file on exit; synthesizes a failure if the process crashes
+- `kill_on_drop(true)` ensures the orchestrator is terminated if the user quits the TUI
 
 **Direct Mode** (simple tasks without `INTENDANT_ROLE`):
 - Single-loop execution similar to the original behavior
@@ -475,7 +476,7 @@ To customize prompts for a specific project, place your modified `.md` files in 
 ┌─────────────────────────────────────────────┐
 │ StatusBar: provider │ model │ turn │ budget  │  1 line
 ├─────────────────────────────────────────────┤
-│ ActionPanel: phase + spinner + key hints    │  1-3 lines
+│ ActionPanel: phase + spinner + key hints    │  2 lines
 ├─────────────────────────────────────────────┤
 │                                             │
 │ LogPanel: scrollable, color-coded entries   │  fills remaining
