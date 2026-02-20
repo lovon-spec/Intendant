@@ -1,6 +1,6 @@
 # Intendant
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI or Anthropic API. The runtime manages process lifecycles via shared memory-style state files, streams status updates, and persists logs across binary restarts. The CLI features a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles via shared memory-style state files, streams status updates, and persists logs across binary restarts. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
@@ -19,6 +19,7 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   +--> Sub-Agent Mode:  scoped task, writes results/progress, isolated context
   +--> Direct Mode:     single-loop execution for simple tasks
   |
+  +--> Native tool calling (OpenAI/Anthropic/Gemini) with text extraction fallback
   +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
   +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
   +--> Optional control socket (--control-socket): /tmp/intendant-<pid>.sock (JSON-line protocol)
@@ -205,10 +206,10 @@ enabled = false  # default: true
 cargo test
 ```
 
-The test suite covers both binaries with several hundred unit/integration tests:
+The test suite covers both binaries with 519 unit/integration tests:
 
 - **Agent binary (115 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary (344 tests):** JSON extraction, done signal handling, conversation management with message layer protection, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, status line filtering, auto-fetch detection, session log file creation, and model summary formatting.
+- **Caller binary (404 tests):** JSON extraction, done signal handling, conversation management with message layer protection and tool call tracking, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, native tool definitions (12 tools, provider conversion formats), tool call batch assembly and result routing, Gemini provider request/response format, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults, tools-mode variant), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, status line filtering, auto-fetch detection, session log file creation, and model summary formatting.
 
 ## Session Logging
 
@@ -298,10 +299,16 @@ OPENAI_API_KEY=sk-...
 # Or Anthropic
 ANTHROPIC_API_KEY=sk-ant-...
 
-# If both are set, choose one:
-PROVIDER=openai          # or "anthropic"
+# Or Gemini (Google AI)
+GEMINI_API_KEY=AI...
+
+# If multiple keys are set, choose one:
+PROVIDER=openai          # or "anthropic" or "gemini"
 
 MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
+
+# Disable native tool calling (fall back to text-based JSON extraction)
+# USE_NATIVE_TOOLS=false
 ```
 
 ### Running
@@ -319,6 +326,9 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 # Specify provider and model
 ./target/release/intendant --provider anthropic --model claude-sonnet-4-5-20250929 "List files"
 
+# Use Gemini provider
+./target/release/intendant --provider gemini --model gemini-2.5-pro "List files"
+
 # Interactive mode (prompts for task on stdin)
 ./target/release/intendant
 
@@ -330,7 +340,7 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 
 | Flag | Description |
 |------|-------------|
-| `--provider <name>` | Force provider (`openai` or `anthropic`) |
+| `--provider <name>` | Force provider (`openai`, `anthropic`, or `gemini`) |
 | `--model <name>` | Override model name |
 | `--verbose` | Show debug-level log entries in TUI |
 | `--no-tui` | Disable TUI, use plain text output |
@@ -370,32 +380,33 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 
 ### How it works
 
-1. Loads `.env` and selects the API provider (OpenAI or Anthropic). All OpenAI models use the Responses API (`/v1/responses`)
-2. Configures structured output (JSON mode), reasoning controls, and max output tokens based on model capabilities and env vars
+1. Loads `.env` and selects the API provider (OpenAI, Anthropic, or Gemini). OpenAI uses the Responses API (`/v1/responses`), Anthropic uses the Messages API, Gemini uses the `generateContent` endpoint
+2. Configures structured output (JSON mode), reasoning controls, native tool calling, and max output tokens based on model capabilities and env vars
 3. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
-4. Resolves role-appropriate system prompt via cascade: project root → `~/.config/intendant/` → compiled-in default
+4. Resolves role-appropriate system prompt via cascade: project root → `~/.config/intendant/` → compiled-in default. When native tools are enabled, uses the condensed `SysPrompt_tools.md` (tool docs live in API tool definitions instead of prose)
 5. Injects the project working directory into the conversation so the model knows which project to work in
 6. Loads knowledge from `<project>/.intendant/memory.json`, injects into conversation
 7. Logs the full messages array to `turn_NNN_messages.json` before each API call
-8. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, and optional JSON format)
+8. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, optional JSON format, and native tool definitions when enabled)
 9. Logs reasoning content (both summary and full text) to `turn_NNN_reasoning.txt` when available
-10. Extracts JSON from the model's response (handles structured output, code fences, and bare JSON)
-11. Checks for explicit `done` signal (`{"done": true}`) for task completion in JSON mode
-12. Applies context directives (`drop_turns`, `summarize`) to the conversation
-13. Injects project context (`memory_file`) into relevant commands
-14. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
-15. If approval is required:
+10. Processes the model's response via one of two paths:
+    - **Native tool call path** (when response contains tool calls): Collects individual tool calls, assembles them into an `AgentInput` batch, pipes to the runtime, maps results back to per-tool-call responses. Handles `manage_context` and `signal_done` tool calls caller-side
+    - **Legacy text extraction path** (fallback): Extracts JSON from the response text (handles structured output, code fences, and bare JSON), checks for explicit `done` signal (`{"done": true}`)
+11. Applies context directives (`drop_turns`, `summarize`) to the conversation
+12. Injects project context (`memory_file`) into relevant commands
+13. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
+14. If approval is required:
     - TUI mode: emits an approval request and waits for user response
     - Headless mode: denies execution (no implicit auto-approve fallback)
-16. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with adaptive timeouts:
+15. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with adaptive timeouts:
     - Default: idle-before-first `2s`, idle-after-first `1s`, hard `30s`
     - `fetchStatus(wait=true)`: idle-before-first `15s`, hard `45s`
     - `askHuman`: idle-before-first `330s`, idle-after-first `1s`, hard `600s`
-17. Filters agent status lines to only include nonces from the current command batch (reduces noise)
-18. For single standalone `execAsAgent` commands that complete successfully, auto-appends stdout (saves the model a `fetchStatus` round-trip)
-19. Feeds the agent output back as the next user message, appending a token budget summary
-20. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
-21. In headless mode, if the model emits `askHuman`, the loop now sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
+16. Filters agent status lines to only include nonces from the current command batch (reduces noise)
+17. For single standalone `execAsAgent` commands that complete successfully, auto-appends stdout (saves the model a `fetchStatus` round-trip)
+18. Feeds the agent output back as the next user message (text path) or as individual tool results (tool call path), appending a token budget summary
+19. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
+20. In headless mode, if the model emits `askHuman`, the loop now sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
 
 ## Environment
 
@@ -410,8 +421,10 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 |----------|---------|-------------|
 | `OPENAI_API_KEY` / `OPENAI` | — | OpenAI API key |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC` | — | Anthropic API key |
-| `PROVIDER` | auto-detect | `"openai"` or `"anthropic"` (used when both keys are set) |
-| `MODEL_NAME` | `gpt-5.2-codex` / `claude-sonnet-4-5-20250929` | Model to use (default depends on provider) |
+| `GEMINI_API_KEY` | — | Google AI (Gemini) API key |
+| `PROVIDER` | auto-detect | `"openai"`, `"anthropic"`, or `"gemini"` (used when multiple keys are set) |
+| `MODEL_NAME` | per-provider default | Model to use (e.g. `gpt-5.2-codex`, `claude-sonnet-4-5-20250929`, `gemini-2.5-pro`) |
+| `USE_NATIVE_TOOLS` | `true` | Enable native API tool calling; `false` falls back to text-based JSON extraction |
 | `INTENDANT_IDLE_TIMEOUT` | `2` | Seconds to wait for first agent stdout byte before assuming idle (baseline mode) |
 | `INTENDANT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
@@ -456,10 +469,17 @@ destructive = "ask"           # ask before destructive commands (default)
 
 ### System Prompts
 
-System prompts (`SysPrompt.md` and role-specific variants) are compiled into the binary at build time, so `intendant` works from any directory without needing the source tree. Prompts are resolved using a 3-layer cascade (highest priority first):
+System prompts are compiled into the binary at build time, so `intendant` works from any directory without needing the source tree. Two base prompt variants exist:
 
-1. **Project root** — `<git-root>/SysPrompt.md` (per-project customization)
-2. **Global config** — `~/.config/intendant/SysPrompt.md` (user-wide customization)
+- **`SysPrompt.md`** — Full prompt with JSON schema and per-function documentation (used with text-based JSON extraction)
+- **`SysPrompt_tools.md`** — Condensed prompt for native tool calling mode (function docs live in API tool definitions, reducing system prompt tokens)
+
+The active variant is selected automatically based on whether the provider has native tool calling enabled.
+
+Prompts are resolved using a 3-layer cascade (highest priority first):
+
+1. **Project root** — `<git-root>/SysPrompt.md` or `SysPrompt_tools.md` (per-project customization)
+2. **Global config** — `~/.config/intendant/SysPrompt.md` or `SysPrompt_tools.md` (user-wide customization)
 3. **Compiled-in default** — always available, zero-config
 
 Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`, `SysPrompt_implementation.md`) follow the same cascade and are appended to the base prompt.

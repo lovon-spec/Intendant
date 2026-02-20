@@ -10,6 +10,7 @@ mod prompts;
 mod provider;
 mod session_log;
 mod sub_agent;
+mod tools;
 mod tui;
 mod user_mode;
 mod worktree;
@@ -63,7 +64,7 @@ fn print_help() {
     println!("    echo \"task\" | intendant [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    --provider <NAME>     API provider (openai or anthropic)");
+    println!("    --provider <NAME>     API provider (openai, anthropic, or gemini)");
     println!("    --model <NAME>        Model name to use");
     println!("    --autonomy <LEVEL>    Autonomy level: low, medium, high, full");
     println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<ts>/)");
@@ -88,7 +89,8 @@ fn print_help() {
     println!("ENVIRONMENT:");
     println!("    OPENAI_API_KEY        OpenAI API key (for openai provider)");
     println!("    ANTHROPIC_API_KEY     Anthropic API key (for anthropic provider)");
-    println!("    PROVIDER              Default provider (openai or anthropic)");
+    println!("    GEMINI_API_KEY        Google AI API key (for gemini provider)");
+    println!("    PROVIDER              Default provider (openai, anthropic, or gemini)");
     println!("    MODEL_NAME            Default model name");
     println!("    STRUCTURED_OUTPUT     Enable JSON structured output (true/false)");
     println!("    REASONING_EFFORT      Reasoning effort: low, medium, high");
@@ -953,6 +955,410 @@ Also: {"source": "bare"}"#;
         let json = r#"{"commands":[{"function":"fetchStatus","nonce":5}]}"#;
         assert_eq!(single_exec_nonce(json), None);
     }
+
+    // --- assemble_batch_from_tool_calls tests ---
+
+    #[test]
+    fn assemble_batch_single_exec() {
+        let calls = vec![provider::ToolCall {
+            id: "call_1".to_string(),
+            name: "exec_command".to_string(),
+            arguments: r#"{"nonce":1,"command":"ls -la"}"#.to_string(),
+        }];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert!(!result.is_done);
+        assert!(result.context_directives.is_none());
+        assert!(result.agent_input_json.is_some());
+
+        let input: serde_json::Value =
+            serde_json::from_str(result.agent_input_json.as_ref().unwrap()).unwrap();
+        assert_eq!(input["commands"][0]["function"], "execAsAgent");
+        assert_eq!(input["commands"][0]["command"], "ls -la");
+        assert_eq!(input["commands"][0]["nonce"], 1);
+        assert_eq!(result.nonce_to_call_id.get(&1), Some(&"call_1".to_string()));
+    }
+
+    #[test]
+    fn assemble_batch_signal_done() {
+        let calls = vec![provider::ToolCall {
+            id: "call_1".to_string(),
+            name: "signal_done".to_string(),
+            arguments: r#"{"message":"All tasks completed"}"#.to_string(),
+        }];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert!(result.is_done);
+        assert_eq!(result.done_message.as_deref(), Some("All tasks completed"));
+        assert!(result.agent_input_json.is_none());
+    }
+
+    #[test]
+    fn assemble_batch_signal_done_no_message() {
+        let calls = vec![provider::ToolCall {
+            id: "call_1".to_string(),
+            name: "signal_done".to_string(),
+            arguments: r#"{}"#.to_string(),
+        }];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert!(result.is_done);
+        assert!(result.done_message.is_none());
+    }
+
+    #[test]
+    fn assemble_batch_manage_context() {
+        let calls = vec![provider::ToolCall {
+            id: "call_1".to_string(),
+            name: "manage_context".to_string(),
+            arguments: r#"{"drop_turns":[1,2]}"#.to_string(),
+        }];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert!(!result.is_done);
+        assert!(result.agent_input_json.is_none());
+        assert!(result.context_directives.is_some());
+        let ctx = result.context_directives.unwrap();
+        assert_eq!(ctx["drop_turns"][0], 1);
+        assert_eq!(ctx["drop_turns"][1], 2);
+    }
+
+    #[test]
+    fn assemble_batch_mixed_tools() {
+        let calls = vec![
+            provider::ToolCall {
+                id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                arguments: r#"{"nonce":10,"command":"echo hello"}"#.to_string(),
+            },
+            provider::ToolCall {
+                id: "call_2".to_string(),
+                name: "fetch_status".to_string(),
+                arguments: r#"{"nonce":11,"status_type":"stdout","depending_nonce":10,"wait":true}"#.to_string(),
+            },
+            provider::ToolCall {
+                id: "call_3".to_string(),
+                name: "manage_context".to_string(),
+                arguments: r#"{"drop_turns":[3]}"#.to_string(),
+            },
+        ];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert!(!result.is_done);
+        assert!(result.context_directives.is_some());
+        assert!(result.agent_input_json.is_some());
+
+        let input: serde_json::Value =
+            serde_json::from_str(result.agent_input_json.as_ref().unwrap()).unwrap();
+        let commands = input["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["function"], "execAsAgent");
+        assert_eq!(commands[1]["function"], "fetchStatus");
+        assert_eq!(result.nonce_to_call_id.len(), 2);
+        assert_eq!(result.call_id_names.len(), 3);
+    }
+
+    #[test]
+    fn assemble_batch_unknown_tool_ignored() {
+        let calls = vec![provider::ToolCall {
+            id: "call_1".to_string(),
+            name: "nonexistent_tool".to_string(),
+            arguments: r#"{"nonce":1}"#.to_string(),
+        }];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert!(result.agent_input_json.is_none());
+    }
+
+    #[test]
+    fn assemble_batch_tool_name_mapping() {
+        // Verify all tool names map correctly
+        let tool_pairs = vec![
+            ("exec_command", "execAsAgent"),
+            ("capture_screen", "captureScreen"),
+            ("fetch_status", "fetchStatus"),
+            ("inspect_path", "inspectPath"),
+            ("edit_file", "editFile"),
+            ("browse_url", "browse"),
+            ("ask_human", "askHuman"),
+            ("exec_pty", "execPty"),
+            ("store_memory", "storeMemory"),
+            ("recall_memory", "recallMemory"),
+        ];
+        for (tool_name, expected_func) in tool_pairs {
+            let calls = vec![provider::ToolCall {
+                id: "call_1".to_string(),
+                name: tool_name.to_string(),
+                arguments: r#"{"nonce":1,"command":"test","status_type":"stdout","path":"/tmp","file_path":"/tmp/f","operation":"write","url":"http://x","question":"?","memory_key":"k","memory_summary":"s","memory_query":"q"}"#.to_string(),
+            }];
+            let result = assemble_batch_from_tool_calls(&calls);
+            let input: serde_json::Value =
+                serde_json::from_str(result.agent_input_json.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                input["commands"][0]["function"].as_str().unwrap(),
+                expected_func,
+                "Tool {} should map to function {}",
+                tool_name,
+                expected_func
+            );
+        }
+    }
+
+    // --- map_results_to_tool_responses tests ---
+
+    #[test]
+    fn map_results_single_exec() {
+        let stdout = "1r0\n1c0\n";
+        let stderr = "";
+        let mut nonce_map = std::collections::HashMap::new();
+        nonce_map.insert(1u64, "call_1".to_string());
+        let call_ids = vec![("call_1".to_string(), "exec_command".to_string())];
+
+        let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "call_1");
+        assert!(results[0].2.contains("1c0"));
+    }
+
+    #[test]
+    fn map_results_with_json_output() {
+        let stdout = "5c0\n{\"content\":\"hello\",\"total_size\":5}\n";
+        let stderr = "";
+        let mut nonce_map = std::collections::HashMap::new();
+        nonce_map.insert(5u64, "call_1".to_string());
+        let call_ids = vec![("call_1".to_string(), "fetch_status".to_string())];
+
+        let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].2.contains("5c0"));
+        assert!(results[0].2.contains("\"content\":\"hello\""));
+    }
+
+    #[test]
+    fn map_results_with_stderr() {
+        let stdout = "1c1\n";
+        let stderr = "command not found";
+        let mut nonce_map = std::collections::HashMap::new();
+        nonce_map.insert(1u64, "call_1".to_string());
+        let call_ids = vec![("call_1".to_string(), "exec_command".to_string())];
+
+        let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].2.contains("1c1"));
+        assert!(results[0].2.contains("stderr: command not found"));
+    }
+
+    #[test]
+    fn map_results_signal_done() {
+        let stdout = "";
+        let stderr = "";
+        let nonce_map = std::collections::HashMap::new();
+        let call_ids = vec![("call_1".to_string(), "signal_done".to_string())];
+
+        let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].2, "OK");
+    }
+
+    #[test]
+    fn map_results_manage_context() {
+        let stdout = "";
+        let stderr = "";
+        let nonce_map = std::collections::HashMap::new();
+        let call_ids = vec![("call_1".to_string(), "manage_context".to_string())];
+
+        let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].2, "OK");
+    }
+
+    #[test]
+    fn map_results_multiple_tools() {
+        let stdout = "10r0\n10c0\n11c0\n{\"exists\":true}\n";
+        let stderr = "";
+        let mut nonce_map = std::collections::HashMap::new();
+        nonce_map.insert(10u64, "call_1".to_string());
+        nonce_map.insert(11u64, "call_2".to_string());
+        let call_ids = vec![
+            ("call_1".to_string(), "exec_command".to_string()),
+            ("call_2".to_string(), "inspect_path".to_string()),
+        ];
+
+        let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
+        assert_eq!(results.len(), 2);
+        // exec_command should have its status
+        assert!(results[0].2.contains("10c0"));
+        // inspect_path should have JSON output
+        assert!(results[1].2.contains("\"exists\":true"));
+    }
+
+    #[test]
+    fn map_results_empty_output() {
+        let stdout = "";
+        let stderr = "";
+        let mut nonce_map = std::collections::HashMap::new();
+        nonce_map.insert(1u64, "call_1".to_string());
+        let call_ids = vec![("call_1".to_string(), "exec_command".to_string())];
+
+        let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].2, "OK");
+    }
+}
+
+/// Context directives extracted from manage_context / signal_done tool calls.
+struct ToolBatchResult {
+    /// JSON string of AgentInput to send to the runtime (None if no runtime commands).
+    agent_input_json: Option<String>,
+    /// Whether to apply context directives (from manage_context tool calls).
+    context_directives: Option<serde_json::Value>,
+    /// Whether the model signaled completion (signal_done).
+    is_done: bool,
+    /// Done message, if any.
+    done_message: Option<String>,
+    /// Map of nonce → tool call ID for routing results back.
+    nonce_to_call_id: std::collections::HashMap<u64, String>,
+    /// All tool call IDs and their names (for result routing).
+    call_id_names: Vec<(String, String)>,
+}
+
+/// Assemble an AgentInput batch from individual tool calls.
+/// Separates manage_context/signal_done from runtime commands.
+fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> ToolBatchResult {
+    let mut commands = Vec::new();
+    let mut nonce_to_call_id = std::collections::HashMap::new();
+    let mut call_id_names = Vec::new();
+    let mut context_directives = None;
+    let mut is_done = false;
+    let mut done_message = None;
+
+    for tc in tool_calls {
+        call_id_names.push((tc.id.clone(), tc.name.clone()));
+
+        match tc.name.as_str() {
+            "manage_context" => {
+                // Parse the arguments as context directives
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    context_directives = Some(args);
+                }
+            }
+            "signal_done" => {
+                is_done = true;
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    done_message = args
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map(String::from);
+                }
+            }
+            tool_name => {
+                // Runtime command — map tool name to function name
+                if let Some(function) = tools::tool_name_to_function(tool_name) {
+                    if let Ok(mut args) =
+                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    {
+                        // Set the function field
+                        args["function"] = serde_json::Value::String(function.to_string());
+
+                        // Track nonce → call ID for result routing
+                        if let Some(nonce) = args.get("nonce").and_then(|n| n.as_u64()) {
+                            nonce_to_call_id.insert(nonce, tc.id.clone());
+                        }
+
+                        commands.push(args);
+                    }
+                }
+            }
+        }
+    }
+
+    let agent_input_json = if commands.is_empty() {
+        None
+    } else {
+        let input = serde_json::json!({
+            "commands": commands,
+        });
+        Some(serde_json::to_string(&input).unwrap_or_default())
+    };
+
+    ToolBatchResult {
+        agent_input_json,
+        context_directives,
+        is_done,
+        done_message,
+        nonce_to_call_id,
+        call_id_names,
+    }
+}
+
+/// Map agent runtime output back to individual tool call responses.
+/// Returns Vec<(call_id, tool_name, response_text)>.
+fn map_results_to_tool_responses(
+    agent_stdout: &str,
+    agent_stderr: &str,
+    nonce_to_call_id: &std::collections::HashMap<u64, String>,
+    call_id_names: &[(String, String)],
+) -> Vec<(String, String, String)> {
+    let status_re =
+        regex::Regex::new(r"^(\d+)([rcfswRCFSW])(\d+)$").expect("valid status line regex");
+
+    // Collect status per nonce
+    let mut nonce_status: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
+    let mut other_lines = Vec::new();
+
+    for line in agent_stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(caps) = status_re.captures(trimmed) {
+            if let Ok(nonce) = caps[1].parse::<u64>() {
+                // Overwrite: last status wins (e.g., running → completed)
+                nonce_status.insert(nonce, trimmed.to_string());
+            }
+        } else if !trimmed.is_empty() {
+            other_lines.push(trimmed.to_string());
+        }
+    }
+
+    // Try to parse any JSON output lines
+    let json_output = other_lines.join("\n");
+
+    let mut results = Vec::new();
+
+    for (call_id, tool_name) in call_id_names {
+        // Find the nonce for this call ID
+        let nonce = nonce_to_call_id
+            .iter()
+            .find(|(_, cid)| *cid == call_id)
+            .map(|(&n, _)| n);
+
+        let mut parts = Vec::new();
+
+        if let Some(n) = nonce {
+            if let Some(status) = nonce_status.get(&n) {
+                parts.push(status.clone());
+            }
+        }
+
+        // For non-runtime tools (manage_context, signal_done), return acknowledgement
+        if tool_name == "manage_context" || tool_name == "signal_done" {
+            results.push((call_id.clone(), tool_name.clone(), "OK".to_string()));
+            continue;
+        }
+
+        // Include JSON output for all tool calls (it's typically from synchronous
+        // commands like fetchStatus, inspectPath, editFile, browse)
+        if !json_output.is_empty() {
+            parts.push(json_output.clone());
+        }
+
+        if !agent_stderr.is_empty() {
+            parts.push(format!("stderr: {}", agent_stderr));
+        }
+
+        let response_text = if parts.is_empty() {
+            "OK".to_string()
+        } else {
+            parts.join("\n")
+        };
+
+        results.push((call_id.clone(), tool_name.clone(), response_text));
+    }
+
+    results
 }
 
 const PROGRESS_INTERVAL: usize = 5;
@@ -1041,7 +1447,23 @@ async fn run_agent_loop(
         loop_stats.usage.prompt_tokens += response.usage.prompt_tokens;
         loop_stats.usage.completion_tokens += response.usage.completion_tokens;
         loop_stats.usage.total_tokens += response.usage.total_tokens;
-        conversation.add_assistant(response.content.clone());
+
+        // Store assistant message — with or without tool calls
+        let has_tool_calls = !response.tool_calls.is_empty();
+        if has_tool_calls {
+            let refs: Vec<conversation::ToolCallRef> = response
+                .tool_calls
+                .iter()
+                .map(|tc| conversation::ToolCallRef {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                })
+                .collect();
+            conversation.add_assistant_tool_calls(response.content.clone(), refs);
+        } else {
+            conversation.add_assistant(response.content.clone());
+        }
 
         // Log the full model response (no truncation)
         slog(&session_log, |l| {
@@ -1118,58 +1540,59 @@ async fn run_agent_loop(
             },
         );
 
-        // Extract JSON from response
-        let json_str = match extract_json(&response.content) {
-            Some(json) => json.to_string(),
-            None => {
-                slog(&session_log, |l| {
-                    l.info("No JSON found in response — task complete")
-                });
-                emit(
-                    &bus,
-                    || AppEvent::TaskComplete {
-                        reason: "Task complete".to_string(),
-                    },
-                    || println!("--- Task complete ---"),
-                );
-                break;
+        // ====== TOOL CALL PATH vs TEXT EXTRACTION PATH ======
+        if has_tool_calls {
+            // --- Native tool call path ---
+            let batch = assemble_batch_from_tool_calls(&response.tool_calls);
+
+            // Apply context directives from manage_context tool call
+            if let Some(ref ctx) = batch.context_directives {
+                if let Some(drops) = ctx.get("drop_turns").and_then(|d| d.as_array()) {
+                    let indices: Vec<usize> = drops
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect();
+                    conversation.drop_turns(&indices);
+                }
+                if let Some(summarize) = ctx.get("summarize") {
+                    if let (Some(turns), Some(summary)) = (
+                        summarize.get("turns").and_then(|t| t.as_array()),
+                        summarize.get("summary").and_then(|s| s.as_str()),
+                    ) {
+                        let indices: Vec<usize> = turns
+                            .iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as usize))
+                            .collect();
+                        conversation.summarize_turns(&indices, summary);
+                    }
+                }
+                slog(&session_log, |l| l.debug("Context directives applied (tool call)"));
             }
-        };
 
-        slog(&session_log, |l| l.json_extracted(&json_str));
-
-        emit(
-            &bus,
-            || AppEvent::JsonExtracted {
-                preview: json_str.chars().take(100).collect(),
-            },
-            || {},
-        );
-
-        // Check for explicit done signal (used in structured output / JSON mode)
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
-            if parsed
-                .get("done")
-                .and_then(|d| d.as_bool())
-                .unwrap_or(false)
-            {
-                let message = parsed
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .map(String::from);
+            // Check done signal
+            if batch.is_done {
                 slog(&session_log, |l| {
                     l.info(&format!(
-                        "Done signal received: {}",
-                        message.as_deref().unwrap_or("(no message)")
+                        "Done signal received (tool call): {}",
+                        batch.done_message.as_deref().unwrap_or("(no message)")
                     ))
                 });
+                // Send tool results for all calls including signal_done
+                for (call_id, tool_name, _) in map_results_to_tool_responses(
+                    "",
+                    "",
+                    &batch.nonce_to_call_id,
+                    &batch.call_id_names,
+                ) {
+                    conversation.add_tool_result(&call_id, &tool_name, "OK");
+                }
                 emit(
                     &bus,
                     || AppEvent::DoneSignal {
-                        message: message.clone(),
+                        message: batch.done_message.clone(),
                     },
                     || {
-                        if let Some(ref msg) = message {
+                        if let Some(ref msg) = batch.done_message {
                             println!("{}", msg);
                         }
                         println!("--- Task complete ---");
@@ -1177,37 +1600,181 @@ async fn run_agent_loop(
                 );
                 break;
             }
-        }
 
-        // Apply context directives (drop_turns, summarize) before sending to agent
-        let (json_str, had_context) = apply_context_directives(&json_str, conversation);
-
-        if had_context {
-            slog(&session_log, |l| l.debug("Context directives applied"));
-        }
-
-        // No commands to execute
-        if json_str.is_empty() {
-            if had_context {
+            // If no runtime commands, just respond to tool calls with context update
+            let Some(ref json_str) = batch.agent_input_json else {
                 empty_command_streak = 0;
-                // Context directives were applied, but no commands — context management turn
-                slog(&session_log, |l| {
-                    l.debug(&format!("Turn {}: context management only", turn))
-                });
-                emit(
-                    &bus,
-                    || AppEvent::ContextManagement { turn },
-                    || println!("[Turn {}] Context management only, continuing...", turn),
-                );
-                conversation.add_user("Context updated.".to_string());
+                // Respond to manage_context or empty batch
+                for (call_id, tool_name) in &batch.call_id_names {
+                    conversation.add_tool_result(call_id, tool_name, "OK — context updated.");
+                }
                 continue;
-            } else {
-                // Do not complete immediately on an empty command turn.
-                // Require explicit done=true, or two consecutive empty-command turns.
-                empty_command_streak += 1;
-                if empty_command_streak >= 2 {
+            };
+            empty_command_streak = 0;
+
+            // Inject project context and normalize
+            let json_str = normalize_command_batch(&inject_project_context(json_str, project));
+
+            // Headless askHuman check
+            if bus.is_none() && has_ask_human_command(&json_str) {
+                slog(&session_log, |l| {
+                    l.warn("askHuman requested in headless mode; prompting model to continue")
+                });
+                for (call_id, tool_name) in &batch.call_id_names {
+                    conversation.add_tool_result(
+                        call_id,
+                        tool_name,
+                        "askHuman is unavailable in headless mode. Proceed with assumptions.",
+                    );
+                }
+                continue;
+            }
+
+            // Autonomy / approval check (same as text path)
+            let needs_approval = {
+                let classifications = autonomy::classify_batch(&json_str);
+                let autonomy_state = autonomy.read().await;
+                let mut need = None;
+                for (_idx, categories) in &classifications {
+                    for &cat in categories {
+                        if cat == autonomy::ActionCategory::HumanInput {
+                            continue;
+                        }
+                        let rule = autonomy_state.rules.rule_for(cat);
+                        if matches!(rule, autonomy::ApprovalRule::Deny) {
+                            need = Some((cat, true));
+                            break;
+                        }
+                        if autonomy_state.needs_approval(cat) {
+                            need = Some((cat, false));
+                            break;
+                        }
+                    }
+                    if need.is_some() {
+                        break;
+                    }
+                }
+                need
+            };
+
+            let mut should_skip = false;
+            if let Some((cat, denied_by_policy)) = needs_approval {
+                let preview = format_command_preview(&json_str);
+                slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "waiting"));
+
+                if denied_by_policy {
+                    slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "denied-policy"));
+                    emit(
+                        &bus,
+                        || AppEvent::TaskComplete {
+                            reason: format!("Denied by policy ({})", cat),
+                        },
+                        || println!("--- Denied by policy ({}) ---", cat),
+                    );
+                    return Ok(loop_stats);
+                }
+
+                if let Some(ref bus_ref) = bus {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    bus_ref.send(AppEvent::ApprovalRequired {
+                        id: turn as u64,
+                        command_preview: preview.clone(),
+                        category: cat,
+                        responder: tx,
+                    });
+                    match rx.await {
+                        Ok(tui::event::ApprovalResponse::Approve) => {
+                            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "approved"));
+                        }
+                        Ok(tui::event::ApprovalResponse::ApproveAll) => {
+                            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "approve-all"));
+                            let mut state = autonomy.write().await;
+                            state.level = AutonomyLevel::Full;
+                        }
+                        Ok(tui::event::ApprovalResponse::Skip) => {
+                            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "skipped"));
+                            should_skip = true;
+                        }
+                        Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
+                            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "denied"));
+                            emit(
+                                &bus,
+                                || AppEvent::TaskComplete { reason: "Denied by user".to_string() },
+                                || println!("--- Denied by user ---"),
+                            );
+                            return Ok(loop_stats);
+                        }
+                    }
+                }
+                if bus.is_none() {
+                    slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "denied-no-approver"));
+                    emit(
+                        &bus,
+                        || AppEvent::TaskComplete {
+                            reason: format!("Approval required in headless mode ({})", cat),
+                        },
+                        || println!("--- Approval required in headless mode ({}) ---", cat),
+                    );
+                    return Ok(loop_stats);
+                }
+            }
+
+            if should_skip {
+                for (call_id, tool_name) in &batch.call_id_names {
+                    conversation.add_tool_result(call_id, tool_name, "Command skipped by user.");
+                }
+                continue;
+            }
+
+            // Run agent
+            slog(&session_log, |l| l.agent_input(&json_str));
+            emit(
+                &bus,
+                || AppEvent::AgentStarted { turn },
+                || println!("[Turn {}] Running agent...", turn),
+            );
+
+            let output = agent_runner::run_agent(&json_str).await?;
+
+            // Log agent output
+            slog(&session_log, |l| l.agent_output(&output.stdout, &output.stderr));
+
+            emit(
+                &bus,
+                || AppEvent::AgentOutput {
+                    stdout: output.stdout.clone(),
+                    stderr: output.stderr.clone(),
+                },
+                || {
+                    println!("Agent stdout:\n{}", output.stdout);
+                    if !output.stderr.is_empty() {
+                        eprintln!("Agent stderr:\n{}", output.stderr);
+                    }
+                },
+            );
+
+            // Map results back to individual tool responses
+            let tool_results = map_results_to_tool_responses(
+                &output.stdout,
+                &output.stderr,
+                &batch.nonce_to_call_id,
+                &batch.call_id_names,
+            );
+            let budget = conversation.budget_summary();
+            for (call_id, tool_name, result_text) in &tool_results {
+                let text = format!("{}\n\n{}", result_text, budget);
+                conversation.add_tool_result(call_id, tool_name, &text);
+            }
+
+        } else {
+            // --- Legacy text extraction path ---
+
+            // Extract JSON from response
+            let json_str = match extract_json(&response.content) {
+                Some(json) => json.to_string(),
+                None => {
                     slog(&session_log, |l| {
-                        l.info("No commands across consecutive turns — task complete")
+                        l.info("No JSON found in response — task complete")
                     });
                     emit(
                         &bus,
@@ -1218,231 +1785,307 @@ async fn run_agent_loop(
                     );
                     break;
                 }
-                slog(&session_log, |l| {
-                    l.warn(
-                        "No commands and no context directives — requesting explicit done signal",
-                    )
-                });
-                conversation.add_user(
-                    "No commands were produced. If the task is complete, respond with JSON containing done=true. Otherwise provide commands.".to_string(),
-                );
-                continue;
-            }
-        }
-        empty_command_streak = 0;
+            };
 
-        // Inject project context (memory_file) into commands and normalize aliases.
-        let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
+            slog(&session_log, |l| l.json_extracted(&json_str));
 
-        // In headless mode there is no askHuman input panel.
-        // Avoid blocking on runtime human-input timeout; ask the model to continue with assumptions.
-        if bus.is_none() && has_ask_human_command(&json_str) {
-            slog(&session_log, |l| {
-                l.warn("askHuman requested in headless mode; prompting model to continue")
-            });
-            conversation.add_user(
-                "askHuman is unavailable in headless mode (--no-tui or non-interactive stdin). \
-Proceed with explicit assumptions and continue without additional questions."
-                    .to_string(),
+            emit(
+                &bus,
+                || AppEvent::JsonExtracted {
+                    preview: json_str.chars().take(100).collect(),
+                },
+                || {},
             );
-            continue;
-        }
 
-        // Check autonomy / approval for commands
-        let needs_approval = {
-            let classifications = autonomy::classify_batch(&json_str);
-            let autonomy_state = autonomy.read().await;
-            let mut need = None;
-            for (_idx, categories) in &classifications {
-                for &cat in categories {
-                    // askHuman is handled via the dedicated TUI input flow, not approval buttons.
-                    if cat == autonomy::ActionCategory::HumanInput {
-                        continue;
-                    }
-                    let rule = autonomy_state.rules.rule_for(cat);
-                    if matches!(rule, autonomy::ApprovalRule::Deny) {
-                        need = Some((cat, true));
-                        break;
-                    }
-                    if autonomy_state.needs_approval(cat) {
-                        need = Some((cat, false));
-                        break;
-                    }
-                }
-                if need.is_some() {
+            // Check for explicit done signal (used in structured output / JSON mode)
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                if parsed
+                    .get("done")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false)
+                {
+                    let message = parsed
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map(String::from);
+                    slog(&session_log, |l| {
+                        l.info(&format!(
+                            "Done signal received: {}",
+                            message.as_deref().unwrap_or("(no message)")
+                        ))
+                    });
+                    emit(
+                        &bus,
+                        || AppEvent::DoneSignal {
+                            message: message.clone(),
+                        },
+                        || {
+                            if let Some(ref msg) = message {
+                                println!("{}", msg);
+                            }
+                            println!("--- Task complete ---");
+                        },
+                    );
                     break;
                 }
             }
-            need
-        }; // autonomy_state read lock dropped here
 
-        let mut should_skip = false;
-        if let Some((cat, denied_by_policy)) = needs_approval {
-            let preview = format_command_preview(&json_str);
-            slog(&session_log, |l| {
-                l.approval(&cat.to_string(), &preview, "waiting")
-            });
+            // Apply context directives (drop_turns, summarize) before sending to agent
+            let (json_str, had_context) = apply_context_directives(&json_str, conversation);
 
-            if denied_by_policy {
-                slog(&session_log, |l| {
-                    l.approval(&cat.to_string(), &preview, "denied-policy")
-                });
-                emit(
-                    &bus,
-                    || AppEvent::TaskComplete {
-                        reason: format!("Denied by policy ({})", cat),
-                    },
-                    || println!("--- Denied by policy ({}) ---", cat),
-                );
-                return Ok(loop_stats);
+            if had_context {
+                slog(&session_log, |l| l.debug("Context directives applied"));
             }
 
-            if let Some(ref bus_ref) = bus {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                bus_ref.send(AppEvent::ApprovalRequired {
-                    id: turn as u64,
-                    command_preview: preview.clone(),
-                    category: cat,
-                    responder: tx,
-                });
-                match rx.await {
-                    Ok(tui::event::ApprovalResponse::Approve) => {
+            // No commands to execute
+            if json_str.is_empty() {
+                if had_context {
+                    empty_command_streak = 0;
+                    slog(&session_log, |l| {
+                        l.debug(&format!("Turn {}: context management only", turn))
+                    });
+                    emit(
+                        &bus,
+                        || AppEvent::ContextManagement { turn },
+                        || println!("[Turn {}] Context management only, continuing...", turn),
+                    );
+                    conversation.add_user("Context updated.".to_string());
+                    continue;
+                } else {
+                    empty_command_streak += 1;
+                    if empty_command_streak >= 2 {
                         slog(&session_log, |l| {
-                            l.approval(&cat.to_string(), &preview, "approved")
-                        });
-                    }
-                    Ok(tui::event::ApprovalResponse::ApproveAll) => {
-                        slog(&session_log, |l| {
-                            l.approval(&cat.to_string(), &preview, "approve-all")
-                        });
-                        let mut state = autonomy.write().await;
-                        state.level = AutonomyLevel::Full;
-                    }
-                    Ok(tui::event::ApprovalResponse::Skip) => {
-                        slog(&session_log, |l| {
-                            l.approval(&cat.to_string(), &preview, "skipped")
-                        });
-                        should_skip = true;
-                    }
-                    Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
-                        slog(&session_log, |l| {
-                            l.approval(&cat.to_string(), &preview, "denied")
+                            l.info("No commands across consecutive turns — task complete")
                         });
                         emit(
                             &bus,
                             || AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
+                                reason: "Task complete".to_string(),
                             },
-                            || println!("--- Denied by user ---"),
+                            || println!("--- Task complete ---"),
                         );
-                        return Ok(loop_stats);
+                        break;
                     }
-                }
-            }
-            // In headless mode, approval-required actions cannot proceed without an approver.
-            if bus.is_none() {
-                slog(&session_log, |l| {
-                    l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                });
-                emit(
-                    &bus,
-                    || AppEvent::TaskComplete {
-                        reason: format!("Approval required in headless mode ({})", cat),
-                    },
-                    || println!("--- Approval required in headless mode ({}) ---", cat),
-                );
-                return Ok(loop_stats);
-            }
-        }
-
-        if should_skip {
-            conversation.add_user("Command skipped by user.".to_string());
-            continue;
-        }
-
-        // Log the full JSON being sent to the agent
-        slog(&session_log, |l| l.agent_input(&json_str));
-
-        emit(
-            &bus,
-            || AppEvent::AgentStarted { turn },
-            || println!("[Turn {}] Running agent...", turn),
-        );
-
-        let output = agent_runner::run_agent(&json_str).await?;
-
-        // Filter status lines to only include relevant nonces (current batch + dependencies)
-        let batch_nonces = extract_batch_nonces(&json_str);
-        let mut filtered_stdout = filter_status_lines(&output.stdout, &batch_nonces);
-
-        // Auto-fetch stdout for single standalone execAsAgent commands that completed successfully.
-        // This saves the model from needing a separate fetchStatus turn.
-        if let Some(nonce) = single_exec_nonce(&json_str) {
-            // Check if the nonce completed successfully (look for "<nonce>c0" in filtered output)
-            let success_marker = format!("{}c0", nonce);
-            if filtered_stdout.lines().any(|l| l.trim() == success_marker) {
-                let session_dir = session_log.lock().ok().map(|l| l.dir().to_path_buf());
-                if let Some(dir) = session_dir {
-                    if let Some(stdout_content) = read_nonce_stdout(&dir, nonce) {
-                        filtered_stdout.push_str(&format!(
-                            "\n--- stdout (nonce {}) ---\n{}\n--- end stdout ---",
-                            nonce, stdout_content
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Log full agent output (no truncation, unfiltered for debugging)
-        slog(&session_log, |l| {
-            l.agent_output(&output.stdout, &output.stderr)
-        });
-
-        emit(
-            &bus,
-            || AppEvent::AgentOutput {
-                stdout: filtered_stdout.clone(),
-                stderr: output.stderr.clone(),
-            },
-            || {
-                println!("Agent stdout:\n{}", filtered_stdout);
-                if !output.stderr.is_empty() {
-                    eprintln!("Agent stderr:\n{}", output.stderr);
-                }
-            },
-        );
-
-        // Check for completed sub-agent results
-        let sub_agent_dir = project.sub_agent_dir();
-        if sub_agent_dir.exists() {
-            let results = sub_agent::scan_completed_results(&sub_agent_dir);
-            for result in &results {
-                let key = format!("{}::{}", result.id, result.summary);
-                if !seen_sub_agent_results.insert(key) {
+                    slog(&session_log, |l| {
+                        l.warn(
+                            "No commands and no context directives — requesting explicit done signal",
+                        )
+                    });
+                    conversation.add_user(
+                        "No commands were produced. If the task is complete, respond with JSON containing done=true. Otherwise provide commands.".to_string(),
+                    );
                     continue;
                 }
-                let msg = sub_agent::format_result_message(result);
-                slog(&session_log, |l| {
-                    l.info(&format!("Sub-agent result: {}", msg))
-                });
-                emit(
-                    &bus,
-                    || AppEvent::SubAgentResult {
-                        formatted: msg.clone(),
-                    },
-                    || println!("{}", msg),
-                );
             }
-        }
+            empty_command_streak = 0;
 
-        // Format agent output as next user message, include budget summary
-        // Use filtered stdout so the model only sees relevant status lines
-        let mut user_msg = format!("Agent output:\n{}", filtered_stdout);
-        if !output.stderr.is_empty() {
-            user_msg.push_str(&format!("\nStderr:\n{}", output.stderr));
-        }
-        user_msg.push_str(&format!("\n\n{}", conversation.budget_summary()));
-        conversation.add_user(user_msg);
+            // Inject project context (memory_file) into commands and normalize aliases.
+            let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
+
+            // In headless mode there is no askHuman input panel.
+            if bus.is_none() && has_ask_human_command(&json_str) {
+                slog(&session_log, |l| {
+                    l.warn("askHuman requested in headless mode; prompting model to continue")
+                });
+                conversation.add_user(
+                    "askHuman is unavailable in headless mode (--no-tui or non-interactive stdin). \
+Proceed with explicit assumptions and continue without additional questions."
+                        .to_string(),
+                );
+                continue;
+            }
+
+            // Check autonomy / approval for commands
+            let needs_approval = {
+                let classifications = autonomy::classify_batch(&json_str);
+                let autonomy_state = autonomy.read().await;
+                let mut need = None;
+                for (_idx, categories) in &classifications {
+                    for &cat in categories {
+                        if cat == autonomy::ActionCategory::HumanInput {
+                            continue;
+                        }
+                        let rule = autonomy_state.rules.rule_for(cat);
+                        if matches!(rule, autonomy::ApprovalRule::Deny) {
+                            need = Some((cat, true));
+                            break;
+                        }
+                        if autonomy_state.needs_approval(cat) {
+                            need = Some((cat, false));
+                            break;
+                        }
+                    }
+                    if need.is_some() {
+                        break;
+                    }
+                }
+                need
+            };
+
+            let mut should_skip = false;
+            if let Some((cat, denied_by_policy)) = needs_approval {
+                let preview = format_command_preview(&json_str);
+                slog(&session_log, |l| {
+                    l.approval(&cat.to_string(), &preview, "waiting")
+                });
+
+                if denied_by_policy {
+                    slog(&session_log, |l| {
+                        l.approval(&cat.to_string(), &preview, "denied-policy")
+                    });
+                    emit(
+                        &bus,
+                        || AppEvent::TaskComplete {
+                            reason: format!("Denied by policy ({})", cat),
+                        },
+                        || println!("--- Denied by policy ({}) ---", cat),
+                    );
+                    return Ok(loop_stats);
+                }
+
+                if let Some(ref bus_ref) = bus {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    bus_ref.send(AppEvent::ApprovalRequired {
+                        id: turn as u64,
+                        command_preview: preview.clone(),
+                        category: cat,
+                        responder: tx,
+                    });
+                    match rx.await {
+                        Ok(tui::event::ApprovalResponse::Approve) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "approved")
+                            });
+                        }
+                        Ok(tui::event::ApprovalResponse::ApproveAll) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "approve-all")
+                            });
+                            let mut state = autonomy.write().await;
+                            state.level = AutonomyLevel::Full;
+                        }
+                        Ok(tui::event::ApprovalResponse::Skip) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "skipped")
+                            });
+                            should_skip = true;
+                        }
+                        Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "denied")
+                            });
+                            emit(
+                                &bus,
+                                || AppEvent::TaskComplete {
+                                    reason: "Denied by user".to_string(),
+                                },
+                                || println!("--- Denied by user ---"),
+                            );
+                            return Ok(loop_stats);
+                        }
+                    }
+                }
+                if bus.is_none() {
+                    slog(&session_log, |l| {
+                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                    });
+                    emit(
+                        &bus,
+                        || AppEvent::TaskComplete {
+                            reason: format!("Approval required in headless mode ({})", cat),
+                        },
+                        || println!("--- Approval required in headless mode ({}) ---", cat),
+                    );
+                    return Ok(loop_stats);
+                }
+            }
+
+            if should_skip {
+                conversation.add_user("Command skipped by user.".to_string());
+                continue;
+            }
+
+            // Log the full JSON being sent to the agent
+            slog(&session_log, |l| l.agent_input(&json_str));
+
+            emit(
+                &bus,
+                || AppEvent::AgentStarted { turn },
+                || println!("[Turn {}] Running agent...", turn),
+            );
+
+            let output = agent_runner::run_agent(&json_str).await?;
+
+            // Filter status lines to only include relevant nonces (current batch + dependencies)
+            let batch_nonces = extract_batch_nonces(&json_str);
+            let mut filtered_stdout = filter_status_lines(&output.stdout, &batch_nonces);
+
+            // Auto-fetch stdout for single standalone execAsAgent commands that completed successfully.
+            if let Some(nonce) = single_exec_nonce(&json_str) {
+                let success_marker = format!("{}c0", nonce);
+                if filtered_stdout.lines().any(|l| l.trim() == success_marker) {
+                    let session_dir = session_log.lock().ok().map(|l| l.dir().to_path_buf());
+                    if let Some(dir) = session_dir {
+                        if let Some(stdout_content) = read_nonce_stdout(&dir, nonce) {
+                            filtered_stdout.push_str(&format!(
+                                "\n--- stdout (nonce {}) ---\n{}\n--- end stdout ---",
+                                nonce, stdout_content
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Log full agent output (no truncation, unfiltered for debugging)
+            slog(&session_log, |l| {
+                l.agent_output(&output.stdout, &output.stderr)
+            });
+
+            emit(
+                &bus,
+                || AppEvent::AgentOutput {
+                    stdout: filtered_stdout.clone(),
+                    stderr: output.stderr.clone(),
+                },
+                || {
+                    println!("Agent stdout:\n{}", filtered_stdout);
+                    if !output.stderr.is_empty() {
+                        eprintln!("Agent stderr:\n{}", output.stderr);
+                    }
+                },
+            );
+
+            // Check for completed sub-agent results
+            let sub_agent_dir = project.sub_agent_dir();
+            if sub_agent_dir.exists() {
+                let results = sub_agent::scan_completed_results(&sub_agent_dir);
+                for result in &results {
+                    let key = format!("{}::{}", result.id, result.summary);
+                    if !seen_sub_agent_results.insert(key) {
+                        continue;
+                    }
+                    let msg = sub_agent::format_result_message(result);
+                    slog(&session_log, |l| {
+                        l.info(&format!("Sub-agent result: {}", msg))
+                    });
+                    emit(
+                        &bus,
+                        || AppEvent::SubAgentResult {
+                            formatted: msg.clone(),
+                        },
+                        || println!("{}", msg),
+                    );
+                }
+            }
+
+            // Format agent output as next user message, include budget summary
+            let mut user_msg = format!("Agent output:\n{}", filtered_stdout);
+            if !output.stderr.is_empty() {
+                user_msg.push_str(&format!("\nStderr:\n{}", output.stderr));
+            }
+            user_msg.push_str(&format!("\n\n{}", conversation.budget_summary()));
+            conversation.add_user(user_msg);
+        } // end tool_calls vs text branch
 
         if turn == SAFETY_CAP {
             slog(&session_log, |l| {
@@ -1496,7 +2139,11 @@ async fn run_sub_agent_mode(
     session_log: SharedSessionLog,
 ) -> Result<LoopStats, CallerError> {
     let project = Project::detect()?;
-    let system_prompt = prompts::resolve_system_prompt(&role, Some(&project.root))?;
+    let system_prompt = if provider.use_tools() {
+        prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
+    } else {
+        prompts::resolve_system_prompt(&role, Some(&project.root))?
+    };
     let task = get_task()?;
 
     if task.is_empty() {
@@ -1769,10 +2416,12 @@ async fn run_direct_mode(
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
 ) -> Result<LoopStats, CallerError> {
-    let system_prompt = prompts::resolve_system_prompt(
-        &sub_agent::SubAgentRole::Custom("direct".to_string()),
-        Some(&project.root),
-    )?;
+    let role = sub_agent::SubAgentRole::Custom("direct".to_string());
+    let system_prompt = if provider.use_tools() {
+        prompts::resolve_system_prompt_for_tools(&role, Some(&project.root))?
+    } else {
+        prompts::resolve_system_prompt(&role, Some(&project.root))?
+    };
 
     slog(&session_log, |l| {
         l.info(&format!(

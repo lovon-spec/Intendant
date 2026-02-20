@@ -3,6 +3,7 @@ use crate::sub_agent::SubAgentRole;
 use std::path::Path;
 
 const DEFAULT_PROMPT: &str = include_str!("../../../SysPrompt.md");
+const DEFAULT_PROMPT_TOOLS: &str = include_str!("../../../SysPrompt_tools.md");
 #[allow(dead_code)]
 const DEFAULT_USER_PROMPT: &str = include_str!("../../../SysPrompt_user.md");
 const DEFAULT_ORCHESTRATOR_PROMPT: &str = include_str!("../../../SysPrompt_orchestrator.md");
@@ -36,13 +37,37 @@ fn resolve_prompt(filename: &str, default: &str, project_root: Option<&Path>) ->
 
 /// Resolve the full system prompt for a given role.
 ///
-/// Always loads the base prompt (`SysPrompt.md`), then appends a role-specific
-/// prompt for Orchestrator, Research, and Implementation roles.
+/// When `use_tools` is true, resolves the tools-mode prompt (`SysPrompt_tools.md`)
+/// which omits JSON schema and per-function docs (those live in native tool definitions).
+///
+/// Always loads the base prompt, then appends a role-specific prompt for
+/// Orchestrator, Research, and Implementation roles.
 pub fn resolve_system_prompt(
     role: &SubAgentRole,
     project_root: Option<&Path>,
 ) -> Result<String, CallerError> {
-    let base_prompt = resolve_prompt("SysPrompt.md", DEFAULT_PROMPT, project_root);
+    resolve_system_prompt_inner(role, project_root, false)
+}
+
+/// Like `resolve_system_prompt` but uses the condensed tools-mode base prompt.
+pub fn resolve_system_prompt_for_tools(
+    role: &SubAgentRole,
+    project_root: Option<&Path>,
+) -> Result<String, CallerError> {
+    resolve_system_prompt_inner(role, project_root, true)
+}
+
+fn resolve_system_prompt_inner(
+    role: &SubAgentRole,
+    project_root: Option<&Path>,
+    use_tools: bool,
+) -> Result<String, CallerError> {
+    let (filename, default) = if use_tools {
+        ("SysPrompt_tools.md", DEFAULT_PROMPT_TOOLS)
+    } else {
+        ("SysPrompt.md", DEFAULT_PROMPT)
+    };
+    let base_prompt = resolve_prompt(filename, default, project_root);
 
     let role_addition: Option<(&str, &str)> = match role {
         SubAgentRole::Orchestrator => {
@@ -71,10 +96,16 @@ mod tests {
     #[test]
     fn compiled_defaults_are_non_empty() {
         assert!(!DEFAULT_PROMPT.is_empty());
+        assert!(!DEFAULT_PROMPT_TOOLS.is_empty());
         assert!(!DEFAULT_USER_PROMPT.is_empty());
         assert!(!DEFAULT_ORCHESTRATOR_PROMPT.is_empty());
         assert!(!DEFAULT_RESEARCH_PROMPT.is_empty());
         assert!(!DEFAULT_IMPLEMENTATION_PROMPT.is_empty());
+    }
+
+    #[test]
+    fn tools_prompt_is_shorter_than_default() {
+        assert!(DEFAULT_PROMPT_TOOLS.len() < DEFAULT_PROMPT.len());
     }
 
     #[test]
@@ -172,5 +203,39 @@ mod tests {
 
         let result = resolve_system_prompt(&SubAgentRole::Research, Some(dir.path())).unwrap();
         assert_eq!(result, format!("{}\n\n{}", custom_base, custom_research));
+    }
+
+    #[test]
+    fn resolve_tools_prompt_direct_role() {
+        let result = resolve_system_prompt_for_tools(
+            &SubAgentRole::Custom("direct".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, DEFAULT_PROMPT_TOOLS);
+        assert!(result.contains("Tool Calling Protocol"));
+        assert!(!result.contains("JSON Schema"));
+    }
+
+    #[test]
+    fn resolve_tools_prompt_with_role_appends() {
+        let result =
+            resolve_system_prompt_for_tools(&SubAgentRole::Orchestrator, None).unwrap();
+        assert!(result.contains(DEFAULT_PROMPT_TOOLS));
+        assert!(result.contains(DEFAULT_ORCHESTRATOR_PROMPT));
+    }
+
+    #[test]
+    fn resolve_tools_prompt_project_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom_tools = "Custom tools prompt";
+        std::fs::write(dir.path().join("SysPrompt_tools.md"), custom_tools).unwrap();
+
+        let result = resolve_system_prompt_for_tools(
+            &SubAgentRole::Custom("direct".into()),
+            Some(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(result, custom_tools);
     }
 }

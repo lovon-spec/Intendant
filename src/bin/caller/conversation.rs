@@ -9,10 +9,27 @@ pub enum MessageLayer {
     SubAgent,
 }
 
+/// Reference to a tool call, stored on assistant messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRef {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// Tool calls made by the assistant (present on assistant messages with tool use).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallRef>>,
+    /// ID of the tool call this message is a response to (present on tool result messages).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Name of the tool this result is for (present on tool result messages).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
     #[serde(skip)]
     pub layer: Option<MessageLayer>,
 }
@@ -31,7 +48,7 @@ impl Conversation {
             messages: vec![Message {
                 role: "system".to_string(),
                 content: system_prompt,
-                layer: None,
+                ..Default::default()
             }],
             last_usage: None,
             context_window,
@@ -49,7 +66,7 @@ impl Conversation {
         self.messages.push(Message {
             role: "user".to_string(),
             content,
-            layer: None,
+            ..Default::default()
         });
     }
 
@@ -59,6 +76,7 @@ impl Conversation {
             role: "user".to_string(),
             content,
             layer: Some(layer),
+            ..Default::default()
         });
     }
 
@@ -67,6 +85,30 @@ impl Conversation {
             role: "assistant".to_string(),
             content,
             layer: None,
+            ..Default::default()
+        });
+    }
+
+    /// Add an assistant message that includes tool calls.
+    pub fn add_assistant_tool_calls(&mut self, content: String, tool_calls: Vec<ToolCallRef>) {
+        self.messages.push(Message {
+            role: "assistant".to_string(),
+            content,
+            tool_calls: Some(tool_calls),
+            layer: None,
+            ..Default::default()
+        });
+    }
+
+    /// Add a tool result message.
+    pub fn add_tool_result(&mut self, call_id: &str, name: &str, output: &str) {
+        self.messages.push(Message {
+            role: "tool".to_string(),
+            content: output.to_string(),
+            tool_call_id: Some(call_id.to_string()),
+            tool_name: Some(name.to_string()),
+            layer: None,
+            ..Default::default()
         });
     }
 
@@ -76,6 +118,7 @@ impl Conversation {
             role: "assistant".to_string(),
             content,
             layer: Some(layer),
+            ..Default::default()
         });
     }
 
@@ -218,7 +261,7 @@ impl Conversation {
             Message {
                 role: "user".to_string(),
                 content: format!("[Context Summary] {}", summary),
-                layer: None,
+                ..Default::default()
             },
         );
     }
@@ -400,6 +443,7 @@ mod tests {
             role: "user".to_string(),
             content: "test".to_string(),
             layer: Some(MessageLayer::User),
+            ..Default::default()
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("layer"));
@@ -577,5 +621,80 @@ mod tests {
         assert_eq!(conv.turn(), 1);
         conv.increment_turn();
         assert_eq!(conv.turn(), 2);
+    }
+
+    // --- Tool call message tests ---
+
+    #[test]
+    fn add_assistant_tool_calls_stores_refs() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_assistant_tool_calls(
+            "I'll run some commands.".to_string(),
+            vec![ToolCallRef {
+                id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                arguments: r#"{"nonce":1,"command":"ls"}"#.to_string(),
+            }],
+        );
+        let msg = &conv.messages()[1];
+        assert_eq!(msg.role, "assistant");
+        assert!(msg.tool_calls.is_some());
+        assert_eq!(msg.tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(msg.tool_calls.as_ref().unwrap()[0].name, "exec_command");
+    }
+
+    #[test]
+    fn add_tool_result_stores_fields() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_tool_result("call_1", "exec_command", "1c0\n");
+        let msg = &conv.messages()[1];
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(msg.tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(msg.content, "1c0\n");
+    }
+
+    #[test]
+    fn tool_call_ref_serialization() {
+        let tc = ToolCallRef {
+            id: "call_abc".to_string(),
+            name: "fetch_status".to_string(),
+            arguments: r#"{"nonce":5}"#.to_string(),
+        };
+        let json = serde_json::to_string(&tc).unwrap();
+        assert!(json.contains("call_abc"));
+        assert!(json.contains("fetch_status"));
+        let deserialized: ToolCallRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, "call_abc");
+    }
+
+    #[test]
+    fn message_with_tool_calls_serialization() {
+        let msg = Message {
+            role: "assistant".to_string(),
+            content: "Running commands.".to_string(),
+            tool_calls: Some(vec![ToolCallRef {
+                id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("tool_calls"));
+        assert!(json.contains("call_1"));
+    }
+
+    #[test]
+    fn message_without_tool_calls_omits_field() {
+        let msg = Message {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("tool_calls"));
+        assert!(!json.contains("tool_call_id"));
+        assert!(!json.contains("tool_name"));
     }
 }
