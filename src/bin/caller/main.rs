@@ -972,6 +972,7 @@ Also: {"source": "bare"}"#;
     fn assemble_batch_single_exec() {
         let calls = vec![provider::ToolCall {
             id: "call_1".to_string(),
+            call_id: "call_1".to_string(),
             name: "exec_command".to_string(),
             arguments: r#"{"nonce":1,"command":"ls -la"}"#.to_string(),
         }];
@@ -992,6 +993,7 @@ Also: {"source": "bare"}"#;
     fn assemble_batch_signal_done() {
         let calls = vec![provider::ToolCall {
             id: "call_1".to_string(),
+            call_id: "call_1".to_string(),
             name: "signal_done".to_string(),
             arguments: r#"{"message":"All tasks completed"}"#.to_string(),
         }];
@@ -1005,6 +1007,7 @@ Also: {"source": "bare"}"#;
     fn assemble_batch_signal_done_no_message() {
         let calls = vec![provider::ToolCall {
             id: "call_1".to_string(),
+            call_id: "call_1".to_string(),
             name: "signal_done".to_string(),
             arguments: r#"{}"#.to_string(),
         }];
@@ -1017,6 +1020,7 @@ Also: {"source": "bare"}"#;
     fn assemble_batch_manage_context() {
         let calls = vec![provider::ToolCall {
             id: "call_1".to_string(),
+            call_id: "call_1".to_string(),
             name: "manage_context".to_string(),
             arguments: r#"{"drop_turns":[1,2]}"#.to_string(),
         }];
@@ -1034,16 +1038,19 @@ Also: {"source": "bare"}"#;
         let calls = vec![
             provider::ToolCall {
                 id: "call_1".to_string(),
+                call_id: "call_1".to_string(),
                 name: "exec_command".to_string(),
                 arguments: r#"{"nonce":10,"command":"echo hello"}"#.to_string(),
             },
             provider::ToolCall {
                 id: "call_2".to_string(),
+                call_id: "call_2".to_string(),
                 name: "fetch_status".to_string(),
                 arguments: r#"{"nonce":11,"status_type":"stdout","depending_nonce":10,"wait":true}"#.to_string(),
             },
             provider::ToolCall {
                 id: "call_3".to_string(),
+                call_id: "call_3".to_string(),
                 name: "manage_context".to_string(),
                 arguments: r#"{"drop_turns":[3]}"#.to_string(),
             },
@@ -1067,6 +1074,7 @@ Also: {"source": "bare"}"#;
     fn assemble_batch_unknown_tool_ignored() {
         let calls = vec![provider::ToolCall {
             id: "call_1".to_string(),
+            call_id: "call_1".to_string(),
             name: "nonexistent_tool".to_string(),
             arguments: r#"{"nonce":1}"#.to_string(),
         }];
@@ -1092,6 +1100,7 @@ Also: {"source": "bare"}"#;
         for (tool_name, expected_func) in tool_pairs {
             let calls = vec![provider::ToolCall {
                 id: "call_1".to_string(),
+                call_id: "call_1".to_string(),
                 name: tool_name.to_string(),
                 arguments: r#"{"nonce":1,"command":"test","status_type":"stdout","path":"/tmp","file_path":"/tmp/f","operation":"write","url":"http://x","question":"?","memory_key":"k","memory_summary":"s","memory_query":"q"}"#.to_string(),
             }];
@@ -1237,7 +1246,7 @@ fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> ToolBatc
     let mut done_message = None;
 
     for tc in tool_calls {
-        call_id_names.push((tc.id.clone(), tc.name.clone()));
+        call_id_names.push((tc.call_id.clone(), tc.name.clone()));
 
         match tc.name.as_str() {
             "manage_context" => {
@@ -1266,7 +1275,7 @@ fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> ToolBatc
 
                         // Track nonce → call ID for result routing
                         if let Some(nonce) = args.get("nonce").and_then(|n| n.as_u64()) {
-                            nonce_to_call_id.insert(nonce, tc.id.clone());
+                            nonce_to_call_id.insert(nonce, tc.call_id.clone());
                         }
 
                         commands.push(args);
@@ -1466,11 +1475,16 @@ async fn run_agent_loop(
                 .iter()
                 .map(|tc| conversation::ToolCallRef {
                     id: tc.id.clone(),
+                    call_id: tc.call_id.clone(),
                     name: tc.name.clone(),
                     arguments: tc.arguments.clone(),
                 })
                 .collect();
-            conversation.add_assistant_tool_calls(response.content.clone(), refs);
+            conversation.add_assistant_tool_calls(
+                response.content.clone(),
+                refs,
+                response.raw_output.clone(),
+            );
         } else {
             conversation.add_assistant(response.content.clone());
         }
