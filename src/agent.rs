@@ -436,7 +436,12 @@ impl Agent {
     }
 
     async fn capture_screen(&self, cmd: &AgentCommand) -> Result<(), AgentError> {
-        let display = cmd.display.unwrap_or(1);
+        let display = cmd.display.unwrap_or_else(|| {
+            std::env::var("DISPLAY")
+                .ok()
+                .and_then(|d| d.trim_start_matches(':').parse().ok())
+                .unwrap_or(1)
+        });
         let screenshot_path = self.log_dir.join(format!("screenshot_{}.png", cmd.nonce));
 
         // Handle dependencies similarly to exec_as_agent

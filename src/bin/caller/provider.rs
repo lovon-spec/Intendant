@@ -16,7 +16,11 @@ pub struct TokenUsage {
 /// A tool call returned by the model.
 #[derive(Debug, Clone)]
 pub struct ToolCall {
+    /// The item ID (fc_-prefixed for Responses API, call_-prefixed for others).
     pub id: String,
+    /// The correlation key used to pair calls with outputs (call_-prefixed).
+    /// For Responses API this is distinct from `id`; for other providers it equals `id`.
+    pub call_id: String,
     pub name: String,
     pub arguments: String,
 }
@@ -28,6 +32,9 @@ pub struct ChatResponse {
     pub reasoning_summary: Option<String>,
     pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Raw output items from the Responses API (reasoning + function_call items).
+    /// Echoed back verbatim in subsequent requests per the API contract.
+    pub raw_output: Option<Vec<serde_json::Value>>,
 }
 
 #[async_trait]
@@ -110,6 +117,12 @@ struct OpenAIResponsesResponse {
     usage: Option<ResponsesUsage>,
 }
 
+/// Minimal wrapper to capture raw output items as JSON values.
+#[derive(Deserialize)]
+struct OpenAIResponsesRawOutput {
+    output: Option<Vec<serde_json::Value>>,
+}
+
 #[derive(Deserialize)]
 struct ResponsesOutputItem {
     #[serde(rename = "type")]
@@ -117,6 +130,9 @@ struct ResponsesOutputItem {
     content: Option<Vec<ResponsesContentItem>>,
     summary: Option<Vec<ResponsesSummaryItem>>,
     // function_call fields (type="function_call")
+    /// Item ID (fc_-prefixed), used when echoing function_call back in input.
+    id: Option<String>,
+    /// Correlation key (call_-prefixed), used for function_call_output.
     call_id: Option<String>,
     name: Option<String>,
     arguments: Option<String>,
@@ -194,22 +210,32 @@ impl ChatProvider for OpenAIProvider {
 
                 // If this is an assistant message with tool calls, emit function_call items
                 if m.role == "assistant" {
-                    if let Some(ref tcs) = m.tool_calls {
-                        // Emit the assistant message first (may have text content)
-                        if !m.content.is_empty() {
-                            items.push(openai_message_item(&m.role, &m.content));
+                    if m.tool_calls.is_some() {
+                        // When raw_output is available, emit those items verbatim.
+                        // This preserves reasoning items alongside function_call items,
+                        // which reasoning models require. raw_output already contains
+                        // all output items (reasoning, function_call, message), so we
+                        // don't emit m.content separately to avoid duplication.
+                        if let Some(ref raw) = m.raw_output {
+                            items.extend(raw.iter().cloned());
+                            return items;
                         }
-                        // Then emit each function_call as a separate output item
-                        for tc in tcs {
-                            items.push(serde_json::json!({
-                                "type": "function_call",
-                                "id": tc.id,
-                                "call_id": tc.id,
-                                "name": tc.name,
-                                "arguments": tc.arguments,
-                            }));
+                        // Fallback: reconstruct function_call items from tool_calls
+                        if let Some(ref tcs) = m.tool_calls {
+                            if !m.content.is_empty() {
+                                items.push(openai_message_item(&m.role, &m.content));
+                            }
+                            for tc in tcs {
+                                items.push(serde_json::json!({
+                                    "type": "function_call",
+                                    "id": tc.id,
+                                    "call_id": tc.call_id,
+                                    "name": tc.name,
+                                    "arguments": tc.arguments,
+                                }));
+                            }
+                            return items;
                         }
-                        return items;
                     }
                 }
 
@@ -279,7 +305,12 @@ impl ChatProvider for OpenAIProvider {
             return Err(CallerError::Provider(format!("{}: {}", status, body)));
         }
 
-        let resp: OpenAIResponsesResponse = response.json().await?;
+        let body = response.text().await?;
+        let resp: OpenAIResponsesResponse = serde_json::from_str(&body)?;
+        // Capture raw output items for verbatim echo-back (reasoning + function_call items)
+        let raw_output = serde_json::from_str::<OpenAIResponsesRawOutput>(&body)
+            .ok()
+            .and_then(|r| r.output);
 
         // Extract function_call items from the output array
         let mut tool_calls = Vec::new();
@@ -290,7 +321,9 @@ impl ChatProvider for OpenAIProvider {
                         (&item.call_id, &item.name, &item.arguments)
                     {
                         tool_calls.push(ToolCall {
-                            id: call_id.clone(),
+                            // Use the fc_-prefixed id if present, fall back to call_id
+                            id: item.id.clone().unwrap_or_else(|| call_id.clone()),
+                            call_id: call_id.clone(),
                             name: name.clone(),
                             arguments: arguments.clone(),
                         });
@@ -386,6 +419,7 @@ impl ChatProvider for OpenAIProvider {
             reasoning_summary,
             reasoning_content,
             tool_calls,
+            raw_output,
         })
     }
 
@@ -607,6 +641,7 @@ impl ChatProvider for AnthropicProvider {
                     {
                         tool_calls.push(ToolCall {
                             id: id.clone(),
+                            call_id: id.clone(),
                             name: name.clone(),
                             arguments: serde_json::to_string(input).unwrap_or_default(),
                         });
@@ -638,6 +673,7 @@ impl ChatProvider for AnthropicProvider {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls,
+            raw_output: None,
         })
     }
 
@@ -854,7 +890,8 @@ impl ChatProvider for GeminiProvider {
                     // Gemini doesn't provide call IDs; generate one
                     let id = format!("gemini_call_{}", tool_calls.len());
                     tool_calls.push(ToolCall {
-                        id,
+                        id: id.clone(),
+                        call_id: id,
                         name,
                         arguments: args,
                     });
@@ -891,6 +928,7 @@ impl ChatProvider for GeminiProvider {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls,
+            raw_output: None,
         })
     }
 
@@ -1522,12 +1560,14 @@ mod tests {
         let json = r#"{
             "output": [
                 {
+                    "id": "fc_abc123",
                     "type": "function_call",
                     "call_id": "call_abc123",
                     "name": "exec_command",
                     "arguments": "{\"nonce\":1,\"command\":\"ls -la\"}"
                 },
                 {
+                    "id": "fc_def456",
                     "type": "function_call",
                     "call_id": "call_def456",
                     "name": "fetch_status",
@@ -1540,9 +1580,11 @@ mod tests {
         let items = resp.output.unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].item_type.as_deref(), Some("function_call"));
+        assert_eq!(items[0].id.as_deref(), Some("fc_abc123"));
         assert_eq!(items[0].call_id.as_deref(), Some("call_abc123"));
         assert_eq!(items[0].name.as_deref(), Some("exec_command"));
         assert!(items[0].arguments.as_ref().unwrap().contains("ls -la"));
+        assert_eq!(items[1].id.as_deref(), Some("fc_def456"));
         assert_eq!(items[1].name.as_deref(), Some("fetch_status"));
     }
 
@@ -1649,6 +1691,7 @@ mod tests {
             reasoning_summary: None,
             reasoning_content: None,
             tool_calls: vec![],
+            raw_output: None,
         };
         assert!(resp.tool_calls.is_empty());
     }
@@ -1656,11 +1699,13 @@ mod tests {
     #[test]
     fn tool_call_fields() {
         let tc = ToolCall {
-            id: "call_123".to_string(),
+            id: "fc_123".to_string(),
+            call_id: "call_123".to_string(),
             name: "exec_command".to_string(),
             arguments: r#"{"nonce":1,"command":"ls"}"#.to_string(),
         };
-        assert_eq!(tc.id, "call_123");
+        assert_eq!(tc.id, "fc_123");
+        assert_eq!(tc.call_id, "call_123");
         assert_eq!(tc.name, "exec_command");
         assert!(tc.arguments.contains("nonce"));
     }

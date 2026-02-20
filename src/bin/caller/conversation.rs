@@ -12,7 +12,11 @@ pub enum MessageLayer {
 /// Reference to a tool call, stored on assistant messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRef {
+    /// Item ID (fc_-prefixed for Responses API).
     pub id: String,
+    /// Correlation key (call_-prefixed). Used for function_call_output.
+    #[serde(default)]
+    pub call_id: String,
     pub name: String,
     pub arguments: String,
 }
@@ -30,6 +34,10 @@ pub struct Message {
     /// Name of the tool this result is for (present on tool result messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Raw output items from the API response (for verbatim echo-back).
+    /// Used by OpenAI Responses API to echo reasoning + function_call items together.
+    #[serde(skip)]
+    pub raw_output: Option<Vec<serde_json::Value>>,
     #[serde(skip)]
     pub layer: Option<MessageLayer>,
 }
@@ -90,11 +98,17 @@ impl Conversation {
     }
 
     /// Add an assistant message that includes tool calls.
-    pub fn add_assistant_tool_calls(&mut self, content: String, tool_calls: Vec<ToolCallRef>) {
+    pub fn add_assistant_tool_calls(
+        &mut self,
+        content: String,
+        tool_calls: Vec<ToolCallRef>,
+        raw_output: Option<Vec<serde_json::Value>>,
+    ) {
         self.messages.push(Message {
             role: "assistant".to_string(),
             content,
             tool_calls: Some(tool_calls),
+            raw_output,
             layer: None,
             ..Default::default()
         });
@@ -632,9 +646,11 @@ mod tests {
             "I'll run some commands.".to_string(),
             vec![ToolCallRef {
                 id: "call_1".to_string(),
+                call_id: "call_1".to_string(),
                 name: "exec_command".to_string(),
                 arguments: r#"{"nonce":1,"command":"ls"}"#.to_string(),
             }],
+            None,
         );
         let msg = &conv.messages()[1];
         assert_eq!(msg.role, "assistant");
@@ -658,6 +674,7 @@ mod tests {
     fn tool_call_ref_serialization() {
         let tc = ToolCallRef {
             id: "call_abc".to_string(),
+            call_id: "call_abc".to_string(),
             name: "fetch_status".to_string(),
             arguments: r#"{"nonce":5}"#.to_string(),
         };
@@ -675,6 +692,7 @@ mod tests {
             content: "Running commands.".to_string(),
             tool_calls: Some(vec![ToolCallRef {
                 id: "call_1".to_string(),
+                call_id: "call_1".to_string(),
                 name: "exec_command".to_string(),
                 arguments: "{}".to_string(),
             }]),

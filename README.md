@@ -206,10 +206,10 @@ enabled = false  # default: true
 cargo test
 ```
 
-The test suite covers both binaries with 519 unit/integration tests:
+The test suite covers both binaries:
 
-- **Agent binary (115 tests):** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary (404 tests):** JSON extraction, done signal handling, conversation management with message layer protection and tool call tracking, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, native tool definitions (12 tools, provider conversion formats), tool call batch assembly and result routing, Gemini provider request/response format, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults, tools-mode variant), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, status line filtering, auto-fetch detection, session log file creation, and model summary formatting.
+- **Agent binary:** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
+- **Caller binary:** JSON extraction, done signal handling, conversation management with message layer protection and tool call tracking, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, native tool definitions (12 tools, provider conversion formats), tool call batch assembly and result routing, Gemini provider request/response format, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults, tools-mode variant), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, status line filtering, auto-fetch detection, session log file creation, model summary formatting, Xvfb display configuration per provider, and dynamic display allocation.
 
 ## Session Logging
 
@@ -347,7 +347,7 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
 | `--log-file <dir>` | Override session log directory |
 | `--control-socket` | Enable Unix control socket (TUI mode) |
-| `--vision` | Launch Xvfb virtual display sized for the provider's vision model |
+| `--vision` | Launch Xvfb virtual display (auto-allocated `:99+`) sized for the provider's vision model |
 
 The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
 
@@ -391,7 +391,7 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 8. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, optional JSON format, and native tool definitions when enabled)
 9. Logs reasoning content (both summary and full text) to `turn_NNN_reasoning.txt` when available
 10. Processes the model's response via one of two paths:
-    - **Native tool call path** (when response contains tool calls): Collects individual tool calls, assembles them into an `AgentInput` batch, pipes to the runtime, maps results back to per-tool-call responses. Handles `manage_context` and `signal_done` tool calls caller-side
+    - **Native tool call path** (when response contains tool calls): Collects individual tool calls, assembles them into an `AgentInput` batch, pipes to the runtime, maps results back to per-tool-call responses. Handles `manage_context` and `signal_done` tool calls caller-side. Raw API output items (reasoning + function_call) are preserved for verbatim echo-back in subsequent requests, which reasoning models (GPT-5, o3, o4) require
     - **Legacy text extraction path** (fallback): Extracts JSON from the response text (handles structured output, code fences, and bare JSON), checks for explicit `done` signal (`{"done": true}`)
 11. Applies context directives (`drop_turns`, `summarize`) to the conversation
 12. Injects project context (`memory_file`) into relevant commands
@@ -413,7 +413,7 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 
 - **OS:** Debian 12+
 - **Runtime:** Tokio async
-- **Display:** DISPLAY is automatically set to `:1` (configurable via `display` field) for GUI commands
+- **Display:** DISPLAY is set from the environment (configurable via `display` field per command, defaults to env `DISPLAY` or `:1`). With `--vision`, Xvfb is auto-allocated on a free display (`:99+`)
 - **Permissions:** Runs as unprivileged user with passwordless sudo
 
 ### Environment Variables

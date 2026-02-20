@@ -22,10 +22,21 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
         _ => (1024, 768),            // safe default
     };
     DisplayConfig {
-        display_id: 1,
+        display_id: find_free_display(),
         width,
         height,
     }
+}
+
+/// Find a free X display number by checking for lock files.
+fn find_free_display() -> u32 {
+    for id in 99..200 {
+        let lock = format!("/tmp/.X{}-lock", id);
+        if !std::path::Path::new(&lock).exists() {
+            return id;
+        }
+    }
+    199 // fallback
 }
 
 /// Guard that kills the Xvfb process when dropped.
@@ -89,7 +100,6 @@ mod tests {
         let config = display_config_for_provider("openai");
         assert_eq!(config.width, 1024);
         assert_eq!(config.height, 768);
-        assert_eq!(config.display_id, 1);
     }
 
     #[test]
@@ -97,7 +107,6 @@ mod tests {
         let config = display_config_for_provider("anthropic");
         assert_eq!(config.width, 819);
         assert_eq!(config.height, 1456);
-        assert_eq!(config.display_id, 1);
     }
 
     #[test]
@@ -105,7 +114,6 @@ mod tests {
         let config = display_config_for_provider("gemini");
         assert_eq!(config.width, 768);
         assert_eq!(config.height, 1024);
-        assert_eq!(config.display_id, 1);
     }
 
     #[test]
@@ -113,5 +121,15 @@ mod tests {
         let config = display_config_for_provider("unknown-provider");
         assert_eq!(config.width, 1024);
         assert_eq!(config.height, 768);
+    }
+
+    #[test]
+    fn find_free_display_avoids_existing() {
+        // Should return a display number >= 99
+        let id = find_free_display();
+        assert!(id >= 99);
+        // The returned display should not have a lock file
+        let lock = format!("/tmp/.X{}-lock", id);
+        assert!(!std::path::Path::new(&lock).exists());
     }
 }
