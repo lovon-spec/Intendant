@@ -21,6 +21,7 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   |
   +--> Native tool calling (OpenAI/Anthropic/Gemini) with text extraction fallback
   +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
+  +--> MCP Server:      --mcp flag, stdio transport, full parity with TUI (tools + resources)
   +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
   +--> Optional control socket (--control-socket): /tmp/intendant-<pid>.sock (JSON-line protocol)
   +--> Token budget tracking (context-window-aware loop termination)
@@ -346,6 +347,7 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--no-tui` | Disable TUI, use plain text output |
 | `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
 | `--log-file <dir>` | Override session log directory |
+| `--mcp` | Run as MCP server on stdio (replaces TUI) |
 | `--control-socket` | Enable Unix control socket (TUI mode) |
 | `--vision` | Launch Xvfb virtual display (auto-allocated `:99+`) sized for the provider's vision model |
 
@@ -579,3 +581,73 @@ Example usage:
 ```bash
 echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
 ```
+
+## MCP Server
+
+The `--mcp` flag launches Intendant as a [Model Context Protocol](https://modelcontextprotocol.io/) server on stdio. This lets external AI agents (Claude Code, Codex, etc.) observe and control Intendant with full parity to the TUI — every action a human can take in the TUI is available as an MCP tool.
+
+### Running
+
+```bash
+# Launch as MCP server (stdio transport)
+./target/release/intendant --mcp "Deploy the application"
+
+# With provider/model overrides
+./target/release/intendant --mcp --provider anthropic --model claude-sonnet-4-5-20250929 "Fix the tests"
+
+# With autonomy preset
+./target/release/intendant --mcp --autonomy high "Refactor the auth module"
+```
+
+### Client Configuration
+
+Add Intendant to your MCP client's config. For Claude Code (`~/.claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "intendant": {
+      "command": "intendant",
+      "args": ["--mcp", "Your task description here"]
+    }
+  }
+}
+```
+
+### Tools
+
+All tools mirror TUI actions. The server enforces compile-time parity — adding a new user action to the TUI requires implementing it in the MCP server (and vice versa).
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `get_status` | Current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens | — |
+| `get_logs` | Log entries with cursor-based pagination and level filtering | `since_id?`, `level_filter?`, `limit?` |
+| `get_pending_approval` | Current pending approval request (or null) | — |
+| `get_pending_input` | Current pending human question (or null) | — |
+| `approve` | Approve a pending command (TUI: `y`) | `id` |
+| `deny` | Deny a pending command and stop (TUI: `n`) | `id` |
+| `skip` | Skip a pending command, continue (TUI: `s`) | `id` |
+| `approve_all` | Approve and set autonomy to Full (TUI: `a`) | `id` |
+| `respond` | Answer an `askHuman` question (TUI: type + Enter) | `text` |
+| `set_autonomy` | Set autonomy level (TUI: `+`/`-`) | `level`: `"low"`, `"medium"`, `"high"`, `"full"` |
+| `set_verbosity` | Set log verbosity (TUI: `v`) | `level`: `"quiet"`, `"normal"`, `"verbose"`, `"debug"` |
+| `quit` | Shut down the agent (TUI: `q`) | — |
+
+### Resources
+
+Resources provide push-based state observation via subscriptions. The server sends `notifications/resources/updated` when state changes, so clients know to re-fetch.
+
+| URI | Description |
+|-----|-------------|
+| `intendant://status` | Provider, model, turn count, budget %, phase, autonomy level |
+| `intendant://logs` | Last 100 chronological log entries (same as TUI log panel) |
+| `intendant://pending-approval` | Current pending approval request, if any |
+| `intendant://pending-input` | Current pending human question, if any |
+
+### Typical Agent Workflow
+
+1. Call `get_status` to see the current phase and budget
+2. Poll `get_logs` with `since_id` to stream new events
+3. When an approval is needed, `get_pending_approval` returns the command preview — call `approve`, `deny`, or `skip`
+4. When `askHuman` triggers, `get_pending_input` returns the question — call `respond` with your answer
+5. Call `quit` when done
