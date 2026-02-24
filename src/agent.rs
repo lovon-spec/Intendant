@@ -45,6 +45,8 @@ pub struct Agent {
     status_tx: mpsc::Sender<StatusUpdate>,
     pty_sessions: Arc<tokio::sync::Mutex<HashMap<String, PtySession>>>,
     source_generation: u64,
+    available_displays: Vec<i32>,
+    session_xauthority: Option<PathBuf>,
 }
 
 impl Agent {
@@ -108,6 +110,8 @@ impl Agent {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            available_displays: vec![],
+            session_xauthority: None,
         })
     }
 
@@ -158,6 +162,10 @@ impl Agent {
         // Resolve log directory (reuse existing session or create new)
         let log_dir = Self::resolve_log_dir()?;
 
+        // Discover X displays and merge xauth cookies
+        let available_displays = Self::discover_displays();
+        let session_xauthority = Self::setup_merged_xauthority(&available_displays, &log_dir);
+
         // Setup status channel
         let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(1024);
 
@@ -196,6 +204,8 @@ impl Agent {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            available_displays,
+            session_xauthority,
         })
     }
 
@@ -319,6 +329,125 @@ impl Agent {
         Ok(())
     }
 
+    /// Scan `/tmp/.X*-lock` for active X display numbers.
+    fn discover_displays() -> Vec<i32> {
+        let mut displays = Vec::new();
+        if let Ok(entries) = fs::read_dir("/tmp") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(rest) = name.strip_prefix(".X") {
+                    if let Some(num_str) = rest.strip_suffix("-lock") {
+                        if let Ok(n) = num_str.parse::<i32>() {
+                            displays.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        displays.sort();
+        displays
+    }
+
+    /// Merge xauth cookies from all discovered displays into a session-scoped file.
+    fn setup_merged_xauthority(displays: &[i32], log_dir: &Path) -> Option<PathBuf> {
+        if displays.is_empty() {
+            return None;
+        }
+        let merged_path = log_dir.join("session.Xauthority");
+        let mut any_merged = false;
+
+        // Candidate source paths for xauth cookies
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let user_xauth = PathBuf::from(&home).join(".Xauthority");
+
+        for &disp in displays {
+            let display_str = format!(":{}", disp);
+            // Try user's own Xauthority
+            if user_xauth.exists() {
+                if let Ok(status) = std::process::Command::new("xauth")
+                    .arg("-f")
+                    .arg(&user_xauth)
+                    .arg("nlist")
+                    .arg(&display_str)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                {
+                    if !status.stdout.is_empty() {
+                        if let Ok(merge_status) = std::process::Command::new("xauth")
+                            .arg("-f")
+                            .arg(&merged_path)
+                            .arg("nmerge")
+                            .arg("-")
+                            .stdin(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .spawn()
+                            .and_then(|mut child| {
+                                use std::io::Write;
+                                if let Some(ref mut stdin) = child.stdin {
+                                    let _ = stdin.write_all(&status.stdout);
+                                }
+                                child.wait()
+                            })
+                        {
+                            if merge_status.success() {
+                                any_merged = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // Try lightdm root cookie
+            let lightdm_path = format!("/var/run/lightdm/root/:{}", disp);
+            if Path::new(&lightdm_path).exists() {
+                if let Ok(status) = std::process::Command::new("sudo")
+                    .args(["-n", "xauth", "-f", &lightdm_path, "nlist", &display_str])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                {
+                    if !status.stdout.is_empty() {
+                        if let Ok(merge_status) = std::process::Command::new("xauth")
+                            .arg("-f")
+                            .arg(&merged_path)
+                            .arg("nmerge")
+                            .arg("-")
+                            .stdin(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .spawn()
+                            .and_then(|mut child| {
+                                use std::io::Write;
+                                if let Some(ref mut stdin) = child.stdin {
+                                    let _ = stdin.write_all(&status.stdout);
+                                }
+                                child.wait()
+                            })
+                        {
+                            if merge_status.success() {
+                                any_merged = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if any_merged {
+            Some(merged_path)
+        } else {
+            None
+        }
+    }
+
+    /// Return the first discovered display number, falling back to 1.
+    fn default_display(&self) -> i32 {
+        self.available_displays.first().copied().unwrap_or(1)
+    }
+
     async fn exec_as_agent(&self, cmd: &AgentCommand) -> Result<(), AgentError> {
         let command = cmd.command.as_ref().ok_or_else(|| {
             AgentError::Process("Command string is required for execAsAgent".to_string())
@@ -384,15 +513,19 @@ impl Agent {
             std::env::var("DISPLAY")
                 .ok()
                 .and_then(|d| d.trim_start_matches(':').parse().ok())
-                .unwrap_or(1)
+                .unwrap_or_else(|| self.default_display())
         });
-        let mut child = Command::new("bash")
+        let mut cmd_builder = Command::new("bash");
+        cmd_builder
             .arg("-c")
             .arg(&command)
             .env("DISPLAY", format!(":{}", display_id))
             .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file))
-            .spawn()?;
+            .stderr(Stdio::from(stderr_file));
+        if let Some(ref xauth) = self.session_xauthority {
+            cmd_builder.env("XAUTHORITY", xauth);
+        }
+        let mut child = cmd_builder.spawn()?;
 
         // Update process info in shared memory
         let pid = child.id().unwrap_or(0) as i32;
@@ -445,7 +578,7 @@ impl Agent {
             std::env::var("DISPLAY")
                 .ok()
                 .and_then(|d| d.trim_start_matches(':').parse().ok())
-                .unwrap_or(1)
+                .unwrap_or_else(|| self.default_display())
         });
         let screenshot_path = self.log_dir.join(format!("screenshot_{}.png", cmd.nonce));
 
@@ -471,16 +604,18 @@ impl Agent {
         }
 
         // Use import command from ImageMagick
-        let status = Command::new("import")
-            .args([
-                "-window",
-                "root",
-                "-display",
-                &format!(":{}", display),
-                &screenshot_path.to_string_lossy(),
-            ])
-            .status()
-            .await?;
+        let mut cmd_builder = Command::new("import");
+        cmd_builder.args([
+            "-window",
+            "root",
+            "-display",
+            &format!(":{}", display),
+            &screenshot_path.to_string_lossy(),
+        ]);
+        if let Some(ref xauth) = self.session_xauthority {
+            cmd_builder.env("XAUTHORITY", xauth);
+        }
+        let status = cmd_builder.status().await?;
         let exit_code = status.code().unwrap_or(-1);
         let process_status = if status.success() {
             ProcessStatus::Completed
@@ -3960,5 +4095,38 @@ mod tests {
         // The exec should be skipped since its dependency failed (exit_code 1 != expected 0)
         let exec_info = agent.get_process_info(21).unwrap();
         assert_eq!(exec_info.status, ProcessStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn discover_displays_no_lock_files() {
+        // In a temp dir with no .X*-lock files, discovery returns empty
+        let _tmp = TempDir::new().unwrap();
+        // discover_displays scans /tmp so we can't easily isolate it,
+        // but we can verify it returns a sorted vec of valid i32s
+        let displays = Agent::discover_displays();
+        for w in displays.windows(2) {
+            assert!(w[0] <= w[1], "displays should be sorted");
+        }
+    }
+
+    #[tokio::test]
+    async fn default_display_empty_returns_1() {
+        let (mut agent, _shm, _log) = create_test_agent();
+        agent.available_displays = vec![];
+        assert_eq!(agent.default_display(), 1);
+    }
+
+    #[tokio::test]
+    async fn default_display_returns_first() {
+        let (mut agent, _shm, _log) = create_test_agent();
+        agent.available_displays = vec![0, 1, 2];
+        assert_eq!(agent.default_display(), 0);
+    }
+
+    #[tokio::test]
+    async fn setup_merged_xauthority_empty_displays() {
+        let tmp = TempDir::new().unwrap();
+        let result = Agent::setup_merged_xauthority(&[], tmp.path());
+        assert!(result.is_none());
     }
 }

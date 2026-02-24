@@ -415,7 +415,7 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 
 - **OS:** Debian 12+
 - **Runtime:** Tokio async
-- **Display:** DISPLAY is set from the environment (configurable via `display` field per command, defaults to env `DISPLAY` or `:1`). With `--vision`, Xvfb is auto-allocated on a free display (`:99+`)
+- **Display:** DISPLAY is set from the environment (configurable via `display` field per command, defaults to env `DISPLAY` or first discovered display from `/tmp/.X*-lock`, then `:1`). With `--vision`, Xvfb is auto-allocated on a free display (`:99+`). At startup the runtime discovers active X displays and merges their xauth cookies (from `~/.Xauthority` and `/var/run/lightdm/root/:N` via `sudo -n`) into a session-scoped `session.Xauthority` file, which is passed as `XAUTHORITY` to all spawned commands.
 - **Permissions:** Runs as unprivileged user with passwordless sudo
 
 ### Environment Variables
