@@ -1391,7 +1391,7 @@ fn map_results_to_tool_responses(
     results
 }
 
-const PROGRESS_INTERVAL: usize = 5;
+const PROGRESS_INTERVAL: usize = 1;
 
 async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
@@ -1547,7 +1547,7 @@ async fn run_agent_loop(
         if let Some((id, _role)) = sub_agent_mode {
             if turn % PROGRESS_INTERVAL == 0 {
                 if let Ok(progress_path) = env::var("INTENDANT_PROGRESS_FILE") {
-                    let last_action = response.content.chars().take(200).collect::<String>();
+                    let last_action = response.content.chars().take(500).collect::<String>();
                     let progress = sub_agent::SubAgentProgress {
                         id: id.clone(),
                         turn,
@@ -1763,9 +1763,10 @@ async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
+            let preview = json_str.chars().take(300).collect::<String>();
             emit(
                 &bus,
-                || AppEvent::AgentStarted { turn },
+                || AppEvent::AgentStarted { turn, commands_preview: preview.clone() },
                 || println!("[Turn {}] Running agent...", turn),
             );
 
@@ -2043,9 +2044,10 @@ Proceed with explicit assumptions and continue without additional questions."
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
 
+            let preview = json_str.chars().take(300).collect::<String>();
             emit(
                 &bus,
-                || AppEvent::AgentStarted { turn },
+                || AppEvent::AgentStarted { turn, commands_preview: preview.clone() },
                 || println!("[Turn {}] Running agent...", turn),
             );
 
@@ -2640,13 +2642,24 @@ async fn main() -> Result<(), CallerError> {
         run_sub_agent_mode(provider, id, role, session_log).await?;
         return Ok(());
     }
-    let task = get_task_from_flags_or_env(&flags)?;
 
-    if task.is_empty() {
-        return Err(CallerError::Config("No task provided".to_string()));
+    // In MCP mode, a task is optional — it can be started later via the
+    // `start_task` MCP tool. We must NOT call get_task_from_flags_or_env()
+    // because it would print to stdout and read from stdin, both of which
+    // are reserved for the MCP JSON-RPC transport.
+    let task = if flags.mcp {
+        flags.task.clone().filter(|t| !t.is_empty())
+    } else {
+        let t = get_task_from_flags_or_env(&flags)?;
+        if t.is_empty() {
+            return Err(CallerError::Config("No task provided".to_string()));
+        }
+        Some(t)
+    };
+
+    if let Some(ref t) = task {
+        slog(&session_log, |l| l.info(&format!("Task: {}", t)));
     }
-
-    slog(&session_log, |l| l.info(&format!("Task: {}", task)));
 
     // Determine whether to use TUI
     let use_tui = !flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -2660,6 +2673,7 @@ async fn main() -> Result<(), CallerError> {
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
         let (bus, event_rx) = EventBus::new();
         let _human_monitor = tui::event::spawn_human_question_monitor(bus.clone());
+        let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 1000);
 
         let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(
             mcp::McpAppState::new(
@@ -2669,61 +2683,113 @@ async fn main() -> Result<(), CallerError> {
             ),
         ));
 
-        // Spawn the agent loop in a background task
-        let bus_clone = bus.clone();
-        let autonomy_clone = autonomy.clone();
-        let task_clone = task.clone();
-        let task_for_summary = task.clone();
-        let session_log_clone = session_log.clone();
-        let session_log_summary = session_log.clone();
-        let _loop_handle = tokio::spawn(async move {
-            let result = if is_simple_task(&task_clone) {
-                run_direct_mode(
-                    provider,
-                    task_clone,
-                    project,
-                    Some(bus_clone.clone()),
-                    autonomy_clone,
-                    session_log_clone,
-                )
-                .await
-            } else {
-                run_user_mode(
-                    provider,
-                    task_clone,
-                    project,
-                    Some(bus_clone.clone()),
-                    autonomy_clone,
-                    session_log_clone,
-                )
-                .await
-            };
+        // Build a launcher closure that can spawn the agent loop on demand.
+        // This captures the provider factory parameters (not the provider itself,
+        // since providers are not Clone) so each start_task creates a fresh provider.
+        let project_root = project.root.clone();
+        let approval_config = project.config.approval.clone();
+        let cli_autonomy = flags.autonomy;
+        let session_log_for_launcher = session_log.clone();
+        let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
+            let project_root = project_root.clone();
+            let approval_config = approval_config.clone();
+            let session_log = session_log_for_launcher.clone();
+            Box::pin(async move {
+                // Create a fresh provider for this task
+                let provider = match provider::select_provider() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        bus.send(AppEvent::LoopError(format!(
+                            "Failed to create provider: {}",
+                            e
+                        )));
+                        return tokio::spawn(async {});
+                    }
+                };
+                let project = match Project::from_root(project_root.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        bus.send(AppEvent::LoopError(format!(
+                            "Failed to load project: {}",
+                            e
+                        )));
+                        return tokio::spawn(async {});
+                    }
+                };
+                let autonomy = autonomy::shared_autonomy(AutonomyState::new(
+                    cli_autonomy,
+                    approval_config.clone(),
+                ));
+                let bus_clone = bus.clone();
+                let task_for_summary = task_str.clone();
+                let session_log_summary = session_log.clone();
+                tokio::spawn(async move {
+                    // MCP always uses direct mode — the MCP client (e.g. Claude Code)
+                    // is already the orchestrator. Adding intendant's own orchestrator
+                    // layer creates a subprocess with poor visibility and no benefit.
+                    let result = run_direct_mode(
+                        provider,
+                        task_str,
+                        project,
+                        Some(bus_clone.clone()),
+                        autonomy,
+                        session_log,
+                    )
+                    .await;
 
-            match result {
-                Ok(stats) => {
-                    slog(&session_log_summary, |l| {
-                        l.write_summary(&task_for_summary, "completed", stats.turns)
-                    });
-                    bus_clone.send(AppEvent::TaskComplete {
-                        reason: "Task complete".to_string(),
-                    });
-                }
-                Err(e) => {
-                    slog(&session_log_summary, |l| {
-                        l.write_summary(&task_for_summary, &format!("error: {}", e), 0)
-                    });
-                    bus_clone.send(AppEvent::LoopError(e.to_string()));
-                }
-            }
+                    match result {
+                        Ok(stats) => {
+                            slog(&session_log_summary, |l| {
+                                l.write_summary(&task_for_summary, "completed", stats.turns)
+                            });
+                            bus_clone.send(AppEvent::TaskComplete {
+                                reason: "Task complete".to_string(),
+                            });
+                        }
+                        Err(e) => {
+                            slog(&session_log_summary, |l| {
+                                l.write_summary(
+                                    &task_for_summary,
+                                    &format!("error: {}", e),
+                                    0,
+                                )
+                            });
+                            bus_clone.send(AppEvent::LoopError(e.to_string()));
+                        }
+                    }
+                })
+            })
         });
 
+        // Store the launcher in MCP state
+        {
+            let mut s = mcp_state.write().await;
+            s.launcher = Some(std::sync::Arc::new(launcher));
+        }
+
+        // If a task was provided on the CLI, start it immediately
+        if let Some(initial_task) = task {
+            let handle = {
+                let s = mcp_state.read().await;
+                let launcher = s.launcher.as_ref().unwrap().clone();
+                drop(s);
+                (launcher)(initial_task, bus.clone()).await
+            };
+            let mut s = mcp_state.write().await;
+            s.phase = tui::app::Phase::Thinking;
+            s.task_handle = Some(handle);
+        }
+
         // Run the MCP server on stdio (blocks until client disconnects or quit)
-        if let Err(e) = mcp::run_mcp_server(mcp_state, event_rx).await {
+        if let Err(e) = mcp::run_mcp_server(mcp_state, bus, event_rx).await {
             slog(&session_log, |l| {
                 l.info(&format!("MCP server ended: {}", e))
             });
         }
     } else if use_tui {
+        // Non-MCP paths always have a task (enforced above).
+        let task = task.unwrap();
+
         // TUI mode
         let (bus, event_rx) = EventBus::new();
 
@@ -2816,6 +2882,9 @@ async fn main() -> Result<(), CallerError> {
             .restore()
             .map_err(|e| CallerError::Tui(e.to_string()))?;
     } else {
+        // Non-MCP paths always have a task (enforced above).
+        let task = task.unwrap();
+
         // Headless mode (--no-tui or non-TTY)
         let result = if is_simple_task(&task) {
             run_direct_mode(

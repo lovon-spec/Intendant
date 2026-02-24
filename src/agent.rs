@@ -379,8 +379,13 @@ impl Agent {
             .truncate(true)
             .open(&stderr_path)?;
 
-        // Execute command
-        let display_id = cmd.display.unwrap_or(1);
+        // Execute command — inherit DISPLAY from environment (set by --vision)
+        let display_id = cmd.display.unwrap_or_else(|| {
+            std::env::var("DISPLAY")
+                .ok()
+                .and_then(|d| d.trim_start_matches(':').parse().ok())
+                .unwrap_or(1)
+        });
         let mut child = Command::new("bash")
             .arg("-c")
             .arg(&command)
@@ -1834,6 +1839,10 @@ impl Agent {
             }
         }
 
+        eprintln!(
+            "Warning: dependency nonce {} not found after exhausting retries (wait={})",
+            depending_nonce, wait
+        );
         Ok(false)
     }
 

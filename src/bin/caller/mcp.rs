@@ -11,6 +11,8 @@
 //! types as the TUI. Adding a new `UserAction` variant forces both this module
 //! and the TUI key handler to handle it (Rust exhaustive match, no wildcards).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use rmcp::{
@@ -22,7 +24,7 @@ use rmcp::{
         ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
         SubscribeRequestParams, UnsubscribeRequestParams,
     },
-    schemars, tool, tool_router,
+    schemars, tool, tool_handler, tool_router,
     service::{RequestContext, RoleServer},
 };
 use serde::Deserialize;
@@ -34,7 +36,22 @@ use crate::frontend::{
     StateResult, StatusSnapshot, UserAction,
 };
 use crate::tui::app::{LogLevel, Phase, Verbosity};
-use crate::tui::event::{AppEvent, ApprovalResponse};
+use crate::tui::event::{AppEvent, ApprovalResponse, EventBus};
+
+// ---------------------------------------------------------------------------
+// Task launcher: allows MCP to start agent loops on demand
+// ---------------------------------------------------------------------------
+
+/// A boxed async closure that spawns an agent loop for the given task.
+///
+/// The closure receives the task string and an `EventBus` for communicating
+/// events back to the MCP server. It returns a `JoinHandle` for the spawned
+/// background task.
+pub type TaskLauncher = Box<
+    dyn Fn(String, EventBus) -> Pin<Box<dyn Future<Output = tokio::task::JoinHandle<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
 // ---------------------------------------------------------------------------
 // Shared state that both the event listener and MCP handlers access
@@ -48,6 +65,7 @@ pub struct McpAppState {
     pub turn: usize,
     pub budget_pct: f64,
     pub phase: Phase,
+    pub phase_entered_at: std::time::Instant,
     pub autonomy: SharedAutonomy,
     pub verbosity: Verbosity,
     pub session_tokens: u64,
@@ -56,6 +74,10 @@ pub struct McpAppState {
     pub pending_approval: Option<PendingApprovalState>,
     pub human_question: Option<String>,
     pub should_quit: bool,
+    /// Optional launcher for starting tasks via MCP. Set by main.rs.
+    pub launcher: Option<Arc<TaskLauncher>>,
+    /// Handle to the currently running agent loop, if any.
+    pub task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Tracks a pending approval along with the oneshot sender.
@@ -74,6 +96,7 @@ impl McpAppState {
             turn: 0,
             budget_pct: 0.0,
             phase: Phase::Idle,
+            phase_entered_at: std::time::Instant::now(),
             autonomy,
             verbosity: Verbosity::Normal,
             session_tokens: 0,
@@ -82,6 +105,15 @@ impl McpAppState {
             pending_approval: None,
             human_question: None,
             should_quit: false,
+            launcher: None,
+            task_handle: None,
+        }
+    }
+
+    fn set_phase(&mut self, phase: Phase) {
+        if self.phase != phase {
+            self.phase = phase;
+            self.phase_entered_at = std::time::Instant::now();
         }
     }
 
@@ -188,7 +220,26 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::Tick => {}
+                    AppEvent::Tick => {
+                        // Detect stuck phases — warn every 30s after 120s
+                        if matches!(
+                            s.phase,
+                            Phase::Thinking | Phase::RunningAgent | Phase::Orchestrating
+                        ) {
+                            let elapsed = s.phase_entered_at.elapsed().as_secs();
+                            if elapsed >= 120 && elapsed % 30 == 0 {
+                                let phase_name = phase_to_str(&s.phase).to_string();
+                                s.push_log(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "Phase '{}' active for {}s (possible stuck state)",
+                                        phase_name, elapsed
+                                    ),
+                                );
+                                resource_changed = Some("intendant://logs");
+                            }
+                        }
+                    }
                     AppEvent::Quit => {
                         s.should_quit = true;
                         break;
@@ -201,7 +252,7 @@ pub fn spawn_event_listener(
                     } => {
                         s.turn = turn;
                         s.budget_pct = budget_pct;
-                        s.phase = Phase::Thinking;
+                        s.set_phase(Phase::Thinking);
                         s.push_log(
                             LogLevel::Info,
                             format!("Turn {} started (budget: {:.1}%)", turn, budget_pct),
@@ -216,8 +267,8 @@ pub fn spawn_event_listener(
                         reasoning,
                     } => {
                         s.session_tokens += usage.total_tokens;
-                        let preview = if content.len() > 200 {
-                            format!("{}...", &content[..200])
+                        let preview = if content.len() > 500 {
+                            format!("{}...", &content[..500])
                         } else {
                             content
                         };
@@ -236,7 +287,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::DoneSignal { message } => {
-                        s.phase = Phase::Done;
+                        s.set_phase(Phase::Done);
                         s.push_log(
                             LogLevel::Info,
                             format!(
@@ -247,9 +298,9 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://status");
                     }
 
-                    AppEvent::AgentStarted { turn } => {
-                        s.phase = Phase::RunningAgent;
-                        s.push_log(LogLevel::Debug, format!("[T{}] Agent started", turn));
+                    AppEvent::AgentStarted { turn, commands_preview } => {
+                        s.set_phase(Phase::RunningAgent);
+                        s.push_log(LogLevel::Agent, format!("[T{}] {}", turn, commands_preview));
                         resource_changed = Some("intendant://status");
                     }
 
@@ -277,7 +328,7 @@ pub fn spawn_event_listener(
                         status,
                         last_action,
                     } => {
-                        s.phase = Phase::Orchestrating;
+                        s.set_phase(Phase::Orchestrating);
                         s.push_log(
                             LogLevel::SubAgent,
                             format!("[T{}] {} — {}", turn, status, last_action),
@@ -293,7 +344,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::TaskComplete { reason } => {
-                        s.phase = Phase::Done;
+                        s.set_phase(Phase::Done);
                         s.push_log(LogLevel::Info, format!("Task complete: {}", reason));
                         resource_changed = Some("intendant://status");
                     }
@@ -320,19 +371,19 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::SafetyCapReached => {
-                        s.phase = Phase::Done;
+                        s.set_phase(Phase::Done);
                         s.push_log(LogLevel::Error, "Safety cap reached (500 turns)".to_string());
                         resource_changed = Some("intendant://status");
                     }
 
                     AppEvent::LoopError(msg) => {
-                        s.phase = Phase::Done;
+                        s.set_phase(Phase::Done);
                         s.push_log(LogLevel::Error, format!("Error: {}", msg));
                         resource_changed = Some("intendant://status");
                     }
 
                     AppEvent::HumanQuestionDetected { question } => {
-                        s.phase = Phase::WaitingHuman;
+                        s.set_phase(Phase::WaitingHuman);
                         s.human_question = Some(question.clone());
                         s.push_log(LogLevel::Info, format!("Human question: {}", question));
                         resource_changed = Some("intendant://pending-input");
@@ -340,7 +391,7 @@ pub fn spawn_event_listener(
 
                     AppEvent::HumanResponseSent => {
                         s.human_question = None;
-                        s.phase = Phase::RunningAgent;
+                        s.set_phase(Phase::RunningAgent);
                         s.push_log(LogLevel::Info, "Human response sent".to_string());
                         resource_changed = Some("intendant://pending-input");
                     }
@@ -351,7 +402,7 @@ pub fn spawn_event_listener(
                         category,
                         responder,
                     } => {
-                        s.phase = Phase::WaitingApproval;
+                        s.set_phase(Phase::WaitingApproval);
                         s.push_log(
                             LogLevel::Info,
                             format!("Approval required [{}]: {}", category, command_preview),
@@ -434,6 +485,12 @@ pub struct SetVerbosityParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StartTaskParams {
+    /// The task description for the AI agent to execute.
+    pub task: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetLogsParams {
     /// Only return log entries with IDs greater than this value (cursor-based pagination).
     #[serde(default)]
@@ -455,13 +512,15 @@ pub struct GetLogsParams {
 #[derive(Clone)]
 pub struct IntendantServer {
     state: SharedMcpState,
+    bus: EventBus,
     tool_router: ToolRouter<Self>,
 }
 
 impl IntendantServer {
-    pub fn new(state: SharedMcpState) -> Self {
+    pub fn new(state: SharedMcpState, bus: EventBus) -> Self {
         Self {
             state,
+            bus,
             tool_router: Self::tool_router(),
         }
     }
@@ -481,7 +540,7 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
                 if let Some(responder) = pending.responder.take() {
                     let _ = responder.send(ApprovalResponse::Approve);
                 }
-                state.phase = Phase::RunningAgent;
+                state.set_phase(Phase::RunningAgent);
                 state.push_log(LogLevel::Info, "Approved by MCP agent".to_string());
                 ActionOutcome::Ok
             } else {
@@ -495,7 +554,7 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
                 if let Some(responder) = pending.responder.take() {
                     let _ = responder.send(ApprovalResponse::Deny);
                 }
-                state.phase = Phase::Done;
+                state.set_phase(Phase::Done);
                 state.push_log(LogLevel::Info, "Denied by MCP agent".to_string());
                 ActionOutcome::Ok
             } else {
@@ -509,7 +568,7 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
                 if let Some(responder) = pending.responder.take() {
                     let _ = responder.send(ApprovalResponse::Skip);
                 }
-                state.phase = Phase::RunningAgent;
+                state.set_phase(Phase::RunningAgent);
                 state.push_log(LogLevel::Info, "Skipped by MCP agent".to_string());
                 ActionOutcome::Ok
             } else {
@@ -523,7 +582,7 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
                 if let Some(responder) = pending.responder.take() {
                     let _ = responder.send(ApprovalResponse::ApproveAll);
                 }
-                state.phase = Phase::RunningAgent;
+                state.set_phase(Phase::RunningAgent);
                 state.push_log(
                     LogLevel::Info,
                     "Approved all (autonomy → Full) by MCP agent".to_string(),
@@ -541,7 +600,7 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
                 let response_path = shared_file_path("intendant_human_response");
                 if std::fs::write(&response_path, &text).is_ok() {
                     state.human_question = None;
-                    state.phase = Phase::RunningAgent;
+                    state.set_phase(Phase::RunningAgent);
                     state.push_log(
                         LogLevel::Info,
                         format!("Human response (MCP): {}", text),
@@ -747,6 +806,58 @@ impl IntendantServer {
         let outcome = process_action_sync(&mut s, action);
         format_outcome(outcome)
     }
+
+    #[tool(description = "Start a new task for the Intendant agent to execute. The agent will begin working on the task immediately. Only one task can run at a time — check get_status to see if a task is already running.")]
+    async fn start_task(&self, Parameters(params): Parameters<StartTaskParams>) -> String {
+        let mut s = self.state.write().await;
+
+        // Check if a task is already running
+        match s.phase {
+            Phase::Thinking | Phase::RunningAgent | Phase::Orchestrating
+            | Phase::WaitingApproval | Phase::WaitingHuman => {
+                return format!(
+                    "Cannot start task: agent is currently in '{}' phase. \
+                     Wait for it to finish or call quit first.",
+                    phase_to_str(&s.phase)
+                );
+            }
+            Phase::Idle | Phase::Done => {} // OK to start
+        }
+
+        let launcher = match s.launcher.as_ref() {
+            Some(l) => Arc::clone(l),
+            None => {
+                return "Cannot start task: no task launcher configured. \
+                        This MCP server was not started with launcher support."
+                    .to_string();
+            }
+        };
+
+        // Reset state for the new task
+        s.turn = 0;
+        s.budget_pct = 0.0;
+        s.session_tokens = 0;
+        s.set_phase(Phase::Thinking);
+        s.pending_approval = None;
+        s.human_question = None;
+        s.should_quit = false;
+        s.push_log(
+            LogLevel::Info,
+            format!("Task started via MCP: {}", params.task),
+        );
+
+        // We need to drop the write lock before calling the async launcher
+        let bus = self.bus.clone();
+        drop(s);
+
+        let handle = (launcher)(params.task, bus).await;
+
+        // Store the handle
+        let mut s = self.state.write().await;
+        s.task_handle = Some(handle);
+
+        "ok".to_string()
+    }
 }
 
 fn format_outcome(outcome: ActionOutcome) -> String {
@@ -810,6 +921,7 @@ fn resource_definitions() -> Vec<Resource> {
 // ServerHandler implementation
 // ---------------------------------------------------------------------------
 
+#[tool_handler]
 impl ServerHandler for IntendantServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -934,9 +1046,10 @@ impl ServerHandler for IntendantServer {
 /// resources.
 pub async fn run_mcp_server(
     state: SharedMcpState,
+    bus: EventBus,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = IntendantServer::new(state.clone());
+    let server = IntendantServer::new(state.clone(), bus);
 
     // Start serving on stdio
     let transport = rmcp::transport::io::stdio();
@@ -998,7 +1111,7 @@ mod tests {
             let mut s = state.write().await;
             s.turn = 5;
             s.budget_pct = 42.0;
-            s.phase = Phase::Thinking;
+            s.set_phase(Phase::Thinking);
             s.session_tokens = 1234;
             let snap = s.status_snapshot();
             assert_eq!(snap.provider, "openai");
@@ -1265,7 +1378,8 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let server = IntendantServer::new(state);
+            let (bus, _rx) = EventBus::new();
+            let server = IntendantServer::new(state, bus);
             let info = server.get_info();
             assert_eq!(info.server_info.name, "intendant");
             assert!(info.instructions.is_some());
