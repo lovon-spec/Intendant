@@ -1,10 +1,22 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize an `Option<u64>` where `0` is treated as `None`.
+/// Nonce 0 is never valid, so LLMs sending `"depending_nonce": 0`
+/// mean "no dependency."
+fn deserialize_zero_as_none<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<u64>::deserialize(deserializer)?;
+    Ok(opt.filter(|&v| v != 0))
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Command {
     pub function: String,
     pub command: Option<String>,
     pub nonce: u64,
+    #[serde(default, deserialize_with = "deserialize_zero_as_none")]
     pub depending_nonce: Option<u64>,
     pub expected_status: Option<i32>,
     pub wait: Option<bool>,
@@ -139,7 +151,7 @@ mod tests {
         assert_eq!(cmd.function, "execAsAgent");
         assert_eq!(cmd.command.as_deref(), Some("echo hello"));
         assert_eq!(cmd.nonce, 1);
-        assert_eq!(cmd.depending_nonce, Some(0));
+        assert_eq!(cmd.depending_nonce, None); // 0 is normalized to None
         assert_eq!(cmd.expected_status, Some(0));
         assert_eq!(cmd.wait, Some(true));
         assert_eq!(cmd.display, Some(1));
@@ -191,6 +203,27 @@ mod tests {
         assert_eq!(copy.nonce, 1);
         assert_eq!(copy.pid, 1234);
         assert_eq!(copy.status, ProcessStatus::Running);
+    }
+
+    #[test]
+    fn depending_nonce_zero_becomes_none() {
+        let json = r#"{"function": "execAsAgent", "nonce": 1, "depending_nonce": 0}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.depending_nonce, None);
+    }
+
+    #[test]
+    fn depending_nonce_nonzero_preserved() {
+        let json = r#"{"function": "execAsAgent", "nonce": 2, "depending_nonce": 5}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.depending_nonce, Some(5));
+    }
+
+    #[test]
+    fn depending_nonce_absent_is_none() {
+        let json = r#"{"function": "execAsAgent", "nonce": 3}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.depending_nonce, None);
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub enum AppEvent {
     },
     AgentStarted {
         turn: usize,
+        commands_preview: String,
     },
     AgentOutput {
         stdout: String,

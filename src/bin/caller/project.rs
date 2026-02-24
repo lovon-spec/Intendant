@@ -56,6 +56,11 @@ pub struct Project {
 impl Project {
     pub fn detect() -> Result<Self, CallerError> {
         let root = detect_project_root()?;
+        Self::from_root(root)
+    }
+
+    /// Build a Project from an explicit root path, loading intendant.toml if present.
+    pub fn from_root(root: PathBuf) -> Result<Self, CallerError> {
         let config_path = root.join("intendant.toml");
         let config = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path).map_err(|e| {

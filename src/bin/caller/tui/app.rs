@@ -656,9 +656,9 @@ impl App {
                 }
                 self.current_phase = Phase::Done;
             }
-            AppEvent::AgentStarted { turn } => {
+            AppEvent::AgentStarted { turn, commands_preview } => {
                 self.current_phase = Phase::RunningAgent;
-                self.log(LogLevel::Debug, format!("Agent running (turn {})", turn));
+                self.log(LogLevel::Debug, format!("Agent running (turn {}): {}", turn, commands_preview));
             }
             AppEvent::AgentOutput { stdout, stderr } => {
                 self.broadcast_control(OutboundEvent::AgentOutput {
