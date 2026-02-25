@@ -443,9 +443,9 @@ impl Agent {
         }
     }
 
-    /// Return the first discovered display number, falling back to 1.
+    /// Return the first discovered display number >0, falling back to 1.
     fn default_display(&self) -> i32 {
-        self.available_displays.first().copied().unwrap_or(1)
+        self.available_displays.iter().copied().find(|&d| d > 0).unwrap_or(1)
     }
 
     async fn exec_as_agent(&self, cmd: &AgentCommand) -> Result<(), AgentError> {
@@ -4120,7 +4120,14 @@ mod tests {
     async fn default_display_returns_first() {
         let (mut agent, _shm, _log) = create_test_agent();
         agent.available_displays = vec![0, 1, 2];
-        assert_eq!(agent.default_display(), 0);
+        assert_eq!(agent.default_display(), 1);
+    }
+
+    #[tokio::test]
+    async fn default_display_only_zero() {
+        let (mut agent, _shm, _log) = create_test_agent();
+        agent.available_displays = vec![0];
+        assert_eq!(agent.default_display(), 1);
     }
 
     #[tokio::test]

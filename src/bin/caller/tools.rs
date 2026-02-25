@@ -93,7 +93,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             },
             "display": {
                 "type": "integer",
-                "description": "X11 display ID (default: 1)."
+                "description": "X11 display number for GUI commands. Omit to auto-discover (skips :0, the user's workspace). Launch your own Xvfb for GUI automation: start it via exec_command, then pass that display number."
             },
             "wait_for_port": {
                 "type": "integer",
@@ -104,7 +104,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
         tools.push(ToolDefinition {
             name: "exec_command".to_string(),
-            description: "Execute a Bash command in the background. Stdout/stderr are logged to disk; use fetch_status to read them. Reference a previous command's PID with $NONCE[id].".to_string(),
+            description: "Execute a Bash command in the background. Stdout/stderr are logged to disk; use fetch_status to read them. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id].".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
@@ -123,14 +123,14 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             },
             "display": {
                 "type": "integer",
-                "description": "X11 display ID to capture (default: 1)."
+                "description": "X11 display number to capture. Omit to auto-discover (skips :0, the user's workspace)."
             }
         });
         merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "capture_screen".to_string(),
-            description: "Capture a screenshot of the specified X11 display.".to_string(),
+            description: "Capture a screenshot of an X11 display. Screenshots are saved to the log directory. The runtime auto-discovers active displays, skipping :0. Chain after UI interactions to verify success.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
