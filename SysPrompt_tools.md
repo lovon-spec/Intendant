@@ -28,47 +28,6 @@ Status updates use the format `[NONCE][STATUS_CHAR][EXIT_CODE]`:
 - **s**: Skipped (dependency check failed)
 - **w**: Waiting (waiting on dependency)
 
-## Tool Usage Notes
-
-### exec_command
-- Commands run in the background. Use `fetch_status` to read stdout/stderr.
-- DISPLAY is automatically set to `:<display>` (default `:1`). GUI commands work without manual export.
-- Set `wait_for_port` to wait up to 30s for a TCP port before executing.
-
-### capture_screen
-- Screenshots saved to the log directory. Chain after UI interactions to verify success.
-
-### fetch_status
-- `status_type`: "stdout", "stderr", "exit_code", or "status".
-- For stdout/stderr: no offset/limit returns last 10KB (tail). Set offset/limit for precise ranges.
-- Returns JSON: `{"content":"...","total_size":N,"offset":N,"bytes_read":N}`.
-
-### inspect_path
-- Synchronous. Returns JSON with `exists`, `path`, `type`, `size`, `permissions`, `modified`, `uid`, `gid`.
-
-### edit_file
-- Synchronous. Operations: "write", "append", "replace", "insert_at", "replace_lines".
-- Prefer this over fragile `sed`/`echo` commands.
-
-### browse_url
-- Fetches URL, converts HTML to plain text (120-column width). 15s timeout, 50KB limit.
-
-### ask_human
-- Asks the operator a question and waits up to 5 minutes. Use when stuck.
-
-### exec_pty
-- Persistent PTY session within a single turn. Shell state (cd, env vars) persists between commands in the same session.
-
-### store_memory / recall_memory
-- Persist/retrieve project knowledge across sessions. The `memory_file` is injected automatically.
-
-### manage_context
-- Prune conversation history: `drop_turns` removes messages by index; `summarize` replaces messages with a summary.
-- Index 0 (system prompt) and the last 2 messages are always protected.
-
-### signal_done
-- Signal task completion. Include an optional `message` summarizing what was accomplished.
-
 ## Best Practices
 
 1. **Batched Operations:** Perform complex workflows in a single turn using dependency chains.
