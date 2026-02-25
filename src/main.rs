@@ -1,13 +1,11 @@
 use crate::agent::Agent;
 use crate::error::AgentError;
 use crate::models::AgentInput;
-use crate::status_monitor::StatusMonitor;
 use std::io::{self, Read, Write};
 
 mod agent;
 mod error;
 mod models;
-mod status_monitor;
 mod utils;
 
 /// Write a line to stdout, returning false on broken pipe (caller killed us).
@@ -19,18 +17,6 @@ fn write_line(stdout: &mut io::StdoutLock, line: &str) -> bool {
 async fn main() -> Result<(), AgentError> {
     // Initialize logging
     env_logger::init();
-
-    // Create agent instance
-    let agent = Agent::new()?;
-
-    // Create and start status monitor
-    let (monitor, mut status_rx) =
-        StatusMonitor::new(agent.shared_mem.clone(), agent.process_map.clone());
-
-    // Spawn status monitor task
-    tokio::spawn(async move {
-        monitor.run().await;
-    });
 
     // Read entire JSON input
     let mut buffer = String::new();
@@ -46,10 +32,13 @@ async fn main() -> Result<(), AgentError> {
         }
     };
 
+    // Create agent instance with optional state socket for cross-turn PID queries
+    let (agent, mut status_rx) = Agent::new(input.state_socket.clone())?;
+
     // Process commands and get initial results
     let results = agent.process_input(input).await?;
 
-    // Print initial results; exit gracefully on broken pipe (caller killed us)
+    // Print initial results (JSON lines); exit gracefully on broken pipe
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     for result in results {
@@ -58,7 +47,7 @@ async fn main() -> Result<(), AgentError> {
         }
     }
 
-    // Continue monitoring for status updates
+    // Continue receiving background status updates (JSON lines)
     while let Some(status) = status_rx.recv().await {
         if !write_line(&mut stdout, &status) {
             return Ok(());

@@ -3,13 +3,11 @@ use crate::models::{
     AgentInput, Command as AgentCommand, ProcessInfo, ProcessStatus, StatusUpdate,
 };
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
 
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
     io::{Read as _, Seek, SeekFrom},
-    mem::size_of,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, RwLock},
@@ -17,7 +15,6 @@ use std::{
 };
 
 use chrono::Local;
-use memmap2::{MmapMut, MmapOptions};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -33,16 +30,15 @@ struct PtySession {
 const HUMAN_TIMEOUT_MS: u64 = 5 * 60 * 1000; // 5 minutes
 const HUMAN_POLL_MS: u64 = 500;
 
-const MAX_PROCESSES: usize = 1024;
-const SHARED_MEM_SIZE: usize = size_of::<ProcessInfo>() * MAX_PROCESSES;
 #[derive(Clone)]
 pub struct Agent {
-    pub shared_mem: Arc<RwLock<MmapMut>>,
-    pub process_map: Arc<RwLock<HashMap<u64, usize>>>,
+    process_state: Arc<RwLock<HashMap<u64, ProcessInfo>>>,
+    state_socket: Option<String>,
     scope_to_nonce: Arc<RwLock<HashMap<String, u64>>>,
     nonce_to_scope: Arc<RwLock<HashMap<u64, String>>>,
     log_dir: PathBuf,
     status_tx: mpsc::Sender<StatusUpdate>,
+    output_tx: mpsc::Sender<String>,
     pty_sessions: Arc<tokio::sync::Mutex<HashMap<String, PtySession>>>,
     source_generation: u64,
     available_displays: Vec<i32>,
@@ -59,105 +55,59 @@ impl Agent {
 
     /// Create an agent with custom paths, used for testing.
     #[cfg(test)]
-    pub fn new_with_paths(shared_mem_path: &str, log_dir: PathBuf) -> Result<Self, AgentError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .open(shared_mem_path)?;
-        file.set_len(SHARED_MEM_SIZE as u64)?;
-
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        let process_map = Self::rebuild_process_map(&mmap);
-        let shared_mem = Arc::new(RwLock::new(mmap));
-        let process_map = Arc::new(RwLock::new(process_map));
+    pub fn new_with_paths(log_dir: PathBuf) -> Result<(Self, mpsc::Receiver<String>), AgentError> {
+        let process_state = Arc::new(RwLock::new(HashMap::new()));
 
         fs::create_dir_all(&log_dir)?;
 
         let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(1024);
+        let (output_tx, output_rx) = mpsc::channel::<String>(1024);
 
-        let shared_mem_clone = shared_mem.clone();
-        let process_map_clone = process_map.clone();
+        let state_clone = process_state.clone();
+        let otx = output_tx.clone();
         tokio::spawn(async move {
             while let Some(update) = status_rx.recv().await {
-                if let Err(e) = Self::update_process_status(
-                    shared_mem_clone.clone(),
+                Self::update_process_status_map(
+                    state_clone.clone(),
                     update.nonce,
                     update.status,
                     update.exit_code,
-                ) {
-                    eprintln!("Failed to update process status: {}", e);
-                }
-                let info_size = size_of::<ProcessInfo>();
-                let offset = (update.nonce as usize % MAX_PROCESSES) * info_size;
-                process_map_clone
-                    .write()
-                    .unwrap()
-                    .insert(update.nonce, offset);
+                );
+                // Emit JSON status line
+                let json = serde_json::json!({
+                    "type": "status",
+                    "nonce": update.nonce,
+                    "status": (update.status as u8 as char).to_string(),
+                    "pid": state_clone.read().unwrap().get(&update.nonce).map(|i| i.pid).unwrap_or(0),
+                    "exit_code": update.exit_code
+                });
+                let _ = otx.send(json.to_string()).await;
             }
         });
 
-        Ok(Self {
-            shared_mem,
-            process_map,
-            scope_to_nonce: Arc::new(RwLock::new(HashMap::new())),
-            nonce_to_scope: Arc::new(RwLock::new(HashMap::new())),
-            log_dir,
-            status_tx,
-            pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            source_generation: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            available_displays: vec![],
-            session_xauthority: None,
-        })
+        Ok((
+            Self {
+                process_state,
+                state_socket: None,
+                scope_to_nonce: Arc::new(RwLock::new(HashMap::new())),
+                nonce_to_scope: Arc::new(RwLock::new(HashMap::new())),
+                log_dir,
+                status_tx,
+                output_tx,
+                pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                source_generation: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                available_displays: vec![],
+                session_xauthority: None,
+            },
+            output_rx,
+        ))
     }
 
-    pub fn new() -> Result<Self, AgentError> {
-        // Open/create shared memory file — truncate(false) preserves existing content across restarts
-        #[allow(clippy::suspicious_open_options)]
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .open(shared_mem_path())?;
-        file.set_len(SHARED_MEM_SIZE as u64)?;
-
-        let resume_session = std::env::var("INTENDANT_RESUME_SESSION")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-        // Map shared memory. Preserve state across turns in the same caller session,
-        // but reset when a new top-level session starts (unless explicitly resuming).
-        let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        let session_id = Self::current_session_id();
-        let marker_id = fs::read_to_string(runtime_session_marker_path())
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let preserve_state = if resume_session {
-            true
-        } else if let Some(ref sid) = session_id {
-            marker_id.as_deref() == Some(sid.as_str())
-        } else {
-            false
-        };
-
-        let process_map = if preserve_state {
-            Self::rebuild_process_map(&mmap)
-        } else {
-            Self::reset_shared_mem(&mut mmap);
-            HashMap::new()
-        };
-        if let Some(sid) = session_id {
-            let _ = fs::write(runtime_session_marker_path(), sid);
-        }
-        let shared_mem = Arc::new(RwLock::new(mmap));
-        let process_map = Arc::new(RwLock::new(process_map));
+    pub fn new(state_socket: Option<String>) -> Result<(Self, mpsc::Receiver<String>), AgentError> {
+        let process_state = Arc::new(RwLock::new(HashMap::new()));
 
         // Resolve log directory (reuse existing session or create new)
         let log_dir = Self::resolve_log_dir()?;
@@ -168,45 +118,50 @@ impl Agent {
 
         // Setup status channel
         let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(1024);
+        let (output_tx, output_rx) = mpsc::channel::<String>(1024);
 
-        // Start status monitor thread
-        let shared_mem_clone = shared_mem.clone();
-        let process_map_clone = process_map.clone();
+        // Background task: process status updates and emit JSON status lines
+        let state_clone = process_state.clone();
+        let otx = output_tx.clone();
         tokio::spawn(async move {
             while let Some(update) = status_rx.recv().await {
-                if let Err(e) = Self::update_process_status(
-                    shared_mem_clone.clone(),
+                Self::update_process_status_map(
+                    state_clone.clone(),
                     update.nonce,
                     update.status,
                     update.exit_code,
-                ) {
-                    eprintln!("Failed to update process status: {}", e);
-                }
-                // Update process_map so StatusMonitor can see this nonce
-                let info_size = size_of::<ProcessInfo>();
-                let offset = (update.nonce as usize % MAX_PROCESSES) * info_size;
-                process_map_clone
-                    .write()
-                    .unwrap()
-                    .insert(update.nonce, offset);
+                );
+                // Emit JSON status line
+                let json = serde_json::json!({
+                    "type": "status",
+                    "nonce": update.nonce,
+                    "status": (update.status as u8 as char).to_string(),
+                    "pid": state_clone.read().unwrap().get(&update.nonce).map(|i| i.pid).unwrap_or(0),
+                    "exit_code": update.exit_code
+                });
+                let _ = otx.send(json.to_string()).await;
             }
         });
 
-        Ok(Self {
-            shared_mem,
-            process_map,
-            scope_to_nonce: Arc::new(RwLock::new(HashMap::new())),
-            nonce_to_scope: Arc::new(RwLock::new(HashMap::new())),
-            log_dir,
-            status_tx,
-            pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            source_generation: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            available_displays,
-            session_xauthority,
-        })
+        Ok((
+            Self {
+                process_state,
+                state_socket,
+                scope_to_nonce: Arc::new(RwLock::new(HashMap::new())),
+                nonce_to_scope: Arc::new(RwLock::new(HashMap::new())),
+                log_dir,
+                status_tx,
+                output_tx,
+                pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                source_generation: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                available_displays,
+                session_xauthority,
+            },
+            output_rx,
+        ))
     }
 
     fn resolve_log_dir() -> Result<PathBuf, AgentError> {
@@ -222,25 +177,6 @@ impl Agent {
         fs::create_dir_all(&log_dir)?;
         fs::write(session_file_path(), log_dir.to_string_lossy().as_bytes())?;
         Ok(log_dir)
-    }
-
-    fn rebuild_process_map(mmap: &MmapMut) -> HashMap<u64, usize> {
-        let mut map = HashMap::new();
-        let info_size = size_of::<ProcessInfo>();
-        for i in 0..MAX_PROCESSES {
-            let offset = i * info_size;
-            let info = unsafe {
-                std::ptr::read(mmap[offset..offset + info_size].as_ptr() as *const ProcessInfo)
-            };
-            if info.nonce != 0 {
-                map.insert(info.nonce, offset);
-            }
-        }
-        map
-    }
-
-    fn reset_shared_mem(mmap: &mut MmapMut) {
-        mmap.fill(0);
     }
 
     fn scope_key(run_id: &str, agent_id: &str, attempt_id: &str, command_id: &str) -> String {
@@ -293,40 +229,21 @@ impl Agent {
         Some((run_id, agent_id, attempt_id, command_id))
     }
 
-    fn update_process_status(
-        shared_mem: Arc<RwLock<MmapMut>>,
+    fn update_process_status_map(
+        process_state: Arc<RwLock<HashMap<u64, ProcessInfo>>>,
         nonce: u64,
         status: ProcessStatus,
         exit_code: i32,
-    ) -> Result<(), AgentError> {
-        let mut mmap = shared_mem.write().unwrap();
-        let info_size = size_of::<ProcessInfo>();
-        let offset = (nonce as usize % MAX_PROCESSES) * info_size;
-
-        // Read existing entry to preserve PID
-        let existing = unsafe {
-            std::ptr::read(mmap[offset..offset + info_size].as_ptr() as *const ProcessInfo)
-        };
-
-        let info = ProcessInfo {
-            nonce,
-            pid: existing.pid,
-            status,
-            exit_code,
-            timestamp: SystemTime::now()
+    ) {
+        let mut map = process_state.write().unwrap();
+        if let Some(info) = map.get_mut(&nonce) {
+            info.status = status;
+            info.exit_code = exit_code;
+            info.timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_secs(),
-        };
-
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &info as *const ProcessInfo as *const u8,
-                size_of::<ProcessInfo>(),
-            )
-        };
-        mmap[offset..offset + info_size].copy_from_slice(bytes);
-        Ok(())
+                .as_secs();
+        }
     }
 
     /// Scan `/tmp/.X*-lock` for active X display numbers.
@@ -1711,6 +1628,26 @@ impl Agent {
         .to_string())
     }
 
+    fn status_json(nonce: u64, status: &str, pid: i32, exit_code: i32) -> String {
+        serde_json::json!({
+            "type": "status",
+            "nonce": nonce,
+            "status": status,
+            "pid": pid,
+            "exit_code": exit_code
+        })
+        .to_string()
+    }
+
+    fn result_json(nonce: u64, data: &str) -> String {
+        serde_json::json!({
+            "type": "result",
+            "nonce": nonce,
+            "data": data
+        })
+        .to_string()
+    }
+
     pub async fn process_input(&self, input: AgentInput) -> Result<Vec<String>, AgentError> {
         let mut results = Vec::new();
 
@@ -1733,11 +1670,12 @@ impl Agent {
                             eprintln!("Error executing command {}: {}", cmd_clone.nonce, e);
                         }
                     });
-                    if cmd.depending_nonce.is_some() {
-                        results.push(format!("{}w0", cmd.nonce));
+                    let initial_status = if cmd.depending_nonce.is_some() {
+                        "w"
                     } else {
-                        results.push(format!("{}r0", cmd.nonce));
-                    }
+                        "r"
+                    };
+                    results.push(Self::status_json(cmd.nonce, initial_status, 0, 0));
                 }
                 "captureScreen" => {
                     let agent = self.clone();
@@ -1747,11 +1685,12 @@ impl Agent {
                             eprintln!("Error capturing screen {}: {}", cmd_clone.nonce, e);
                         }
                     });
-                    if cmd.depending_nonce.is_some() {
-                        results.push(format!("{}w0", cmd.nonce));
+                    let initial_status = if cmd.depending_nonce.is_some() {
+                        "w"
                     } else {
-                        results.push(format!("{}r0", cmd.nonce));
-                    }
+                        "r"
+                    };
+                    results.push(Self::status_json(cmd.nonce, initial_status, 0, 0));
                 }
                 "fetchStatus" => {
                     // Wait for dependency if specified
@@ -1765,32 +1704,35 @@ impl Agent {
                     }
                     match self.fetch_status(&cmd) {
                         Ok(status) => {
-                            results.push(status);
+                            results.push(Self::result_json(cmd.nonce, &status));
                             self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                         }
                         Err(e) => {
-                            results.push(format!("Error: {}", e));
+                            results.push(Self::result_json(
+                                cmd.nonce,
+                                &format!("Error: {}", e),
+                            ));
                             self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                         }
                     }
                 }
                 "inspectPath" => match self.inspect_path(&cmd) {
                     Ok(result) => {
-                        results.push(result);
+                        results.push(Self::result_json(cmd.nonce, &result));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
                     Err(e) => {
-                        results.push(format!("Error: {}", e));
+                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
                 },
                 "editFile" => match self.edit_file(&cmd) {
                     Ok(result) => {
-                        results.push(result);
+                        results.push(Self::result_json(cmd.nonce, &result));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
                     Err(e) => {
-                        results.push(format!("Error: {}", e));
+                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
                 },
@@ -1802,62 +1744,62 @@ impl Agent {
                     }
                     match self.edit_file(&edit_cmd) {
                         Ok(result) => {
-                            results.push(result);
+                            results.push(Self::result_json(cmd.nonce, &result));
                             self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                         }
                         Err(e) => {
-                            results.push(format!("Error: {}", e));
+                            results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
                             self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                         }
                     }
                 }
                 "browse" => match self.browse(&cmd).await {
                     Ok(result) => {
-                        results.push(result);
+                        results.push(Self::result_json(cmd.nonce, &result));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
                     Err(e) => {
-                        results.push(format!("Error: {}", e));
+                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
                 },
                 "askHuman" => match self.ask_human(&cmd).await {
                     Ok(result) => {
-                        results.push(result);
+                        results.push(Self::result_json(cmd.nonce, &result));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
                     Err(e) => {
-                        results.push(format!("Error: {}", e));
+                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
                 },
                 "execPty" => match self.exec_pty(&cmd).await {
                     Ok(result) => {
-                        results.push(result);
+                        results.push(Self::result_json(cmd.nonce, &result));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
                     Err(e) => {
-                        results.push(format!("Error: {}", e));
+                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
                 },
                 "storeMemory" => match self.store_memory(&cmd) {
                     Ok(result) => {
-                        results.push(result);
+                        results.push(Self::result_json(cmd.nonce, &result));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
                     Err(e) => {
-                        results.push(format!("Error: {}", e));
+                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
                 },
                 "recallMemory" => match self.recall_memory(&cmd) {
                     Ok(result) => {
-                        results.push(result);
+                        results.push(Self::result_json(cmd.nonce, &result));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Completed, 0)?;
                     }
                     Err(e) => {
-                        results.push(format!("Error: {}", e));
+                        results.push(Self::result_json(cmd.nonce, &format!("Error: {}", e)));
                         self.update_process_info(cmd.nonce, 0, ProcessStatus::Failed, 1)?;
                     }
                 },
@@ -1887,10 +1829,6 @@ impl Agent {
         status: ProcessStatus,
         exit_code: i32,
     ) -> Result<(), AgentError> {
-        let mut mmap = self.shared_mem.write().unwrap();
-        let info_size = size_of::<ProcessInfo>();
-        let offset = (nonce as usize % MAX_PROCESSES) * info_size;
-
         let info = ProcessInfo {
             nonce,
             pid,
@@ -1901,32 +1839,64 @@ impl Agent {
                 .unwrap()
                 .as_secs(),
         };
-
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &info as *const ProcessInfo as *const u8,
-                size_of::<ProcessInfo>(),
-            )
-        };
-        mmap[offset..offset + info_size].copy_from_slice(bytes);
-
-        // Update process map
-        let mut map = self.process_map.write().unwrap();
-        map.insert(nonce, offset);
-
+        self.process_state.write().unwrap().insert(nonce, info);
         Ok(())
     }
 
     fn get_process_info(&self, nonce: u64) -> Result<ProcessInfo, AgentError> {
-        let map = self.process_map.read().unwrap();
-        let offset = *map.get(&nonce).ok_or(AgentError::InvalidNonce(nonce))?;
+        // Check local (turn-local) state first
+        if let Some(info) = self.process_state.read().unwrap().get(&nonce) {
+            return Ok(*info);
+        }
+        // Cross-turn: query caller's state socket for PID
+        if let Some(ref socket_path) = self.state_socket {
+            if let Ok(pid) = Self::query_pid_from_caller(socket_path, nonce) {
+                return Ok(ProcessInfo {
+                    nonce,
+                    pid,
+                    status: ProcessStatus::Completed,
+                    exit_code: 0,
+                    timestamp: 0,
+                });
+            }
+        }
+        Err(AgentError::InvalidNonce(nonce))
+    }
 
-        let mmap = self.shared_mem.read().unwrap();
-        let info_slice = &mmap[offset..offset + size_of::<ProcessInfo>()];
+    fn query_pid_from_caller(socket_path: &str, nonce: u64) -> Result<i32, AgentError> {
+        use std::io::{BufRead, Write};
+        let stream = std::os::unix::net::UnixStream::connect(socket_path)
+            .map_err(|e| AgentError::Process(format!("state socket connect: {}", e)))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .ok();
+        let mut writer = std::io::BufWriter::new(stream.try_clone().map_err(|e| {
+            AgentError::Process(format!("state socket clone: {}", e))
+        })?);
+        let reader = std::io::BufReader::new(stream);
 
-        let info = unsafe { std::ptr::read(info_slice.as_ptr() as *const ProcessInfo) };
+        let request = serde_json::json!({"query": "get_pid", "nonce": nonce});
+        writeln!(writer, "{}", request).map_err(|e| {
+            AgentError::Process(format!("state socket write: {}", e))
+        })?;
+        writer.flush().map_err(|e| {
+            AgentError::Process(format!("state socket flush: {}", e))
+        })?;
 
-        Ok(info)
+        let mut line = String::new();
+        let mut buf_reader = reader;
+        buf_reader.read_line(&mut line).map_err(|e| {
+            AgentError::Process(format!("state socket read: {}", e))
+        })?;
+
+        let parsed: serde_json::Value = serde_json::from_str(line.trim())
+            .map_err(|e| AgentError::Process(format!("state socket parse: {}", e)))?;
+
+        if let Some(pid) = parsed.get("pid").and_then(|p| p.as_i64()) {
+            Ok(pid as i32)
+        } else {
+            Err(AgentError::InvalidNonce(nonce))
+        }
     }
 
     async fn check_dependency(
@@ -2018,16 +1988,8 @@ fn shared_path(name: &str) -> PathBuf {
     shared_dir().join(name)
 }
 
-fn shared_mem_path() -> PathBuf {
-    shared_path("intendant_processes")
-}
-
 fn session_file_path() -> PathBuf {
     shared_path("intendant_session")
-}
-
-fn runtime_session_marker_path() -> PathBuf {
-    shared_path("intendant_runtime_session")
 }
 
 fn human_question_path() -> PathBuf {
@@ -2054,19 +2016,17 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Create a test agent with temp directories
-    fn create_test_agent() -> (Agent, TempDir, TempDir) {
-        let shm_dir = TempDir::new().unwrap();
+    /// Create a test agent with temp directory
+    fn create_test_agent() -> (Agent, mpsc::Receiver<String>, TempDir) {
         let log_dir = TempDir::new().unwrap();
-        let shm_path = shm_dir.path().join("test_processes");
-        let agent = Agent::new_with_paths(shm_path.to_str().unwrap(), log_dir.path().to_path_buf())
-            .unwrap();
-        (agent, shm_dir, log_dir)
+        let (agent, output_rx) =
+            Agent::new_with_paths(log_dir.path().to_path_buf()).unwrap();
+        (agent, output_rx, log_dir)
     }
 
     #[tokio::test]
     async fn update_and_get_process_info() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 1234, ProcessStatus::Running, 0)
             .unwrap();
@@ -2079,7 +2039,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_process_info_invalid_nonce() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let result = agent.get_process_info(999);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2090,7 +2050,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_nonce_refs_single() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 4567, ProcessStatus::Running, 0)
             .unwrap();
@@ -2100,7 +2060,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_nonce_refs_multiple() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 100, ProcessStatus::Running, 0)
             .unwrap();
@@ -2115,21 +2075,21 @@ mod tests {
 
     #[tokio::test]
     async fn replace_nonce_refs_no_refs() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let result = agent.replace_nonce_refs("echo hello").unwrap();
         assert_eq!(result, "echo hello");
     }
 
     #[tokio::test]
     async fn replace_nonce_refs_invalid_nonce() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let result = agent.replace_nonce_refs("kill $NONCE[999]");
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn inspect_path_existing_file() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let file_path = tmp.path().join("test.txt");
         fs::write(&file_path, "hello").unwrap();
@@ -2149,7 +2109,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_path_nonexistent() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "inspectPath".to_string(),
             nonce: 1,
@@ -2163,7 +2123,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_path_directory() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let cmd = AgentCommand {
             function: "inspectPath".to_string(),
@@ -2179,7 +2139,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_path_missing_path_field() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "inspectPath".to_string(),
             nonce: 1,
@@ -2191,7 +2151,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_returns_status_char() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(5, 1000, ProcessStatus::Running, 0)
             .unwrap();
@@ -2210,7 +2170,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_returns_exit_code() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(5, 1000, ProcessStatus::Failed, 127)
             .unwrap();
@@ -2229,7 +2189,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_stdout_reads_log() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         agent
             .update_process_info(3, 100, ProcessStatus::Completed, 0)
             .unwrap();
@@ -2250,7 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_uses_depending_nonce_as_target() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         agent
             .update_process_info(100, 5000, ProcessStatus::Completed, 0)
             .unwrap();
@@ -2274,7 +2234,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_depending_nonce_status() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(100, 5000, ProcessStatus::Completed, 42)
             .unwrap();
@@ -2294,7 +2254,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_missing_status_type() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 1,
@@ -2306,7 +2266,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_invalid_status_type() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 100, ProcessStatus::Running, 0)
             .unwrap();
@@ -2322,7 +2282,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_unknown_nonce_returns_structured_error() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "fetchStatus".to_string(),
             nonce: 4242,
@@ -2341,7 +2301,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_stdout_missing_log_file() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(99, 100, ProcessStatus::Waiting, 0)
             .unwrap();
@@ -2362,7 +2322,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_dependency_completed_matching_exit() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 100, ProcessStatus::Completed, 0)
             .unwrap();
@@ -2372,7 +2332,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_dependency_completed_wrong_exit_no_wait() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 100, ProcessStatus::Completed, 1)
             .unwrap();
@@ -2382,7 +2342,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_dependency_completed_wrong_exit_with_wait() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 100, ProcessStatus::Completed, 1)
             .unwrap();
@@ -2400,7 +2360,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_dependency_failed() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 100, ProcessStatus::Failed, 1)
             .unwrap();
@@ -2410,7 +2370,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_dependency_skipped() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(1, 100, ProcessStatus::Skipped, 0)
             .unwrap();
@@ -2420,14 +2380,14 @@ mod tests {
 
     #[tokio::test]
     async fn check_dependency_invalid_nonce_no_wait() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let result = agent.check_dependency(999, 0, false).await.unwrap();
         assert!(!result, "should fail for invalid nonce without wait");
     }
 
     #[tokio::test]
     async fn process_input_exec_returns_running() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "execAsAgent".to_string(),
@@ -2437,15 +2397,19 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            state_socket: None,
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], "1r0");
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["type"], "status");
+        assert_eq!(parsed["nonce"], 1);
+        assert_eq!(parsed["status"], "r");
     }
 
     #[tokio::test]
     async fn process_input_exec_with_dependency_returns_waiting() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "execAsAgent".to_string(),
@@ -2458,15 +2422,19 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            state_socket: None,
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], "2w0");
+        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(parsed["type"], "status");
+        assert_eq!(parsed["nonce"], 2);
+        assert_eq!(parsed["status"], "w");
     }
 
     #[tokio::test]
     async fn process_input_unknown_function() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "unknownFunc".to_string(),
@@ -2474,6 +2442,7 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            ..Default::default()
         };
         let result = agent.process_input(input).await;
         assert!(result.is_err());
@@ -2481,7 +2450,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_input_inspect_path() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "inspectPath".to_string(),
@@ -2490,17 +2459,22 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            state_socket: None,
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(wrapper["type"], "result");
+        assert_eq!(wrapper["nonce"], 1);
+        let parsed: serde_json::Value =
+            serde_json::from_str(wrapper["data"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["exists"], true);
         assert_eq!(parsed["type"], "directory");
     }
 
     #[tokio::test]
     async fn process_input_with_wait_for_status() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "execAsAgent".to_string(),
@@ -2510,6 +2484,7 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: Some(200),
+            ..Default::default()
         };
         let start = std::time::Instant::now();
         let results = agent.process_input(input).await.unwrap();
@@ -2525,7 +2500,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_as_agent_creates_log_files() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         let cmd = AgentCommand {
             function: "execAsAgent".to_string(),
             command: Some("echo test_output".to_string()),
@@ -2547,7 +2522,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_as_agent_missing_command() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "execAsAgent".to_string(),
             nonce: 1,
@@ -2559,15 +2534,19 @@ mod tests {
 
     #[tokio::test]
     async fn update_process_status_preserves_pid() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         // Set a process with a real PID
         agent
             .update_process_info(1, 9999, ProcessStatus::Running, 0)
             .unwrap();
 
         // Simulate status update (what happens when process completes)
-        Agent::update_process_status(agent.shared_mem.clone(), 1, ProcessStatus::Completed, 0)
-            .unwrap();
+        Agent::update_process_status_map(
+            agent.process_state.clone(),
+            1,
+            ProcessStatus::Completed,
+            0,
+        );
 
         // Read the process info back - PID should still be 9999
         let info = agent.get_process_info(1).unwrap();
@@ -2579,8 +2558,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_process_map_finds_existing_entries() {
-        let (agent, _shm, _log) = create_test_agent();
+    async fn process_state_contains_entries() {
+        let (agent, _rx, _log) = create_test_agent();
         agent
             .update_process_info(10, 100, ProcessStatus::Running, 0)
             .unwrap();
@@ -2588,8 +2567,7 @@ mod tests {
             .update_process_info(20, 200, ProcessStatus::Completed, 0)
             .unwrap();
 
-        let mmap = agent.shared_mem.read().unwrap();
-        let map = Agent::rebuild_process_map(&mmap);
+        let map = agent.process_state.read().unwrap();
         assert!(map.contains_key(&10));
         assert!(map.contains_key(&20));
         assert!(!map.contains_key(&30));
@@ -2599,7 +2577,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_default_tail() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         // Create a small file (< 10KB)
         let content = "a".repeat(500);
         fs::write(log_dir.path().join("1_stdout.log"), &content).unwrap();
@@ -2620,7 +2598,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_default_tail_large_file() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         // Create a file larger than 10KB
         let content = "x".repeat(20_000);
         fs::write(log_dir.path().join("1_stdout.log"), &content).unwrap();
@@ -2643,7 +2621,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_offset_and_limit() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
         agent
             .update_process_info(1, 100, ProcessStatus::Completed, 0)
@@ -2666,7 +2644,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_offset_only() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
         agent
             .update_process_info(1, 100, ProcessStatus::Completed, 0)
@@ -2687,7 +2665,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_limit_only() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stdout.log"), "0123456789").unwrap();
         agent
             .update_process_info(1, 100, ProcessStatus::Completed, 0)
@@ -2708,7 +2686,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_offset_beyond_file() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stdout.log"), "short").unwrap();
         agent
             .update_process_info(1, 100, ProcessStatus::Completed, 0)
@@ -2729,7 +2707,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_stderr_partial() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         fs::write(log_dir.path().join("1_stderr.log"), "error output here").unwrap();
         agent
             .update_process_info(1, 100, ProcessStatus::Completed, 0)
@@ -2751,7 +2729,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_write_creates_file() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("new.txt");
         let cmd = AgentCommand {
@@ -2771,7 +2749,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_write_creates_parent_dirs() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("a/b/c/file.txt");
         let cmd = AgentCommand {
@@ -2790,7 +2768,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_write_overwrites() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("existing.txt");
         fs::write(&fp, "old content").unwrap();
@@ -2808,7 +2786,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_append() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("append.txt");
         fs::write(&fp, "first").unwrap();
@@ -2828,7 +2806,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_replace_found() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("replace.txt");
         fs::write(&fp, "hello world hello").unwrap();
@@ -2850,7 +2828,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_replace_not_found() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("replace.txt");
         fs::write(&fp, "hello world").unwrap();
@@ -2870,7 +2848,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_insert_at_beginning() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("insert.txt");
         fs::write(&fp, "line1\nline2\n").unwrap();
@@ -2892,7 +2870,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_insert_at_end() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("insert.txt");
         fs::write(&fp, "line1\nline2").unwrap();
@@ -2912,7 +2890,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_replace_lines() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("rlines.txt");
         fs::write(&fp, "a\nb\nc\nd\ne").unwrap();
@@ -2935,7 +2913,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_replace_lines_end_before_start() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("rlines.txt");
         fs::write(&fp, "a\nb\nc").unwrap();
@@ -2955,7 +2933,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_missing_fields() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         // Missing file_path
         let cmd = AgentCommand {
             function: "editFile".to_string(),
@@ -2977,7 +2955,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_unknown_operation() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "editFile".to_string(),
             nonce: 1,
@@ -2990,7 +2968,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_process_input_integration() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("integration.txt");
         let input = AgentInput {
@@ -3003,10 +2981,14 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            state_socket: None,
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(wrapper["type"], "result");
+        let parsed: serde_json::Value =
+            serde_json::from_str(wrapper["data"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(fs::read_to_string(&fp).unwrap(), "via process_input");
     }
@@ -3015,7 +2997,7 @@ mod tests {
 
     #[tokio::test]
     async fn browse_missing_url() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "browse".to_string(),
             nonce: 1,
@@ -3027,7 +3009,7 @@ mod tests {
 
     #[tokio::test]
     async fn browse_invalid_scheme() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "browse".to_string(),
             nonce: 1,
@@ -3055,7 +3037,7 @@ mod tests {
             );
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
         });
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "browse".to_string(),
             nonce: 1,
@@ -3095,7 +3077,7 @@ mod tests {
             );
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
         });
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "browse".to_string(),
             nonce: 1,
@@ -3123,7 +3105,7 @@ mod tests {
             );
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
         });
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "browse".to_string(),
             nonce: 1,
@@ -3151,7 +3133,7 @@ mod tests {
             );
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
         });
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "browse".to_string(),
             nonce: 1,
@@ -3180,7 +3162,7 @@ mod tests {
             );
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
         });
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "browse".to_string(),
@@ -3189,10 +3171,14 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            ..Default::default()
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(wrapper["type"], "result");
+        let parsed: serde_json::Value =
+            serde_json::from_str(wrapper["data"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["success"], true);
     }
 
@@ -3200,7 +3186,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_port_already_open() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let result = agent
@@ -3212,7 +3198,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_port_opens_during_wait() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         // Drop listener to close port, then reopen after a delay
@@ -3233,7 +3219,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_port_timeout() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         // Use a port that is very likely not open
         let result = agent
             .wait_for_port_with_retries(19999, 3, 50)
@@ -3244,7 +3230,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_as_agent_wait_for_port_success() {
-        let (agent, _shm, log_dir) = create_test_agent();
+        let (agent, _rx, log_dir) = create_test_agent();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let cmd = AgentCommand {
@@ -3268,7 +3254,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_human_missing_question() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "askHuman".to_string(),
             nonce: 1,
@@ -3285,7 +3271,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_human_response_already_available() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let q_path = tmp.path().join("question");
         let r_path = tmp.path().join("response");
@@ -3312,7 +3298,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_human_response_after_delay() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let q_path = tmp.path().join("question");
         let r_path = tmp.path().join("response");
@@ -3338,7 +3324,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_human_timeout() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let q_path = tmp.path().join("question");
         let r_path = tmp.path().join("response");
@@ -3359,7 +3345,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_human_question_file_content() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let q_path = tmp.path().join("question");
         let r_path = tmp.path().join("response");
@@ -3381,7 +3367,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_human_file_cleanup_on_timeout() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let q_path = tmp.path().join("question");
         let r_path = tmp.path().join("response");
@@ -3409,7 +3395,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_pty_simple_echo() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "execPty".to_string(),
             command: Some("echo hello_pty".to_string()),
@@ -3430,7 +3416,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_pty_state_persistence() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         // Set an env var in the first command
         let cmd1 = AgentCommand {
             function: "execPty".to_string(),
@@ -3463,7 +3449,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_pty_cd_persistence() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let tmp_path = tmp.path().to_string_lossy().to_string();
 
@@ -3496,7 +3482,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_pty_multiple_sessions() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd1 = AgentCommand {
             function: "execPty".to_string(),
             command: Some("export S=session_a".to_string()),
@@ -3536,7 +3522,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_pty_default_shell_id() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "execPty".to_string(),
             command: Some("echo default_test".to_string()),
@@ -3550,7 +3536,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_pty_missing_command() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let cmd = AgentCommand {
             function: "execPty".to_string(),
             nonce: 1,
@@ -3562,7 +3548,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_pty_process_input_integration() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "execPty".to_string(),
@@ -3571,10 +3557,14 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            ..Default::default()
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert_eq!(wrapper["type"], "result");
+        let parsed: serde_json::Value =
+            serde_json::from_str(wrapper["data"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["success"], true);
         let output = parsed["output"].as_str().unwrap();
         assert!(output.contains("integration_test"), "got: {}", output);
@@ -3585,9 +3575,8 @@ mod tests {
     #[tokio::test]
     async fn store_memory_create() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("agent").join("memory.json");
         let cmd = AgentCommand {
@@ -3617,9 +3606,8 @@ mod tests {
     #[tokio::test]
     async fn store_memory_update() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("memory.json");
 
@@ -3655,9 +3643,8 @@ mod tests {
     #[tokio::test]
     async fn store_memory_missing_key() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let cmd = AgentCommand {
             function: "storeMemory".to_string(),
@@ -3674,9 +3661,8 @@ mod tests {
     #[tokio::test]
     async fn recall_memory_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("nonexistent.json");
         let cmd = AgentCommand {
@@ -3696,9 +3682,8 @@ mod tests {
     #[tokio::test]
     async fn recall_memory_finds_matches() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("memory.json");
 
@@ -3738,9 +3723,8 @@ mod tests {
     #[tokio::test]
     async fn recall_memory_missing_query() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let cmd = AgentCommand {
             function: "recallMemory".to_string(),
@@ -3754,9 +3738,8 @@ mod tests {
     #[tokio::test]
     async fn store_memory_process_input_integration() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("mem.json");
         let input = AgentInput {
@@ -3769,19 +3752,21 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            ..Default::default()
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(wrapper["data"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["success"], true);
     }
 
     #[tokio::test]
     async fn recall_memory_process_input_integration() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("mem2.json");
         let input = AgentInput {
@@ -3793,10 +3778,13 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            ..Default::default()
         };
         let results = agent.process_input(input).await.unwrap();
         assert_eq!(results.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(wrapper["data"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["success"], true);
     }
 
@@ -3805,9 +3793,8 @@ mod tests {
     #[tokio::test]
     async fn store_memory_with_tags_and_channel() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("knowledge.json");
 
@@ -3849,9 +3836,8 @@ mod tests {
     #[tokio::test]
     async fn recall_memory_with_tag_filter() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("knowledge.json");
 
@@ -3886,9 +3872,8 @@ mod tests {
     #[tokio::test]
     async fn recall_memory_with_channel_filter() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("knowledge.json");
 
@@ -3920,9 +3905,8 @@ mod tests {
     #[tokio::test]
     async fn store_memory_backward_compat_old_format() {
         let dir = tempfile::tempdir().unwrap();
-        let shm = dir.path().join("shm");
         let log = dir.path().join("log");
-        let agent = Agent::new_with_paths(shm.to_str().unwrap(), log.clone()).unwrap();
+        let (agent, _rx) = Agent::new_with_paths(log.clone()).unwrap();
 
         let memory_file = dir.path().join("old_mem.json");
         // Pre-populate with old format
@@ -3954,11 +3938,11 @@ mod tests {
         assert!(data["entries"]["new-key"].is_object());
     }
 
-    // --- Synchronous command shared memory registration tests ---
+    // --- Synchronous command process state registration tests ---
 
     #[tokio::test]
-    async fn sync_command_registers_completed_in_shared_memory() {
-        let (agent, _shm, _log) = create_test_agent();
+    async fn sync_command_registers_completed_in_process_state() {
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "inspectPath".to_string(),
@@ -3967,6 +3951,7 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            state_socket: None,
         };
         agent.process_input(input).await.unwrap();
 
@@ -3977,8 +3962,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_command_registers_failed_in_shared_memory() {
-        let (agent, _shm, _log) = create_test_agent();
+    async fn sync_command_registers_failed_in_process_state() {
+        let (agent, _rx, _log) = create_test_agent();
         // editFile without required fields will fail
         let input = AgentInput {
             commands: vec![AgentCommand {
@@ -3988,9 +3973,11 @@ mod tests {
                 ..Default::default()
             }],
             wait_for_status: None,
+            state_socket: None,
         };
         let results = agent.process_input(input).await.unwrap();
-        assert!(results[0].starts_with("Error:"));
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert!(wrapper["data"].as_str().unwrap().starts_with("Error:"));
 
         // The synchronous command should now be registered as Failed
         let info = agent.get_process_info(43).unwrap();
@@ -4000,7 +3987,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_depends_on_sync_command_runs() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("dep_test.txt");
 
@@ -4028,21 +4015,27 @@ mod tests {
                 },
             ],
             wait_for_status: None,
+            state_socket: None,
         };
 
         let results = agent.process_input(input).await.unwrap();
 
         // editFile should have succeeded
-        let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(wrapper["data"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["success"], true);
 
-        // The editFile nonce should be Completed in shared memory
+        // The editFile nonce should be Completed in process state
         let info = agent.get_process_info(10).unwrap();
         assert_eq!(info.status, ProcessStatus::Completed);
 
         // The execAsAgent should report waiting (it's async, spawned with dependency)
         // but crucially it was NOT skipped — the dependency was found
-        assert_eq!(results[1], "11w0");
+        let parsed: serde_json::Value = serde_json::from_str(&results[1]).unwrap();
+        assert_eq!(parsed["type"], "status");
+        assert_eq!(parsed["nonce"], 11);
+        assert_eq!(parsed["status"], "w");
 
         // Give the spawned command time to complete and verify it ran
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4052,7 +4045,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_depends_on_failed_sync_command_is_skipped() {
-        let (agent, _shm, _log) = create_test_agent();
+        let (agent, _rx, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![
                 // Synchronous command that will fail (missing file_path)
@@ -4075,19 +4068,24 @@ mod tests {
                 },
             ],
             wait_for_status: None,
+            state_socket: None,
         };
 
         let results = agent.process_input(input).await.unwrap();
 
         // editFile failed
-        assert!(results[0].starts_with("Error:"));
+        let wrapper: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+        assert!(wrapper["data"].as_str().unwrap().starts_with("Error:"));
 
-        // The failed editFile should be Failed in shared memory
+        // The failed editFile should be Failed in process state
         let info = agent.get_process_info(20).unwrap();
         assert_eq!(info.status, ProcessStatus::Failed);
 
         // The execAsAgent reports waiting (spawned async)
-        assert_eq!(results[1], "21w0");
+        let parsed_exec: serde_json::Value = serde_json::from_str(&results[1]).unwrap();
+        assert_eq!(parsed_exec["type"], "status");
+        assert_eq!(parsed_exec["nonce"], 21);
+        assert_eq!(parsed_exec["status"], "w");
 
         // Give the spawned command time to process dependency check
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4111,21 +4109,21 @@ mod tests {
 
     #[tokio::test]
     async fn default_display_empty_returns_1() {
-        let (mut agent, _shm, _log) = create_test_agent();
+        let (mut agent, _rx, _log) = create_test_agent();
         agent.available_displays = vec![];
         assert_eq!(agent.default_display(), 1);
     }
 
     #[tokio::test]
     async fn default_display_returns_first() {
-        let (mut agent, _shm, _log) = create_test_agent();
+        let (mut agent, _rx, _log) = create_test_agent();
         agent.available_displays = vec![0, 1, 2];
         assert_eq!(agent.default_display(), 1);
     }
 
     #[tokio::test]
     async fn default_display_only_zero() {
-        let (mut agent, _shm, _log) = create_test_agent();
+        let (mut agent, _rx, _log) = create_test_agent();
         agent.available_displays = vec![0];
         assert_eq!(agent.default_display(), 1);
     }

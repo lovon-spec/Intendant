@@ -63,13 +63,14 @@ pub struct Command {
     pub memory_since: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentInput {
     pub wait_for_status: Option<u64>,
     pub commands: Vec<Command>,
+    #[serde(default)]
+    pub state_socket: Option<String>,
 }
 
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessInfo {
     pub nonce: u64,
@@ -177,16 +178,20 @@ mod tests {
         let input: AgentInput = serde_json::from_str(json).unwrap();
         assert!(input.commands.is_empty());
         assert!(input.wait_for_status.is_none());
+        assert!(input.state_socket.is_none());
     }
 
     #[test]
-    fn process_info_is_repr_c() {
-        // Verify ProcessInfo has a stable layout by checking size
+    fn agent_input_with_state_socket() {
+        let json = r#"{"commands": [], "state_socket": "/tmp/test.sock"}"#;
+        let input: AgentInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.state_socket.as_deref(), Some("/tmp/test.sock"));
+    }
+
+    #[test]
+    fn process_info_size_nonzero() {
         let size = std::mem::size_of::<ProcessInfo>();
-        // u64 (8) + i32 (4) + ProcessStatus(u8) (1) + padding (3) + i32 (4) + u64 (8) = 28 + padding
-        // With repr(C): nonce(8) + pid(4) + status(1) + pad(3) + exit_code(4) + pad(4) + timestamp(8) = 32
         assert!(size > 0);
-        // Ensure it's consistent (the exact size depends on alignment)
         assert_eq!(size, std::mem::size_of::<ProcessInfo>());
     }
 

@@ -11,6 +11,7 @@ mod project;
 mod prompts;
 mod provider;
 mod session_log;
+mod state_socket;
 mod sub_agent;
 mod tools;
 mod tui;
@@ -443,32 +444,25 @@ fn read_nonce_stdout(session_dir: &std::path::Path, nonce: u64) -> Option<String
     std::fs::read_to_string(path).ok().filter(|s| !s.is_empty())
 }
 
-/// Filter agent stdout to only include status lines for relevant nonces
-/// and any non-status-line content (JSON from fetchStatus, etc.).
-/// Status lines match the pattern `<nonce><status_char><exit_code>` (e.g., "1c0", "42f1").
+/// Filter agent stdout to only include JSON status/result lines for relevant nonces.
+/// Lines are JSON objects with a "type" field ("status" or "result") and a "nonce" field.
 fn filter_status_lines(stdout: &str, relevant_nonces: &std::collections::HashSet<u64>) -> String {
     // If no nonces to filter by, return as-is (safety fallback)
     if relevant_nonces.is_empty() {
         return stdout.to_string();
     }
 
-    let status_line_re =
-        regex::Regex::new(r"^(\d+)([rcfswRCFSW])(\d+)$").expect("valid status line regex");
-
     stdout
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
-            if let Some(caps) = status_line_re.captures(trimmed) {
-                // This is a status line — only keep if nonce is relevant
-                if let Ok(nonce) = caps[1].parse::<u64>() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(nonce) = parsed.get("nonce").and_then(|n| n.as_u64()) {
                     return relevant_nonces.contains(&nonce);
                 }
-                false
-            } else {
-                // Not a status line (JSON output, etc.) — always keep
-                true
             }
+            // Non-JSON lines are always kept
+            true
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -924,30 +918,33 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn filter_status_lines_keeps_relevant() {
-        let stdout = "1r0\n2c0\n3c0\n1c0\n";
+        let stdout = r#"{"type":"status","nonce":1,"status":"r","pid":0,"exit_code":0}
+{"type":"status","nonce":2,"status":"c","pid":0,"exit_code":0}
+{"type":"status","nonce":3,"status":"c","pid":0,"exit_code":0}
+{"type":"status","nonce":1,"status":"c","pid":0,"exit_code":0}
+"#;
         let mut nonces = std::collections::HashSet::new();
         nonces.insert(1);
         let result = filter_status_lines(stdout, &nonces);
-        assert!(result.contains("1r0"));
-        assert!(result.contains("1c0"));
-        assert!(!result.contains("2c0"));
-        assert!(!result.contains("3c0"));
+        assert!(result.contains("\"nonce\":1"));
+        assert!(!result.contains("\"nonce\":2"));
+        assert!(!result.contains("\"nonce\":3"));
     }
 
     #[test]
-    fn filter_status_lines_keeps_json() {
-        let stdout = "1c0\n{\"agent_id\":\"runtime\",\"ok\":true}\n2c0\n";
+    fn filter_status_lines_keeps_non_json() {
+        let stdout = "{\"type\":\"status\",\"nonce\":1,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\nplain text line\n{\"type\":\"status\",\"nonce\":2,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n";
         let mut nonces = std::collections::HashSet::new();
         nonces.insert(1);
         let result = filter_status_lines(stdout, &nonces);
-        assert!(result.contains("1c0"));
-        assert!(result.contains("agent_id"));
-        assert!(!result.contains("2c0"));
+        assert!(result.contains("\"nonce\":1"));
+        assert!(result.contains("plain text line"));
+        assert!(!result.contains("\"nonce\":2"));
     }
 
     #[test]
     fn filter_status_lines_empty_nonces_returns_all() {
-        let stdout = "1c0\n2c0\n";
+        let stdout = "{\"type\":\"status\",\"nonce\":1,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n{\"type\":\"status\",\"nonce\":2,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n";
         let nonces = std::collections::HashSet::new();
         let result = filter_status_lines(stdout, &nonces);
         assert_eq!(result, stdout);
@@ -1132,7 +1129,7 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn map_results_single_exec() {
-        let stdout = "1r0\n1c0\n";
+        let stdout = "{\"type\":\"status\",\"nonce\":1,\"status\":\"r\",\"pid\":0,\"exit_code\":0}\n{\"type\":\"status\",\"nonce\":1,\"status\":\"c\",\"pid\":1234,\"exit_code\":0}\n";
         let stderr = "";
         let mut nonce_map = std::collections::HashMap::new();
         nonce_map.insert(1u64, "call_1".to_string());
@@ -1145,8 +1142,8 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn map_results_with_json_output() {
-        let stdout = "5c0\n{\"content\":\"hello\",\"total_size\":5}\n";
+    fn map_results_with_result_output() {
+        let stdout = "{\"type\":\"status\",\"nonce\":5,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n{\"type\":\"result\",\"nonce\":5,\"data\":\"{\\\"content\\\":\\\"hello\\\",\\\"total_size\\\":5}\"}\n";
         let stderr = "";
         let mut nonce_map = std::collections::HashMap::new();
         nonce_map.insert(5u64, "call_1".to_string());
@@ -1160,7 +1157,7 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn map_results_with_stderr() {
-        let stdout = "1c1\n";
+        let stdout = "{\"type\":\"status\",\"nonce\":1,\"status\":\"c\",\"pid\":0,\"exit_code\":1}\n";
         let stderr = "command not found";
         let mut nonce_map = std::collections::HashMap::new();
         nonce_map.insert(1u64, "call_1".to_string());
@@ -1198,7 +1195,7 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn map_results_multiple_tools() {
-        let stdout = "10r0\n10c0\n11c0\n{\"exists\":true}\n";
+        let stdout = "{\"type\":\"status\",\"nonce\":10,\"status\":\"r\",\"pid\":0,\"exit_code\":0}\n{\"type\":\"status\",\"nonce\":10,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n{\"type\":\"status\",\"nonce\":11,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n{\"type\":\"result\",\"nonce\":11,\"data\":\"{\\\"exists\\\":true}\"}\n";
         let stderr = "";
         let mut nonce_map = std::collections::HashMap::new();
         nonce_map.insert(10u64, "call_1".to_string());
@@ -1212,7 +1209,7 @@ Also: {"source": "bare"}"#;
         assert_eq!(results.len(), 2);
         // exec_command should have its status
         assert!(results[0].2.contains("10c0"));
-        // inspect_path should have JSON output
+        // inspect_path should have result data
         assert!(results[1].2.contains("\"exists\":true"));
     }
 
@@ -1323,28 +1320,51 @@ fn map_results_to_tool_responses(
     nonce_to_call_id: &std::collections::HashMap<u64, String>,
     call_id_names: &[(String, String)],
 ) -> Vec<(String, String, String)> {
-    let status_re =
-        regex::Regex::new(r"^(\d+)([rcfswRCFSW])(\d+)$").expect("valid status line regex");
-
-    // Collect status per nonce
+    // Parse JSON lines from runtime stdout.
+    // Status lines: {"type":"status","nonce":N,"status":"c","pid":P,"exit_code":E}
+    // Result lines: {"type":"result","nonce":N,"data":"..."}
     let mut nonce_status: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
+    let mut nonce_results: std::collections::HashMap<u64, Vec<String>> =
         std::collections::HashMap::new();
     let mut other_lines = Vec::new();
 
     for line in agent_stdout.lines() {
         let trimmed = line.trim();
-        if let Some(caps) = status_re.captures(trimmed) {
-            if let Ok(nonce) = caps[1].parse::<u64>() {
-                // Overwrite: last status wins (e.g., running → completed)
-                nonce_status.insert(nonce, trimmed.to_string());
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let msg_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let nonce = parsed.get("nonce").and_then(|n| n.as_u64());
+            match (msg_type, nonce) {
+                ("status", Some(n)) => {
+                    // Last status wins (e.g., running → completed)
+                    let status_char = parsed
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?");
+                    let exit_code = parsed
+                        .get("exit_code")
+                        .and_then(|e| e.as_i64())
+                        .unwrap_or(0);
+                    nonce_status.insert(n, format!("{}{}{}", n, status_char, exit_code));
+                }
+                ("result", Some(n)) => {
+                    if let Some(data) = parsed.get("data").and_then(|d| d.as_str()) {
+                        nonce_results.entry(n).or_default().push(data.to_string());
+                    }
+                }
+                _ => {
+                    other_lines.push(trimmed.to_string());
+                }
             }
-        } else if !trimmed.is_empty() {
+        } else {
             other_lines.push(trimmed.to_string());
         }
     }
 
-    // Try to parse any JSON output lines
-    let json_output = other_lines.join("\n");
+    let other_output = other_lines.join("\n");
 
     let mut results = Vec::new();
 
@@ -1361,6 +1381,11 @@ fn map_results_to_tool_responses(
             if let Some(status) = nonce_status.get(&n) {
                 parts.push(status.clone());
             }
+            if let Some(result_data) = nonce_results.get(&n) {
+                for data in result_data {
+                    parts.push(data.clone());
+                }
+            }
         }
 
         // For non-runtime tools (manage_context, signal_done), return acknowledgement
@@ -1369,10 +1394,9 @@ fn map_results_to_tool_responses(
             continue;
         }
 
-        // Include JSON output for all tool calls (it's typically from synchronous
-        // commands like fetchStatus, inspectPath, editFile, browse)
-        if !json_output.is_empty() {
-            parts.push(json_output.clone());
+        // Include any non-typed output for all tool calls (fallback)
+        if !other_output.is_empty() {
+            parts.push(other_output.clone());
         }
 
         if !agent_stderr.is_empty() {
@@ -2059,8 +2083,17 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Auto-fetch stdout for single standalone execAsAgent commands that completed successfully.
             if let Some(nonce) = single_exec_nonce(&json_str) {
-                let success_marker = format!("{}c0", nonce);
-                if filtered_stdout.lines().any(|l| l.trim() == success_marker) {
+                let completed = filtered_stdout.lines().any(|l| {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(l.trim()) {
+                        parsed.get("type").and_then(|t| t.as_str()) == Some("status")
+                            && parsed.get("nonce").and_then(|n| n.as_u64()) == Some(nonce)
+                            && parsed.get("status").and_then(|s| s.as_str()) == Some("c")
+                            && parsed.get("exit_code").and_then(|e| e.as_i64()) == Some(0)
+                    } else {
+                        false
+                    }
+                });
+                if completed {
                     let session_dir = session_log.lock().ok().map(|l| l.dir().to_path_buf());
                     if let Some(dir) = session_dir {
                         if let Some(stdout_content) = read_nonce_stdout(&dir, nonce) {
@@ -2580,16 +2613,13 @@ async fn main() -> Result<(), CallerError> {
 
     // Create or resume session log.
     let log_dir = if flags.resume {
-        let dir = session_log::SessionLog::resolve_resume_path(flags.log_file.as_deref())
+        session_log::SessionLog::resolve_resume_path(flags.log_file.as_deref())
             .ok_or_else(|| {
                 CallerError::Config(
                     "Resume requested, but no existing session directory was found".to_string(),
                 )
-            })?;
-        env::set_var("INTENDANT_RESUME_SESSION", "1");
-        dir
+            })?
     } else {
-        env::remove_var("INTENDANT_RESUME_SESSION");
         session_log::SessionLog::resolve_path(flags.log_file.as_deref())
     };
     let session_log: SharedSessionLog = match session_log::SessionLog::open(log_dir.clone()) {
