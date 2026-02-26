@@ -490,6 +490,23 @@ fn normalize_command_batch(json_str: &str) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
 
+/// Inject the state socket path into an agent input JSON string.
+/// Adds `"state_socket": "<path>"` at the top level alongside `"commands"`.
+/// Invalid JSON passes through unchanged.
+fn inject_state_socket(json_str: &str, socket_path: &str) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return json_str.to_string(),
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "state_socket".to_string(),
+            serde_json::Value::String(socket_path.to_string()),
+        );
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
+}
+
 /// Macro-like helper for conditional output: TUI event bus or println.
 fn emit(bus: &Option<EventBus>, event_fn: impl FnOnce() -> AppEvent, fallback: impl FnOnce()) {
     if let Some(bus) = bus {
@@ -1225,6 +1242,23 @@ Also: {"source": "bare"}"#;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].2, "OK");
     }
+
+    #[test]
+    fn inject_state_socket_adds_field() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo hi"}]}"#;
+        let result = inject_state_socket(json, "/tmp/test.sock");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["state_socket"].as_str().unwrap(), "/tmp/test.sock");
+        // Original fields preserved
+        assert!(parsed["commands"].is_array());
+        assert_eq!(parsed["commands"][0]["function"], "execAsAgent");
+    }
+
+    #[test]
+    fn inject_state_socket_invalid_json_passthrough() {
+        let bad = "not json at all";
+        assert_eq!(inject_state_socket(bad, "/tmp/test.sock"), bad);
+    }
 }
 
 /// Context directives extracted from manage_context / signal_done tool calls.
@@ -1426,6 +1460,9 @@ async fn run_agent_loop(
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
 ) -> Result<LoopStats, CallerError> {
+    let process_state_store = state_socket::ProcessStateStore::new();
+    let _state_server = process_state_store.start_server();
+
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
     let mut loop_stats = LoopStats::default();
@@ -1671,8 +1708,9 @@ async fn run_agent_loop(
             };
             empty_command_streak = 0;
 
-            // Inject project context and normalize
+            // Inject project context, normalize, and attach state socket
             let json_str = normalize_command_batch(&inject_project_context(json_str, project));
+            let json_str = inject_state_socket(&json_str, &process_state_store.socket_path().to_string_lossy());
 
             // Headless askHuman check
             if bus.is_none() && has_ask_human_command(&json_str) {
@@ -1795,6 +1833,7 @@ async fn run_agent_loop(
             );
 
             let output = agent_runner::run_agent(&json_str).await?;
+            process_state_store.ingest_stdout(&output.stdout).await;
 
             // Log agent output
             slog(&session_log, |l| l.agent_output(&output.stdout, &output.stderr));
@@ -1939,8 +1978,9 @@ async fn run_agent_loop(
             }
             empty_command_streak = 0;
 
-            // Inject project context (memory_file) into commands and normalize aliases.
+            // Inject project context (memory_file) into commands, normalize aliases, and attach state socket.
             let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
+            let json_str = inject_state_socket(&json_str, &process_state_store.socket_path().to_string_lossy());
 
             // In headless mode there is no askHuman input panel.
             if bus.is_none() && has_ask_human_command(&json_str) {
@@ -2076,6 +2116,7 @@ Proceed with explicit assumptions and continue without additional questions."
             );
 
             let output = agent_runner::run_agent(&json_str).await?;
+            process_state_store.ingest_stdout(&output.stdout).await;
 
             // Filter status lines to only include relevant nonces (current batch + dependencies)
             let batch_nonces = extract_batch_nonces(&json_str);
