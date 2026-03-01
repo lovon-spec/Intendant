@@ -44,7 +44,6 @@ pub fn tool_name_to_function(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "exec_command" => Some("execAsAgent"),
         "capture_screen" => Some("captureScreen"),
-        "fetch_status" => Some("fetchStatus"),
         "inspect_path" => Some("inspectPath"),
         "edit_file" => Some("editFile"),
         "browse_url" => Some("browse"),
@@ -56,33 +55,13 @@ pub fn tool_name_to_function(tool_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Common dependency parameters shared by all runtime tool definitions.
-fn dependency_properties() -> Value {
-    json!({
-        "depending_nonce": {
-            "type": "integer",
-            "description": "Nonce of a command that must finish before this one starts."
-        },
-        "expected_status": {
-            "type": "integer",
-            "description": "Required exit code of the dependency (default: 0)."
-        },
-        "wait": {
-            "type": "boolean",
-            "description": "If true, block until the dependency completes (exits). If false, skip immediately if not yet completed. Long-running daemons never complete — see exec_command for the correct pattern."
-        }
-    })
-}
-
-/// Returns all 12 tool definitions.
+/// Returns all 11 tool definitions.
 pub fn all_tools() -> Vec<ToolDefinition> {
-    let dep = dependency_properties();
-
-    let mut tools = Vec::with_capacity(12);
+    let mut tools = Vec::with_capacity(11);
 
     // 1. exec_command → execAsAgent
     {
-        let mut props = json!({
+        let props = json!({
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
@@ -100,11 +79,10 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "description": "TCP port to wait for (up to 30s) before executing."
             }
         });
-        merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "exec_command".to_string(),
-            description: "Execute a Bash command in the background. Stdout/stderr are logged to disk; use fetch_status to read them. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id]. For daemons/servers that run indefinitely, background them in the shell (e.g. `Xvfb :50 ... & sleep 1 && test -e /tmp/.X50-lock`) with `wait: true`, so the nonce completes while the daemon keeps running. Never use `depending_nonce` pointing at a nonce that won't exit.".to_string(),
+            description: "Execute a Bash command and wait for completion. Returns exit code, stdout tail (last 10KB), and stderr tail directly. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id]. For daemons, background in bash (`cmd &`) — the shell exits and the tool returns while the daemon keeps running.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
@@ -116,7 +94,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
     // 2. capture_screen → captureScreen
     {
-        let mut props = json!({
+        let props = json!({
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
@@ -126,7 +104,6 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "description": "X11 display number to capture. Omit to auto-discover (skips :0, the user's workspace)."
             }
         });
-        merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "capture_screen".to_string(),
@@ -140,46 +117,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         });
     }
 
-    // 3. fetch_status → fetchStatus
-    {
-        let mut props = json!({
-            "nonce": {
-                "type": "integer",
-                "description": "Nonce of the command to query."
-            },
-            "status_type": {
-                "type": "string",
-                "enum": ["status", "stdout", "stderr", "exit_code"],
-                "description": "What to retrieve: process status, stdout log, stderr log, or exit code."
-            },
-            "offset": {
-                "type": "integer",
-                "description": "Byte offset for stdout/stderr log reading."
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Max bytes to read from the log."
-            },
-            "cursor": {
-                "type": "integer",
-                "description": "Cursor position for incremental log reading."
-            }
-        });
-        merge_properties(&mut props, &dep);
-
-        tools.push(ToolDefinition {
-            name: "fetch_status".to_string(),
-            description: "Retrieve status, stdout, stderr, or exit code for a previously launched command by its nonce.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": props,
-                "required": ["nonce", "status_type"],
-                "additionalProperties": false
-            }),
-        });
-    }
-
-    // 4. inspect_path → inspectPath
+    // 3. inspect_path → inspectPath
     {
         let props = json!({
             "nonce": {
@@ -204,9 +142,9 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         });
     }
 
-    // 5. edit_file → editFile
+    // 4. edit_file → editFile
     {
-        let mut props = json!({
+        let props = json!({
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
@@ -237,7 +175,6 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "description": "End line (exclusive) for 'replace_lines' operation."
             }
         });
-        merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "edit_file".to_string(),
@@ -251,9 +188,9 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         });
     }
 
-    // 6. browse_url → browse
+    // 5. browse_url → browse
     {
-        let mut props = json!({
+        let props = json!({
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
@@ -263,7 +200,6 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "description": "URL to fetch (must start with http:// or https://)."
             }
         });
-        merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "browse_url".to_string(),
@@ -277,9 +213,9 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         });
     }
 
-    // 7. ask_human → askHuman
+    // 6. ask_human → askHuman
     {
-        let mut props = json!({
+        let props = json!({
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
@@ -293,7 +229,6 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "description": "Timeout in milliseconds (default: 300000 = 5 minutes)."
             }
         });
-        merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "ask_human".to_string(),
@@ -307,9 +242,9 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         });
     }
 
-    // 8. exec_pty → execPty
+    // 7. exec_pty → execPty
     {
-        let mut props = json!({
+        let props = json!({
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
@@ -323,7 +258,6 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "description": "PTY session identifier (default: 'default'). Use different IDs for independent sessions."
             }
         });
-        merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "exec_pty".to_string(),
@@ -337,9 +271,9 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         });
     }
 
-    // 9. store_memory → storeMemory
+    // 8. store_memory → storeMemory
     {
-        let mut props = json!({
+        let props = json!({
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
@@ -361,7 +295,6 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "description": "Channel/namespace for the memory entry."
             }
         });
-        merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "store_memory".to_string(),
@@ -375,9 +308,9 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         });
     }
 
-    // 10. recall_memory → recallMemory
+    // 9. recall_memory → recallMemory
     {
-        let mut props = json!({
+        let props = json!({
             "nonce": {
                 "type": "integer",
                 "description": "Unique identifier for this command."
@@ -399,7 +332,6 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "description": "Only return entries created after this Unix timestamp."
             }
         });
-        merge_properties(&mut props, &dep);
 
         tools.push(ToolDefinition {
             name: "recall_memory".to_string(),
@@ -413,7 +345,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         });
     }
 
-    // 11. manage_context (caller-handled, not sent to runtime)
+    // 10. manage_context (caller-handled, not sent to runtime)
     tools.push(ToolDefinition {
         name: "manage_context".to_string(),
         description: "Manage conversation context by dropping or summarizing old messages to keep the conversation focused.".to_string(),
@@ -445,7 +377,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         }),
     });
 
-    // 12. signal_done (caller-handled, not sent to runtime)
+    // 11. signal_done (caller-handled, not sent to runtime)
     tools.push(ToolDefinition {
         name: "signal_done".to_string(),
         description: "Signal that the task is complete. Call this when you have finished all work.".to_string(),
@@ -464,23 +396,14 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     tools
 }
 
-/// Merge properties from `src` into `dest` (both must be JSON objects).
-fn merge_properties(dest: &mut Value, src: &Value) {
-    if let (Some(d), Some(s)) = (dest.as_object_mut(), src.as_object()) {
-        for (k, v) in s {
-            d.insert(k.clone(), v.clone());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn all_tools_has_12_definitions() {
+    fn all_tools_has_11_definitions() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]
@@ -533,7 +456,6 @@ mod tests {
         let runtime_tools = [
             "exec_command",
             "capture_screen",
-            "fetch_status",
             "inspect_path",
             "edit_file",
             "browse_url",
@@ -575,10 +497,7 @@ mod tests {
             tool_name_to_function("capture_screen"),
             Some("captureScreen")
         );
-        assert_eq!(
-            tool_name_to_function("fetch_status"),
-            Some("fetchStatus")
-        );
+        assert_eq!(tool_name_to_function("fetch_status"), None);
         assert_eq!(
             tool_name_to_function("inspect_path"),
             Some("inspectPath")
@@ -638,42 +557,38 @@ mod tests {
         let tools = all_tools();
 
         let oai_tools: Vec<Value> = tools.iter().map(|t| t.to_openai()).collect();
-        assert_eq!(oai_tools.len(), 12);
+        assert_eq!(oai_tools.len(), 11);
         for t in &oai_tools {
             assert_eq!(t["type"].as_str(), Some("function"));
         }
 
         let ant_tools: Vec<Value> = tools.iter().map(|t| t.to_anthropic()).collect();
-        assert_eq!(ant_tools.len(), 12);
+        assert_eq!(ant_tools.len(), 11);
         for t in &ant_tools {
             assert!(t["input_schema"].is_object());
         }
 
         let gem_tools: Vec<Value> = tools.iter().map(|t| t.to_gemini()).collect();
-        assert_eq!(gem_tools.len(), 12);
+        assert_eq!(gem_tools.len(), 11);
         for t in &gem_tools {
             assert!(t["parameters"].is_object());
         }
     }
 
     #[test]
-    fn exec_command_has_dependency_params() {
+    fn exec_command_has_no_dependency_params() {
         let tools = all_tools();
         let exec = tools.iter().find(|t| t.name == "exec_command").unwrap();
         let props = exec.parameters["properties"].as_object().unwrap();
-        assert!(props.contains_key("depending_nonce"));
-        assert!(props.contains_key("expected_status"));
-        assert!(props.contains_key("wait"));
+        assert!(!props.contains_key("depending_nonce"));
+        assert!(!props.contains_key("expected_status"));
+        assert!(!props.contains_key("wait"));
     }
 
     #[test]
-    fn fetch_status_has_log_params() {
+    fn no_fetch_status_tool() {
         let tools = all_tools();
-        let fs = tools.iter().find(|t| t.name == "fetch_status").unwrap();
-        let props = fs.parameters["properties"].as_object().unwrap();
-        assert!(props.contains_key("offset"));
-        assert!(props.contains_key("limit"));
-        assert!(props.contains_key("cursor"));
+        assert!(tools.iter().find(|t| t.name == "fetch_status").is_none());
     }
 
     #[test]

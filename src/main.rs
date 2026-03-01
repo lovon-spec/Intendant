@@ -32,24 +32,17 @@ async fn main() -> Result<(), AgentError> {
         }
     };
 
-    // Create agent instance with optional state socket for cross-turn PID queries
-    let (agent, mut status_rx) = Agent::new(input.state_socket.clone())?;
+    // Create agent instance
+    let agent = Agent::new()?;
 
-    // Process commands and get initial results
+    // Process commands sequentially and get results
     let results = agent.process_input(input).await?;
 
-    // Print initial results (JSON lines); exit gracefully on broken pipe
+    // Print results; exit gracefully on broken pipe
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     for result in results {
         if !write_line(&mut stdout, &result) {
-            return Ok(());
-        }
-    }
-
-    // Continue receiving background status updates (JSON lines)
-    while let Some(status) = status_rx.recv().await {
-        if !write_line(&mut stdout, &status) {
             return Ok(());
         }
     }

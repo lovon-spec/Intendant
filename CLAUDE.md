@@ -2,10 +2,10 @@
 
 ## Project Overview
 
-This is **Intendant**, a Rust runtime for autonomous AI agents with process lifecycle management. It executes bash commands on behalf of AI agents, tracks process state via shared memory, streams status updates, and persists logs across binary restarts.
+This is **Intendant**, a Rust runtime for autonomous AI agents with process lifecycle management. It executes bash commands on behalf of AI agents, tracks process state via shared memory, and persists logs across binary restarts.
 
 The project produces two binaries:
-- **intendant-runtime** — Command runtime that reads JSON from stdin, spawns bash commands, and writes status lines to stdout
+- **intendant-runtime** — Command runtime that reads JSON from stdin, executes commands sequentially (blocking until completion), and writes result lines to stdout
 - **intendant** — AI integration layer (CLI/TUI) that drives the runtime via the OpenAI Responses API or Anthropic Messages API in a loop
 
 ## Repository Structure
@@ -13,28 +13,26 @@ The project produces two binaries:
 ```
 src/
 ├── main.rs              # intendant-runtime binary entry point (tokio async main)
-├── agent.rs             # Core agent implementation (~3000 lines)
+├── agent.rs             # Core agent implementation
 │                        #   - Shared memory management
-│                        #   - Command execution (execAsAgent)
+│                        #   - Blocking command execution (execAsAgent) — returns exit code, stdout/stderr tail
 │                        #   - Screenshot capture (captureScreen)
-│                        #   - Status fetching (fetchStatus) with log tail
 │                        #   - Path inspection (inspectPath)
 │                        #   - File editing (editFile)
 │                        #   - Web browsing (browse)
 │                        #   - Human interaction (askHuman)
 │                        #   - PTY sessions (execPty)
 │                        #   - Memory storage/recall with tagged knowledge (storeMemory, recallMemory)
-│                        #   - Dependency checking and nonce replacement
-├── models.rs            # Data structures: Command, AgentInput, ProcessInfo, ProcessStatus, StatusUpdate
+│                        #   - Nonce variable replacement
+├── models.rs            # Data structures: Command, AgentInput, ProcessInfo, ProcessStatus
 ├── error.rs             # AgentError enum (Io, Json, Process, InvalidNonce)
-├── utils.rs             # get_timestamp(), format_status_output()
-├── status_monitor.rs    # Background task polling shared memory every 100ms
+├── utils.rs             # get_timestamp()
 └── bin/
     └── caller/
         ├── main.rs          # intendant entry point: 3 modes (user/sub-agent/direct), budget-aware loop, TUI init
         ├── provider.rs      # Multi-provider API client (OpenAI Responses API + Anthropic), structured output, reasoning controls
         ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
-        ├── agent_runner.rs  # Spawns intendant-runtime subprocess, manages I/O with timeouts (askHuman-aware)
+        ├── agent_runner.rs  # Spawns intendant-runtime subprocess, waits for completion with hard timeout (askHuman-aware)
         ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
         ├── memory.rs        # Backward-compatible memory wrapper delegating to knowledge.rs
         ├── sub_agent.rs     # Sub-agent spawning, result/progress I/O, role-specific configuration
@@ -84,18 +82,18 @@ echo "task" | ./target/release/intendant                   # Auto-detects non-TT
 ## Testing
 
 ```bash
-cargo test                # Run all 459 tests (115 agent + 344 caller)
+cargo test                # Run all tests
 cargo test -- --list      # List all test names
 ```
 
 All tests are inline `#[cfg(test)]` modules in the same files as the code they test. Async tests use `#[tokio::test]`. The `tempfile` crate provides isolated temporary directories for tests that touch the filesystem or shared memory.
 
 Test coverage includes:
-- **agent.rs** (115 tests): Process info operations, dependency checking, command execution, status fetching with log tail, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters, synchronous command shared memory registration, cross-command-type dependency chaining
+- **agent.rs**: Process info operations, blocking command execution, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
-- **utils.rs**: Timestamp validity, status output formatting
-- **caller/main.rs** (344 tests total across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit, status line filtering, auto-fetch nonce detection, batch nonce extraction
+- **utils.rs**: Timestamp validity
+- **caller/main.rs** (tests across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit, batch assembly, tool name mapping
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
@@ -108,7 +106,7 @@ Test coverage includes:
 - **caller/error.rs**: Display formatting, type conversions (including Tui variant)
 - **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
 - **caller/control.rs**: Socket path, outbound event serialization, broadcast, server lifecycle
-- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants including OrchestratorProgress), bottom panel heights, model summary formatting (exec, fetch, edit, multiple commands, done signal, askHuman, invalid JSON)
+- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants including OrchestratorProgress), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON)
 - **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
 - **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
 - **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
@@ -125,21 +123,13 @@ Process state lives in `/dev/shm/intendant_processes` — a fixed-size array of 
 
 The process map (`HashMap<u64, usize>`) is rebuilt from shared memory on every startup by scanning all 1024 slots for non-zero nonces.
 
-All command nonces (both async and synchronous) are pre-registered in shared memory with `Waiting` status before execution begins. Synchronous commands update their status to `Completed`/`Failed` after execution. This enables dependency chaining across command types (e.g., `editFile` -> `execAsAgent` via `depending_nonce`).
-
 ### Session Persistence
 
 `/dev/shm/intendant_session` stores the log directory path. Consecutive runs reuse the same log directory (`/var/log/intendant/<timestamp>/`). To reset: `rm -f /dev/shm/intendant_processes /dev/shm/intendant_session`.
 
-### Status Protocol
+### Execution Model
 
-Status lines are formatted as `[nonce][status_char][exit_code]`:
-- `r` = Running, `c` = Completed, `f` = Failed, `s` = Skipped, `w` = Waiting
-- Example: `42c0` means nonce 42 completed with exit code 0
-
-### Command Dependencies
-
-Commands chain via `depending_nonce`, `wait`, and `expected_status`. When `wait` is true, execution blocks until the dependency finishes. When false, the command is skipped if the dependency hasn't completed yet.
+Commands are processed sequentially. Each command blocks until completion and returns its result directly (exit code, stdout tail, stderr tail for exec commands). The runtime exits after processing all commands.
 
 ### Nonce Variables
 

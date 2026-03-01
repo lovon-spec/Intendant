@@ -1,17 +1,17 @@
 # Intendant
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles via shared memory-style state files, streams status updates, and persists logs across binary restarts. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles via shared memory-style state files, executes commands sequentially (blocking until completion), and persists logs across binary restarts. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
 ```
-stdin (JSON) --> intendant-runtime --> spawns bash commands
+stdin (JSON) --> intendant-runtime --> executes commands sequentially (blocking)
                   |
                   +--> $INTENDANT_SHARED_DIR/intendant_processes (or /dev/shm, or temp dir)
                   +--> $INTENDANT_SHARED_DIR/intendant_session   (or /dev/shm, or temp dir)
                   +--> ~/.intendant/logs/<timestamp>/  (stdout/stderr logs per nonce)
                   |
-                  +--> StatusMonitor --> stdout (status lines)
+                  +--> stdout (result lines with exit code, stdout/stderr tail)
 
 intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   |
@@ -33,7 +33,7 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
 - **Shared Process State (`intendant_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Path resolves via `INTENDANT_SHARED_DIR`, then `/dev/shm` if available, else OS temp dir.
 - **Session File (`intendant_session`):** Stores the log directory path so consecutive runs reuse the same directory. Uses the same shared-dir resolution.
 - **Log Directory (`~/.intendant/logs/<timestamp>/`):** Per-nonce stdout and stderr log files, plus structured session logs. Created once per session.
-- **Status Monitor:** Background task that polls SHM for status changes and writes update lines to stdout. Status lines are filtered caller-side to only include nonces from the current command batch.
+- **Execution Model:** Commands are processed sequentially. Each command blocks until completion and returns its result directly (exit code, stdout tail, stderr tail). The runtime exits after processing all commands.
 
 ## Building
 
@@ -55,33 +55,14 @@ Both binaries are installed to `~/.cargo/bin/`. The `intendant` binary embeds de
 
 ## Usage
 
-The agent reads a single JSON object from stdin and writes status lines to stdout.
+The agent reads a single JSON object from stdin, executes commands sequentially, and writes result lines to stdout.
 
 ```bash
 echo '{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo hello"}]}' \
   | ./target/release/intendant-runtime
 ```
 
-Output:
-
-```
-1r0        # nonce 1, running, exit code 0
-1c0        # nonce 1, completed, exit code 0
-```
-
-Retrieve results in a subsequent run (returns JSON with `content`, `total_size`, `offset`, `bytes_read`):
-
-```bash
-echo '{"commands":[{"function":"fetchStatus","nonce":1,"status_type":"stdout"}]}' \
-  | ./target/release/intendant-runtime
-```
-
-Read only the last 1024 bytes of a log:
-
-```bash
-echo '{"commands":[{"function":"fetchStatus","nonce":1,"status_type":"stdout","limit":1024}]}' \
-  | ./target/release/intendant-runtime
-```
+Output is a JSON result line containing the nonce, exit code, stdout tail (last 10KB), and stderr tail.
 
 Inspect a file path:
 
@@ -133,9 +114,8 @@ echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database
 
 | Function | Description | Key Fields |
 |----------|-------------|------------|
-| `execAsAgent` | Run a bash command in the background | `command`, `display`, `depending_nonce`, `wait`, `expected_status`, `wait_for_port` |
+| `execAsAgent` | Run a bash command (blocks until exit, returns exit code + stdout/stderr tail) | `command`, `display`, `wait_for_port` |
 | `captureScreen` | Screenshot a display via ImageMagick | `display` |
-| `fetchStatus` | Read process state/logs (JSON with offset/limit) | `status_type` (`status`, `stdout`, `stderr`, `exit_code`), `offset`, `limit` |
 | `inspectPath` | Inspect filesystem path metadata | `path` |
 | `editFile` | Structured file editing without shell commands | `file_path`, `operation`, `content`, `match_content`, `line_number`, `end_line` |
 | `writeFile` | Alias for `editFile` write operation | `file_path`, `content` |
@@ -144,22 +124,6 @@ echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database
 | `execPty` | Run command in a persistent PTY session | `command`, `shell_id` |
 | `storeMemory` | Store a knowledge entry with optional tags/channel | `memory_key`, `memory_summary`, `memory_file`, `memory_tags`, `memory_channel`, `memory_source` |
 | `recallMemory` | Search knowledge by keyword with optional filters | `memory_query`, `memory_file`, `memory_tags`, `memory_channel`, `memory_source`, `memory_since` |
-
-### Status Codes
-
-| Code | Meaning |
-|------|---------|
-| `r` | Running |
-| `c` | Completed |
-| `f` | Failed (could not start) |
-| `s` | Skipped (dependency not met) |
-| `w` | Waiting (on dependency) |
-
-Status lines are formatted as `[nonce][status_char][exit_code]`, e.g. `42c0` means nonce 42 completed with exit code 0.
-
-### Dependencies
-
-Commands can be chained using `depending_nonce`, `wait`, and `expected_status`. When `wait` is `true`, the dependent command blocks until its dependency finishes. When `false`, it is skipped immediately if the dependency is not yet done.
 
 ### Nonce Variables
 
@@ -209,8 +173,8 @@ cargo test
 
 The test suite covers both binaries:
 
-- **Agent binary:** models serialization, status formatting, error types, shared memory operations, nonce replacement, path inspection, status fetching, dependency checking, command processing, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary:** JSON extraction, done signal handling, conversation management with message layer protection and tool call tracking, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, native tool definitions (12 tools, provider conversion formats), tool call batch assembly and result routing, Gemini provider request/response format, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults, tools-mode variant), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, status line filtering, auto-fetch detection, session log file creation, model summary formatting, Xvfb display configuration per provider, and dynamic display allocation.
+- **Agent binary:** models serialization, error types, shared memory operations, nonce replacement, path inspection, blocking command execution, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
+- **Caller binary:** JSON extraction, done signal handling, conversation management with message layer protection and tool call tracking, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, native tool definitions (11 tools, provider conversion formats), tool call batch assembly and result routing, Gemini provider request/response format, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults, tools-mode variant), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, session log file creation, model summary formatting, Xvfb display configuration per provider, and dynamic display allocation.
 
 ## Session Logging
 
@@ -401,15 +365,10 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 14. If approval is required:
     - TUI mode: emits an approval request and waits for user response
     - Headless mode: denies execution (no implicit auto-approve fallback)
-15. Pipes the JSON to the `intendant-runtime` binary, reads stdout/stderr with adaptive timeouts:
-    - Default: idle-before-first `2s`, idle-after-first `1s`, hard `30s`
-    - `fetchStatus(wait=true)`: idle-before-first `15s`, hard `45s`
-    - `askHuman`: idle-before-first `330s`, idle-after-first `1s`, hard `600s`
-16. Filters agent status lines to only include nonces from the current command batch (reduces noise)
-17. For single standalone `execAsAgent` commands that complete successfully, auto-appends stdout (saves the model a `fetchStatus` round-trip)
-18. Feeds the agent output back as the next user message (text path) or as individual tool results (tool call path), appending a token budget summary
-19. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
-20. In headless mode, if the model emits `askHuman`, the loop now sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
+15. Pipes the JSON to the `intendant-runtime` binary and waits for completion with a hard timeout (120s default, 600s for `askHuman`)
+16. Feeds the agent output back as the next user message (text path) or as individual tool results (tool call path), appending a token budget summary
+17. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
+18. In headless mode, if the model emits `askHuman`, the loop now sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
 
 ## Environment
 
@@ -428,8 +387,7 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 | `PROVIDER` | auto-detect | `"openai"`, `"anthropic"`, or `"gemini"` (used when multiple keys are set) |
 | `MODEL_NAME` | per-provider default | Model to use (e.g. `gpt-5.2-codex`, `claude-sonnet-4-5-20250929`, `gemini-2.5-pro`) |
 | `USE_NATIVE_TOOLS` | `true` | Enable native API tool calling; `false` falls back to text-based JSON extraction |
-| `INTENDANT_IDLE_TIMEOUT` | `2` | Seconds to wait for first agent stdout byte before assuming idle (baseline mode) |
-| `INTENDANT_HARD_TIMEOUT` | `30` | Maximum seconds to wait for agent output |
+| `INTENDANT_HARD_TIMEOUT` | `120` | Maximum seconds to wait for agent completion (600s for askHuman) |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
 | `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call (sent to API) |
 | `STRUCTURED_OUTPUT` | `true` for gpt-5+/o3/o4 | Enable JSON object mode for deterministic parsing |
@@ -443,7 +401,7 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 | `INTENDANT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
 | `INTENDANT_SHARED_DIR` | auto | Shared state directory for process/session/human I/O files (`/dev/shm` if available, else temp dir) |
 
-Timeouts are automatically extended for slow-start workflows (`askHuman`, `fetchStatus(wait=true)`). Manual override via env vars is still supported.
+The hard timeout is automatically extended to 600s when `askHuman` is present in the command batch.
 
 ### Project Configuration
 

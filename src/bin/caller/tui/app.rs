@@ -833,18 +833,6 @@ fn format_model_summary(content: &str) -> String {
                     let truncated = truncate_str(command, 120);
                     format!("exec: {}", truncated)
                 }
-                "fetchStatus" => {
-                    let st = cmd
-                        .get("status_type")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("?");
-                    let dep = cmd
-                        .get("depending_nonce")
-                        .and_then(|n| n.as_u64())
-                        .map(|n| format!(" (nonce {})", n))
-                        .unwrap_or_default();
-                    format!("fetch: {}{}", st, dep)
-                }
                 "editFile" => {
                     let path = cmd
                         .get("file_path")
@@ -1239,13 +1227,6 @@ mod tests {
     }
 
     #[test]
-    fn format_model_summary_fetch() {
-        let json = r#"{"commands":[{"function":"fetchStatus","nonce":2,"status_type":"stdout","depending_nonce":1}]}"#;
-        let summary = format_model_summary(json);
-        assert!(summary.contains("fetch: stdout (nonce 1)"));
-    }
-
-    #[test]
     fn format_model_summary_edit() {
         let json = r#"{"commands":[{"function":"editFile","nonce":3,"file_path":"/tmp/test.rs","operation":"write","content":"fn main(){}"}]}"#;
         let summary = format_model_summary(json);
@@ -1254,10 +1235,10 @@ mod tests {
 
     #[test]
     fn format_model_summary_multiple() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"},{"function":"fetchStatus","nonce":2,"status_type":"stdout"}]}"#;
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"},{"function":"inspectPath","nonce":2,"path":"/tmp"}]}"#;
         let summary = format_model_summary(json);
         assert!(summary.contains("exec: ls"));
-        assert!(summary.contains("fetch: stdout"));
+        assert!(summary.contains("inspect: /tmp"));
         assert!(summary.contains(" | "));
     }
 

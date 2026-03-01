@@ -226,7 +226,7 @@ pub fn classify_command(cmd: &serde_json::Value) -> Vec<ActionCategory> {
     let function = cmd.get("function").and_then(|f| f.as_str()).unwrap_or("");
 
     match function {
-        "inspectPath" | "fetchStatus" | "recallMemory" => vec![ActionCategory::FileRead],
+        "inspectPath" | "recallMemory" => vec![ActionCategory::FileRead],
         "writeFile" | "editFile" | "storeMemory" => vec![ActionCategory::FileWrite],
         "captureScreen" => vec![ActionCategory::FileRead],
         "askHuman" => vec![ActionCategory::HumanInput],

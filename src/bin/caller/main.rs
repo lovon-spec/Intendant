@@ -11,7 +11,6 @@ mod project;
 mod prompts;
 mod provider;
 mod session_log;
-mod state_socket;
 mod sub_agent;
 mod tools;
 mod tui;
@@ -379,10 +378,6 @@ fn format_command_preview(json_str: &str) -> String {
                             let path = cmd.get("path").and_then(|p| p.as_str()).unwrap_or("?");
                             format!("inspect: {}", path)
                         }
-                        "fetchStatus" => {
-                            let nonce = cmd.get("nonce").and_then(|n| n.as_u64()).unwrap_or(0);
-                            format!("fetchStatus(nonce={})", nonce)
-                        }
                         "browse" => {
                             let url = cmd.get("url").and_then(|u| u.as_str()).unwrap_or("?");
                             format!("browse: {}", url)
@@ -398,74 +393,6 @@ fn format_command_preview(json_str: &str) -> String {
     }
     // Fallback: first 200 chars of raw JSON
     json_str.chars().take(200).collect()
-}
-
-/// Extract nonces from a command batch JSON, including depending_nonce references.
-fn extract_batch_nonces(json_str: &str) -> std::collections::HashSet<u64> {
-    let mut nonces = std::collections::HashSet::new();
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-        if let Some(commands) = parsed.get("commands").and_then(|c| c.as_array()) {
-            for cmd in commands {
-                if let Some(n) = cmd.get("nonce").and_then(|v| v.as_u64()) {
-                    nonces.insert(n);
-                }
-                if let Some(n) = cmd.get("depending_nonce").and_then(|v| v.as_u64()) {
-                    nonces.insert(n);
-                }
-            }
-        }
-    }
-    nonces
-}
-
-/// Check if a command batch is a single standalone execAsAgent (no dependencies),
-/// and if so return its nonce. Used for auto-fetch optimization.
-fn single_exec_nonce(json_str: &str) -> Option<u64> {
-    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let commands = parsed.get("commands")?.as_array()?;
-    if commands.len() != 1 {
-        return None;
-    }
-    let cmd = &commands[0];
-    let func = cmd.get("function")?.as_str()?;
-    if func != "execAsAgent" {
-        return None;
-    }
-    // Skip if it has dependencies (it's part of a chain)
-    if cmd.get("depending_nonce").is_some() {
-        return None;
-    }
-    cmd.get("nonce")?.as_u64()
-}
-
-/// Read the stdout log file for a completed nonce directly from the session log directory.
-fn read_nonce_stdout(session_dir: &std::path::Path, nonce: u64) -> Option<String> {
-    let path = session_dir.join(format!("{}_stdout.log", nonce));
-    std::fs::read_to_string(path).ok().filter(|s| !s.is_empty())
-}
-
-/// Filter agent stdout to only include JSON status/result lines for relevant nonces.
-/// Lines are JSON objects with a "type" field ("status" or "result") and a "nonce" field.
-fn filter_status_lines(stdout: &str, relevant_nonces: &std::collections::HashSet<u64>) -> String {
-    // If no nonces to filter by, return as-is (safety fallback)
-    if relevant_nonces.is_empty() {
-        return stdout.to_string();
-    }
-
-    stdout
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(nonce) = parsed.get("nonce").and_then(|n| n.as_u64()) {
-                    return relevant_nonces.contains(&nonce);
-                }
-            }
-            // Non-JSON lines are always kept
-            true
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn normalize_command_batch(json_str: &str) -> String {
@@ -487,23 +414,6 @@ fn normalize_command_batch(json_str: &str) -> String {
         }
     }
 
-    serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
-}
-
-/// Inject the state socket path into an agent input JSON string.
-/// Adds `"state_socket": "<path>"` at the top level alongside `"commands"`.
-/// Invalid JSON passes through unchanged.
-fn inject_state_socket(json_str: &str, socket_path: &str) -> String {
-    let mut value: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return json_str.to_string(),
-    };
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "state_socket".to_string(),
-            serde_json::Value::String(socket_path.to_string()),
-        );
-    }
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
 
@@ -837,10 +747,10 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn format_command_preview_multiple() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"cargo build"},{"function":"fetchStatus","nonce":2}]}"#;
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"cargo build"},{"function":"inspectPath","nonce":2,"path":"/tmp"}]}"#;
         let preview = format_command_preview(json);
         assert!(preview.contains("exec: cargo build"));
-        assert!(preview.contains("fetchStatus(nonce=2)"));
+        assert!(preview.contains("inspect: /tmp"));
         assert!(preview.contains(" | "));
     }
 
@@ -908,87 +818,6 @@ Also: {"source": "bare"}"#;
         let mut called = false;
         emit(&bus_opt, || AppEvent::Tick, || called = true);
         assert!(called);
-    }
-
-    #[test]
-    fn extract_batch_nonces_single() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":42,"command":"ls"}]}"#;
-        let nonces = extract_batch_nonces(json);
-        assert_eq!(nonces.len(), 1);
-        assert!(nonces.contains(&42));
-    }
-
-    #[test]
-    fn extract_batch_nonces_with_dependency() {
-        let json = r#"{"commands":[{"function":"fetchStatus","nonce":5,"depending_nonce":3}]}"#;
-        let nonces = extract_batch_nonces(json);
-        assert_eq!(nonces.len(), 2);
-        assert!(nonces.contains(&5));
-        assert!(nonces.contains(&3));
-    }
-
-    #[test]
-    fn extract_batch_nonces_invalid_json() {
-        let nonces = extract_batch_nonces("not json");
-        assert!(nonces.is_empty());
-    }
-
-    #[test]
-    fn filter_status_lines_keeps_relevant() {
-        let stdout = r#"{"type":"status","nonce":1,"status":"r","pid":0,"exit_code":0}
-{"type":"status","nonce":2,"status":"c","pid":0,"exit_code":0}
-{"type":"status","nonce":3,"status":"c","pid":0,"exit_code":0}
-{"type":"status","nonce":1,"status":"c","pid":0,"exit_code":0}
-"#;
-        let mut nonces = std::collections::HashSet::new();
-        nonces.insert(1);
-        let result = filter_status_lines(stdout, &nonces);
-        assert!(result.contains("\"nonce\":1"));
-        assert!(!result.contains("\"nonce\":2"));
-        assert!(!result.contains("\"nonce\":3"));
-    }
-
-    #[test]
-    fn filter_status_lines_keeps_non_json() {
-        let stdout = "{\"type\":\"status\",\"nonce\":1,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\nplain text line\n{\"type\":\"status\",\"nonce\":2,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n";
-        let mut nonces = std::collections::HashSet::new();
-        nonces.insert(1);
-        let result = filter_status_lines(stdout, &nonces);
-        assert!(result.contains("\"nonce\":1"));
-        assert!(result.contains("plain text line"));
-        assert!(!result.contains("\"nonce\":2"));
-    }
-
-    #[test]
-    fn filter_status_lines_empty_nonces_returns_all() {
-        let stdout = "{\"type\":\"status\",\"nonce\":1,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n{\"type\":\"status\",\"nonce\":2,\"status\":\"c\",\"pid\":0,\"exit_code\":0}\n";
-        let nonces = std::collections::HashSet::new();
-        let result = filter_status_lines(stdout, &nonces);
-        assert_eq!(result, stdout);
-    }
-
-    #[test]
-    fn single_exec_nonce_single_exec() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":7,"command":"ls"}]}"#;
-        assert_eq!(single_exec_nonce(json), Some(7));
-    }
-
-    #[test]
-    fn single_exec_nonce_with_dependency() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":7,"command":"ls","depending_nonce":3}]}"#;
-        assert_eq!(single_exec_nonce(json), None);
-    }
-
-    #[test]
-    fn single_exec_nonce_multiple_commands() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"execAsAgent","nonce":2}]}"#;
-        assert_eq!(single_exec_nonce(json), None);
-    }
-
-    #[test]
-    fn single_exec_nonce_not_exec() {
-        let json = r#"{"commands":[{"function":"fetchStatus","nonce":5}]}"#;
-        assert_eq!(single_exec_nonce(json), None);
     }
 
     // --- assemble_batch_from_tool_calls tests ---
@@ -1070,8 +899,8 @@ Also: {"source": "bare"}"#;
             provider::ToolCall {
                 id: "call_2".to_string(),
                 call_id: "call_2".to_string(),
-                name: "fetch_status".to_string(),
-                arguments: r#"{"nonce":11,"status_type":"stdout","depending_nonce":10,"wait":true}"#.to_string(),
+                name: "inspect_path".to_string(),
+                arguments: r#"{"nonce":11,"path":"/tmp"}"#.to_string(),
             },
             provider::ToolCall {
                 id: "call_3".to_string(),
@@ -1090,7 +919,7 @@ Also: {"source": "bare"}"#;
         let commands = input["commands"].as_array().unwrap();
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0]["function"], "execAsAgent");
-        assert_eq!(commands[1]["function"], "fetchStatus");
+        assert_eq!(commands[1]["function"], "inspectPath");
         assert_eq!(result.nonce_to_call_id.len(), 2);
         assert_eq!(result.call_id_names.len(), 3);
     }
@@ -1113,7 +942,6 @@ Also: {"source": "bare"}"#;
         let tool_pairs = vec![
             ("exec_command", "execAsAgent"),
             ("capture_screen", "captureScreen"),
-            ("fetch_status", "fetchStatus"),
             ("inspect_path", "inspectPath"),
             ("edit_file", "editFile"),
             ("browse_url", "browse"),
@@ -1164,7 +992,7 @@ Also: {"source": "bare"}"#;
         let stderr = "";
         let mut nonce_map = std::collections::HashMap::new();
         nonce_map.insert(5u64, "call_1".to_string());
-        let call_ids = vec![("call_1".to_string(), "fetch_status".to_string())];
+        let call_ids = vec![("call_1".to_string(), "inspect_path".to_string())];
 
         let results = map_results_to_tool_responses(stdout, stderr, &nonce_map, &call_ids);
         assert_eq!(results.len(), 1);
@@ -1243,22 +1071,6 @@ Also: {"source": "bare"}"#;
         assert_eq!(results[0].2, "OK");
     }
 
-    #[test]
-    fn inject_state_socket_adds_field() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo hi"}]}"#;
-        let result = inject_state_socket(json, "/tmp/test.sock");
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["state_socket"].as_str().unwrap(), "/tmp/test.sock");
-        // Original fields preserved
-        assert!(parsed["commands"].is_array());
-        assert_eq!(parsed["commands"][0]["function"], "execAsAgent");
-    }
-
-    #[test]
-    fn inject_state_socket_invalid_json_passthrough() {
-        let bad = "not json at all";
-        assert_eq!(inject_state_socket(bad, "/tmp/test.sock"), bad);
-    }
 }
 
 /// Context directives extracted from manage_context / signal_done tool calls.
@@ -1460,9 +1272,6 @@ async fn run_agent_loop(
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
 ) -> Result<LoopStats, CallerError> {
-    let process_state_store = state_socket::ProcessStateStore::new();
-    let _state_server = process_state_store.start_server();
-
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
     let mut loop_stats = LoopStats::default();
@@ -1708,9 +1517,8 @@ async fn run_agent_loop(
             };
             empty_command_streak = 0;
 
-            // Inject project context, normalize, and attach state socket
+            // Inject project context and normalize
             let json_str = normalize_command_batch(&inject_project_context(json_str, project));
-            let json_str = inject_state_socket(&json_str, &process_state_store.socket_path().to_string_lossy());
 
             // Headless askHuman check
             if bus.is_none() && has_ask_human_command(&json_str) {
@@ -1833,7 +1641,6 @@ async fn run_agent_loop(
             );
 
             let output = agent_runner::run_agent(&json_str).await?;
-            process_state_store.ingest_stdout(&output.stdout).await;
 
             // Log agent output
             slog(&session_log, |l| l.agent_output(&output.stdout, &output.stderr));
@@ -1978,9 +1785,8 @@ async fn run_agent_loop(
             }
             empty_command_streak = 0;
 
-            // Inject project context (memory_file) into commands, normalize aliases, and attach state socket.
+            // Inject project context (memory_file) into commands and normalize aliases.
             let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
-            let json_str = inject_state_socket(&json_str, &process_state_store.socket_path().to_string_lossy());
 
             // In headless mode there is no askHuman input panel.
             if bus.is_none() && has_ask_human_command(&json_str) {
@@ -2116,38 +1922,8 @@ Proceed with explicit assumptions and continue without additional questions."
             );
 
             let output = agent_runner::run_agent(&json_str).await?;
-            process_state_store.ingest_stdout(&output.stdout).await;
 
-            // Filter status lines to only include relevant nonces (current batch + dependencies)
-            let batch_nonces = extract_batch_nonces(&json_str);
-            let mut filtered_stdout = filter_status_lines(&output.stdout, &batch_nonces);
-
-            // Auto-fetch stdout for single standalone execAsAgent commands that completed successfully.
-            if let Some(nonce) = single_exec_nonce(&json_str) {
-                let completed = filtered_stdout.lines().any(|l| {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(l.trim()) {
-                        parsed.get("type").and_then(|t| t.as_str()) == Some("status")
-                            && parsed.get("nonce").and_then(|n| n.as_u64()) == Some(nonce)
-                            && parsed.get("status").and_then(|s| s.as_str()) == Some("c")
-                            && parsed.get("exit_code").and_then(|e| e.as_i64()) == Some(0)
-                    } else {
-                        false
-                    }
-                });
-                if completed {
-                    let session_dir = session_log.lock().ok().map(|l| l.dir().to_path_buf());
-                    if let Some(dir) = session_dir {
-                        if let Some(stdout_content) = read_nonce_stdout(&dir, nonce) {
-                            filtered_stdout.push_str(&format!(
-                                "\n--- stdout (nonce {}) ---\n{}\n--- end stdout ---",
-                                nonce, stdout_content
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Log full agent output (no truncation, unfiltered for debugging)
+            // Log agent output
             slog(&session_log, |l| {
                 l.agent_output(&output.stdout, &output.stderr)
             });
@@ -2155,11 +1931,11 @@ Proceed with explicit assumptions and continue without additional questions."
             emit(
                 &bus,
                 || AppEvent::AgentOutput {
-                    stdout: filtered_stdout.clone(),
+                    stdout: output.stdout.clone(),
                     stderr: output.stderr.clone(),
                 },
                 || {
-                    println!("Agent stdout:\n{}", filtered_stdout);
+                    println!("Agent stdout:\n{}", output.stdout);
                     if !output.stderr.is_empty() {
                         eprintln!("Agent stderr:\n{}", output.stderr);
                     }
@@ -2190,7 +1966,7 @@ Proceed with explicit assumptions and continue without additional questions."
             }
 
             // Format agent output as next user message, include budget summary
-            let mut user_msg = format!("Agent output:\n{}", filtered_stdout);
+            let mut user_msg = format!("Agent output:\n{}", output.stdout);
             if !output.stderr.is_empty() {
                 user_msg.push_str(&format!("\nStderr:\n{}", output.stderr));
             }
