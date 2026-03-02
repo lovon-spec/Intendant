@@ -112,6 +112,8 @@ ln -sfn "$RUN_DIR" "$LATEST_LINK"
 printf '%s\n' "$$" > "$LATEST_PID_FILE"
 printf '%s\n' "$OUT_FILE" > "$LATEST_OUT_FILE"
 printf '%s\n' "$RUN_ID" > "$LATEST_RUN_ID_FILE"
+# Clear stale operator intervention requests from prior runs.
+rm -f "$STOP_FILE" "$ABORT_FILE"
 write_status "starting" -1 ""
 printf '%s run_started run_id=%s pid=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$RUN_ID" "$$" > "$INTERVENTION_LOG"
 
@@ -126,16 +128,22 @@ HB_PID=$!
 
 (
   while true; do
-    if [[ -n "$CODEX_PID" ]] && kill -0 "$CODEX_PID" >/dev/null 2>&1; then
+    current_pid=""
+    if [[ -f "$CODEX_PID_FILE" ]]; then
+      current_pid="$(cat "$CODEX_PID_FILE" 2>/dev/null || true)"
+    elif [[ -n "$CODEX_PID" ]]; then
+      current_pid="$CODEX_PID"
+    fi
+    if [[ -n "$current_pid" ]] && kill -0 "$current_pid" >/dev/null 2>&1; then
       if [[ -f "$STOP_FILE" ]]; then
-        printf '%s operator_request=stop codex_pid=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$CODEX_PID" >> "$INTERVENTION_LOG"
+        printf '%s operator_request=stop codex_pid=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$current_pid" >> "$INTERVENTION_LOG"
         rm -f "$STOP_FILE"
-        kill -TERM "$CODEX_PID" >/dev/null 2>&1 || true
+        kill -TERM "$current_pid" >/dev/null 2>&1 || true
       fi
       if [[ -f "$ABORT_FILE" ]]; then
-        printf '%s operator_request=abort codex_pid=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$CODEX_PID" >> "$INTERVENTION_LOG"
+        printf '%s operator_request=abort codex_pid=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$current_pid" >> "$INTERVENTION_LOG"
         rm -f "$ABORT_FILE"
-        kill -KILL "$CODEX_PID" >/dev/null 2>&1 || true
+        kill -KILL "$current_pid" >/dev/null 2>&1 || true
       fi
     fi
     sleep 2
