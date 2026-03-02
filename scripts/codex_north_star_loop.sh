@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="/home/user/projects/intendant-codex-fork"
+LOG_DIR="${ROOT}/.intendant/controller-loop"
+HALT_FILE="${LOG_DIR}/request_halt"
+HALT_AFTER_CYCLE_FILE="${LOG_DIR}/request_halt_after_cycle"
+
+# Persistent graceful halt gate: when armed, refuse to start a new cycle.
+if [[ -f "$HALT_FILE" ]]; then
+  exit 0
+fi
+
+# Legacy one-shot graceful halt gate.
+if [[ -f "$HALT_AFTER_CYCLE_FILE" ]]; then
+  rm -f "$HALT_AFTER_CYCLE_FILE"
+  exit 0
+fi
+
 # Ensure each loop cycle runs in its own detached session. This prevents
 # parent/session teardown from sending TERM to newly spawned cycles.
 if [[ "${INTENDANT_LOOP_DETACHED:-0}" != "1" ]]; then
@@ -15,8 +31,6 @@ if [[ "${INTENDANT_LOOP_DETACHED:-0}" != "1" ]]; then
   exit 0
 fi
 
-ROOT="/home/user/projects/intendant-codex-fork"
-LOG_DIR="${ROOT}/.intendant/controller-loop"
 RUN_TS="$(date -u +"%Y%m%dT%H%M%SZ")"
 RUN_ID="${RUN_TS}-$$"
 RUN_DIR="${LOG_DIR}/${RUN_ID}"

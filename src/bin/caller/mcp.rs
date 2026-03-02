@@ -841,45 +841,76 @@ async fn handle_control_command_mcp(
                 let mut s = state.write().await;
                 let log_dir = s.log_dir.clone();
                 let Some(active) = s.controller_restart.as_mut() else {
+                    let error = "No controller restart is scheduled".to_string();
+                    let data = serde_json::json!({
+                        "status": "rejected",
+                        "ok": false,
+                        "restart_id": params.restart_id,
+                        "error": error,
+                    });
                     emit_control_result(
                         control_tx,
                         "controller_turn_complete",
                         false,
-                        "No controller restart is scheduled".to_string(),
-                        None,
+                        error,
+                        Some(data),
                     );
                     return Some(RESOURCE_RESTART_URI);
                 };
                 if active.restart_id != params.restart_id {
+                    let error = "restart_id does not match the active restart".to_string();
+                    let data = serde_json::json!({
+                        "status": "rejected",
+                        "ok": false,
+                        "restart_id": params.restart_id,
+                        "phase": active.phase,
+                        "error": error,
+                    });
                     emit_control_result(
                         control_tx,
                         "controller_turn_complete",
                         false,
-                        "restart_id does not match the active restart".to_string(),
-                        None,
+                        error,
+                        Some(data),
                     );
                     return Some(RESOURCE_RESTART_URI);
                 }
                 if active.turn_complete_token != params.turn_complete_token {
+                    let error = "turn_complete_token is invalid".to_string();
+                    let data = serde_json::json!({
+                        "status": "rejected",
+                        "ok": false,
+                        "restart_id": params.restart_id,
+                        "phase": active.phase,
+                        "error": error,
+                    });
                     emit_control_result(
                         control_tx,
                         "controller_turn_complete",
                         false,
-                        "turn_complete_token is invalid".to_string(),
-                        None,
+                        error,
+                        Some(data),
                     );
                     return Some(RESOURCE_RESTART_URI);
                 }
                 if !matches!(active.phase, RestartPhase::AwaitingTurnComplete) {
+                    let error = format!(
+                        "Restart is not awaiting completion (phase={:?})",
+                        active.phase
+                    );
+                    let data = serde_json::json!({
+                        "status": "rejected",
+                        "ok": false,
+                        "restart_id": params.restart_id,
+                        "phase": active.phase,
+                        "error": error,
+                    });
                     emit_control_result(
                         control_tx,
                         "controller_turn_complete",
                         false,
-                        format!(
-                            "Restart is not awaiting completion (phase={:?})",
-                            active.phase
-                        ),
-                        None,
+                        error,
+                        Some(data),
                     );
                     return Some(RESOURCE_RESTART_URI);
                 }
@@ -893,19 +924,56 @@ async fn handle_control_command_mcp(
             }
 
             match run_scheduled_controller_restart_with_state(state, bus).await {
-                Ok(result) => emit_control_result(
-                    control_tx,
-                    "controller_turn_complete",
-                    true,
-                    if result.is_empty() {
+                Ok(result) => {
+                    let execution = if result.is_empty() {
                         "ok".to_string()
                     } else {
                         result
-                    },
-                    None,
-                ),
+                    };
+                    let phase = {
+                        let s = state.read().await;
+                        s.controller_restart
+                            .as_ref()
+                            .map(restart_phase_value)
+                            .unwrap_or(serde_json::Value::Null)
+                    };
+                    let data = serde_json::json!({
+                        "status": "completed",
+                        "ok": true,
+                        "restart_id": params.restart_id,
+                        "execution": execution,
+                        "phase": phase,
+                    });
+                    emit_control_result(
+                        control_tx,
+                        "controller_turn_complete",
+                        true,
+                        "ok".to_string(),
+                        Some(data),
+                    )
+                }
                 Err(e) => {
-                    emit_control_result(control_tx, "controller_turn_complete", false, e, None)
+                    let phase = {
+                        let s = state.read().await;
+                        s.controller_restart
+                            .as_ref()
+                            .map(restart_phase_value)
+                            .unwrap_or(serde_json::Value::Null)
+                    };
+                    let data = serde_json::json!({
+                        "status": "restart_pending",
+                        "ok": false,
+                        "restart_id": params.restart_id,
+                        "phase": phase,
+                        "error": e,
+                    });
+                    emit_control_result(
+                        control_tx,
+                        "controller_turn_complete",
+                        false,
+                        "restart execution failed".to_string(),
+                        Some(data),
+                    )
                 }
             }
             Some(RESOURCE_RESTART_URI)
@@ -928,27 +996,44 @@ async fn handle_control_command_mcp(
             let mut s = state.write().await;
             let log_dir = s.log_dir.clone();
             let Some(active) = s.controller_restart.as_mut() else {
+                let error = "No controller restart is scheduled".to_string();
+                let mut data = serde_json::json!({
+                    "status": "rejected",
+                    "ok": false,
+                    "error": error,
+                });
+                if let Some(restart_id) = params.restart_id {
+                    data["restart_id"] = serde_json::Value::String(restart_id);
+                }
                 emit_control_result(
                     control_tx,
                     "cancel_controller_restart",
                     false,
-                    "No controller restart is scheduled".to_string(),
-                    None,
+                    error,
+                    Some(data),
                 );
                 return Some(RESOURCE_RESTART_URI);
             };
 
             if let Some(expected_id) = params.restart_id.as_deref() {
                 if expected_id != active.restart_id {
+                    let error = format!(
+                        "restart_id '{}' does not match active '{}'",
+                        expected_id, active.restart_id
+                    );
+                    let data = serde_json::json!({
+                        "status": "rejected",
+                        "ok": false,
+                        "restart_id": active.restart_id.clone(),
+                        "phase": active.phase,
+                        "error": error,
+                    });
                     emit_control_result(
                         control_tx,
                         "cancel_controller_restart",
                         false,
-                        format!(
-                            "restart_id '{}' does not match active '{}'",
-                            expected_id, active.restart_id
-                        ),
-                        None,
+                        error,
+                        Some(data),
                     );
                     return Some(RESOURCE_RESTART_URI);
                 }
@@ -957,14 +1042,22 @@ async fn handle_control_command_mcp(
             active.phase = RestartPhase::Cancelled;
             active.updated_at = ControllerRestartState::now_string();
             active.last_result = Some("Cancelled by operator".to_string());
+            let restart_id = active.restart_id.clone();
+            let phase = active.phase;
             let snapshot = s.controller_restart.clone();
             persist_restart_state(&log_dir, &snapshot);
+            let data = serde_json::json!({
+                "status": "cancelled",
+                "ok": true,
+                "restart_id": restart_id,
+                "phase": phase,
+            });
             emit_control_result(
                 control_tx,
                 "cancel_controller_restart",
                 true,
                 "ok".to_string(),
-                None,
+                Some(data),
             );
             Some(RESOURCE_RESTART_URI)
         }
@@ -3194,6 +3287,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_controller_turn_complete_returns_structured_data_payload() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx.clone()),
+            ControlMsg::ScheduleControllerRestart {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            },
+        )
+        .await;
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+
+        let scheduled_event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for schedule command_result")
+            .expect("broadcast recv failed");
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled_event).unwrap();
+        let restart_id = scheduled_json
+            .get("data")
+            .and_then(|v| v.get("restart_id"))
+            .and_then(|v| v.as_str())
+            .expect("schedule payload should include restart_id")
+            .to_string();
+        let token = scheduled_json
+            .get("data")
+            .and_then(|v| v.get("turn_complete_token"))
+            .and_then(|v| v.as_str())
+            .expect("schedule payload should include token")
+            .to_string();
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx),
+            ControlMsg::ControllerTurnComplete {
+                restart_id: restart_id.clone(),
+                turn_complete_token: token,
+                status: None,
+                handoff_summary: None,
+            },
+        )
+        .await;
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+
+        let event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for turn_complete command_result")
+            .expect("broadcast recv failed");
+        let json: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            json.get("action").and_then(|v| v.as_str()),
+            Some("controller_turn_complete")
+        );
+        assert_eq!(json.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            json.get("data")
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str()),
+            Some("completed")
+        );
+        assert_eq!(
+            json.get("data")
+                .and_then(|v| v.get("restart_id"))
+                .and_then(|v| v.as_str()),
+            Some(restart_id.as_str())
+        );
+        assert_eq!(
+            json.get("data")
+                .and_then(|v| v.get("phase"))
+                .and_then(|v| v.as_str()),
+            Some("completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_cancel_controller_restart_returns_structured_data_payloads() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx.clone()),
+            ControlMsg::CancelControllerRestart {
+                restart_id: Some("abc".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+        let rejected_event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for rejected cancel command_result")
+            .expect("broadcast recv failed");
+        let rejected_json: serde_json::Value = serde_json::from_str(&rejected_event).unwrap();
+        assert_eq!(
+            rejected_json.get("ok").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            rejected_json
+                .get("data")
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str()),
+            Some("rejected")
+        );
+        assert_eq!(
+            rejected_json
+                .get("data")
+                .and_then(|v| v.get("restart_id"))
+                .and_then(|v| v.as_str()),
+            Some("abc")
+        );
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx.clone()),
+            ControlMsg::ScheduleControllerRestart {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            },
+        )
+        .await;
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+        let scheduled_event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for schedule command_result")
+            .expect("broadcast recv failed");
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled_event).unwrap();
+        let restart_id = scheduled_json
+            .get("data")
+            .and_then(|v| v.get("restart_id"))
+            .and_then(|v| v.as_str())
+            .expect("schedule payload should include restart_id")
+            .to_string();
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx),
+            ControlMsg::CancelControllerRestart { restart_id: None },
+        )
+        .await;
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+        let cancelled_event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for successful cancel command_result")
+            .expect("broadcast recv failed");
+        let cancelled_json: serde_json::Value = serde_json::from_str(&cancelled_event).unwrap();
+        assert_eq!(
+            cancelled_json.get("ok").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            cancelled_json
+                .get("data")
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str()),
+            Some("cancelled")
+        );
+        assert_eq!(
+            cancelled_json
+                .get("data")
+                .and_then(|v| v.get("restart_id"))
+                .and_then(|v| v.as_str()),
+            Some(restart_id.as_str())
+        );
+        assert_eq!(
+            cancelled_json
+                .get("data")
+                .and_then(|v| v.get("phase"))
+                .and_then(|v| v.as_str()),
+            Some("cancelled")
+        );
+    }
+
+    #[tokio::test]
     async fn schedule_restart_rejects_invalid_restart_after() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
@@ -3433,7 +3723,10 @@ mod tests {
             status_json["turn_complete_token"].as_str(),
             Some("[redacted]")
         );
-        assert_ne!(status_json["turn_complete_token"].as_str(), Some(token.as_str()));
+        assert_ne!(
+            status_json["turn_complete_token"].as_str(),
+            Some(token.as_str())
+        );
     }
 
     #[tokio::test]

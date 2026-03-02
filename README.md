@@ -688,6 +688,7 @@ Notes:
 - `cancel_controller_restart` reports JSON results:
   - success: `"status": "cancelled"`, `"ok": true`, plus `"restart_id"` and `"phase": "cancelled"`.
   - rejection: `"status": "rejected"`, `"ok": false`, with `"error"` (and optional `"restart_id"`/`"phase"` context).
+- Control-socket `command_result.data` mirrors structured restart payloads for `schedule_controller_restart`, `controller_turn_complete`, and `cancel_controller_restart` (including `status`, `restart_id`, `phase`, and `error`/`execution` fields).
 - `get_restart_status` (MCP tool and control-socket `command_result.data`) and `intendant://controller-restart` redact `turn_complete_token` as `"[redacted]"`; only `schedule_controller_restart` returns the raw token for the final handshake call.
 
 Controller recursion profile (recommended for Codex/Claude-style controllers):
@@ -707,6 +708,8 @@ Controller loop monitoring files (for `restart_command` scripts):
   - `watch -n 2 'cat .intendant/controller-loop/latest/heartbeat.txt'`
   - `cat .intendant/controller-loop/latest.status.json`
 - Intervention controls:
+  - Halt future loop cycles (persistent): `touch .intendant/controller-loop/request_halt`
+  - Halt future loop cycles (legacy marker, consumed once): `touch .intendant/controller-loop/request_halt_after_cycle`
   - Graceful stop current run: `touch .intendant/controller-loop/request_stop`
   - Immediate abort current run: `touch .intendant/controller-loop/request_abort`
   - Intervention history: `cat .intendant/controller-loop/latest/intervention.log`
