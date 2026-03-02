@@ -89,6 +89,41 @@ fn resolve_system_prompt_inner(
     }
 }
 
+/// Load project instructions from INTENDANT.md files.
+/// Uses a 2-layer cascade: global (`~/.config/intendant/INTENDANT.md`) + project
+/// (`<root>/INTENDANT.md`). Both are concatenated if present.
+pub fn load_project_instructions(project_root: Option<&Path>) -> Option<String> {
+    let mut parts = Vec::new();
+
+    // 1. Global instructions
+    if let Some(config_dir) = dirs::config_dir() {
+        let global_path = config_dir.join("intendant").join("INTENDANT.md");
+        if let Ok(content) = std::fs::read_to_string(&global_path) {
+            let content = content.trim().to_string();
+            if !content.is_empty() {
+                parts.push(content);
+            }
+        }
+    }
+
+    // 2. Project-local instructions
+    if let Some(root) = project_root {
+        let project_path = root.join("INTENDANT.md");
+        if let Ok(content) = std::fs::read_to_string(&project_path) {
+            let content = content.trim().to_string();
+            if !content.is_empty() {
+                parts.push(content);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("[Project Instructions]\n\n{}", parts.join("\n\n")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +272,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, custom_tools);
+    }
+
+    #[test]
+    fn load_project_instructions_none_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_project_instructions(Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn load_project_instructions_project_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("INTENDANT.md"), "Always use bun").unwrap();
+        let result = load_project_instructions(Some(dir.path())).unwrap();
+        assert!(result.contains("[Project Instructions]"));
+        assert!(result.contains("Always use bun"));
+    }
+
+    #[test]
+    fn load_project_instructions_empty_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("INTENDANT.md"), "  \n  ").unwrap();
+        assert!(load_project_instructions(Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn load_project_instructions_no_root() {
+        // With no project root and no global config, returns None
+        // (global might exist on developer machines, so we can only test
+        // that this doesn't panic)
+        let _ = load_project_instructions(None);
     }
 }

@@ -393,11 +393,40 @@ impl Agent {
         .to_string())
     }
 
+    fn validate_path(path_str: &str) -> Result<PathBuf, AgentError> {
+        // Block path traversal
+        if path_str.contains("/../") || path_str.ends_with("/..") || path_str == ".." {
+            return Err(AgentError::Process(format!(
+                "path traversal blocked: {}",
+                path_str
+            )));
+        }
+        let sensitive = [
+            "/etc/shadow",
+            "/etc/gshadow",
+            "/proc/",
+            "/sys/",
+            "/dev/",
+            "/.ssh/",
+            "/.gnupg/",
+        ];
+        for prefix in &sensitive {
+            if path_str.contains(prefix) {
+                return Err(AgentError::Process(format!(
+                    "access to sensitive path blocked: {}",
+                    path_str
+                )));
+            }
+        }
+        Ok(PathBuf::from(path_str))
+    }
+
     fn inspect_path(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
         let path_str = cmd
             .path
             .as_ref()
             .ok_or_else(|| AgentError::Process("path is required for inspectPath".to_string()))?;
+        Self::validate_path(path_str)?;
         let path = std::path::Path::new(path_str);
 
         if !path.exists() {
@@ -740,6 +769,7 @@ impl Agent {
             .file_path
             .as_ref()
             .ok_or_else(|| AgentError::Process("file_path is required for editFile".to_string()))?;
+        Self::validate_path(file_path)?;
         let operation = cmd
             .operation
             .as_ref()
@@ -2313,5 +2343,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = Agent::setup_merged_xauthority(&[], tmp.path());
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn validate_path_traversal_blocked() {
+        assert!(Agent::validate_path("/tmp/../etc/passwd").is_err());
+        assert!(Agent::validate_path("/home/user/..").is_err());
+        assert!(Agent::validate_path("..").is_err());
+    }
+
+    #[test]
+    fn validate_path_sensitive_blocked() {
+        assert!(Agent::validate_path("/etc/shadow").is_err());
+        assert!(Agent::validate_path("/proc/1/cmdline").is_err());
+        assert!(Agent::validate_path("/sys/class/net").is_err());
+        assert!(Agent::validate_path("/dev/sda").is_err());
+        assert!(Agent::validate_path("/home/user/.ssh/id_rsa").is_err());
+        assert!(Agent::validate_path("/home/user/.gnupg/secring.gpg").is_err());
+    }
+
+    #[test]
+    fn validate_path_normal_accepted() {
+        assert!(Agent::validate_path("/tmp/test.txt").is_ok());
+        assert!(Agent::validate_path("/home/user/project/src/main.rs").is_ok());
+        assert!(Agent::validate_path("relative/path.txt").is_ok());
     }
 }

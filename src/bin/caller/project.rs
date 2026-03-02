@@ -34,6 +34,17 @@ pub struct OrchestratorConfig {
     pub sub_agent_dir: Option<String>,
 }
 
+/// Configuration for an external MCP server to connect to as a client.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct ProjectConfig {
     #[serde(default)]
@@ -45,6 +56,21 @@ pub struct ProjectConfig {
     pub orchestrator: OrchestratorConfig,
     #[serde(default)]
     pub approval: ApprovalConfig,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub sandbox: SandboxProjectConfig,
+}
+
+/// Sandbox configuration in intendant.toml.
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct SandboxProjectConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub extra_write_paths: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -254,6 +280,54 @@ destructive = "deny"
             config.approval.destructive,
             crate::autonomy::ApprovalRule::Deny
         );
+    }
+
+    #[test]
+    fn parse_mcp_servers_empty() {
+        let config: ProjectConfig = toml::from_str("").unwrap();
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn parse_mcp_servers_single() {
+        let toml_str = r#"
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].name, "filesystem");
+        assert_eq!(config.mcp_servers[0].command, "npx");
+        assert_eq!(config.mcp_servers[0].args.len(), 3);
+        assert!(config.mcp_servers[0].env.is_empty());
+    }
+
+    #[test]
+    fn parse_mcp_servers_multiple_with_env() {
+        let toml_str = r#"
+[[mcp_servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp_servers.env]
+GITHUB_TOKEN = "ghp_test123"
+
+[[mcp_servers]]
+name = "sqlite"
+command = "uvx"
+args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mcp_servers.len(), 2);
+        assert_eq!(config.mcp_servers[0].name, "github");
+        assert_eq!(
+            config.mcp_servers[0].env.get("GITHUB_TOKEN").unwrap(),
+            "ghp_test123"
+        );
+        assert_eq!(config.mcp_servers[1].name, "sqlite");
     }
 
     #[test]

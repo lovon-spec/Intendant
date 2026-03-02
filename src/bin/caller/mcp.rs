@@ -69,7 +69,7 @@ pub struct McpAppState {
     pub autonomy: SharedAutonomy,
     pub verbosity: Verbosity,
     pub session_tokens: u64,
-    pub log_entries: Vec<LogEntrySnapshot>,
+    pub log_entries: std::collections::VecDeque<LogEntrySnapshot>,
     next_log_id: u64,
     pub pending_approval: Option<PendingApprovalState>,
     pub human_question: Option<String>,
@@ -107,7 +107,7 @@ impl McpAppState {
             autonomy,
             verbosity: Verbosity::Normal,
             session_tokens: 0,
-            log_entries: Vec::new(),
+            log_entries: std::collections::VecDeque::new(),
             next_log_id: 0,
             pending_approval: None,
             human_question: None,
@@ -129,16 +129,15 @@ impl McpAppState {
         let id = self.next_log_id;
         self.next_log_id += 1;
         let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-        self.log_entries.push(LogEntrySnapshot {
+        if self.log_entries.len() >= 10_000 {
+            self.log_entries.pop_front();
+        }
+        self.log_entries.push_back(LogEntrySnapshot {
             id,
             ts,
             level: frontend::log_level_to_str(&level).to_string(),
             content,
         });
-        // Cap at 10k entries (same as TUI)
-        if self.log_entries.len() > 10_000 {
-            self.log_entries.drain(..1000);
-        }
     }
 
     fn status_snapshot(&self) -> StatusSnapshot {
@@ -289,6 +288,10 @@ pub fn spawn_event_listener(
                             );
                         }
                         resource_changed = Some("intendant://logs");
+                    }
+
+                    AppEvent::ModelResponseDelta { .. } => {
+                        // Streaming deltas: MCP doesn't need to handle incremental text
                     }
 
                     AppEvent::JsonExtracted { preview } => {

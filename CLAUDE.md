@@ -30,21 +30,22 @@ src/
 └── bin/
     └── caller/
         ├── main.rs          # intendant entry point: 3 modes (user/sub-agent/direct), budget-aware loop, TUI init
-        ├── provider.rs      # Multi-provider API client (OpenAI Responses API + Anthropic + Gemini), structured output, reasoning controls
-        ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
-        ├── agent_runner.rs  # Spawns intendant-runtime subprocess, waits for completion with hard timeout (askHuman-aware)
+        ├── provider.rs      # Multi-provider API client (OpenAI Responses API + Anthropic + Gemini), structured output, reasoning controls, streaming, rate-limit retry
+        ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking, auto-compaction
+        ├── agent_runner.rs  # Spawns intendant-runtime subprocess, waits for completion with hard timeout (askHuman-aware), optional Landlock sandboxing
         ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
-        ├── memory.rs        # Backward-compatible memory wrapper delegating to knowledge.rs
         ├── sub_agent.rs     # Sub-agent spawning, result/progress I/O, role-specific configuration
         ├── worktree.rs      # Git worktree management for isolated implementation agents
         ├── user_mode.rs     # User-mode orchestrator spawning, progress monitoring, input relay
-        ├── prompts.rs       # System prompt resolution: compile-time defaults (include_str!) + 3-layer cascade
-        ├── project.rs       # Project detection (git root), config parsing (intendant.toml + [approval])
+        ├── prompts.rs       # System prompt resolution: compile-time defaults (include_str!) + 3-layer cascade + INTENDANT.md loading
+        ├── project.rs       # Project detection (git root), config parsing (intendant.toml + [approval] + [[mcp_servers]] + [sandbox])
         ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
         ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/intendant-<pid>.sock)
         ├── frontend.rs      # Shared frontend contract for TUI and MCP (UserAction enum, state queries)
-        ├── tools.rs         # Native tool definitions (11 tools), provider format conversion
+        ├── tools.rs         # Native tool definitions (11 tools), provider format conversion, extra tool registration for MCP client
         ├── mcp.rs           # MCP server implementation (rmcp-based, stdio transport, hot-reload)
+        ├── mcp_client.rs    # MCP client: connects to external MCP servers, discovers tools, proxies calls
+        ├── sandbox.rs       # Landlock filesystem sandboxing (Linux): read/write path policies, process restriction
         ├── vision.rs        # Xvfb display management, per-provider resolution
         ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
         ├── error.rs         # CallerError enum (includes Tui variant)
@@ -87,6 +88,8 @@ Running the CLI (requires `.env` with API key):
 ./target/release/intendant --resume abc123 "continue"      # Resume specific session by ID
 ./target/release/intendant --mcp "task"                    # Run as MCP server on stdio
 ./target/release/intendant --vision "screenshot test"      # Launch with Xvfb virtual display
+./target/release/intendant --json "echo hello"             # JSONL output to stdout (implies --no-tui)
+./target/release/intendant --sandbox "run tests"           # Enable Landlock filesystem sandboxing
 echo "task" | ./target/release/intendant                   # Auto-detects non-TTY, runs headless
 ```
 
@@ -104,31 +107,33 @@ Test coverage includes:
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity
-- **caller/main.rs** (tests across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags, EventBus emit, batch assembly, tool name mapping
+- **caller/main.rs** (tests across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags (including --json, --sandbox), EventBus emit, batch assembly, tool name mapping, JSON output format, INTENDANT.md loading
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking, save/load JSONL roundtrip
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
 - **caller/worktree.rs**: Full lifecycle (create/list/merge/remove), conflict handling
 - **caller/user_mode.rs**: Orchestrator spec generation, progress formatting, input relay, prompt resolution
-- **caller/project.rs**: Config parsing, project paths, sub-agent directory, approval config parsing
-- **caller/memory.rs**: Memory/knowledge loading, formatting, format migration
+- **caller/project.rs**: Config parsing, project paths, sub-agent directory, approval config parsing, MCP server config, sandbox config
 - **caller/prompts.rs**: Compiled-in defaults non-empty, cascade resolution (project root, global config, compiled default), role-specific prompt appending (orchestrator, research, implementation, testing, direct), project override combinations
-- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types, structured output, reasoning controls, role mapping
+- **caller/provider.rs**: Provider selection, token usage parsing, context window defaults, Responses API types, structured output, reasoning controls, role mapping, rate-limit retry, API key masking, SSE parsing, streaming events, shared message builders
 - **caller/error.rs**: Display formatting, type conversions (including Tui variant)
 - **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
 - **caller/control.rs**: Socket path, outbound event serialization, broadcast, server lifecycle
-- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants including OrchestratorProgress), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON)
+- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses), event dispatch (all AppEvent variants including OrchestratorProgress, ModelResponseDelta), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON), streaming buffer accumulation
 - **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
 - **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
 - **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
 - **caller/tui/theme.rs**: Budget color thresholds, spinner frames, action style variants, autonomy color variants
 - **caller/tui/mod.rs**: TestBackend rendering (default state, log entries, approval panel, help overlay, all phases, verbose modes, small terminal)
-- **caller/agent_runner.rs**: askHuman detection in JSON input
+- **caller/agent_runner.rs**: askHuman detection in JSON input, sandboxed execution
 - **caller/session_log.rs**: UUID-based session directories, session metadata (write_meta, find_latest_session, find_session_by_id), directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
 - **caller/tools.rs**: Tool definitions, provider format conversion, tool count validation
 - **caller/frontend.rs**: UserAction enum completeness, state query types, log level parsing
 - **caller/vision.rs**: Xvfb display configuration per provider, dynamic display allocation
 - **caller/mcp.rs**: MCP state management, process_action_sync, resource definitions, tool parameter schemas, event-to-state mappings
+- **caller/mcp_client.rs**: Tool name parsing (`mcp__<server>_<tool>`), routing validation, connection lifecycle
+- **caller/sandbox.rs**: Default config construction, disabled config skip, write path setup
+- **caller/conversation.rs** (additional): Auto-compaction threshold, compaction preserves system+tail, too-few-messages guard
 
 ## Architecture Details
 
@@ -210,6 +215,68 @@ The `reload` MCP tool rebuilds the binary and replaces the running process via `
 - **Role mapping**: Responses API passes through all non-system roles (user, assistant, developer, tool) instead of filtering to user/assistant only.
 - **Done signal**: With structured output enabled, models signal task completion via `{"commands": [], "done": true}` instead of prose responses.
 
+### Streaming Output
+
+All three providers (OpenAI, Anthropic, Gemini) support streaming via `chat_stream()` on the `ChatProvider` trait. The default implementation falls back to non-streaming `chat()` for compatibility. Streaming uses SSE (Server-Sent Events) parsing for all providers:
+- **Anthropic**: `stream: true` on Messages API, parses `content_block_delta`, `content_block_start/stop`, `message_delta`
+- **OpenAI**: `stream: true` on Responses API, parses `response.output_text.delta`, `response.function_call_arguments.delta`, `response.completed`
+- **Gemini**: `streamGenerateContent?alt=sse` endpoint, parses chunked JSON candidates
+
+Text deltas are forwarded to the TUI via `AppEvent::ModelResponseDelta` and accumulated in `App::streaming_buffer`, which is cleared when the full `ModelResponse` arrives.
+
+### Rate-Limit Retry
+
+API requests use `send_with_retry()` with exponential backoff (1s * 2^attempt + jitter, up to 5 retries) for HTTP 429 and 5xx responses. Non-retryable errors (400, 401, etc.) fail immediately. API keys in error messages are masked via `mask_api_keys()`.
+
+### Prompt Caching
+
+- **Anthropic**: Uses `anthropic-beta: prompt-caching-2024-07-31` header with structured system content containing `cache_control: {"type": "ephemeral"}`
+- **OpenAI**: Automatic server-side caching for prompts >1024 tokens (no API changes needed)
+- **Gemini**: Implicit context caching (no API changes needed)
+
+### INTENDANT.md Project Instructions
+
+Project-level instructions are loaded from a 2-layer cascade:
+1. `~/.config/intendant/INTENDANT.md` (global)
+2. `<project_root>/INTENDANT.md` (project-local)
+
+Both are loaded and injected as user messages at conversation start (before memory/knowledge injection). Loaded via `prompts::load_project_instructions()`.
+
+### Auto-Compaction
+
+When context usage reaches 90% (`usage_fraction() >= 0.90`), `conversation.auto_compact()` triggers:
+- Keeps: system message, first 2 context messages, last 4 messages
+- Summarizes: oldest half of remaining middle messages via `summarize_turns()`
+- Emits `ContextManagement` event to TUI/MCP
+
+### JSON Output Mode
+
+`--json` flag enables JSONL structured output to stdout (implies `--no-tui`). Each line is a JSON object with `type` and `data` fields. Event types include: `turn_started`, `model_response`, `model_response_delta`, `agent_output`, `done`, `error`, `approval_required`, `budget_warning`.
+
+### MCP Client Support
+
+External MCP servers can be configured in `intendant.toml`:
+```toml
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp_servers.env]
+SOME_VAR = "value"
+```
+
+At startup, `McpClientManager` connects to all configured servers, discovers their tools, and registers them with the `mcp__<server>_<tool>` naming convention. Tool calls with this prefix are routed through the MCP client manager. If a server fails to connect, it is skipped with a warning.
+
+### Landlock Sandboxing
+
+On Linux (kernel 5.13+), `--sandbox` or `[sandbox] enabled = true` in `intendant.toml` enables Landlock filesystem restrictions on the agent runtime process:
+- **Read**: `/` (everything)
+- **Write**: project root, `/tmp`, log directory, `~/.intendant`
+- Extra write paths can be configured via `[sandbox] extra_write_paths`
+
+The sandbox config is passed to the runtime via `INTENDANT_SANDBOX_WRITE_PATHS` environment variable. On kernels without Landlock support, sandboxing is silently skipped.
+
 ## Code Conventions
 
 - **Rust 2021 edition** with default rustfmt and clippy settings (no .rustfmt.toml or .clippy.toml)
@@ -230,7 +297,7 @@ The `reload` MCP tool rebuilds the binary and replaces the running process via `
 | `chrono` | Timestamp formatting for log directories |
 | `env_logger` | Logging |
 | `regex` | $NONCE[id] pattern matching, ANSI escape stripping |
-| `reqwest` (rustls-tls) | HTTP client for API calls |
+| `reqwest` (rustls-tls, stream) | HTTP client for API calls, SSE streaming |
 | `html2text` | HTML to plain text conversion for browse |
 | `portable-pty` | PTY session management for execPty |
 | `dotenvy` | .env file loading |
@@ -238,7 +305,9 @@ The `reload` MCP tool rebuilds the binary and replaces the running process via `
 | `async-trait` | Async trait support for ChatProvider |
 | `uuid` (v4) | Session ID generation |
 | `dirs` | Platform config directory resolution |
-| `rmcp` (server, transport-io) | MCP server framework |
+| `rmcp` (server, client, transport-io, transport-child-process) | MCP server and client framework |
+| `futures-util` | Stream utilities for SSE response parsing |
+| `landlock` (Linux only) | Filesystem sandboxing via Landlock LSM |
 | `schemars` | JSON schema derivation for MCP tool parameters |
 | `ratatui` | Terminal UI framework |
 | `crossterm` | Terminal input/output backend (event-stream feature) |

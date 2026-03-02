@@ -213,12 +213,8 @@ pub fn scan_completed_results(sub_agent_dir: &Path) -> Vec<SubAgentResult> {
 }
 
 fn shell_escape(s: &str) -> String {
-    if s.contains(' ') || s.contains('\'') || s.contains('"') || s.contains('$') || s.contains('\\')
-    {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    } else {
-        s.to_string()
-    }
+    // Always single-quote to handle all special characters safely
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -267,8 +263,8 @@ mod tests {
         let spec = make_spec();
         let cmd = build_spawn_command(&spec, Path::new("/usr/local/bin/intendant"));
 
-        assert!(cmd.contains("INTENDANT_ROLE=research"));
-        assert!(cmd.contains("INTENDANT_ID=research-1"));
+        assert!(cmd.contains("INTENDANT_ROLE='research'"));
+        assert!(cmd.contains("INTENDANT_ID='research-1'"));
         assert!(cmd.contains("INTENDANT_RESULT_FILE="));
         assert!(cmd.contains("INTENDANT_PROGRESS_FILE="));
         assert!(cmd.contains("INTENDANT_INHERIT_MEMORY=1"));
@@ -540,8 +536,8 @@ mod tests {
 
     #[test]
     fn shell_escape_simple() {
-        assert_eq!(shell_escape("hello"), "hello");
-        assert_eq!(shell_escape("/usr/bin/caller"), "/usr/bin/caller");
+        assert_eq!(shell_escape("hello"), "'hello'");
+        assert_eq!(shell_escape("/usr/bin/caller"), "'/usr/bin/caller'");
     }
 
     #[test]
@@ -552,5 +548,25 @@ mod tests {
     #[test]
     fn shell_escape_with_quotes() {
         assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_escape_empty() {
+        assert_eq!(shell_escape(""), "''");
+    }
+
+    #[test]
+    fn shell_escape_newlines() {
+        assert_eq!(shell_escape("line1\nline2"), "'line1\nline2'");
+    }
+
+    #[test]
+    fn shell_escape_tabs() {
+        assert_eq!(shell_escape("col1\tcol2"), "'col1\tcol2'");
+    }
+
+    #[test]
+    fn shell_escape_dollar() {
+        assert_eq!(shell_escape("$HOME"), "'$HOME'");
     }
 }

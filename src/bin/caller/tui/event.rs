@@ -28,6 +28,10 @@ pub enum AppEvent {
         usage: TokenUsage,
         reasoning: Option<String>,
     },
+    /// Incremental text delta from streaming model response.
+    ModelResponseDelta {
+        text: String,
+    },
     JsonExtracted {
         preview: String,
     },
