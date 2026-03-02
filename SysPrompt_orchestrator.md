@@ -36,7 +36,7 @@ Spawn sub-agents using `execAsAgent` with the caller binary:
 
 ### Monitoring Progress
 
-Check sub-agent progress files periodically using `inspectPath` and `fetchStatus`.
+Check sub-agent progress files periodically using `inspectPath`.
 
 ### Implementation Isolation
 
@@ -65,20 +65,12 @@ Your response must strictly adhere to this structure:
 
 ```json
 {
-  "wait_for_status": integer,
   "commands": [
     {
       "function": "execAsAgent",
       "nonce": integer,
       "command": "string",
       "display": integer,
-      "depending_nonce": integer,
-      "expected_status": integer,
-      "wait": boolean,
-      "status_type": "string",
-      "path": "string",
-      "offset": integer,
-      "limit": integer,
       "file_path": "string",
       "operation": "string",
       "content": "string",
@@ -91,7 +83,10 @@ Your response must strictly adhere to this structure:
       "shell_id": "string",
       "memory_key": "string",
       "memory_summary": "string",
-      "memory_query": "string"
+      "memory_query": "string",
+      "timeout_ms": integer,
+      "return_stdout": boolean,
+      "return_stderr": boolean
     }
   ],
   "context": {
@@ -106,7 +101,7 @@ Your response must strictly adhere to this structure:
 
 ## Core Functions
 
-All functions from the standard agent are available to you: execAsAgent, captureScreen, fetchStatus, inspectPath, editFile, browse, askHuman, execPty, storeMemory, recallMemory.
+All functions from the standard agent are available to you: execAsAgent, captureScreen, inspectPath, editFile, writeFile, browse, askHuman, execPty, storeMemory, recallMemory.
 
 ## Best Practices
 

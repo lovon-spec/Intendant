@@ -4,6 +4,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
+/// Maximum bytes to read from agent stdout/stderr (64 MB).
+const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
 pub struct AgentOutput {
     pub stdout: String,
     pub stderr: String,
@@ -54,15 +57,15 @@ pub async fn run_agent(
     let hard_timeout_secs: u64 = if has_ask_human(json_input) { 600 } else { 120 };
     let hard_timeout = Duration::from_secs(hard_timeout_secs);
 
-    // Read stdout and stderr, then wait for exit, all under a single hard timeout
+    // Read stdout and stderr (bounded), then wait for exit, all under a single hard timeout
     let result = timeout(hard_timeout, async {
-        let mut stdout_buf = Vec::new();
-        let mut stderr_buf = Vec::new();
+        let mut stdout_buf = Vec::with_capacity(8192);
+        let mut stderr_buf = Vec::with_capacity(8192);
         if let Some(mut stdout) = child.stdout.take() {
-            let _ = stdout.read_to_end(&mut stdout_buf).await;
+            let _ = (&mut stdout).take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut stdout_buf).await;
         }
         if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_end(&mut stderr_buf).await;
+            let _ = (&mut stderr).take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut stderr_buf).await;
         }
         let _ = child.wait().await;
         (stdout_buf, stderr_buf)

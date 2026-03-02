@@ -921,7 +921,13 @@ impl IntendantServer {
 
             // exec() replaces the process image. stdin/stdout fds survive.
             use std::os::unix::process::CommandExt;
-            let exe = std::env::current_exe().expect("current_exe");
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("reload failed: cannot determine current exe: {}", e);
+                    return;
+                }
+            };
             let err = std::process::Command::new(exe)
                 .args(&args[1..])
                 .env("INTENDANT_MCP_RELOAD", "1")
@@ -1262,6 +1268,7 @@ mod reload_transport {
 // ---------------------------------------------------------------------------
 
 /// Exit code used to signal a reload request to a parent wrapper script.
+#[allow(dead_code)]
 pub const RELOAD_EXIT_CODE: i32 = 42;
 
 /// Run the MCP server on stdio. This replaces the TUI — the external agent

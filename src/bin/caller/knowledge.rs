@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::error::CallerError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,6 +41,7 @@ impl Default for KnowledgeStore {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct KnowledgeQuery {
     pub tags: Option<Vec<String>>,
@@ -52,6 +51,7 @@ pub struct KnowledgeQuery {
     pub since: Option<u64>,
 }
 
+#[allow(dead_code)]
 pub fn publish(store: &mut KnowledgeStore, entry: KnowledgeEntry) {
     // Check if entry with same key and source exists
     if let Some(existing) = store
@@ -68,6 +68,7 @@ pub fn publish(store: &mut KnowledgeStore, entry: KnowledgeEntry) {
     }
 }
 
+#[allow(dead_code)]
 pub fn query<'a>(store: &'a KnowledgeStore, q: &KnowledgeQuery) -> Vec<&'a KnowledgeEntry> {
     store
         .entries
@@ -108,6 +109,7 @@ pub fn query<'a>(store: &'a KnowledgeStore, q: &KnowledgeQuery) -> Vec<&'a Knowl
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn subscribe(store: &mut KnowledgeStore, agent_id: &str, channel: &str) {
     store
         .subscriptions
@@ -122,6 +124,7 @@ pub fn subscribe(store: &mut KnowledgeStore, agent_id: &str, channel: &str) {
     }
 }
 
+#[allow(dead_code)]
 pub fn get_unseen<'a>(store: &'a KnowledgeStore, agent_id: &str) -> Vec<&'a KnowledgeEntry> {
     let cursor = store.cursors.get(agent_id).copied().unwrap_or(0);
     let channels = match store.subscriptions.get(agent_id) {
@@ -135,6 +138,7 @@ pub fn get_unseen<'a>(store: &'a KnowledgeStore, agent_id: &str) -> Vec<&'a Know
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn advance_cursor(store: &mut KnowledgeStore, agent_id: &str) {
     store
         .cursors
@@ -192,6 +196,7 @@ fn migrate_from_old_format(content: &str) -> Result<KnowledgeStore, CallerError>
     Ok(new_store)
 }
 
+#[allow(dead_code)]
 pub fn save(store: &KnowledgeStore, path: &Path) -> Result<(), CallerError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -222,6 +227,7 @@ pub fn format_for_injection(entries: &[&KnowledgeEntry]) -> String {
     msg
 }
 
+#[allow(dead_code)]
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -229,6 +235,7 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
+#[allow(dead_code)]
 pub fn route_knowledge<'a>(
     store: &'a KnowledgeStore,
     active_agent_ids: &[String],

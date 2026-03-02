@@ -245,7 +245,17 @@ fn classify_shell_command(cmd: &str) -> Vec<ActionCategory> {
     let lower = cmd.to_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
 
-    let first = tokens.first().copied().unwrap_or("");
+    // Skip leading `sudo` to classify the actual command
+    let first = if tokens.first().copied() == Some("sudo") {
+        tokens.get(1).copied().unwrap_or("")
+    } else {
+        tokens.first().copied().unwrap_or("")
+    };
+
+    // Detect sudo usage as destructive (privilege escalation)
+    if tokens.first().copied() == Some("sudo") {
+        categories.push(ActionCategory::Destructive);
+    }
 
     // Destructive commands
     let destructive_commands = [

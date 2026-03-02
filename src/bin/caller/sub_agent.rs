@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::error::CallerError;
 use crate::provider::TokenUsage;
 use serde::{Deserialize, Serialize};
@@ -76,15 +74,15 @@ pub struct SubAgentProgress {
 pub fn build_spawn_command(spec: &SubAgentSpec, caller_path: &Path) -> String {
     let caller = caller_path.to_string_lossy();
     let mut env_parts = vec![
-        format!("INTENDANT_ROLE={}", spec.role.as_str()),
-        format!("INTENDANT_ID={}", spec.id),
+        format!("INTENDANT_ROLE={}", shell_escape(spec.role.as_str())),
+        format!("INTENDANT_ID={}", shell_escape(&spec.id)),
         format!(
             "INTENDANT_RESULT_FILE={}",
-            spec.result_file.to_string_lossy()
+            shell_escape(&spec.result_file.to_string_lossy())
         ),
         format!(
             "INTENDANT_PROGRESS_FILE={}",
-            spec.progress_file.to_string_lossy()
+            shell_escape(&spec.progress_file.to_string_lossy())
         ),
     ];
 
@@ -93,7 +91,7 @@ pub fn build_spawn_command(spec: &SubAgentSpec, caller_path: &Path) -> String {
     }
 
     if let Some(ref prompt) = spec.system_prompt {
-        env_parts.push(format!("INTENDANT_SYSTEM_PROMPT={}", prompt));
+        env_parts.push(format!("INTENDANT_SYSTEM_PROMPT={}", shell_escape(prompt)));
     }
 
     let env_str = env_parts.join(" ");
@@ -291,7 +289,7 @@ mod tests {
         let mut spec = make_spec();
         spec.system_prompt = Some("Custom prompt".to_string());
         let cmd = build_spawn_command(&spec, Path::new("/usr/local/bin/intendant"));
-        assert!(cmd.contains("INTENDANT_SYSTEM_PROMPT=Custom prompt"));
+        assert!(cmd.contains("INTENDANT_SYSTEM_PROMPT='Custom prompt'"));
     }
 
     #[test]

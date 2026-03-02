@@ -1,15 +1,14 @@
 # Intendant
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles via shared memory-style state files, executes commands sequentially (blocking until completion), and persists logs across binary restarts. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles with in-memory state, executes commands sequentially (blocking until completion), and persists structured session logs. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
 ```
 stdin (JSON) --> intendant-runtime --> executes commands sequentially (blocking)
                   |
-                  +--> $INTENDANT_SHARED_DIR/intendant_processes (or /dev/shm, or temp dir)
-                  +--> $INTENDANT_SHARED_DIR/intendant_session   (or /dev/shm, or temp dir)
-                  +--> ~/.intendant/logs/<timestamp>/  (stdout/stderr logs per nonce)
+                  +--> in-memory process state (HashMap<nonce, ProcessInfo>)
+                  +--> $INTENDANT_LOG_DIR/  (stdout/stderr logs per nonce)
                   |
                   +--> stdout (result lines with exit code, stdout/stderr tail)
 
@@ -30,9 +29,8 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   +--> Tagged knowledge store with pub/sub channels between agents
 ```
 
-- **Shared Process State (`intendant_processes`):** Fixed-size array of `ProcessInfo` structs (1024 slots). Each slot stores nonce, PID, status, exit code, and timestamp. Path resolves via `INTENDANT_SHARED_DIR`, then `/dev/shm` if available, else OS temp dir.
-- **Session File (`intendant_session`):** Stores the log directory path so consecutive runs reuse the same directory. Uses the same shared-dir resolution.
-- **Log Directory (`~/.intendant/logs/<timestamp>/`):** Per-nonce stdout and stderr log files, plus structured session logs. Created once per session.
+- **Process State:** In-memory `HashMap<u64, ProcessInfo>` tracking nonce, PID, status, exit code, and timestamp. Ephemeral — does not survive binary restarts.
+- **Session Directory (`~/.intendant/logs/<uuid>/`):** Per-session directory with UUID-based naming. Contains per-nonce stdout/stderr log files, structured session logs, conversation history, and askHuman IPC files. The log directory is passed to the runtime via `INTENDANT_LOG_DIR`.
 - **Execution Model:** Commands are processed sequentially. Each command blocks until completion and returns its result directly (exit code, stdout tail, stderr tail). The runtime exits after processing all commands.
 
 ## Building
@@ -173,17 +171,17 @@ cargo test
 
 The test suite covers both binaries:
 
-- **Agent binary:** models serialization, error types, shared memory operations, nonce replacement, path inspection, blocking command execution, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
+- **Agent binary:** models serialization, error types, process state operations, nonce replacement, path inspection, blocking command execution, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
 - **Caller binary:** JSON extraction, done signal handling, conversation management with message layer protection and tool call tracking, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, native tool definitions (11 tools, provider conversion formats), tool call batch assembly and result routing, Gemini provider request/response format, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults, tools-mode variant), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, session log file creation, model summary formatting, Xvfb display configuration per provider, and dynamic display allocation.
 
 ## Session Logging
 
-Each `intendant` invocation creates a structured session log directory at `~/.intendant/logs/<timestamp>_<pid>/`. The log provides full observability for debugging and post-session analysis.
+Each `intendant` invocation creates a structured session log directory at `~/.intendant/logs/<uuid>/`. The log provides full observability for debugging and post-session analysis.
 
 ### Directory Structure
 
 ```
-~/.intendant/logs/20260219_040037_119700/
+~/.intendant/logs/<uuid>/
 ├── session.jsonl                    # Structured event log (one JSON per line)
 ├── summary.json                     # Post-session summary (task, outcome, turns)
 ├── 1_stdout.log                     # Runtime stdout for nonce 1
@@ -230,17 +228,16 @@ grep '"event":"agent_input"' ~/.intendant/logs/<session>/session.jsonl | jq -r '
 
 ## Session Management
 
-State persists across binary restarts via the shared state directory:
+Each invocation creates an isolated session with a UUID-based directory at `~/.intendant/logs/<uuid>/`. No global state files are used.
 
-- **Process state** is stored in `intendant_processes`.
-- **Log directory marker** is stored in `intendant_session`.
-- Shared path resolution: `INTENDANT_SHARED_DIR` -> `/dev/shm` (if present) -> system temp dir.
+- **Process state** is in-memory (ephemeral, per-invocation).
+- **Session logs** persist in the session directory.
+- **Conversation history** is saved to `conversation.jsonl` for resume support.
 
-To reset all state (start a fresh session):
-
+Sessions can be resumed:
 ```bash
-rm -f "${INTENDANT_SHARED_DIR:-/dev/shm}/intendant_processes" \
-      "${INTENDANT_SHARED_DIR:-/dev/shm}/intendant_session"
+./target/release/intendant --continue "fix that bug"     # Resume most recent session for this project
+./target/release/intendant --resume abc123 "continue"     # Resume specific session by ID or prefix
 ```
 
 ## AI Caller
@@ -387,7 +384,6 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 | `PROVIDER` | auto-detect | `"openai"`, `"anthropic"`, or `"gemini"` (used when multiple keys are set) |
 | `MODEL_NAME` | per-provider default | Model to use (e.g. `gpt-5.2-codex`, `claude-sonnet-4-5-20250929`, `gemini-2.5-pro`) |
 | `USE_NATIVE_TOOLS` | `true` | Enable native API tool calling; `false` falls back to text-based JSON extraction |
-| `INTENDANT_HARD_TIMEOUT` | `120` | Maximum seconds to wait for agent completion (600s for askHuman) |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
 | `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call (sent to API) |
 | `STRUCTURED_OUTPUT` | `true` for gpt-5+/o3/o4 | Enable JSON object mode for deterministic parsing |
@@ -399,9 +395,9 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 | `INTENDANT_PROGRESS_FILE` | — | Path for sub-agent to write periodic progress |
 | `INTENDANT_TASK` | — | Task description for sub-agent mode |
 | `INTENDANT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
-| `INTENDANT_SHARED_DIR` | auto | Shared state directory for process/session/human I/O files (`/dev/shm` if available, else temp dir) |
+| `INTENDANT_LOG_DIR` | auto | Session log directory (set automatically by caller for the runtime) |
 
-The hard timeout is automatically extended to 600s when `askHuman` is present in the command batch.
+The agent runner hard timeout is 120s default, automatically extended to 600s when `askHuman` is present in the command batch.
 
 ### Project Configuration
 
@@ -502,7 +498,7 @@ Override the global level for specific action categories. Rules: `auto` (always 
 **Layer 3 — Per-action approval** (TUI panel):
 When approval is needed, the agent loop pauses and the TUI shows the command preview. The user can approve, skip, deny, or switch to auto-approve mode.
 
-Action categories are determined by analyzing command JSON: shell commands are classified by inspecting for destructive patterns (`rm`, `kill`, `dd`, `mkfs`), network operations (`curl`, `wget`, `ssh`), file operations, etc.
+Action categories are determined by analyzing command JSON: shell commands are classified by inspecting for destructive patterns (`rm`, `kill`, `dd`, `mkfs`, `sudo`), network operations (`curl`, `wget`, `ssh`), file operations, etc.
 
 ## Control Socket
 

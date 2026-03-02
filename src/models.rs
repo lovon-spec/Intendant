@@ -42,6 +42,7 @@ pub struct AgentInput {
     pub commands: Vec<Command>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessInfo {
     pub nonce: u64,

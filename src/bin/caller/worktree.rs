@@ -1,9 +1,8 @@
-#![allow(dead_code)]
-
 use crate::error::CallerError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Worktree {
     pub branch_name: String,
@@ -11,12 +10,14 @@ pub struct Worktree {
     pub base_branch: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum MergeResult {
     Clean,
     Conflict(String),
 }
 
+#[allow(dead_code)]
 pub fn create(project_root: &Path, branch: &str, base: &str) -> Result<Worktree, CallerError> {
     let worktree_path = project_root
         .join(".intendant")
@@ -51,6 +52,7 @@ pub fn create(project_root: &Path, branch: &str, base: &str) -> Result<Worktree,
     })
 }
 
+#[allow(dead_code)]
 pub fn remove(project_root: &Path, wt: &Worktree) -> Result<(), CallerError> {
     let output = Command::new("git")
         .args(["worktree", "remove", &wt.path.to_string_lossy()])
@@ -75,6 +77,7 @@ pub fn remove(project_root: &Path, wt: &Worktree) -> Result<(), CallerError> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn merge(project_root: &Path, wt: &Worktree, target: &str) -> Result<MergeResult, CallerError> {
     let output = Command::new("git")
         .args(["merge", &wt.branch_name, "--no-edit"])
@@ -105,6 +108,7 @@ pub fn merge(project_root: &Path, wt: &Worktree, target: &str) -> Result<MergeRe
     }
 }
 
+#[allow(dead_code)]
 pub fn list(project_root: &Path) -> Result<Vec<Worktree>, CallerError> {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])

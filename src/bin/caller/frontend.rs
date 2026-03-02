@@ -84,6 +84,7 @@ pub struct HumanQuestionSnapshot {
 ///
 /// Adding a variant here forces both the TUI rendering and MCP resource
 /// handler to provide the data.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateQuery {
     /// Current status bar information.
@@ -382,6 +383,7 @@ pub fn log_level_to_str(level: &LogLevel) -> &'static str {
 }
 
 /// Parse a log level filter string back to a LogLevel.
+#[allow(dead_code)]
 pub fn parse_log_level(s: &str) -> Option<LogLevel> {
     match s.to_lowercase().as_str() {
         "info" => Some(LogLevel::Info),

@@ -8,7 +8,7 @@ use std::{
     io::{Read as _, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, RwLock},
+    sync::{Arc, LazyLock, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,6 +16,14 @@ use chrono::Local;
 use tokio::process::Command;
 
 use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, PtySize};
+
+static ANSI_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\r").unwrap()
+});
+
+static NONCE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\$NONCE\[(\d+)\]").unwrap()
+});
 
 struct PtySession {
     writer: Box<dyn std::io::Write + Send>,
@@ -283,6 +291,12 @@ impl Agent {
             .arg("-c")
             .arg(&command)
             .env("DISPLAY", format!(":{}", display_id))
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("GEMINI_API_KEY")
+            .env_remove("GEMINI")
+            .env_remove("OPENAI")
+            .env_remove("ANTHROPIC")
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
         if let Some(ref xauth) = self.session_xauthority {
@@ -515,8 +529,7 @@ impl Agent {
         }
 
         // Clean output: strip ANSI escapes and carriage returns
-        let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\r").unwrap();
-        let cleaned = ansi_re.replace_all(&output, "").to_string();
+        let cleaned = ANSI_RE.replace_all(&output, "").to_string();
 
         // Extract content between start_marker and end_marker
         let content = if let Some(start_pos) = cleaned.find(&start_marker) {
@@ -939,7 +952,9 @@ impl Agent {
 
         if is_new_format {
             // New KnowledgeStore format (Vec)
-            let entries = data["entries"].as_array_mut().unwrap();
+            let entries = data["entries"].as_array_mut().ok_or_else(|| {
+                AgentError::Process("Corrupted memory file: 'entries' is not an array".to_string())
+            })?;
             let existing_idx = entries.iter().position(|e| {
                 e.get("key").and_then(|k| k.as_str()) == Some(key.as_str())
                     && e.get("source").and_then(|s| s.as_str()) == Some(source.as_str())
@@ -1296,10 +1311,9 @@ impl Agent {
     }
 
     fn replace_nonce_refs(&self, command: &str) -> Result<String, AgentError> {
-        let re = regex::Regex::new(r"\$NONCE\[(\d+)\]").unwrap();
         let mut result = command.to_string();
 
-        for cap in re.captures_iter(command) {
+        for cap in NONCE_RE.captures_iter(command) {
             let nonce: u64 = cap[1].parse().map_err(|_| {
                 AgentError::Process(format!("Invalid nonce reference: {}", &cap[1]))
             })?;

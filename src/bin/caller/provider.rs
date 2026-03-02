@@ -5,6 +5,17 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::time::Duration;
+
+/// HTTP client timeout for API requests (120 seconds).
+const API_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn api_client() -> Client {
+    Client::builder()
+        .timeout(API_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -180,7 +191,7 @@ impl OpenAIProvider {
         let use_tools = resolve_use_tools();
 
         Self {
-            client: Client::new(),
+            client: api_client(),
             api_key,
             model,
             context_window,
@@ -512,7 +523,7 @@ impl AnthropicProvider {
     ) -> Self {
         let use_tools = resolve_use_tools();
         Self {
-            client: Client::new(),
+            client: api_client(),
             api_key,
             model,
             context_window,
@@ -730,7 +741,7 @@ impl GeminiProvider {
             "https://generativelanguage.googleapis.com".to_string()
         });
         Self {
-            client: Client::new(),
+            client: api_client(),
             api_key,
             model,
             context_window,
@@ -845,14 +856,15 @@ impl ChatProvider for GeminiProvider {
         }
 
         let url = format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            self.endpoint, self.model, self.api_key
+            "{}/v1beta/models/{}:generateContent",
+            self.endpoint, self.model
         );
 
         let response = self
             .client
             .post(&url)
             .header("content-type", "application/json")
+            .header("x-goog-api-key", &self.api_key)
             .json(&request_body)
             .send()
             .await?;

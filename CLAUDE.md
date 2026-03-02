@@ -2,11 +2,11 @@
 
 ## Project Overview
 
-This is **Intendant**, a Rust runtime for autonomous AI agents with process lifecycle management. It executes bash commands on behalf of AI agents, tracks process state via shared memory, and persists logs across binary restarts.
+This is **Intendant**, a Rust runtime for autonomous AI agents with process lifecycle management. It executes bash commands on behalf of AI agents, tracks process state in memory, and persists structured logs per session.
 
 The project produces two binaries:
 - **intendant-runtime** — Command runtime that reads JSON from stdin, executes commands sequentially (blocking until completion), and writes result lines to stdout
-- **intendant** — AI integration layer (CLI/TUI) that drives the runtime via the OpenAI Responses API or Anthropic Messages API in a loop
+- **intendant** — AI integration layer (CLI/TUI/MCP) that drives the runtime via the OpenAI Responses API, Anthropic Messages API, or Gemini API in a loop
 
 ## Repository Structure
 
@@ -14,11 +14,11 @@ The project produces two binaries:
 src/
 ├── main.rs              # intendant-runtime binary entry point (tokio async main)
 ├── agent.rs             # Core agent implementation
-│                        #   - Shared memory management
+│                        #   - In-memory process state (HashMap<u64, ProcessInfo>)
 │                        #   - Blocking command execution (execAsAgent) — returns exit code, stdout/stderr tail
 │                        #   - Screenshot capture (captureScreen)
 │                        #   - Path inspection (inspectPath)
-│                        #   - File editing (editFile)
+│                        #   - File editing (editFile) / writing (writeFile)
 │                        #   - Web browsing (browse)
 │                        #   - Human interaction (askHuman)
 │                        #   - PTY sessions (execPty)
@@ -30,7 +30,7 @@ src/
 └── bin/
     └── caller/
         ├── main.rs          # intendant entry point: 3 modes (user/sub-agent/direct), budget-aware loop, TUI init
-        ├── provider.rs      # Multi-provider API client (OpenAI Responses API + Anthropic), structured output, reasoning controls
+        ├── provider.rs      # Multi-provider API client (OpenAI Responses API + Anthropic + Gemini), structured output, reasoning controls
         ├── conversation.rs  # Message management with layer protection, drop/summarize, budget tracking
         ├── agent_runner.rs  # Spawns intendant-runtime subprocess, waits for completion with hard timeout (askHuman-aware)
         ├── knowledge.rs     # Tagged knowledge store with pub/sub channels, cursor-based routing
@@ -42,6 +42,11 @@ src/
         ├── project.rs       # Project detection (git root), config parsing (intendant.toml + [approval])
         ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
         ├── control.rs       # Unix control socket server (JSON-line protocol at /tmp/intendant-<pid>.sock)
+        ├── frontend.rs      # Shared frontend contract for TUI and MCP (UserAction enum, state queries)
+        ├── tools.rs         # Native tool definitions (11 tools), provider format conversion
+        ├── mcp.rs           # MCP server implementation (rmcp-based, stdio transport, hot-reload)
+        ├── vision.rs        # Xvfb display management, per-provider resolution
+        ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
             ├── mod.rs       # Tui struct: terminal init/restore, panic hook, render+event loop
@@ -50,7 +55,8 @@ src/
             ├── widgets.rs   # StatusBar, LogPanel, ActionPanel, InputPanel, ApprovalPanel rendering
             ├── layout.rs    # Panel sizing with constraints, responsive to terminal size
             └── theme.rs     # Color/style constants (Catppuccin Mocha-inspired)
-SysPrompt.md                 # Default system prompt (direct mode)
+SysPrompt.md                 # Default system prompt (direct mode, text-based JSON extraction)
+SysPrompt_tools.md           # Condensed prompt for native tool calling mode
 SysPrompt_user.md            # User-facing mode prompt
 SysPrompt_orchestrator.md    # Orchestrator agent prompt
 SysPrompt_research.md        # Research sub-agent prompt
@@ -76,8 +82,11 @@ Running the CLI (requires `.env` with API key):
 ./target/release/intendant --no-tui "echo hello"          # Headless (no TUI)
 ./target/release/intendant --autonomy low "rm /tmp/test"   # Ask before every command
 ./target/release/intendant --provider anthropic --model claude-sonnet-4-5-20250929 "task"
+./target/release/intendant --provider gemini --model gemini-2.5-pro "task"
 ./target/release/intendant --continue "fix that bug"       # Resume most recent session
 ./target/release/intendant --resume abc123 "continue"      # Resume specific session by ID
+./target/release/intendant --mcp "task"                    # Run as MCP server on stdio
+./target/release/intendant --vision "screenshot test"      # Launch with Xvfb virtual display
 echo "task" | ./target/release/intendant                   # Auto-detects non-TTY, runs headless
 ```
 
@@ -88,7 +97,7 @@ cargo test                # Run all tests
 cargo test -- --list      # List all test names
 ```
 
-All tests are inline `#[cfg(test)]` modules in the same files as the code they test. Async tests use `#[tokio::test]`. The `tempfile` crate provides isolated temporary directories for tests that touch the filesystem or shared memory.
+All tests are inline `#[cfg(test)]` modules in the same files as the code they test. Async tests use `#[tokio::test]`. The `tempfile` crate provides isolated temporary directories for tests that touch the filesystem.
 
 Test coverage includes:
 - **agent.rs**: Process info operations, blocking command execution, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters
@@ -116,14 +125,16 @@ Test coverage includes:
 - **caller/tui/mod.rs**: TestBackend rendering (default state, log entries, approval panel, help overlay, all phases, verbose modes, small terminal)
 - **caller/agent_runner.rs**: askHuman detection in JSON input
 - **caller/session_log.rs**: UUID-based session directories, session metadata (write_meta, find_latest_session, find_session_by_id), directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
+- **caller/tools.rs**: Tool definitions, provider format conversion, tool count validation
+- **caller/frontend.rs**: UserAction enum completeness, state query types, log level parsing
+- **caller/vision.rs**: Xvfb display configuration per provider, dynamic display allocation
+- **caller/mcp.rs**: MCP state management, process_action_sync, resource definitions, tool parameter schemas, event-to-state mappings
 
 ## Architecture Details
 
-### Shared Memory
+### Process State
 
-Process state lives in `/dev/shm/intendant_processes` — a fixed-size array of 1024 `ProcessInfo` slots (repr(C) structs). Each slot holds: nonce (u64), PID (i32), status (u8), exit code (i32), timestamp (u64). This survives binary restarts since `/dev/shm` is tmpfs.
-
-The process map (`HashMap<u64, usize>`) is rebuilt from shared memory on every startup by scanning all 1024 slots for non-zero nonces.
+Process state (nonce → PID/status/exit_code mappings) is stored in an in-memory `HashMap<u64, ProcessInfo>` protected by `Arc<RwLock<...>>`. This state is ephemeral — it does not survive binary restarts. Each runtime invocation starts with an empty process map.
 
 ### Session Management
 
@@ -136,7 +147,7 @@ Each session directory contains:
 - `human_question` / `human_response` — askHuman IPC files (session-scoped)
 - `turns/` — per-turn model responses and agent I/O
 
-Sessions can be resumed with `--continue` (most recent session for the project) or `--resume <id>` (specific session by ID or prefix). To reset shared memory: `rm -f /dev/shm/intendant_processes`.
+Sessions can be resumed with `--continue` (most recent session for the project) or `--resume <id>` (specific session by ID or prefix).
 
 ### Execution Model
 
@@ -155,7 +166,7 @@ Commands are processed sequentially. Each command blocks until completion and re
 **User Mode** (complex task, no `INTENDANT_ROLE`): Pure subprocess monitor — makes zero model API calls. Spawns orchestrator as a child process, polls its progress file every 500ms, reads its result file on exit. `kill_on_drop(true)` ensures cleanup on TUI quit.
 
 **Direct Mode** (simple task, no `INTENDANT_ROLE`): Single-loop execution:
-1. Selects API provider (OpenAI or Anthropic) from env, configures structured output and reasoning controls
+1. Selects API provider (OpenAI, Anthropic, or Gemini) from env, configures structured output and reasoning controls
 2. Detects project root via git, loads `intendant.toml` config
 3. Reads role-appropriate system prompt
 4. Injects project knowledge into conversation
@@ -181,7 +192,7 @@ Three-layer autonomy control:
 2. **Category rules** (`[approval]` section in intendant.toml): per-category Auto/Ask/Deny
 3. **Per-action approval** (TUI only): approve/skip/approve-all/deny
 
-Commands are classified into categories (FileRead, FileWrite, FileDelete, CommandExec, NetworkRequest, Destructive, HumanInput) by `autonomy::classify_command()`. Shell commands are further classified by inspecting the command string for destructive patterns (rm, kill), network tools (curl, wget, git), and file writes (redirects, tee, mv, cp).
+Commands are classified into categories (FileRead, FileWrite, FileDelete, CommandExec, NetworkRequest, Destructive, HumanInput) by `autonomy::classify_command()`. Shell commands are further classified by inspecting the command string for destructive patterns (rm, kill, sudo), network tools (curl, wget, git), and file writes (redirects, tee, mv, cp). The `sudo` prefix is detected as Destructive and the actual command after `sudo` is also classified.
 
 ### Control Socket
 
@@ -206,7 +217,7 @@ The `reload` MCP tool rebuilds the binary and replaces the running process via `
 - **Error handling**: Custom `thiserror`-based enums (`AgentError`, `CallerError`) with `Result<T>` returns
 - **Async**: tokio with full features; background tasks via `tokio::spawn`
 - **Shared state**: `Arc<RwLock<T>>` for mutable shared state, `mpsc` channels for communication
-- **Unsafe code**: Used sparingly for memory-mapped file pointer operations (reading/writing `ProcessInfo` structs to shared memory)
+- **No unsafe code**: The codebase contains no `unsafe` blocks
 - **Tests**: Always inline `#[cfg(test)]` modules — no separate test files
 
 ## Dependencies
@@ -216,16 +227,19 @@ The `reload` MCP tool rebuilds the binary and replaces the running process via `
 | `tokio` (full) | Async runtime |
 | `serde` + `serde_json` | JSON serialization/deserialization |
 | `thiserror` | Error type derivation |
-| `memmap2` | Memory-mapped files for shared memory |
 | `chrono` | Timestamp formatting for log directories |
 | `env_logger` | Logging |
-| `regex` | $NONCE[id] pattern matching |
+| `regex` | $NONCE[id] pattern matching, ANSI escape stripping |
 | `reqwest` (rustls-tls) | HTTP client for API calls |
 | `html2text` | HTML to plain text conversion for browse |
 | `portable-pty` | PTY session management for execPty |
 | `dotenvy` | .env file loading |
 | `toml` | intendant.toml config parsing |
 | `async-trait` | Async trait support for ChatProvider |
+| `uuid` (v4) | Session ID generation |
+| `dirs` | Platform config directory resolution |
+| `rmcp` (server, transport-io) | MCP server framework |
+| `schemars` | JSON schema derivation for MCP tool parameters |
 | `ratatui` | Terminal UI framework |
 | `crossterm` | Terminal input/output backend (event-stream feature) |
 | `tui-textarea` | Text input widget for askHuman responses |
@@ -234,9 +248,9 @@ The `reload` MCP tool rebuilds the binary and replaces the running process via `
 
 ## Environment Requirements
 
-- **OS**: Linux (requires `/dev/shm` for shared memory)
+- **OS**: Linux
 - **Permissions**: Runs as unprivileged user with passwordless sudo
-- **For intendant**: `.env` file with `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optional `PROVIDER`, `MODEL_NAME`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`, `INTENDANT_LOG_DIR` (set automatically by caller for the runtime)
+- **For intendant**: `.env` file with `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`. Optional: `PROVIDER`, `MODEL_NAME`, `USE_NATIVE_TOOLS`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`, `INTENDANT_LOG_DIR` (set automatically by caller for the runtime)
 - **For captureScreen**: ImageMagick `import` command and DISPLAY environment variable (defaults to `:1`)
 
 ## CI/CD

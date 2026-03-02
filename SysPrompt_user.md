@@ -38,6 +38,6 @@ The orchestrator will handle task decomposition, sub-agent coordination, and res
 
 ## Progress Monitoring
 
-Use `fetchStatus` to check orchestrator progress. The orchestrator writes periodic updates to its progress file and a final result to its result file.
+The orchestrator writes periodic updates to its progress file and a final result to its result file. Use `inspectPath` to check these files for progress.
 
 ===SYSTEM PROMPT END===

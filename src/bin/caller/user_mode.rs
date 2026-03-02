@@ -1,6 +1,7 @@
 use crate::error::CallerError;
 use crate::project::Project;
 use crate::sub_agent::{SubAgentProgress, SubAgentRole, SubAgentSpec};
+use crate::tui::widgets::truncate_utf8;
 use std::path::{Path, PathBuf};
 
 pub fn spawn_orchestrator_spec(task: &str, project: &Project, _caller_path: &Path) -> SubAgentSpec {
@@ -53,17 +54,6 @@ pub fn get_caller_path() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("intendant")))
         .unwrap_or_else(|| PathBuf::from("./target/debug/intendant"))
-}
-
-fn truncate_utf8(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 #[cfg(test)]

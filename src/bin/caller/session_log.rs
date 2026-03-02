@@ -118,7 +118,9 @@ impl SessionLog {
             last_turn: None,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            let _ = fs::write(self.dir.join("session_meta.json"), json);
+            if let Err(e) = fs::write(self.dir.join("session_meta.json"), json) {
+                eprintln!("session_log: failed to write session_meta.json: {}", e);
+            }
         }
     }
 
@@ -244,7 +246,9 @@ impl SessionLog {
 
     fn emit(&mut self, event: LogEvent) {
         if let Ok(json) = serde_json::to_string(&event) {
-            let _ = writeln!(self.writer, "{}", json);
+            if let Err(e) = writeln!(self.writer, "{}", json) {
+                eprintln!("session_log: failed to write log event: {}", e);
+            }
             let _ = self.writer.flush();
         }
     }
@@ -563,7 +567,9 @@ impl SessionLog {
         });
         let path = self.dir.join("summary.json");
         if let Ok(pretty) = serde_json::to_string_pretty(&summary) {
-            let _ = fs::write(path, pretty);
+            if let Err(e) = fs::write(&path, &pretty) {
+                eprintln!("session_log: failed to write summary.json: {}", e);
+            }
         }
 
         // Update session_meta.json with completion status
@@ -573,7 +579,9 @@ impl SessionLog {
                 meta.status = Some("completed".to_string());
                 meta.last_turn = Some(total_turns);
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                    let _ = fs::write(&meta_path, json);
+                    if let Err(e) = fs::write(&meta_path, &json) {
+                        eprintln!("session_log: failed to update session_meta.json: {}", e);
+                    }
                 }
             }
         }
