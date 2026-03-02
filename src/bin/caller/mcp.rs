@@ -1833,15 +1833,24 @@ impl IntendantServer {
     ) -> String {
         let mut s = self.state.write().await;
         let log_dir = s.log_dir.clone();
+        let requested_restart_id = params.restart_id.as_deref();
         let Some(active) = s.controller_restart.as_mut() else {
-            return "No controller restart is scheduled".to_string();
+            return schedule_error_response(
+                "No controller restart is scheduled".to_string(),
+                requested_restart_id,
+                None,
+            );
         };
 
-        if let Some(expected_id) = params.restart_id {
+        if let Some(expected_id) = requested_restart_id {
             if expected_id != active.restart_id {
-                return format!(
-                    "restart_id '{}' does not match active '{}'",
-                    expected_id, active.restart_id
+                return schedule_error_response(
+                    format!(
+                        "restart_id '{}' does not match active '{}'",
+                        expected_id, active.restart_id
+                    ),
+                    Some(active.restart_id.as_str()),
+                    Some(active.phase),
                 );
             }
         }
@@ -1856,7 +1865,13 @@ impl IntendantServer {
             LogLevel::Info,
             format!("Controller restart cancelled (id={})", restart_id),
         );
-        "ok".to_string()
+        serde_json::json!({
+            "status": "cancelled",
+            "ok": true,
+            "restart_id": restart_id,
+            "phase": RestartPhase::Cancelled,
+        })
+        .to_string()
     }
 
     #[tool(
@@ -3097,5 +3112,61 @@ mod tests {
             json["error"].as_str(),
             Some("turn_complete_token is invalid")
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_controller_restart_returns_json_success_payload() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state, bus);
+
+        let scheduled = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled).unwrap();
+        let restart_id = scheduled_json["restart_id"].as_str().unwrap().to_string();
+
+        let output = server
+            .cancel_controller_restart(Parameters(CancelControllerRestartParams {
+                restart_id: Some(restart_id.clone()),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(true));
+        assert_eq!(json["status"].as_str(), Some("cancelled"));
+        assert_eq!(json["restart_id"].as_str(), Some(restart_id.as_str()));
+        assert_eq!(json["phase"].as_str(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cancel_controller_restart_returns_json_error_payload() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state, bus);
+
+        let output = server
+            .cancel_controller_restart(Parameters(CancelControllerRestartParams {
+                restart_id: Some("abc".to_string()),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(false));
+        assert_eq!(json["status"].as_str(), Some("rejected"));
+        assert_eq!(
+            json["error"].as_str(),
+            Some("No controller restart is scheduled")
+        );
+        assert_eq!(json["restart_id"].as_str(), Some("abc"));
     }
 }

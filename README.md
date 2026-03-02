@@ -631,7 +631,7 @@ All tools mirror TUI actions. The server enforces compile-time parity — adding
 | `cancel_controller_restart` | Cancel scheduled restart | `restart_id?` |
 | `reload` | Rebuild binary and hot-reload the MCP server via exec() | — |
 
-`schedule_controller_restart` and `controller_turn_complete` return JSON payloads with an `ok` boolean and status fields. Rejections are returned as JSON (`ok: false`) with an `error` message instead of plain text.
+`schedule_controller_restart`, `controller_turn_complete`, and `cancel_controller_restart` return JSON payloads with an `ok` boolean and status fields. Rejections are returned as JSON (`ok: false`) with an `error` message instead of plain text.
 
 ### Hot Reload
 
@@ -680,6 +680,9 @@ Notes:
 - `controller_turn_complete` reports JSON results:
   - success: `"status": "completed"`, `"ok": true`, plus `"execution"` and `"phase"`.
   - rejection/pending: `"ok": false`, with `"status"` (`"rejected"` or `"restart_pending"`) and `"error"`.
+- `cancel_controller_restart` reports JSON results:
+  - success: `"status": "cancelled"`, `"ok": true`, plus `"restart_id"` and `"phase": "cancelled"`.
+  - rejection: `"status": "rejected"`, `"ok": false`, with `"error"` (and optional `"restart_id"`/`"phase"` context).
 
 Controller recursion profile (recommended for Codex/Claude-style controllers):
 - Set `auto_start_task=false` (or omit it, since `false` is the default).
