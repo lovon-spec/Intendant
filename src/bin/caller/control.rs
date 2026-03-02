@@ -1,5 +1,7 @@
 use crate::tui::event::{AppEvent, ControlMsg, EventBus};
 use serde::Serialize;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -33,6 +35,13 @@ pub enum OutboundEvent {
         phase: String,
         autonomy: String,
     },
+    CommandResult {
+        action: String,
+        ok: bool,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
 }
 
 /// Get the socket path for this process.
@@ -60,10 +69,24 @@ pub fn spawn_control_server(
                 return;
             }
         };
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
 
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let current_uid = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
+                        if let (Some(uid), Ok(cred)) = (current_uid, stream.peer_cred()) {
+                            if cred.uid() != uid {
+                                continue;
+                            }
+                        }
+                    }
+
                     let bus = bus.clone();
                     let mut outbound_rx = outbound_tx_clone.subscribe();
 
@@ -208,6 +231,19 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"status\""));
         assert!(json.contains("\"turn\":3"));
+    }
+
+    #[test]
+    fn outbound_event_command_result_serialize() {
+        let event = OutboundEvent::CommandResult {
+            action: "get_restart_status".to_string(),
+            ok: true,
+            message: "ok".to_string(),
+            data: Some(serde_json::json!({"phase":"ready"})),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event\":\"command_result\""));
+        assert!(json.contains("\"action\":\"get_restart_status\""));
     }
 
     #[test]

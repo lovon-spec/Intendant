@@ -123,7 +123,7 @@ echo '{"commands":[{"function":"recallMemory","nonce":1,"memory_query":"database
 | `editFile` | Structured file editing without shell commands | `file_path`, `operation`, `content`, `match_content`, `line_number`, `end_line` |
 | `writeFile` | Alias for `editFile` write operation | `file_path`, `content` |
 | `browse` | Fetch URL and convert HTML to text | `url` |
-| `askHuman` | Ask the operator a question and wait for response | `question` |
+| `askHuman` | Ask the operator a question and wait for response | `question`, `timeout_ms` |
 | `execPty` | Run command in a persistent PTY session | `command`, `shell_id` |
 | `storeMemory` | Store a knowledge entry with optional tags/channel | `memory_key`, `memory_summary`, `memory_file`, `memory_tags`, `memory_channel`, `memory_source` |
 | `recallMemory` | Search knowledge by keyword with optional filters | `memory_query`, `memory_file`, `memory_tags`, `memory_channel`, `memory_source`, `memory_since` |
@@ -314,7 +314,7 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
 | `--log-file <dir>` | Override session log directory |
 | `--mcp` | Run as MCP server on stdio (replaces TUI) |
-| `--control-socket` | Enable Unix control socket (TUI mode) |
+| `--control-socket` | Enable Unix control socket (TUI and MCP modes) |
 | `--vision` | Launch Xvfb virtual display (auto-allocated `:99+`) sized for the provider's vision model |
 | `--json` | JSONL structured output to stdout (implies `--no-tui`) |
 | `--sandbox` | Enable Landlock filesystem sandboxing (Linux kernel 5.13+) |
@@ -449,6 +449,8 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 GITHUB_TOKEN = "ghp_..."
 ```
 
+When sandboxing is enabled (via `--sandbox` or `[sandbox].enabled = true`), runtime command execution is restricted to read-only filesystem access plus writes to project root, `/tmp`, session log directory, `~/.intendant`, and `extra_write_paths`.
+
 ### INTENDANT.md Project Instructions
 
 Place an `INTENDANT.md` file in your project root or at `~/.config/intendant/INTENDANT.md` for global instructions. These are injected into the conversation at session start, before knowledge/memory. Both files are loaded if present (global first, project-local second).
@@ -531,11 +533,11 @@ Action categories are determined by analyzing command JSON: shell commands are c
 
 ## Control Socket
 
-When `--control-socket` is enabled in TUI mode, a Unix domain socket is created at `/tmp/intendant-<pid>.sock`.
+When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/intendant-<pid>.sock`.
 
 Current status:
 - Outbound event broadcast is implemented.
-- Inbound command handling is implemented for status, approval, denial, human input, autonomy change, and quit.
+- Inbound command handling is implemented for status, approval, denial, human input, autonomy change, quit, and controller-restart workflow commands (in MCP mode).
 - Socket server is opt-in via `--control-socket`.
 
 ### Inbound Commands (JSON-line)
@@ -546,6 +548,10 @@ Current status:
 {"action": "deny", "id": 123}
 {"action": "input", "text": "answer to askHuman"}
 {"action": "set_autonomy", "level": "high"}
+{"action": "schedule_controller_restart", "controller_id":"codex", "north_star_goal":"audit and improve", "restart_after":"turn_end"}
+{"action": "controller_turn_complete", "restart_id":"<id>", "turn_complete_token":"<token>", "status":"ok", "handoff_summary":"..."}
+{"action": "get_restart_status"}
+{"action": "cancel_controller_restart", "restart_id":"<id>"}
 {"action": "quit"}
 ```
 
@@ -558,6 +564,7 @@ Current status:
 {"event": "ask_human", "question": "Which database?"}
 {"event": "task_complete", "reason": "done signal"}
 {"event": "status", "turn": 3, "phase": "thinking", "autonomy": "medium"}
+{"event": "command_result", "action": "get_restart_status", "ok": true, "message": "ok", "data": {...}}
 ```
 
 Example usage:
@@ -616,6 +623,10 @@ All tools mirror TUI actions. The server enforces compile-time parity — adding
 | `set_verbosity` | Set log verbosity (TUI: `v`) | `level`: `"quiet"`, `"normal"`, `"verbose"`, `"debug"` |
 | `quit` | Shut down the agent (TUI: `q`) | — |
 | `start_task` | Start a new agent task | `task` |
+| `schedule_controller_restart` | Schedule a controller restart/autonomous re-init workflow | `controller_id`, `north_star_goal`, `reason?`, `restart_after?` (`"turn_end"` or `"now"`), `restart_command?`, `auto_start_task?`, `max_attempts?`, `cooldown_sec?` |
+| `controller_turn_complete` | Final handshake from controller; validates token and executes scheduled restart | `restart_id`, `turn_complete_token`, `status?`, `handoff_summary?` |
+| `get_restart_status` | Get current controller restart state (or null) | — |
+| `cancel_controller_restart` | Cancel scheduled restart | `restart_id?` |
 | `reload` | Rebuild binary and hot-reload the MCP server via exec() | — |
 
 ### Hot Reload
@@ -640,6 +651,22 @@ Resources provide push-based state observation via subscriptions. The server sen
 | `intendant://logs` | Last 100 chronological log entries (same as TUI log panel) |
 | `intendant://pending-approval` | Current pending approval request, if any |
 | `intendant://pending-input` | Current pending human question, if any |
+| `intendant://controller-restart` | Current controller restart workflow state, if any |
+
+### Controller Restart Workflow
+
+Use this when you want Intendant to trigger a controller re-init cycle safely.
+
+1. Call `schedule_controller_restart` and capture `restart_id` + `turn_complete_token`.
+2. Before ending the controlling agent turn, call `controller_turn_complete` with both values.
+3. Intendant executes restart actions:
+   - spawn `restart_command` (if provided), and/or
+   - start a fresh Intendant task using `north_star_goal` (`auto_start_task=true` by default).
+4. Inspect state via `get_restart_status` or `intendant://controller-restart`.
+
+Notes:
+- Restart state is persisted to the current session dir as `controller_restart.json`.
+- `restart_after` defaults to `"turn_end"`.
 
 ### Typical Agent Workflow
 

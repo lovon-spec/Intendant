@@ -16,27 +16,30 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         Implementation, ListResourcesResult, PaginatedRequestParams, RawResource,
         ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
-        ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
-        SubscribeRequestParams, UnsubscribeRequestParams,
+        ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+        UnsubscribeRequestParams,
     },
-    schemars, tool, tool_handler, tool_router,
+    schemars,
     service::{RequestContext, RoleServer},
+    tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use tokio::sync::{Mutex, RwLock};
+use uuid::Uuid;
 
 use crate::autonomy::{AutonomyLevel, SharedAutonomy};
+use crate::control::{self, OutboundEvent};
 use crate::frontend::{
-    self, ActionOutcome, ApprovalSnapshot, HumanQuestionSnapshot, LogEntrySnapshot,
-    StateResult, StatusSnapshot, UserAction,
+    self, ActionOutcome, ApprovalSnapshot, HumanQuestionSnapshot, LogEntrySnapshot, StateResult,
+    StatusSnapshot, UserAction,
 };
 use crate::tui::app::{LogLevel, Phase, Verbosity};
-use crate::tui::event::{AppEvent, ApprovalResponse, EventBus};
+use crate::tui::event::{AppEvent, ApprovalResponse, ControlMsg, EventBus};
 
 // ---------------------------------------------------------------------------
 // Task launcher: allows MCP to start agent loops on demand
@@ -80,6 +83,8 @@ pub struct McpAppState {
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
     pub task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Pending or completed controller restart plan.
+    pub controller_restart: Option<ControllerRestartState>,
 }
 
 /// Tracks a pending approval along with the oneshot sender.
@@ -115,6 +120,7 @@ impl McpAppState {
             log_dir,
             launcher: None,
             task_handle: None,
+            controller_restart: None,
         }
     }
 
@@ -162,11 +168,639 @@ impl McpAppState {
     }
 
     fn human_question_snapshot(&self) -> Option<HumanQuestionSnapshot> {
-        self.human_question
-            .as_ref()
-            .map(|q| HumanQuestionSnapshot {
-                question: q.clone(),
-            })
+        self.human_question.as_ref().map(|q| HumanQuestionSnapshot {
+            question: q.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartAfter {
+    TurnEnd,
+    Now,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPhase {
+    AwaitingTurnComplete,
+    Ready,
+    Restarting,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerRestartState {
+    pub restart_id: String,
+    pub controller_id: String,
+    pub north_star_goal: String,
+    pub reason: Option<String>,
+    pub restart_after: RestartAfter,
+    pub phase: RestartPhase,
+    pub turn_complete_token: String,
+    pub handoff_summary: Option<String>,
+    pub completion_status: Option<String>,
+    pub restart_command: Option<String>,
+    pub auto_start_task: bool,
+    pub max_attempts: u32,
+    pub cooldown_sec: u64,
+    pub attempts: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_result: Option<String>,
+}
+
+impl ControllerRestartState {
+    fn now_string() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn new(params: &ScheduleControllerRestartParams) -> Self {
+        let now = Self::now_string();
+        let restart_after = parse_restart_after(params.restart_after.as_deref());
+        Self {
+            restart_id: Uuid::new_v4().to_string(),
+            controller_id: params.controller_id.clone(),
+            north_star_goal: params.north_star_goal.clone(),
+            reason: params.reason.clone(),
+            restart_after,
+            phase: match restart_after {
+                RestartAfter::TurnEnd => RestartPhase::AwaitingTurnComplete,
+                RestartAfter::Now => RestartPhase::Ready,
+            },
+            turn_complete_token: Uuid::new_v4().to_string(),
+            handoff_summary: None,
+            completion_status: None,
+            restart_command: params.restart_command.clone(),
+            auto_start_task: params.auto_start_task.unwrap_or(true),
+            max_attempts: params.max_attempts.unwrap_or(1).max(1),
+            cooldown_sec: params.cooldown_sec.unwrap_or(30),
+            attempts: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_attempt_at: None,
+            last_error: None,
+            last_result: None,
+        }
+    }
+}
+
+fn parse_restart_after(raw: Option<&str>) -> RestartAfter {
+    match raw.map(str::trim).map(str::to_lowercase).as_deref() {
+        Some("now") => RestartAfter::Now,
+        _ => RestartAfter::TurnEnd,
+    }
+}
+
+fn restart_state_path(log_dir: &std::path::Path) -> std::path::PathBuf {
+    log_dir.join("controller_restart.json")
+}
+
+fn persist_restart_state(log_dir: &std::path::Path, state: &Option<ControllerRestartState>) {
+    let path = restart_state_path(log_dir);
+    if let Some(s) = state {
+        if let Ok(json) = serde_json::to_string_pretty(s) {
+            let _ = std::fs::write(path, json);
+        }
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn emit_control_result(
+    control_tx: &Option<broadcast::Sender<String>>,
+    action: &str,
+    ok: bool,
+    message: String,
+    data: Option<serde_json::Value>,
+) {
+    if let Some(tx) = control_tx {
+        let event = OutboundEvent::CommandResult {
+            action: action.to_string(),
+            ok,
+            message,
+            data,
+        };
+        control::broadcast_event(tx, &event);
+    }
+}
+
+fn current_autonomy_label(level: AutonomyLevel) -> String {
+    level.to_string().to_lowercase()
+}
+
+async fn emit_control_status(
+    state: &SharedMcpState,
+    control_tx: &Option<broadcast::Sender<String>>,
+) {
+    if let Some(tx) = control_tx {
+        let s = state.read().await;
+        let autonomy_level = s.autonomy.read().await.level;
+        let event = OutboundEvent::Status {
+            turn: s.turn,
+            phase: phase_to_str(&s.phase).to_string(),
+            autonomy: current_autonomy_label(autonomy_level),
+        };
+        control::broadcast_event(tx, &event);
+    }
+}
+
+async fn start_task_with_state(
+    state: &SharedMcpState,
+    bus: &EventBus,
+    task: String,
+    source: &str,
+) -> Result<(), String> {
+    let mut s = state.write().await;
+
+    match s.phase {
+        Phase::Thinking
+        | Phase::RunningAgent
+        | Phase::Orchestrating
+        | Phase::WaitingApproval
+        | Phase::WaitingHuman => {
+            return Err(format!(
+                "agent is currently in '{}' phase",
+                phase_to_str(&s.phase)
+            ));
+        }
+        Phase::Idle | Phase::Done => {}
+    }
+
+    let launcher = s
+        .launcher
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "no task launcher configured".to_string())?;
+
+    s.turn = 0;
+    s.budget_pct = 0.0;
+    s.session_tokens = 0;
+    s.set_phase(Phase::Thinking);
+    s.pending_approval = None;
+    s.human_question = None;
+    s.should_quit = false;
+    s.push_log(
+        LogLevel::Info,
+        format!("Task started via {}: {}", source, task),
+    );
+
+    let bus = bus.clone();
+    drop(s);
+
+    let handle = (launcher)(task, bus).await;
+    let mut s = state.write().await;
+    s.task_handle = Some(handle);
+    Ok(())
+}
+
+async fn run_scheduled_controller_restart_with_state(
+    state: &SharedMcpState,
+    bus: &EventBus,
+) -> Result<String, String> {
+    let (restart, log_dir) = {
+        let mut s = state.write().await;
+        let log_dir = s.log_dir.clone();
+        let Some(active) = s.controller_restart.as_mut() else {
+            return Err("No scheduled controller restart".to_string());
+        };
+
+        if !matches!(active.phase, RestartPhase::Ready) {
+            return Err(format!(
+                "Restart is not ready (current phase: {:?})",
+                active.phase
+            ));
+        }
+
+        if active.attempts >= active.max_attempts {
+            active.phase = RestartPhase::Failed;
+            active.last_error = Some("Max restart attempts reached".to_string());
+            active.updated_at = ControllerRestartState::now_string();
+            let snapshot = s.controller_restart.clone();
+            persist_restart_state(&log_dir, &snapshot);
+            return Err("Max restart attempts reached".to_string());
+        }
+
+        if let Some(last_attempt) = &active.last_attempt_at {
+            if let Ok(last) = chrono::DateTime::parse_from_rfc3339(last_attempt) {
+                let elapsed = chrono::Utc::now() - last.with_timezone(&chrono::Utc);
+                if elapsed.num_seconds() < active.cooldown_sec as i64 {
+                    return Err(format!(
+                        "Restart cooldown active ({}s remaining)",
+                        active
+                            .cooldown_sec
+                            .saturating_sub(elapsed.num_seconds() as u64)
+                    ));
+                }
+            }
+        }
+
+        active.phase = RestartPhase::Restarting;
+        active.attempts += 1;
+        active.last_attempt_at = Some(ControllerRestartState::now_string());
+        active.updated_at = ControllerRestartState::now_string();
+        active.last_error = None;
+        active.last_result = None;
+        let restart = active.clone();
+        let snapshot = s.controller_restart.clone();
+        persist_restart_state(&log_dir, &snapshot);
+        (restart, log_dir)
+    };
+
+    let mut result_parts = Vec::new();
+
+    if let Some(cmd) = &restart.restart_command {
+        use std::process::Stdio;
+        let spawn_result = tokio::process::Command::new("bash")
+            .args(["-lc", cmd])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match spawn_result {
+            Ok(child) => {
+                result_parts.push(format!(
+                    "spawned controller command (pid {})",
+                    child.id().unwrap_or(0)
+                ));
+            }
+            Err(e) => {
+                let mut s = state.write().await;
+                if let Some(active) = s.controller_restart.as_mut() {
+                    active.phase = RestartPhase::Failed;
+                    active.last_error = Some(format!("Failed to spawn restart_command: {}", e));
+                    active.updated_at = ControllerRestartState::now_string();
+                }
+                let snapshot = s.controller_restart.clone();
+                persist_restart_state(&log_dir, &snapshot);
+                return Err(format!("Failed to spawn restart_command: {}", e));
+            }
+        }
+    }
+
+    if restart.auto_start_task {
+        start_task_with_state(
+            state,
+            bus,
+            restart.north_star_goal.clone(),
+            "controller_restart",
+        )
+        .await?;
+        result_parts.push("started autonomous follow-up task".to_string());
+    }
+
+    if restart.restart_command.is_none() && !restart.auto_start_task {
+        let mut s = state.write().await;
+        if let Some(active) = s.controller_restart.as_mut() {
+            active.phase = RestartPhase::Failed;
+            active.last_error = Some(
+                "No restart action configured: set restart_command and/or auto_start_task=true"
+                    .to_string(),
+            );
+            active.updated_at = ControllerRestartState::now_string();
+        }
+        let snapshot = s.controller_restart.clone();
+        persist_restart_state(&log_dir, &snapshot);
+        return Err("No restart action configured".to_string());
+    }
+
+    let mut s = state.write().await;
+    if let Some(active) = s.controller_restart.as_mut() {
+        active.phase = RestartPhase::Completed;
+        active.last_result = Some(if result_parts.is_empty() {
+            "ok".to_string()
+        } else {
+            result_parts.join("; ")
+        });
+        active.updated_at = ControllerRestartState::now_string();
+    }
+    let snapshot = s.controller_restart.clone();
+    persist_restart_state(&log_dir, &snapshot);
+
+    Ok(result_parts.join("; "))
+}
+
+async fn handle_control_command_mcp(
+    state: &SharedMcpState,
+    bus: &EventBus,
+    control_tx: &Option<broadcast::Sender<String>>,
+    msg: ControlMsg,
+) -> Option<&'static str> {
+    match msg {
+        ControlMsg::Status => {
+            emit_control_status(state, control_tx).await;
+            None
+        }
+        ControlMsg::Approve { id } => {
+            let mut s = state.write().await;
+            let outcome = process_action_sync(&mut s, UserAction::Approve { id });
+            emit_control_result(
+                control_tx,
+                "approve",
+                matches!(outcome, ActionOutcome::Ok),
+                format_outcome(outcome),
+                None,
+            );
+            Some(RESOURCE_APPROVAL_URI)
+        }
+        ControlMsg::Deny { id } => {
+            let mut s = state.write().await;
+            let outcome = process_action_sync(&mut s, UserAction::Deny { id });
+            emit_control_result(
+                control_tx,
+                "deny",
+                matches!(outcome, ActionOutcome::Ok),
+                format_outcome(outcome),
+                None,
+            );
+            Some(RESOURCE_APPROVAL_URI)
+        }
+        ControlMsg::Input { text } => {
+            let mut s = state.write().await;
+            let outcome = process_action_sync(&mut s, UserAction::RespondHuman { text });
+            emit_control_result(
+                control_tx,
+                "input",
+                matches!(outcome, ActionOutcome::Ok),
+                format_outcome(outcome),
+                None,
+            );
+            Some(RESOURCE_INPUT_URI)
+        }
+        ControlMsg::SetAutonomy { level } => {
+            let parsed = AutonomyLevel::from_str_loose(&level);
+            {
+                let s = state.read().await;
+                let autonomy = s.autonomy.clone();
+                drop(s);
+                let mut a = autonomy.write().await;
+                a.level = parsed;
+            }
+            emit_control_result(
+                control_tx,
+                "set_autonomy",
+                true,
+                format!("Autonomy set to {}", parsed),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::ScheduleControllerRestart {
+            controller_id,
+            north_star_goal,
+            reason,
+            restart_after,
+            restart_command,
+            auto_start_task,
+            max_attempts,
+            cooldown_sec,
+        } => {
+            if controller_id.trim().is_empty() || north_star_goal.trim().is_empty() {
+                emit_control_result(
+                    control_tx,
+                    "schedule_controller_restart",
+                    false,
+                    "controller_id and north_star_goal are required".to_string(),
+                    None,
+                );
+                return Some(RESOURCE_RESTART_URI);
+            }
+
+            let params = ScheduleControllerRestartParams {
+                controller_id,
+                north_star_goal,
+                reason,
+                restart_after,
+                restart_command,
+                auto_start_task,
+                max_attempts,
+                cooldown_sec,
+            };
+
+            let restart = {
+                let mut s = state.write().await;
+                if let Some(active) = s.controller_restart.as_ref() {
+                    if matches!(
+                        active.phase,
+                        RestartPhase::AwaitingTurnComplete
+                            | RestartPhase::Ready
+                            | RestartPhase::Restarting
+                    ) {
+                        emit_control_result(
+                            control_tx,
+                            "schedule_controller_restart",
+                            false,
+                            format!(
+                                "A restart is already active (id={}, phase={:?})",
+                                active.restart_id, active.phase
+                            ),
+                            None,
+                        );
+                        return Some(RESOURCE_RESTART_URI);
+                    }
+                }
+
+                let restart = ControllerRestartState::new(&params);
+                s.push_log(
+                    LogLevel::Info,
+                    format!(
+                        "Controller restart scheduled for '{}' (id={})",
+                        restart.controller_id, restart.restart_id
+                    ),
+                );
+                s.controller_restart = Some(restart.clone());
+                persist_restart_state(&s.log_dir, &s.controller_restart);
+                restart
+            };
+
+            let mut payload = serde_json::json!({
+                "status": "scheduled",
+                "restart_id": restart.restart_id,
+                "turn_complete_token": restart.turn_complete_token,
+                "phase": restart.phase,
+            });
+
+            if matches!(restart.restart_after, RestartAfter::Now) {
+                match run_scheduled_controller_restart_with_state(state, bus).await {
+                    Ok(result) => {
+                        payload["execution"] = serde_json::Value::String(if result.is_empty() {
+                            "ok".to_string()
+                        } else {
+                            result
+                        });
+                    }
+                    Err(e) => {
+                        payload["execution_error"] = serde_json::Value::String(e);
+                    }
+                }
+            }
+
+            emit_control_result(
+                control_tx,
+                "schedule_controller_restart",
+                true,
+                "ok".to_string(),
+                Some(payload),
+            );
+            Some(RESOURCE_RESTART_URI)
+        }
+        ControlMsg::ControllerTurnComplete {
+            restart_id,
+            turn_complete_token,
+            status,
+            handoff_summary,
+        } => {
+            {
+                let mut s = state.write().await;
+                let log_dir = s.log_dir.clone();
+                let Some(active) = s.controller_restart.as_mut() else {
+                    emit_control_result(
+                        control_tx,
+                        "controller_turn_complete",
+                        false,
+                        "No controller restart is scheduled".to_string(),
+                        None,
+                    );
+                    return Some(RESOURCE_RESTART_URI);
+                };
+                if active.restart_id != restart_id {
+                    emit_control_result(
+                        control_tx,
+                        "controller_turn_complete",
+                        false,
+                        "restart_id does not match the active restart".to_string(),
+                        None,
+                    );
+                    return Some(RESOURCE_RESTART_URI);
+                }
+                if active.turn_complete_token != turn_complete_token {
+                    emit_control_result(
+                        control_tx,
+                        "controller_turn_complete",
+                        false,
+                        "turn_complete_token is invalid".to_string(),
+                        None,
+                    );
+                    return Some(RESOURCE_RESTART_URI);
+                }
+                if !matches!(
+                    active.phase,
+                    RestartPhase::AwaitingTurnComplete | RestartPhase::Ready
+                ) {
+                    emit_control_result(
+                        control_tx,
+                        "controller_turn_complete",
+                        false,
+                        format!(
+                            "Restart is not awaiting completion (phase={:?})",
+                            active.phase
+                        ),
+                        None,
+                    );
+                    return Some(RESOURCE_RESTART_URI);
+                }
+
+                active.handoff_summary = handoff_summary;
+                active.completion_status = status;
+                active.phase = RestartPhase::Ready;
+                active.updated_at = ControllerRestartState::now_string();
+                let snapshot = s.controller_restart.clone();
+                persist_restart_state(&log_dir, &snapshot);
+            }
+
+            match run_scheduled_controller_restart_with_state(state, bus).await {
+                Ok(result) => emit_control_result(
+                    control_tx,
+                    "controller_turn_complete",
+                    true,
+                    if result.is_empty() {
+                        "ok".to_string()
+                    } else {
+                        result
+                    },
+                    None,
+                ),
+                Err(e) => {
+                    emit_control_result(control_tx, "controller_turn_complete", false, e, None)
+                }
+            }
+            Some(RESOURCE_RESTART_URI)
+        }
+        ControlMsg::GetRestartStatus => {
+            let s = state.read().await;
+            let data = serde_json::to_value(&s.controller_restart).ok();
+            emit_control_result(
+                control_tx,
+                "get_restart_status",
+                true,
+                "ok".to_string(),
+                data,
+            );
+            Some(RESOURCE_RESTART_URI)
+        }
+        ControlMsg::CancelControllerRestart { restart_id } => {
+            let mut s = state.write().await;
+            let log_dir = s.log_dir.clone();
+            let Some(active) = s.controller_restart.as_mut() else {
+                emit_control_result(
+                    control_tx,
+                    "cancel_controller_restart",
+                    false,
+                    "No controller restart is scheduled".to_string(),
+                    None,
+                );
+                return Some(RESOURCE_RESTART_URI);
+            };
+
+            if let Some(expected_id) = restart_id {
+                if expected_id != active.restart_id {
+                    emit_control_result(
+                        control_tx,
+                        "cancel_controller_restart",
+                        false,
+                        format!(
+                            "restart_id '{}' does not match active '{}'",
+                            expected_id, active.restart_id
+                        ),
+                        None,
+                    );
+                    return Some(RESOURCE_RESTART_URI);
+                }
+            }
+
+            active.phase = RestartPhase::Cancelled;
+            active.updated_at = ControllerRestartState::now_string();
+            active.last_result = Some("Cancelled by operator".to_string());
+            let snapshot = s.controller_restart.clone();
+            persist_restart_state(&log_dir, &snapshot);
+            emit_control_result(
+                control_tx,
+                "cancel_controller_restart",
+                true,
+                "ok".to_string(),
+                None,
+            );
+            Some(RESOURCE_RESTART_URI)
+        }
+        ControlMsg::Quit => {
+            let action = UserAction::Quit;
+            let mut s = state.write().await;
+            let outcome = process_action_sync(&mut s, action);
+            emit_control_result(
+                control_tx,
+                "quit",
+                matches!(outcome, ActionOutcome::Ok),
+                format_outcome(outcome),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
     }
 }
 
@@ -215,11 +849,14 @@ pub fn spawn_event_listener(
     state: SharedMcpState,
     mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     peer: Arc<Mutex<Option<rmcp::Peer<RoleServer>>>>,
+    bus: EventBus,
     human_question_path: Option<crate::tui::event::SharedQuestionPath>,
+    control_tx: Option<broadcast::Sender<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             let mut resource_changed: Option<&str> = None;
+            let mut deferred_control_msg: Option<ControlMsg> = None;
 
             {
                 let mut s = state.write().await;
@@ -302,15 +939,15 @@ pub fn spawn_event_listener(
                         s.set_phase(Phase::Done);
                         s.push_log(
                             LogLevel::Info,
-                            format!(
-                                "Done: {}",
-                                message.as_deref().unwrap_or("task complete")
-                            ),
+                            format!("Done: {}", message.as_deref().unwrap_or("task complete")),
                         );
                         resource_changed = Some("intendant://status");
                     }
 
-                    AppEvent::AgentStarted { turn, commands_preview } => {
+                    AppEvent::AgentStarted {
+                        turn,
+                        commands_preview,
+                    } => {
                         s.set_phase(Phase::RunningAgent);
                         s.push_log(LogLevel::Agent, format!("[T{}] {}", turn, commands_preview));
                         resource_changed = Some("intendant://status");
@@ -349,10 +986,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ContextManagement { turn } => {
-                        s.push_log(
-                            LogLevel::Debug,
-                            format!("[T{}] Context management", turn),
-                        );
+                        s.push_log(LogLevel::Debug, format!("[T{}] Context management", turn));
                     }
 
                     AppEvent::TaskComplete { reason } => {
@@ -384,7 +1018,10 @@ pub fn spawn_event_listener(
 
                     AppEvent::SafetyCapReached => {
                         s.set_phase(Phase::Done);
-                        s.push_log(LogLevel::Error, "Safety cap reached (500 turns)".to_string());
+                        s.push_log(
+                            LogLevel::Error,
+                            "Safety cap reached (500 turns)".to_string(),
+                        );
                         resource_changed = Some("intendant://status");
                     }
 
@@ -430,6 +1067,7 @@ pub fn spawn_event_listener(
 
                     AppEvent::SessionDirChanged { ref path } => {
                         s.log_dir = path.clone();
+                        persist_restart_state(&s.log_dir, &s.controller_restart);
                         // Update the human question monitor's watched path
                         if let Some(ref hqp) = human_question_path {
                             if let Ok(mut p) = hqp.try_write() {
@@ -438,10 +1076,14 @@ pub fn spawn_event_listener(
                         }
                     }
 
-                    AppEvent::ControlCommand(_) => {
-                        // Control socket commands are handled by the control socket;
-                        // the MCP server is a separate interface.
-                    }
+                    AppEvent::ControlCommand(msg) => deferred_control_msg = Some(msg),
+                }
+            }
+
+            if let Some(msg) = deferred_control_msg {
+                if let Some(uri) = handle_control_command_mcp(&state, &bus, &control_tx, msg).await
+                {
+                    resource_changed = Some(uri);
                 }
             }
 
@@ -513,6 +1155,53 @@ pub struct StartTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScheduleControllerRestartParams {
+    /// Identifier for the controlling agent/client (e.g. "codex", "claude_code").
+    pub controller_id: String,
+    /// Goal for the next controller session / autonomous cycle.
+    pub north_star_goal: String,
+    /// Optional operator-provided reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// When to execute restart: "turn_end" (default) or "now".
+    #[serde(default)]
+    pub restart_after: Option<String>,
+    /// Optional command to spawn for controller restart.
+    #[serde(default)]
+    pub restart_command: Option<String>,
+    /// Auto-start the next intendant task with north_star_goal (default: true).
+    #[serde(default)]
+    pub auto_start_task: Option<bool>,
+    /// Maximum restart attempts before failing (default: 1).
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    /// Cooldown between restart attempts in seconds (default: 30).
+    #[serde(default)]
+    pub cooldown_sec: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ControllerTurnCompleteParams {
+    /// Restart ID returned by schedule_controller_restart.
+    pub restart_id: String,
+    /// Completion token returned by schedule_controller_restart.
+    pub turn_complete_token: String,
+    /// Optional completion status from the controller.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Optional final handoff summary from the controller.
+    #[serde(default)]
+    pub handoff_summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CancelControllerRestartParams {
+    /// Optional restart ID guard. If provided and mismatched, cancellation is rejected.
+    #[serde(default)]
+    pub restart_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetLogsParams {
     /// Only return log entries with IDs greater than this value (cursor-based pagination).
     #[serde(default)]
@@ -545,6 +1234,14 @@ impl IntendantServer {
             bus,
             tool_router: Self::tool_router(),
         }
+    }
+
+    async fn start_task_internal(&self, task: String, source: &str) -> Result<(), String> {
+        start_task_with_state(&self.state, &self.bus, task, source).await
+    }
+
+    async fn run_scheduled_controller_restart(&self) -> Result<String, String> {
+        run_scheduled_controller_restart_with_state(&self.state, &self.bus).await
     }
 }
 
@@ -623,10 +1320,7 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
                 if std::fs::write(&response_path, &text).is_ok() {
                     state.human_question = None;
                     state.set_phase(Phase::RunningAgent);
-                    state.push_log(
-                        LogLevel::Info,
-                        format!("Human response (MCP): {}", text),
-                    );
+                    state.push_log(LogLevel::Info, format!("Human response (MCP): {}", text));
                     ActionOutcome::Ok
                 } else {
                     ActionOutcome::NoOp {
@@ -665,7 +1359,9 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
 
 #[tool_router]
 impl IntendantServer {
-    #[tool(description = "Get current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens.")]
+    #[tool(
+        description = "Get current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens."
+    )]
     async fn get_status(&self) -> String {
         let s = self.state.read().await;
         let mut snap = s.status_snapshot();
@@ -677,7 +1373,9 @@ impl IntendantServer {
         serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "{}".to_string())
     }
 
-    #[tool(description = "Get log entries. Supports cursor-based pagination via since_id and filtering by level.")]
+    #[tool(
+        description = "Get log entries. Supports cursor-based pagination via since_id and filtering by level."
+    )]
     async fn get_logs(&self, Parameters(params): Parameters<GetLogsParams>) -> String {
         let s = self.state.read().await;
         let limit = params.limit.unwrap_or(100);
@@ -702,25 +1400,35 @@ impl IntendantServer {
         serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
     }
 
-    #[tool(description = "Get the current pending approval request, if any. Returns null if no approval is pending.")]
+    #[tool(
+        description = "Get the current pending approval request, if any. Returns null if no approval is pending."
+    )]
     async fn get_pending_approval(&self) -> String {
         let s = self.state.read().await;
         match s.approval_snapshot() {
-            Some(snap) => serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "null".to_string()),
+            Some(snap) => {
+                serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "null".to_string())
+            }
             None => "null".to_string(),
         }
     }
 
-    #[tool(description = "Get the current pending human question, if any. Returns null if no question is pending.")]
+    #[tool(
+        description = "Get the current pending human question, if any. Returns null if no question is pending."
+    )]
     async fn get_pending_input(&self) -> String {
         let s = self.state.read().await;
         match s.human_question_snapshot() {
-            Some(snap) => serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "null".to_string()),
+            Some(snap) => {
+                serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "null".to_string())
+            }
             None => "null".to_string(),
         }
     }
 
-    #[tool(description = "Approve a pending command execution. Equivalent to pressing 'y' in the TUI.")]
+    #[tool(
+        description = "Approve a pending command execution. Equivalent to pressing 'y' in the TUI."
+    )]
     async fn approve(&self, Parameters(params): Parameters<ApproveParams>) -> String {
         let action = UserAction::Approve { id: params.id };
         let mut s = self.state.write().await;
@@ -728,7 +1436,9 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(description = "Deny a pending command execution. Stops the agent loop. Equivalent to pressing 'n' in the TUI.")]
+    #[tool(
+        description = "Deny a pending command execution. Stops the agent loop. Equivalent to pressing 'n' in the TUI."
+    )]
     async fn deny(&self, Parameters(params): Parameters<DenyParams>) -> String {
         let action = UserAction::Deny { id: params.id };
         let mut s = self.state.write().await;
@@ -736,7 +1446,9 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(description = "Skip a pending command execution. The agent continues with the next command. Equivalent to pressing 's' in the TUI.")]
+    #[tool(
+        description = "Skip a pending command execution. The agent continues with the next command. Equivalent to pressing 's' in the TUI."
+    )]
     async fn skip(&self, Parameters(params): Parameters<SkipParams>) -> String {
         let action = UserAction::Skip { id: params.id };
         let mut s = self.state.write().await;
@@ -744,7 +1456,9 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(description = "Approve this and all future commands (sets autonomy to Full). Equivalent to pressing 'a' in the TUI.")]
+    #[tool(
+        description = "Approve this and all future commands (sets autonomy to Full). Equivalent to pressing 'a' in the TUI."
+    )]
     async fn approve_all(&self, Parameters(params): Parameters<ApproveAllParams>) -> String {
         let action = UserAction::ApproveAll { id: params.id };
         let mut s = self.state.write().await;
@@ -758,7 +1472,9 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(description = "Respond to an askHuman question. Equivalent to typing a response and pressing Enter in the TUI.")]
+    #[tool(
+        description = "Respond to an askHuman question. Equivalent to typing a response and pressing Enter in the TUI."
+    )]
     async fn respond(&self, Parameters(params): Parameters<RespondParams>) -> String {
         let action = UserAction::RespondHuman { text: params.text };
         let mut s = self.state.write().await;
@@ -766,7 +1482,9 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(description = "Set the autonomy level. Controls how much approval is required. Equivalent to +/- keys in the TUI.")]
+    #[tool(
+        description = "Set the autonomy level. Controls how much approval is required. Equivalent to +/- keys in the TUI."
+    )]
     async fn set_autonomy(&self, Parameters(params): Parameters<SetAutonomyParams>) -> String {
         let level = AutonomyLevel::from_str_loose(&params.level);
         let s = self.state.read().await;
@@ -777,10 +1495,7 @@ impl IntendantServer {
             a.level = level;
         }
         let mut s = self.state.write().await;
-        let _ = process_action_sync(
-            &mut s,
-            UserAction::SetAutonomy { level },
-        );
+        let _ = process_action_sync(&mut s, UserAction::SetAutonomy { level });
         s.push_log(
             LogLevel::Info,
             format!("Autonomy set to {} by MCP agent", level),
@@ -788,7 +1503,9 @@ impl IntendantServer {
         format!("Autonomy set to {}", level)
     }
 
-    #[tool(description = "Set log verbosity level. Controls which log entries are shown. Equivalent to pressing 'v' in the TUI.")]
+    #[tool(
+        description = "Set log verbosity level. Controls which log entries are shown. Equivalent to pressing 'v' in the TUI."
+    )]
     async fn set_verbosity(&self, Parameters(params): Parameters<SetVerbosityParams>) -> String {
         match parse_verbosity(&params.level) {
             Some(level) => {
@@ -804,7 +1521,9 @@ impl IntendantServer {
         }
     }
 
-    #[tool(description = "Shut down the Intendant agent. Equivalent to pressing 'q' or Ctrl-C in the TUI.")]
+    #[tool(
+        description = "Shut down the Intendant agent. Equivalent to pressing 'q' or Ctrl-C in the TUI."
+    )]
     async fn quit(&self) -> String {
         let action = UserAction::Quit;
         let mut s = self.state.write().await;
@@ -812,59 +1531,183 @@ impl IntendantServer {
         format_outcome(outcome)
     }
 
-    #[tool(description = "Start a new task for the Intendant agent to execute. The agent will begin working on the task immediately. Only one task can run at a time — check get_status to see if a task is already running.")]
+    #[tool(
+        description = "Start a new task for the Intendant agent to execute. The agent will begin working on the task immediately. Only one task can run at a time — check get_status to see if a task is already running."
+    )]
     async fn start_task(&self, Parameters(params): Parameters<StartTaskParams>) -> String {
-        let mut s = self.state.write().await;
+        match self.start_task_internal(params.task, "MCP").await {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("Cannot start task: {}", e),
+        }
+    }
 
-        // Check if a task is already running
-        match s.phase {
-            Phase::Thinking | Phase::RunningAgent | Phase::Orchestrating
-            | Phase::WaitingApproval | Phase::WaitingHuman => {
-                return format!(
-                    "Cannot start task: agent is currently in '{}' phase. \
-                     Wait for it to finish or call quit first.",
-                    phase_to_str(&s.phase)
-                );
-            }
-            Phase::Idle | Phase::Done => {} // OK to start
+    #[tool(
+        description = "Schedule a controller restart workflow. Returns a restart ID and a completion token that must be passed to controller_turn_complete as the final controller action."
+    )]
+    async fn schedule_controller_restart(
+        &self,
+        Parameters(params): Parameters<ScheduleControllerRestartParams>,
+    ) -> String {
+        if params.controller_id.trim().is_empty() {
+            return "Invalid request: controller_id must not be empty".to_string();
+        }
+        if params.north_star_goal.trim().is_empty() {
+            return "Invalid request: north_star_goal must not be empty".to_string();
         }
 
-        let launcher = match s.launcher.as_ref() {
-            Some(l) => Arc::clone(l),
-            None => {
-                return "Cannot start task: no task launcher configured. \
-                        This MCP server was not started with launcher support."
-                    .to_string();
+        let restart = {
+            let mut s = self.state.write().await;
+            if let Some(active) = s.controller_restart.as_ref() {
+                if matches!(
+                    active.phase,
+                    RestartPhase::AwaitingTurnComplete
+                        | RestartPhase::Ready
+                        | RestartPhase::Restarting
+                ) {
+                    return format!(
+                        "A restart is already active (id={}, phase={:?})",
+                        active.restart_id, active.phase
+                    );
+                }
             }
+
+            let restart = ControllerRestartState::new(&params);
+            s.push_log(
+                LogLevel::Info,
+                format!(
+                    "Controller restart scheduled for '{}' (id={})",
+                    restart.controller_id, restart.restart_id
+                ),
+            );
+            s.controller_restart = Some(restart.clone());
+            persist_restart_state(&s.log_dir, &s.controller_restart);
+            restart
         };
 
-        // Reset state for the new task
-        s.turn = 0;
-        s.budget_pct = 0.0;
-        s.session_tokens = 0;
-        s.set_phase(Phase::Thinking);
-        s.pending_approval = None;
-        s.human_question = None;
-        s.should_quit = false;
+        let mut output = serde_json::json!({
+            "status": "scheduled",
+            "restart_id": restart.restart_id,
+            "turn_complete_token": restart.turn_complete_token,
+            "phase": restart.phase,
+        });
+
+        if matches!(restart.restart_after, RestartAfter::Now) {
+            match self.run_scheduled_controller_restart().await {
+                Ok(result) => {
+                    output["execution"] = serde_json::Value::String(if result.is_empty() {
+                        "ok".to_string()
+                    } else {
+                        result
+                    });
+                }
+                Err(e) => {
+                    output["execution_error"] = serde_json::Value::String(e);
+                }
+            }
+        }
+
+        serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    #[tool(
+        description = "Final handshake call from the controlling agent before ending its turn. Validates token and executes any pending scheduled restart."
+    )]
+    async fn controller_turn_complete(
+        &self,
+        Parameters(params): Parameters<ControllerTurnCompleteParams>,
+    ) -> String {
+        {
+            let mut s = self.state.write().await;
+            let log_dir = s.log_dir.clone();
+            let Some(active) = s.controller_restart.as_mut() else {
+                return "No controller restart is scheduled".to_string();
+            };
+
+            if active.restart_id != params.restart_id {
+                return "restart_id does not match the active restart".to_string();
+            }
+            if active.turn_complete_token != params.turn_complete_token {
+                return "turn_complete_token is invalid".to_string();
+            }
+            if !matches!(
+                active.phase,
+                RestartPhase::AwaitingTurnComplete | RestartPhase::Ready
+            ) {
+                return format!(
+                    "Restart is not awaiting completion (phase={:?})",
+                    active.phase
+                );
+            }
+
+            active.handoff_summary = params.handoff_summary.clone();
+            active.completion_status = params.status.clone();
+            active.phase = RestartPhase::Ready;
+            active.updated_at = ControllerRestartState::now_string();
+            let restart_id = active.restart_id.clone();
+            let snapshot = s.controller_restart.clone();
+            persist_restart_state(&log_dir, &snapshot);
+            s.push_log(
+                LogLevel::Info,
+                format!("Controller turn complete acknowledged (id={})", restart_id),
+            );
+        }
+
+        match self.run_scheduled_controller_restart().await {
+            Ok(result) if result.is_empty() => "ok".to_string(),
+            Ok(result) => format!("ok: {}", result),
+            Err(e) => format!("restart pending: {}", e),
+        }
+    }
+
+    #[tool(
+        description = "Get the current controller restart state, if any. Returns null when no restart is tracked."
+    )]
+    async fn get_restart_status(&self) -> String {
+        let s = self.state.read().await;
+        match s.controller_restart.as_ref() {
+            Some(restart) => {
+                serde_json::to_string_pretty(restart).unwrap_or_else(|_| "null".to_string())
+            }
+            None => "null".to_string(),
+        }
+    }
+
+    #[tool(description = "Cancel a scheduled controller restart.")]
+    async fn cancel_controller_restart(
+        &self,
+        Parameters(params): Parameters<CancelControllerRestartParams>,
+    ) -> String {
+        let mut s = self.state.write().await;
+        let log_dir = s.log_dir.clone();
+        let Some(active) = s.controller_restart.as_mut() else {
+            return "No controller restart is scheduled".to_string();
+        };
+
+        if let Some(expected_id) = params.restart_id {
+            if expected_id != active.restart_id {
+                return format!(
+                    "restart_id '{}' does not match active '{}'",
+                    expected_id, active.restart_id
+                );
+            }
+        }
+
+        active.phase = RestartPhase::Cancelled;
+        active.updated_at = ControllerRestartState::now_string();
+        active.last_result = Some("Cancelled by operator".to_string());
+        let restart_id = active.restart_id.clone();
+        let snapshot = s.controller_restart.clone();
+        persist_restart_state(&log_dir, &snapshot);
         s.push_log(
             LogLevel::Info,
-            format!("Task started via MCP: {}", params.task),
+            format!("Controller restart cancelled (id={})", restart_id),
         );
-
-        // We need to drop the write lock before calling the async launcher
-        let bus = self.bus.clone();
-        drop(s);
-
-        let handle = (launcher)(params.task, bus).await;
-
-        // Store the handle
-        let mut s = self.state.write().await;
-        s.task_handle = Some(handle);
-
         "ok".to_string()
     }
 
-    #[tool(description = "Rebuild the intendant binary from source and hot-reload the MCP server. The server process is replaced in-place via exec() — the MCP connection survives seamlessly. Use this after making code changes so the running server picks them up without restarting Claude Code.")]
+    #[tool(
+        description = "Rebuild the intendant binary from source and hot-reload the MCP server. The server process is replaced in-place via exec() — the MCP connection survives seamlessly. Use this after making code changes so the running server picks them up without restarting Claude Code."
+    )]
     async fn reload(&self) -> String {
         // Find the project root (where Cargo.toml lives)
         let exe = match std::env::current_exe() {
@@ -899,7 +1742,10 @@ impl IntendantServer {
             match output {
                 Ok(o) if o.status.success() => {
                     let mut s = self.state.write().await;
-                    s.push_log(LogLevel::Info, "Binary rebuilt successfully, exec'ing...".to_string());
+                    s.push_log(
+                        LogLevel::Info,
+                        "Binary rebuilt successfully, exec'ing...".to_string(),
+                    );
                 }
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
@@ -959,6 +1805,7 @@ const RESOURCE_STATUS_URI: &str = "intendant://status";
 const RESOURCE_LOGS_URI: &str = "intendant://logs";
 const RESOURCE_APPROVAL_URI: &str = "intendant://pending-approval";
 const RESOURCE_INPUT_URI: &str = "intendant://pending-input";
+const RESOURCE_RESTART_URI: &str = "intendant://controller-restart";
 
 fn make_resource(uri: &str, name: &str, description: &str) -> Resource {
     Resource {
@@ -998,6 +1845,11 @@ fn resource_definitions() -> Vec<Resource> {
             "pending-input",
             "Current pending human question, if any",
         ),
+        make_resource(
+            RESOURCE_RESTART_URI,
+            "controller-restart",
+            "Controller restart schedule / execution state",
+        ),
     ]
 }
 
@@ -1012,9 +1864,11 @@ impl ServerHandler for IntendantServer {
             instructions: Some(
                 "Intendant AI agent runtime. This MCP server exposes the same controls \
                  and observations as the TUI. Use tools to control the agent (approve, \
-                 deny, respond, set_autonomy, quit) and to observe its state (get_status, \
-                 get_logs, get_pending_approval, get_pending_input). Resources provide \
-                 push-based state updates via subscriptions."
+                 deny, respond, set_autonomy, quit), manage controller restarts \
+                 (schedule_controller_restart, controller_turn_complete, \
+                 get_restart_status, cancel_controller_restart), and observe state \
+                 (get_status, get_logs, get_pending_approval, get_pending_input). \
+                 Resources provide push-based state updates via subscriptions."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder()
@@ -1087,6 +1941,8 @@ impl ServerHandler for IntendantServer {
                 serde_json::to_string_pretty(&StateResult::PendingInput { question: snap })
                     .unwrap_or_else(|_| "null".to_string())
             }
+            RESOURCE_RESTART_URI => serde_json::to_string_pretty(&s.controller_restart)
+                .unwrap_or_else(|_| "null".to_string()),
             _ => {
                 return Err(McpError::invalid_params(
                     format!("Unknown resource URI: {}", request.uri),
@@ -1131,15 +1987,15 @@ impl ServerHandler for IntendantServer {
 /// swallowing the server's init response on the send side. After this two-message
 /// preamble, all messages pass through to real stdio transparently.
 mod reload_transport {
-    use std::borrow::Cow;
-    use std::pin::Pin;
-    use std::future::Future;
     use rmcp::model::{
-        ClientJsonRpcMessage, ServerJsonRpcMessage, ClientRequest, ClientNotification,
-        InitializeRequestParams, Implementation, ProtocolVersion,
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, Implementation,
+        InitializeRequestParams, ProtocolVersion, ServerJsonRpcMessage,
     };
     use rmcp::service::RoleServer;
     use rmcp::transport::Transport;
+    use std::borrow::Cow;
+    use std::future::Future;
+    use std::pin::Pin;
 
     /// Phases of the reload handshake injection.
     enum Phase {
@@ -1186,19 +2042,15 @@ mod reload_transport {
             params,
             extensions: Default::default(),
         });
-        ClientJsonRpcMessage::request(
-            request,
-            rmcp::model::RequestId::Number(0),
-        )
+        ClientJsonRpcMessage::request(request, rmcp::model::RequestId::Number(0))
     }
 
     fn fake_initialized_notification() -> ClientJsonRpcMessage {
-        let notification = ClientNotification::InitializedNotification(
-            rmcp::model::InitializedNotification {
+        let notification =
+            ClientNotification::InitializedNotification(rmcp::model::InitializedNotification {
                 method: Default::default(),
                 extensions: Default::default(),
-            },
-        );
+            });
         ClientJsonRpcMessage::notification(notification)
     }
 
@@ -1232,9 +2084,7 @@ mod reload_transport {
             }
         }
 
-        fn receive(
-            &mut self,
-        ) -> impl Future<Output = Option<ClientJsonRpcMessage>> + Send {
+        fn receive(&mut self) -> impl Future<Output = Option<ClientJsonRpcMessage>> + Send {
             match self.phase {
                 Phase::InjectInit => {
                     self.phase = Phase::SwallowInitResp;
@@ -1289,8 +2139,9 @@ pub async fn run_mcp_server(
     event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     reloaded: bool,
     human_question_path: Option<crate::tui::event::SharedQuestionPath>,
+    control_tx: Option<broadcast::Sender<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = IntendantServer::new(state.clone(), bus);
+    let server = IntendantServer::new(state.clone(), bus.clone());
 
     // Start serving on stdio, using ReloadTransport if this is a post-exec reload
     let running = if reloaded {
@@ -1307,7 +2158,14 @@ pub async fn run_mcp_server(
     let peer = Arc::new(Mutex::new(Some(running.peer().clone())));
 
     // Spawn event listener that mirrors AppEvents into McpAppState
-    let _listener = spawn_event_listener(state, event_rx, peer, human_question_path);
+    let _listener = spawn_event_listener(
+        state,
+        event_rx,
+        peer,
+        bus.clone(),
+        human_question_path,
+        control_tx,
+    );
 
     // Wait until the service finishes (client disconnects or quit)
     running.waiting().await?;
@@ -1409,8 +2267,7 @@ mod tests {
                 responder: Some(tx),
             });
 
-            let outcome =
-                process_action_sync(&mut s, UserAction::Approve { id: 1 });
+            let outcome = process_action_sync(&mut s, UserAction::Approve { id: 1 });
             assert_eq!(outcome, ActionOutcome::Ok);
             assert!(s.pending_approval.is_none());
             assert_eq!(s.phase, Phase::RunningAgent);
@@ -1430,8 +2287,7 @@ mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            let outcome =
-                process_action_sync(&mut s, UserAction::Approve { id: 1 });
+            let outcome = process_action_sync(&mut s, UserAction::Approve { id: 1 });
             match outcome {
                 ActionOutcome::NoOp { reason } => {
                     assert!(reason.contains("No pending approval"));
@@ -1510,8 +2366,7 @@ mod tests {
                 responder: Some(tx),
             });
 
-            let outcome =
-                process_action_sync(&mut s, UserAction::ApproveAll { id: 4 });
+            let outcome = process_action_sync(&mut s, UserAction::ApproveAll { id: 4 });
             assert_eq!(outcome, ActionOutcome::Ok);
 
             let response = rx.await.unwrap();
@@ -1600,9 +2455,36 @@ mod tests {
     }
 
     #[test]
-    fn resource_definitions_has_four_entries() {
+    fn parse_restart_after_defaults_to_turn_end() {
+        assert_eq!(parse_restart_after(None), RestartAfter::TurnEnd);
+        assert_eq!(parse_restart_after(Some("turn_end")), RestartAfter::TurnEnd);
+        assert_eq!(parse_restart_after(Some("NOW")), RestartAfter::Now);
+    }
+
+    #[test]
+    fn controller_restart_state_defaults() {
+        let params = ScheduleControllerRestartParams {
+            controller_id: "codex".to_string(),
+            north_star_goal: "audit and improve".to_string(),
+            reason: Some("periodic refresh".to_string()),
+            restart_after: None,
+            restart_command: None,
+            auto_start_task: None,
+            max_attempts: None,
+            cooldown_sec: None,
+        };
+        let state = ControllerRestartState::new(&params);
+        assert_eq!(state.controller_id, "codex");
+        assert_eq!(state.phase, RestartPhase::AwaitingTurnComplete);
+        assert_eq!(state.max_attempts, 1);
+        assert_eq!(state.cooldown_sec, 30);
+        assert!(state.auto_start_task);
+    }
+
+    #[test]
+    fn resource_definitions_has_five_entries() {
         let defs = resource_definitions();
-        assert_eq!(defs.len(), 4);
+        assert_eq!(defs.len(), 5);
     }
 
     #[test]

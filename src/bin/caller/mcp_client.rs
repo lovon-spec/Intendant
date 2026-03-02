@@ -56,10 +56,7 @@ impl McpClientManager {
                     servers.push(server);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "MCP client: failed to connect to '{}': {}",
-                        config.name, e
-                    );
+                    eprintln!("MCP client: failed to connect to '{}': {}", config.name, e);
                 }
             }
         }
@@ -74,21 +71,30 @@ impl McpClientManager {
             cmd.env(k, v);
         }
 
-        let transport = TokioChildProcess::new(cmd)
-            .map_err(|e| CallerError::Config(format!("Failed to spawn MCP server '{}': {}", config.name, e)))?;
+        let transport = TokioChildProcess::new(cmd).map_err(|e| {
+            CallerError::Config(format!(
+                "Failed to spawn MCP server '{}': {}",
+                config.name, e
+            ))
+        })?;
 
-        let running: RunningService<RoleClient, McpClientHandler> = McpClientHandler
-            .serve(transport)
-            .await
-            .map_err(|e| CallerError::Config(format!("MCP handshake with '{}' failed: {}", config.name, e)))?;
+        let running: RunningService<RoleClient, McpClientHandler> =
+            McpClientHandler.serve(transport).await.map_err(|e| {
+                CallerError::Config(format!(
+                    "MCP handshake with '{}' failed: {}",
+                    config.name, e
+                ))
+            })?;
 
         let peer: Peer<RoleClient> = running.peer().clone();
 
         // Discover tools
-        let mcp_tools = peer
-            .list_all_tools()
-            .await
-            .map_err(|e| CallerError::Config(format!("Failed to list tools from '{}': {}", config.name, e)))?;
+        let mcp_tools = peer.list_all_tools().await.map_err(|e| {
+            CallerError::Config(format!(
+                "Failed to list tools from '{}': {}",
+                config.name, e
+            ))
+        })?;
 
         let tools: Vec<ToolDefinition> = mcp_tools
             .into_iter()
@@ -123,16 +129,14 @@ impl McpClientManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<String, CallerError> {
-        let (server_name, actual_tool) = parse_mcp_tool_name(tool_name)
-            .ok_or_else(|| CallerError::Config(format!("Invalid MCP tool name: {}", tool_name)))?;
-
-        let server = self
+        let (server, actual_tool) = self
             .servers
             .iter()
-            .find(|s| s.name == server_name)
-            .ok_or_else(|| {
-                CallerError::Config(format!("MCP server '{}' not connected", server_name))
-            })?;
+            .filter_map(|s| {
+                parse_mcp_tool_name_for_server(tool_name, &s.name).map(|tool| (s, tool))
+            })
+            .max_by_key(|(s, _)| s.name.len())
+            .ok_or_else(|| CallerError::Config(format!("Invalid MCP tool name: {}", tool_name)))?;
 
         let args_map: Option<serde_json::Map<String, serde_json::Value>> =
             if let serde_json::Value::Object(map) = arguments {
@@ -162,6 +166,7 @@ impl McpClientManager {
 }
 
 /// Parse `mcp__<server>_<tool>` into `(server, tool)`.
+#[allow(dead_code)]
 fn parse_mcp_tool_name(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix("mcp__")?;
     let underscore_pos = rest.find('_')?;
@@ -169,6 +174,11 @@ fn parse_mcp_tool_name(name: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((&rest[..underscore_pos], &rest[underscore_pos + 1..]))
+}
+
+fn parse_mcp_tool_name_for_server<'a>(name: &'a str, server: &str) -> Option<&'a str> {
+    let prefix = format!("mcp__{}_", server);
+    name.strip_prefix(&prefix)
 }
 
 /// Format a CallToolResult into a string for the agent.
@@ -211,6 +221,14 @@ mod tests {
     #[test]
     fn parse_mcp_tool_name_single_char_parts() {
         assert_eq!(parse_mcp_tool_name("mcp__a_b"), Some(("a", "b")));
+    }
+
+    #[test]
+    fn parse_mcp_tool_name_server_with_underscore() {
+        assert_eq!(
+            parse_mcp_tool_name_for_server("mcp__my_server_list_issues", "my_server"),
+            Some("list_issues")
+        );
     }
 
     #[test]

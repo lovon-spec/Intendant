@@ -600,10 +600,7 @@ impl App {
             }
             ControlMsg::Input { text } => {
                 if self.mode == AppMode::AskHuman {
-                    let _ = std::fs::write(
-                        self.log_dir.join("human_response"),
-                        text.as_bytes(),
-                    );
+                    let _ = std::fs::write(self.log_dir.join("human_response"), text.as_bytes());
                     self.human_textarea = None;
                     self.human_question = None;
                     self.mode = AppMode::Normal;
@@ -612,6 +609,16 @@ impl App {
             }
             ControlMsg::SetAutonomy { level } => {
                 self.set_autonomy_level(&level);
+            }
+            ControlMsg::ScheduleControllerRestart { .. }
+            | ControlMsg::ControllerTurnComplete { .. }
+            | ControlMsg::GetRestartStatus
+            | ControlMsg::CancelControllerRestart { .. } => {
+                self.log(
+                    LogLevel::Warn,
+                    "Controller-restart control commands are only supported in MCP mode"
+                        .to_string(),
+                );
             }
             ControlMsg::Quit => {
                 self.should_quit = true;
@@ -645,10 +652,7 @@ impl App {
                 self.streaming_buffer.clear();
                 // Show human-readable command summary at Model level (visible at Normal verbosity)
                 let summary = format_model_summary(&content);
-                self.log(
-                    LogLevel::Model,
-                    format!("T{}: {}", turn, summary),
-                );
+                self.log(LogLevel::Model, format!("T{}: {}", turn, summary));
                 if let Some(ref reasoning_text) = reasoning {
                     self.log(LogLevel::Model, format!("Reasoning: {}", reasoning_text));
                 }
@@ -674,9 +678,15 @@ impl App {
                 }
                 self.current_phase = Phase::Done;
             }
-            AppEvent::AgentStarted { turn, commands_preview } => {
+            AppEvent::AgentStarted {
+                turn,
+                commands_preview,
+            } => {
                 self.current_phase = Phase::RunningAgent;
-                self.log(LogLevel::Debug, format!("Agent running (turn {}): {}", turn, commands_preview));
+                self.log(
+                    LogLevel::Debug,
+                    format!("Agent running (turn {}): {}", turn, commands_preview),
+                );
             }
             AppEvent::AgentOutput { stdout, stderr } => {
                 self.broadcast_control(OutboundEvent::AgentOutput {
@@ -847,22 +857,13 @@ fn format_model_summary(content: &str) -> String {
             let func = cmd.get("function").and_then(|f| f.as_str()).unwrap_or("?");
             match func {
                 "execAsAgent" => {
-                    let command = cmd
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("?");
+                    let command = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("?");
                     let truncated = truncate_str(command, 120);
                     format!("exec: {}", truncated)
                 }
                 "editFile" => {
-                    let path = cmd
-                        .get("file_path")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("?");
-                    let op = cmd
-                        .get("operation")
-                        .and_then(|o| o.as_str())
-                        .unwrap_or("?");
+                    let path = cmd.get("file_path").and_then(|p| p.as_str()).unwrap_or("?");
+                    let op = cmd.get("operation").and_then(|o| o.as_str()).unwrap_or("?");
                     format!("edit: {} ({})", path, op)
                 }
                 "inspectPath" => {
@@ -874,10 +875,7 @@ fn format_model_summary(content: &str) -> String {
                     format!("browse: {}", truncate_str(url, 80))
                 }
                 "askHuman" => {
-                    let q = cmd
-                        .get("question")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or("?");
+                    let q = cmd.get("question").and_then(|q| q.as_str()).unwrap_or("?");
                     format!("ask: {}", truncate_str(q, 100))
                 }
                 "storeMemory" => {
@@ -895,10 +893,7 @@ fn format_model_summary(content: &str) -> String {
                     format!("recall: {}", q)
                 }
                 "execPty" => {
-                    let command = cmd
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("?");
+                    let command = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("?");
                     format!("pty: {}", truncate_str(command, 120))
                 }
                 _ => func.to_string(),
@@ -920,7 +915,6 @@ fn truncate_str(s: &str, max: usize) -> &str {
         &s[..end]
     }
 }
-
 
 #[cfg(test)]
 mod tests {
