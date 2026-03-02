@@ -678,6 +678,7 @@ Notes:
 - `max_attempts` must be `>= 1`; `0` is rejected.
 - Optional `status`, `handoff_summary`, and cancel `restart_id` guard treat whitespace-only values as unset.
 - If `restart_after="now"` and execution fails after passing validation, `schedule_controller_restart` reports `"ok": false` and includes `execution_error`.
+- `schedule_controller_restart` always reports `"phase"` from persisted restart state; for `restart_after="now"` this reflects the post-execution phase (`"completed"` or `"failed"`).
 - Any restart execution failure (including `auto_start_task` launch errors) updates persisted restart state to `"phase": "failed"` and populates `last_error`.
 - `schedule_controller_restart` rejection payloads use `"status": "rejected"` and include `"error"` (plus `"restart_id"`/`"phase"` when a conflicting active restart exists).
 - `controller_turn_complete` reports JSON results:

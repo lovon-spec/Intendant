@@ -784,7 +784,6 @@ async fn handle_control_command_mcp(
                 "status": "scheduled",
                 "restart_id": restart.restart_id,
                 "turn_complete_token": restart.turn_complete_token,
-                "phase": restart.phase,
             });
             let mut command_ok = true;
             let mut command_message = "ok".to_string();
@@ -805,6 +804,16 @@ async fn handle_control_command_mcp(
                     }
                 }
             }
+            let phase = {
+                let s = state.read().await;
+                s.controller_restart
+                    .as_ref()
+                    .map(restart_phase_value)
+                    .unwrap_or_else(|| {
+                        serde_json::to_value(restart.phase).unwrap_or(serde_json::Value::Null)
+                    })
+            };
+            payload["phase"] = phase;
 
             emit_control_result(
                 control_tx,
@@ -1764,7 +1773,6 @@ impl IntendantServer {
             "status": "scheduled",
             "restart_id": restart.restart_id,
             "turn_complete_token": restart.turn_complete_token,
-            "phase": restart.phase,
             "ok": true,
         });
         let mut command_ok = true;
@@ -1785,6 +1793,16 @@ impl IntendantServer {
             }
         }
         output["ok"] = serde_json::Value::Bool(command_ok);
+        let phase = {
+            let s = self.state.read().await;
+            s.controller_restart
+                .as_ref()
+                .map(restart_phase_value)
+                .unwrap_or_else(|| {
+                    serde_json::to_value(restart.phase).unwrap_or(serde_json::Value::Null)
+                })
+        };
+        output["phase"] = phase;
 
         serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
     }
@@ -2963,6 +2981,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_restart_now_reports_completed_phase() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state, bus);
+
+        let output = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("now".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(true));
+        assert_eq!(json["phase"].as_str(), Some("completed"));
+        assert!(json["execution"].as_str().unwrap_or("").contains("spawned"));
+    }
+
+    #[tokio::test]
+    async fn schedule_restart_now_reports_failed_phase() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state, bus);
+
+        let output = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("now".to_string()),
+                restart_command: None,
+                auto_start_task: Some(true),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(false));
+        assert_eq!(json["phase"].as_str(), Some("failed"));
+        assert!(json["execution_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Failed to start follow-up task"));
+    }
+
+    #[tokio::test]
     async fn control_schedule_restart_rejects_missing_actions() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
@@ -3007,6 +3078,53 @@ mod tests {
             Some(
                 "Invalid request: configure at least one restart action (restart_command and/or auto_start_task=true)"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn control_schedule_restart_now_reports_completed_phase() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx),
+            ControlMsg::ScheduleControllerRestart {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("now".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+        let event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for command_result")
+            .expect("broadcast recv failed");
+        let json: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            json.get("event").and_then(|v| v.as_str()),
+            Some("command_result")
+        );
+        assert_eq!(
+            json.get("action").and_then(|v| v.as_str()),
+            Some("schedule_controller_restart")
+        );
+        assert_eq!(json.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            json.get("data")
+                .and_then(|v| v.get("phase"))
+                .and_then(|v| v.as_str()),
+            Some("completed")
         );
     }
 
