@@ -187,6 +187,10 @@ Commands are classified into categories (FileRead, FileWrite, FileDelete, Comman
 
 A Unix socket server at `/tmp/intendant-<pid>.sock` enables programmatic control. JSON-line protocol supports: status, approve, deny, input, set_autonomy, quit. Outbound events are broadcast to all connected clients.
 
+### MCP Hot Reload
+
+The `reload` MCP tool rebuilds the binary and replaces the running process via `exec()`. A `ReloadTransport` wrapper injects a synthetic MCP initialization handshake so rmcp's `serve()` works transparently after exec. The `INTENDANT_MCP_RELOAD` env var signals the new process to use `ReloadTransport` instead of plain stdio.
+
 ### OpenAI API Features
 
 - **Structured output**: JSON object mode (`text.format`) is enabled by default for capable models (gpt-5+, o3, o4). Controlled via `STRUCTURED_OUTPUT` env var. Eliminates brittle free-text JSON extraction.

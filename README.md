@@ -590,6 +590,20 @@ All tools mirror TUI actions. The server enforces compile-time parity — adding
 | `set_autonomy` | Set autonomy level (TUI: `+`/`-`) | `level`: `"low"`, `"medium"`, `"high"`, `"full"` |
 | `set_verbosity` | Set log verbosity (TUI: `v`) | `level`: `"quiet"`, `"normal"`, `"verbose"`, `"debug"` |
 | `quit` | Shut down the agent (TUI: `q`) | — |
+| `start_task` | Start a new agent task | `task` |
+| `reload` | Rebuild binary and hot-reload the MCP server via exec() | — |
+
+### Hot Reload
+
+The `reload` tool rebuilds the binary from source (`cargo build --release`) and replaces the running MCP server process in-place using `exec()`. The MCP connection survives seamlessly — no Claude Code restart needed.
+
+How it works:
+1. `reload` runs `cargo build --release` in the project directory
+2. After sending the tool response, the process calls `exec()` to replace itself with the new binary
+3. The new process detects `INTENDANT_MCP_RELOAD=1` and uses a `ReloadTransport` that injects a synthetic MCP initialization handshake
+4. Claude Code continues using the same connection — the stdio file descriptors survive `exec()`
+
+This is particularly useful during development: edit code, call `reload`, and the MCP server picks up all changes without losing the connection.
 
 ### Resources
 
