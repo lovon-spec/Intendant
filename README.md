@@ -625,11 +625,13 @@ All tools mirror TUI actions. The server enforces compile-time parity — adding
 | `set_verbosity` | Set log verbosity (TUI: `v`) | `level`: `"quiet"`, `"normal"`, `"verbose"`, `"debug"` |
 | `quit` | Shut down the agent (TUI: `q`) | — |
 | `start_task` | Start a new agent task | `task` |
-| `schedule_controller_restart` | Schedule a controller restart/autonomous re-init workflow | `controller_id`, `north_star_goal`, `reason?`, `restart_after?` (`"turn_end"` or `"now"`), `restart_command?`, `auto_start_task?` (default `false`), `max_attempts?`, `cooldown_sec?` |
+| `schedule_controller_restart` | Schedule a controller restart/autonomous re-init workflow | `controller_id`, `north_star_goal`, `reason?`, `restart_after?` (`"turn_end"` or `"now"`), `restart_command?` (non-empty), `auto_start_task?` (default `false`), `max_attempts?`, `cooldown_sec?`; requires at least one restart action (`restart_command` and/or `auto_start_task=true`) |
 | `controller_turn_complete` | Final handshake from controller; validates token and executes scheduled restart | `restart_id`, `turn_complete_token`, `status?`, `handoff_summary?` |
 | `get_restart_status` | Get current controller restart state (or null) | — |
 | `cancel_controller_restart` | Cancel scheduled restart | `restart_id?` |
 | `reload` | Rebuild binary and hot-reload the MCP server via exec() | — |
+
+`schedule_controller_restart` and `controller_turn_complete` return JSON payloads with an `ok` boolean and status fields. Rejections are returned as JSON (`ok: false`) with an `error` message instead of plain text.
 
 ### Hot Reload
 
@@ -670,8 +672,14 @@ Notes:
 - Restart state is persisted to the current session dir as `controller_restart.json`.
 - `restart_after` defaults to `"turn_end"`.
 - `restart_after` accepts only `"turn_end"` or `"now"`; other values are rejected.
+- `restart_command`, when provided, must not be empty/whitespace.
+- At least one restart action is required at schedule time: set `restart_command` and/or `auto_start_task=true`.
 - `max_attempts` must be `>= 1`; `0` is rejected.
-- If `restart_after="now"` and execution fails, `schedule_controller_restart` reports `"ok": false` and includes `execution_error`.
+- If `restart_after="now"` and execution fails after passing validation, `schedule_controller_restart` reports `"ok": false` and includes `execution_error`.
+- `schedule_controller_restart` rejection payloads use `"status": "rejected"` and include `"error"` (plus `"restart_id"`/`"phase"` when a conflicting active restart exists).
+- `controller_turn_complete` reports JSON results:
+  - success: `"status": "completed"`, `"ok": true`, plus `"execution"` and `"phase"`.
+  - rejection/pending: `"ok": false`, with `"status"` (`"rejected"` or `"restart_pending"`) and `"error"`.
 
 Controller recursion profile (recommended for Codex/Claude-style controllers):
 - Set `auto_start_task=false` (or omit it, since `false` is the default).

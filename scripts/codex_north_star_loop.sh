@@ -88,6 +88,13 @@ Execution policy:
 - Keep changes incremental and shippable.
 - Run intendant E2E tests each cycle before handoff.
 - If E2E or regression tests fail, fix the bugs in the same cycle before scheduling restart.
+- The repository may already contain uncommitted changes from prior loop cycles; treat those as expected baseline context, not as unexpected external edits.
+- Do not stop only because `git status` is dirty at turn start; continue from current workspace state.
+- Commit each completed cycle before restart handshake.
+- Use one commit per cycle with message format: `loop: <short summary> [run <YYYYMMDDTHHMMSSZ>]`.
+- Do not amend prior commits.
+- Do not push unless explicitly requested by the user.
+- Before restart handshake, ensure there are no staged/unstaged tracked changes left (`git status --porcelain --untracked-files=no` should be empty).
 
 Controller recursion policy:
 - Near turn end, call intendant MCP tool schedule_controller_restart with:
