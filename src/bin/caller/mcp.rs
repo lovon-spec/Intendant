@@ -432,6 +432,19 @@ async fn start_task_with_state(
     Ok(())
 }
 
+fn restart_state_public_value(state: Option<&ControllerRestartState>) -> serde_json::Value {
+    let mut value = serde_json::to_value(state).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = value.as_object_mut() {
+        if obj.contains_key("turn_complete_token") {
+            obj.insert(
+                "turn_complete_token".to_string(),
+                serde_json::Value::String("[redacted]".to_string()),
+            );
+        }
+    }
+    value
+}
+
 async fn spawn_detached_restart_command(cmd: &str) -> Result<u32, String> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -1877,12 +1890,8 @@ impl IntendantServer {
     )]
     async fn get_restart_status(&self) -> String {
         let s = self.state.read().await;
-        match s.controller_restart.as_ref() {
-            Some(restart) => {
-                serde_json::to_string_pretty(restart).unwrap_or_else(|_| "null".to_string())
-            }
-            None => "null".to_string(),
-        }
+        let value = restart_state_public_value(s.controller_restart.as_ref());
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string())
     }
 
     #[tool(description = "Cancel a scheduled controller restart.")]
@@ -2170,8 +2179,10 @@ impl ServerHandler for IntendantServer {
                 serde_json::to_string_pretty(&StateResult::PendingInput { question: snap })
                     .unwrap_or_else(|_| "null".to_string())
             }
-            RESOURCE_RESTART_URI => serde_json::to_string_pretty(&s.controller_restart)
-                .unwrap_or_else(|_| "null".to_string()),
+            RESOURCE_RESTART_URI => {
+                let value = restart_state_public_value(s.controller_restart.as_ref());
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string())
+            }
             _ => {
                 return Err(McpError::invalid_params(
                     format!("Unknown resource URI: {}", request.uri),
@@ -2737,6 +2748,36 @@ mod tests {
     }
 
     #[test]
+    fn restart_state_public_value_redacts_turn_complete_token() {
+        let params = ScheduleControllerRestartParams {
+            controller_id: "codex".to_string(),
+            north_star_goal: "audit and improve".to_string(),
+            reason: None,
+            restart_after: None,
+            restart_command: Some("true".to_string()),
+            auto_start_task: Some(false),
+            max_attempts: None,
+            cooldown_sec: None,
+        };
+        let restart = ControllerRestartState::new(&params);
+        let raw_token = restart.turn_complete_token.clone();
+
+        let public = restart_state_public_value(Some(&restart));
+        assert_eq!(
+            public.get("turn_complete_token").and_then(|v| v.as_str()),
+            Some("[redacted]")
+        );
+        assert_ne!(
+            public.get("turn_complete_token").and_then(|v| v.as_str()),
+            Some(raw_token.as_str())
+        );
+        assert_eq!(
+            public.get("restart_id").and_then(|v| v.as_str()),
+            Some(restart.restart_id.as_str())
+        );
+    }
+
+    #[test]
     fn resource_definitions_has_five_entries() {
         let defs = resource_definitions();
         assert_eq!(defs.len(), 5);
@@ -3176,6 +3217,40 @@ mod tests {
         assert_eq!(json["restart_id"].as_str(), Some(restart_id.as_str()));
         assert_eq!(json["phase"].as_str(), Some("completed"));
         assert!(json["execution"].as_str().unwrap_or("").contains("spawned"));
+    }
+
+    #[tokio::test]
+    async fn get_restart_status_redacts_turn_complete_token() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state, bus);
+
+        let scheduled = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled).unwrap();
+        let token = scheduled_json["turn_complete_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let status = server.get_restart_status().await;
+        let status_json: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(
+            status_json["turn_complete_token"].as_str(),
+            Some("[redacted]")
+        );
+        assert_ne!(status_json["turn_complete_token"].as_str(), Some(token.as_str()));
     }
 
     #[tokio::test]

@@ -686,6 +686,7 @@ Notes:
 - `cancel_controller_restart` reports JSON results:
   - success: `"status": "cancelled"`, `"ok": true`, plus `"restart_id"` and `"phase": "cancelled"`.
   - rejection: `"status": "rejected"`, `"ok": false`, with `"error"` (and optional `"restart_id"`/`"phase"` context).
+- `get_restart_status` and `intendant://controller-restart` redact `turn_complete_token` as `"[redacted]"`; only `schedule_controller_restart` returns the raw token for the final handshake call.
 
 Controller recursion profile (recommended for Codex/Claude-style controllers):
 - Set `auto_start_task=false` (or omit it, since `false` is the default).
