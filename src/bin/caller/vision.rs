@@ -16,10 +16,10 @@ pub struct DisplayConfig {
 /// resolution = screenshot resolution = what the model sees (no scaling).
 pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
     let (width, height) = match provider_name {
-        "openai" => (1024, 768),     // 3 tiles of 512x512 → ~595 tokens
-        "anthropic" => (819, 1456),  // 9:16 within 1568px limit → ~1590 tokens
-        "gemini" => (768, 1024),     // 2 tiles of 768x768 → ~516 tokens
-        _ => (1024, 768),            // safe default
+        "openai" => (1024, 768),    // 3 tiles of 512x512 → ~595 tokens
+        "anthropic" => (819, 1456), // 9:16 within 1568px limit → ~1590 tokens
+        "gemini" => (768, 1024),    // 2 tiles of 768x768 → ~516 tokens
+        _ => (1024, 768),           // safe default
     };
     DisplayConfig {
         display_id: find_free_display(),

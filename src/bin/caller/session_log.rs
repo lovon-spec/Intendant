@@ -169,11 +169,7 @@ impl SessionLog {
                                 None => true,
                             };
                             if dominated {
-                                best = Some((
-                                    meta.session_id,
-                                    entry.path(),
-                                    meta.created_at,
-                                ));
+                                best = Some((meta.session_id, entry.path(), meta.created_at));
                             }
                         }
                     }
@@ -219,8 +215,7 @@ impl SessionLog {
                 let meta_path = entry.path().join("session_meta.json");
                 if let Ok(meta_str) = fs::read_to_string(&meta_path) {
                     if let Ok(meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
-                        if meta.session_id == session_id
-                            || meta.session_id.starts_with(session_id)
+                        if meta.session_id == session_id || meta.session_id.starts_with(session_id)
                         {
                             return Some(entry.path());
                         }
@@ -818,10 +813,9 @@ mod tests {
         log.write_summary("task", "completed", 3);
         drop(log);
 
-        let meta: SessionMeta = serde_json::from_str(
-            &fs::read_to_string(log_dir.join("session_meta.json")).unwrap(),
-        )
-        .unwrap();
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
         assert_eq!(meta.last_turn, Some(3));
     }
@@ -936,7 +930,9 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.messages_input(r#"[{"role":"system","content":"You are an AI."},{"role":"user","content":"Hello"}]"#);
+        log.messages_input(
+            r#"[{"role":"system","content":"You are an AI."},{"role":"user","content":"Hello"}]"#,
+        );
         drop(log);
 
         let messages_file = log_dir.join("turns/turn_001_messages.json");

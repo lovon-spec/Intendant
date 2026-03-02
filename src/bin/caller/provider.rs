@@ -50,9 +50,9 @@ async fn send_with_retry(
             tokio::time::sleep(backoff_delay(attempt)).await;
         }
     }
-    Err(CallerError::Provider(
-        last_err.unwrap_or_else(|| "request failed after retries".to_string()),
-    ))
+    Err(CallerError::Provider(last_err.unwrap_or_else(|| {
+        "request failed after retries".to_string()
+    })))
 }
 
 /// Parse Server-Sent Events from a byte stream. Returns (event_type, data) pairs.
@@ -310,8 +310,7 @@ impl ChatProvider for OpenAIProvider {
         // Note: OpenAI Responses API uses automatic prompt caching for prompts
         // longer than 1024 tokens. No explicit API changes are needed — caching
         // is applied server-side and reported via usage.prompt_tokens_details.
-        let request_json =
-            serde_json::to_value(&request).map_err(CallerError::Json)?;
+        let request_json = serde_json::to_value(&request).map_err(CallerError::Json)?;
         let client = &self.client;
         let api_key = &self.api_key;
         let response = send_with_retry(
@@ -568,7 +567,8 @@ impl ChatProvider for OpenAIProvider {
                                         let idx = event
                                             .get("output_index")
                                             .and_then(|v| v.as_u64())
-                                            .unwrap_or(0) as usize;
+                                            .unwrap_or(0)
+                                            as usize;
                                         let id = item
                                             .get("id")
                                             .and_then(|v| v.as_str())
@@ -600,7 +600,8 @@ impl ChatProvider for OpenAIProvider {
                                 let idx = event
                                     .get("output_index")
                                     .and_then(|v| v.as_u64())
-                                    .unwrap_or(0) as usize;
+                                    .unwrap_or(0)
+                                    as usize;
                                 if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
                                     if let Some(tc) = pending_tools.get_mut(&idx) {
                                         tc.arguments.push_str(delta);
@@ -611,7 +612,8 @@ impl ChatProvider for OpenAIProvider {
                                 let idx = event
                                     .get("output_index")
                                     .and_then(|v| v.as_u64())
-                                    .unwrap_or(0) as usize;
+                                    .unwrap_or(0)
+                                    as usize;
                                 if let Some(tc) = pending_tools.remove(&idx) {
                                     tool_calls.push(tc);
                                 }
@@ -622,7 +624,8 @@ impl ChatProvider for OpenAIProvider {
                                     let idx = event
                                         .get("output_index")
                                         .and_then(|v| v.as_u64())
-                                        .unwrap_or(0) as usize;
+                                        .unwrap_or(0)
+                                        as usize;
                                     if idx < raw_output_items.len() {
                                         raw_output_items[idx] = item.clone();
                                     }
@@ -637,8 +640,7 @@ impl ChatProvider for OpenAIProvider {
                                                 if let Some(text) =
                                                     s.get("text").and_then(|t| t.as_str())
                                                 {
-                                                    reasoning_summary_parts
-                                                        .push(text.to_string());
+                                                    reasoning_summary_parts.push(text.to_string());
                                                 }
                                             }
                                         }
@@ -887,8 +889,7 @@ impl ChatProvider for AnthropicProvider {
             stream: false,
         };
 
-        let request_json =
-            serde_json::to_value(&request).map_err(CallerError::Json)?;
+        let request_json = serde_json::to_value(&request).map_err(CallerError::Json)?;
         let client = &self.client;
         let api_key = &self.api_key;
         let response = send_with_retry(
@@ -1109,9 +1110,8 @@ impl ChatProvider for AnthropicProvider {
                                             }
                                         }
                                         "input_json_delta" => {
-                                            if let Some(json) = delta
-                                                .get("partial_json")
-                                                .and_then(|t| t.as_str())
+                                            if let Some(json) =
+                                                delta.get("partial_json").and_then(|t| t.as_str())
                                             {
                                                 current_tool_json.push_str(json);
                                             }
@@ -1176,9 +1176,7 @@ impl ChatProvider for AnthropicProvider {
 }
 
 /// Build Anthropic API messages from our message format (shared between streaming and non-streaming).
-fn build_anthropic_messages(
-    messages: &[Message],
-) -> (serde_json::Value, Vec<AnthropicMessage>) {
+fn build_anthropic_messages(messages: &[Message]) -> (serde_json::Value, Vec<AnthropicMessage>) {
     let system_text = messages
         .iter()
         .find(|m| m.role == "system")
@@ -1265,9 +1263,8 @@ impl GeminiProvider {
         max_output_tokens: u64,
     ) -> Self {
         let use_tools = resolve_use_tools();
-        let endpoint = env::var("GEMINI_ENDPOINT").unwrap_or_else(|_| {
-            "https://generativelanguage.googleapis.com".to_string()
-        });
+        let endpoint = env::var("GEMINI_ENDPOINT")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
         Self {
             client: api_client(),
             api_key,
@@ -1292,8 +1289,7 @@ fn gemini_role(role: &str) -> &str {
 #[async_trait]
 impl ChatProvider for GeminiProvider {
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        let (system_text, _contents, mut request_body) =
-            build_gemini_request_parts(messages, self);
+        let (system_text, _contents, mut request_body) = build_gemini_request_parts(messages, self);
 
         if let Some(ref sys) = system_text {
             request_body["systemInstruction"] = serde_json::json!({
@@ -1372,25 +1368,28 @@ impl ChatProvider for GeminiProvider {
         let content = text_parts.join("");
 
         // Extract usage
-        let usage = resp.get("usageMetadata").map(|u| {
-            let prompt = u
-                .get("promptTokenCount")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let completion = u
-                .get("candidatesTokenCount")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let total = u
-                .get("totalTokenCount")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(prompt + completion);
-            TokenUsage {
-                prompt_tokens: prompt,
-                completion_tokens: completion,
-                total_tokens: total,
-            }
-        }).unwrap_or_default();
+        let usage = resp
+            .get("usageMetadata")
+            .map(|u| {
+                let prompt = u
+                    .get("promptTokenCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let completion = u
+                    .get("candidatesTokenCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let total = u
+                    .get("totalTokenCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(prompt + completion);
+                TokenUsage {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_tokens: total,
+                }
+            })
+            .unwrap_or_default();
 
         Ok(ChatResponse {
             content,
@@ -1435,8 +1434,7 @@ impl ChatProvider for GeminiProvider {
         messages: &[Message],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ChatResponse, CallerError> {
-        let (system_text, contents, request_body_base) =
-            build_gemini_request_parts(messages, self);
+        let (system_text, contents, request_body_base) = build_gemini_request_parts(messages, self);
 
         let mut request_body = request_body_base;
         if let Some(ref sys) = system_text {
@@ -1779,8 +1777,7 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
         let key = gemini_key.ok_or_else(|| {
             CallerError::Config("PROVIDER=gemini but no GEMINI_API_KEY found.".to_string())
         })?;
-        let model =
-            env::var("MODEL_NAME").unwrap_or_else(|_| "gemini-2.5-pro".to_string());
+        let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gemini-2.5-pro".to_string());
         let ctx = resolve_context_window(&model);
         let max_out = resolve_max_output_tokens(&model);
         return Ok(Box::new(GeminiProvider::new(key, model, ctx, max_out)));
@@ -1983,7 +1980,10 @@ mod tests {
         let resp: AnthropicChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.content.len(), 2);
         assert_eq!(resp.content[0].content_type.as_deref(), Some("text"));
-        assert_eq!(resp.content[0].text.as_deref(), Some("I'll list the files."));
+        assert_eq!(
+            resp.content[0].text.as_deref(),
+            Some("I'll list the files.")
+        );
         assert_eq!(resp.content[1].content_type.as_deref(), Some("tool_use"));
         assert_eq!(resp.content[1].id.as_deref(), Some("toolu_abc123"));
         assert_eq!(resp.content[1].name.as_deref(), Some("exec_command"));
@@ -2515,7 +2515,8 @@ mod tests {
 
     #[test]
     fn gemini_response_text_parsing() {
-        let resp: serde_json::Value = serde_json::from_str(r#"{
+        let resp: serde_json::Value = serde_json::from_str(
+            r#"{
             "candidates": [{
                 "content": {
                     "parts": [{"text": "Hello from Gemini!"}],
@@ -2527,7 +2528,9 @@ mod tests {
                 "candidatesTokenCount": 5,
                 "totalTokenCount": 15
             }
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let text = resp
             .pointer("/candidates/0/content/parts/0/text")
@@ -2603,7 +2606,9 @@ mod tests {
             1_048_576,
             65_536,
         );
-        assert!(provider.endpoint.contains("generativelanguage.googleapis.com"));
+        assert!(provider
+            .endpoint
+            .contains("generativelanguage.googleapis.com"));
     }
 
     #[test]

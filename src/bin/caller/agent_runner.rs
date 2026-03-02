@@ -1,4 +1,6 @@
 use crate::error::CallerError;
+use crate::sandbox::SandboxConfig;
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -32,6 +34,22 @@ pub async fn run_agent(
     json_input: &str,
     log_dir: &std::path::Path,
 ) -> Result<AgentOutput, CallerError> {
+    #[cfg(target_os = "linux")]
+    if let Ok(raw_paths) = std::env::var("INTENDANT_SANDBOX_WRITE_PATHS") {
+        let write_paths: Vec<PathBuf> = raw_paths
+            .split(':')
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !write_paths.is_empty() {
+            let sandbox = SandboxConfig {
+                read_paths: vec![PathBuf::from("/")],
+                write_paths,
+                enabled: true,
+            };
+            return run_agent_inner(json_input, log_dir, Some(&sandbox)).await;
+        }
+    }
     run_agent_inner(json_input, log_dir, None).await
 }
 
@@ -48,7 +66,7 @@ pub async fn run_agent_sandboxed(
 async fn run_agent_inner(
     json_input: &str,
     log_dir: &std::path::Path,
-    _sandbox: Option<&crate::sandbox::SandboxConfig>,
+    sandbox: Option<&crate::sandbox::SandboxConfig>,
 ) -> Result<AgentOutput, CallerError> {
     let agent_path = std::env::current_exe()
         .ok()
@@ -64,7 +82,7 @@ async fn run_agent_inner(
     // If sandbox config is provided, serialize it as an env var.
     // The runtime will apply Landlock restrictions at startup.
     #[cfg(target_os = "linux")]
-    if let Some(sandbox) = _sandbox {
+    if let Some(sandbox) = sandbox {
         if sandbox.enabled {
             let write_paths: Vec<String> = sandbox
                 .write_paths
@@ -75,11 +93,9 @@ async fn run_agent_inner(
         }
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| {
-            CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
-        })?;
+    let mut child = cmd.spawn().map_err(|e| {
+        CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
+    })?;
 
     // Write JSON to stdin and close it
     if let Some(mut stdin) = child.stdin.take() {
@@ -93,15 +109,31 @@ async fn run_agent_inner(
 
     // Read stdout and stderr (bounded), then wait for exit, all under a single hard timeout
     let result = timeout(hard_timeout, async {
-        let mut stdout_buf = Vec::with_capacity(8192);
-        let mut stderr_buf = Vec::with_capacity(8192);
-        if let Some(mut stdout) = child.stdout.take() {
-            let _ = (&mut stdout).take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut stdout_buf).await;
-        }
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = (&mut stderr).take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut stderr_buf).await;
-        }
-        let _ = child.wait().await;
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+
+        let read_stdout = async {
+            let mut buf = Vec::with_capacity(8192);
+            if let Some(ref mut out) = stdout {
+                let _ = out
+                    .take(MAX_OUTPUT_BYTES as u64)
+                    .read_to_end(&mut buf)
+                    .await;
+            }
+            buf
+        };
+        let read_stderr = async {
+            let mut buf = Vec::with_capacity(8192);
+            if let Some(ref mut err) = stderr {
+                let _ = err
+                    .take(MAX_OUTPUT_BYTES as u64)
+                    .read_to_end(&mut buf)
+                    .await;
+            }
+            buf
+        };
+
+        let (stdout_buf, stderr_buf, _) = tokio::join!(read_stdout, read_stderr, child.wait());
         (stdout_buf, stderr_buf)
     })
     .await;

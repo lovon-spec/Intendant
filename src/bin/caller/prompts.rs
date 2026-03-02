@@ -242,11 +242,8 @@ mod tests {
 
     #[test]
     fn resolve_tools_prompt_direct_role() {
-        let result = resolve_system_prompt_for_tools(
-            &SubAgentRole::Custom("direct".into()),
-            None,
-        )
-        .unwrap();
+        let result =
+            resolve_system_prompt_for_tools(&SubAgentRole::Custom("direct".into()), None).unwrap();
         assert_eq!(result, DEFAULT_PROMPT_TOOLS);
         assert!(result.contains("Tool Calling Protocol"));
         assert!(!result.contains("JSON Schema"));
@@ -254,8 +251,7 @@ mod tests {
 
     #[test]
     fn resolve_tools_prompt_with_role_appends() {
-        let result =
-            resolve_system_prompt_for_tools(&SubAgentRole::Orchestrator, None).unwrap();
+        let result = resolve_system_prompt_for_tools(&SubAgentRole::Orchestrator, None).unwrap();
         assert!(result.contains(DEFAULT_PROMPT_TOOLS));
         assert!(result.contains(DEFAULT_ORCHESTRATOR_PROMPT));
     }

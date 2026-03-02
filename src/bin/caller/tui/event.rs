@@ -112,10 +112,47 @@ pub enum ApprovalResponse {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ControlMsg {
     Status,
-    Approve { id: u64 },
-    Deny { id: u64 },
-    Input { text: String },
-    SetAutonomy { level: String },
+    Approve {
+        id: u64,
+    },
+    Deny {
+        id: u64,
+    },
+    Input {
+        text: String,
+    },
+    SetAutonomy {
+        level: String,
+    },
+    ScheduleControllerRestart {
+        controller_id: String,
+        north_star_goal: String,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        restart_after: Option<String>,
+        #[serde(default)]
+        restart_command: Option<String>,
+        #[serde(default)]
+        auto_start_task: Option<bool>,
+        #[serde(default)]
+        max_attempts: Option<u32>,
+        #[serde(default)]
+        cooldown_sec: Option<u64>,
+    },
+    ControllerTurnComplete {
+        restart_id: String,
+        turn_complete_token: String,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        handoff_summary: Option<String>,
+    },
+    GetRestartStatus,
+    CancelControllerRestart {
+        #[serde(default)]
+        restart_id: Option<String>,
+    },
     Quit,
 }
 
@@ -327,6 +364,42 @@ mod tests {
     }
 
     #[test]
+    fn control_msg_schedule_restart_deserialize() {
+        let json = r#"{"action":"schedule_controller_restart","controller_id":"codex","north_star_goal":"audit and improve","restart_after":"turn_end"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ScheduleControllerRestart {
+                controller_id,
+                north_star_goal,
+                restart_after,
+                ..
+            } => {
+                assert_eq!(controller_id, "codex");
+                assert_eq!(north_star_goal, "audit and improve");
+                assert_eq!(restart_after.as_deref(), Some("turn_end"));
+            }
+            _ => panic!("expected ScheduleControllerRestart"),
+        }
+    }
+
+    #[test]
+    fn control_msg_controller_turn_complete_deserialize() {
+        let json = r#"{"action":"controller_turn_complete","restart_id":"abc","turn_complete_token":"tok"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ControllerTurnComplete {
+                restart_id,
+                turn_complete_token,
+                ..
+            } => {
+                assert_eq!(restart_id, "abc");
+                assert_eq!(turn_complete_token, "tok");
+            }
+            _ => panic!("expected ControllerTurnComplete"),
+        }
+    }
+
+    #[test]
     fn control_msg_serialize_roundtrip() {
         let msgs = vec![
             ControlMsg::Status,
@@ -338,6 +411,24 @@ mod tests {
             ControlMsg::SetAutonomy {
                 level: "low".to_string(),
             },
+            ControlMsg::ScheduleControllerRestart {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: None,
+                auto_start_task: Some(true),
+                max_attempts: Some(1),
+                cooldown_sec: Some(30),
+            },
+            ControlMsg::ControllerTurnComplete {
+                restart_id: "id".to_string(),
+                turn_complete_token: "token".to_string(),
+                status: None,
+                handoff_summary: None,
+            },
+            ControlMsg::GetRestartStatus,
+            ControlMsg::CancelControllerRestart { restart_id: None },
             ControlMsg::Quit,
         ];
         for msg in msgs {

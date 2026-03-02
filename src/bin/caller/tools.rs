@@ -183,7 +183,8 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
         tools.push(ToolDefinition {
             name: "browse_url".to_string(),
-            description: "Fetch a URL and convert HTML to readable plain text (truncated to 50KB).".to_string(),
+            description: "Fetch a URL and convert HTML to readable plain text (truncated to 50KB)."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
@@ -332,7 +333,8 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     // 11. signal_done (caller-handled, not sent to runtime)
     tools.push(ToolDefinition {
         name: "signal_done".to_string(),
-        description: "Signal that the task is complete. Call this when you have finished all work.".to_string(),
+        description: "Signal that the task is complete. Call this when you have finished all work."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -387,11 +389,7 @@ mod tests {
                 "Tool '{}' has uppercase characters",
                 tool.name
             );
-            assert!(
-                !tool.name.contains('-'),
-                "Tool '{}' has hyphens",
-                tool.name
-            );
+            assert!(!tool.name.contains('-'), "Tool '{}' has hyphens", tool.name);
         }
     }
 
@@ -471,22 +469,13 @@ mod tests {
             Some("captureScreen")
         );
         assert_eq!(tool_name_to_function("fetch_status"), None);
-        assert_eq!(
-            tool_name_to_function("inspect_path"),
-            Some("inspectPath")
-        );
+        assert_eq!(tool_name_to_function("inspect_path"), Some("inspectPath"));
         assert_eq!(tool_name_to_function("edit_file"), Some("editFile"));
         assert_eq!(tool_name_to_function("browse_url"), Some("browse"));
         assert_eq!(tool_name_to_function("ask_human"), Some("askHuman"));
         assert_eq!(tool_name_to_function("exec_pty"), Some("execPty"));
-        assert_eq!(
-            tool_name_to_function("store_memory"),
-            Some("storeMemory")
-        );
-        assert_eq!(
-            tool_name_to_function("recall_memory"),
-            Some("recallMemory")
-        );
+        assert_eq!(tool_name_to_function("store_memory"), Some("storeMemory"));
+        assert_eq!(tool_name_to_function("recall_memory"), Some("recallMemory"));
         assert_eq!(tool_name_to_function("manage_context"), None);
         assert_eq!(tool_name_to_function("signal_done"), None);
         assert_eq!(tool_name_to_function("nonexistent"), None);

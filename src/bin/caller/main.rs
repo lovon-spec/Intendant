@@ -9,10 +9,11 @@ mod mcp;
 mod mcp_client;
 mod project;
 mod prompts;
-mod sandbox;
 mod provider;
+mod sandbox;
 mod session_log;
 mod sub_agent;
+mod tool_batch;
 mod tools;
 mod tui;
 mod user_mode;
@@ -28,6 +29,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
 use tui::event::{AppEvent, EventBus};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
@@ -556,10 +558,9 @@ fn app_event_to_json(event: &AppEvent) -> Option<(&'static str, serde_json::Valu
         AppEvent::TaskComplete { reason } => {
             Some(("done", serde_json::json!({ "reason": reason })))
         }
-        AppEvent::ContextManagement { turn } => Some((
-            "context_management",
-            serde_json::json!({ "turn": turn }),
-        )),
+        AppEvent::ContextManagement { turn } => {
+            Some(("context_management", serde_json::json!({ "turn": turn })))
+        }
         _ => None, // Skip events that don't need JSON output (Key, Resize, Tick, etc.)
     }
 }
@@ -1124,6 +1125,29 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn assemble_batch_duplicate_nonce_emits_error() {
+        let calls = vec![
+            provider::ToolCall {
+                id: "call_1".to_string(),
+                call_id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                arguments: r#"{"nonce":1,"command":"echo a"}"#.to_string(),
+            },
+            provider::ToolCall {
+                id: "call_2".to_string(),
+                call_id: "call_2".to_string(),
+                name: "inspect_path".to_string(),
+                arguments: r#"{"nonce":1,"path":"/tmp"}"#.to_string(),
+            },
+        ];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert_eq!(result.precomputed_results.len(), 1);
+        assert!(result.precomputed_results[0]
+            .2
+            .contains("duplicate nonce 1"));
+    }
+
+    #[test]
     fn assemble_batch_tool_name_mapping() {
         // Verify all tool names map correctly
         let tool_pairs = vec![
@@ -1189,7 +1213,8 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn map_results_with_stderr() {
-        let stdout = "{\"type\":\"status\",\"nonce\":1,\"status\":\"c\",\"pid\":0,\"exit_code\":1}\n";
+        let stdout =
+            "{\"type\":\"status\",\"nonce\":1,\"status\":\"c\",\"pid\":0,\"exit_code\":1}\n";
         let stderr = "command not found";
         let mut nonce_map = std::collections::HashMap::new();
         nonce_map.insert(1u64, "call_1".to_string());
@@ -1257,207 +1282,6 @@ Also: {"source": "bare"}"#;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].2, "OK");
     }
-
-}
-
-/// Context directives extracted from manage_context / signal_done tool calls.
-struct ToolBatchResult {
-    /// JSON string of AgentInput to send to the runtime (None if no runtime commands).
-    agent_input_json: Option<String>,
-    /// Whether to apply context directives (from manage_context tool calls).
-    context_directives: Option<serde_json::Value>,
-    /// Whether the model signaled completion (signal_done).
-    is_done: bool,
-    /// Done message, if any.
-    done_message: Option<String>,
-    /// Map of nonce → tool call ID for routing results back.
-    nonce_to_call_id: std::collections::HashMap<u64, String>,
-    /// All tool call IDs and their names (for result routing).
-    call_id_names: Vec<(String, String)>,
-    /// MCP tool calls that should be routed through the MCP client manager.
-    /// Vec of (call_id, tool_name, arguments_json).
-    mcp_calls: Vec<(String, String, String)>,
-}
-
-/// Assemble an AgentInput batch from individual tool calls.
-/// Separates manage_context/signal_done from runtime commands.
-fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> ToolBatchResult {
-    let mut commands = Vec::new();
-    let mut nonce_to_call_id = std::collections::HashMap::new();
-    let mut call_id_names = Vec::new();
-    let mut context_directives = None;
-    let mut is_done = false;
-    let mut done_message = None;
-    let mut mcp_calls = Vec::new();
-
-    for tc in tool_calls {
-        call_id_names.push((tc.call_id.clone(), tc.name.clone()));
-
-        match tc.name.as_str() {
-            "manage_context" => {
-                // Parse the arguments as context directives
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    context_directives = Some(args);
-                }
-            }
-            "signal_done" => {
-                is_done = true;
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    done_message = args
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .map(String::from);
-                }
-            }
-            tool_name if mcp_client::McpClientManager::is_mcp_tool(tool_name) => {
-                mcp_calls.push((
-                    tc.call_id.clone(),
-                    tool_name.to_string(),
-                    tc.arguments.clone(),
-                ));
-            }
-            tool_name => {
-                // Runtime command — map tool name to function name
-                if let Some(function) = tools::tool_name_to_function(tool_name) {
-                    if let Ok(mut args) =
-                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    {
-                        // Set the function field
-                        args["function"] = serde_json::Value::String(function.to_string());
-
-                        // Track nonce → call ID for result routing
-                        if let Some(nonce) = args.get("nonce").and_then(|n| n.as_u64()) {
-                            nonce_to_call_id.insert(nonce, tc.call_id.clone());
-                        }
-
-                        commands.push(args);
-                    }
-                }
-            }
-        }
-    }
-
-    let agent_input_json = if commands.is_empty() {
-        None
-    } else {
-        let input = serde_json::json!({
-            "commands": commands,
-        });
-        Some(serde_json::to_string(&input).unwrap_or_default())
-    };
-
-    ToolBatchResult {
-        agent_input_json,
-        context_directives,
-        is_done,
-        done_message,
-        nonce_to_call_id,
-        call_id_names,
-        mcp_calls,
-    }
-}
-
-/// Map agent runtime output back to individual tool call responses.
-/// Returns Vec<(call_id, tool_name, response_text)>.
-fn map_results_to_tool_responses(
-    agent_stdout: &str,
-    agent_stderr: &str,
-    nonce_to_call_id: &std::collections::HashMap<u64, String>,
-    call_id_names: &[(String, String)],
-) -> Vec<(String, String, String)> {
-    // Parse JSON lines from runtime stdout.
-    // Status lines: {"type":"status","nonce":N,"status":"c","pid":P,"exit_code":E}
-    // Result lines: {"type":"result","nonce":N,"data":"..."}
-    let mut nonce_status: std::collections::HashMap<u64, String> =
-        std::collections::HashMap::new();
-    let mut nonce_results: std::collections::HashMap<u64, Vec<String>> =
-        std::collections::HashMap::new();
-    let mut other_lines = Vec::new();
-
-    for line in agent_stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            let msg_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let nonce = parsed.get("nonce").and_then(|n| n.as_u64());
-            match (msg_type, nonce) {
-                ("status", Some(n)) => {
-                    // Last status wins (e.g., running → completed)
-                    let status_char = parsed
-                        .get("status")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("?");
-                    let exit_code = parsed
-                        .get("exit_code")
-                        .and_then(|e| e.as_i64())
-                        .unwrap_or(0);
-                    nonce_status.insert(n, format!("{}{}{}", n, status_char, exit_code));
-                }
-                ("result", Some(n)) => {
-                    if let Some(data) = parsed.get("data").and_then(|d| d.as_str()) {
-                        nonce_results.entry(n).or_default().push(data.to_string());
-                    }
-                }
-                _ => {
-                    other_lines.push(trimmed.to_string());
-                }
-            }
-        } else {
-            other_lines.push(trimmed.to_string());
-        }
-    }
-
-    let other_output = other_lines.join("\n");
-
-    let mut results = Vec::new();
-
-    for (call_id, tool_name) in call_id_names {
-        // Find the nonce for this call ID
-        let nonce = nonce_to_call_id
-            .iter()
-            .find(|(_, cid)| *cid == call_id)
-            .map(|(&n, _)| n);
-
-        let mut parts = Vec::new();
-
-        if let Some(n) = nonce {
-            if let Some(status) = nonce_status.get(&n) {
-                parts.push(status.clone());
-            }
-            if let Some(result_data) = nonce_results.get(&n) {
-                for data in result_data {
-                    parts.push(data.clone());
-                }
-            }
-        }
-
-        // For non-runtime tools (manage_context, signal_done), return acknowledgement
-        if tool_name == "manage_context" || tool_name == "signal_done" {
-            results.push((call_id.clone(), tool_name.clone(), "OK".to_string()));
-            continue;
-        }
-
-        // Include any non-typed output for all tool calls (fallback)
-        if !other_output.is_empty() {
-            parts.push(other_output.clone());
-        }
-
-        if !agent_stderr.is_empty() {
-            parts.push(format!("stderr: {}", agent_stderr));
-        }
-
-        let response_text = if parts.is_empty() {
-            "OK".to_string()
-        } else {
-            parts.join("\n")
-        };
-
-        results.push((call_id.clone(), tool_name.clone(), response_text));
-    }
-
-    results
 }
 
 const PROGRESS_INTERVAL: usize = 5;
@@ -1536,9 +1360,7 @@ async fn run_agent_loop(
         let on_stream_event = move |event: crate::provider::StreamEvent| {
             if let crate::provider::StreamEvent::Delta(ref text) = event {
                 if let Some(ref b) = stream_bus {
-                    b.send(AppEvent::ModelResponseDelta {
-                        text: text.clone(),
-                    });
+                    b.send(AppEvent::ModelResponseDelta { text: text.clone() });
                 }
             }
         };
@@ -1678,6 +1500,10 @@ async fn run_agent_loop(
             // --- Native tool call path ---
             let batch = assemble_batch_from_tool_calls(&response.tool_calls);
 
+            for (call_id, tool_name, result_text) in &batch.precomputed_results {
+                conversation.add_tool_result(call_id, tool_name, result_text);
+            }
+
             // Apply context directives from manage_context tool call
             if let Some(ref ctx) = batch.context_directives {
                 if let Some(drops) = ctx.get("drop_turns").and_then(|d| d.as_array()) {
@@ -1699,7 +1525,9 @@ async fn run_agent_loop(
                         conversation.summarize_turns(&indices, summary);
                     }
                 }
-                slog(&session_log, |l| l.debug("Context directives applied (tool call)"));
+                slog(&session_log, |l| {
+                    l.debug("Context directives applied (tool call)")
+                });
             }
 
             // Check done signal
@@ -1756,6 +1584,10 @@ async fn run_agent_loop(
                         );
                     }
                 }
+            }
+
+            if batch.agent_input_json.is_none() && !batch.precomputed_results.is_empty() {
+                continue;
             }
 
             // If no runtime commands, just respond to tool calls with context update
@@ -1819,10 +1651,14 @@ async fn run_agent_loop(
             let mut should_skip = false;
             if let Some((cat, denied_by_policy)) = needs_approval {
                 let preview = format_command_preview(&json_str);
-                slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "waiting"));
+                slog(&session_log, |l| {
+                    l.approval(&cat.to_string(), &preview, "waiting")
+                });
 
                 if denied_by_policy {
-                    slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "denied-policy"));
+                    slog(&session_log, |l| {
+                        l.approval(&cat.to_string(), &preview, "denied-policy")
+                    });
                     emit(
                         &bus,
                         || AppEvent::TaskComplete {
@@ -1843,22 +1679,32 @@ async fn run_agent_loop(
                     });
                     match rx.await {
                         Ok(tui::event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "approved"));
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "approved")
+                            });
                         }
                         Ok(tui::event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "approve-all"));
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "approve-all")
+                            });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
                         }
                         Ok(tui::event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "skipped"));
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "skipped")
+                            });
                             should_skip = true;
                         }
                         Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
-                            slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "denied"));
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "denied")
+                            });
                             emit(
                                 &bus,
-                                || AppEvent::TaskComplete { reason: "Denied by user".to_string() },
+                                || AppEvent::TaskComplete {
+                                    reason: "Denied by user".to_string(),
+                                },
                                 || println!("--- Denied by user ---"),
                             );
                             return Ok(loop_stats);
@@ -1866,7 +1712,9 @@ async fn run_agent_loop(
                     }
                 }
                 if bus.is_none() {
-                    slog(&session_log, |l| l.approval(&cat.to_string(), &preview, "denied-no-approver"));
+                    slog(&session_log, |l| {
+                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                    });
                     emit(
                         &bus,
                         || AppEvent::TaskComplete {
@@ -1890,14 +1738,19 @@ async fn run_agent_loop(
             let preview = json_str.chars().take(300).collect::<String>();
             emit(
                 &bus,
-                || AppEvent::AgentStarted { turn, commands_preview: preview.clone() },
+                || AppEvent::AgentStarted {
+                    turn,
+                    commands_preview: preview.clone(),
+                },
                 || println!("[Turn {}] Running agent...", turn),
             );
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
 
             // Log agent output
-            slog(&session_log, |l| l.agent_output(&output.stdout, &output.stderr));
+            slog(&session_log, |l| {
+                l.agent_output(&output.stdout, &output.stderr)
+            });
 
             emit(
                 &bus,
@@ -1925,7 +1778,6 @@ async fn run_agent_loop(
                 let text = format!("{}\n\n{}", result_text, budget);
                 conversation.add_tool_result(call_id, tool_name, &text);
             }
-
         } else {
             // --- Legacy text extraction path ---
 
@@ -2171,7 +2023,10 @@ Proceed with explicit assumptions and continue without additional questions."
             let preview = json_str.chars().take(300).collect::<String>();
             emit(
                 &bus,
-                || AppEvent::AgentStarted { turn, commands_preview: preview.clone() },
+                || AppEvent::AgentStarted {
+                    turn,
+                    commands_preview: preview.clone(),
+                },
                 || println!("[Turn {}] Running agent...", turn),
             );
 
@@ -2323,14 +2178,15 @@ async fn run_sub_agent_mode(
 All relative paths and commands execute from this directory.",
         project.root.display()
     ));
-    conversation.add_assistant("Understood. I will work within the specified project directory.".to_string());
+    conversation.add_assistant(
+        "Understood. I will work within the specified project directory.".to_string(),
+    );
 
     // Inject INTENDANT.md instructions
     if let Some(instructions) = prompts::load_project_instructions(Some(&project.root)) {
         conversation.add_user(instructions);
-        conversation.add_assistant(
-            "Acknowledged. I will follow the project instructions.".to_string(),
-        );
+        conversation
+            .add_assistant("Acknowledged. I will follow the project instructions.".to_string());
     }
 
     // Inject knowledge if inherited
@@ -2510,10 +2366,7 @@ async fn run_user_mode(
     let _ = stderr_handle.await;
 
     slog(&session_log, |l| {
-        l.info(&format!(
-            "Orchestrator exited with status: {}",
-            exit_status
-        ));
+        l.info(&format!("Orchestrator exited with status: {}", exit_status));
     });
 
     // Read result from result file, or synthesize a failure
@@ -2616,15 +2469,15 @@ async fn run_direct_mode(
                     ))
                 });
                 // Append the new task as a continuation message
-                conv.add_user(format!(
-                    "[Session resumed] Continue with: {}",
-                    task
-                ));
+                conv.add_user(format!("[Session resumed] Continue with: {}", task));
                 conv
             }
             Err(e) => {
                 slog(&session_log, |l| {
-                    l.warn(&format!("Failed to load conversation, starting fresh: {}", e))
+                    l.warn(&format!(
+                        "Failed to load conversation, starting fresh: {}",
+                        e
+                    ))
                 });
                 let mut conv = Conversation::new(system_prompt, provider.context_window());
                 setup_fresh_conversation(&mut conv, &project, &task);
@@ -2676,9 +2529,7 @@ All relative paths and commands execute from this directory.",
     // Inject INTENDANT.md instructions
     if let Some(instructions) = prompts::load_project_instructions(Some(&project.root)) {
         conv.add_user(instructions);
-        conv.add_assistant(
-            "Acknowledged. I will follow the project instructions.".to_string(),
-        );
+        conv.add_assistant("Acknowledged. I will follow the project instructions.".to_string());
     }
 
     // Inject knowledge
@@ -2732,6 +2583,33 @@ fn is_simple_task(task: &str) -> bool {
     task.len() < 100
 }
 
+fn configure_sandbox_env(flags: &CliFlags, project: &Project, log_dir: &std::path::Path) {
+    let enabled = flags.sandbox || project.config.sandbox.enabled;
+    if !enabled {
+        env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
+        return;
+    }
+
+    let mut sandbox_cfg = sandbox::SandboxConfig::default_for_project(&project.root, log_dir);
+    for p in &project.config.sandbox.extra_write_paths {
+        let extra = if std::path::Path::new(p).is_absolute() {
+            PathBuf::from(p)
+        } else {
+            project.root.join(p)
+        };
+        sandbox_cfg.write_paths.push(extra);
+    }
+    sandbox_cfg.write_paths.sort();
+    sandbox_cfg.write_paths.dedup();
+
+    let write_paths: Vec<String> = sandbox_cfg
+        .write_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    env::set_var("INTENDANT_SANDBOX_WRITE_PATHS", write_paths.join(":"));
+}
+
 #[tokio::main]
 async fn main() -> Result<(), CallerError> {
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
@@ -2772,13 +2650,12 @@ async fn main() -> Result<(), CallerError> {
     let _is_resume = flags.continue_last || flags.resume_id.is_some();
     let log_dir = if let Some(ref session_id) = flags.resume_id {
         // --resume <id>: find a specific session by ID or path
-        session_log::SessionLog::find_session_by_id(session_id)
-            .ok_or_else(|| {
-                CallerError::Config(format!(
-                    "Resume requested, but session '{}' was not found",
-                    session_id
-                ))
-            })?
+        session_log::SessionLog::find_session_by_id(session_id).ok_or_else(|| {
+            CallerError::Config(format!(
+                "Resume requested, but session '{}' was not found",
+                session_id
+            ))
+        })?
     } else if flags.continue_last {
         // --continue: find the most recent session for this project
         session_log::SessionLog::find_latest_session(&project.root)
@@ -2815,6 +2692,8 @@ async fn main() -> Result<(), CallerError> {
             Arc::new(Mutex::new(log))
         }
     };
+
+    configure_sandbox_env(&flags, &project, &log_dir);
 
     // Write session metadata (project root, task will be filled in later if available).
     slog(&session_log, |l| {
@@ -2868,7 +2747,8 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Determine whether to use TUI
-    let use_tui = !flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let use_tui =
+        !flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal();
 
     // Build autonomy state from project config + CLI flags
     let autonomy_state = AutonomyState::new(flags.autonomy, project.config.approval.clone());
@@ -2878,23 +2758,29 @@ async fn main() -> Result<(), CallerError> {
         // MCP mode — speaks Model Context Protocol on stdio.
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
         let (bus, event_rx) = EventBus::new();
-        let human_question_path = tui::event::shared_question_path(
-            log_dir.join("human_question"),
-        );
-        let _human_monitor = tui::event::spawn_human_question_monitor(
-            bus.clone(),
-            human_question_path.clone(),
-        );
+        let human_question_path = tui::event::shared_question_path(log_dir.join("human_question"));
+        let _human_monitor =
+            tui::event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
         let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 1000);
+        let mcp_control_tx = if flags.control_socket {
+            let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
+            slog(&session_log, |l| {
+                l.info(&format!(
+                    "Control socket: {}",
+                    control::socket_path().display()
+                ))
+            });
+            Some(control_tx)
+        } else {
+            None
+        };
 
-        let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            mcp::McpAppState::new(
-                provider.name().to_string(),
-                provider.model().to_string(),
-                autonomy.clone(),
-                log_dir.clone(),
-            ),
-        ));
+        let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp::McpAppState::new(
+            provider.name().to_string(),
+            provider.model().to_string(),
+            autonomy.clone(),
+            log_dir.clone(),
+        )));
 
         // Build a launcher closure that can spawn the agent loop on demand.
         // This captures the provider factory parameters (not the provider itself,
@@ -2987,11 +2873,7 @@ async fn main() -> Result<(), CallerError> {
                         }
                         Err(e) => {
                             slog(&session_log_summary, |l| {
-                                l.write_summary(
-                                    &task_for_summary,
-                                    &format!("error: {}", e),
-                                    0,
-                                )
+                                l.write_summary(&task_for_summary, &format!("error: {}", e), 0)
                             });
                             bus_clone.send(AppEvent::LoopError(e.to_string()));
                         }
@@ -3028,10 +2910,22 @@ async fn main() -> Result<(), CallerError> {
                 l.info("MCP server reloaded via exec (injecting synthetic init)");
             });
         }
-        if let Err(e) = mcp::run_mcp_server(mcp_state, bus, event_rx, reloaded, Some(human_question_path)).await {
+        if let Err(e) = mcp::run_mcp_server(
+            mcp_state,
+            bus,
+            event_rx,
+            reloaded,
+            Some(human_question_path),
+            mcp_control_tx,
+        )
+        .await
+        {
             slog(&session_log, |l| {
                 l.info(&format!("MCP server ended: {}", e))
             });
+        }
+        if flags.control_socket {
+            control::cleanup();
         }
     } else if use_tui {
         // Non-MCP paths always have a task (enforced above).

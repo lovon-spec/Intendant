@@ -5,8 +5,6 @@ pub struct Command {
     pub function: String,
     pub command: Option<String>,
     pub nonce: u64,
-    pub return_stdout: Option<bool>,
-    pub return_stderr: Option<bool>,
     pub display: Option<i32>,
     pub path: Option<String>,
     pub timeout_ms: Option<u64>,

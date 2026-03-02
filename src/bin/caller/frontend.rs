@@ -106,9 +106,15 @@ pub enum StateQuery {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StateResult {
     Status(StatusSnapshot),
-    Logs { entries: Vec<LogEntrySnapshot> },
-    PendingApproval { approval: Option<ApprovalSnapshot> },
-    PendingInput { question: Option<HumanQuestionSnapshot> },
+    Logs {
+        entries: Vec<LogEntrySnapshot>,
+    },
+    PendingApproval {
+        approval: Option<ApprovalSnapshot>,
+    },
+    PendingInput {
+        question: Option<HumanQuestionSnapshot>,
+    },
 }
 
 /// Outcome of processing a [`UserAction`].

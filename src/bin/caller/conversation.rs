@@ -343,10 +343,7 @@ impl Conversation {
     /// Load conversation from a JSONL file. Creates a new Conversation with the
     /// given context window and populates it with the saved messages.
     /// Note: `raw_output` and `layer` are lost on roundtrip (they are `#[serde(skip)]`).
-    pub fn load_from_file(
-        path: &std::path::Path,
-        context_window: u64,
-    ) -> std::io::Result<Self> {
+    pub fn load_from_file(path: &std::path::Path, context_window: u64) -> std::io::Result<Self> {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
         let mut messages = Vec::new();
@@ -862,7 +859,10 @@ mod tests {
         assert_eq!(loaded.messages().len(), 3);
         let assistant = &loaded.messages()[1];
         assert!(assistant.tool_calls.is_some());
-        assert_eq!(assistant.tool_calls.as_ref().unwrap()[0].name, "exec_command");
+        assert_eq!(
+            assistant.tool_calls.as_ref().unwrap()[0].name,
+            "exec_command"
+        );
 
         let tool_result = &loaded.messages()[2];
         assert_eq!(tool_result.role, "tool");

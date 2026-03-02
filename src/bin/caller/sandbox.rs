@@ -17,10 +17,7 @@ impl SandboxConfig {
     /// Build a default config for the given project.
     /// - Read: `/` (everything)
     /// - Write: project root, `/tmp`, log directory, home `.intendant`
-    pub fn default_for_project(
-        project_root: &Path,
-        log_dir: &Path,
-    ) -> Self {
+    pub fn default_for_project(project_root: &Path, log_dir: &Path) -> Self {
         let mut write_paths = vec![
             project_root.to_path_buf(),
             PathBuf::from("/tmp"),
@@ -50,8 +47,7 @@ impl SandboxConfig {
         #[cfg(target_os = "linux")]
         {
             use landlock::{
-                AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr,
-                RulesetCreatedAttr, ABI,
+                AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
             };
 
             let abi = ABI::V5;
@@ -114,7 +110,9 @@ mod tests {
             Path::new("/tmp/logs"),
         );
         assert!(config.enabled);
-        assert!(config.write_paths.contains(&PathBuf::from("/home/user/project")));
+        assert!(config
+            .write_paths
+            .contains(&PathBuf::from("/home/user/project")));
         assert!(config.write_paths.contains(&PathBuf::from("/tmp")));
         assert!(config.write_paths.contains(&PathBuf::from("/tmp/logs")));
         assert!(config.read_paths.contains(&PathBuf::from("/")));
@@ -122,10 +120,8 @@ mod tests {
 
     #[test]
     fn disabled_config_skips_apply() {
-        let mut config = SandboxConfig::default_for_project(
-            Path::new("/tmp/test"),
-            Path::new("/tmp/logs"),
-        );
+        let mut config =
+            SandboxConfig::default_for_project(Path::new("/tmp/test"), Path::new("/tmp/logs"));
         config.enabled = false;
         assert_eq!(config.apply_to_current_process().unwrap(), false);
     }
