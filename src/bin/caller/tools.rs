@@ -1,5 +1,9 @@
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::sync::Mutex;
+
+/// Extra tool definitions registered at runtime (e.g. from MCP servers).
+static EXTRA_TOOLS: Mutex<Vec<ToolDefinition>> = Mutex::new(Vec::new());
 
 /// Provider-agnostic tool definition.
 #[derive(Debug, Clone, Serialize)]
@@ -341,7 +345,28 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         }),
     });
 
+    // Append any extra tools registered at runtime (MCP servers, etc.)
+    if let Ok(extra) = EXTRA_TOOLS.lock() {
+        tools.extend(extra.iter().cloned());
+    }
+
     tools
+}
+
+/// Register additional tool definitions (e.g. from MCP servers).
+/// These will be included in subsequent calls to `all_tools()`.
+pub fn register_extra_tools(new_tools: Vec<ToolDefinition>) {
+    if let Ok(mut extra) = EXTRA_TOOLS.lock() {
+        extra.extend(new_tools);
+    }
+}
+
+/// Clear all extra registered tools.
+#[allow(dead_code)]
+pub fn clear_extra_tools() {
+    if let Ok(mut extra) = EXTRA_TOOLS.lock() {
+        extra.clear();
+    }
 }
 
 #[cfg(test)]

@@ -181,6 +181,51 @@ impl Conversation {
         }
     }
 
+    /// Auto-compact the conversation when usage exceeds 90% of the context window.
+    ///
+    /// Keeps the system message, first 2 context messages (working directory + ack),
+    /// and last 4 messages. Summarizes everything in between.
+    /// Returns `true` if compaction occurred.
+    pub fn auto_compact(&mut self) -> bool {
+        const COMPACTION_THRESHOLD: f64 = 0.90;
+
+        if self.usage_fraction() < COMPACTION_THRESHOLD {
+            return false;
+        }
+
+        let len = self.messages.len();
+        // Need at least: 1 system + 2 context + 4 tail + something to compact = 8
+        if len < 8 {
+            return false;
+        }
+
+        // Keep: index 0 (system), 1..=2 (first 2 context msgs), last 4
+        let keep_prefix = 3; // system + first 2
+        let keep_suffix = 4;
+        let tail_start = len - keep_suffix;
+
+        if keep_prefix >= tail_start {
+            return false; // nothing to compact
+        }
+
+        // Indices to summarize: everything between prefix and tail
+        let to_summarize: Vec<usize> = (keep_prefix..tail_start).collect();
+        if to_summarize.is_empty() {
+            return false;
+        }
+
+        let summary = format!(
+            "The conversation was compacted at turn {}. \
+             {} messages were summarized to free context space. \
+             The agent was working on the assigned task and making progress.",
+            self.turn,
+            to_summarize.len()
+        );
+
+        self.summarize_turns(&to_summarize, &summary);
+        true
+    }
+
     pub fn budget_summary(&self) -> String {
         match &self.last_usage {
             Some(usage) => {
@@ -845,5 +890,100 @@ mod tests {
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.messages()[0].role, "system");
         assert_eq!(loaded.turn(), 0);
+    }
+
+    // --- Auto-compaction tests ---
+
+    #[test]
+    fn auto_compact_below_threshold_noop() {
+        let mut conv = Conversation::new("sys".to_string(), 200_000);
+        for i in 0..20 {
+            conv.add_user(format!("msg {}", i));
+            conv.add_assistant(format!("resp {}", i));
+        }
+        // No usage set → 0% → no compaction
+        assert!(!conv.auto_compact());
+        assert_eq!(conv.len(), 41); // 1 system + 40 user/assistant
+    }
+
+    #[test]
+    fn auto_compact_triggers_at_90_percent() {
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        // system + 2 context msgs + many middle msgs + 4 tail = need 8+
+        conv.add_user("working dir".to_string()); // 1 - context
+        conv.add_assistant("ack".to_string()); // 2 - context
+        for i in 0..10 {
+            conv.add_user(format!("msg {}", i));
+            conv.add_assistant(format!("resp {}", i));
+        }
+        conv.increment_turn();
+        conv.increment_turn();
+        // Set usage to 91%
+        conv.set_usage(TokenUsage {
+            prompt_tokens: 91_000,
+            completion_tokens: 0,
+            total_tokens: 91_000,
+        });
+        let before = conv.len();
+        assert!(conv.auto_compact());
+        // Should have fewer messages now (compacted middle)
+        assert!(conv.len() < before);
+        // System is preserved
+        assert_eq!(conv.messages()[0].content, "sys");
+        // First 2 context msgs preserved
+        assert_eq!(conv.messages()[1].content, "working dir");
+        assert_eq!(conv.messages()[2].content, "ack");
+        // Summary message exists
+        assert!(conv.messages()[3].content.contains("[Context Summary]"));
+        // Last 4 messages preserved
+        let msgs = conv.messages();
+        let last = &msgs[msgs.len() - 1];
+        assert_eq!(last.content, "resp 9");
+    }
+
+    #[test]
+    fn auto_compact_preserves_system_and_tail() {
+        let mut conv = Conversation::new("system prompt".to_string(), 10_000);
+        conv.add_user("ctx1".to_string());
+        conv.add_assistant("ctx2".to_string());
+        for _ in 0..8 {
+            conv.add_user("middle".to_string());
+            conv.add_assistant("middle_resp".to_string());
+        }
+        conv.add_user("tail1".to_string());
+        conv.add_assistant("tail2".to_string());
+        conv.add_user("tail3".to_string());
+        conv.add_assistant("tail4".to_string());
+        conv.set_usage(TokenUsage {
+            prompt_tokens: 9_500,
+            completion_tokens: 0,
+            total_tokens: 9_500,
+        });
+        assert!(conv.auto_compact());
+        let msgs = conv.messages();
+        assert_eq!(msgs[0].content, "system prompt");
+        assert_eq!(msgs[1].content, "ctx1");
+        assert_eq!(msgs[2].content, "ctx2");
+        assert!(msgs[3].content.contains("[Context Summary]"));
+        assert_eq!(msgs[msgs.len() - 4].content, "tail1");
+        assert_eq!(msgs[msgs.len() - 3].content, "tail2");
+        assert_eq!(msgs[msgs.len() - 2].content, "tail3");
+        assert_eq!(msgs[msgs.len() - 1].content, "tail4");
+    }
+
+    #[test]
+    fn auto_compact_too_few_messages_noop() {
+        let mut conv = Conversation::new("sys".to_string(), 1_000);
+        conv.add_user("u1".to_string());
+        conv.add_assistant("a1".to_string());
+        conv.add_user("u2".to_string());
+        conv.add_assistant("a2".to_string());
+        conv.set_usage(TokenUsage {
+            prompt_tokens: 950,
+            completion_tokens: 0,
+            total_tokens: 950,
+        });
+        // Only 5 messages — too few to compact
+        assert!(!conv.auto_compact());
     }
 }

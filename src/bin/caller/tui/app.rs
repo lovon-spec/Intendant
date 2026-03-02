@@ -4,6 +4,7 @@ use crate::tui::event::{AppEvent, ApprovalResponse, ControlMsg};
 use crate::tui::layout::PanelConfig;
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::VecDeque;
 use tokio::sync::oneshot;
 
 const MAX_LOG_ENTRIES: usize = 10_000;
@@ -107,7 +108,7 @@ pub struct PendingApproval {
 /// The main application state.
 pub struct App {
     // Display
-    pub log_entries: Vec<LogEntry>,
+    pub log_entries: VecDeque<LogEntry>,
     pub scroll_offset: usize,
     pub auto_scroll: bool,
     pub verbosity: Verbosity,
@@ -130,8 +131,8 @@ pub struct App {
     pub human_question: Option<String>,
     pub human_textarea: Option<tui_textarea::TextArea<'static>>,
 
-    // Approval
-    pub pending_approval: Option<PendingApproval>,
+    // Approval queue (FIFO)
+    pub pending_approvals: VecDeque<PendingApproval>,
 
     // Shared autonomy state
     pub autonomy: SharedAutonomy,
@@ -145,6 +146,9 @@ pub struct App {
 
     // Animation
     pub tick_count: usize,
+
+    // Streaming buffer for incremental text deltas
+    pub streaming_buffer: String,
 }
 
 impl App {
@@ -155,7 +159,7 @@ impl App {
         log_dir: std::path::PathBuf,
     ) -> Self {
         Self {
-            log_entries: Vec::new(),
+            log_entries: VecDeque::new(),
             scroll_offset: 0,
             auto_scroll: true,
             verbosity: Verbosity::Normal,
@@ -171,12 +175,13 @@ impl App {
             should_quit: false,
             human_question: None,
             human_textarea: None,
-            pending_approval: None,
+            pending_approvals: VecDeque::new(),
             autonomy,
             control_tx: None,
             log_dir,
             session_tokens: 0,
             tick_count: 0,
+            streaming_buffer: String::new(),
         }
     }
 
@@ -185,15 +190,14 @@ impl App {
     }
 
     pub fn log(&mut self, level: LogLevel, content: String) {
-        self.log_entries.push(LogEntry {
+        if self.log_entries.len() >= MAX_LOG_ENTRIES {
+            self.log_entries.pop_front();
+        }
+        self.log_entries.push_back(LogEntry {
             ts: Local::now().format("%H:%M:%S").to_string(),
             level,
             content,
         });
-        if self.log_entries.len() > MAX_LOG_ENTRIES {
-            self.log_entries
-                .drain(..self.log_entries.len() - MAX_LOG_ENTRIES);
-        }
         if self.auto_scroll {
             self.scroll_to_bottom();
         }
@@ -459,11 +463,13 @@ impl App {
         };
 
         if let Some(resp) = response {
-            if let Some(pending) = self.pending_approval.take() {
+            if let Some(pending) = self.pending_approvals.pop_front() {
                 let _ = pending.responder.send(resp);
             }
-            self.mode = AppMode::Normal;
-            self.current_phase = Phase::RunningAgent;
+            if self.pending_approvals.is_empty() {
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::RunningAgent;
+            }
             true
         } else {
             false
@@ -573,24 +579,22 @@ impl App {
                 });
             }
             ControlMsg::Approve { id } => {
-                if let Some(pending) = self.pending_approval.take() {
-                    if pending.id == id {
-                        let _ = pending.responder.send(ApprovalResponse::Approve);
+                if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
+                    let pending = self.pending_approvals.remove(pos).unwrap();
+                    let _ = pending.responder.send(ApprovalResponse::Approve);
+                    if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
                         self.current_phase = Phase::RunningAgent;
-                    } else {
-                        self.pending_approval = Some(pending);
                     }
                 }
             }
             ControlMsg::Deny { id } => {
-                if let Some(pending) = self.pending_approval.take() {
-                    if pending.id == id {
-                        let _ = pending.responder.send(ApprovalResponse::Deny);
+                if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
+                    let pending = self.pending_approvals.remove(pos).unwrap();
+                    let _ = pending.responder.send(ApprovalResponse::Deny);
+                    if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
                         self.current_phase = Phase::Done;
-                    } else {
-                        self.pending_approval = Some(pending);
                     }
                 }
             }
@@ -638,6 +642,7 @@ impl App {
             } => {
                 self.turn = turn;
                 self.session_tokens += usage.total_tokens;
+                self.streaming_buffer.clear();
                 // Show human-readable command summary at Model level (visible at Normal verbosity)
                 let summary = format_model_summary(&content);
                 self.log(
@@ -655,6 +660,10 @@ impl App {
                     ),
                 );
                 self.log(LogLevel::Debug, format!("Raw model response: {}", content));
+            }
+            AppEvent::ModelResponseDelta { text } => {
+                // Accumulate streaming text; shown at Debug level to avoid noise
+                self.streaming_buffer.push_str(&text);
             }
             AppEvent::JsonExtracted { preview } => {
                 self.log(LogLevel::Debug, format!("JSON: {}", preview));
@@ -761,7 +770,7 @@ impl App {
             } => {
                 self.current_phase = Phase::WaitingApproval;
                 self.mode = AppMode::Approval;
-                self.pending_approval = Some(PendingApproval {
+                self.pending_approvals.push_back(PendingApproval {
                     id,
                     command_preview: command_preview.clone(),
                     category: category.to_string(),
@@ -1270,7 +1279,7 @@ mod tests {
         let mut app = test_app();
         let (tx, rx) = oneshot::channel();
         app.mode = AppMode::Approval;
-        app.pending_approval = Some(PendingApproval {
+        app.pending_approvals.push_back(PendingApproval {
             id: 1,
             command_preview: "rm -rf /tmp".to_string(),
             category: "destructive".to_string(),
@@ -1293,7 +1302,7 @@ mod tests {
         let mut app = test_app();
         let (tx, rx) = oneshot::channel();
         app.mode = AppMode::Approval;
-        app.pending_approval = Some(PendingApproval {
+        app.pending_approvals.push_back(PendingApproval {
             id: 2,
             command_preview: "rm -rf /".to_string(),
             category: "destructive".to_string(),
@@ -1315,7 +1324,7 @@ mod tests {
         let mut app = test_app();
         let (tx, rx) = oneshot::channel();
         app.mode = AppMode::Approval;
-        app.pending_approval = Some(PendingApproval {
+        app.pending_approvals.push_back(PendingApproval {
             id: 3,
             command_preview: "test".to_string(),
             category: "command_exec".to_string(),
@@ -1337,7 +1346,7 @@ mod tests {
         let mut app = test_app();
         let (tx, rx) = oneshot::channel();
         app.mode = AppMode::Approval;
-        app.pending_approval = Some(PendingApproval {
+        app.pending_approvals.push_back(PendingApproval {
             id: 4,
             command_preview: "test".to_string(),
             category: "command_exec".to_string(),
@@ -1382,5 +1391,34 @@ mod tests {
         assert_eq!(app.current_phase, Phase::Orchestrating);
         assert!(app.log_entries[0].content.contains("spawning"));
         assert!(!app.log_entries[0].content.contains("—"));
+    }
+
+    #[test]
+    fn handle_event_streaming_delta_accumulates() {
+        let mut app = test_app();
+        app.handle_event(AppEvent::ModelResponseDelta {
+            text: "Hello ".to_string(),
+        });
+        app.handle_event(AppEvent::ModelResponseDelta {
+            text: "world".to_string(),
+        });
+        assert_eq!(app.streaming_buffer, "Hello world");
+    }
+
+    #[test]
+    fn handle_event_model_response_clears_streaming_buffer() {
+        let mut app = test_app();
+        app.streaming_buffer = "partial text".to_string();
+        app.handle_event(AppEvent::ModelResponse {
+            turn: 1,
+            content: r#"{"commands":[]}"#.to_string(),
+            usage: crate::provider::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+            reasoning: None,
+        });
+        assert!(app.streaming_buffer.is_empty());
     }
 }

@@ -32,16 +32,50 @@ pub async fn run_agent(
     json_input: &str,
     log_dir: &std::path::Path,
 ) -> Result<AgentOutput, CallerError> {
+    run_agent_inner(json_input, log_dir, None).await
+}
+
+/// Run the agent with optional Landlock sandbox configuration.
+#[allow(dead_code)]
+pub async fn run_agent_sandboxed(
+    json_input: &str,
+    log_dir: &std::path::Path,
+    sandbox: &crate::sandbox::SandboxConfig,
+) -> Result<AgentOutput, CallerError> {
+    run_agent_inner(json_input, log_dir, Some(sandbox)).await
+}
+
+async fn run_agent_inner(
+    json_input: &str,
+    log_dir: &std::path::Path,
+    _sandbox: Option<&crate::sandbox::SandboxConfig>,
+) -> Result<AgentOutput, CallerError> {
     let agent_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("intendant-runtime")))
         .unwrap_or_else(|| std::path::PathBuf::from("./target/debug/intendant-runtime"));
 
-    let mut child = Command::new(&agent_path)
-        .env("INTENDANT_LOG_DIR", log_dir)
+    let mut cmd = Command::new(&agent_path);
+    cmd.env("INTENDANT_LOG_DIR", log_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // If sandbox config is provided, serialize it as an env var.
+    // The runtime will apply Landlock restrictions at startup.
+    #[cfg(target_os = "linux")]
+    if let Some(sandbox) = _sandbox {
+        if sandbox.enabled {
+            let write_paths: Vec<String> = sandbox
+                .write_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            cmd.env("INTENDANT_SANDBOX_WRITE_PATHS", write_paths.join(":"));
+        }
+    }
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| {
             CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))

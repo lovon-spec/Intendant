@@ -5,10 +5,11 @@ mod conversation;
 mod error;
 mod frontend;
 mod knowledge;
-mod memory;
 mod mcp;
+mod mcp_client;
 mod project;
 mod prompts;
+mod sandbox;
 mod provider;
 mod session_log;
 mod sub_agent;
@@ -25,10 +26,14 @@ use project::Project;
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tui::event::{AppEvent, EventBus};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
+
+/// Module-level flag for --json output mode.
+static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 /// Helper to write to the session log without propagating errors.
 fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
@@ -63,6 +68,11 @@ struct CliFlags {
     resume_id: Option<String>,
     control_socket: bool,
     vision: bool,
+    /// --json: Emit JSONL events to stdout (implies --no-tui).
+    json_output: bool,
+    /// --sandbox: Enable Landlock filesystem sandboxing for the runtime.
+    #[allow(dead_code)]
+    sandbox: bool,
 }
 
 fn print_help() {
@@ -83,6 +93,8 @@ fn print_help() {
     println!("    --mcp                 Run as MCP server on stdio (replaces TUI)");
     println!("    --verbose, -v         Enable verbose output");
     println!("    --control-socket      Enable Unix control socket");
+    println!("    --json                Emit JSONL events to stdout (implies --no-tui)");
+    println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --vision              Launch Xvfb virtual display for captureScreen");
     println!("    --help, -h            Show this help message");
     println!();
@@ -124,6 +136,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         resume_id: None,
         control_socket: false,
         vision: false,
+        json_output: false,
+        sandbox: false,
     };
 
     let mut task_parts = Vec::new();
@@ -200,6 +214,15 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--vision" => {
                 flags.vision = true;
+                i += 1;
+            }
+            "--json" => {
+                flags.json_output = true;
+                flags.no_tui = true; // --json implies --no-tui
+                i += 1;
+            }
+            "--sandbox" => {
+                flags.sandbox = true;
                 i += 1;
             }
             "--control-socket" => {
@@ -428,12 +451,116 @@ fn normalize_command_batch(json_str: &str) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
 
-/// Macro-like helper for conditional output: TUI event bus or println.
+/// Emit a JSONL event to stdout (used in --json mode).
+fn emit_json(event_type: &str, data: serde_json::Value) {
+    let event = serde_json::json!({
+        "type": event_type,
+        "data": data,
+    });
+    if let Ok(line) = serde_json::to_string(&event) {
+        println!("{}", line);
+    }
+}
+
+/// Macro-like helper for conditional output: TUI event bus, JSON, or println.
 fn emit(bus: &Option<EventBus>, event_fn: impl FnOnce() -> AppEvent, fallback: impl FnOnce()) {
     if let Some(bus) = bus {
         bus.send(event_fn());
+    } else if JSON_OUTPUT.load(Ordering::Relaxed) {
+        let event = event_fn();
+        if let Some((event_type, data)) = app_event_to_json(&event) {
+            emit_json(event_type, data);
+        }
     } else {
         fallback();
+    }
+}
+
+/// Convert an AppEvent to a (type, data) pair for JSON output.
+fn app_event_to_json(event: &AppEvent) -> Option<(&'static str, serde_json::Value)> {
+    match event {
+        AppEvent::TurnStarted {
+            turn,
+            budget_pct,
+            remaining,
+        } => Some((
+            "turn_started",
+            serde_json::json!({
+                "turn": turn,
+                "budget_pct": budget_pct,
+                "remaining": remaining,
+            }),
+        )),
+        AppEvent::ModelResponse {
+            turn,
+            content,
+            usage,
+            reasoning,
+        } => Some((
+            "model_response",
+            serde_json::json!({
+                "turn": turn,
+                "content": content,
+                "usage": {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                },
+                "reasoning": reasoning,
+            }),
+        )),
+        AppEvent::ModelResponseDelta { ref text } => Some((
+            "model_response_delta",
+            serde_json::json!({
+                "text": text,
+            }),
+        )),
+        AppEvent::AgentOutput { stdout, stderr } => Some((
+            "agent_output",
+            serde_json::json!({
+                "stdout": stdout,
+                "stderr": stderr,
+            }),
+        )),
+        AppEvent::DoneSignal { message } => Some((
+            "done",
+            serde_json::json!({
+                "message": message,
+            }),
+        )),
+        AppEvent::LoopError(msg) => Some(("error", serde_json::json!({ "message": msg }))),
+        AppEvent::BudgetWarning { pct, remaining } => Some((
+            "budget_warning",
+            serde_json::json!({
+                "pct": pct,
+                "remaining": remaining,
+            }),
+        )),
+        AppEvent::BudgetExhausted { remaining } => Some((
+            "budget_exhausted",
+            serde_json::json!({ "remaining": remaining }),
+        )),
+        AppEvent::ApprovalRequired {
+            id,
+            command_preview,
+            category,
+            ..
+        } => Some((
+            "approval_required",
+            serde_json::json!({
+                "id": id,
+                "command_preview": command_preview,
+                "category": format!("{:?}", category),
+            }),
+        )),
+        AppEvent::TaskComplete { reason } => {
+            Some(("done", serde_json::json!({ "reason": reason })))
+        }
+        AppEvent::ContextManagement { turn } => Some((
+            "context_management",
+            serde_json::json!({ "turn": turn }),
+        )),
+        _ => None, // Skip events that don't need JSON output (Key, Resize, Tick, etc.)
     }
 }
 
@@ -734,6 +861,8 @@ Also: {"source": "bare"}"#;
             resume_id: None,
             control_socket: false,
             vision: false,
+            json_output: false,
+            sandbox: false,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -741,7 +870,52 @@ Also: {"source": "bare"}"#;
         assert!(!flags.continue_last);
         assert!(flags.resume_id.is_none());
         assert!(!flags.vision);
+        assert!(!flags.sandbox);
+        assert!(!flags.json_output);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
+    }
+
+    #[test]
+    fn emit_json_format() {
+        // Test that emit_json produces valid JSONL
+        let data = serde_json::json!({"turn": 1, "content": "hello"});
+        let event = serde_json::json!({
+            "type": "model_response",
+            "data": data,
+        });
+        let line = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "model_response");
+        assert_eq!(parsed["data"]["turn"], 1);
+    }
+
+    #[test]
+    fn app_event_to_json_turn_started() {
+        let event = AppEvent::TurnStarted {
+            turn: 5,
+            budget_pct: 42.0,
+            remaining: 100_000,
+        };
+        let (event_type, data) = app_event_to_json(&event).unwrap();
+        assert_eq!(event_type, "turn_started");
+        assert_eq!(data["turn"], 5);
+        assert_eq!(data["remaining"], 100_000);
+    }
+
+    #[test]
+    fn app_event_to_json_done_signal() {
+        let event = AppEvent::DoneSignal {
+            message: Some("All done".to_string()),
+        };
+        let (event_type, data) = app_event_to_json(&event).unwrap();
+        assert_eq!(event_type, "done");
+        assert_eq!(data["message"], "All done");
+    }
+
+    #[test]
+    fn app_event_to_json_skips_tick() {
+        let event = AppEvent::Tick;
+        assert!(app_event_to_json(&event).is_none());
     }
 
     #[test]
@@ -1100,6 +1274,9 @@ struct ToolBatchResult {
     nonce_to_call_id: std::collections::HashMap<u64, String>,
     /// All tool call IDs and their names (for result routing).
     call_id_names: Vec<(String, String)>,
+    /// MCP tool calls that should be routed through the MCP client manager.
+    /// Vec of (call_id, tool_name, arguments_json).
+    mcp_calls: Vec<(String, String, String)>,
 }
 
 /// Assemble an AgentInput batch from individual tool calls.
@@ -1111,6 +1288,7 @@ fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> ToolBatc
     let mut context_directives = None;
     let mut is_done = false;
     let mut done_message = None;
+    let mut mcp_calls = Vec::new();
 
     for tc in tool_calls {
         call_id_names.push((tc.call_id.clone(), tc.name.clone()));
@@ -1130,6 +1308,13 @@ fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> ToolBatc
                         .and_then(|m| m.as_str())
                         .map(String::from);
                 }
+            }
+            tool_name if mcp_client::McpClientManager::is_mcp_tool(tool_name) => {
+                mcp_calls.push((
+                    tc.call_id.clone(),
+                    tool_name.to_string(),
+                    tc.arguments.clone(),
+                ));
             }
             tool_name => {
                 // Runtime command — map tool name to function name
@@ -1168,6 +1353,7 @@ fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> ToolBatc
         done_message,
         nonce_to_call_id,
         call_id_names,
+        mcp_calls,
     }
 }
 
@@ -1274,8 +1460,9 @@ fn map_results_to_tool_responses(
     results
 }
 
-const PROGRESS_INTERVAL: usize = 1;
+const PROGRESS_INTERVAL: usize = 5;
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
     conversation: &mut Conversation,
@@ -1285,6 +1472,7 @@ async fn run_agent_loop(
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
     log_dir: &std::path::Path,
+    mcp_mgr: Option<&mcp_client::McpClientManager>,
 ) -> Result<LoopStats, CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -1344,7 +1532,20 @@ async fn run_agent_loop(
             }
         });
 
-        let response = match provider.chat(conversation.messages()).await {
+        let stream_bus = bus.clone();
+        let on_stream_event = move |event: crate::provider::StreamEvent| {
+            if let crate::provider::StreamEvent::Delta(ref text) = event {
+                if let Some(ref b) = stream_bus {
+                    b.send(AppEvent::ModelResponseDelta {
+                        text: text.clone(),
+                    });
+                }
+            }
+        };
+        let response = match provider
+            .chat_stream(conversation.messages(), &on_stream_event)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 slog(&session_log, |l| l.error(&format!("API error: {}", e)));
@@ -1357,6 +1558,19 @@ async fn run_agent_loop(
             }
         };
         conversation.set_usage(response.usage.clone());
+
+        // Auto-compact when context usage exceeds 90%
+        if conversation.auto_compact() {
+            slog(&session_log, |l| {
+                l.info(&format!("Auto-compacted conversation at turn {}", turn))
+            });
+            emit(
+                &bus,
+                || AppEvent::ContextManagement { turn },
+                || eprintln!("Context compacted at turn {}", turn),
+            );
+        }
+
         loop_stats.turns = turn;
         loop_stats.usage.prompt_tokens += response.usage.prompt_tokens;
         loop_stats.usage.completion_tokens += response.usage.completion_tokens;
@@ -1520,12 +1734,38 @@ async fn run_agent_loop(
                 break;
             }
 
+            // Process MCP tool calls (if any)
+            if !batch.mcp_calls.is_empty() {
+                if let Some(mgr) = mcp_mgr {
+                    for (call_id, tool_name, args_json) in &batch.mcp_calls {
+                        let args: serde_json::Value =
+                            serde_json::from_str(args_json).unwrap_or_default();
+                        let result = mgr.call_tool(tool_name, args).await;
+                        let output = match result {
+                            Ok(text) => text,
+                            Err(e) => format!("MCP tool error: {}", e),
+                        };
+                        conversation.add_tool_result(call_id, tool_name, &output);
+                    }
+                } else {
+                    for (call_id, tool_name, _) in &batch.mcp_calls {
+                        conversation.add_tool_result(
+                            call_id,
+                            tool_name,
+                            "Error: MCP client not configured",
+                        );
+                    }
+                }
+            }
+
             // If no runtime commands, just respond to tool calls with context update
             let Some(ref json_str) = batch.agent_input_json else {
                 empty_command_streak = 0;
-                // Respond to manage_context or empty batch
+                // Respond to manage_context, MCP, or empty batch
                 for (call_id, tool_name) in &batch.call_id_names {
-                    conversation.add_tool_result(call_id, tool_name, "OK — context updated.");
+                    if !mcp_client::McpClientManager::is_mcp_tool(tool_name) {
+                        conversation.add_tool_result(call_id, tool_name, "OK — context updated.");
+                    }
                 }
                 continue;
             };
@@ -2085,13 +2325,24 @@ All relative paths and commands execute from this directory.",
     ));
     conversation.add_assistant("Understood. I will work within the specified project directory.".to_string());
 
-    // Inject memory if inherited
-    if env::var("INTENDANT_INHERIT_MEMORY").is_ok() {
-        if let Some(store) = memory::load_memory(&project) {
-            if let Some(memory_msg) = memory::format_memory_message(&store) {
-                conversation.add_user(memory_msg);
-                conversation
-                    .add_assistant("Acknowledged. I have loaded the project memory.".to_string());
+    // Inject INTENDANT.md instructions
+    if let Some(instructions) = prompts::load_project_instructions(Some(&project.root)) {
+        conversation.add_user(instructions);
+        conversation.add_assistant(
+            "Acknowledged. I will follow the project instructions.".to_string(),
+        );
+    }
+
+    // Inject knowledge if inherited
+    if env::var("INTENDANT_INHERIT_MEMORY").is_ok() && project.config.memory.enabled {
+        if let Ok(kstore) = knowledge::load(&project.memory_path()) {
+            let refs: Vec<&_> = kstore.entries.iter().collect();
+            let msg = knowledge::format_for_injection(&refs);
+            if !msg.is_empty() {
+                conversation.add_user(msg);
+                conversation.add_assistant(
+                    "Acknowledged. I have loaded the project knowledge.".to_string(),
+                );
             }
         }
     }
@@ -2116,6 +2367,7 @@ All relative paths and commands execute from this directory.",
         autonomy,
         session_log,
         &log_dir,
+        None, // no MCP client for sub-agents
     )
     .await;
 
@@ -2327,6 +2579,7 @@ async fn run_direct_mode(
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
     log_dir: PathBuf,
+    mcp_mgr: Option<mcp_client::McpClientManager>,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -2384,6 +2637,11 @@ async fn run_direct_mode(
         conv
     };
 
+    // Register MCP tools so providers include them in API requests
+    if let Some(ref mgr) = mcp_mgr {
+        tools::register_extra_tools(mgr.all_tools());
+    }
+
     if bus.is_none() {
         println!("Task: {}", task);
         println!("---");
@@ -2398,6 +2656,7 @@ async fn run_direct_mode(
         autonomy,
         session_log,
         &log_dir,
+        mcp_mgr.as_ref(),
     )
     .await
 }
@@ -2414,11 +2673,25 @@ All relative paths and commands execute from this directory.",
         "Understood. I will work within the specified project directory.".to_string(),
     );
 
-    // Inject memory
-    if let Some(store) = memory::load_memory(project) {
-        if let Some(memory_msg) = memory::format_memory_message(&store) {
-            conv.add_user(memory_msg);
-            conv.add_assistant("Acknowledged. I have loaded the project memory.".to_string());
+    // Inject INTENDANT.md instructions
+    if let Some(instructions) = prompts::load_project_instructions(Some(&project.root)) {
+        conv.add_user(instructions);
+        conv.add_assistant(
+            "Acknowledged. I will follow the project instructions.".to_string(),
+        );
+    }
+
+    // Inject knowledge
+    if project.config.memory.enabled {
+        if let Ok(kstore) = knowledge::load(&project.memory_path()) {
+            let refs: Vec<&_> = kstore.entries.iter().collect();
+            let msg = knowledge::format_for_injection(&refs);
+            if !msg.is_empty() {
+                conv.add_user(msg);
+                conv.add_assistant(
+                    "Acknowledged. I have loaded the project knowledge.".to_string(),
+                );
+            }
         }
     }
 
@@ -2471,6 +2744,9 @@ async fn main() -> Result<(), CallerError> {
 
     // Override env vars from CLI flags before provider selection
     let flags = parse_cli_flags()?;
+    if flags.json_output {
+        JSON_OUTPUT.store(true, Ordering::Relaxed);
+    }
     if let Some(ref p) = flags.provider {
         env::set_var("PROVIDER", p);
     }
@@ -2627,6 +2903,7 @@ async fn main() -> Result<(), CallerError> {
         let autonomy_for_launcher = autonomy.clone();
         let session_log_for_launcher = session_log.clone();
         let log_dir_for_launcher = log_dir.clone();
+        #[allow(clippy::async_yields_async)]
         let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
             let project_root = project_root.clone();
             let autonomy = autonomy_for_launcher.clone();
@@ -2696,6 +2973,7 @@ async fn main() -> Result<(), CallerError> {
                         autonomy,
                         session_log,
                         log_dir,
+                        None, // MCP tasks don't use MCP client
                     )
                     .await;
 
@@ -2805,6 +3083,11 @@ async fn main() -> Result<(), CallerError> {
         let session_log_clone = session_log.clone();
         let session_log_summary = session_log.clone();
         let log_dir_clone = log_dir.clone();
+        let mcp_mgr = if !project.config.mcp_servers.is_empty() {
+            Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
+        } else {
+            None
+        };
         let loop_handle = tokio::spawn(async move {
             let result = if is_simple_task(&task_clone) {
                 run_direct_mode(
@@ -2815,6 +3098,7 @@ async fn main() -> Result<(), CallerError> {
                     autonomy_clone,
                     session_log_clone,
                     log_dir_clone,
+                    mcp_mgr,
                 )
                 .await
             } else {
@@ -2861,6 +3145,11 @@ async fn main() -> Result<(), CallerError> {
         let task = task.unwrap();
 
         // Headless mode (--no-tui or non-TTY)
+        let mcp_mgr = if !project.config.mcp_servers.is_empty() {
+            Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
+        } else {
+            None
+        };
         let result = if is_simple_task(&task) {
             run_direct_mode(
                 provider,
@@ -2870,6 +3159,7 @@ async fn main() -> Result<(), CallerError> {
                 autonomy,
                 session_log.clone(),
                 log_dir,
+                mcp_mgr,
             )
             .await
         } else {

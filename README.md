@@ -1,6 +1,6 @@
 # Intendant
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles with in-memory state, executes commands sequentially (blocking until completion), and persists structured session logs. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles with in-memory state, executes commands sequentially (blocking until completion), and persists structured session logs. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, streaming token output with real-time deltas, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, MCP client support for connecting to external tool servers, Landlock filesystem sandboxing, prompt caching (Anthropic), auto-compaction at 90% context usage, JSONL structured output mode, INTENDANT.md project instructions, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
@@ -19,9 +19,14 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   +--> Direct Mode:     single-loop execution for simple tasks
   |
   +--> Native tool calling (OpenAI/Anthropic/Gemini) with text extraction fallback
+  +--> Streaming output:  SSE-based token streaming for all 3 providers
   +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
   +--> MCP Server:      --mcp flag, stdio transport, full parity with TUI (tools + resources)
+  +--> MCP Client:      connects to external MCP servers (configured in intendant.toml)
   +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
+  +--> Landlock sandbox: filesystem restrictions on agent runtime (Linux)
+  +--> Prompt caching:  Anthropic cache_control, OpenAI/Gemini implicit caching
+  +--> Auto-compaction: triggers at 90% context usage, preserves system+tail messages
   +--> Optional control socket (--control-socket): /tmp/intendant-<pid>.sock (JSON-line protocol)
   +--> Token budget tracking (context-window-aware loop termination)
   +--> Sub-agent spawning via env vars (INTENDANT_ROLE, INTENDANT_ID, etc.)
@@ -172,7 +177,7 @@ cargo test
 The test suite covers both binaries:
 
 - **Agent binary:** models serialization, error types, process state operations, nonce replacement, path inspection, blocking command execution, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters.
-- **Caller binary:** JSON extraction, done signal handling, conversation management with message layer protection and tool call tracking, context directives (drop/summarize), error types, project detection, config parsing with approval rules, memory/knowledge loading and formatting, provider selection with token usage tracking and Responses API support, structured output and reasoning controls, role mapping, native tool definitions (11 tools, provider conversion formats), tool call batch assembly and result routing, Gemini provider request/response format, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults, tools-mode variant), TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, session log file creation, model summary formatting, Xvfb display configuration per provider, and dynamic display allocation.
+- **Caller binary:** JSON extraction, done signal handling, conversation management with message layer protection, tool call tracking, and auto-compaction, context directives (drop/summarize), error types, project detection, config parsing with approval rules and MCP server config and sandbox config, provider selection with token usage tracking, Responses API support, rate-limit retry with exponential backoff, API key masking, SSE streaming and event parsing, shared message builders, structured output and reasoning controls, role mapping, native tool definitions (11+ tools including MCP client tools, provider conversion formats), tool call batch assembly and result routing (including MCP tool routing), Gemini provider request/response format, sub-agent spawning and result parsing, git worktree lifecycle, user mode orchestration, knowledge pub/sub system, prompt resolution cascade (project root, global config, compiled-in defaults, tools-mode variant) with INTENDANT.md loading, TUI rendering (status bar, log panel, action panel, approval panel, help overlay, layout calculations, orchestrator progress, streaming buffer), autonomy level resolution and command classification, event bus dispatch, theme color thresholds, control socket serialization, session log file creation, model summary formatting, Xvfb display configuration per provider, dynamic display allocation, MCP client tool name parsing and routing, Landlock sandbox config construction, and JSON structured output mode.
 
 ## Session Logging
 
@@ -311,6 +316,8 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--mcp` | Run as MCP server on stdio (replaces TUI) |
 | `--control-socket` | Enable Unix control socket (TUI mode) |
 | `--vision` | Launch Xvfb virtual display (auto-allocated `:99+`) sized for the provider's vision model |
+| `--json` | JSONL structured output to stdout (implies `--no-tui`) |
+| `--sandbox` | Enable Landlock filesystem sandboxing (Linux kernel 5.13+) |
 
 The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
 
@@ -344,14 +351,14 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 
 ### How it works
 
-1. Loads `.env` and selects the API provider (OpenAI, Anthropic, or Gemini). OpenAI uses the Responses API (`/v1/responses`), Anthropic uses the Messages API, Gemini uses the `generateContent` endpoint
-2. Configures structured output (JSON mode), reasoning controls, native tool calling, and max output tokens based on model capabilities and env vars
+1. Loads `.env` and selects the API provider (OpenAI, Anthropic, or Gemini). OpenAI uses the Responses API (`/v1/responses`), Anthropic uses the Messages API, Gemini uses the `generateContent` endpoint. All providers support streaming via SSE
+2. Configures structured output (JSON mode), reasoning controls, native tool calling, prompt caching (Anthropic `cache_control`), and max output tokens based on model capabilities and env vars
 3. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
 4. Resolves role-appropriate system prompt via cascade: project root → `~/.config/intendant/` → compiled-in default. When native tools are enabled, uses the condensed `SysPrompt_tools.md` (tool docs live in API tool definitions instead of prose)
 5. Injects the project working directory into the conversation so the model knows which project to work in
 6. Loads knowledge from `<project>/.intendant/memory.json`, injects into conversation
 7. Logs the full messages array to `turn_NNN_messages.json` before each API call
-8. Sends the task to the chat API (with `max_tokens`/`max_output_tokens`, optional `reasoning`, optional JSON format, and native tool definitions when enabled)
+8. Sends the task to the chat API via streaming (`chat_stream()`), with `max_tokens`/`max_output_tokens`, optional `reasoning`, optional JSON format, and native tool definitions when enabled. API requests use exponential backoff retry (up to 5 retries) for rate-limit (429) and server errors (5xx). Text deltas are forwarded to the TUI in real-time
 9. Logs reasoning content (both summary and full text) to `turn_NNN_reasoning.txt` when available
 10. Processes the model's response via one of two paths:
     - **Native tool call path** (when response contains tool calls): Collects individual tool calls, assembles them into an `AgentInput` batch, pipes to the runtime, maps results back to per-tool-call responses. Handles `manage_context` and `signal_done` tool calls caller-side. Raw API output items (reasoning + function_call) are preserved for verbatim echo-back in subsequent requests, which reasoning models (GPT-5, o3, o4) require
@@ -422,7 +429,29 @@ file_delete = "ask"           # ask before file deletes (default)
 command_exec = "auto"         # auto-approve command execution
 network = "auto"              # auto-approve network requests
 destructive = "ask"           # ask before destructive commands (default)
+
+[sandbox]
+enabled = false               # enable Landlock filesystem sandboxing (default: false)
+extra_write_paths = ["/var/log"]  # additional writable paths beyond project root, /tmp, log dir
+
+# External MCP servers to connect to as a client
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[[mcp_servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp_servers.env]
+GITHUB_TOKEN = "ghp_..."
 ```
+
+### INTENDANT.md Project Instructions
+
+Place an `INTENDANT.md` file in your project root or at `~/.config/intendant/INTENDANT.md` for global instructions. These are injected into the conversation at session start, before knowledge/memory. Both files are loaded if present (global first, project-local second).
 
 ### System Prompts
 

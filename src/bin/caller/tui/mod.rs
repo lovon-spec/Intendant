@@ -67,7 +67,7 @@ impl Tui {
             if let Some(bottom_area) = app_layout.bottom_panel {
                 match app.mode {
                     app::AppMode::Approval => {
-                        if let Some(ref pending) = app.pending_approval {
+                        if let Some(pending) = app.pending_approvals.front() {
                             widgets::render_approval_panel(
                                 f,
                                 bottom_area,
