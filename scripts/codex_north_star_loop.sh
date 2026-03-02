@@ -26,6 +26,23 @@ CONTROL_PID=""
 FINALIZED="0"
 STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
+log_intervention() {
+  printf '%s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*" >> "$INTERVENTION_LOG"
+}
+
+capture_signal_diagnostics() {
+  local sig="$1"
+  local self_meta parent_meta
+  self_meta="$(ps -o pid=,ppid=,pgid=,sid=,tty=,stat=,etime=,cmd= -p "$$" 2>/dev/null | sed 's/^ *//')"
+  parent_meta="$(ps -o pid=,ppid=,pgid=,sid=,tty=,stat=,etime=,cmd= -p "$PPID" 2>/dev/null | sed 's/^ *//')"
+  log_intervention "signal_received=$sig self=[$self_meta] parent=[$parent_meta] codex_pid=${CODEX_PID:-unset}"
+  if [[ -n "${CODEX_PID:-}" ]]; then
+    local codex_meta
+    codex_meta="$(ps -o pid=,ppid=,pgid=,sid=,tty=,stat=,etime=,cmd= -p "$CODEX_PID" 2>/dev/null | sed 's/^ *//')"
+    log_intervention "signal_context_codex=[$codex_meta]"
+  fi
+}
+
 write_status() {
   local state="$1"
   local exit_code="$2"
@@ -47,6 +64,7 @@ cleanup() {
     return
   fi
   FINALIZED="1"
+  log_intervention "cleanup_begin state=$state exit_code=$exit_code reason=${reason:-none} codex_pid=${CODEX_PID:-unset}"
   if [[ -n "$HB_PID" ]]; then
     kill "$HB_PID" >/dev/null 2>&1 || true
     wait "$HB_PID" 2>/dev/null || true
@@ -71,10 +89,12 @@ cleanup() {
     wait "$CODEX_PID" 2>/dev/null || true
   fi
   write_status "$state" "$exit_code" "$reason"
+  log_intervention "cleanup_end state=$state exit_code=$exit_code reason=${reason:-none}"
 }
 
 on_signal() {
   local sig="$1"
+  capture_signal_diagnostics "$sig"
   cleanup "signaled" 143 "$sig"
   exit 143
 }
@@ -115,7 +135,7 @@ printf '%s\n' "$RUN_ID" > "$LATEST_RUN_ID_FILE"
 # Clear stale operator intervention requests from prior runs.
 rm -f "$STOP_FILE" "$ABORT_FILE"
 write_status "starting" -1 ""
-printf '%s run_started run_id=%s pid=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$RUN_ID" "$$" > "$INTERVENTION_LOG"
+log_intervention "run_started run_id=$RUN_ID pid=$$ ppid=$PPID"
 
 cd "$ROOT"
 (
@@ -136,12 +156,12 @@ HB_PID=$!
     fi
     if [[ -n "$current_pid" ]] && kill -0 "$current_pid" >/dev/null 2>&1; then
       if [[ -f "$STOP_FILE" ]]; then
-        printf '%s operator_request=stop codex_pid=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$current_pid" >> "$INTERVENTION_LOG"
+        log_intervention "operator_request=stop codex_pid=$current_pid"
         rm -f "$STOP_FILE"
         kill -TERM "$current_pid" >/dev/null 2>&1 || true
       fi
       if [[ -f "$ABORT_FILE" ]]; then
-        printf '%s operator_request=abort codex_pid=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$current_pid" >> "$INTERVENTION_LOG"
+        log_intervention "operator_request=abort codex_pid=$current_pid"
         rm -f "$ABORT_FILE"
         kill -KILL "$current_pid" >/dev/null 2>&1 || true
       fi
@@ -153,6 +173,8 @@ CONTROL_PID=$!
 
 trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
+trap 'on_signal QUIT' QUIT
 
 set +e
 codex exec \
@@ -163,6 +185,7 @@ codex exec \
   "$PROMPT" >> "$OUT_FILE" 2>&1 &
 CODEX_PID="$!"
 printf '%s\n' "$CODEX_PID" > "$CODEX_PID_FILE"
+log_intervention "codex_started codex_pid=$CODEX_PID"
 wait "$CODEX_PID"
 EXIT_CODE=$?
 set -e
