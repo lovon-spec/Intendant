@@ -2629,8 +2629,30 @@ async fn main() -> Result<(), CallerError> {
             let project_root = project_root.clone();
             let approval_config = approval_config.clone();
             let session_log = session_log_for_launcher.clone();
-            let log_dir = log_dir_for_launcher.clone();
+            let _parent_log_dir = log_dir_for_launcher.clone();
             Box::pin(async move {
+                // Each MCP task gets a fresh session directory so conversations
+                // don't bleed between tasks (reasoning items, tool calls, etc.).
+                let task_log_dir = session_log::SessionLog::resolve_path(None);
+                match session_log::SessionLog::open(task_log_dir.clone()) {
+                    Ok(mut l) => {
+                        l.write_meta(Some(&project_root), Some(&task_str));
+                        l.info(&format!("MCP sub-task session: {}", l.session_id()));
+                        // Replace the shared session log with the fresh one
+                        if let Ok(mut guard) = session_log.lock() {
+                            *guard = l;
+                        }
+                    }
+                    Err(e) => {
+                        bus.send(AppEvent::LoopError(format!(
+                            "Failed to create task session: {}",
+                            e
+                        )));
+                        return tokio::spawn(async {});
+                    }
+                }
+                let log_dir = task_log_dir;
+
                 // Create a fresh provider for this task
                 let provider = match provider::select_provider() {
                     Ok(p) => p,
