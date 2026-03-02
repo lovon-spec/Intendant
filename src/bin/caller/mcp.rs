@@ -912,7 +912,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::GetRestartStatus => {
             let s = state.read().await;
-            let data = serde_json::to_value(&s.controller_restart).ok();
+            let data = Some(restart_state_public_value(s.controller_restart.as_ref()));
             emit_control_result(
                 control_tx,
                 "get_restart_status",
@@ -3119,6 +3119,77 @@ mod tests {
                 .and_then(|v| v.get("phase"))
                 .and_then(|v| v.as_str()),
             Some("completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_get_restart_status_redacts_turn_complete_token() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let (control_tx, mut control_rx) = broadcast::channel::<String>(8);
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx.clone()),
+            ControlMsg::ScheduleControllerRestart {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            },
+        )
+        .await;
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+
+        let scheduled_event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for scheduled command_result")
+            .expect("broadcast recv failed");
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled_event).unwrap();
+        let token = scheduled_json
+            .get("data")
+            .and_then(|v| v.get("turn_complete_token"))
+            .and_then(|v| v.as_str())
+            .expect("schedule payload should include raw token")
+            .to_string();
+
+        let resource = handle_control_command_mcp(
+            &state,
+            &bus,
+            &Some(control_tx),
+            ControlMsg::GetRestartStatus,
+        )
+        .await;
+        assert_eq!(resource, Some(RESOURCE_RESTART_URI));
+
+        let status_event = timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .expect("timed out waiting for status command_result")
+            .expect("broadcast recv failed");
+        let status_json: serde_json::Value = serde_json::from_str(&status_event).unwrap();
+        assert_eq!(
+            status_json.get("action").and_then(|v| v.as_str()),
+            Some("get_restart_status")
+        );
+        assert_eq!(
+            status_json
+                .get("data")
+                .and_then(|v| v.get("turn_complete_token"))
+                .and_then(|v| v.as_str()),
+            Some("[redacted]")
+        );
+        assert_ne!(
+            status_json
+                .get("data")
+                .and_then(|v| v.get("turn_complete_token"))
+                .and_then(|v| v.as_str()),
+            Some(token.as_str())
         );
     }
 
