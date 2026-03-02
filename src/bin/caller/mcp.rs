@@ -262,6 +262,41 @@ fn parse_restart_after(raw: Option<&str>) -> Result<RestartAfter, String> {
     }
 }
 
+fn normalize_string_field(value: &mut String) {
+    *value = value.trim().to_string();
+}
+
+fn normalize_optional_string_field(value: &mut Option<String>) {
+    if let Some(trimmed) = value.as_ref().map(|v| v.trim().to_string()) {
+        if trimmed.is_empty() {
+            *value = None;
+        } else {
+            *value = Some(trimmed);
+        }
+    }
+}
+
+fn normalize_schedule_controller_restart_params(params: &mut ScheduleControllerRestartParams) {
+    normalize_string_field(&mut params.controller_id);
+    normalize_string_field(&mut params.north_star_goal);
+    normalize_optional_string_field(&mut params.reason);
+    normalize_optional_string_field(&mut params.restart_after);
+    if let Some(cmd) = params.restart_command.as_mut() {
+        normalize_string_field(cmd);
+    }
+}
+
+fn normalize_controller_turn_complete_params(params: &mut ControllerTurnCompleteParams) {
+    normalize_string_field(&mut params.restart_id);
+    normalize_string_field(&mut params.turn_complete_token);
+    normalize_optional_string_field(&mut params.status);
+    normalize_optional_string_field(&mut params.handoff_summary);
+}
+
+fn normalize_cancel_controller_restart_params(params: &mut CancelControllerRestartParams) {
+    normalize_optional_string_field(&mut params.restart_id);
+}
+
 fn validate_schedule_controller_restart_params(
     params: &ScheduleControllerRestartParams,
 ) -> Result<(), String> {
@@ -667,7 +702,7 @@ async fn handle_control_command_mcp(
             max_attempts,
             cooldown_sec,
         } => {
-            let params = ScheduleControllerRestartParams {
+            let mut params = ScheduleControllerRestartParams {
                 controller_id,
                 north_star_goal,
                 reason,
@@ -677,6 +712,7 @@ async fn handle_control_command_mcp(
                 max_attempts,
                 cooldown_sec,
             };
+            normalize_schedule_controller_restart_params(&mut params);
 
             if let Err(e) = validate_schedule_controller_restart_params(&params) {
                 emit_control_result(control_tx, "schedule_controller_restart", false, e, None);
@@ -760,6 +796,13 @@ async fn handle_control_command_mcp(
             status,
             handoff_summary,
         } => {
+            let mut params = ControllerTurnCompleteParams {
+                restart_id,
+                turn_complete_token,
+                status,
+                handoff_summary,
+            };
+            normalize_controller_turn_complete_params(&mut params);
             {
                 let mut s = state.write().await;
                 let log_dir = s.log_dir.clone();
@@ -773,7 +816,7 @@ async fn handle_control_command_mcp(
                     );
                     return Some(RESOURCE_RESTART_URI);
                 };
-                if active.restart_id != restart_id {
+                if active.restart_id != params.restart_id {
                     emit_control_result(
                         control_tx,
                         "controller_turn_complete",
@@ -783,7 +826,7 @@ async fn handle_control_command_mcp(
                     );
                     return Some(RESOURCE_RESTART_URI);
                 }
-                if active.turn_complete_token != turn_complete_token {
+                if active.turn_complete_token != params.turn_complete_token {
                     emit_control_result(
                         control_tx,
                         "controller_turn_complete",
@@ -810,8 +853,8 @@ async fn handle_control_command_mcp(
                     return Some(RESOURCE_RESTART_URI);
                 }
 
-                active.handoff_summary = handoff_summary;
-                active.completion_status = status;
+                active.handoff_summary = params.handoff_summary.clone();
+                active.completion_status = params.status.clone();
                 active.phase = RestartPhase::Ready;
                 active.updated_at = ControllerRestartState::now_string();
                 let snapshot = s.controller_restart.clone();
@@ -849,6 +892,8 @@ async fn handle_control_command_mcp(
             Some(RESOURCE_RESTART_URI)
         }
         ControlMsg::CancelControllerRestart { restart_id } => {
+            let mut params = CancelControllerRestartParams { restart_id };
+            normalize_cancel_controller_restart_params(&mut params);
             let mut s = state.write().await;
             let log_dir = s.log_dir.clone();
             let Some(active) = s.controller_restart.as_mut() else {
@@ -862,7 +907,7 @@ async fn handle_control_command_mcp(
                 return Some(RESOURCE_RESTART_URI);
             };
 
-            if let Some(expected_id) = restart_id {
+            if let Some(expected_id) = params.restart_id.as_deref() {
                 if expected_id != active.restart_id {
                     emit_control_result(
                         control_tx,
@@ -1650,8 +1695,9 @@ impl IntendantServer {
     )]
     async fn schedule_controller_restart(
         &self,
-        Parameters(params): Parameters<ScheduleControllerRestartParams>,
+        Parameters(mut params): Parameters<ScheduleControllerRestartParams>,
     ) -> String {
+        normalize_schedule_controller_restart_params(&mut params);
         if let Err(e) = validate_schedule_controller_restart_params(&params) {
             return schedule_error_response(e, None, None);
         }
@@ -1723,8 +1769,9 @@ impl IntendantServer {
     )]
     async fn controller_turn_complete(
         &self,
-        Parameters(params): Parameters<ControllerTurnCompleteParams>,
+        Parameters(mut params): Parameters<ControllerTurnCompleteParams>,
     ) -> String {
+        normalize_controller_turn_complete_params(&mut params);
         {
             let mut s = self.state.write().await;
             let log_dir = s.log_dir.clone();
@@ -1829,8 +1876,9 @@ impl IntendantServer {
     #[tool(description = "Cancel a scheduled controller restart.")]
     async fn cancel_controller_restart(
         &self,
-        Parameters(params): Parameters<CancelControllerRestartParams>,
+        Parameters(mut params): Parameters<CancelControllerRestartParams>,
     ) -> String {
+        normalize_cancel_controller_restart_params(&mut params);
         let mut s = self.state.write().await;
         let log_dir = s.log_dir.clone();
         let requested_restart_id = params.restart_id.as_deref();
@@ -2646,6 +2694,17 @@ mod tests {
     }
 
     #[test]
+    fn normalize_optional_string_field_trims_and_drops_empty() {
+        let mut value = Some("  hello  ".to_string());
+        normalize_optional_string_field(&mut value);
+        assert_eq!(value.as_deref(), Some("hello"));
+
+        let mut empty = Some("   ".to_string());
+        normalize_optional_string_field(&mut empty);
+        assert!(empty.is_none());
+    }
+
+    #[test]
     fn controller_restart_state_defaults() {
         let params = ScheduleControllerRestartParams {
             controller_id: "codex".to_string(),
@@ -2814,6 +2873,40 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("configure at least one restart action"));
+    }
+
+    #[tokio::test]
+    async fn schedule_restart_normalizes_string_fields() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state.clone(), bus);
+
+        let output = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "  codex  ".to_string(),
+                north_star_goal: "  improve loop  ".to_string(),
+                reason: Some("  periodic refresh  ".to_string()),
+                restart_after: Some("  NOW  ".to_string()),
+                restart_command: Some("  true  ".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(true));
+
+        let s = state.read().await;
+        let restart = s
+            .controller_restart
+            .as_ref()
+            .expect("restart should be stored");
+        assert_eq!(restart.controller_id, "codex");
+        assert_eq!(restart.north_star_goal, "improve loop");
+        assert_eq!(restart.reason.as_deref(), Some("periodic refresh"));
+        assert_eq!(restart.restart_after, RestartAfter::Now);
+        assert_eq!(restart.restart_command.as_deref(), Some("true"));
     }
 
     #[tokio::test]
@@ -3115,6 +3208,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controller_turn_complete_normalizes_ids_and_optional_fields() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state.clone(), bus);
+
+        let scheduled = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled).unwrap();
+        let restart_id = scheduled_json["restart_id"].as_str().unwrap().to_string();
+        let token = scheduled_json["turn_complete_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let output = server
+            .controller_turn_complete(Parameters(ControllerTurnCompleteParams {
+                restart_id: format!("  {}  ", restart_id),
+                turn_complete_token: format!("  {}  ", token),
+                status: Some("   ".to_string()),
+                handoff_summary: Some("  handoff summary  ".to_string()),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(true));
+
+        let s = state.read().await;
+        let restart = s
+            .controller_restart
+            .as_ref()
+            .expect("restart should be stored");
+        assert!(restart.completion_status.is_none());
+        assert_eq!(restart.handoff_summary.as_deref(), Some("handoff summary"));
+    }
+
+    #[tokio::test]
     async fn cancel_controller_restart_returns_json_success_payload() {
         let dir = tempdir().unwrap();
         let state = test_state_with_log_dir(dir.path().to_path_buf());
@@ -3168,5 +3307,37 @@ mod tests {
             Some("No controller restart is scheduled")
         );
         assert_eq!(json["restart_id"].as_str(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn cancel_controller_restart_treats_whitespace_guard_as_none() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_log_dir(dir.path().to_path_buf());
+        let (bus, _rx) = EventBus::new();
+        let server = IntendantServer::new(state, bus);
+
+        let scheduled = server
+            .schedule_controller_restart(Parameters(ScheduleControllerRestartParams {
+                controller_id: "codex".to_string(),
+                north_star_goal: "improve loop".to_string(),
+                reason: None,
+                restart_after: Some("turn_end".to_string()),
+                restart_command: Some("true".to_string()),
+                auto_start_task: Some(false),
+                max_attempts: None,
+                cooldown_sec: None,
+            }))
+            .await;
+        let scheduled_json: serde_json::Value = serde_json::from_str(&scheduled).unwrap();
+        let restart_id = scheduled_json["restart_id"].as_str().unwrap().to_string();
+
+        let output = server
+            .cancel_controller_restart(Parameters(CancelControllerRestartParams {
+                restart_id: Some("   ".to_string()),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["ok"].as_bool(), Some(true));
+        assert_eq!(json["restart_id"].as_str(), Some(restart_id.as_str()));
     }
 }

@@ -672,9 +672,11 @@ Notes:
 - Restart state is persisted to the current session dir as `controller_restart.json`.
 - `restart_after` defaults to `"turn_end"`.
 - `restart_after` accepts only `"turn_end"` or `"now"`; other values are rejected.
+- Restart workflow string inputs are normalized (trimmed) before validation/execution.
 - `restart_command`, when provided, must not be empty/whitespace.
 - At least one restart action is required at schedule time: set `restart_command` and/or `auto_start_task=true`.
 - `max_attempts` must be `>= 1`; `0` is rejected.
+- Optional `status`, `handoff_summary`, and cancel `restart_id` guard treat whitespace-only values as unset.
 - If `restart_after="now"` and execution fails after passing validation, `schedule_controller_restart` reports `"ok": false` and includes `execution_error`.
 - `schedule_controller_restart` rejection payloads use `"status": "rejected"` and include `"error"` (plus `"restart_id"`/`"phase"` when a conflicting active restart exists).
 - `controller_turn_complete` reports JSON results:
