@@ -63,8 +63,26 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
                 .bg(theme::STATUS_BAR_BG),
         ),
         Span::styled(
-            format!(" [{}:{}]", autonomy_str, app.verbosity.label()),
+            " autonomy:",
+            Style::default()
+                .fg(theme::LOG_DIM_FG)
+                .bg(theme::STATUS_BAR_BG),
+        ),
+        Span::styled(
+            autonomy_str,
             Style::default().fg(autonomy_color).bg(theme::STATUS_BAR_BG),
+        ),
+        Span::styled(
+            "  verbosity:",
+            Style::default()
+                .fg(theme::LOG_DIM_FG)
+                .bg(theme::STATUS_BAR_BG),
+        ),
+        Span::styled(
+            app.verbosity.label().to_string(),
+            Style::default()
+                .fg(theme::LOG_DIM_FG)
+                .bg(theme::STATUS_BAR_BG),
         ),
         // Fill remaining with bg
         Span::styled(
