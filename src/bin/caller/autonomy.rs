@@ -76,6 +76,23 @@ pub enum ActionCategory {
     HumanInput,
 }
 
+impl ActionCategory {
+    /// Return a severity score for display priority ordering.
+    /// Higher = more severe. Used to show the most important category
+    /// in approval prompts when multiple categories apply.
+    pub fn severity(self) -> u8 {
+        match self {
+            Self::FileRead => 0,
+            Self::CommandExec => 1,
+            Self::NetworkRequest => 2,
+            Self::FileWrite => 3,
+            Self::FileDelete => 4,
+            Self::Destructive => 5,
+            Self::HumanInput => 6,
+        }
+    }
+}
+
 impl fmt::Display for ActionCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -683,5 +700,20 @@ destructive = "deny"
     fn shared_autonomy_default() {
         let state = AutonomyState::default();
         assert_eq!(state.level, AutonomyLevel::Medium);
+    }
+
+    #[test]
+    fn severity_ordering() {
+        // Destructive > FileDelete > FileWrite > NetworkRequest > CommandExec > FileRead
+        assert!(ActionCategory::Destructive.severity() > ActionCategory::FileDelete.severity());
+        assert!(ActionCategory::FileDelete.severity() > ActionCategory::FileWrite.severity());
+        assert!(ActionCategory::FileWrite.severity() > ActionCategory::NetworkRequest.severity());
+        assert!(ActionCategory::NetworkRequest.severity() > ActionCategory::CommandExec.severity());
+        assert!(ActionCategory::CommandExec.severity() > ActionCategory::FileRead.severity());
+    }
+
+    #[test]
+    fn human_input_highest_severity() {
+        assert!(ActionCategory::HumanInput.severity() > ActionCategory::Destructive.severity());
     }
 }

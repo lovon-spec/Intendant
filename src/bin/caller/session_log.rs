@@ -599,6 +599,24 @@ impl SessionLog {
             file2: None,
         });
     }
+
+    /// Mark the session as interrupted and flush logs.
+    /// Called from signal handlers (SIGTERM) where Drop may not run.
+    pub fn mark_interrupted(&mut self) {
+        let _ = self.writer.flush();
+        let meta_path = self.dir.join("session_meta.json");
+        if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+            if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
+                if meta.status.as_deref() == Some("running") {
+                    meta.status = Some("interrupted".to_string());
+                    meta.last_turn = Some(self.current_turn);
+                    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+                        let _ = fs::write(&meta_path, &json);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Drop for SessionLog {
@@ -1039,5 +1057,40 @@ mod tests {
                 .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
         assert_eq!(meta.last_turn, Some(5));
+    }
+
+    #[test]
+    fn mark_interrupted_updates_running_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.turn_start(7, 0.0, 100000);
+
+        // Explicitly mark interrupted (simulates SIGTERM handler)
+        log.mark_interrupted();
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("interrupted"));
+        assert_eq!(meta.last_turn, Some(7));
+    }
+
+    #[test]
+    fn mark_interrupted_does_not_overwrite_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.write_summary("task", "completed", 5);
+
+        // mark_interrupted should not overwrite "completed"
+        log.mark_interrupted();
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("completed"));
     }
 }

@@ -1502,27 +1502,69 @@ async fn run_agent_loop(
             }
         });
 
-        let stream_bus = bus.clone();
-        let on_stream_event = move |event: crate::provider::StreamEvent| {
-            if let crate::provider::StreamEvent::Delta(ref text) = event {
-                if let Some(ref b) = stream_bus {
-                    b.send(AppEvent::ModelResponseDelta { text: text.clone() });
+        let response = {
+            const STREAM_RETRIES: u32 = 3;
+            let mut last_stream_err = None;
+            let mut resp = None;
+            for attempt in 0..=STREAM_RETRIES {
+                let stream_bus = bus.clone();
+                let on_stream_event = move |event: crate::provider::StreamEvent| {
+                    if let crate::provider::StreamEvent::Delta(ref text) = event {
+                        if let Some(ref b) = stream_bus {
+                            b.send(AppEvent::ModelResponseDelta { text: text.clone() });
+                        }
+                    }
+                };
+                match provider
+                    .chat_stream(conversation.messages(), &on_stream_event)
+                    .await
+                {
+                    Ok(r) => {
+                        resp = Some(r);
+                        break;
+                    }
+                    Err(e) => {
+                        let is_stream_error = e.to_string().contains("Stream error");
+                        if is_stream_error && attempt < STREAM_RETRIES {
+                            slog(&session_log, |l| {
+                                l.warn(&format!(
+                                    "Stream error (attempt {}/{}), retrying: {}",
+                                    attempt + 1,
+                                    STREAM_RETRIES + 1,
+                                    e
+                                ))
+                            });
+                            let delay = std::time::Duration::from_millis(
+                                1000 * 2u64.pow(attempt) + (turn as u64 % 500),
+                            );
+                            tokio::time::sleep(delay).await;
+                            last_stream_err = Some(e);
+                            continue;
+                        }
+                        slog(&session_log, |l| l.error(&format!("API error: {}", e)));
+                        emit(
+                            &bus,
+                            || AppEvent::LoopError(e.to_string()),
+                            || eprintln!("Error: {}", e),
+                        );
+                        return Err(e);
+                    }
                 }
             }
-        };
-        let response = match provider
-            .chat_stream(conversation.messages(), &on_stream_event)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                slog(&session_log, |l| l.error(&format!("API error: {}", e)));
-                emit(
-                    &bus,
-                    || AppEvent::LoopError(e.to_string()),
-                    || eprintln!("Error: {}", e),
-                );
-                return Err(e);
+            match resp {
+                Some(r) => r,
+                None => {
+                    let e = last_stream_err.unwrap_or_else(|| {
+                        CallerError::Provider("Stream failed after retries".to_string())
+                    });
+                    slog(&session_log, |l| l.error(&format!("API error: {}", e)));
+                    emit(
+                        &bus,
+                        || AppEvent::LoopError(e.to_string()),
+                        || eprintln!("Error: {}", e),
+                    );
+                    return Err(e);
+                }
             }
         };
         conversation.set_usage(response.usage.clone());
@@ -1771,7 +1813,7 @@ async fn run_agent_loop(
             let needs_approval = {
                 let classifications = autonomy::classify_batch(&json_str);
                 let autonomy_state = autonomy.read().await;
-                let mut need = None;
+                let mut need: Option<(autonomy::ActionCategory, bool)> = None;
                 for (_idx, categories) in &classifications {
                     for &cat in categories {
                         if cat == autonomy::ActionCategory::HumanInput {
@@ -1779,16 +1821,18 @@ async fn run_agent_loop(
                         }
                         let rule = autonomy_state.rules.rule_for(cat);
                         if matches!(rule, autonomy::ApprovalRule::Deny) {
-                            need = Some((cat, true));
-                            break;
+                            // Deny is highest priority — pick highest severity among denies
+                            if need.is_none_or(|(prev, _)| cat.severity() > prev.severity()) {
+                                need = Some((cat, true));
+                            }
+                        } else if autonomy_state.needs_approval(cat) {
+                            // Among non-deny approvals, pick highest severity
+                            if need.is_none_or(|(prev, was_deny)| {
+                                !was_deny && cat.severity() > prev.severity()
+                            }) {
+                                need = Some((cat, false));
+                            }
                         }
-                        if autonomy_state.needs_approval(cat) {
-                            need = Some((cat, false));
-                            break;
-                        }
-                    }
-                    if need.is_some() {
-                        break;
                     }
                 }
                 need
@@ -2059,7 +2103,7 @@ Proceed with explicit assumptions and continue without additional questions."
             let needs_approval = {
                 let classifications = autonomy::classify_batch(&json_str);
                 let autonomy_state = autonomy.read().await;
-                let mut need = None;
+                let mut need: Option<(autonomy::ActionCategory, bool)> = None;
                 for (_idx, categories) in &classifications {
                     for &cat in categories {
                         if cat == autonomy::ActionCategory::HumanInput {
@@ -2067,16 +2111,18 @@ Proceed with explicit assumptions and continue without additional questions."
                         }
                         let rule = autonomy_state.rules.rule_for(cat);
                         if matches!(rule, autonomy::ApprovalRule::Deny) {
-                            need = Some((cat, true));
-                            break;
+                            // Deny is highest priority — pick highest severity among denies
+                            if need.is_none_or(|(prev, _)| cat.severity() > prev.severity()) {
+                                need = Some((cat, true));
+                            }
+                        } else if autonomy_state.needs_approval(cat) {
+                            // Among non-deny approvals, pick highest severity
+                            if need.is_none_or(|(prev, was_deny)| {
+                                !was_deny && cat.severity() > prev.severity()
+                            }) {
+                                need = Some((cat, false));
+                            }
                         }
-                        if autonomy_state.needs_approval(cat) {
-                            need = Some((cat, false));
-                            break;
-                        }
-                    }
-                    if need.is_some() {
-                        break;
                     }
                 }
                 need
@@ -2364,6 +2410,7 @@ All relative paths and commands execute from this directory.",
     ));
 
     let sub_agent_info = (id.clone(), role);
+    let session_log_for_summary = session_log.clone();
     let result = run_agent_loop(
         provider.as_ref(),
         &mut conversation,
@@ -2376,6 +2423,16 @@ All relative paths and commands execute from this directory.",
         None, // no MCP client for sub-agents
     )
     .await;
+
+    // Update session status before writing result file
+    match &result {
+        Ok(stats) => slog(&session_log_for_summary, |l| {
+            l.write_summary(&task, "completed", stats.turns)
+        }),
+        Err(e) => slog(&session_log_for_summary, |l| {
+            l.write_summary(&task, &format!("error: {}", e), 0)
+        }),
+    }
 
     // Write result file
     if let Ok(result_path) = env::var("INTENDANT_RESULT_FILE") {
@@ -2844,6 +2901,32 @@ async fn main() -> Result<(), CallerError> {
     };
 
     configure_sandbox_env(&flags, &project, &log_dir);
+
+    // Install SIGTERM handler to mark session as interrupted before exit.
+    // Rust's Drop trait does not run when the process is killed by a signal,
+    // so we need an explicit handler to update session_meta.json.
+    {
+        let signal_session_log = session_log.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+                sigterm.recv().await;
+                if let Ok(mut log) = signal_session_log.lock() {
+                    log.mark_interrupted();
+                }
+                // Restore terminal (best-effort) so the shell isn't left in raw mode
+                let _ = crossterm::terminal::disable_raw_mode();
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::LeaveAlternateScreen
+                );
+                std::process::exit(130);
+            }
+        });
+    }
 
     // Write session metadata (project root, task will be filled in later if available).
     slog(&session_log, |l| {
