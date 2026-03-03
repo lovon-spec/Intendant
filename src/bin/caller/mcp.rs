@@ -2606,6 +2606,7 @@ impl ServerHandler for IntendantServer {
             ),
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .enable_resources()
                 .enable_resources_subscribe()
                 .enable_resources_list_changed()
@@ -2896,6 +2897,13 @@ pub async fn run_mcp_server(
         let transport = rmcp::transport::io::stdio();
         server.serve(transport).await?
     };
+
+    // After a reload, notify the client that tools may have changed so it
+    // re-fetches the tool list.  This is the MCP-standard mechanism for
+    // telling a client that server capabilities have been updated.
+    if reloaded {
+        let _ = running.peer().notify_tool_list_changed().await;
+    }
 
     // Store the peer for sending notifications
     let peer = Arc::new(Mutex::new(Some(running.peer().clone())));

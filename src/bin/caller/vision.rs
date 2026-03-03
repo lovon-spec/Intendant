@@ -9,6 +9,29 @@ pub struct DisplayConfig {
     pub height: u32,
 }
 
+/// Check if a lock file is stale (the PID inside is no longer running).
+fn is_lock_stale(lock_path: &str) -> bool {
+    let contents = match std::fs::read_to_string(lock_path) {
+        Ok(c) => c,
+        Err(_) => return false, // can't read → assume not stale
+    };
+    let pid_str = contents.trim();
+    let pid: u32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    // Check if the process is alive via /proc (Linux-only)
+    !std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+/// Remove a stale X lock file and its socket.
+fn remove_stale_lock(id: u32) {
+    let lock = format!("/tmp/.X{}-lock", id);
+    let socket = format!("/tmp/.X11-unix/X{}", id);
+    let _ = std::fs::remove_file(&lock);
+    let _ = std::fs::remove_file(&socket);
+}
+
 /// Returns the optimal display resolution for the given provider name.
 ///
 /// Resolutions are chosen to minimize token cost while maintaining UI readability,
@@ -29,10 +52,16 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
 }
 
 /// Find a free X display number by checking for lock files.
+/// Cleans up stale lock files (dead PIDs) encountered along the way.
 fn find_free_display() -> u32 {
     for id in 99..200 {
         let lock = format!("/tmp/.X{}-lock", id);
         if !std::path::Path::new(&lock).exists() {
+            return id;
+        }
+        // Lock file exists — check if the owning process is dead
+        if is_lock_stale(&lock) {
+            remove_stale_lock(id);
             return id;
         }
     }
@@ -40,13 +69,17 @@ fn find_free_display() -> u32 {
 }
 
 /// Guard that kills the Xvfb process when dropped.
+/// Cleans up the lock file and socket after killing.
 pub struct XvfbGuard {
     child: Child,
+    display_id: u32,
 }
 
 impl Drop for XvfbGuard {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        // Clean up lock file and socket so the display number can be reused
+        remove_stale_lock(self.display_id);
     }
 }
 
@@ -88,7 +121,10 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     // Set DISPLAY env var so the runtime subprocess inherits it
     std::env::set_var("DISPLAY", &display_arg);
 
-    Ok(XvfbGuard { child })
+    Ok(XvfbGuard {
+        child,
+        display_id: config.display_id,
+    })
 }
 
 /// Check whether the current DISPLAY environment variable points to an accessible X server.
@@ -144,9 +180,35 @@ mod tests {
         // Should return a display number >= 99
         let id = find_free_display();
         assert!(id >= 99);
-        // The returned display should not have a lock file
+        // The returned display should either have no lock file,
+        // or have a stale lock file that was cleaned up
         let lock = format!("/tmp/.X{}-lock", id);
+        assert!(
+            !std::path::Path::new(&lock).exists() || is_lock_stale(&lock),
+            "display :{} has a live lock file",
+            id
+        );
+    }
+
+    #[test]
+    fn is_lock_stale_nonexistent_file() {
+        assert!(!is_lock_stale("/tmp/.X_nonexistent_test-lock"));
+    }
+
+    #[test]
+    fn stale_lock_detection_and_cleanup() {
+        // Create a lock file with a definitely-dead PID
+        let test_id = 198; // high number unlikely to conflict
+        let lock = format!("/tmp/.X{}-lock", test_id);
+        let socket_dir = "/tmp/.X11-unix";
+        let socket = format!("{}/X{}", socket_dir, test_id);
+        // Use PID 1999999999 which cannot exist
+        std::fs::write(&lock, " 1999999999\n").unwrap();
+        assert!(is_lock_stale(&lock));
+        remove_stale_lock(test_id);
         assert!(!std::path::Path::new(&lock).exists());
+        // Clean up socket if it was created
+        let _ = std::fs::remove_file(&socket);
     }
 
     #[test]

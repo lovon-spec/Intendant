@@ -409,14 +409,39 @@ fn has_capture_screen_command(json_str: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Auto-launch Xvfb when the batch contains `captureScreen` and no working display exists.
+fn has_exec_command(json_str: &str) -> bool {
+    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    parsed
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .map(|commands| {
+            commands.iter().any(|cmd| {
+                matches!(
+                    cmd.get("function").and_then(|v| v.as_str()),
+                    Some("execAsAgent" | "execPty")
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Auto-launch Xvfb when no working display exists and the batch needs one.
 ///
 /// Detection flow:
 /// 1. Already launched (`xvfb_guard` is `Some`)? → skip
-/// 2. Batch contains `captureScreen`? No → skip
-/// 3. Current DISPLAY accessible? Yes → skip
+/// 2. Current DISPLAY accessible? Yes → skip
+/// 3. Batch contains `captureScreen` or any `execAsAgent`? No → skip
 /// 4. Launch Xvfb, store guard, set DISPLAY
-/// 5. On failure → log warning, let captureScreen fail naturally
+/// 5. On failure → log warning, let commands fail naturally
+///
+/// We launch on execAsAgent (not just captureScreen) because GUI applications
+/// started in early turns must share the same display that captureScreen will
+/// later capture. Launching only on captureScreen is too late — the app would
+/// already be running on a different (or no) display.
 async fn maybe_auto_launch_xvfb(
     json_str: &str,
     xvfb_guard: &mut Option<vision::XvfbGuard>,
@@ -426,17 +451,22 @@ async fn maybe_auto_launch_xvfb(
     if xvfb_guard.is_some() {
         return;
     }
-    if !has_capture_screen_command(json_str) {
-        return;
-    }
     if vision::is_display_accessible() {
         return;
     }
+    if !has_capture_screen_command(json_str) && !has_exec_command(json_str) {
+        return;
+    }
     let config = vision::display_config_for_provider(provider_name);
+    let trigger = if has_capture_screen_command(json_str) {
+        "captureScreen"
+    } else {
+        "execAsAgent (display needed)"
+    };
     slog(session_log, |l| {
         l.info(&format!(
-            "Auto-launching Xvfb :{} at {}x{} for captureScreen",
-            config.display_id, config.width, config.height
+            "Auto-launching Xvfb :{} at {}x{} for {}",
+            config.display_id, config.width, config.height, trigger
         ))
     });
     match vision::launch_display(&config).await {
@@ -1060,6 +1090,29 @@ Also: {"source": "bare"}"#;
     #[test]
     fn has_capture_screen_command_invalid_json() {
         assert!(!has_capture_screen_command("not json"));
+    }
+
+    #[test]
+    fn has_exec_command_true() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
+        assert!(has_exec_command(json));
+    }
+
+    #[test]
+    fn has_exec_command_pty() {
+        let json = r#"{"commands":[{"function":"execPty","nonce":1,"command":"ls"}]}"#;
+        assert!(has_exec_command(json));
+    }
+
+    #[test]
+    fn has_exec_command_false_for_non_exec() {
+        let json = r#"{"commands":[{"function":"captureScreen","nonce":1}]}"#;
+        assert!(!has_exec_command(json));
+    }
+
+    #[test]
+    fn has_exec_command_invalid_json() {
+        assert!(!has_exec_command("not json"));
     }
 
     #[test]
