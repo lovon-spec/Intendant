@@ -46,7 +46,7 @@ src/
         ├── mcp.rs           # MCP server implementation (rmcp-based, stdio transport, hot-reload)
         ├── mcp_client.rs    # MCP client: connects to external MCP servers, discovers tools, proxies calls
         ├── sandbox.rs       # Landlock filesystem sandboxing (Linux): read/write path policies, process restriction
-        ├── vision.rs        # Xvfb display management, per-provider resolution
+        ├── vision.rs        # Xvfb display management, per-provider resolution, display accessibility probe
         ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
@@ -107,7 +107,7 @@ Test coverage includes:
 - **models.rs**: Serialization roundtrips, deserialization of minimal/full commands, repr(C) layout
 - **error.rs**: Display formatting, From conversions
 - **utils.rs**: Timestamp validity
-- **caller/main.rs** (tests across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags (including --json, --sandbox), EventBus emit, batch assembly, tool name mapping, JSON output format, INTENDANT.md loading
+- **caller/main.rs** (tests across caller modules): JSON extraction, context directives, done signal handling, budget constants, task classification, CLI flags (including --json, --sandbox), EventBus emit, batch assembly, tool name mapping, JSON output format, INTENDANT.md loading, captureScreen command detection
 - **caller/conversation.rs**: Message ordering, serialization, drop/summarize turns, message layer protection, budget tracking, save/load JSONL roundtrip
 - **caller/knowledge.rs**: Pub/sub lifecycle, subscription/cursor tracking, tag/channel/keyword filtering, old format migration, save/load roundtrip, knowledge routing
 - **caller/sub_agent.rs**: Spawn command generation, result/progress I/O, serialization, role roundtrips, directory scanning
@@ -129,7 +129,7 @@ Test coverage includes:
 - **caller/session_log.rs**: UUID-based session directories, session metadata (write_meta, find_latest_session, find_session_by_id), directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
 - **caller/tools.rs**: Tool definitions, provider format conversion, tool count validation
 - **caller/frontend.rs**: UserAction enum completeness, state query types, log level parsing
-- **caller/vision.rs**: Xvfb display configuration per provider, dynamic display allocation
+- **caller/vision.rs**: Xvfb display configuration per provider, dynamic display allocation, display accessibility probe
 - **caller/mcp.rs**: MCP state management, process_action_sync, resource definitions, tool parameter schemas, event-to-state mappings
 - **caller/mcp_client.rs**: Tool name parsing (`mcp__<server>_<tool>`), routing validation, connection lifecycle
 - **caller/sandbox.rs**: Default config construction, disabled config skip, write path setup
@@ -276,6 +276,17 @@ On Linux (kernel 5.13+), `--sandbox` or `[sandbox] enabled = true` in `intendant
 - Extra write paths can be configured via `[sandbox] extra_write_paths`
 
 The sandbox config is passed to the runtime via `INTENDANT_SANDBOX_WRITE_PATHS` environment variable. On kernels without Landlock support, sandboxing is silently skipped.
+
+### Vision / Xvfb
+
+The `--vision` flag explicitly launches an Xvfb virtual display at startup with provider-optimized resolution. Without `--vision`, Xvfb is auto-launched lazily on the first turn that contains a `captureScreen` command and no accessible X display exists. The detection flow per turn:
+1. Already launched? → skip
+2. Batch contains `captureScreen`? No → skip
+3. Current `DISPLAY` accessible (via `xdpyinfo`)? Yes → skip (user has working display)
+4. Auto-launch Xvfb, store guard, set `DISPLAY`
+5. On failure → log warning, let `captureScreen` fail naturally
+
+The `XvfbGuard` kills the Xvfb process on drop, ensuring cleanup when the session ends.
 
 ## Code Conventions
 

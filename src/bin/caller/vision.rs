@@ -91,6 +91,22 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     Ok(XvfbGuard { child })
 }
 
+/// Check whether the current DISPLAY environment variable points to an accessible X server.
+/// Returns `false` if DISPLAY is unset or `xdpyinfo` fails to connect.
+pub fn is_display_accessible() -> bool {
+    let display = match std::env::var("DISPLAY") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return false,
+    };
+    std::process::Command::new("xdpyinfo")
+        .args(["-display", &display])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +147,17 @@ mod tests {
         // The returned display should not have a lock file
         let lock = format!("/tmp/.X{}-lock", id);
         assert!(!std::path::Path::new(&lock).exists());
+    }
+
+    #[test]
+    fn is_display_accessible_no_display_set() {
+        // Temporarily unset DISPLAY to test the "no display" path.
+        let prev = std::env::var("DISPLAY").ok();
+        std::env::remove_var("DISPLAY");
+        assert!(!is_display_accessible());
+        // Restore
+        if let Some(d) = prev {
+            std::env::set_var("DISPLAY", d);
+        }
     }
 }

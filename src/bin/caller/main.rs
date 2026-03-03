@@ -392,6 +392,65 @@ fn has_ask_human_command(json_str: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn has_capture_screen_command(json_str: &str) -> bool {
+    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    parsed
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .map(|commands| {
+            commands
+                .iter()
+                .any(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("captureScreen"))
+        })
+        .unwrap_or(false)
+}
+
+/// Auto-launch Xvfb when the batch contains `captureScreen` and no working display exists.
+///
+/// Detection flow:
+/// 1. Already launched (`xvfb_guard` is `Some`)? → skip
+/// 2. Batch contains `captureScreen`? No → skip
+/// 3. Current DISPLAY accessible? Yes → skip
+/// 4. Launch Xvfb, store guard, set DISPLAY
+/// 5. On failure → log warning, let captureScreen fail naturally
+async fn maybe_auto_launch_xvfb(
+    json_str: &str,
+    xvfb_guard: &mut Option<vision::XvfbGuard>,
+    provider_name: &str,
+    session_log: &SharedSessionLog,
+) {
+    if xvfb_guard.is_some() {
+        return;
+    }
+    if !has_capture_screen_command(json_str) {
+        return;
+    }
+    if vision::is_display_accessible() {
+        return;
+    }
+    let config = vision::display_config_for_provider(provider_name);
+    slog(session_log, |l| {
+        l.info(&format!(
+            "Auto-launching Xvfb :{} at {}x{} for captureScreen",
+            config.display_id, config.width, config.height
+        ))
+    });
+    match vision::launch_display(&config).await {
+        Ok(guard) => {
+            *xvfb_guard = Some(guard);
+        }
+        Err(e) => {
+            slog(session_log, |l| {
+                l.warn(&format!("Failed to auto-launch Xvfb: {}", e))
+            });
+        }
+    }
+}
+
 /// Format a human-readable command preview from raw JSON (for approval display).
 fn format_command_preview(json_str: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
@@ -981,6 +1040,29 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn has_capture_screen_command_true() {
+        let json = r#"{"commands":[{"function":"captureScreen","nonce":1}]}"#;
+        assert!(has_capture_screen_command(json));
+    }
+
+    #[test]
+    fn has_capture_screen_command_false() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#;
+        assert!(!has_capture_screen_command(json));
+    }
+
+    #[test]
+    fn has_capture_screen_command_mixed_batch() {
+        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"captureScreen","nonce":2}]}"#;
+        assert!(has_capture_screen_command(json));
+    }
+
+    #[test]
+    fn has_capture_screen_command_invalid_json() {
+        assert!(!has_capture_screen_command("not json"));
+    }
+
+    #[test]
     fn emit_with_bus() {
         let (bus, mut rx) = EventBus::new();
         let bus_opt = Some(bus);
@@ -1303,6 +1385,7 @@ async fn run_agent_loop(
     let mut loop_stats = LoopStats::default();
     let mut seen_sub_agent_results: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut xvfb_guard: Option<vision::XvfbGuard> = None;
 
     for turn in 1..=SAFETY_CAP {
         // Check budget before sending
@@ -1735,6 +1818,8 @@ async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
+            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log)
+                .await;
             let preview = json_str.chars().take(300).collect::<String>();
             emit(
                 &bus,
@@ -2019,6 +2104,8 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
+            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log)
+                .await;
 
             let preview = json_str.chars().take(300).collect::<String>();
             emit(
