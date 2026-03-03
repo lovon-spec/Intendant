@@ -83,6 +83,9 @@ pub struct McpAppState {
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
     pub task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Mode override for the next task: None = auto, Some(true) = orchestrate,
+    /// Some(false) = direct. Consumed (reset to None) when a task starts.
+    pub next_task_orchestrate: Option<bool>,
     /// Pending or completed controller restart plan.
     pub controller_restart: Option<ControllerRestartState>,
 }
@@ -121,6 +124,7 @@ impl McpAppState {
             launcher: None,
             task_handle: None,
             controller_restart: None,
+            next_task_orchestrate: None,
         }
     }
 
@@ -388,6 +392,7 @@ async fn start_task_with_state(
     bus: &EventBus,
     task: String,
     source: &str,
+    orchestrate: Option<bool>,
 ) -> Result<(), String> {
     let mut s = state.write().await;
 
@@ -418,6 +423,7 @@ async fn start_task_with_state(
     s.pending_approval = None;
     s.human_question = None;
     s.should_quit = false;
+    s.next_task_orchestrate = orchestrate;
     s.push_log(
         LogLevel::Info,
         format!("Task started via {}: {}", source, task),
@@ -795,6 +801,7 @@ async fn run_scheduled_controller_restart_with_state(
             bus,
             restart.north_star_goal.clone(),
             "controller_restart",
+            None, // auto-start uses default mode selection
         )
         .await
         {
@@ -1731,6 +1738,11 @@ pub struct SetVerbosityParams {
 pub struct StartTaskParams {
     /// The task description for the AI agent to execute.
     pub task: String,
+    /// When true, use orchestration mode (spawns orchestrator + sub-agents)
+    /// instead of direct mode. When false or omitted, the mode is chosen
+    /// automatically: complex tasks use orchestration, simple tasks use direct.
+    #[serde(default)]
+    pub orchestrate: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1829,8 +1841,13 @@ impl IntendantServer {
         }
     }
 
-    async fn start_task_internal(&self, task: String, source: &str) -> Result<(), String> {
-        start_task_with_state(&self.state, &self.bus, task, source).await
+    async fn start_task_internal(
+        &self,
+        task: String,
+        source: &str,
+        orchestrate: Option<bool>,
+    ) -> Result<(), String> {
+        start_task_with_state(&self.state, &self.bus, task, source, orchestrate).await
     }
 
     async fn run_scheduled_controller_restart(&self) -> Result<String, String> {
@@ -2128,7 +2145,10 @@ impl IntendantServer {
         description = "Start a new task for the Intendant agent to execute. The agent will begin working on the task immediately. Only one task can run at a time — check get_status to see if a task is already running."
     )]
     async fn start_task(&self, Parameters(params): Parameters<StartTaskParams>) -> String {
-        match self.start_task_internal(params.task, "MCP").await {
+        match self
+            .start_task_internal(params.task, "MCP", params.orchestrate)
+            .await
+        {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("Cannot start task: {}", e),
         }

@@ -75,6 +75,8 @@ struct CliFlags {
     /// --sandbox: Enable Landlock filesystem sandboxing for the runtime.
     #[allow(dead_code)]
     sandbox: bool,
+    /// --direct: Force direct mode (skip orchestration even for complex tasks).
+    direct: bool,
 }
 
 fn print_help() {
@@ -98,6 +100,7 @@ fn print_help() {
     println!("    --json                Emit JSONL events to stdout (implies --no-tui)");
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --vision              Launch Xvfb virtual display for captureScreen");
+    println!("    --direct              Force direct mode (skip orchestration for complex tasks)");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -140,6 +143,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         vision: false,
         json_output: false,
         sandbox: false,
+        direct: false,
     };
 
     let mut task_parts = Vec::new();
@@ -229,6 +233,10 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--control-socket" => {
                 flags.control_socket = true;
+                i += 1;
+            }
+            "--direct" => {
+                flags.direct = true;
                 i += 1;
             }
             other => {
@@ -953,6 +961,7 @@ Also: {"source": "bare"}"#;
             vision: false,
             json_output: false,
             sandbox: false,
+            direct: false,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -962,6 +971,7 @@ Also: {"source": "bare"}"#;
         assert!(!flags.vision);
         assert!(!flags.sandbox);
         assert!(!flags.json_output);
+        assert!(!flags.direct);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
     }
 
@@ -2929,12 +2939,14 @@ async fn main() -> Result<(), CallerError> {
         let autonomy_for_launcher = autonomy.clone();
         let session_log_for_launcher = session_log.clone();
         let log_dir_for_launcher = log_dir.clone();
+        let mcp_state_for_launcher = mcp_state.clone();
         #[allow(clippy::async_yields_async)]
         let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
             let project_root = project_root.clone();
             let autonomy = autonomy_for_launcher.clone();
             let session_log = session_log_for_launcher.clone();
             let _parent_log_dir = log_dir_for_launcher.clone();
+            let mcp_state = mcp_state_for_launcher.clone();
             Box::pin(async move {
                 // Each MCP task gets a fresh session directory so conversations
                 // don't bleed between tasks (reasoning items, tool calls, etc.).
@@ -2984,24 +2996,44 @@ async fn main() -> Result<(), CallerError> {
                         return tokio::spawn(async {});
                     }
                 };
+                // Read and consume the mode override set by start_task
+                let orchestrate_override = {
+                    let mut s = mcp_state.write().await;
+                    s.next_task_orchestrate.take()
+                };
+                let use_orchestration = match orchestrate_override {
+                    Some(true) => true,
+                    Some(false) => false,
+                    None => !is_simple_task(&task_str), // auto: same heuristic as TUI
+                };
+
                 let bus_clone = bus.clone();
                 let task_for_summary = task_str.clone();
                 let session_log_summary = session_log.clone();
                 tokio::spawn(async move {
-                    // MCP always uses direct mode — the MCP client (e.g. Claude Code)
-                    // is already the orchestrator. Adding intendant's own orchestrator
-                    // layer creates a subprocess with poor visibility and no benefit.
-                    let result = run_direct_mode(
-                        provider,
-                        task_str,
-                        project,
-                        Some(bus_clone.clone()),
-                        autonomy,
-                        session_log,
-                        log_dir,
-                        None, // MCP tasks don't use MCP client
-                    )
-                    .await;
+                    let result = if use_orchestration {
+                        run_user_mode(
+                            provider,
+                            task_str,
+                            project,
+                            Some(bus_clone.clone()),
+                            autonomy,
+                            session_log,
+                        )
+                        .await
+                    } else {
+                        run_direct_mode(
+                            provider,
+                            task_str,
+                            project,
+                            Some(bus_clone.clone()),
+                            autonomy,
+                            session_log,
+                            log_dir,
+                            None,
+                        )
+                        .await
+                    };
 
                     match result {
                         Ok(stats) => {
@@ -3122,8 +3154,9 @@ async fn main() -> Result<(), CallerError> {
         } else {
             None
         };
+        let force_direct = flags.direct;
         let loop_handle = tokio::spawn(async move {
-            let result = if is_simple_task(&task_clone) {
+            let result = if force_direct || is_simple_task(&task_clone) {
                 run_direct_mode(
                     provider,
                     task_clone,
@@ -3184,7 +3217,7 @@ async fn main() -> Result<(), CallerError> {
         } else {
             None
         };
-        let result = if is_simple_task(&task) {
+        let result = if flags.direct || is_simple_task(&task) {
             run_direct_mode(
                 provider,
                 task.clone(),
