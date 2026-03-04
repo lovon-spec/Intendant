@@ -1790,6 +1790,19 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://pending-approval");
                     }
 
+                    AppEvent::DisplayReady {
+                        display_id,
+                        vnc_port,
+                    } => {
+                        let info = if let Some(port) = vnc_port {
+                            format!("Display :{}, VNC port {}", display_id, port)
+                        } else {
+                            format!("Display :{}", display_id)
+                        };
+                        s.push_log(LogLevel::Info, info);
+                        resource_changed = Some("intendant://logs");
+                    }
+
                     AppEvent::SessionDirChanged { ref path } => {
                         s.log_dir = path.clone();
                         persist_restart_state(&s.log_dir, &s.controller_restart);

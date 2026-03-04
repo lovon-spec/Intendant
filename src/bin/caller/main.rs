@@ -510,6 +510,7 @@ async fn maybe_auto_launch_xvfb(
     xvfb_guard: &mut Option<vision::XvfbGuard>,
     provider_name: &str,
     session_log: &SharedSessionLog,
+    bus: &Option<EventBus>,
 ) {
     if xvfb_guard.is_some() {
         return;
@@ -534,11 +535,21 @@ async fn maybe_auto_launch_xvfb(
     });
     match vision::launch_display(&config).await {
         Ok(guard) => {
-            if let Some(port) = guard.vnc_port() {
+            let vnc_port = guard.vnc_port();
+            if let Some(port) = vnc_port {
                 slog(session_log, |l| {
                     l.info(&format!("VNC server available at vnc://localhost:{}", port))
                 });
             }
+            let display_id = config.display_id;
+            emit(
+                bus,
+                || AppEvent::DisplayReady {
+                    display_id,
+                    vnc_port,
+                },
+                || {},
+            );
             *xvfb_guard = Some(guard);
         }
         Err(e) => {
@@ -2104,7 +2115,7 @@ async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log)
+            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, &bus)
                 .await;
             let preview = json_str.chars().take(300).collect::<String>();
             emit(
@@ -2415,7 +2426,7 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log)
+            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, &bus)
                 .await;
 
             let preview = json_str.chars().take(300).collect::<String>();
@@ -3258,7 +3269,7 @@ async fn main() -> Result<(), CallerError> {
     });
 
     // Launch Xvfb virtual display if --vision flag is set
-    let _xvfb_guard = if flags.vision {
+    let (_xvfb_guard, vision_display_info) = if flags.vision {
         let config = vision::display_config_for_provider(provider.name());
         slog(&session_log, |l| {
             l.info(&format!(
@@ -3272,9 +3283,10 @@ async fn main() -> Result<(), CallerError> {
                 l.info(&format!("VNC server available at vnc://localhost:{}", port))
             });
         }
-        Some(guard)
+        let info = (config.display_id, guard.vnc_port());
+        (Some(guard), Some(info))
     } else {
-        None
+        (None, None)
     };
 
     // Check if running as a sub-agent (headless, no TUI)
@@ -3313,6 +3325,12 @@ async fn main() -> Result<(), CallerError> {
         // MCP mode — speaks Model Context Protocol on stdio.
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
         let (bus, event_rx) = EventBus::new();
+        if let Some((display_id, vnc_port)) = vision_display_info {
+            bus.send(AppEvent::DisplayReady {
+                display_id,
+                vnc_port,
+            });
+        }
         let human_question_path = tui::event::shared_question_path(log_dir.join("human_question"));
         let _human_monitor =
             tui::event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
@@ -3558,6 +3576,12 @@ async fn main() -> Result<(), CallerError> {
 
         // TUI mode
         let (bus, event_rx) = EventBus::new();
+        if let Some((display_id, vnc_port)) = vision_display_info {
+            bus.send(AppEvent::DisplayReady {
+                display_id,
+                vnc_port,
+            });
+        }
 
         // Spawn background tasks
         let _crossterm_handle = tui::event::spawn_crossterm_reader(bus.clone());

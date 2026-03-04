@@ -177,7 +177,7 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     let screen_arg = format!("{}x{}x24", config.width, config.height);
 
     let child = tokio::process::Command::new("Xvfb")
-        .args([&display_arg, "-screen", "0", &screen_arg])
+        .args([&display_arg, "-screen", "0", &screen_arg, "-ac"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

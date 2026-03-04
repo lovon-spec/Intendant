@@ -26,7 +26,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
 
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(
             " Agent ",
             Style::default()
@@ -84,12 +84,29 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
                 .fg(theme::LOG_DIM_FG)
                 .bg(theme::STATUS_BAR_BG),
         ),
-        // Fill remaining with bg
-        Span::styled(
-            " ".repeat(area.width.saturating_sub(40) as usize),
-            Style::default().bg(theme::STATUS_BAR_BG),
-        ),
     ];
+
+    // Show display/VNC info when vision is active
+    if let Some(ref info) = app.display_info {
+        spans.push(Span::styled(
+            "  display:",
+            Style::default()
+                .fg(theme::LOG_DIM_FG)
+                .bg(theme::STATUS_BAR_BG),
+        ));
+        spans.push(Span::styled(
+            info.clone(),
+            Style::default()
+                .fg(theme::STATUS_PROVIDER_FG)
+                .bg(theme::STATUS_BAR_BG),
+        ));
+    }
+
+    // Fill remaining with bg
+    spans.push(Span::styled(
+        " ".repeat(area.width.saturating_sub(40) as usize),
+        Style::default().bg(theme::STATUS_BAR_BG),
+    ));
 
     let line = Line::from(spans);
     let widget = Paragraph::new(line).style(theme::status_bar_style());

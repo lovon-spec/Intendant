@@ -156,6 +156,9 @@ pub struct App {
     pub round: usize,
     pub follow_up_textarea: Option<tui_textarea::TextArea<'static>>,
     pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
+
+    // Vision display info (shown in status bar when active)
+    pub display_info: Option<String>,
 }
 
 impl App {
@@ -192,6 +195,7 @@ impl App {
             round: 1,
             follow_up_textarea: None,
             follow_up_tx: None,
+            display_info: None,
         }
     }
 
@@ -983,6 +987,21 @@ impl App {
                         round, turns_in_round
                     ),
                 );
+            }
+            AppEvent::DisplayReady {
+                display_id,
+                vnc_port,
+            } => {
+                let info = if let Some(port) = vnc_port {
+                    format!(":{}  VNC:{}", display_id, port)
+                } else {
+                    format!(":{}", display_id)
+                };
+                self.display_info = Some(info);
+                self.broadcast_control(OutboundEvent::DisplayReady {
+                    display_id,
+                    vnc_port,
+                });
             }
             AppEvent::SessionDirChanged { .. } => {
                 // Only relevant for MCP mode; TUI ignores this.

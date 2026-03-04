@@ -34,6 +34,10 @@ pub enum OutboundEvent {
         round: usize,
         turns_in_round: usize,
     },
+    DisplayReady {
+        display_id: u32,
+        vnc_port: Option<u32>,
+    },
     Status {
         turn: usize,
         phase: String,

@@ -84,6 +84,12 @@ pub enum AppEvent {
         responder: tokio::sync::oneshot::Sender<ApprovalResponse>,
     },
 
+    // Vision display ready
+    DisplayReady {
+        display_id: u32,
+        vnc_port: Option<u32>,
+    },
+
     // Session directory changed (MCP per-task isolation)
     SessionDirChanged {
         path: std::path::PathBuf,
