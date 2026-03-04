@@ -3437,7 +3437,7 @@ async fn main() -> Result<(), CallerError> {
             None
         };
         let force_direct = flags.direct;
-        let loop_handle = tokio::spawn(async move {
+        let mut loop_handle = tokio::spawn(async move {
             let result = if force_direct || is_simple_task(&task_clone) {
                 run_direct_mode(
                     provider,
@@ -3487,8 +3487,17 @@ async fn main() -> Result<(), CallerError> {
         // Run the TUI event loop (blocks until quit)
         let _ = terminal.run(&mut app, event_rx).await;
 
-        // Clean up
-        loop_handle.abort();
+        // Drop the App (and its follow_up_tx) so the round loop's recv()
+        // returns None and exits gracefully, allowing write_summary to run.
+        drop(app);
+
+        // Give the agent task a moment to finish writing the session summary.
+        // If it doesn't finish in time (e.g. stuck on an API call), abort it.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut loop_handle).await {
+            Ok(_) => {} // task finished naturally
+            Err(_) => loop_handle.abort(), // timed out — force stop
+        }
+
         control::cleanup();
         terminal
             .restore()
