@@ -91,7 +91,6 @@ Running the CLI (requires `.env` with API key):
 ./target/release/intendant --continue "fix that bug"       # Resume most recent session
 ./target/release/intendant --resume abc123 "continue"      # Resume specific session by ID
 ./target/release/intendant --mcp "task"                    # Run as MCP server on stdio
-./target/release/intendant --vision "screenshot test"      # Launch with Xvfb virtual display
 ./target/release/intendant --json "echo hello"             # JSONL output to stdout (implies --no-tui)
 ./target/release/intendant --sandbox "run tests"           # Enable Landlock filesystem sandboxing
 ./target/release/intendant --voice-gateway --mcp           # Voice control via phone browser (port 8765)
@@ -289,11 +288,11 @@ The sandbox config is passed to the runtime via `INTENDANT_SANDBOX_WRITE_PATHS` 
 
 ### Vision / Xvfb
 
-The `--vision` flag explicitly launches an Xvfb virtual display at startup with provider-optimized resolution. Without `--vision`, Xvfb is auto-launched lazily on the first turn that contains a `captureScreen` command and no accessible X display exists. The detection flow per turn:
+Xvfb is auto-launched lazily on the first turn that contains an `execAsAgent` or `captureScreen` command and no accessible X display exists. The detection flow per turn:
 1. Already launched? → skip
-2. Batch contains `captureScreen`? No → skip
+2. Batch contains `execAsAgent` or `captureScreen`? No → skip
 3. Current `DISPLAY` accessible (via `xdpyinfo`)? Yes → skip (user has working display)
-4. Auto-launch Xvfb, store guard, set `DISPLAY`
+4. Auto-launch Xvfb, store guard, set `DISPLAY`, emit `DisplayReady` event
 5. On failure → log warning, let `captureScreen` fail naturally
 
 Display allocation prefers `:99` for a predictable VNC port (5999). If `:99` is locked by a live Xvfb process from a previous session, it is automatically killed and reclaimed (detected via `/proc/<pid>/cmdline`). If `:99` is held by a non-Xvfb process, allocation falls through to `:100+`.

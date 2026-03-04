@@ -90,7 +90,6 @@ struct CliFlags {
     /// --resume / -r [id]: resume a specific session by ID or path.
     resume_id: Option<String>,
     control_socket: bool,
-    vision: bool,
     /// --json: Emit JSONL events to stdout (implies --no-tui).
     json_output: bool,
     /// --sandbox: Enable Landlock filesystem sandboxing for the runtime.
@@ -124,7 +123,6 @@ fn print_help() {
     println!("    --control-socket      Enable Unix control socket");
     println!("    --json                Emit JSONL events to stdout (implies --no-tui)");
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
-    println!("    --vision              Launch Xvfb virtual display for captureScreen");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --voice-gateway [PORT] Enable voice control WebSocket gateway (default port: 8765)");
     println!("    --help, -h            Show this help message");
@@ -166,7 +164,6 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         continue_last: false,
         resume_id: None,
         control_socket: false,
-        vision: false,
         json_output: false,
         sandbox: false,
         direct: false,
@@ -244,10 +241,6 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--mcp" => {
                 flags.mcp = true;
-                i += 1;
-            }
-            "--vision" => {
-                flags.vision = true;
                 i += 1;
             }
             "--json" => {
@@ -1039,7 +1032,6 @@ Also: {"source": "bare"}"#;
             continue_last: false,
             resume_id: None,
             control_socket: false,
-            vision: false,
             json_output: false,
             sandbox: false,
             direct: false,
@@ -1051,7 +1043,6 @@ Also: {"source": "bare"}"#;
         assert!(!flags.mcp);
         assert!(!flags.continue_last);
         assert!(flags.resume_id.is_none());
-        assert!(!flags.vision);
         assert!(!flags.sandbox);
         assert!(!flags.json_output);
         assert!(!flags.direct);
@@ -1074,7 +1065,6 @@ Also: {"source": "bare"}"#;
             continue_last: false,
             resume_id: None,
             control_socket: false,
-            vision: false,
             json_output: false,
             sandbox: false,
             direct: false,
@@ -1099,7 +1089,6 @@ Also: {"source": "bare"}"#;
             continue_last: false,
             resume_id: None,
             control_socket: false,
-            vision: false,
             json_output: false,
             sandbox: false,
             direct: false,
@@ -3268,27 +3257,6 @@ async fn main() -> Result<(), CallerError> {
         l.info(&format!("Autonomy: {}", flags.autonomy));
     });
 
-    // Launch Xvfb virtual display if --vision flag is set
-    let (_xvfb_guard, vision_display_info) = if flags.vision {
-        let config = vision::display_config_for_provider(provider.name());
-        slog(&session_log, |l| {
-            l.info(&format!(
-                "Vision mode: launching Xvfb :{} at {}x{}",
-                config.display_id, config.width, config.height
-            ))
-        });
-        let guard = vision::launch_display(&config).await?;
-        if let Some(port) = guard.vnc_port() {
-            slog(&session_log, |l| {
-                l.info(&format!("VNC server available at vnc://localhost:{}", port))
-            });
-        }
-        let info = (config.display_id, guard.vnc_port());
-        (Some(guard), Some(info))
-    } else {
-        (None, None)
-    };
-
     // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
         run_sub_agent_mode(provider, id, role, session_log, log_dir).await?;
@@ -3325,12 +3293,6 @@ async fn main() -> Result<(), CallerError> {
         // MCP mode — speaks Model Context Protocol on stdio.
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
         let (bus, event_rx) = EventBus::new();
-        if let Some((display_id, vnc_port)) = vision_display_info {
-            bus.send(AppEvent::DisplayReady {
-                display_id,
-                vnc_port,
-            });
-        }
         let human_question_path = tui::event::shared_question_path(log_dir.join("human_question"));
         let _human_monitor =
             tui::event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
@@ -3576,12 +3538,6 @@ async fn main() -> Result<(), CallerError> {
 
         // TUI mode
         let (bus, event_rx) = EventBus::new();
-        if let Some((display_id, vnc_port)) = vision_display_info {
-            bus.send(AppEvent::DisplayReady {
-                display_id,
-                vnc_port,
-            });
-        }
 
         // Spawn background tasks
         let _crossterm_handle = tui::event::spawn_crossterm_reader(bus.clone());

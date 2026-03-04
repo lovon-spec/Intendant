@@ -215,7 +215,7 @@ impl Agent {
     /// the DISPLAY env var is not set/parseable.  Prefers discovered displays
     /// >0, falling back to 1.
     fn default_display(&self) -> i32 {
-        // Prefer the DISPLAY env var (set by the caller when --vision launches Xvfb)
+        // Prefer the DISPLAY env var (set by the caller when Xvfb is auto-launched)
         if let Ok(d) = std::env::var("DISPLAY") {
             if let Ok(n) = d.trim_start_matches(':').parse::<i32>() {
                 return n;

@@ -316,7 +316,6 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 | `--log-file <dir>` | Override session log directory |
 | `--mcp` | Run as MCP server on stdio (replaces TUI) |
 | `--control-socket` | Enable Unix control socket (TUI and MCP modes) |
-| `--vision` | Launch Xvfb virtual display at startup (prefers `:99`, VNC on port 5999) sized for the provider's vision model. An `x11vnc` server is co-launched for remote observation. Without this flag, Xvfb is auto-launched lazily on the first `captureScreen` call if no accessible display exists |
 | `--json` | JSONL structured output to stdout (implies `--no-tui`) |
 | `--sandbox` | Enable Landlock filesystem sandboxing (Linux kernel 5.13+) |
 | `--direct` | Force single-agent direct mode (skip orchestrator even for complex tasks) |
@@ -381,7 +380,7 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 
 - **OS:** Debian 12+
 - **Runtime:** Tokio async
-- **Display:** DISPLAY is set from the environment (configurable via `display` field per command, defaults to env `DISPLAY` or first discovered display from `/tmp/.X*-lock`, then `:1`). With `--vision`, Xvfb is launched at startup (preferring `:99` for a predictable VNC port of 5999). An `x11vnc` server is co-launched alongside Xvfb for remote VNC observation (port = `5900 + display_id`); if `x11vnc` is not installed, the display works normally. Orphaned Xvfb processes from crashed sessions are detected via `/proc/<pid>/cmdline` and automatically reclaimed. Without `--vision`, Xvfb is auto-launched lazily on the first turn containing a `captureScreen` command when no accessible X display exists (checked via `xdpyinfo`); the guard is kept for the session lifetime so subsequent calls reuse the same display. At startup the runtime discovers active X displays and merges their xauth cookies (from `~/.Xauthority` and `/var/run/lightdm/root/:N` via `sudo -n`) into a session-scoped `session.Xauthority` file, which is passed as `XAUTHORITY` to all spawned commands.
+- **Display:** Xvfb is auto-launched lazily on the first turn containing an `execAsAgent` or `captureScreen` command when no accessible X display exists (checked via `xdpyinfo`). Display allocation prefers `:99` for a predictable VNC port (5999). An `x11vnc` server is co-launched alongside Xvfb for remote VNC observation (port = `5900 + display_id`); if `x11vnc` is not installed, the display works normally. Orphaned Xvfb processes from crashed sessions are detected via `/proc/<pid>/cmdline` and automatically reclaimed. The guard is kept for the session lifetime so subsequent calls reuse the same display. At startup the runtime discovers active X displays and merges their xauth cookies (from `~/.Xauthority` and `/var/run/lightdm/root/:N` via `sudo -n`) into a session-scoped `session.Xauthority` file, which is passed as `XAUTHORITY` to all spawned commands.
 - **Permissions:** Runs as unprivileged user with passwordless sudo
 
 ### VNC Remote Observation
@@ -394,7 +393,7 @@ When running intendant in a VM (or any headless machine), you can watch the agen
 sudo apt-get install -y x11vnc
 ```
 
-That's it. When intendant launches a virtual display (via `--vision` or auto-launch), it automatically starts an `x11vnc` server alongside it. The default display is `:99` with VNC on port **5999**.
+That's it. When intendant auto-launches a virtual display, it automatically starts an `x11vnc` server alongside it. The default display is `:99` with VNC on port **5999**.
 
 **From your host machine** — connect with any VNC client:
 

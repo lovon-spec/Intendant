@@ -997,7 +997,13 @@ impl App {
                 } else {
                     format!(":{}", display_id)
                 };
-                self.display_info = Some(info);
+                self.display_info = Some(info.clone());
+                let log_msg = if let Some(port) = vnc_port {
+                    format!("Display :{} ready, VNC on port {}", display_id, port)
+                } else {
+                    format!("Display :{} ready", display_id)
+                };
+                self.log(LogLevel::Info, log_msg);
                 self.broadcast_control(OutboundEvent::DisplayReady {
                     display_id,
                     vnc_port,
