@@ -182,6 +182,11 @@ pub enum ControlMsg {
         mode: String,
     },
     GetControllerLoopStatus,
+    StartTask {
+        task: String,
+        #[serde(default)]
+        orchestrate: Option<bool>,
+    },
     FollowUp {
         text: String,
     },
@@ -495,6 +500,10 @@ mod tests {
                 mode: "stop".to_string(),
             },
             ControlMsg::GetControllerLoopStatus,
+            ControlMsg::StartTask {
+                task: "fix bug".to_string(),
+                orchestrate: None,
+            },
             ControlMsg::FollowUp {
                 text: "continue working".to_string(),
             },
@@ -533,6 +542,36 @@ mod tests {
         match msg {
             ControlMsg::SetVerbosity { level } => assert_eq!(level, "verbose"),
             _ => panic!("expected SetVerbosity"),
+        }
+    }
+
+    #[test]
+    fn control_msg_start_task_deserialize() {
+        let json = r#"{"action":"start_task","task":"fix bug"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::StartTask { task, orchestrate } => {
+                assert_eq!(task, "fix bug");
+                assert!(orchestrate.is_none());
+            }
+            _ => panic!("expected StartTask"),
+        }
+    }
+
+    #[test]
+    fn control_msg_start_task_roundtrip() {
+        let msg = ControlMsg::StartTask {
+            task: "deploy app".to_string(),
+            orchestrate: Some(true),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ControlMsg = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlMsg::StartTask { task, orchestrate } => {
+                assert_eq!(task, "deploy app");
+                assert_eq!(orchestrate, Some(true));
+            }
+            _ => panic!("expected StartTask"),
         }
     }
 

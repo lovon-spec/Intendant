@@ -18,6 +18,7 @@ mod tools;
 mod tui;
 mod user_mode;
 mod vision;
+mod voice_gateway;
 mod worktree;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
@@ -98,6 +99,9 @@ struct CliFlags {
     /// --direct: Force single-agent mode (skip orchestrator/sub-agent delegation).
     /// Does NOT disable the TUI — use --no-tui for headless output.
     direct: bool,
+    /// --voice-gateway [PORT]: Enable voice control WebSocket gateway.
+    voice_gateway: bool,
+    voice_gateway_port: u16,
 }
 
 fn print_help() {
@@ -122,6 +126,7 @@ fn print_help() {
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --vision              Launch Xvfb virtual display for captureScreen");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
+    println!("    --voice-gateway [PORT] Enable voice control WebSocket gateway (default port: 8765)");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -165,6 +170,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         json_output: false,
         sandbox: false,
         direct: false,
+        voice_gateway: false,
+        voice_gateway_port: voice_gateway::DEFAULT_PORT,
     };
 
     let mut task_parts = Vec::new();
@@ -259,6 +266,16 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             "--direct" => {
                 flags.direct = true;
                 i += 1;
+            }
+            "--voice-gateway" => {
+                flags.voice_gateway = true;
+                // Optional port argument (next arg if it's numeric)
+                if i + 1 < args.len() && args[i + 1].parse::<u16>().is_ok() {
+                    flags.voice_gateway_port = args[i + 1].parse().unwrap();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             other => {
                 if other.starts_with('-') {
@@ -1015,6 +1032,8 @@ Also: {"source": "bare"}"#;
             json_output: false,
             sandbox: false,
             direct: false,
+            voice_gateway: false,
+            voice_gateway_port: voice_gateway::DEFAULT_PORT,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -1025,7 +1044,59 @@ Also: {"source": "bare"}"#;
         assert!(!flags.sandbox);
         assert!(!flags.json_output);
         assert!(!flags.direct);
+        assert!(!flags.voice_gateway);
+        assert_eq!(flags.voice_gateway_port, 8765);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
+    }
+
+    #[test]
+    fn cli_voice_gateway_flag() {
+        let flags = CliFlags {
+            task: None,
+            provider: None,
+            model: None,
+            verbose: false,
+            no_tui: false,
+            mcp: false,
+            autonomy: AutonomyLevel::Medium,
+            log_file: None,
+            continue_last: false,
+            resume_id: None,
+            control_socket: false,
+            vision: false,
+            json_output: false,
+            sandbox: false,
+            direct: false,
+            voice_gateway: true,
+            voice_gateway_port: voice_gateway::DEFAULT_PORT,
+        };
+        assert!(flags.voice_gateway);
+        assert_eq!(flags.voice_gateway_port, voice_gateway::DEFAULT_PORT);
+    }
+
+    #[test]
+    fn cli_voice_gateway_with_port() {
+        let flags = CliFlags {
+            task: None,
+            provider: None,
+            model: None,
+            verbose: false,
+            no_tui: false,
+            mcp: false,
+            autonomy: AutonomyLevel::Medium,
+            log_file: None,
+            continue_last: false,
+            resume_id: None,
+            control_socket: false,
+            vision: false,
+            json_output: false,
+            sandbox: false,
+            direct: false,
+            voice_gateway: true,
+            voice_gateway_port: 9000,
+        };
+        assert!(flags.voice_gateway);
+        assert_eq!(flags.voice_gateway_port, 9000);
     }
 
     #[test]
@@ -3259,6 +3330,34 @@ async fn main() -> Result<(), CallerError> {
             None
         };
 
+        // Voice gateway (WebSocket)
+        let _voice_handle = if flags.voice_gateway {
+            let broadcast_tx = if let Some(ref tx) = mcp_control_tx {
+                tx.clone()
+            } else {
+                let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
+                tx
+            };
+            let handle = voice_gateway::spawn_voice_gateway(
+                flags.voice_gateway_port,
+                bus.clone(),
+                broadcast_tx,
+            );
+            slog(&session_log, |l| {
+                l.info(&format!(
+                    "Voice gateway: http://0.0.0.0:{}",
+                    flags.voice_gateway_port
+                ))
+            });
+            eprintln!(
+                "Voice gateway: http://0.0.0.0:{}",
+                flags.voice_gateway_port
+            );
+            Some(handle)
+        } else {
+            None
+        };
+
         let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp::McpAppState::new(
             provider.name().to_string(),
             provider.model().to_string(),
@@ -3493,6 +3592,29 @@ async fn main() -> Result<(), CallerError> {
             );
         }
 
+        // Voice gateway (WebSocket) — shares broadcast channel with control socket if both enabled
+        let _voice_handle = if flags.voice_gateway {
+            let broadcast_tx = if let Some(ref tx) = app.control_tx {
+                tx.clone()
+            } else {
+                let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
+                app.set_control_socket(tx.clone());
+                tx
+            };
+            let handle = voice_gateway::spawn_voice_gateway(
+                flags.voice_gateway_port,
+                bus.clone(),
+                broadcast_tx,
+            );
+            app.log(
+                tui::app::LogLevel::Info,
+                format!("Voice gateway: http://0.0.0.0:{}", flags.voice_gateway_port),
+            );
+            Some(handle)
+        } else {
+            None
+        };
+
         app.log(tui::app::LogLevel::Info, format!("Task: {}", task));
 
         // Create follow-up channel for multi-round support
@@ -3583,6 +3705,25 @@ async fn main() -> Result<(), CallerError> {
         let task = task.unwrap();
 
         // Headless mode (--no-tui or non-TTY)
+
+        // Voice gateway in headless mode needs an EventBus + broadcast channel
+        let headless_bus = if flags.voice_gateway {
+            let (bus, _rx) = EventBus::new();
+            let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+            let _voice_handle = voice_gateway::spawn_voice_gateway(
+                flags.voice_gateway_port,
+                bus.clone(),
+                broadcast_tx,
+            );
+            eprintln!(
+                "Voice gateway: http://0.0.0.0:{}",
+                flags.voice_gateway_port
+            );
+            Some(bus)
+        } else {
+            None
+        };
+
         let mcp_mgr = if !project.config.mcp_servers.is_empty() {
             Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
         } else {
@@ -3619,7 +3760,7 @@ async fn main() -> Result<(), CallerError> {
                 provider,
                 task.clone(),
                 project,
-                None,
+                headless_bus,
                 autonomy,
                 session_log.clone(),
                 log_dir,

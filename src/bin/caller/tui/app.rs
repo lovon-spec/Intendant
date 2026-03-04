@@ -746,6 +746,12 @@ impl App {
                     format!("Verbosity set to {} via control socket", new_verbosity.label()),
                 );
             }
+            ControlMsg::StartTask { .. } => {
+                self.log(
+                    LogLevel::Warn,
+                    "start_task is only supported in MCP/voice mode".to_string(),
+                );
+            }
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
             | ControlMsg::GetRestartStatus

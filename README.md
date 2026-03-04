@@ -1,6 +1,6 @@
 # Intendant
 
-A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles with in-memory state, executes commands sequentially (blocking until completion), and persists structured session logs. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, streaming token output with real-time deltas, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, MCP client support for connecting to external tool servers, Landlock filesystem sandboxing, prompt caching (Anthropic), auto-compaction at 90% context usage, JSONL structured output mode, INTENDANT.md project instructions, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
+A Rust runtime that executes commands on behalf of an AI agent, plus an AI integration layer that drives the runtime via the OpenAI, Anthropic, or Gemini API. The runtime manages process lifecycles with in-memory state, executes commands sequentially (blocking until completion), and persists structured session logs. The CLI features native API tool calling (function calling) with automatic fallback to text-based JSON extraction, streaming token output with real-time deltas, a ratatui-based TUI for real-time monitoring and control, a configurable autonomy system with per-action approval, MCP client support for connecting to external tool servers, Landlock filesystem sandboxing, prompt caching (Anthropic), auto-compaction at 90% context usage, JSONL structured output mode, INTENDANT.md project instructions, a voice control gateway (Gemini Live API) for phone-based control, and supports hierarchical multi-agent orchestration with token budget awareness, sub-agent spawning, git worktree isolation, and a tagged knowledge system with pub/sub channels.
 
 ## Architecture
 
@@ -28,6 +28,7 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   +--> Prompt caching:  Anthropic cache_control, OpenAI/Gemini implicit caching
   +--> Auto-compaction: triggers at 90% context usage, preserves system+tail messages
   +--> Optional control socket (--control-socket): /tmp/intendant-<pid>.sock (JSON-line protocol)
+  +--> Voice gateway (--voice-gateway): WebSocket + Gemini Live API for phone-based voice control
   +--> Token budget tracking (context-window-aware loop termination)
   +--> Sub-agent spawning via env vars (INTENDANT_ROLE, INTENDANT_ID, etc.)
   +--> Git worktree isolation for implementation agents
@@ -608,6 +609,57 @@ Example usage:
 ```bash
 echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
 ```
+
+## Voice Gateway
+
+The `--voice-gateway` flag starts a WebSocket server that enables voice control of Intendant from a phone browser via the Gemini Live API.
+
+### How it works
+
+```
+Phone browser ──WebSocket──> Intendant gateway (port 8765)
+     │                              │
+     │  (audio)                     │ (ControlMsg JSON, same as control socket)
+     v                              v
+Gemini Live API            EventBus / broadcast channel
+     │                              │
+     │  (function calls)            │ (OutboundEvent JSON)
+     v                              v
+  JS bridge ──────────────> Intendant agent loop
+```
+
+The phone browser connects directly to the Gemini Live API for low-latency voice I/O, and to the Intendant gateway for control messages. A JS bridge in the browser translates Gemini function calls (`submit_task`, `approve_action`, `check_status`, etc.) into Intendant `ControlMsg` JSON and injects Intendant events back into the Gemini session for voice narration.
+
+### Running
+
+```bash
+# With MCP mode
+./target/release/intendant --mcp --voice-gateway
+
+# With TUI
+./target/release/intendant --voice-gateway "Fix the login bug"
+
+# Custom port
+./target/release/intendant --voice-gateway 9000 --mcp
+```
+
+Open `http://<host>:8765/` on your phone. On first visit, enter your [Google AI Studio API key](https://aistudio.google.com/apikey) (stored in browser localStorage, never sent to Intendant).
+
+### Requirements
+
+- **Microphone access requires a secure context**: Use `localhost` (via SSH tunnel: `ssh -L 8765:localhost:8765 host`), or set browser flags for insecure origins.
+- **Gemini API key**: Free tier from Google AI Studio. The key is used browser-side only.
+
+### Supported Gemini voice commands
+
+| Voice command | Maps to |
+|---|---|
+| "List files in /tmp" | `submit_task({description: "list files in /tmp"})` |
+| "What's the status?" | `check_status()` |
+| "Approve that" | `approve_action({id: N})` |
+| "No, skip it" | `skip_action({id: N})` |
+| "Set autonomy to full" | `set_autonomy({level: "full"})` |
+| "The answer is PostgreSQL" | `respond_to_question({text: "PostgreSQL"})` |
 
 ## MCP Server
 

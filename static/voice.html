@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Intendant Voice</title>
+<style>
+:root {
+  --base: #1e1e2e;
+  --mantle: #181825;
+  --crust: #11111b;
+  --surface0: #313244;
+  --surface1: #45475a;
+  --surface2: #585b70;
+  --text: #cdd6f4;
+  --subtext0: #a6adc8;
+  --subtext1: #bac2de;
+  --blue: #89b4fa;
+  --green: #a6e3a1;
+  --red: #f38ba8;
+  --yellow: #f9e2af;
+  --mauve: #cba6f7;
+  --peach: #fab387;
+  --teal: #94e2d5;
+  --overlay0: #6c7086;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+  background: var(--base);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Status bar */
+.status-bar {
+  background: var(--mantle);
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+}
+.status-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--surface2);
+  transition: background 0.3s;
+}
+.status-dot.connected { background: var(--green); }
+.status-dot.error { background: var(--red); }
+.status-label {
+  font-size: 13px;
+  color: var(--subtext0);
+}
+.status-phase {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--mauve);
+  font-weight: 600;
+}
+
+/* Main area */
+.main-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  padding: 20px;
+}
+
+/* Mic button */
+.mic-btn {
+  width: 100px; height: 100px;
+  border-radius: 50%;
+  border: 3px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 36px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+.mic-btn:hover { border-color: var(--blue); }
+.mic-btn.active {
+  border-color: var(--red);
+  background: rgba(243, 139, 168, 0.15);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(243, 139, 168, 0.3); }
+  50% { box-shadow: 0 0 0 16px rgba(243, 139, 168, 0); }
+}
+
+/* Waveform */
+.waveform {
+  width: 80%;
+  max-width: 400px;
+  height: 80px;
+  border-radius: 8px;
+  background: var(--crust);
+}
+
+/* Audio status */
+.audio-status {
+  font-size: 12px;
+  color: var(--subtext0);
+  text-align: center;
+  min-height: 16px;
+}
+.audio-status .active { color: var(--green); }
+.audio-status .sending { color: var(--peach); }
+.audio-status .receiving { color: var(--blue); }
+
+/* Mode toggle */
+.mode-toggle {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.mode-toggle label {
+  font-size: 13px;
+  color: var(--subtext0);
+  cursor: pointer;
+}
+.mode-toggle input {
+  accent-color: var(--blue);
+}
+
+/* Event log */
+.log-panel {
+  background: var(--mantle);
+  border-top: 1px solid var(--surface0);
+  max-height: 35vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.log-toggle {
+  display: flex;
+  align-items: center;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--subtext0);
+  gap: 8px;
+  user-select: none;
+}
+.log-toggle .arrow { transition: transform 0.2s; }
+.log-toggle .arrow.open { transform: rotate(90deg); }
+.log-entries {
+  padding: 0 16px 8px;
+  display: none;
+}
+.log-entries.open { display: block; }
+.log-entry {
+  font-size: 12px;
+  font-family: monospace;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--surface0);
+  color: var(--subtext1);
+  word-break: break-word;
+}
+.log-entry.event { color: var(--teal); }
+.log-entry.error { color: var(--red); }
+.log-entry.info { color: var(--blue); }
+
+/* Settings dialog */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.dialog-overlay.hidden { display: none; }
+.dialog {
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 12px;
+  padding: 24px;
+  width: 90%;
+  max-width: 400px;
+}
+.dialog h2 {
+  font-size: 18px;
+  margin-bottom: 16px;
+  color: var(--text);
+}
+.dialog label {
+  font-size: 13px;
+  color: var(--subtext0);
+  display: block;
+  margin-bottom: 4px;
+}
+.dialog input {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 14px;
+  margin-bottom: 12px;
+  outline: none;
+}
+.dialog input:focus { border-color: var(--blue); }
+.dialog .btn-row {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.dialog button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+}
+.dialog .btn-primary {
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 600;
+}
+.dialog .btn-secondary {
+  background: var(--surface1);
+  color: var(--text);
+}
+
+/* Settings gear */
+.settings-btn {
+  background: none;
+  border: none;
+  color: var(--subtext0);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px;
+}
+.settings-btn:hover { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="status-bar">
+  <div class="status-dot" id="intendantDot"></div>
+  <span class="status-label" id="intendantLabel">Intendant</span>
+  <div class="status-dot" id="geminiDot"></div>
+  <span class="status-label" id="geminiLabel">Gemini</span>
+  <span class="status-phase" id="phaseLabel">Idle</span>
+  <button class="settings-btn" id="settingsBtn" title="Settings">&#9881;</button>
+</div>
+
+<div class="main-area">
+  <canvas class="waveform" id="waveform" width="400" height="80"></canvas>
+  <div class="audio-status" id="audioStatus"></div>
+  <button class="mic-btn" id="micBtn">&#127908;</button>
+  <div class="mode-toggle">
+    <input type="checkbox" id="alwaysOn">
+    <label for="alwaysOn">Always-on</label>
+  </div>
+</div>
+
+<div class="log-panel">
+  <div class="log-toggle" id="logToggle">
+    <span class="arrow" id="logArrow">&#9654;</span>
+    <span>Event Log</span>
+  </div>
+  <div class="log-entries" id="logEntries"></div>
+</div>
+
+<!-- Settings dialog -->
+<div class="dialog-overlay hidden" id="settingsDialog">
+  <div class="dialog">
+    <h2>Settings</h2>
+    <label for="geminiKeyInput">Gemini API Key</label>
+    <input type="password" id="geminiKeyInput" placeholder="AIza...">
+    <label for="serverUrlInput">Intendant Server</label>
+    <input type="text" id="serverUrlInput" placeholder="ws://host:8765">
+    <div class="btn-row">
+      <button class="btn-secondary" id="settingsCancel">Cancel</button>
+      <button class="btn-primary" id="settingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- First-run API key dialog -->
+<div class="dialog-overlay hidden" id="firstRunDialog">
+  <div class="dialog">
+    <h2>Welcome to Intendant Voice</h2>
+    <p style="color:var(--subtext0);font-size:13px;margin-bottom:16px;">
+      Enter your Gemini API key to enable voice control.
+      Get one at <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--blue);">aistudio.google.com/apikey</a>
+    </p>
+    <label for="firstRunKeyInput">Gemini API Key</label>
+    <input type="password" id="firstRunKeyInput" placeholder="AIza...">
+    <div class="btn-row">
+      <button class="btn-primary" id="firstRunSave">Connect</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// --- State ---
+let geminiWs = null;
+let intendantWs = null;
+let audioCtx = null;
+let mediaStream = null;
+let scriptNode = null;
+let micActive = false;
+let alwaysOn = false;
+let geminiConnected = false;
+let intendantConnected = false;
+let pendingFunctionCalls = new Map();
+let analyserNode = null;
+let animFrameId = null;
+let audioChunksSent = 0;
+let audioChunksReceived = 0;
+
+const GEMINI_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+const SAMPLE_RATE = 16000;
+
+// --- DOM refs ---
+const micBtn = document.getElementById('micBtn');
+const waveformCanvas = document.getElementById('waveform');
+const waveformCtx = waveformCanvas.getContext('2d');
+const audioStatus = document.getElementById('audioStatus');
+const alwaysOnCb = document.getElementById('alwaysOn');
+const intendantDot = document.getElementById('intendantDot');
+const geminiDot = document.getElementById('geminiDot');
+const intendantLabel = document.getElementById('intendantLabel');
+const geminiLabel = document.getElementById('geminiLabel');
+const phaseLabel = document.getElementById('phaseLabel');
+const logToggle = document.getElementById('logToggle');
+const logArrow = document.getElementById('logArrow');
+const logEntries = document.getElementById('logEntries');
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsDialog = document.getElementById('settingsDialog');
+const settingsCancel = document.getElementById('settingsCancel');
+const settingsSave = document.getElementById('settingsSave');
+const geminiKeyInput = document.getElementById('geminiKeyInput');
+const serverUrlInput = document.getElementById('serverUrlInput');
+const firstRunDialog = document.getElementById('firstRunDialog');
+const firstRunSave = document.getElementById('firstRunSave');
+const firstRunKeyInput = document.getElementById('firstRunKeyInput');
+
+// --- Logging ---
+function addLog(text, cls = '') {
+  const el = document.createElement('div');
+  el.className = 'log-entry ' + cls;
+  el.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+  logEntries.appendChild(el);
+  logEntries.scrollTop = logEntries.scrollHeight;
+}
+
+// Log toggle
+logToggle.addEventListener('click', () => {
+  const open = logEntries.classList.toggle('open');
+  logArrow.classList.toggle('open', open);
+});
+
+// --- Settings ---
+function getGeminiKey() { return localStorage.getItem('intendant_gemini_key') || ''; }
+function setGeminiKey(k) { localStorage.setItem('intendant_gemini_key', k); }
+function getServerUrl() {
+  const saved = localStorage.getItem('intendant_server_url');
+  if (saved) return saved;
+  // Default: ws on same host, port 8765
+  return `ws://${location.hostname || 'localhost'}:${location.port || '8765'}`;
+}
+function setServerUrl(u) { localStorage.setItem('intendant_server_url', u); }
+
+settingsBtn.addEventListener('click', () => {
+  geminiKeyInput.value = getGeminiKey();
+  serverUrlInput.value = getServerUrl();
+  settingsDialog.classList.remove('hidden');
+});
+settingsCancel.addEventListener('click', () => settingsDialog.classList.add('hidden'));
+settingsSave.addEventListener('click', () => {
+  setGeminiKey(geminiKeyInput.value.trim());
+  setServerUrl(serverUrlInput.value.trim());
+  settingsDialog.classList.add('hidden');
+  // Reconnect
+  connectAll();
+});
+
+firstRunSave.addEventListener('click', () => {
+  const key = firstRunKeyInput.value.trim();
+  if (!key) return;
+  setGeminiKey(key);
+  firstRunDialog.classList.add('hidden');
+  connectAll();
+});
+
+// --- Intendant WebSocket ---
+function connectIntendant() {
+  if (intendantWs) {
+    try { intendantWs.close(); } catch(_) {}
+  }
+  const url = getServerUrl();
+  addLog(`Connecting to Intendant: ${url}`, 'info');
+  try {
+    intendantWs = new WebSocket(url);
+  } catch(e) {
+    addLog(`Intendant connection error: ${e}`, 'error');
+    return;
+  }
+
+  intendantWs.onopen = () => {
+    intendantConnected = true;
+    intendantDot.className = 'status-dot connected';
+    intendantLabel.textContent = 'Intendant';
+    addLog('Connected to Intendant', 'info');
+    // Request initial status
+    intendantWs.send(JSON.stringify({ action: 'status' }));
+  };
+
+  intendantWs.onmessage = (e) => {
+    try {
+      const evt = JSON.parse(e.data);
+      handleIntendantEvent(evt);
+    } catch(err) {
+      addLog(`Parse error: ${err}`, 'error');
+    }
+  };
+
+  intendantWs.onclose = () => {
+    intendantConnected = false;
+    intendantDot.className = 'status-dot';
+    addLog('Disconnected from Intendant', 'error');
+  };
+
+  intendantWs.onerror = () => {
+    intendantDot.className = 'status-dot error';
+  };
+}
+
+function handleIntendantEvent(evt) {
+  const eventType = evt.event;
+  addLog(`${eventType}: ${JSON.stringify(evt).substring(0, 200)}`, 'event');
+
+  // Update phase display
+  if (eventType === 'status') {
+    phaseLabel.textContent = evt.phase || 'Idle';
+  } else if (eventType === 'turn_started') {
+    phaseLabel.textContent = 'Thinking';
+  } else if (eventType === 'task_complete') {
+    phaseLabel.textContent = 'Done';
+  } else if (eventType === 'approval_required') {
+    phaseLabel.textContent = 'Approval';
+  } else if (eventType === 'ask_human') {
+    phaseLabel.textContent = 'Question';
+  }
+
+  // Inject notable events into Gemini for narration
+  if (geminiWs && geminiConnected) {
+    const injectEvents = ['approval_required', 'ask_human', 'task_complete',
+                          'round_complete', 'agent_output', 'command_result'];
+    if (injectEvents.includes(eventType)) {
+      const summary = buildEventSummary(evt);
+      if (summary) {
+        injectUserTurn(summary);
+      }
+    }
+  }
+}
+
+function buildEventSummary(evt) {
+  switch (evt.event) {
+    case 'approval_required':
+      return `[Intendant needs approval] Command: "${evt.command}" (id: ${evt.id}). Tell the user and ask if they want to approve, deny, or skip.`;
+    case 'ask_human':
+      return `[Intendant has a question] "${evt.question}". Relay this to the user conversationally.`;
+    case 'task_complete':
+      return `[Task complete] Reason: ${evt.reason}. Let the user know.`;
+    case 'round_complete':
+      return `[Round ${evt.round} complete] ${evt.turns_in_round} turns. Ask if the user wants to continue or has a new task.`;
+    case 'agent_output':
+      if (evt.stdout && evt.stdout.length > 0) {
+        const preview = evt.stdout.substring(0, 300);
+        return `[Agent output] ${preview}`;
+      }
+      return null;
+    case 'command_result':
+      return `[Command result] ${evt.action}: ${evt.ok ? 'ok' : 'failed'} - ${evt.message}`;
+    default:
+      return null;
+  }
+}
+
+function sendToIntendant(msg) {
+  if (intendantWs && intendantConnected) {
+    intendantWs.send(JSON.stringify(msg));
+    addLog(`Sent: ${JSON.stringify(msg).substring(0, 200)}`, 'info');
+  } else {
+    addLog('Not connected to Intendant', 'error');
+  }
+}
+
+// --- Gemini Live WebSocket ---
+function connectGemini() {
+  const key = getGeminiKey();
+  if (!key) {
+    addLog('No Gemini API key configured', 'error');
+    return;
+  }
+
+  if (geminiWs) {
+    try { geminiWs.close(); } catch(_) {}
+  }
+
+  const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${key}`;
+  addLog('Connecting to Gemini Live...', 'info');
+
+  try {
+    geminiWs = new WebSocket(url);
+  } catch(e) {
+    addLog(`Gemini connection error: ${e}`, 'error');
+    return;
+  }
+
+  geminiWs.onopen = () => {
+    geminiConnected = true;
+    geminiDot.className = 'status-dot connected';
+    geminiLabel.textContent = 'Gemini';
+    addLog('Connected to Gemini — sending setup...', 'info');
+    sendGeminiSetup();
+  };
+
+  geminiWs.onmessage = async (e) => {
+    try {
+      let text;
+      if (typeof e.data === 'string') {
+        text = e.data;
+      } else if (e.data instanceof Blob) {
+        text = await e.data.text();
+      } else {
+        return;
+      }
+      const msg = JSON.parse(text);
+      handleGeminiMessage(msg);
+    } catch(err) {
+      addLog(`Gemini parse error: ${err}`, 'error');
+    }
+  };
+
+  geminiWs.onclose = (e) => {
+    geminiConnected = false;
+    geminiDot.className = 'status-dot';
+    addLog(`Disconnected from Gemini (code: ${e.code}, reason: ${e.reason || 'none'})`, 'error');
+  };
+
+  geminiWs.onerror = () => {
+    geminiDot.className = 'status-dot error';
+    addLog('Gemini WebSocket error', 'error');
+  };
+}
+
+function sendGeminiSetup() {
+  const setup = {
+    setup: {
+      model: `models/${GEMINI_MODEL}`,
+      generation_config: {
+        response_modalities: ['AUDIO'],
+        speech_config: {
+          voice_config: {
+            prebuilt_voice_config: { voice_name: 'Aoede' }
+          }
+        }
+      },
+      system_instruction: {
+        parts: [{
+          text: `You are Intendant, an AI agent that helps users build software. You speak via voice. Be concise and conversational (1-3 sentences).
+
+## How Intendant works
+You are the voice interface to a coding agent running on the user's machine. The agent has its own lifecycle:
+- It may already be running a task when you connect
+- After completing a task, it enters "waiting_follow_up" phase — you can send follow-up tasks
+- Events like approval_required, ask_human, task_complete arrive as system messages
+
+## Your function calls
+- submit_task(description): Start a NEW task or send a follow-up when agent is idle/waiting
+- check_status(): See current phase, turn count, autonomy level — use this when unsure
+- approve_action(id): Approve a command needing authorization (id comes from approval_required events)
+- deny_action(id): Block a command
+- skip_action(id): Skip a command
+- respond_to_question(text): Answer an agent question (from ask_human events)
+- set_autonomy(level): Change to low/medium/high/full
+
+## Rules
+- When the user asks to do something, use submit_task with a clear description
+- When an approval_required event arrives, tell the user the command and ask before approving
+- When a round_complete event arrives, tell the user and ask if they want to continue
+- Use check_status if you're unsure what state things are in
+- Do NOT explain your internal reasoning — just act and talk naturally`
+        }]
+      },
+      tools: [{
+        function_declarations: [
+          {
+            name: 'submit_task',
+            description: 'Submit a new task for Intendant to work on',
+            parameters: {
+              type: 'object',
+              properties: {
+                description: {
+                  type: 'string',
+                  description: 'What the user wants done'
+                }
+              },
+              required: ['description']
+            }
+          },
+          {
+            name: 'check_status',
+            description: 'Check the current status of Intendant',
+            parameters: { type: 'object', properties: {} }
+          },
+          {
+            name: 'approve_action',
+            description: 'Approve a pending command that needs user authorization',
+            parameters: {
+              type: 'object',
+              properties: {
+                id: { type: 'integer', description: 'The approval ID (turn number)' }
+              },
+              required: ['id']
+            }
+          },
+          {
+            name: 'deny_action',
+            description: 'Deny/block a pending command',
+            parameters: {
+              type: 'object',
+              properties: {
+                id: { type: 'integer', description: 'The approval ID (turn number)' }
+              },
+              required: ['id']
+            }
+          },
+          {
+            name: 'skip_action',
+            description: 'Skip a pending command without executing it',
+            parameters: {
+              type: 'object',
+              properties: {
+                id: { type: 'integer', description: 'The approval ID (turn number)' }
+              },
+              required: ['id']
+            }
+          },
+          {
+            name: 'respond_to_question',
+            description: 'Respond to a question asked by the agent',
+            parameters: {
+              type: 'object',
+              properties: {
+                text: { type: 'string', description: 'The response text' }
+              },
+              required: ['text']
+            }
+          },
+          {
+            name: 'set_autonomy',
+            description: 'Change the autonomy level (how much the agent can do without asking)',
+            parameters: {
+              type: 'object',
+              properties: {
+                level: {
+                  type: 'string',
+                  description: 'Autonomy level: low, medium, high, or full',
+                  enum: ['low', 'medium', 'high', 'full']
+                }
+              },
+              required: ['level']
+            }
+          }
+        ]
+      }]
+    }
+  };
+
+  geminiWs.send(JSON.stringify(setup));
+  addLog('Sent Gemini setup', 'info');
+}
+
+function handleGeminiMessage(msg) {
+  // Server setup complete
+  if (msg.setupComplete) {
+    addLog('Gemini session ready — you can speak now', 'info');
+    phaseLabel.textContent = 'Ready';
+    return;
+  }
+
+  const response = msg.serverContent;
+  if (!response) {
+    // Top-level toolCall field (different format: has functionCalls array)
+    if (msg.toolCall && msg.toolCall.functionCalls) {
+      for (const fc of msg.toolCall.functionCalls) {
+        handleGeminiToolCall(fc);
+      }
+      return;
+    }
+    // Tool call cancellation
+    if (msg.toolCallCancellation) {
+      addLog(`Gemini cancelled tool calls: ${msg.toolCallCancellation.ids?.join(', ')}`, 'event');
+      return;
+    }
+    // Log unknown message types for debugging
+    const keys = Object.keys(msg);
+    addLog(`Gemini msg: ${keys.join(', ')} ${JSON.stringify(msg).substring(0, 300)}`, 'event');
+    return;
+  }
+
+  // Turn complete signal
+  if (response.turnComplete) {
+    addLog('Gemini turn complete', 'event');
+    phaseLabel.textContent = 'Listening';
+    return;
+  }
+
+  // Handle model turn
+  if (response.modelTurn && response.modelTurn.parts) {
+    for (const part of response.modelTurn.parts) {
+      // Audio output
+      if (part.inlineData && part.inlineData.mimeType && part.inlineData.mimeType.startsWith('audio/')) {
+        audioChunksReceived++;
+        playAudioChunk(part.inlineData.data);
+        if (audioChunksReceived === 1) {
+          addLog('Receiving audio from Gemini...', 'info');
+          phaseLabel.textContent = 'Speaking';
+        }
+      }
+      // Text output
+      if (part.text) {
+        addLog(`Gemini: ${part.text}`, 'info');
+      }
+      // Function call
+      if (part.functionCall) {
+        handleGeminiToolCall(part.functionCall);
+      }
+    }
+  }
+
+  // Interrupted
+  if (response.interrupted) {
+    addLog('Gemini interrupted', 'event');
+  }
+}
+
+function handleGeminiToolCall(call) {
+  const name = call.name;
+  const args = call.args || {};
+  if (!name) {
+    addLog(`Gemini tool call with no name: ${JSON.stringify(call).substring(0, 300)}`, 'error');
+    return;
+  }
+  addLog(`Gemini calls: ${name}(${JSON.stringify(args)})`, 'info');
+
+  let controlMsg = null;
+  switch (name) {
+    case 'submit_task':
+      controlMsg = { action: 'start_task', task: args.description || '' };
+      break;
+    case 'check_status':
+      controlMsg = { action: 'status' };
+      break;
+    case 'approve_action':
+      controlMsg = { action: 'approve', id: args.id };
+      break;
+    case 'deny_action':
+      controlMsg = { action: 'deny', id: args.id };
+      break;
+    case 'skip_action':
+      controlMsg = { action: 'skip', id: args.id };
+      break;
+    case 'respond_to_question':
+      controlMsg = { action: 'input', text: args.text || '' };
+      break;
+    case 'set_autonomy':
+      controlMsg = { action: 'set_autonomy', level: args.level || 'medium' };
+      break;
+    default:
+      addLog(`Unknown function: ${name}`, 'error');
+      sendToolResponse(call, { error: 'unknown function' });
+      return;
+  }
+
+  sendToIntendant(controlMsg);
+
+  // Listen for command_result to send tool response back
+  const resultHandler = (e) => {
+    try {
+      const evt = JSON.parse(e.data);
+      if (evt.event === 'command_result' || evt.event === 'status') {
+        sendToolResponse(call, evt);
+        intendantWs.removeEventListener('message', resultHandler);
+      }
+    } catch(_) {}
+  };
+
+  if (intendantWs && name !== 'check_status') {
+    intendantWs.addEventListener('message', resultHandler);
+    // Timeout: if no result in 5s, send a generic ok
+    setTimeout(() => {
+      intendantWs.removeEventListener('message', resultHandler);
+      sendToolResponse(call, { ok: true, message: 'sent' });
+    }, 5000);
+  } else if (name === 'check_status') {
+    // Status response comes back as a status event
+    intendantWs.addEventListener('message', resultHandler);
+    setTimeout(() => {
+      intendantWs.removeEventListener('message', resultHandler);
+    }, 3000);
+  }
+}
+
+function sendToolResponse(call, result) {
+  if (!geminiWs || !geminiConnected) return;
+  const resp = {
+    tool_response: {
+      function_responses: [{
+        name: call.name,
+        id: call.id || call.name,
+        response: result
+      }]
+    }
+  };
+  geminiWs.send(JSON.stringify(resp));
+}
+
+function injectUserTurn(text) {
+  if (!geminiWs || !geminiConnected) return;
+  const msg = {
+    client_content: {
+      turns: [{
+        role: 'user',
+        parts: [{ text }]
+      }],
+      turn_complete: true
+    }
+  };
+  geminiWs.send(JSON.stringify(msg));
+}
+
+// --- Audio capture ---
+// Downsample from native sample rate to target rate (linear interpolation)
+function downsample(float32, fromRate, toRate) {
+  if (fromRate === toRate) return float32;
+  const ratio = fromRate / toRate;
+  const outLen = Math.floor(float32.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const srcIdx = i * ratio;
+    const lo = Math.floor(srcIdx);
+    const hi = Math.min(lo + 1, float32.length - 1);
+    const frac = srcIdx - lo;
+    out[i] = float32[lo] * (1 - frac) + float32[hi] * frac;
+  }
+  return out;
+}
+
+async function startMic() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    addLog('Microphone access requires HTTPS or localhost. Try: ssh -L 8765:localhost:8765 host', 'error');
+    micActive = false;
+    micBtn.classList.remove('active');
+    return;
+  }
+  // Use native sample rate — forcing 16kHz breaks many browsers
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+  }
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
+  addLog(`AudioContext: ${audioCtx.sampleRate} Hz, state: ${audioCtx.state}`, 'info');
+
+  if (!mediaStream) {
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true }
+      });
+      addLog(`Microphone access granted (${mediaStream.getAudioTracks()[0].label})`, 'info');
+    } catch(e) {
+      addLog(`Microphone access denied: ${e.message}`, 'error');
+      micActive = false;
+      micBtn.classList.remove('active');
+      return;
+    }
+  }
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+
+  // AnalyserNode for real-time waveform visualization
+  analyserNode = audioCtx.createAnalyser();
+  analyserNode.fftSize = 2048;
+  source.connect(analyserNode);
+
+  // ScriptProcessor for capturing raw PCM and sending to Gemini
+  const nativeSR = audioCtx.sampleRate;
+  scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  audioChunksSent = 0;
+  scriptNode.onaudioprocess = (e) => {
+    if (!micActive) return;
+    const float32 = e.inputBuffer.getChannelData(0);
+
+    // Only send if Gemini is connected
+    if (geminiWs && geminiConnected) {
+      // Downsample to 16kHz for Gemini
+      const resampled = downsample(float32, nativeSR, SAMPLE_RATE);
+      const pcm16 = new Int16Array(resampled.length);
+      for (let i = 0; i < resampled.length; i++) {
+        pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
+      }
+      const b64 = arrayBufferToBase64(pcm16.buffer);
+      geminiWs.send(JSON.stringify({
+        realtime_input: {
+          media_chunks: [{
+            mime_type: 'audio/pcm;rate=16000',
+            data: b64
+          }]
+        }
+      }));
+      audioChunksSent++;
+    }
+  };
+  source.connect(scriptNode);
+  scriptNode.connect(audioCtx.destination);
+
+  // Start waveform animation loop
+  startWaveformLoop();
+  updateAudioStatus();
+  addLog('Audio pipeline started — waveform should be visible', 'info');
+}
+
+function stopMic() {
+  if (scriptNode) {
+    scriptNode.disconnect();
+    scriptNode = null;
+  }
+  analyserNode = null;
+  if (animFrameId) {
+    cancelAnimationFrame(animFrameId);
+    animFrameId = null;
+  }
+  clearWaveform();
+  audioStatus.textContent = '';
+}
+
+// --- Audio playback ---
+const audioQueue = [];
+let isPlaying = false;
+
+function playAudioChunk(b64data) {
+  if (!audioCtx) {
+    audioCtx = new AudioContext({ sampleRate: 24000 });
+  }
+  const bytes = base64ToArrayBuffer(b64data);
+  const pcm16 = new Int16Array(bytes);
+  const float32 = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) {
+    float32[i] = pcm16[i] / 32768.0;
+  }
+  const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+  buffer.copyToChannel(float32, 0);
+  audioQueue.push(buffer);
+  if (!isPlaying) playNext();
+}
+
+function playNext() {
+  if (audioQueue.length === 0) {
+    isPlaying = false;
+    return;
+  }
+  isPlaying = true;
+  const buffer = audioQueue.shift();
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(audioCtx.destination);
+  src.onended = playNext;
+  src.start();
+}
+
+// --- Waveform ---
+function startWaveformLoop() {
+  if (animFrameId) return;
+  const draw = () => {
+    animFrameId = requestAnimationFrame(draw);
+    if (!analyserNode) return;
+    const bufLen = analyserNode.fftSize;
+    const data = new Float32Array(bufLen);
+    analyserNode.getFloatTimeDomainData(data);
+
+    const w = waveformCanvas.width;
+    const h = waveformCanvas.height;
+
+    // Background
+    waveformCtx.fillStyle = '#11111b';
+    waveformCtx.fillRect(0, 0, w, h);
+
+    // Waveform line
+    waveformCtx.strokeStyle = micActive ? '#f38ba8' : '#585b70';
+    waveformCtx.lineWidth = 2;
+    waveformCtx.beginPath();
+    const step = bufLen / w;
+    for (let i = 0; i < w; i++) {
+      const v = data[Math.floor(i * step)] || 0;
+      const y = (v + 1) * h / 2;
+      if (i === 0) waveformCtx.moveTo(i, y);
+      else waveformCtx.lineTo(i, y);
+    }
+    waveformCtx.stroke();
+
+    // RMS level bar at the bottom
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+    const rms = Math.sqrt(sum / data.length);
+    const level = Math.min(1, rms * 8); // amplify for visibility
+    const barH = 4;
+    waveformCtx.fillStyle = level > 0.02 ? '#a6e3a1' : '#45475a';
+    waveformCtx.fillRect(0, h - barH, w * level, barH);
+  };
+  draw();
+}
+
+function clearWaveform() {
+  waveformCtx.fillStyle = '#11111b';
+  waveformCtx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+}
+
+function updateAudioStatus() {
+  if (!micActive) {
+    audioStatus.textContent = '';
+    return;
+  }
+  const parts = [];
+  parts.push('<span class="active">Mic active</span>');
+  if (geminiConnected) {
+    parts.push(`<span class="sending">${audioChunksSent} chunks sent</span>`);
+  } else {
+    parts.push('Gemini not connected — audio not sent');
+  }
+  if (audioChunksReceived > 0) {
+    parts.push(`<span class="receiving">${audioChunksReceived} chunks received</span>`);
+  }
+  audioStatus.innerHTML = parts.join(' · ');
+}
+
+// Update status display periodically when mic is active
+setInterval(() => { if (micActive) updateAudioStatus(); }, 500);
+
+// --- Utilities ---
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+// --- Mic button ---
+micBtn.addEventListener('click', async () => {
+  micActive = !micActive;
+  micBtn.classList.toggle('active', micActive);
+  if (micActive) {
+    audioChunksSent = 0;
+    audioChunksReceived = 0;
+    await startMic();
+    addLog('Mic on' + (geminiConnected ? ' — speak now' : ' — waiting for Gemini connection'), 'info');
+    phaseLabel.textContent = geminiConnected ? 'Listening' : 'Mic on (no Gemini)';
+  } else if (!alwaysOn) {
+    stopMic();
+    addLog(`Mic off (sent ${audioChunksSent} chunks, received ${audioChunksReceived})`, 'info');
+    phaseLabel.textContent = 'Idle';
+  }
+});
+
+alwaysOnCb.addEventListener('change', async () => {
+  alwaysOn = alwaysOnCb.checked;
+  if (alwaysOn && !micActive) {
+    micActive = true;
+    micBtn.classList.add('active');
+    await startMic();
+    addLog('Always-on mic enabled', 'info');
+  }
+});
+
+// --- Init ---
+function connectAll() {
+  connectIntendant();
+  if (getGeminiKey()) {
+    connectGemini();
+  } else {
+    addLog('No Gemini key — voice disabled', 'error');
+  }
+}
+
+// On load: check for API key
+window.addEventListener('load', () => {
+  if (!getGeminiKey()) {
+    firstRunDialog.classList.remove('hidden');
+  } else {
+    connectAll();
+  }
+});
+</script>
+</body>
+</html>

@@ -1453,6 +1453,17 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_LOOP_URI)
         }
+        ControlMsg::StartTask { task, orchestrate } => {
+            match start_task_with_state(state, bus, task, "voice", orchestrate).await {
+                Ok(()) => {
+                    emit_control_result(control_tx, "start_task", true, "ok".to_string(), None);
+                }
+                Err(e) => {
+                    emit_control_result(control_tx, "start_task", false, e, None);
+                }
+            }
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::FollowUp { text } => {
             let mut s = state.write().await;
             if s.phase != Phase::WaitingFollowUp {
