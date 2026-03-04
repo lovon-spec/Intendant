@@ -170,7 +170,7 @@ Commands are processed sequentially. Each command blocks until completion and re
 
 **User Mode** (complex task, no `INTENDANT_ROLE`): Pure subprocess monitor — makes zero model API calls. Spawns orchestrator as a child process, polls its progress file every 500ms, reads its result file on exit. `kill_on_drop(true)` ensures cleanup on TUI quit.
 
-**Direct Mode** (simple task, no `INTENDANT_ROLE`): Single-loop execution:
+**Direct Mode** (simple task or `--direct` flag, no `INTENDANT_ROLE`): Single-agent execution without orchestrator/sub-agent delegation. Still uses TUI when stdin is a TTY (use `--no-tui` for headless):
 1. Selects API provider (OpenAI, Anthropic, or Gemini) from env, configures structured output and reasoning controls
 2. Detects project root via git, loads `intendant.toml` config
 3. Reads role-appropriate system prompt

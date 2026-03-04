@@ -75,7 +75,8 @@ struct CliFlags {
     /// --sandbox: Enable Landlock filesystem sandboxing for the runtime.
     #[allow(dead_code)]
     sandbox: bool,
-    /// --direct: Force direct mode (skip orchestration even for complex tasks).
+    /// --direct: Force single-agent mode (skip orchestrator/sub-agent delegation).
+    /// Does NOT disable the TUI — use --no-tui for headless output.
     direct: bool,
 }
 
@@ -100,7 +101,7 @@ fn print_help() {
     println!("    --json                Emit JSONL events to stdout (implies --no-tui)");
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --vision              Launch Xvfb virtual display for captureScreen");
-    println!("    --direct              Force direct mode (skip orchestration for complex tasks)");
+    println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -2844,6 +2845,27 @@ fn configure_sandbox_env(flags: &CliFlags, project: &Project, log_dir: &std::pat
 
 #[tokio::main]
 async fn main() -> Result<(), CallerError> {
+    // Handle broken pipe (EPIPE) gracefully instead of panicking.
+    // This occurs when stdout is piped into a consumer that exits early (e.g. `grep -q`),
+    // or when the terminal is killed during headless output.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Check if this is a broken pipe panic from println!/write!
+            let msg = if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.contains("Broken pipe")
+            } else if let Some(s) = info.payload().downcast_ref::<&str>() {
+                s.contains("Broken pipe")
+            } else {
+                false
+            };
+            if msg {
+                std::process::exit(0);
+            }
+            default_hook(info);
+        }));
+    }
+
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
     dotenvy::dotenv().ok();
     let project = Project::detect()?;
