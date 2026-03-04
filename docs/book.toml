@@ -1,0 +1,8 @@
+[book]
+title = "Intendant Documentation"
+authors = []
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/anthropics/intendant"

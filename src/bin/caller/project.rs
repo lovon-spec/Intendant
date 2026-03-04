@@ -61,6 +61,8 @@ pub struct ProjectConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub sandbox: SandboxProjectConfig,
+    #[serde(default)]
+    pub presence: crate::presence::PresenceConfig,
 }
 
 /// Sandbox configuration in intendant.toml.
@@ -345,5 +347,36 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
             config.approval.command_exec,
             crate::autonomy::ApprovalRule::Auto
         );
+    }
+
+    #[test]
+    fn parse_presence_config_defaults() {
+        let config: ProjectConfig = toml::from_str("").unwrap();
+        assert!(config.presence.enabled);
+        assert!(config.presence.provider.is_none());
+        assert!(config.presence.model.is_none());
+        assert!(config.presence.audio_model.is_none());
+        assert_eq!(config.presence.context_window, 32_768);
+    }
+
+    #[test]
+    fn parse_presence_config_full() {
+        let toml_str = r#"
+[presence]
+enabled = false
+provider = "gemini"
+model = "gemini-2.5-flash"
+audio_model = "gemini-2.5-flash-live"
+context_window = 65536
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.presence.enabled);
+        assert_eq!(config.presence.provider.as_deref(), Some("gemini"));
+        assert_eq!(config.presence.model.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(
+            config.presence.audio_model.as_deref(),
+            Some("gemini-2.5-flash-live")
+        );
+        assert_eq!(config.presence.context_window, 65_536);
     }
 }

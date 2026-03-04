@@ -9,6 +9,7 @@ const DEFAULT_USER_PROMPT: &str = include_str!("../../../SysPrompt_user.md");
 const DEFAULT_ORCHESTRATOR_PROMPT: &str = include_str!("../../../SysPrompt_orchestrator.md");
 const DEFAULT_RESEARCH_PROMPT: &str = include_str!("../../../SysPrompt_research.md");
 const DEFAULT_IMPLEMENTATION_PROMPT: &str = include_str!("../../../SysPrompt_implementation.md");
+const DEFAULT_PRESENCE_PROMPT: &str = include_str!("../../../SysPrompt_presence.md");
 
 /// Resolve a prompt file using a 3-layer cascade:
 /// 1. Project root (`<project_root>/<filename>`)
@@ -62,6 +63,15 @@ fn resolve_system_prompt_inner(
     project_root: Option<&Path>,
     use_tools: bool,
 ) -> Result<String, CallerError> {
+    // Presence role uses its own standalone prompt (not appended to base)
+    if matches!(role, SubAgentRole::Presence) {
+        return Ok(resolve_prompt(
+            "SysPrompt_presence.md",
+            DEFAULT_PRESENCE_PROMPT,
+            project_root,
+        ));
+    }
+
     let (filename, default) = if use_tools {
         ("SysPrompt_tools.md", DEFAULT_PROMPT_TOOLS)
     } else {
@@ -136,6 +146,7 @@ mod tests {
         assert!(!DEFAULT_ORCHESTRATOR_PROMPT.is_empty());
         assert!(!DEFAULT_RESEARCH_PROMPT.is_empty());
         assert!(!DEFAULT_IMPLEMENTATION_PROMPT.is_empty());
+        assert!(!DEFAULT_PRESENCE_PROMPT.is_empty());
     }
 
     #[test]
@@ -201,6 +212,14 @@ mod tests {
     fn resolve_system_prompt_testing_returns_base_only() {
         let result = resolve_system_prompt(&SubAgentRole::Testing, None).unwrap();
         assert_eq!(result, DEFAULT_PROMPT);
+    }
+
+    #[test]
+    fn resolve_system_prompt_presence_standalone() {
+        let result = resolve_system_prompt(&SubAgentRole::Presence, None).unwrap();
+        // Presence uses its own prompt, NOT appended to base
+        assert_eq!(result, DEFAULT_PRESENCE_PROMPT);
+        assert!(!result.contains(DEFAULT_PROMPT));
     }
 
     #[test]

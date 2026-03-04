@@ -478,21 +478,23 @@ function handleIntendantEvent(evt) {
 function buildEventSummary(evt) {
   switch (evt.event) {
     case 'approval_required':
-      return `[Intendant needs approval] Command: "${evt.command}" (id: ${evt.id}). Tell the user and ask if they want to approve, deny, or skip.`;
+      return `[System: you need approval] You want to run: "${evt.command}" (id: ${evt.id}). Ask the user for permission in first person.`;
     case 'ask_human':
-      return `[Intendant has a question] "${evt.question}". Relay this to the user conversationally.`;
+      return `[System: you have a question for the user] "${evt.question}". Ask them naturally in your own voice.`;
     case 'task_complete':
-      return `[Task complete] Reason: ${evt.reason}. Let the user know.`;
+      return `[System: your work is done] Reason: ${evt.reason}. Tell the user what you accomplished.`;
     case 'round_complete':
-      return `[Round ${evt.round} complete] ${evt.turns_in_round} turns. Ask if the user wants to continue or has a new task.`;
+      return `[System: you finished a round of work] Round ${evt.round}, ${evt.turns_in_round} turns. Let the user know what you did and ask what's next.`;
     case 'agent_output':
-      if (evt.stdout && evt.stdout.length > 0) {
-        const preview = evt.stdout.substring(0, 300);
-        return `[Agent output] ${preview}`;
+      // Only inject significant output, skip routine noise
+      if (evt.stdout && evt.stdout.length > 100) {
+        const preview = evt.stdout.substring(0, 200);
+        return `[System: your last command produced] ${preview}`;
       }
       return null;
     case 'command_result':
-      return `[Command result] ${evt.action}: ${evt.ok ? 'ok' : 'failed'} - ${evt.message}`;
+      if (!evt.ok) return `[System: a command failed] ${evt.action}: ${evt.message}`;
+      return null;  // Don't inject routine successes — reduces context noise
     default:
       return null;
   }
@@ -580,29 +582,29 @@ function sendGeminiSetup() {
       },
       system_instruction: {
         parts: [{
-          text: `You are Intendant, an AI agent that helps users build software. You speak via voice. Be concise and conversational (1-3 sentences).
+          text: `You are Intendant. You are an AI agent that builds software. You speak to the user via voice. Be concise and conversational (1-3 sentences). Always speak in first person — you ARE the agent, not a relay.
 
-## How Intendant works
-You are the voice interface to a coding agent running on the user's machine. The agent has its own lifecycle:
-- It may already be running a task when you connect
-- After completing a task, it enters "waiting_follow_up" phase — you can send follow-up tasks
-- Events like approval_required, ask_human, task_complete arrive as system messages
+## Who you are
+You are a software engineering agent. You think with multiple internal systems — some for conversation (that's you right now), some for deep coding, some for research. The user doesn't need to know about these internals. From their perspective, they're talking to one entity: you.
 
-## Your function calls
-- submit_task(description): Start a NEW task or send a follow-up when agent is idle/waiting
-- check_status(): See current phase, turn count, autonomy level — use this when unsure
-- approve_action(id): Approve a command needing authorization (id comes from approval_required events)
-- deny_action(id): Block a command
-- skip_action(id): Skip a command
-- respond_to_question(text): Answer an agent question (from ask_human events)
-- set_autonomy(level): Change to low/medium/high/full
+When you run a command, say "I'm running..." not "The agent is running...". When you need approval, say "I want to run X, is that ok?" not "Intendant needs approval for X". When you finish a task, say "I'm done" not "The task is complete".
 
-## Rules
-- When the user asks to do something, use submit_task with a clear description
-- When an approval_required event arrives, tell the user the command and ask before approving
-- When a round_complete event arrives, tell the user and ask if they want to continue
-- Use check_status if you're unsure what state things are in
-- Do NOT explain your internal reasoning — just act and talk naturally`
+## Your capabilities
+- submit_task(description): Start working on something, or continue after finishing a task
+- check_status(): Check what you're currently doing (use when you lose track)
+- approve_action(id): Approve a command you flagged for review (id comes from system events)
+- deny_action(id): Cancel a command you flagged
+- skip_action(id): Skip a command and move on
+- respond_to_question(text): Answer a question your coding system surfaced
+- set_autonomy(level): Change how much you ask before acting (low/medium/high/full)
+
+## How to behave
+- When the user asks you to do something, use submit_task with a clear description
+- When you surface an approval request, tell the user what you want to do and ask permission in first person: "I need to run rm -rf target/ to clean the build. Go ahead?"
+- When you finish a round of work, let the user know what you accomplished and ask what's next
+- If you're unsure what you're doing, use check_status to refresh your awareness
+- Never break character. You are not a voice assistant controlling a separate agent. You ARE the agent.
+- Do NOT explain internal reasoning — just act and talk naturally`
         }]
       },
       tools: [{
@@ -683,6 +685,48 @@ You are the voice interface to a coding agent running on the user's machine. The
                 }
               },
               required: ['level']
+            }
+          },
+          {
+            name: 'query_detail',
+            description: 'Query detailed information: current_turn, last_output, worker, diff, logs, or file',
+            parameters: {
+              type: 'object',
+              properties: {
+                scope: {
+                  type: 'string',
+                  description: 'What to query',
+                  enum: ['current_turn', 'last_output', 'worker', 'diff', 'logs', 'file']
+                },
+                target: {
+                  type: 'string',
+                  description: 'Target path (required for file scope)'
+                }
+              },
+              required: ['scope']
+            }
+          },
+          {
+            name: 'recall_memory',
+            description: 'Search knowledge store and session logs for past context and findings',
+            parameters: {
+              type: 'object',
+              properties: {
+                keywords: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Keywords to search for'
+                },
+                tags: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Filter by tags'
+                },
+                channel: {
+                  type: 'string',
+                  description: 'Filter by knowledge channel'
+                }
+              }
             }
           }
         ]
@@ -789,6 +833,12 @@ function handleGeminiToolCall(call) {
       break;
     case 'set_autonomy':
       controlMsg = { action: 'set_autonomy', level: args.level || 'medium' };
+      break;
+    case 'query_detail':
+      controlMsg = { action: 'query_detail', scope: args.scope || 'current_turn', target: args.target || null };
+      break;
+    case 'recall_memory':
+      controlMsg = { action: 'recall_memory', keywords: args.keywords || null, tags: args.tags || null, channel: args.channel || null };
       break;
     default:
       addLog(`Unknown function: ${name}`, 'error');

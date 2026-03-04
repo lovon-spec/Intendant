@@ -9,6 +9,7 @@ pub enum SubAgentRole {
     Implementation,
     Testing,
     Orchestrator,
+    Presence,
     Custom(String),
 }
 
@@ -19,6 +20,7 @@ impl SubAgentRole {
             SubAgentRole::Implementation => "implementation",
             SubAgentRole::Testing => "testing",
             SubAgentRole::Orchestrator => "orchestrator",
+            SubAgentRole::Presence => "presence",
             SubAgentRole::Custom(s) => s,
         }
     }
@@ -29,6 +31,7 @@ impl SubAgentRole {
             "implementation" => SubAgentRole::Implementation,
             "testing" => SubAgentRole::Testing,
             "orchestrator" => SubAgentRole::Orchestrator,
+            "presence" => SubAgentRole::Presence,
             other => SubAgentRole::Custom(other.to_string()),
         }
     }
@@ -210,6 +213,78 @@ pub fn scan_completed_results(sub_agent_dir: &Path) -> Vec<SubAgentResult> {
     }
 
     results
+}
+
+/// Orchestrator project state checkpoint, persisted between context compactions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProjectState {
+    pub completed_tasks: Vec<String>,
+    pub active_tasks: Vec<String>,
+    pub constraints: Vec<String>,
+    pub decisions: Vec<String>,
+    pub updated_at: String,
+}
+
+/// Write a project state checkpoint to the given directory.
+#[allow(dead_code)]
+pub fn write_project_state(dir: &Path, state: &ProjectState) -> Result<(), CallerError> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir_all(dir)?;
+
+    // Write JSON (machine-readable)
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| CallerError::SubAgent(format!("Failed to serialize project state: {}", e)))?;
+    std::fs::write(dir.join("project_state.json"), &json)?;
+
+    // Write Markdown (human-readable)
+    let mut md = String::new();
+    md.push_str("# Project State Checkpoint\n\n");
+    md.push_str(&format!("Updated: {}\n\n", state.updated_at));
+    if !state.completed_tasks.is_empty() {
+        md.push_str("## Completed Tasks\n");
+        for task in &state.completed_tasks {
+            md.push_str(&format!("- {}\n", task));
+        }
+        md.push('\n');
+    }
+    if !state.active_tasks.is_empty() {
+        md.push_str("## Active Tasks\n");
+        for task in &state.active_tasks {
+            md.push_str(&format!("- {}\n", task));
+        }
+        md.push('\n');
+    }
+    if !state.decisions.is_empty() {
+        md.push_str("## Decisions\n");
+        for d in &state.decisions {
+            md.push_str(&format!("- {}\n", d));
+        }
+        md.push('\n');
+    }
+    if !state.constraints.is_empty() {
+        md.push_str("## Constraints\n");
+        for c in &state.constraints {
+            md.push_str(&format!("- {}\n", c));
+        }
+        md.push('\n');
+    }
+    std::fs::write(dir.join("project_state.md"), &md)?;
+
+    Ok(())
+}
+
+/// Read a project state checkpoint from the given directory.
+#[allow(dead_code)]
+pub fn read_project_state(dir: &Path) -> Result<ProjectState, CallerError> {
+    let path = dir.join("project_state.json");
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        CallerError::SubAgent(format!("Failed to read project state: {}", e))
+    })?;
+    serde_json::from_str(&content).map_err(|e| {
+        CallerError::SubAgent(format!("Failed to parse project state: {}", e))
+    })
 }
 
 fn shell_escape(s: &str) -> String {
@@ -568,5 +643,43 @@ mod tests {
     #[test]
     fn shell_escape_dollar() {
         assert_eq!(shell_escape("$HOME"), "'$HOME'");
+    }
+
+    #[test]
+    fn project_state_write_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ProjectState {
+            completed_tasks: vec!["research database".to_string()],
+            active_tasks: vec!["implement auth".to_string()],
+            constraints: vec!["Python 3.9+".to_string()],
+            decisions: vec!["Use PostgreSQL".to_string()],
+            updated_at: "2025-01-15T12:00:00".to_string(),
+        };
+        write_project_state(dir.path(), &state).unwrap();
+
+        let loaded = read_project_state(dir.path()).unwrap();
+        assert_eq!(loaded.completed_tasks, state.completed_tasks);
+        assert_eq!(loaded.active_tasks, state.active_tasks);
+        assert_eq!(loaded.constraints, state.constraints);
+        assert_eq!(loaded.decisions, state.decisions);
+        assert_eq!(loaded.updated_at, state.updated_at);
+
+        // Verify markdown file also exists
+        assert!(dir.path().join("project_state.md").exists());
+    }
+
+    #[test]
+    fn project_state_default() {
+        let state = ProjectState::default();
+        assert!(state.completed_tasks.is_empty());
+        assert!(state.active_tasks.is_empty());
+        assert!(state.constraints.is_empty());
+        assert!(state.decisions.is_empty());
+    }
+
+    #[test]
+    fn presence_role_roundtrip() {
+        assert_eq!(SubAgentRole::from_str("presence"), SubAgentRole::Presence);
+        assert_eq!(SubAgentRole::Presence.as_str(), "presence");
     }
 }

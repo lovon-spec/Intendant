@@ -1512,6 +1512,32 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::QueryDetail { scope, target } => {
+            // Log query detail requests; full handling via presence layer
+            let msg = format!("query_detail: scope={}, target={:?}", scope, target);
+            emit_control_result(
+                control_tx,
+                "query_detail",
+                true,
+                msg,
+                None,
+            );
+            None
+        }
+        ControlMsg::RecallMemory { keywords, tags, channel } => {
+            let msg = format!(
+                "recall_memory: keywords={:?}, tags={:?}, channel={:?}",
+                keywords, tags, channel
+            );
+            emit_control_result(
+                control_tx,
+                "recall_memory",
+                true,
+                msg,
+                None,
+            );
+            None
+        }
         ControlMsg::Quit => {
             let action = UserAction::Quit;
             let mut s = state.write().await;

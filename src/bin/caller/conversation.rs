@@ -219,6 +219,44 @@ impl Conversation {
     /// Keeps the system message, first 2 context messages (working directory + ack),
     /// and last 4 messages. Summarizes everything in between.
     /// Returns `true` if compaction occurred.
+    /// Auto-compact with a configurable threshold (e.g. 0.60 for proactive compaction).
+    #[allow(dead_code)]
+    pub fn auto_compact_at(&mut self, threshold: f64) -> bool {
+        if self.usage_fraction() < threshold {
+            return false;
+        }
+
+        let len = self.messages.len();
+        if len < 8 {
+            return false;
+        }
+
+        let keep_prefix = 3;
+        let keep_suffix = 4;
+        let tail_start = len - keep_suffix;
+
+        if keep_prefix >= tail_start {
+            return false;
+        }
+
+        let to_summarize: Vec<usize> = (keep_prefix..tail_start).collect();
+        if to_summarize.is_empty() {
+            return false;
+        }
+
+        let summary = format!(
+            "The conversation was compacted at turn {} (threshold {:.0}%). \
+             {} messages were summarized to free context space. \
+             The agent was working on the assigned task and making progress.",
+            self.turn,
+            threshold * 100.0,
+            to_summarize.len()
+        );
+
+        self.summarize_turns(&to_summarize, &summary);
+        true
+    }
+
     pub fn auto_compact(&mut self) -> bool {
         const COMPACTION_THRESHOLD: f64 = 0.90;
 
@@ -1106,5 +1144,45 @@ mod tests {
         let msg = &loaded.messages()[1];
         assert!(msg.images.is_some());
         assert_eq!(msg.images.as_ref().unwrap()[0].data, "base64data");
+    }
+
+    #[test]
+    fn auto_compact_at_custom_threshold() {
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        // Build up enough messages (system + 2 context + middle + 4 tail = 8+ needed)
+        conv.add_user("ctx1".to_string());
+        conv.add_assistant("ctx1-reply".to_string());
+        for i in 0..10 {
+            conv.add_user(format!("middle-{}", i));
+            conv.add_assistant(format!("reply-{}", i));
+        }
+        // Set usage at 65% — above 0.60 threshold but below 0.90
+        conv.set_usage(crate::provider::TokenUsage {
+            prompt_tokens: 65_000,
+            completion_tokens: 0,
+            total_tokens: 65_000,
+        });
+        // Standard auto_compact (0.90 threshold) should NOT trigger
+        assert!(!conv.auto_compact());
+        let before = conv.len();
+        // Custom 0.60 threshold SHOULD trigger
+        assert!(conv.auto_compact_at(0.60));
+        assert!(conv.len() < before);
+    }
+
+    #[test]
+    fn auto_compact_at_below_custom_threshold_noop() {
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        for i in 0..10 {
+            conv.add_user(format!("u{}", i));
+            conv.add_assistant(format!("a{}", i));
+        }
+        conv.set_usage(crate::provider::TokenUsage {
+            prompt_tokens: 50_000,
+            completion_tokens: 0,
+            total_tokens: 50_000,
+        });
+        // 50% is below 0.60 threshold
+        assert!(!conv.auto_compact_at(0.60));
     }
 }

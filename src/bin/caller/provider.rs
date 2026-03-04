@@ -1885,6 +1885,74 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
     }
 }
 
+/// Like `select_provider()` but accepts explicit provider/model overrides
+/// instead of reading from the primary `PROVIDER`/`MODEL_NAME` env vars.
+/// Falls back to env-based API key resolution.
+pub fn select_provider_with_overrides(
+    provider_name: Option<&str>,
+    model_name: Option<&str>,
+) -> Result<Box<dyn ChatProvider>, CallerError> {
+    // Also check PRESENCE_PROVIDER / PRESENCE_MODEL env vars as secondary fallback
+    let provider_str = provider_name
+        .map(|s| s.to_string())
+        .or_else(|| env::var("PRESENCE_PROVIDER").ok())
+        .or_else(|| env::var("PROVIDER").ok());
+    let model_str = model_name
+        .map(|s| s.to_string())
+        .or_else(|| env::var("PRESENCE_MODEL").ok());
+
+    let openai_key = env::var("OPENAI_API_KEY")
+        .or_else(|_| env::var("OPENAI"))
+        .ok();
+    let anthropic_key = env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| env::var("ANTHROPIC"))
+        .ok();
+    let gemini_key = env::var("GEMINI_API_KEY")
+        .or_else(|_| env::var("GEMINI"))
+        .ok();
+
+    match provider_str.as_deref() {
+        Some("gemini") => {
+            let key = gemini_key.ok_or_else(|| {
+                CallerError::Config("Presence provider=gemini but no GEMINI_API_KEY found.".into())
+            })?;
+            let model = model_str.unwrap_or_else(|| "gemini-2.5-flash".to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(GeminiProvider::new(key, model, ctx, max_out)))
+        }
+        Some("anthropic") => {
+            let key = anthropic_key.ok_or_else(|| {
+                CallerError::Config(
+                    "Presence provider=anthropic but no ANTHROPIC_API_KEY found.".into(),
+                )
+            })?;
+            let model =
+                model_str.unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(AnthropicProvider::new(key, model, ctx, max_out)))
+        }
+        Some("openai") => {
+            let key = openai_key.ok_or_else(|| {
+                CallerError::Config("Presence provider=openai but no OPENAI_API_KEY found.".into())
+            })?;
+            let model = model_str.unwrap_or_else(|| "gpt-5.2-codex".to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(OpenAIProvider::new(key, model, ctx, max_out)))
+        }
+        Some(other) => Err(CallerError::Config(format!(
+            "Unknown presence provider: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
+            other
+        ))),
+        None => {
+            // No explicit override — fall back to the standard select_provider logic
+            select_provider()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

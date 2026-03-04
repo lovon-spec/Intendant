@@ -196,6 +196,19 @@ pub enum ControlMsg {
     FollowUp {
         text: String,
     },
+    QueryDetail {
+        scope: String,
+        #[serde(default)]
+        target: Option<String>,
+    },
+    RecallMemory {
+        #[serde(default)]
+        keywords: Option<Vec<String>>,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
+        #[serde(default)]
+        channel: Option<String>,
+    },
     Quit,
 }
 
@@ -513,6 +526,15 @@ mod tests {
             ControlMsg::FollowUp {
                 text: "continue working".to_string(),
             },
+            ControlMsg::QueryDetail {
+                scope: "diff".to_string(),
+                target: None,
+            },
+            ControlMsg::RecallMemory {
+                keywords: Some(vec!["auth".to_string()]),
+                tags: None,
+                channel: Some("project_state".to_string()),
+            },
             ControlMsg::Quit,
         ];
         for msg in msgs {
@@ -586,5 +608,67 @@ mod tests {
         assert_ne!(ApprovalResponse::Approve, ApprovalResponse::Deny);
         assert_ne!(ApprovalResponse::Skip, ApprovalResponse::ApproveAll);
         assert_eq!(ApprovalResponse::Approve, ApprovalResponse::Approve);
+    }
+
+    #[test]
+    fn control_msg_query_detail_deserialize() {
+        let json = r#"{"action":"query_detail","scope":"diff"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::QueryDetail { scope, target } => {
+                assert_eq!(scope, "diff");
+                assert!(target.is_none());
+            }
+            _ => panic!("expected QueryDetail"),
+        }
+    }
+
+    #[test]
+    fn control_msg_query_detail_with_target() {
+        let json = r#"{"action":"query_detail","scope":"file","target":"src/main.rs"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::QueryDetail { scope, target } => {
+                assert_eq!(scope, "file");
+                assert_eq!(target.as_deref(), Some("src/main.rs"));
+            }
+            _ => panic!("expected QueryDetail"),
+        }
+    }
+
+    #[test]
+    fn control_msg_recall_memory_deserialize() {
+        let json = r#"{"action":"recall_memory","keywords":["auth","login"],"channel":"project_state"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::RecallMemory {
+                keywords,
+                tags,
+                channel,
+            } => {
+                assert_eq!(keywords, Some(vec!["auth".to_string(), "login".to_string()]));
+                assert!(tags.is_none());
+                assert_eq!(channel.as_deref(), Some("project_state"));
+            }
+            _ => panic!("expected RecallMemory"),
+        }
+    }
+
+    #[test]
+    fn control_msg_recall_memory_minimal() {
+        let json = r#"{"action":"recall_memory"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::RecallMemory {
+                keywords,
+                tags,
+                channel,
+            } => {
+                assert!(keywords.is_none());
+                assert!(tags.is_none());
+                assert!(channel.is_none());
+            }
+            _ => panic!("expected RecallMemory"),
+        }
     }
 }

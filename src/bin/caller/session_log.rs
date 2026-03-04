@@ -680,6 +680,20 @@ impl Drop for SessionLog {
     }
 }
 
+/// Read the last `count` lines from the session.jsonl file in the given log directory.
+/// Returns an empty vec if the file doesn't exist or can't be read.
+pub fn recent_entries(log_dir: &std::path::Path, count: usize) -> Vec<String> {
+    let path = log_dir.join("session.jsonl");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = lines.len().saturating_sub(count);
+            lines[start..].iter().map(|l| l.to_string()).collect()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,5 +1152,43 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn recent_entries_returns_last_n_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        fs::create_dir_all(&log_dir).unwrap();
+        let jsonl_path = log_dir.join("session.jsonl");
+        let mut f = fs::File::create(&jsonl_path).unwrap();
+        for i in 0..10 {
+            use std::io::Write;
+            writeln!(f, r#"{{"event":"test","index":{}}}"#, i).unwrap();
+        }
+        drop(f);
+
+        let entries = recent_entries(&log_dir, 3);
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].contains("\"index\":7"));
+        assert!(entries[2].contains("\"index\":9"));
+    }
+
+    #[test]
+    fn recent_entries_missing_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = recent_entries(dir.path(), 5);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn recent_entries_fewer_than_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        fs::create_dir_all(&log_dir).unwrap();
+        let jsonl_path = log_dir.join("session.jsonl");
+        fs::write(&jsonl_path, "{\"a\":1}\n{\"a\":2}\n").unwrap();
+
+        let entries = recent_entries(&log_dir, 100);
+        assert_eq!(entries.len(), 2);
     }
 }

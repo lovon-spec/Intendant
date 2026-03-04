@@ -156,6 +156,8 @@ pub struct App {
     pub round: usize,
     pub follow_up_textarea: Option<tui_textarea::TextArea<'static>>,
     pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// When presence layer is active, follow-up input goes here instead.
+    pub presence_tx: Option<tokio::sync::mpsc::Sender<String>>,
 
     // Vision display info (shown in status bar when active)
     pub display_info: Option<String>,
@@ -195,12 +197,17 @@ impl App {
             round: 1,
             follow_up_textarea: None,
             follow_up_tx: None,
+            presence_tx: None,
             display_info: None,
         }
     }
 
     pub fn set_follow_up_sender(&mut self, tx: tokio::sync::mpsc::Sender<String>) {
         self.follow_up_tx = Some(tx);
+    }
+
+    pub fn set_presence_sender(&mut self, tx: tokio::sync::mpsc::Sender<String>) {
+        self.presence_tx = Some(tx);
     }
 
     pub fn set_control_socket(&mut self, tx: tokio::sync::broadcast::Sender<String>) {
@@ -591,7 +598,10 @@ impl App {
                         return true;
                     }
 
-                    if let Some(ref tx) = self.follow_up_tx {
+                    // Route through presence layer if active, else direct follow-up
+                    if let Some(ref tx) = self.presence_tx {
+                        let _ = tx.try_send(text.clone());
+                    } else if let Some(ref tx) = self.follow_up_tx {
                         let _ = tx.try_send(text.clone());
                     }
                     self.log(LogLevel::Info, format!("Follow-up: {}", truncate_str(&text, 80)));
@@ -771,7 +781,10 @@ impl App {
             }
             ControlMsg::FollowUp { text } => {
                 if self.mode == AppMode::FollowUp {
-                    if let Some(ref tx) = self.follow_up_tx {
+                    // Route through presence layer if active
+                    if let Some(ref tx) = self.presence_tx {
+                        let _ = tx.try_send(text.clone());
+                    } else if let Some(ref tx) = self.follow_up_tx {
                         let _ = tx.try_send(text.clone());
                     }
                     self.follow_up_textarea = None;
@@ -780,6 +793,19 @@ impl App {
                     self.round += 1;
                     self.log(LogLevel::Info, format!("Follow-up via control socket: {}", truncate_str(&text, 80)));
                 }
+            }
+            ControlMsg::QueryDetail { scope, .. } => {
+                self.log(
+                    LogLevel::Info,
+                    format!("Query detail request: {}", scope),
+                );
+            }
+            ControlMsg::RecallMemory { keywords, .. } => {
+                let kws = keywords.as_deref().unwrap_or(&[]);
+                self.log(
+                    LogLevel::Info,
+                    format!("Memory recall request: {:?}", kws),
+                );
             }
             ControlMsg::Quit => {
                 self.should_quit = true;
