@@ -10,6 +10,13 @@ pub enum MessageLayer {
     SubAgent,
 }
 
+/// Base64-encoded image data attached to a message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    pub media_type: String, // e.g. "image/png"
+    pub data: String,       // base64-encoded
+}
+
 /// Reference to a tool call, stored on assistant messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRef {
@@ -35,6 +42,9 @@ pub struct Message {
     /// Name of the tool this result is for (present on tool result messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Base64-encoded images attached to this message (e.g. from captureScreen).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
     /// Raw output items from the API response (for verbatim echo-back).
     /// Used by OpenAI Responses API to echo reasoning + function_call items together.
     #[serde(skip)]
@@ -122,6 +132,29 @@ impl Conversation {
             content: output.to_string(),
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some(name.to_string()),
+            layer: None,
+            ..Default::default()
+        });
+    }
+
+    /// Add a tool result message with attached images.
+    pub fn add_tool_result_with_images(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        output: &str,
+        images: Vec<ImageData>,
+    ) {
+        self.messages.push(Message {
+            role: "tool".to_string(),
+            content: output.to_string(),
+            tool_call_id: Some(call_id.to_string()),
+            tool_name: Some(name.to_string()),
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(images)
+            },
             layer: None,
             ..Default::default()
         });
@@ -985,5 +1018,93 @@ mod tests {
         });
         // Only 5 messages — too few to compact
         assert!(!conv.auto_compact());
+    }
+
+    // --- ImageData tests ---
+
+    #[test]
+    fn add_tool_result_with_images_sets_field() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_tool_result_with_images(
+            "call_1",
+            "capture_screen",
+            "screenshot taken",
+            vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: "iVBORw0KGgo=".to_string(),
+            }],
+        );
+        let msg = &conv.messages()[1];
+        assert_eq!(msg.role, "tool");
+        assert!(msg.images.is_some());
+        let images = msg.images.as_ref().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(images[0].data, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn add_tool_result_with_empty_images_sets_none() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_tool_result_with_images("call_1", "capture_screen", "output", vec![]);
+        let msg = &conv.messages()[1];
+        assert!(msg.images.is_none());
+    }
+
+    #[test]
+    fn image_data_serialization_roundtrip() {
+        let msg = Message {
+            role: "tool".to_string(),
+            content: "result".to_string(),
+            tool_call_id: Some("call_1".to_string()),
+            tool_name: Some("capture_screen".to_string()),
+            images: Some(vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: "abc123".to_string(),
+            }]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("images"));
+        assert!(json.contains("image/png"));
+        let deserialized: Message = serde_json::from_str(&json).unwrap();
+        let images = deserialized.images.unwrap();
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(images[0].data, "abc123");
+    }
+
+    #[test]
+    fn message_without_images_omits_field() {
+        let msg = Message {
+            role: "tool".to_string(),
+            content: "result".to_string(),
+            tool_call_id: Some("call_1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("images"));
+    }
+
+    #[test]
+    fn save_and_load_with_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_tool_result_with_images(
+            "call_1",
+            "capture_screen",
+            "result",
+            vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: "base64data".to_string(),
+            }],
+        );
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 128_000).unwrap();
+        let msg = &loaded.messages()[1];
+        assert!(msg.images.is_some());
+        assert_eq!(msg.images.as_ref().unwrap()[0].data, "base64data");
     }
 }

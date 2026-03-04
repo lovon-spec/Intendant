@@ -458,6 +458,23 @@ fn has_exec_command(json_str: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Try to encode a captureScreen result as base64 image data.
+/// Returns `Some(vec![ImageData])` on success, `None` on any failure.
+fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> {
+    let parsed: serde_json::Value = serde_json::from_str(result_text).ok()?;
+    if parsed.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let path_str = parsed.get("screenshot_path").and_then(|v| v.as_str())?;
+    let bytes = std::fs::read(path_str).ok()?;
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(vec![conversation::ImageData {
+        media_type: "image/png".to_string(),
+        data: encoded,
+    }])
+}
+
 /// Auto-launch Xvfb when no working display exists and the batch needs one.
 ///
 /// Detection flow:
@@ -1131,6 +1148,46 @@ Also: {"source": "bare"}"#;
     #[test]
     fn has_capture_screen_command_invalid_json() {
         assert!(!has_capture_screen_command("not json"));
+    }
+
+    #[test]
+    fn encode_screenshot_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let img_path = dir.path().join("test.png");
+        std::fs::write(&img_path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let json = serde_json::json!({
+            "success": true,
+            "screenshot_path": img_path.to_str().unwrap(),
+        });
+        let result = encode_screenshot(&json.to_string());
+        assert!(result.is_some());
+        let images = result.unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert!(!images[0].data.is_empty());
+    }
+
+    #[test]
+    fn encode_screenshot_missing_file() {
+        let json = r#"{"success":true,"screenshot_path":"/tmp/nonexistent_screenshot_12345.png"}"#;
+        assert!(encode_screenshot(json).is_none());
+    }
+
+    #[test]
+    fn encode_screenshot_success_false() {
+        let json = r#"{"success":false,"screenshot_path":"/tmp/whatever.png"}"#;
+        assert!(encode_screenshot(json).is_none());
+    }
+
+    #[test]
+    fn encode_screenshot_invalid_json() {
+        assert!(encode_screenshot("not json").is_none());
+    }
+
+    #[test]
+    fn encode_screenshot_missing_path_field() {
+        let json = r#"{"success":true}"#;
+        assert!(encode_screenshot(json).is_none());
     }
 
     #[test]
@@ -2014,6 +2071,14 @@ async fn run_agent_loop(
             let budget = conversation.budget_summary();
             for (call_id, tool_name, result_text) in &tool_results {
                 let text = format!("{}\n\n{}", result_text, budget);
+                if tool_name == "capture_screen" {
+                    if let Some(images) = encode_screenshot(result_text) {
+                        conversation.add_tool_result_with_images(
+                            call_id, tool_name, &text, images,
+                        );
+                        continue;
+                    }
+                }
                 conversation.add_tool_result(call_id, tool_name, &text);
             }
         } else {

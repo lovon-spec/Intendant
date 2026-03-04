@@ -757,6 +757,22 @@ fn build_openai_request_parts(
             if m.role == "tool" {
                 if let Some(ref call_id) = m.tool_call_id {
                     items.push(openai_function_call_output(call_id, &m.content));
+                    if let Some(ref images) = m.images {
+                        let mut content_parts = vec![serde_json::json!({
+                            "type": "input_text",
+                            "text": "Screenshot from the previous tool call:",
+                        })];
+                        for img in images {
+                            content_parts.push(serde_json::json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{};base64,{}", img.media_type, img.data),
+                            }));
+                        }
+                        items.push(serde_json::json!({
+                            "role": "user",
+                            "content": content_parts,
+                        }));
+                    }
                     return items;
                 }
             }
@@ -1195,10 +1211,29 @@ fn build_anthropic_messages(messages: &[Message]) -> (serde_json::Value, Vec<Ant
         }
         if m.role == "tool" {
             if let Some(ref call_id) = m.tool_call_id {
+                let tool_content = if let Some(ref images) = m.images {
+                    let mut parts = vec![serde_json::json!({
+                        "type": "text",
+                        "text": m.content,
+                    })];
+                    for img in images {
+                        parts.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data,
+                            }
+                        }));
+                    }
+                    serde_json::Value::Array(parts)
+                } else {
+                    serde_json::Value::String(m.content.clone())
+                };
                 let block = serde_json::json!([{
                     "type": "tool_result",
                     "tool_use_id": call_id,
-                    "content": m.content,
+                    "content": tool_content,
                 }]);
                 api_messages.push(AnthropicMessage {
                     role: "user".to_string(),
@@ -1598,6 +1633,23 @@ fn build_gemini_request_parts(
                         }
                     }]
                 }));
+                if let Some(ref images) = m.images {
+                    let mut parts = vec![serde_json::json!({
+                        "text": "Screenshot from the previous tool call:",
+                    })];
+                    for img in images {
+                        parts.push(serde_json::json!({
+                            "inlineData": {
+                                "mimeType": img.media_type,
+                                "data": img.data,
+                            }
+                        }));
+                    }
+                    contents.push(serde_json::json!({
+                        "role": "user",
+                        "parts": parts,
+                    }));
+                }
                 continue;
             }
         }
@@ -2848,5 +2900,175 @@ mod tests {
         assert_eq!(sys.as_deref(), Some("System"));
         assert_eq!(contents.len(), 1);
         assert!(body.get("contents").is_some());
+    }
+
+    // --- Image/vision provider tests ---
+
+    fn tool_msg_with_images() -> Message {
+        use crate::conversation::ImageData;
+        Message {
+            role: "tool".to_string(),
+            content: "screenshot taken".to_string(),
+            tool_call_id: Some("call_1".to_string()),
+            tool_name: Some("capture_screen".to_string()),
+            images: Some(vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: "iVBORw0KGgo=".to_string(),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn openai_builder_includes_image_after_tool_result() {
+        let provider = OpenAIProvider::new(
+            "key".to_string(),
+            "gpt-4".to_string(),
+            128_000,
+            16_384,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            tool_msg_with_images(),
+        ];
+        let (_instr, input, _text, _tools) = build_openai_request_parts(&messages, &provider);
+        // Should have function_call_output + user message with image
+        assert!(input.len() >= 2);
+        let image_msg = &input[1];
+        assert_eq!(image_msg["role"].as_str(), Some("user"));
+        let content = image_msg["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"].as_str(), Some("input_text"));
+        assert_eq!(content[1]["type"].as_str(), Some("input_image"));
+        let url = content[1]["image_url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn openai_builder_no_image_without_images_field() {
+        let provider = OpenAIProvider::new(
+            "key".to_string(),
+            "gpt-4".to_string(),
+            128_000,
+            16_384,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: "result".to_string(),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+        ];
+        let (_instr, input, _text, _tools) = build_openai_request_parts(&messages, &provider);
+        // Should have only the function_call_output, no user image message
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"].as_str(), Some("function_call_output"));
+    }
+
+    #[test]
+    fn anthropic_builder_includes_image_in_tool_result() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            tool_msg_with_images(),
+        ];
+        let (_system, api_msgs) = build_anthropic_messages(&messages);
+        assert_eq!(api_msgs.len(), 1);
+        let content = api_msgs[0].content.as_array().unwrap();
+        let tool_result = &content[0];
+        assert_eq!(tool_result["type"].as_str(), Some("tool_result"));
+        let inner = tool_result["content"].as_array().unwrap();
+        assert_eq!(inner[0]["type"].as_str(), Some("text"));
+        assert_eq!(inner[1]["type"].as_str(), Some("image"));
+        assert_eq!(inner[1]["source"]["type"].as_str(), Some("base64"));
+        assert_eq!(inner[1]["source"]["media_type"].as_str(), Some("image/png"));
+    }
+
+    #[test]
+    fn anthropic_builder_plain_string_without_images() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: "result".to_string(),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+        ];
+        let (_system, api_msgs) = build_anthropic_messages(&messages);
+        let content = api_msgs[0].content.as_array().unwrap();
+        let tool_result = &content[0];
+        // content should be a plain string, not an array
+        assert!(tool_result["content"].is_string());
+    }
+
+    #[test]
+    fn gemini_builder_includes_image_after_function_response() {
+        let provider = GeminiProvider::new(
+            "key".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1_048_576,
+            65_536,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            tool_msg_with_images(),
+        ];
+        let (_sys, contents, _body) = build_gemini_request_parts(&messages, &provider);
+        // Should have functionResponse + user message with inlineData
+        assert_eq!(contents.len(), 2);
+        let img_msg = &contents[1];
+        assert_eq!(img_msg["role"].as_str(), Some("user"));
+        let parts = img_msg["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["text"].as_str().unwrap(), "Screenshot from the previous tool call:");
+        assert_eq!(parts[1]["inlineData"]["mimeType"].as_str(), Some("image/png"));
+        assert_eq!(parts[1]["inlineData"]["data"].as_str(), Some("iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn gemini_builder_no_image_without_images_field() {
+        let provider = GeminiProvider::new(
+            "key".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1_048_576,
+            65_536,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: r#"{"output":"result"}"#.to_string(),
+                tool_call_id: Some("call_1".to_string()),
+                tool_name: Some("capture_screen".to_string()),
+                ..Default::default()
+            },
+        ];
+        let (_sys, contents, _body) = build_gemini_request_parts(&messages, &provider);
+        // Should have only the functionResponse, no user image message
+        assert_eq!(contents.len(), 1);
     }
 }

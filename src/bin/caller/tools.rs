@@ -99,7 +99,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
         tools.push(ToolDefinition {
             name: "capture_screen".to_string(),
-            description: "Capture a screenshot of an X11 display. Screenshots are saved to the log directory. The runtime auto-discovers active displays, skipping :0. Chain after UI interactions to verify success. Optional: `display` (integer) — X11 display number, omit to auto-discover.".to_string(),
+            description: "Capture a screenshot of an X11 display. The screenshot image is sent back to you for visual inspection. Screenshots are also saved to the log directory. The runtime auto-discovers active displays, skipping :0. Chain after UI interactions to verify success. Optional: `display` (integer) — X11 display number, omit to auto-discover.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
