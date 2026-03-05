@@ -3435,11 +3435,18 @@ async fn main() -> Result<(), CallerError> {
         return Ok(());
     }
 
-    // In MCP mode, a task is optional — it can be started later via the
-    // `start_task` MCP tool. We must NOT call get_task_from_flags_or_env()
-    // because it would print to stdout and read from stdin, both of which
-    // are reserved for the MCP JSON-RPC transport.
+    // Determine whether to use TUI (needed early for task resolution)
+    let use_tui =
+        !flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal();
+
+    // Task resolution: MCP and TUI modes allow starting without a task.
+    // MCP mode must NOT call get_task_from_flags_or_env() because it would
+    // print to stdout and read from stdin, both reserved for JSON-RPC.
+    // TUI mode can accept a task later via the follow-up input panel.
+    // Headless mode still requires a task upfront.
     let task = if flags.mcp {
+        flags.task.clone().filter(|t| !t.is_empty())
+    } else if use_tui {
         flags.task.clone().filter(|t| !t.is_empty())
     } else {
         let t = get_task_from_flags_or_env(&flags)?;
@@ -3452,10 +3459,6 @@ async fn main() -> Result<(), CallerError> {
     if let Some(ref t) = task {
         slog(&session_log, |l| l.info(&format!("Task: {}", t)));
     }
-
-    // Determine whether to use TUI
-    let use_tui =
-        !flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal();
 
     // Build autonomy state from project config + CLI flags
     let autonomy_state = AutonomyState::new(flags.autonomy, project.config.approval.clone());
@@ -3709,8 +3712,7 @@ async fn main() -> Result<(), CallerError> {
             control::cleanup();
         }
     } else if use_tui {
-        // Non-MCP paths always have a task (enforced above).
-        let task = task.unwrap();
+        // TUI mode — task may be None (user provides it via follow-up input)
 
         // TUI mode
         let (bus, event_rx) = EventBus::new();
@@ -3775,16 +3777,34 @@ async fn main() -> Result<(), CallerError> {
             None
         };
 
-        app.log(tui::app::LogLevel::Info, format!("Task: {}", task));
+        if let Some(ref t) = task {
+            app.log(tui::app::LogLevel::Info, format!("Task: {}", t));
+        }
 
         // Determine if presence layer should be active
         let use_presence = !flags.direct
             && !flags.no_presence
             && project.config.presence.enabled;
 
-        // Create follow-up channel for multi-round support
-        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+        // Create follow-up channel for multi-round support.
+        // When there is no initial task, the follow-up channel also delivers
+        // the very first task from the input panel.
+        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
         app.set_follow_up_sender(follow_up_tx);
+
+        // If no task was provided, start in follow-up mode so the user sees
+        // the input panel immediately.
+        if task.is_none() {
+            app.current_phase = tui::app::Phase::WaitingFollowUp;
+            app.mode = tui::app::AppMode::FollowUp;
+            let mut textarea = tui_textarea::TextArea::default();
+            textarea.set_cursor_line_style(ratatui::style::Style::default());
+            app.follow_up_textarea = Some(textarea);
+            app.log(
+                tui::app::LogLevel::Info,
+                "Ready. Enter a task to get started.".to_string(),
+            );
+        }
 
         // If presence is active, create channels for user ↔ presence communication
         let presence_user_rx = if use_presence {
@@ -3800,8 +3820,6 @@ async fn main() -> Result<(), CallerError> {
         // Spawn the agent loop in a background task
         let bus_clone = bus.clone();
         let autonomy_clone = autonomy.clone();
-        let task_clone = task.clone();
-        let task_for_summary = task.clone();
         let session_log_clone = session_log.clone();
         let session_log_summary = session_log.clone();
         let log_dir_clone = log_dir.clone();
@@ -3831,7 +3849,7 @@ async fn main() -> Result<(), CallerError> {
 
             tokio::spawn(async move {
                 let result = run_with_presence(
-                    Some(task_clone),
+                    task,
                     project,
                     bus_clone.clone(),
                     autonomy_clone,
@@ -3846,7 +3864,7 @@ async fn main() -> Result<(), CallerError> {
                     Ok(stats) => {
                         slog(&session_log_summary, |l| {
                             l.write_summary_with_rounds(
-                                &task_for_summary,
+                                "(presence)",
                                 "completed",
                                 stats.turns,
                                 Some(stats.rounds),
@@ -3856,7 +3874,7 @@ async fn main() -> Result<(), CallerError> {
                     Err(e) => {
                         slog(&session_log_summary, |l| {
                             l.write_summary(
-                                &task_for_summary,
+                                "(presence)",
                                 &format!("error: {}", e),
                                 0,
                             )
@@ -3866,12 +3884,34 @@ async fn main() -> Result<(), CallerError> {
                 }
             })
         } else {
-            // Standard mode: direct agent loop
+            // Standard mode: direct agent loop.
+            // When task is None, wait for the first follow-up message to
+            // use as the task. This lets the TUI start idle.
             tokio::spawn(async move {
-                let result = if force_direct || is_simple_task(&task_clone) {
+                let (task_str, follow_up_rx) = if let Some(t) = task {
+                    (t, follow_up_rx)
+                } else {
+                    // Wait for the first message from the follow-up panel
+                    match follow_up_rx.recv().await {
+                        Some(first_task) => {
+                            slog(&session_log_clone, |l| {
+                                l.info(&format!("Task (from input): {}", first_task))
+                            });
+                            bus_clone.send(AppEvent::TurnStarted {
+                                turn: 0,
+                                budget_pct: 0.0,
+                                remaining: 0,
+                            });
+                            (first_task, follow_up_rx)
+                        }
+                        None => return, // channel closed before a task arrived
+                    }
+                };
+
+                let result = if force_direct || is_simple_task(&task_str) {
                     run_direct_mode(
                         provider,
-                        task_clone,
+                        task_str,
                         project,
                         Some(bus_clone.clone()),
                         autonomy_clone,
@@ -3884,7 +3924,7 @@ async fn main() -> Result<(), CallerError> {
                 } else {
                     run_user_mode(
                         provider,
-                        task_clone,
+                        task_str,
                         project,
                         Some(bus_clone.clone()),
                         autonomy_clone,
@@ -3897,7 +3937,7 @@ async fn main() -> Result<(), CallerError> {
                     Ok(stats) => {
                         slog(&session_log_summary, |l| {
                             l.write_summary_with_rounds(
-                                &task_for_summary,
+                                "(tui)",
                                 "completed",
                                 stats.turns,
                                 Some(stats.rounds),
@@ -3907,7 +3947,7 @@ async fn main() -> Result<(), CallerError> {
                     Err(e) => {
                         slog(&session_log_summary, |l| {
                             l.write_summary(
-                                &task_for_summary,
+                                "(tui)",
                                 &format!("error: {}", e),
                                 0,
                             )
@@ -3937,7 +3977,7 @@ async fn main() -> Result<(), CallerError> {
             .restore()
             .map_err(|e| CallerError::Tui(e.to_string()))?;
     } else {
-        // Non-MCP paths always have a task (enforced above).
+        // Headless mode always has a task (enforced above).
         let task = task.unwrap();
 
         // Headless mode (--no-tui or non-TTY)
