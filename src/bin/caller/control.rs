@@ -42,6 +42,18 @@ pub enum OutboundEvent {
         turn: usize,
         phase: String,
         autonomy: String,
+        session_id: String,
+        task: String,
+    },
+    Usage {
+        main: crate::frontend::ModelUsageSnapshot,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presence: Option<crate::frontend::ModelUsageSnapshot>,
+    },
+    UsageUpdate {
+        main: crate::frontend::ModelUsageSnapshot,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presence: Option<crate::frontend::ModelUsageSnapshot>,
     },
     CommandResult {
         action: String,
@@ -260,10 +272,14 @@ mod tests {
             turn: 3,
             phase: "thinking".to_string(),
             autonomy: "medium".to_string(),
+            session_id: "abc-123".to_string(),
+            task: "list files".to_string(),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"status\""));
         assert!(json.contains("\"turn\":3"));
+        assert!(json.contains("\"session_id\":\"abc-123\""));
+        assert!(json.contains("\"task\":\"list files\""));
     }
 
     #[test]

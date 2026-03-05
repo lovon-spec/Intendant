@@ -143,6 +143,7 @@ pub enum ApprovalResponse {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ControlMsg {
     Status,
+    Usage,
     Approve {
         id: u64,
     },
@@ -549,12 +550,20 @@ mod tests {
                 tags: None,
                 channel: Some("project_state".to_string()),
             },
+            ControlMsg::Usage,
             ControlMsg::Quit,
         ];
         for msg in msgs {
             let json = serde_json::to_string(&msg).unwrap();
             let _: ControlMsg = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    #[test]
+    fn control_msg_usage_deserialize() {
+        let json = r#"{"action":"usage"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ControlMsg::Usage));
     }
 
     #[test]

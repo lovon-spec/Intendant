@@ -145,6 +145,11 @@ pub struct App {
 
     // Token tracking
     pub session_tokens: u64,
+    pub context_window: u64,
+
+    // Session metadata
+    pub session_id: String,
+    pub task_description: String,
 
     // Animation
     pub tick_count: usize,
@@ -202,6 +207,9 @@ impl App {
             control_tx: None,
             log_dir,
             session_tokens: 0,
+            context_window: 0,
+            session_id: String::new(),
+            task_description: String::new(),
             tick_count: 0,
             streaming_buffer: String::new(),
             round: 1,
@@ -231,6 +239,38 @@ impl App {
         tx: tokio::sync::mpsc::Sender<crate::presence::PresenceEvent>,
     ) {
         self.presence_event_tx = Some(tx);
+    }
+
+    /// Build a usage snapshot for the main model.
+    fn main_usage_snapshot(&self) -> crate::frontend::ModelUsageSnapshot {
+        crate::frontend::ModelUsageSnapshot {
+            provider: self.provider_name.clone(),
+            model: self.model_name.clone(),
+            tokens_used: self.session_tokens,
+            context_window: self.context_window,
+            usage_pct: self.budget_pct,
+        }
+    }
+
+    /// Build a usage snapshot for the presence model, if active.
+    fn presence_usage_snapshot(&self) -> Option<crate::frontend::ModelUsageSnapshot> {
+        self.presence_provider_name.as_ref().map(|provider| {
+            crate::frontend::ModelUsageSnapshot {
+                provider: provider.clone(),
+                model: self.presence_model_name.clone().unwrap_or_default(),
+                tokens_used: self.presence_tokens,
+                context_window: self.presence_context_window,
+                usage_pct: self.presence_usage_pct,
+            }
+        })
+    }
+
+    /// Broadcast a usage update to all connected control socket clients.
+    fn broadcast_usage_update(&self) {
+        self.broadcast_control(OutboundEvent::UsageUpdate {
+            main: self.main_usage_snapshot(),
+            presence: self.presence_usage_snapshot(),
+        });
     }
 
     /// Forward a filtered event to the presence layer (non-blocking).
@@ -741,6 +781,14 @@ impl App {
                     turn: self.turn,
                     phase: format!("{:?}", self.current_phase).to_lowercase(),
                     autonomy: self.autonomy_display.to_lowercase(),
+                    session_id: self.session_id.clone(),
+                    task: self.task_description.clone(),
+                });
+            }
+            ControlMsg::Usage => {
+                self.broadcast_control(OutboundEvent::Usage {
+                    main: self.main_usage_snapshot(),
+                    presence: self.presence_usage_snapshot(),
                 });
             }
             ControlMsg::Approve { id } => {
@@ -913,6 +961,7 @@ impl App {
                 self.turn = turn;
                 self.session_tokens += usage.total_tokens;
                 self.streaming_buffer.clear();
+                self.broadcast_usage_update();
                 // Show human-readable command summary at Model level (visible at Normal verbosity)
                 let summary = format_model_summary(&content);
                 self.log(LogLevel::Model, format!("T{}: {}", turn, summary));
@@ -1131,6 +1180,7 @@ impl App {
                     self.presence_provider_name = Some(provider);
                     self.presence_model_name = Some(model);
                 }
+                self.broadcast_usage_update();
             }
             AppEvent::Tick => {
                 self.tick_count += 1;

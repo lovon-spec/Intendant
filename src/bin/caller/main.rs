@@ -3543,12 +3543,16 @@ async fn main() -> Result<(), CallerError> {
             None
         };
 
-        let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp::McpAppState::new(
+        let mut mcp_app_state = mcp::McpAppState::new(
             provider.name().to_string(),
             provider.model().to_string(),
             autonomy.clone(),
             log_dir.clone(),
-        )));
+        );
+        mcp_app_state.context_window = provider.context_window();
+        mcp_app_state.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
+        mcp_app_state.task_description = task.clone().unwrap_or_default();
+        let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_app_state));
 
         // Build a launcher closure that can spawn the agent loop on demand.
         // This captures the provider factory parameters (not the provider itself,
@@ -3762,6 +3766,9 @@ async fn main() -> Result<(), CallerError> {
             autonomy.clone(),
             log_dir.clone(),
         );
+        app.context_window = provider.context_window();
+        app.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
+        app.task_description = task.clone().unwrap_or_default();
         app.verbosity = if flags.verbose {
             tui::app::Verbosity::Debug
         } else {

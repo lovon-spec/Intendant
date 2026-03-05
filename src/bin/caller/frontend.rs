@@ -49,6 +49,8 @@ pub enum UserAction {
 /// A snapshot of the current status bar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
+    pub session_id: String,
+    pub task: String,
     pub provider: String,
     pub model: String,
     pub turn: usize,
@@ -59,6 +61,24 @@ pub struct StatusSnapshot {
     pub session_tokens: u64,
     #[serde(default)]
     pub round: usize,
+}
+
+/// Token usage snapshot for a single model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsageSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub tokens_used: u64,
+    pub context_window: u64,
+    pub usage_pct: f64,
+}
+
+/// Combined usage snapshot for all models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    pub main: ModelUsageSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence: Option<ModelUsageSnapshot>,
 }
 
 /// A single log entry in serializable form.
@@ -93,6 +113,8 @@ pub struct HumanQuestionSnapshot {
 pub enum StateQuery {
     /// Current status bar information.
     Status,
+    /// Token usage for all models.
+    Usage,
     /// Log entries, optionally filtered.
     Logs {
         since_id: Option<u64>,
@@ -110,6 +132,7 @@ pub enum StateQuery {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StateResult {
     Status(StatusSnapshot),
+    Usage(UsageSnapshot),
     Logs {
         entries: Vec<LogEntrySnapshot>,
     },
@@ -192,6 +215,8 @@ mod tests {
     #[test]
     fn status_snapshot_serializes() {
         let snap = StatusSnapshot {
+            session_id: "abc-123".to_string(),
+            task: "list files".to_string(),
             provider: "openai".to_string(),
             model: "gpt-5".to_string(),
             turn: 3,
@@ -205,6 +230,8 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"provider\":\"openai\""));
         assert!(json.contains("\"turn\":3"));
+        assert!(json.contains("\"session_id\":\"abc-123\""));
+        assert!(json.contains("\"task\":\"list files\""));
     }
 
     #[test]
@@ -243,6 +270,8 @@ mod tests {
     #[test]
     fn state_result_status_serializes() {
         let result = StateResult::Status(StatusSnapshot {
+            session_id: "test-id".to_string(),
+            task: "deploy".to_string(),
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-5-20250929".to_string(),
             turn: 1,

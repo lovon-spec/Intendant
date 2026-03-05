@@ -72,6 +72,9 @@ pub struct McpAppState {
     pub autonomy: SharedAutonomy,
     pub verbosity: Verbosity,
     pub session_tokens: u64,
+    pub context_window: u64,
+    pub session_id: String,
+    pub task_description: String,
     pub log_entries: std::collections::VecDeque<LogEntrySnapshot>,
     next_log_id: u64,
     pub pending_approval: Option<PendingApprovalState>,
@@ -92,6 +95,12 @@ pub struct McpAppState {
     pub round: usize,
     /// Sender for follow-up messages (multi-round support).
     pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    // Presence layer usage tracking
+    pub presence_provider_name: Option<String>,
+    pub presence_model_name: Option<String>,
+    pub presence_tokens: u64,
+    pub presence_context_window: u64,
+    pub presence_usage_pct: f64,
 }
 
 /// Tracks a pending approval along with the oneshot sender.
@@ -119,6 +128,9 @@ impl McpAppState {
             autonomy,
             verbosity: Verbosity::Normal,
             session_tokens: 0,
+            context_window: 0,
+            session_id: String::new(),
+            task_description: String::new(),
             log_entries: std::collections::VecDeque::new(),
             next_log_id: 0,
             pending_approval: None,
@@ -131,6 +143,11 @@ impl McpAppState {
             next_task_orchestrate: None,
             round: 0,
             follow_up_tx: None,
+            presence_provider_name: None,
+            presence_model_name: None,
+            presence_tokens: 0,
+            presence_context_window: 0,
+            presence_usage_pct: 0.0,
         }
     }
 
@@ -158,6 +175,8 @@ impl McpAppState {
 
     fn status_snapshot(&self) -> StatusSnapshot {
         StatusSnapshot {
+            session_id: self.session_id.clone(),
+            task: self.task_description.clone(),
             provider: self.provider_name.clone(),
             model: self.model_name.clone(),
             turn: self.turn,
@@ -167,6 +186,27 @@ impl McpAppState {
             verbosity: verbosity_to_str(self.verbosity).to_string(),
             session_tokens: self.session_tokens,
             round: self.round,
+        }
+    }
+
+    fn usage_snapshot(&self) -> crate::frontend::UsageSnapshot {
+        crate::frontend::UsageSnapshot {
+            main: crate::frontend::ModelUsageSnapshot {
+                provider: self.provider_name.clone(),
+                model: self.model_name.clone(),
+                tokens_used: self.session_tokens,
+                context_window: self.context_window,
+                usage_pct: self.budget_pct,
+            },
+            presence: self.presence_provider_name.as_ref().map(|p| {
+                crate::frontend::ModelUsageSnapshot {
+                    provider: p.clone(),
+                    model: self.presence_model_name.clone().unwrap_or_default(),
+                    tokens_used: self.presence_tokens,
+                    context_window: self.presence_context_window,
+                    usage_pct: self.presence_usage_pct,
+                }
+            }),
         }
     }
 
@@ -389,6 +429,8 @@ async fn emit_control_status(
             turn: s.turn,
             phase: phase_to_str(&s.phase).to_string(),
             autonomy: current_autonomy_label(autonomy_level),
+            session_id: s.session_id.clone(),
+            task: s.task_description.clone(),
         };
         control::broadcast_event(tx, &event);
     }
@@ -926,6 +968,17 @@ async fn handle_control_command_mcp(
     match msg {
         ControlMsg::Status => {
             emit_control_status(state, control_tx).await;
+            None
+        }
+        ControlMsg::Usage => {
+            if let Some(tx) = control_tx {
+                let s = state.read().await;
+                let event = OutboundEvent::Usage {
+                    main: s.usage_snapshot().main,
+                    presence: s.usage_snapshot().presence,
+                };
+                control::broadcast_event(tx, &event);
+            }
             None
         }
         ControlMsg::Approve { id } => {
@@ -1865,8 +1918,24 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ControlCommand(msg) => deferred_control_msg = Some(msg),
-                    AppEvent::PresenceUsageUpdate { .. } => {}
-                    AppEvent::PresenceLog { .. } => {}
+                    AppEvent::PresenceUsageUpdate {
+                        total_tokens,
+                        context_window,
+                        usage_pct,
+                        provider,
+                        model,
+                    } => {
+                        s.presence_tokens = total_tokens;
+                        s.presence_context_window = context_window;
+                        s.presence_usage_pct = usage_pct;
+                        if s.presence_provider_name.is_none() {
+                            s.presence_provider_name = Some(provider);
+                            s.presence_model_name = Some(model);
+                        }
+                    }
+                    AppEvent::PresenceLog { message } => {
+                        s.push_log(LogLevel::Info, format!("[presence] {}", message));
+                    }
                 }
             }
 
@@ -2757,6 +2826,7 @@ fn format_outcome(outcome: ActionOutcome) -> String {
 // ---------------------------------------------------------------------------
 
 const RESOURCE_STATUS_URI: &str = "intendant://status";
+const RESOURCE_USAGE_URI: &str = "intendant://usage";
 const RESOURCE_LOGS_URI: &str = "intendant://logs";
 const RESOURCE_APPROVAL_URI: &str = "intendant://pending-approval";
 const RESOURCE_INPUT_URI: &str = "intendant://pending-input";
@@ -2784,7 +2854,12 @@ fn resource_definitions() -> Vec<Resource> {
         make_resource(
             RESOURCE_STATUS_URI,
             "status",
-            "Current status: provider, model, turn, budget, phase, autonomy",
+            "Current status: session_id, task, provider, model, turn, budget, phase, autonomy",
+        ),
+        make_resource(
+            RESOURCE_USAGE_URI,
+            "usage",
+            "Token usage for all models: main (provider, model, tokens_used, context_window, usage_pct) and optional presence",
         ),
         make_resource(
             RESOURCE_LOGS_URI,
@@ -2888,6 +2963,11 @@ impl ServerHandler for IntendantServer {
                 let autonomy_level = s.autonomy.read().await.level;
                 snap.autonomy = autonomy_level.to_string().to_lowercase();
                 serde_json::to_string_pretty(&StateResult::Status(snap))
+                    .unwrap_or_else(|_| "{}".to_string())
+            }
+            RESOURCE_USAGE_URI => {
+                let usage = s.usage_snapshot();
+                serde_json::to_string_pretty(&StateResult::Usage(usage))
                     .unwrap_or_else(|_| "{}".to_string())
             }
             RESOURCE_LOGS_URI => {
@@ -3605,9 +3685,9 @@ mod tests {
     }
 
     #[test]
-    fn resource_definitions_has_six_entries() {
+    fn resource_definitions_has_seven_entries() {
         let defs = resource_definitions();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 7);
     }
 
     #[test]
