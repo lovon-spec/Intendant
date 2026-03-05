@@ -265,6 +265,7 @@ pub struct OpenAIProvider {
     structured_output: bool,
     reasoning: Option<ReasoningConfig>,
     use_tools: bool,
+    custom_tools: Option<Vec<ToolDefinition>>,
 }
 
 impl OpenAIProvider {
@@ -287,6 +288,46 @@ impl OpenAIProvider {
             structured_output,
             reasoning,
             use_tools,
+            custom_tools: None,
+        }
+    }
+
+    pub fn new_plain(
+        api_key: String,
+        model: String,
+        context_window: u64,
+        max_output_tokens: u64,
+    ) -> Self {
+        Self {
+            client: api_client(),
+            api_key,
+            model,
+            context_window,
+            max_output_tokens,
+            structured_output: false,
+            reasoning: None,
+            use_tools: false,
+            custom_tools: None,
+        }
+    }
+
+    pub fn new_with_tools(
+        api_key: String,
+        model: String,
+        context_window: u64,
+        max_output_tokens: u64,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
+            client: api_client(),
+            api_key,
+            model,
+            context_window,
+            max_output_tokens,
+            structured_output: false,
+            reasoning: None,
+            use_tools: true,
+            custom_tools: Some(tools),
         }
     }
 }
@@ -475,7 +516,7 @@ impl ChatProvider for OpenAIProvider {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         if self.use_tools {
-            crate::tools::all_tools()
+            self.custom_tools.clone().unwrap_or_else(|| crate::tools::all_tools())
         } else {
             vec![]
         }
@@ -803,7 +844,7 @@ fn build_openai_request_parts(
     };
 
     let tools = if provider.use_tools {
-        let defs = crate::tools::all_tools();
+        let defs = provider.tools();
         Some(defs.iter().map(|t| t.to_openai()).collect())
     } else {
         None
@@ -863,6 +904,7 @@ pub struct AnthropicProvider {
     context_window: u64,
     max_output_tokens: u64,
     use_tools: bool,
+    custom_tools: Option<Vec<ToolDefinition>>,
 }
 
 impl AnthropicProvider {
@@ -880,6 +922,42 @@ impl AnthropicProvider {
             context_window,
             max_output_tokens,
             use_tools,
+            custom_tools: None,
+        }
+    }
+
+    pub fn new_plain(
+        api_key: String,
+        model: String,
+        context_window: u64,
+        max_output_tokens: u64,
+    ) -> Self {
+        Self {
+            client: api_client(),
+            api_key,
+            model,
+            context_window,
+            max_output_tokens,
+            use_tools: false,
+            custom_tools: None,
+        }
+    }
+
+    pub fn new_with_tools(
+        api_key: String,
+        model: String,
+        context_window: u64,
+        max_output_tokens: u64,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
+            client: api_client(),
+            api_key,
+            model,
+            context_window,
+            max_output_tokens,
+            use_tools: true,
+            custom_tools: Some(tools),
         }
     }
 }
@@ -890,7 +968,7 @@ impl ChatProvider for AnthropicProvider {
         let (system, api_messages) = build_anthropic_messages(messages);
 
         let tools = if self.use_tools {
-            let defs = crate::tools::all_tools();
+            let defs = self.tools();
             Some(defs.iter().map(|t| t.to_anthropic()).collect())
         } else {
             None
@@ -1010,7 +1088,7 @@ impl ChatProvider for AnthropicProvider {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         if self.use_tools {
-            crate::tools::all_tools()
+            self.custom_tools.clone().unwrap_or_else(|| crate::tools::all_tools())
         } else {
             vec![]
         }
@@ -1023,7 +1101,7 @@ impl ChatProvider for AnthropicProvider {
     ) -> Result<ChatResponse, CallerError> {
         let (system, api_messages) = build_anthropic_messages(messages);
         let tools = if self.use_tools {
-            let defs = crate::tools::all_tools();
+            let defs = self.tools();
             Some(defs.iter().map(|t| t.to_anthropic()).collect())
         } else {
             None
@@ -1287,6 +1365,7 @@ pub struct GeminiProvider {
     context_window: u64,
     max_output_tokens: u64,
     use_tools: bool,
+    custom_tools: Option<Vec<ToolDefinition>>,
     endpoint: String,
 }
 
@@ -1307,6 +1386,49 @@ impl GeminiProvider {
             context_window,
             max_output_tokens,
             use_tools,
+            custom_tools: None,
+            endpoint,
+        }
+    }
+
+    /// Create a provider with native tool calling explicitly disabled.
+    pub fn new_plain(
+        api_key: String,
+        model: String,
+        context_window: u64,
+        max_output_tokens: u64,
+    ) -> Self {
+        let endpoint = env::var("GEMINI_ENDPOINT")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        Self {
+            client: api_client(),
+            api_key,
+            model,
+            context_window,
+            max_output_tokens,
+            use_tools: false,
+            custom_tools: None,
+            endpoint,
+        }
+    }
+
+    pub fn new_with_tools(
+        api_key: String,
+        model: String,
+        context_window: u64,
+        max_output_tokens: u64,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        let endpoint = env::var("GEMINI_ENDPOINT")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        Self {
+            client: api_client(),
+            api_key,
+            model,
+            context_window,
+            max_output_tokens,
+            use_tools: true,
+            custom_tools: Some(tools),
             endpoint,
         }
     }
@@ -1458,7 +1580,7 @@ impl ChatProvider for GeminiProvider {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         if self.use_tools {
-            crate::tools::all_tools()
+            self.custom_tools.clone().unwrap_or_else(|| crate::tools::all_tools())
         } else {
             vec![]
         }
@@ -1690,7 +1812,7 @@ fn build_gemini_request_parts(
     });
 
     if provider.use_tools {
-        let defs = crate::tools::all_tools();
+        let defs = provider.tools();
         let func_decls: Vec<serde_json::Value> = defs.iter().map(|t| t.to_gemini()).collect();
         request_body["tools"] = serde_json::json!([{
             "functionDeclarations": func_decls,
@@ -1949,6 +2071,104 @@ pub fn select_provider_with_overrides(
         None => {
             // No explicit override — fall back to the standard select_provider logic
             select_provider()
+        }
+    }
+}
+
+/// Select a provider for the presence layer (text mode).
+///
+/// Priority: explicit config > PRESENCE_PROVIDER/PRESENCE_MODEL env > auto-detect.
+/// Auto-detect prefers gemini (gemini-2.5-flash) when GEMINI_API_KEY is set,
+/// falling back to the cheapest available provider.
+///
+/// Presence providers are created with `new_plain()` — no native agent tools.
+/// The presence layer has its own tool set (submit_task, check_status, etc.)
+/// managed at the conversation level, not through the provider.
+pub fn select_presence_provider(
+    provider_name: Option<&str>,
+    model_name: Option<&str>,
+) -> Result<Box<dyn ChatProvider>, CallerError> {
+    use crate::presence;
+
+    let provider_str = provider_name
+        .map(|s| s.to_string())
+        .or_else(|| env::var("PRESENCE_PROVIDER").ok());
+    let model_str = model_name
+        .map(|s| s.to_string())
+        .or_else(|| env::var("PRESENCE_MODEL").ok());
+
+    let openai_key = env::var("OPENAI_API_KEY")
+        .or_else(|_| env::var("OPENAI"))
+        .ok();
+    let anthropic_key = env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| env::var("ANTHROPIC"))
+        .ok();
+    let gemini_key = env::var("GEMINI_API_KEY")
+        .or_else(|_| env::var("GEMINI"))
+        .ok();
+
+    let tools = presence::presence_tools();
+
+    match provider_str.as_deref() {
+        Some("gemini") => {
+            let key = gemini_key.ok_or_else(|| {
+                CallerError::Config("Presence provider=gemini but no GEMINI_API_KEY found.".into())
+            })?;
+            let model =
+                model_str.unwrap_or_else(|| presence::DEFAULT_TEXT_MODEL.to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(GeminiProvider::new_with_tools(key, model, ctx, max_out, tools)))
+        }
+        Some("anthropic") => {
+            let key = anthropic_key.ok_or_else(|| {
+                CallerError::Config(
+                    "Presence provider=anthropic but no ANTHROPIC_API_KEY found.".into(),
+                )
+            })?;
+            let model =
+                model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(AnthropicProvider::new_with_tools(key, model, ctx, max_out, tools)))
+        }
+        Some("openai") => {
+            let key = openai_key.ok_or_else(|| {
+                CallerError::Config("Presence provider=openai but no OPENAI_API_KEY found.".into())
+            })?;
+            let model = model_str.unwrap_or_else(|| "gpt-4.1-mini".to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(OpenAIProvider::new_with_tools(key, model, ctx, max_out, tools)))
+        }
+        Some(other) => Err(CallerError::Config(format!(
+            "Unknown presence provider: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
+            other
+        ))),
+        None => {
+            // Auto-detect: prefer gemini (cheapest/fastest for presence)
+            if let Some(key) = gemini_key {
+                let model =
+                    model_str.unwrap_or_else(|| presence::DEFAULT_TEXT_MODEL.to_string());
+                let ctx = resolve_context_window(&model);
+                let max_out = resolve_max_output_tokens(&model);
+                Ok(Box::new(GeminiProvider::new_with_tools(key, model, ctx, max_out, tools)))
+            } else if let Some(key) = anthropic_key {
+                let model =
+                    model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+                let ctx = resolve_context_window(&model);
+                let max_out = resolve_max_output_tokens(&model);
+                Ok(Box::new(AnthropicProvider::new_with_tools(key, model, ctx, max_out, tools)))
+            } else if let Some(key) = openai_key {
+                let model = model_str.unwrap_or_else(|| "gpt-4.1-mini".to_string());
+                let ctx = resolve_context_window(&model);
+                let max_out = resolve_max_output_tokens(&model);
+                Ok(Box::new(OpenAIProvider::new_with_tools(key, model, ctx, max_out, tools)))
+            } else {
+                Err(CallerError::Config(
+                    "No API key found for presence layer. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY.".into(),
+                ))
+            }
         }
     }
 }

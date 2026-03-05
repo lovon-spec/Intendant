@@ -188,6 +188,14 @@ impl Conversation {
         self.last_usage = Some(usage);
     }
 
+    pub fn last_usage(&self) -> Option<&TokenUsage> {
+        self.last_usage.as_ref()
+    }
+
+    pub fn context_window(&self) -> u64 {
+        self.context_window
+    }
+
     pub fn increment_turn(&mut self) {
         self.turn += 1;
     }

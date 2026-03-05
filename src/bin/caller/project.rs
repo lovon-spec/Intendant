@@ -355,8 +355,10 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
         assert!(config.presence.enabled);
         assert!(config.presence.provider.is_none());
         assert!(config.presence.model.is_none());
-        assert!(config.presence.audio_model.is_none());
-        assert_eq!(config.presence.context_window, 32_768);
+        assert!(config.presence.live_provider.is_none());
+        assert!(config.presence.live_model.is_none());
+        assert_eq!(config.presence.context_window, 1_048_576);
+        assert_eq!(config.presence.live_context_window, 32_768);
     }
 
     #[test]
@@ -365,18 +367,22 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
 [presence]
 enabled = false
 provider = "gemini"
-model = "gemini-2.5-flash"
-audio_model = "gemini-2.5-flash-live"
-context_window = 65536
+model = "gemini-3.0-flash"
+context_window = 1048576
+live_provider = "openai"
+live_model = "gpt-4o-realtime-preview"
+live_context_window = 65536
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.presence.enabled);
         assert_eq!(config.presence.provider.as_deref(), Some("gemini"));
-        assert_eq!(config.presence.model.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(config.presence.model.as_deref(), Some("gemini-3.0-flash"));
+        assert_eq!(config.presence.context_window, 1_048_576);
+        assert_eq!(config.presence.live_provider.as_deref(), Some("openai"));
         assert_eq!(
-            config.presence.audio_model.as_deref(),
-            Some("gemini-2.5-flash-live")
+            config.presence.live_model.as_deref(),
+            Some("gpt-4o-realtime-preview")
         );
-        assert_eq!(config.presence.context_window, 65_536);
+        assert_eq!(config.presence.live_context_window, 65_536);
     }
 }

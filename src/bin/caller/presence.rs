@@ -16,18 +16,29 @@ use tokio::sync::mpsc;
 pub struct PresenceConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    // --- Text mode (TUI / MCP) ---
     /// Provider name for text mode (e.g. "gemini", "anthropic", "openai").
+    /// Default: auto-detect (prefers gemini when GEMINI_API_KEY is set).
     #[serde(default)]
     pub provider: Option<String>,
-    /// Model for text mode.
+    /// Model for text mode. Default: "gemini-2.5-flash".
     #[serde(default)]
     pub model: Option<String>,
-    /// Model for audio/video mode (live gateway).
-    #[serde(default)]
-    pub audio_model: Option<String>,
-    /// Context window size for the presence conversation.
+    /// Context window size for the text-mode presence conversation.
     #[serde(default = "default_context_window")]
     pub context_window: u64,
+
+    // --- Live mode (audio/video gateway) ---
+    /// Provider for live (audio/video) mode. Default: auto-detect.
+    #[serde(default)]
+    pub live_provider: Option<String>,
+    /// Model for live (audio/video) mode.
+    #[serde(default)]
+    pub live_model: Option<String>,
+    /// Context window for the live-mode conversation.
+    #[serde(default = "default_live_context_window")]
+    pub live_context_window: u64,
 }
 
 fn default_true() -> bool {
@@ -35,8 +46,21 @@ fn default_true() -> bool {
 }
 
 fn default_context_window() -> u64 {
+    1_048_576
+}
+
+fn default_live_context_window() -> u64 {
     32_768
 }
+
+/// Default text presence model.
+pub const DEFAULT_TEXT_MODEL: &str = "gemini-2.5-flash";
+/// Preferred text presence model (Gemini 3 Flash, when available).
+#[allow(dead_code)]
+pub const PREFERRED_TEXT_MODEL: &str = "gemini-3-flash-preview";
+/// Default text presence provider.
+#[allow(dead_code)]
+pub const DEFAULT_TEXT_PROVIDER: &str = "gemini";
 
 impl Default for PresenceConfig {
     fn default() -> Self {
@@ -44,8 +68,10 @@ impl Default for PresenceConfig {
             enabled: true,
             provider: None,
             model: None,
-            audio_model: None,
             context_window: default_context_window(),
+            live_provider: None,
+            live_model: None,
+            live_context_window: default_live_context_window(),
         }
     }
 }
@@ -71,6 +97,16 @@ pub enum PresenceEvent {
     BudgetWarning { pct: f64, remaining: u64 },
     RoundComplete { round: usize, turns_in_round: usize },
     Error { message: String },
+}
+
+/// Token usage snapshot from the presence layer.
+#[derive(Debug, Clone)]
+pub struct PresenceUsage {
+    pub total_tokens: u64,
+    pub context_window: u64,
+    pub usage_pct: f64,
+    pub provider: String,
+    pub model: String,
 }
 
 /// Queryable snapshot of the agent's current state.
@@ -136,7 +172,32 @@ impl PresenceLayer {
     /// Process text input from the user, returning the model's response.
     pub async fn process_user_input(&mut self, input: &str) -> Result<String, CallerError> {
         self.conversation.add_user(input.to_string());
-        self.run_model_loop().await
+        let result = self.run_model_loop().await;
+        self.emit_usage_update();
+        result
+    }
+
+    /// Return current token usage stats for the presence conversation.
+    pub fn usage_snapshot(&self) -> PresenceUsage {
+        PresenceUsage {
+            total_tokens: self.conversation.last_usage().map(|u| u.total_tokens).unwrap_or(0),
+            context_window: self.conversation.context_window(),
+            usage_pct: self.conversation.usage_fraction() * 100.0,
+            provider: self.provider.name().to_string(),
+            model: self.provider.model().to_string(),
+        }
+    }
+
+    /// Emit a PresenceUsageUpdate event to the TUI.
+    fn emit_usage_update(&self) {
+        let usage = self.usage_snapshot();
+        self.bus.send(AppEvent::PresenceUsageUpdate {
+            total_tokens: usage.total_tokens,
+            context_window: usage.context_window,
+            usage_pct: usage.usage_pct,
+            provider: usage.provider,
+            model: usage.model,
+        });
     }
 
     /// Inject a PresenceEvent into the conversation and let the model narrate.
@@ -155,7 +216,7 @@ impl PresenceLayer {
     async fn run_model_loop(&mut self) -> Result<String, CallerError> {
         const MAX_TOOL_ROUNDS: usize = 10;
 
-        for _ in 0..MAX_TOOL_ROUNDS {
+        for _round in 0..MAX_TOOL_ROUNDS {
             let messages = self.conversation.messages().to_vec();
             let response = self.provider.chat(&messages).await?;
 
@@ -171,6 +232,11 @@ impl PresenceLayer {
             }
 
             // Has tool calls — process them
+            let tool_names: Vec<&str> = response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+            self.bus.send(AppEvent::PresenceLog {
+                message: format!("Tool call: {}", tool_names.join(", ")),
+            });
+
             let tool_call_refs: Vec<crate::conversation::ToolCallRef> = response
                 .tool_calls
                 .iter()
@@ -237,7 +303,12 @@ impl PresenceLayer {
         };
 
         match self.task_tx.send(envelope).await {
-            Ok(()) => format!("Task submitted: {}", task),
+            Ok(()) => {
+                self.bus.send(AppEvent::PresenceLog {
+                    message: format!("Dispatched task: {}", task),
+                });
+                format!("Task submitted: {}", task)
+            }
             Err(_) => "Error: task channel closed".to_string(),
         }
     }
@@ -548,6 +619,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::TurnStarted { .. }
         | AppEvent::DisplayReady { .. }
         | AppEvent::SessionDirChanged { .. }
+        | AppEvent::PresenceUsageUpdate { .. }
+        | AppEvent::PresenceLog { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -629,6 +702,39 @@ fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot>>) 
     }
 }
 
+/// Update the agent state snapshot from a PresenceEvent (used by the TUI-side
+/// forwarder to keep the snapshot in sync without needing the EventBus receiver).
+pub fn update_agent_state_from_presence_event(
+    event: &PresenceEvent,
+    state: &Arc<Mutex<AgentStateSnapshot>>,
+) {
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    match event {
+        PresenceEvent::PhaseChanged { phase } => {
+            s.phase = phase.clone();
+        }
+        PresenceEvent::TaskComplete { reason } => {
+            s.phase = format!("done: {}", reason);
+        }
+        PresenceEvent::ApprovalNeeded { preview, .. } => {
+            s.phase = "waiting_approval".to_string();
+            s.last_command_preview = preview.clone();
+        }
+        PresenceEvent::HumanQuestion { .. } => {
+            s.phase = "waiting_human".to_string();
+        }
+        PresenceEvent::BudgetWarning { pct, .. } => {
+            s.budget_pct = *pct;
+        }
+        PresenceEvent::RoundComplete { .. } => {
+            s.phase = "waiting_followup".to_string();
+        }
+        PresenceEvent::Error { .. } => {
+            s.phase = "error".to_string();
+        }
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -669,7 +775,6 @@ fn format_event(event: &PresenceEvent) -> String {
 }
 
 /// Return the 9 presence tool definitions for native tool calling.
-#[allow(dead_code)]
 pub fn presence_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -835,8 +940,10 @@ mod tests {
         assert!(config.enabled);
         assert!(config.provider.is_none());
         assert!(config.model.is_none());
-        assert!(config.audio_model.is_none());
-        assert_eq!(config.context_window, 32_768);
+        assert!(config.live_provider.is_none());
+        assert!(config.live_model.is_none());
+        assert_eq!(config.context_window, 1_048_576);
+        assert_eq!(config.live_context_window, 32_768);
     }
 
     #[test]
@@ -844,19 +951,23 @@ mod tests {
         let toml_str = r#"
             enabled = true
             provider = "gemini"
-            model = "gemini-2.5-flash"
-            audio_model = "gemini-2.5-flash-live"
-            context_window = 65536
+            model = "gemini-3.0-flash"
+            context_window = 1048576
+            live_provider = "gemini"
+            live_model = "gemini-2.5-flash-native-audio-preview-12-2025"
+            live_context_window = 32768
         "#;
         let config: PresenceConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert_eq!(config.provider.as_deref(), Some("gemini"));
-        assert_eq!(config.model.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(config.model.as_deref(), Some("gemini-3.0-flash"));
+        assert_eq!(config.context_window, 1_048_576);
+        assert_eq!(config.live_provider.as_deref(), Some("gemini"));
         assert_eq!(
-            config.audio_model.as_deref(),
-            Some("gemini-2.5-flash-live")
+            config.live_model.as_deref(),
+            Some("gemini-2.5-flash-native-audio-preview-12-2025")
         );
-        assert_eq!(config.context_window, 65536);
+        assert_eq!(config.live_context_window, 32_768);
     }
 
     #[test]

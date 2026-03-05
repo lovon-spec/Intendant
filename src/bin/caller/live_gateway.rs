@@ -165,11 +165,30 @@ pub fn spawn_live_gateway(
     })
 }
 
-/// Build a `LiveGatewayConfig` from the presence config's `audio_model` field,
+/// Build a `LiveGatewayConfig` from the presence config's live fields,
 /// falling back to environment variable detection.
-pub fn build_config(audio_model: Option<&str>) -> LiveGatewayConfig {
-    // If an explicit audio model is given, detect provider from the model name.
-    if let Some(model) = audio_model {
+pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> LiveGatewayConfig {
+    // If an explicit provider is given, use it directly.
+    if let Some(provider) = live_provider {
+        let model = live_model.unwrap_or_else(|| match provider {
+            "openai" => "gpt-4o-realtime-preview",
+            _ => "gemini-2.5-flash-native-audio-preview-12-2025",
+        });
+        let (input_rate, output_rate) = if provider == "openai" {
+            (24000, 24000)
+        } else {
+            (16000, 24000)
+        };
+        return LiveGatewayConfig {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            input_sample_rate: input_rate,
+            output_sample_rate: output_rate,
+        };
+    }
+
+    // If an explicit live model is given, detect provider from the model name.
+    if let Some(model) = live_model {
         if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
             return LiveGatewayConfig {
                 provider: "openai".to_string(),
@@ -234,23 +253,30 @@ mod tests {
 
     #[test]
     fn test_build_config_gemini_model() {
-        let config = build_config(Some("gemini-2.5-flash-native-audio-preview-12-2025"));
+        let config = build_config(None, Some("gemini-2.5-flash-native-audio-preview-12-2025"));
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
     }
 
     #[test]
     fn test_build_config_openai_model() {
-        let config = build_config(Some("gpt-4o-realtime-preview"));
+        let config = build_config(None, Some("gpt-4o-realtime-preview"));
         assert_eq!(config.provider, "openai");
         assert_eq!(config.input_sample_rate, 24000);
+    }
+
+    #[test]
+    fn test_build_config_explicit_provider() {
+        let config = build_config(Some("openai"), None);
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.model, "gpt-4o-realtime-preview");
     }
 
     #[test]
     fn test_build_config_no_model() {
         // With no model and no env vars set in a predictable way,
         // this should default to gemini
-        let config = build_config(None);
+        let config = build_config(None, None);
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
     }

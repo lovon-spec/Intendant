@@ -102,6 +102,36 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // Show presence layer info when active
+    if let Some(ref presence_model) = app.presence_model_name {
+        let presence_pct = app.presence_usage_pct;
+        let presence_color = theme::budget_color(presence_pct);
+        spans.push(Span::styled(
+            "  presence:",
+            Style::default()
+                .fg(theme::LOG_DIM_FG)
+                .bg(theme::STATUS_BAR_BG),
+        ));
+        spans.push(Span::styled(
+            format!("{}", presence_model),
+            Style::default()
+                .fg(theme::STATUS_MODEL_FG)
+                .bg(theme::STATUS_BAR_BG),
+        ));
+        if app.presence_tokens > 0 {
+            spans.push(Span::styled(
+                format!(" {:.1}%", presence_pct),
+                Style::default().fg(presence_color).bg(theme::STATUS_BAR_BG),
+            ));
+            spans.push(Span::styled(
+                format!(" {}", format_token_count(app.presence_tokens)),
+                Style::default()
+                    .fg(theme::STATUS_TURN_FG)
+                    .bg(theme::STATUS_BAR_BG),
+            ));
+        }
+    }
+
     // Fill remaining with bg
     spans.push(Span::styled(
         " ".repeat(area.width.saturating_sub(40) as usize),

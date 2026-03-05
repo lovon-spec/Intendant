@@ -2781,12 +2781,20 @@ async fn run_with_presence(
     log_dir: PathBuf,
     mut user_rx: tokio::sync::mpsc::Receiver<String>,
     response_tx: tokio::sync::mpsc::Sender<String>,
+    presence_event_rx: tokio::sync::mpsc::Receiver<presence::PresenceEvent>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
-    let presence_provider = provider::select_provider_with_overrides(
+    let presence_provider = provider::select_presence_provider(
         project.config.presence.provider.as_deref(),
         project.config.presence.model.as_deref(),
     )?;
+    bus.send(AppEvent::PresenceUsageUpdate {
+        total_tokens: 0,
+        context_window: project.config.presence.context_window,
+        usage_pct: 0.0,
+        provider: presence_provider.name().to_string(),
+        model: presence_provider.model().to_string(),
+    });
 
     // 2. Resolve presence system prompt
     let presence_prompt = prompts::resolve_system_prompt(
@@ -2796,20 +2804,14 @@ async fn run_with_presence(
 
     // 3. Create channels
     let (task_tx, mut task_rx) = tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
-    let (presence_event_tx, presence_event_rx) =
-        tokio::sync::mpsc::channel::<presence::PresenceEvent>(64);
+    // The presence_event_rx is fed by the TUI via App.forward_to_presence() →
+    // presence_event_tx, which was created and wired by the caller (TUI branch).
+    let presence_event_rx = presence_event_rx;
 
     // 4. Create shared agent state
     let agent_state = Arc::new(Mutex::new(presence::AgentStateSnapshot::default()));
 
-    // 5. Create a second EventBus receiver for the event listener
-    let (_relay_bus, relay_rx) = EventBus::new();
-
-    // 6. Start event listener (filters AppEvent → PresenceEvent)
-    let _event_listener =
-        presence::spawn_event_listener(relay_rx, presence_event_tx, agent_state.clone());
-
-    // 7. Create presence layer
+    // 5. Create presence layer
     let context_window = project.config.presence.context_window;
     let mut presence = presence::PresenceLayer::new(
         presence_provider,
@@ -2824,14 +2826,32 @@ async fn run_with_presence(
         project.root.clone(),
     );
 
-    // 8. Send initial task to presence (if provided)
+    // 8. Send initial task to presence (if provided), with a timeout so a
+    //    slow or misconfigured presence provider doesn't freeze the TUI.
     if let Some(ref task_str) = task {
-        let initial_response = presence
-            .process_user_input(&format!("The user wants: {}", task_str))
-            .await
-            .unwrap_or_else(|e| format!("Error: {}", e));
-        if !initial_response.is_empty() {
-            let _ = response_tx.send(initial_response).await;
+        let input = format!("The user wants: {}", task_str);
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            presence.process_user_input(&input),
+        )
+        .await
+        {
+            Ok(Ok(response)) if !response.is_empty() => {
+                let _ = response_tx.send(response).await;
+            }
+            Ok(Err(e)) => {
+                bus.send(AppEvent::LoopError(format!(
+                    "Presence provider error: {}. Falling through to direct agent.",
+                    e
+                )));
+            }
+            Err(_) => {
+                bus.send(AppEvent::LoopError(
+                    "Presence provider timed out (30s). Falling through to direct agent."
+                        .to_string(),
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -2843,15 +2863,20 @@ async fn run_with_presence(
         tokio::select! {
             // User sends follow-up text → route to presence
             Some(input) = user_rx.recv() => {
-                match presence.process_user_input(&input).await {
-                    Ok(response) => {
-                        if !response.is_empty() {
-                            let _ = response_tx.send(response).await;
-                        }
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(30),
+                    presence.process_user_input(&input),
+                ).await {
+                    Ok(Ok(response)) if !response.is_empty() => {
+                        let _ = response_tx.send(response).await;
                     }
-                    Err(e) => {
-                        let _ = response_tx.send(format!("Error: {}", e)).await;
+                    Ok(Err(e)) => {
+                        let _ = response_tx.send(format!("Presence error: {}", e)).await;
                     }
+                    Err(_) => {
+                        let _ = response_tx.send("Presence provider timed out.".to_string()).await;
+                    }
+                    _ => {}
                 }
             }
             // Presence submitted a task → run agent loop
@@ -3494,7 +3519,8 @@ async fn main() -> Result<(), CallerError> {
                 tx
             };
             let config = live_gateway::build_config(
-                project.config.presence.audio_model.as_deref(),
+                project.config.presence.live_provider.as_deref(),
+                project.config.presence.live_model.as_deref(),
             );
             let handle = live_gateway::spawn_live_gateway(
                 flags.live_port,
@@ -3760,7 +3786,8 @@ async fn main() -> Result<(), CallerError> {
                 tx
             };
             let config = live_gateway::build_config(
-                project.config.presence.audio_model.as_deref(),
+                project.config.presence.live_provider.as_deref(),
+                project.config.presence.live_model.as_deref(),
             );
             let handle = live_gateway::spawn_live_gateway(
                 flags.live_port,
@@ -3807,14 +3834,20 @@ async fn main() -> Result<(), CallerError> {
         }
 
         // If presence is active, create channels for user ↔ presence communication
-        let presence_user_rx = if use_presence {
+        let (presence_user_rx, presence_event_rx_for_task) = if use_presence {
             let (presence_tx, presence_user_rx) =
                 tokio::sync::mpsc::channel::<String>(4);
             app.set_presence_sender(presence_tx);
+
+            // Create presence event channel: TUI forwards filtered events here
+            let (presence_event_tx, presence_event_rx) =
+                tokio::sync::mpsc::channel::<presence::PresenceEvent>(64);
+            app.set_presence_event_sender(presence_event_tx);
+
             app.log(tui::app::LogLevel::Info, "Presence layer active".to_string());
-            Some(presence_user_rx)
+            (Some(presence_user_rx), Some(presence_event_rx))
         } else {
-            None
+            (None, None)
         };
 
         // Spawn the agent loop in a background task
@@ -3832,17 +3865,28 @@ async fn main() -> Result<(), CallerError> {
         let mut loop_handle = if use_presence {
             // Presence mode: the presence layer mediates between user and agent
             let presence_user_rx = presence_user_rx.unwrap();
+            let presence_event_rx = presence_event_rx_for_task.unwrap();
             let (response_tx, mut response_rx) =
                 tokio::sync::mpsc::channel::<String>(8);
 
-            // Forward presence responses to TUI as log entries
+            // Forward presence responses to TUI as log entries + reset phase
             let bus_for_responses = bus_clone.clone();
             let _response_forwarder = tokio::spawn(async move {
                 while let Some(response) = response_rx.recv().await {
                     if !response.is_empty() {
-                        bus_for_responses.send(AppEvent::ModelResponseDelta {
-                            text: format!("\n[Intendant] {}\n", response),
-                        });
+                        // Use LoopError for errors, ModelResponseDelta for normal responses
+                        if response.starts_with("Presence error:") || response.starts_with("Presence provider timed out") {
+                            bus_for_responses.send(AppEvent::LoopError(response));
+                        } else {
+                            bus_for_responses.send(AppEvent::ModelResponseDelta {
+                                text: format!("\n[Intendant] {}\n", response),
+                            });
+                            // Reset to follow-up phase after presence responds
+                            bus_for_responses.send(AppEvent::RoundComplete {
+                                round: 0,
+                                turns_in_round: 0,
+                            });
+                        }
                     }
                 }
             });
@@ -3857,6 +3901,7 @@ async fn main() -> Result<(), CallerError> {
                     log_dir_clone,
                     presence_user_rx,
                     response_tx,
+                    presence_event_rx,
                 )
                 .await;
 
@@ -3987,7 +4032,8 @@ async fn main() -> Result<(), CallerError> {
             let (bus, _rx) = EventBus::new();
             let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
             let config = live_gateway::build_config(
-                project.config.presence.audio_model.as_deref(),
+                project.config.presence.live_provider.as_deref(),
+                project.config.presence.live_model.as_deref(),
             );
             let _live_handle = live_gateway::spawn_live_gateway(
                 flags.live_port,

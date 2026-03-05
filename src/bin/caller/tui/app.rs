@@ -161,6 +161,16 @@ pub struct App {
 
     // Vision display info (shown in status bar when active)
     pub display_info: Option<String>,
+
+    // Presence layer usage tracking (parallel to main model)
+    pub presence_provider_name: Option<String>,
+    pub presence_model_name: Option<String>,
+    pub presence_tokens: u64,
+    pub presence_usage_pct: f64,
+    pub presence_context_window: u64,
+
+    // Sender for forwarding filtered events to the presence layer
+    pub presence_event_tx: Option<tokio::sync::mpsc::Sender<crate::presence::PresenceEvent>>,
 }
 
 impl App {
@@ -199,6 +209,12 @@ impl App {
             follow_up_tx: None,
             presence_tx: None,
             display_info: None,
+            presence_provider_name: None,
+            presence_model_name: None,
+            presence_tokens: 0,
+            presence_usage_pct: 0.0,
+            presence_context_window: 0,
+            presence_event_tx: None,
         }
     }
 
@@ -208,6 +224,63 @@ impl App {
 
     pub fn set_presence_sender(&mut self, tx: tokio::sync::mpsc::Sender<String>) {
         self.presence_tx = Some(tx);
+    }
+
+    pub fn set_presence_event_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::Sender<crate::presence::PresenceEvent>,
+    ) {
+        self.presence_event_tx = Some(tx);
+    }
+
+    /// Forward a filtered event to the presence layer (non-blocking).
+    fn forward_to_presence(&self, event: &AppEvent) {
+        use crate::presence;
+        if let Some(ref tx) = self.presence_event_tx {
+            // Reuse the static last_phase tracking via a simple approach:
+            // We only forward push-worthy events. The filter is stateless here
+            // (no phase dedup) to keep it simple — presence can handle duplicates.
+            let pe = match event {
+                AppEvent::TaskComplete { reason } => Some(presence::PresenceEvent::TaskComplete {
+                    reason: reason.clone(),
+                }),
+                AppEvent::ApprovalRequired {
+                    id,
+                    command_preview,
+                    category,
+                    ..
+                } => Some(presence::PresenceEvent::ApprovalNeeded {
+                    id: *id,
+                    preview: command_preview.clone(),
+                    category: format!("{:?}", category),
+                }),
+                AppEvent::HumanQuestionDetected { question } => {
+                    Some(presence::PresenceEvent::HumanQuestion {
+                        question: question.clone(),
+                    })
+                }
+                AppEvent::BudgetWarning { pct, remaining } => {
+                    Some(presence::PresenceEvent::BudgetWarning {
+                        pct: *pct,
+                        remaining: *remaining,
+                    })
+                }
+                AppEvent::RoundComplete {
+                    round,
+                    turns_in_round,
+                } => Some(presence::PresenceEvent::RoundComplete {
+                    round: *round,
+                    turns_in_round: *turns_in_round,
+                }),
+                AppEvent::LoopError(msg) => Some(presence::PresenceEvent::Error {
+                    message: msg.clone(),
+                }),
+                _ => None,
+            };
+            if let Some(pe) = pe {
+                let _ = tx.try_send(pe);
+            }
+        }
     }
 
     pub fn set_control_socket(&mut self, tx: tokio::sync::broadcast::Sender<String>) {
@@ -815,6 +888,9 @@ impl App {
 
     /// Process an AppEvent and update state accordingly.
     pub fn handle_event(&mut self, event: AppEvent) {
+        // Forward filtered events to the presence layer (non-blocking)
+        self.forward_to_presence(&event);
+
         match event {
             AppEvent::TurnStarted {
                 turn, budget_pct, ..
@@ -944,6 +1020,9 @@ impl App {
                 self.log(LogLevel::Error, msg);
                 self.current_phase = Phase::Done;
             }
+            AppEvent::PresenceLog { message } => {
+                self.log(LogLevel::Info, format!("[presence] {}", message));
+            }
             AppEvent::HumanQuestionDetected { question } => {
                 self.human_question = Some(question.clone());
                 self.current_phase = Phase::WaitingHuman;
@@ -1037,6 +1116,21 @@ impl App {
             }
             AppEvent::SessionDirChanged { .. } => {
                 // Only relevant for MCP mode; TUI ignores this.
+            }
+            AppEvent::PresenceUsageUpdate {
+                total_tokens,
+                context_window,
+                usage_pct,
+                provider,
+                model,
+            } => {
+                self.presence_tokens = total_tokens;
+                self.presence_context_window = context_window;
+                self.presence_usage_pct = usage_pct;
+                if self.presence_provider_name.is_none() {
+                    self.presence_provider_name = Some(provider);
+                    self.presence_model_name = Some(model);
+                }
             }
             AppEvent::Tick => {
                 self.tick_count += 1;

@@ -103,6 +103,20 @@ pub enum AppEvent {
         preview: String,
     },
 
+    // Presence layer token usage update
+    PresenceUsageUpdate {
+        total_tokens: u64,
+        context_window: u64,
+        usage_pct: f64,
+        provider: String,
+        model: String,
+    },
+
+    /// Presence layer log message (shown in TUI log panel).
+    PresenceLog {
+        message: String,
+    },
+
     // Round lifecycle
     RoundComplete {
         round: usize,

@@ -1865,6 +1865,8 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ControlCommand(msg) => deferred_control_msg = Some(msg),
+                    AppEvent::PresenceUsageUpdate { .. } => {}
+                    AppEvent::PresenceLog { .. } => {}
                 }
             }
 
