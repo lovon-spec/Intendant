@@ -1,5 +1,6 @@
 use crate::autonomy::SharedAutonomy;
 use crate::control::{self, OutboundEvent};
+use crate::{knowledge, session_log};
 use crate::tui::event::{AppEvent, ApprovalResponse, ControlMsg};
 use crate::tui::layout::PanelConfig;
 use chrono::Local;
@@ -223,6 +224,10 @@ pub struct App {
 
     // Sender for forwarding filtered events to the presence layer
     pub presence_event_tx: Option<tokio::sync::mpsc::Sender<crate::presence::PresenceEvent>>,
+
+    // Project paths for query_detail and recall_memory socket commands
+    pub project_root: Option<std::path::PathBuf>,
+    pub knowledge_path: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -273,6 +278,8 @@ impl App {
             presence_usage_pct: 0.0,
             presence_context_window: 0,
             presence_event_tx: None,
+            project_root: None,
+            knowledge_path: None,
         }
     }
 
@@ -488,8 +495,9 @@ impl App {
             AppMode::AskHuman => 5,
             AppMode::FollowUp => 5,
             _ => {
-                // Show a slim reminder bar when browsing during follow-up
-                if self.current_phase == Phase::WaitingFollowUp
+                // Show a slim reminder bar when browsing during follow-up or after task done
+                if (self.current_phase == Phase::WaitingFollowUp
+                    || self.current_phase == Phase::Done)
                     && self.follow_up_textarea.is_some()
                 {
                     3
@@ -541,8 +549,9 @@ impl App {
                 }
             }
             KeyCode::Char('f') => {
-                // Re-open follow-up input if a round is waiting
-                if self.current_phase == Phase::WaitingFollowUp
+                // Re-open follow-up input if a round is waiting or task is done
+                if (self.current_phase == Phase::WaitingFollowUp
+                    || self.current_phase == Phase::Done)
                     && self.follow_up_textarea.is_some()
                 {
                     self.mode = AppMode::FollowUp;
@@ -645,7 +654,8 @@ impl App {
     /// Whether we're browsing the log but a follow-up is still pending.
     pub fn is_follow_up_browsing(&self) -> bool {
         self.mode != AppMode::FollowUp
-            && self.current_phase == Phase::WaitingFollowUp
+            && (self.current_phase == Phase::WaitingFollowUp
+                || self.current_phase == Phase::Done)
             && self.follow_up_textarea.is_some()
     }
 
@@ -1053,11 +1063,32 @@ impl App {
                     format!("Verbosity set to {} via control socket", new_verbosity.label()),
                 );
             }
-            ControlMsg::StartTask { .. } => {
-                self.log(
-                    LogLevel::Warn,
-                    "start_task is only supported in MCP/voice mode".to_string(),
-                );
+            ControlMsg::StartTask { task, .. } => {
+                // In TUI mode, treat start_task as a follow-up when possible.
+                if self.current_phase == Phase::WaitingFollowUp
+                    || self.current_phase == Phase::Done
+                {
+                    if let Some(ref tx) = self.presence_tx {
+                        let _ = tx.try_send(task.clone());
+                    } else if let Some(ref tx) = self.follow_up_tx {
+                        let _ = tx.try_send(task.clone());
+                    }
+                    self.follow_up_textarea = None;
+                    self.mode = AppMode::Normal;
+                    self.current_phase = Phase::Thinking;
+                    self.round += 1;
+                    self.log(LogLevel::Info, format!("Task started via control socket: {}", truncate_str(&task, 80)));
+                } else if self.current_phase == Phase::Idle {
+                    self.log(
+                        LogLevel::Warn,
+                        "start_task: no active session to send task to".to_string(),
+                    );
+                } else {
+                    self.log(
+                        LogLevel::Warn,
+                        format!("start_task: agent is busy (phase: {:?})", self.current_phase),
+                    );
+                }
             }
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
@@ -1073,7 +1104,11 @@ impl App {
                 );
             }
             ControlMsg::FollowUp { text } => {
-                if self.mode == AppMode::FollowUp {
+                // Accept follow-ups when waiting for follow-up or task is done,
+                // regardless of AppMode (user may have pressed Esc to browse logs).
+                if self.current_phase == Phase::WaitingFollowUp
+                    || self.current_phase == Phase::Done
+                {
                     // Route through presence layer if active
                     if let Some(ref tx) = self.presence_tx {
                         let _ = tx.try_send(text.clone());
@@ -1087,18 +1122,104 @@ impl App {
                     self.log(LogLevel::Info, format!("Follow-up via control socket: {}", truncate_str(&text, 80)));
                 }
             }
-            ControlMsg::QueryDetail { scope, .. } => {
+            ControlMsg::QueryDetail { scope, target } => {
                 self.log(
                     LogLevel::Info,
                     format!("Query detail request: {}", scope),
                 );
+                let result = match scope.as_str() {
+                    "current_turn" => format!("Turn: {}\nPhase: {:?}\nBudget: {:.0}%", self.turn, self.current_phase, self.budget_pct),
+                    "logs" => {
+                        let entries = session_log::recent_entries(&self.log_dir, 20);
+                        if entries.is_empty() { "No log entries yet.".to_string() } else { entries.join("\n") }
+                    }
+                    "diff" => {
+                        if let Some(ref root) = self.project_root {
+                            match std::process::Command::new("git")
+                                .args(["diff", "--stat"])
+                                .current_dir(root)
+                                .output()
+                            {
+                                Ok(o) => {
+                                    let stdout = String::from_utf8_lossy(&o.stdout);
+                                    if stdout.trim().is_empty() { "No changes.".to_string() } else { stdout.to_string() }
+                                }
+                                Err(e) => format!("Failed to run git diff: {}", e),
+                            }
+                        } else {
+                            "No project root available.".to_string()
+                        }
+                    }
+                    "file" => {
+                        match target.as_deref() {
+                            Some(path) => match std::fs::read_to_string(path) {
+                                Ok(content) => content.lines().take(200).collect::<Vec<_>>().join("\n"),
+                                Err(e) => format!("Failed to read file: {}", e),
+                            },
+                            None => "Error: target file path is required".to_string(),
+                        }
+                    }
+                    other => format!("Unknown scope: {}", other),
+                };
+                self.broadcast_control(OutboundEvent::CommandResult {
+                    action: "query_detail".to_string(),
+                    ok: true,
+                    message: result,
+                    data: None,
+                });
             }
-            ControlMsg::RecallMemory { keywords, .. } => {
+            ControlMsg::RecallMemory { keywords, tags, channel } => {
                 let kws = keywords.as_deref().unwrap_or(&[]);
                 self.log(
                     LogLevel::Info,
                     format!("Memory recall request: {:?}", kws),
                 );
+                let result = if let Some(ref kp) = self.knowledge_path {
+                    let query = knowledge::KnowledgeQuery {
+                        keywords: if kws.is_empty() { None } else { Some(kws.to_vec()) },
+                        tags,
+                        channel,
+                        ..Default::default()
+                    };
+                    match knowledge::load(kp) {
+                        Ok(store) => {
+                            let results = knowledge::query(&store, &query);
+                            if results.is_empty() {
+                                // Fall back to session log search
+                                let entries = session_log::recent_entries(&self.log_dir, 100);
+                                if let Some(ref kw_list) = query.keywords {
+                                    let matched: Vec<&String> = entries.iter()
+                                        .filter(|e| {
+                                            let lower = e.to_lowercase();
+                                            kw_list.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+                                        })
+                                        .collect();
+                                    if matched.is_empty() {
+                                        "No matching memories found.".to_string()
+                                    } else {
+                                        matched.into_iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+                                    }
+                                } else {
+                                    "No matching memories found.".to_string()
+                                }
+                            } else {
+                                results.iter()
+                                    .map(|e| format!("[{}] {}: {}", e.channel, e.key, e.summary))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            }
+                        }
+                        Err(_) => "Failed to load knowledge store.".to_string(),
+                    }
+                } else {
+                    "No knowledge path configured.".to_string()
+                };
+                self.broadcast_control(OutboundEvent::CommandResult {
+                    action: "recall_memory".to_string(),
+                    ok: true,
+                    message: result,
+                    data: None,
+                });
             }
             ControlMsg::Quit => {
                 self.should_quit = true;
@@ -1264,6 +1385,15 @@ impl App {
                     reason: reason.clone(),
                 });
                 self.log(LogLevel::Info, format!("--- {} ---", reason));
+                // Create a follow-up textarea so the user can submit follow-ups
+                // after task completion (press f to reopen).
+                if self.follow_up_textarea.is_none()
+                    && (self.follow_up_tx.is_some() || self.presence_tx.is_some())
+                {
+                    let mut textarea = tui_textarea::TextArea::default();
+                    textarea.set_cursor_line_style(ratatui::style::Style::default());
+                    self.follow_up_textarea = Some(textarea);
+                }
             }
             AppEvent::BudgetWarning { pct, remaining } => {
                 self.budget_pct = pct;

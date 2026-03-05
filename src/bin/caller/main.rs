@@ -3769,6 +3769,8 @@ async fn main() -> Result<(), CallerError> {
         app.context_window = provider.context_window();
         app.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
         app.task_description = task.clone().unwrap_or_default();
+        app.project_root = Some(project.root.clone());
+        app.knowledge_path = Some(project.memory_path());
         app.verbosity = if flags.verbose {
             tui::app::Verbosity::Debug
         } else {

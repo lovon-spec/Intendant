@@ -1519,7 +1519,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::FollowUp { text } => {
             let mut s = state.write().await;
-            if s.phase != Phase::WaitingFollowUp {
+            if s.phase != Phase::WaitingFollowUp && s.phase != Phase::Done {
                 emit_control_result(
                     control_tx,
                     "follow_up",
