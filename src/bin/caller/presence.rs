@@ -217,7 +217,18 @@ impl PresenceLayer {
         use crate::tui::app::LogLevel;
         const MAX_TOOL_ROUNDS: usize = 10;
 
-        for _round in 0..MAX_TOOL_ROUNDS {
+        for round in 0..MAX_TOOL_ROUNDS {
+            // Emit a visible log before the (potentially slow) API call so the
+            // TUI isn't blank while waiting.
+            self.bus.send(AppEvent::PresenceLog {
+                message: if round == 0 {
+                    format!("Thinking ({})...", self.provider.model())
+                } else {
+                    format!("Thinking (tool round {})...", round + 1)
+                },
+                level: None, // Info — visible at Normal verbosity
+            });
+
             let messages = self.conversation.messages().to_vec();
             let response = self.provider.chat(&messages).await?;
 

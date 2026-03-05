@@ -3877,6 +3877,11 @@ async fn main() -> Result<(), CallerError> {
             app.set_presence_event_sender(presence_event_tx);
 
             app.log(tui::app::LogLevel::Info, "Presence layer active".to_string());
+            // If there's an initial task, set the phase to Thinking immediately
+            // so the TUI doesn't sit at "Idle" during the presence API call.
+            if task.is_some() {
+                app.current_phase = tui::app::Phase::Thinking;
+            }
             (Some(presence_user_rx), Some(presence_event_rx))
         } else {
             (None, None)
