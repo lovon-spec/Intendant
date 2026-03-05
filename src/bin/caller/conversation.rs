@@ -179,11 +179,6 @@ impl Conversation {
         self.messages.len()
     }
 
-    #[allow(dead_code)]
-    pub fn estimated_tokens(&self) -> usize {
-        self.messages.iter().map(|m| m.content.len() / 4).sum()
-    }
-
     pub fn set_usage(&mut self, usage: TokenUsage) {
         self.last_usage = Some(usage);
     }
@@ -524,17 +519,6 @@ mod tests {
         let deserialized: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.role, "user");
         assert_eq!(deserialized.content, "test");
-    }
-
-    #[test]
-    fn len_and_estimated_tokens() {
-        let mut conv = Conversation::new("system prompt".to_string(), 128_000);
-        assert_eq!(conv.len(), 1);
-        conv.add_user("hello world".to_string());
-        assert_eq!(conv.len(), 2);
-        // estimated_tokens is len/4 per message
-        let tokens = conv.estimated_tokens();
-        assert!(tokens > 0);
     }
 
     #[test]
