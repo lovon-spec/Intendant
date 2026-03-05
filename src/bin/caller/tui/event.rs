@@ -113,8 +113,11 @@ pub enum AppEvent {
     },
 
     /// Presence layer log message (shown in TUI log panel).
+    /// `level` controls visibility: None defaults to Info.
     PresenceLog {
         message: String,
+        #[allow(dead_code)]
+        level: Option<crate::tui::app::LogLevel>,
     },
 
     // Round lifecycle
