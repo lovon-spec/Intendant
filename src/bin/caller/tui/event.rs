@@ -118,6 +118,8 @@ pub enum AppEvent {
         message: String,
         #[allow(dead_code)]
         level: Option<crate::tui::app::LogLevel>,
+        /// Presence interaction turn (for log grouping/collapse).
+        turn: Option<usize>,
     },
 
     // Round lifecycle

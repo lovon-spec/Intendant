@@ -2782,6 +2782,7 @@ async fn run_with_presence(
     mut user_rx: tokio::sync::mpsc::Receiver<String>,
     response_tx: tokio::sync::mpsc::Sender<String>,
     presence_event_rx: tokio::sync::mpsc::Receiver<presence::PresenceEvent>,
+    force_direct: bool,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
     let presence_provider = provider::select_presence_provider(
@@ -2849,6 +2850,7 @@ async fn run_with_presence(
                         e
                     ),
                     level: Some(tui::app::LogLevel::Warn),
+                    turn: None,
                 });
                 presence_failed_task = Some(task_str.clone());
             }
@@ -2858,6 +2860,7 @@ async fn run_with_presence(
                          Submitting task directly."
                         .to_string(),
                     level: Some(tui::app::LogLevel::Warn),
+                    turn: None,
                 });
                 presence_failed_task = Some(task_str.clone());
             }
@@ -2927,7 +2930,7 @@ async fn run_with_presence(
                 let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
                 drop(follow_up_tx); // single-round for delegated tasks
 
-                let result = if envelope.force_direct || is_simple_task(&envelope.task) {
+                let result = if force_direct || envelope.force_direct || is_simple_task(&envelope.task) {
                     run_direct_mode(
                         task_provider,
                         envelope.task,
@@ -3840,9 +3843,10 @@ async fn main() -> Result<(), CallerError> {
             app.log(tui::app::LogLevel::Info, format!("Task: {}", t));
         }
 
-        // Determine if presence layer should be active
-        let use_presence = !flags.direct
-            && !flags.no_presence
+        // Determine if presence layer should be active.
+        // Note: --direct only forces single-agent mode for the worker; it does
+        // NOT disable presence.  Use --no-presence to disable presence.
+        let use_presence = !flags.no_presence
             && project.config.presence.enabled;
 
         // Create follow-up channel for multi-round support.
@@ -3918,6 +3922,7 @@ async fn main() -> Result<(), CallerError> {
                             bus_for_responses.send(AppEvent::PresenceLog {
                                 message: response,
                                 level: None,
+                                turn: None,
                             });
                             // Reset to follow-up phase after presence responds
                             bus_for_responses.send(AppEvent::RoundComplete {
@@ -3940,6 +3945,7 @@ async fn main() -> Result<(), CallerError> {
                     presence_user_rx,
                     response_tx,
                     presence_event_rx,
+                    force_direct,
                 )
                 .await;
 

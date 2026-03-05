@@ -1418,12 +1418,12 @@ impl App {
                 self.log(LogLevel::Error, msg);
                 self.current_phase = Phase::Done;
             }
-            AppEvent::PresenceLog { message, level } => {
+            AppEvent::PresenceLog { message, level, turn } => {
                 self.log_sourced(
                     level.unwrap_or(LogLevel::Info),
                     format!("[presence] {}", message),
                     LogSource::Presence,
-                    None,
+                    turn,
                 );
             }
             AppEvent::HumanQuestionDetected { question } => {
@@ -2380,18 +2380,30 @@ mod tests {
         app.handle_event(AppEvent::PresenceLog {
             message: "Tool call: recall_memory".to_string(),
             level: None,
+            turn: Some(1),
         });
         assert_eq!(app.log_entries.len(), 1);
         assert_eq!(app.log_entries[0].source, LogSource::Presence);
         assert_eq!(app.log_entries[0].level, LogLevel::Info);
+        assert_eq!(app.log_entries[0].turn, Some(1));
 
         // Debug-level presence log
         app.handle_event(AppEvent::PresenceLog {
             message: "Tokens: 100 + 50 = 150".to_string(),
             level: Some(LogLevel::Debug),
+            turn: Some(1),
         });
         assert_eq!(app.log_entries.len(), 2);
         assert_eq!(app.log_entries[1].level, LogLevel::Debug);
         assert_eq!(app.log_entries[1].source, LogSource::Presence);
+        assert_eq!(app.log_entries[1].turn, Some(1));
+
+        // Presence log without turn (e.g. error fallback)
+        app.handle_event(AppEvent::PresenceLog {
+            message: "error".to_string(),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        assert_eq!(app.log_entries[2].turn, None);
     }
 }

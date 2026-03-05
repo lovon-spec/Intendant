@@ -138,6 +138,8 @@ pub struct PresenceLayer {
     log_dir: PathBuf,
     /// Project root for file reads and git operations.
     project_root: PathBuf,
+    /// Presence interaction turn counter (incremented per process_user_input / handle_event).
+    turn: usize,
 }
 
 #[allow(dead_code)]
@@ -166,11 +168,13 @@ impl PresenceLayer {
             knowledge_path,
             log_dir,
             project_root,
+            turn: 0,
         }
     }
 
     /// Process text input from the user, returning the model's response.
     pub async fn process_user_input(&mut self, input: &str) -> Result<String, CallerError> {
+        self.turn += 1;
         self.conversation.add_user(input.to_string());
         let result = self.run_model_loop().await;
         self.emit_usage_update();
@@ -188,6 +192,19 @@ impl PresenceLayer {
         }
     }
 
+    /// Emit a presence log with the current turn number.
+    /// Presence turns are offset by `PRESENCE_TURN_OFFSET` so they never
+    /// collide with agent turns (which start at 1) in the TUI collapse logic.
+    const PRESENCE_TURN_OFFSET: usize = 100_000;
+
+    fn plog(&self, message: String, level: Option<crate::tui::app::LogLevel>) {
+        self.bus.send(AppEvent::PresenceLog {
+            message,
+            level,
+            turn: Some(Self::PRESENCE_TURN_OFFSET + self.turn),
+        });
+    }
+
     /// Emit a PresenceUsageUpdate event to the TUI.
     fn emit_usage_update(&self) {
         let usage = self.usage_snapshot();
@@ -202,6 +219,7 @@ impl PresenceLayer {
 
     /// Inject a PresenceEvent into the conversation and let the model narrate.
     pub async fn handle_event(&mut self, event: PresenceEvent) -> Result<Option<String>, CallerError> {
+        self.turn += 1;
         let event_text = format_event(&event);
         self.conversation.add_user(format!("[Event] {}", event_text));
         let response = self.run_model_loop().await?;
@@ -220,28 +238,28 @@ impl PresenceLayer {
         for round in 0..MAX_TOOL_ROUNDS {
             // Emit a visible log before the (potentially slow) API call so the
             // TUI isn't blank while waiting.
-            self.bus.send(AppEvent::PresenceLog {
-                message: if round == 0 {
+            self.plog(
+                if round == 0 {
                     format!("Thinking ({})...", self.provider.model())
                 } else {
                     format!("Thinking (tool round {})...", round + 1)
                 },
-                level: None, // Info — visible at Normal verbosity
-            });
+                None, // Info — visible at Normal verbosity
+            );
 
             let messages = self.conversation.messages().to_vec();
             let response = self.provider.chat(&messages).await?;
 
             // Debug: token usage per call
-            self.bus.send(AppEvent::PresenceLog {
-                message: format!(
+            self.plog(
+                format!(
                     "Tokens: {} prompt + {} completion = {} total",
                     response.usage.prompt_tokens,
                     response.usage.completion_tokens,
                     response.usage.total_tokens,
                 ),
-                level: Some(LogLevel::Debug),
-            });
+                Some(LogLevel::Debug),
+            );
 
             self.conversation.set_usage(response.usage.clone());
             self.conversation.auto_compact();
@@ -256,25 +274,16 @@ impl PresenceLayer {
 
             // Has tool calls — process them
             let tool_names: Vec<&str> = response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-            self.bus.send(AppEvent::PresenceLog {
-                message: format!("Tool call: {}", tool_names.join(", ")),
-                level: None,
-            });
+            self.plog(format!("Tool call: {}", tool_names.join(", ")), None);
 
             // Verbose: model reasoning text alongside tool calls
             if !response.content.is_empty() {
-                self.bus.send(AppEvent::PresenceLog {
-                    message: format!("Model text: {}", response.content),
-                    level: Some(LogLevel::Agent),
-                });
+                self.plog(format!("Model text: {}", response.content), Some(LogLevel::Agent));
             }
 
             // Debug: full tool call arguments
             for tc in &response.tool_calls {
-                self.bus.send(AppEvent::PresenceLog {
-                    message: format!("{}({})", tc.name, tc.arguments),
-                    level: Some(LogLevel::Debug),
-                });
+                self.plog(format!("{}({})", tc.name, tc.arguments), Some(LogLevel::Debug));
             }
 
             let tool_call_refs: Vec<crate::conversation::ToolCallRef> = response
@@ -302,10 +311,7 @@ impl PresenceLayer {
                 } else {
                     result.clone()
                 };
-                self.bus.send(AppEvent::PresenceLog {
-                    message: format!("{} → {}", tc.name, result_preview),
-                    level: Some(LogLevel::Debug),
-                });
+                self.plog(format!("{} → {}", tc.name, result_preview), Some(LogLevel::Debug));
                 self.conversation.add_tool_result(
                     &tc.call_id,
                     &tc.name,
@@ -354,10 +360,7 @@ impl PresenceLayer {
 
         match self.task_tx.send(envelope).await {
             Ok(()) => {
-                self.bus.send(AppEvent::PresenceLog {
-                    message: format!("Dispatched task: {}", task),
-                    level: None,
-                });
+                self.plog(format!("Dispatched task: {}", task), None);
                 format!("Task submitted: {}", task)
             }
             Err(_) => "Error: task channel closed".to_string(),
