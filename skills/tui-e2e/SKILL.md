@@ -55,7 +55,24 @@ echo '{"action":"status"}' | socat - UNIX-CONNECT:/tmp/intendant-<PID>.sock
 echo '{"action":"approve","id":<TURN>}' | socat - UNIX-CONNECT:/tmp/intendant-<PID>.sock
 ```
 
-Messages: `status`, `approve` (needs `id`), `deny` (needs `id`), `skip` (needs `id`), `approve_all` (needs `id`), `set_autonomy` (needs `level`), `set_verbosity` (needs `level`: quiet/normal/verbose/debug), `input` (needs `text` — for askHuman only), `follow_up` (needs `text` — for follow-up input after a round completes), `quit`.
+Actions:
+
+| Action | Fields | Notes |
+|--------|--------|-------|
+| `status` | — | Returns turn, phase, autonomy, session_id, task |
+| `usage` | — | Returns per-model token usage |
+| `approve` | `id` (turn) | Approve pending action |
+| `deny` | `id` (turn) | Deny pending action |
+| `skip` | `id` (turn) | Skip pending action |
+| `approve_all` | `id` (turn) | Approve all pending actions |
+| `set_autonomy` | `level` | low/medium/high/full |
+| `set_verbosity` | `level` | quiet/normal/verbose/debug |
+| `input` | `text` | Reply to askHuman prompt only |
+| `follow_up` | `text` | Send follow-up after round completes |
+| `start_task` | `task`, `orchestrate`? | Start a new task (optional orchestrator mode) |
+| `query_detail` | `scope`, `target`? | Query detail about a scope |
+| `recall_memory` | `keywords`?, `tags`?, `channel`? | Recall stored knowledge |
+| `quit` | — | End session |
 
 ## Cleanup
 
