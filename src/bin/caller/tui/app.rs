@@ -1418,9 +1418,9 @@ impl App {
                 self.log(LogLevel::Error, msg);
                 self.current_phase = Phase::Done;
             }
-            AppEvent::PresenceLog { message } => {
+            AppEvent::PresenceLog { message, level } => {
                 self.log_sourced(
-                    LogLevel::Info,
+                    level.unwrap_or(LogLevel::Info),
                     format!("[presence] {}", message),
                     LogSource::Presence,
                     None,
@@ -2379,8 +2379,19 @@ mod tests {
         let mut app = test_app();
         app.handle_event(AppEvent::PresenceLog {
             message: "Tool call: recall_memory".to_string(),
+            level: None,
         });
         assert_eq!(app.log_entries.len(), 1);
         assert_eq!(app.log_entries[0].source, LogSource::Presence);
+        assert_eq!(app.log_entries[0].level, LogLevel::Info);
+
+        // Debug-level presence log
+        app.handle_event(AppEvent::PresenceLog {
+            message: "Tokens: 100 + 50 = 150".to_string(),
+            level: Some(LogLevel::Debug),
+        });
+        assert_eq!(app.log_entries.len(), 2);
+        assert_eq!(app.log_entries[1].level, LogLevel::Debug);
+        assert_eq!(app.log_entries[1].source, LogSource::Presence);
     }
 }

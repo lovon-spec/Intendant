@@ -1933,8 +1933,8 @@ pub fn spawn_event_listener(
                             s.presence_model_name = Some(model);
                         }
                     }
-                    AppEvent::PresenceLog { message } => {
-                        s.push_log(LogLevel::Info, format!("[presence] {}", message));
+                    AppEvent::PresenceLog { message, level } => {
+                        s.push_log(level.unwrap_or(LogLevel::Info), format!("[presence] {}", message));
                     }
                 }
             }

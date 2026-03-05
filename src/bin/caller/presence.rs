@@ -214,11 +214,23 @@ impl PresenceLayer {
 
     /// Run the model in a loop, handling tool calls until a text response is produced.
     async fn run_model_loop(&mut self) -> Result<String, CallerError> {
+        use crate::tui::app::LogLevel;
         const MAX_TOOL_ROUNDS: usize = 10;
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let messages = self.conversation.messages().to_vec();
             let response = self.provider.chat(&messages).await?;
+
+            // Debug: token usage per call
+            self.bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "Tokens: {} prompt + {} completion = {} total",
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    response.usage.total_tokens,
+                ),
+                level: Some(LogLevel::Debug),
+            });
 
             self.conversation.set_usage(response.usage.clone());
             self.conversation.auto_compact();
@@ -235,7 +247,24 @@ impl PresenceLayer {
             let tool_names: Vec<&str> = response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
             self.bus.send(AppEvent::PresenceLog {
                 message: format!("Tool call: {}", tool_names.join(", ")),
+                level: None,
             });
+
+            // Verbose: model reasoning text alongside tool calls
+            if !response.content.is_empty() {
+                self.bus.send(AppEvent::PresenceLog {
+                    message: format!("Model text: {}", response.content),
+                    level: Some(LogLevel::Agent),
+                });
+            }
+
+            // Debug: full tool call arguments
+            for tc in &response.tool_calls {
+                self.bus.send(AppEvent::PresenceLog {
+                    message: format!("{}({})", tc.name, tc.arguments),
+                    level: Some(LogLevel::Debug),
+                });
+            }
 
             let tool_call_refs: Vec<crate::conversation::ToolCallRef> = response
                 .tool_calls
@@ -256,6 +285,16 @@ impl PresenceLayer {
 
             for tc in &response.tool_calls {
                 let result = self.handle_presence_tool_call(&tc.name, &tc.arguments).await;
+                // Debug: tool call result
+                let result_preview = if result.len() > 200 {
+                    format!("{}...", &result[..200])
+                } else {
+                    result.clone()
+                };
+                self.bus.send(AppEvent::PresenceLog {
+                    message: format!("{} → {}", tc.name, result_preview),
+                    level: Some(LogLevel::Debug),
+                });
                 self.conversation.add_tool_result(
                     &tc.call_id,
                     &tc.name,
@@ -306,6 +345,7 @@ impl PresenceLayer {
             Ok(()) => {
                 self.bus.send(AppEvent::PresenceLog {
                     message: format!("Dispatched task: {}", task),
+                    level: None,
                 });
                 format!("Task submitted: {}", task)
             }

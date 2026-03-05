@@ -2848,6 +2848,7 @@ async fn run_with_presence(
                          Submitting task directly.",
                         e
                     ),
+                    level: Some(tui::app::LogLevel::Warn),
                 });
                 presence_failed_task = Some(task_str.clone());
             }
@@ -2856,6 +2857,7 @@ async fn run_with_presence(
                     message: "Presence provider timed out (30s). Use --no-presence or --direct to bypass. \
                          Submitting task directly."
                         .to_string(),
+                    level: Some(tui::app::LogLevel::Warn),
                 });
                 presence_failed_task = Some(task_str.clone());
             }
@@ -3910,6 +3912,7 @@ async fn main() -> Result<(), CallerError> {
                             // Log presence response as a visible PresenceLog entry
                             bus_for_responses.send(AppEvent::PresenceLog {
                                 message: response,
+                                level: None,
                             });
                             // Reset to follow-up phase after presence responds
                             bus_for_responses.send(AppEvent::RoundComplete {
