@@ -63,15 +63,6 @@ fn resolve_system_prompt_inner(
     project_root: Option<&Path>,
     use_tools: bool,
 ) -> Result<String, CallerError> {
-    // Presence role uses its own standalone prompt (not appended to base)
-    if matches!(role, SubAgentRole::Presence) {
-        return Ok(resolve_prompt(
-            "SysPrompt_presence.md",
-            DEFAULT_PRESENCE_PROMPT,
-            project_root,
-        ));
-    }
-
     let (filename, default) = if use_tools {
         ("SysPrompt_tools.md", DEFAULT_PROMPT_TOOLS)
     } else {
@@ -97,6 +88,17 @@ fn resolve_system_prompt_inner(
         }
         None => Ok(base_prompt),
     }
+}
+
+/// Resolve the presence layer system prompt via the standard 3-layer cascade.
+/// This is independent of the sub-agent role system — the presence layer is
+/// not a sub-agent.
+pub fn resolve_presence_prompt(project_root: Option<&Path>) -> String {
+    resolve_prompt(
+        "SysPrompt_presence.md",
+        DEFAULT_PRESENCE_PROMPT,
+        project_root,
+    )
 }
 
 /// Load project instructions from INTENDANT.md files.
@@ -215,8 +217,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_system_prompt_presence_standalone() {
-        let result = resolve_system_prompt(&SubAgentRole::Presence, None).unwrap();
+    fn resolve_presence_prompt_standalone() {
+        let result = resolve_presence_prompt(None);
         // Presence uses its own prompt, NOT appended to base
         assert_eq!(result, DEFAULT_PRESENCE_PROMPT);
         assert!(!result.contains(DEFAULT_PROMPT));

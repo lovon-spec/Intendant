@@ -9,7 +9,6 @@ pub enum SubAgentRole {
     Implementation,
     Testing,
     Orchestrator,
-    Presence,
     Custom(String),
 }
 
@@ -20,7 +19,6 @@ impl SubAgentRole {
             SubAgentRole::Implementation => "implementation",
             SubAgentRole::Testing => "testing",
             SubAgentRole::Orchestrator => "orchestrator",
-            SubAgentRole::Presence => "presence",
             SubAgentRole::Custom(s) => s,
         }
     }
@@ -31,7 +29,6 @@ impl SubAgentRole {
             "implementation" => SubAgentRole::Implementation,
             "testing" => SubAgentRole::Testing,
             "orchestrator" => SubAgentRole::Orchestrator,
-            "presence" => SubAgentRole::Presence,
             other => SubAgentRole::Custom(other.to_string()),
         }
     }
@@ -678,8 +675,8 @@ mod tests {
     }
 
     #[test]
-    fn presence_role_roundtrip() {
-        assert_eq!(SubAgentRole::from_str("presence"), SubAgentRole::Presence);
-        assert_eq!(SubAgentRole::Presence.as_str(), "presence");
+    fn custom_role_roundtrip() {
+        // "presence" is no longer a built-in role; it round-trips as Custom
+        assert_eq!(SubAgentRole::from_str("presence"), SubAgentRole::Custom("presence".into()));
     }
 }

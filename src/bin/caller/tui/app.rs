@@ -224,6 +224,10 @@ pub struct App {
 
     // Sender for forwarding filtered events to the presence layer
     pub presence_event_tx: Option<tokio::sync::mpsc::Sender<crate::presence::PresenceEvent>>,
+    // Stateful phase tracking for presence event dedup (used by filter_event)
+    pub last_presence_phase: String,
+    // Shared agent state snapshot for presence layer status queries (check_status, query_detail)
+    pub presence_agent_state: Option<std::sync::Arc<std::sync::Mutex<crate::presence::AgentStateSnapshot>>>,
 
     // Project paths for query_detail and recall_memory socket commands
     pub project_root: Option<std::path::PathBuf>,
@@ -278,6 +282,8 @@ impl App {
             presence_usage_pct: 0.0,
             presence_context_window: 0,
             presence_event_tx: None,
+            last_presence_phase: String::new(),
+            presence_agent_state: None,
             project_root: None,
             knowledge_path: None,
         }
@@ -296,6 +302,13 @@ impl App {
         tx: tokio::sync::mpsc::Sender<crate::presence::PresenceEvent>,
     ) {
         self.presence_event_tx = Some(tx);
+    }
+
+    pub fn set_presence_agent_state(
+        &mut self,
+        state: std::sync::Arc<std::sync::Mutex<crate::presence::AgentStateSnapshot>>,
+    ) {
+        self.presence_agent_state = Some(state);
     }
 
     /// Build a usage snapshot for the main model.
@@ -331,50 +344,21 @@ impl App {
     }
 
     /// Forward a filtered event to the presence layer (non-blocking).
-    fn forward_to_presence(&self, event: &AppEvent) {
-        use crate::presence;
+    ///
+    /// Delegates to `presence::filter_event()` which provides stateful phase
+    /// dedup and covers all push-worthy event types (including ModelResponse and
+    /// AgentStarted, which are needed for phase narration).
+    ///
+    /// Also updates the shared `AgentStateSnapshot` so presence tool calls
+    /// like `check_status` and `query_detail` return accurate data.
+    fn forward_to_presence(&mut self, event: &AppEvent) {
+        // Update the agent state snapshot (sees ALL events, not just filtered ones)
+        if let Some(ref state) = self.presence_agent_state {
+            crate::presence::update_agent_state(event, state);
+        }
+        // Filter and forward push-worthy events to presence
         if let Some(ref tx) = self.presence_event_tx {
-            // Reuse the static last_phase tracking via a simple approach:
-            // We only forward push-worthy events. The filter is stateless here
-            // (no phase dedup) to keep it simple — presence can handle duplicates.
-            let pe = match event {
-                AppEvent::TaskComplete { reason } => Some(presence::PresenceEvent::TaskComplete {
-                    reason: reason.clone(),
-                }),
-                AppEvent::ApprovalRequired {
-                    id,
-                    command_preview,
-                    category,
-                    ..
-                } => Some(presence::PresenceEvent::ApprovalNeeded {
-                    id: *id,
-                    preview: command_preview.clone(),
-                    category: format!("{:?}", category),
-                }),
-                AppEvent::HumanQuestionDetected { question } => {
-                    Some(presence::PresenceEvent::HumanQuestion {
-                        question: question.clone(),
-                    })
-                }
-                AppEvent::BudgetWarning { pct, remaining } => {
-                    Some(presence::PresenceEvent::BudgetWarning {
-                        pct: *pct,
-                        remaining: *remaining,
-                    })
-                }
-                AppEvent::RoundComplete {
-                    round,
-                    turns_in_round,
-                } => Some(presence::PresenceEvent::RoundComplete {
-                    round: *round,
-                    turns_in_round: *turns_in_round,
-                }),
-                AppEvent::LoopError(msg) => Some(presence::PresenceEvent::Error {
-                    message: msg.clone(),
-                }),
-                _ => None,
-            };
-            if let Some(pe) = pe {
+            if let Some(pe) = crate::presence::filter_event(event, &mut self.last_presence_phase) {
                 let _ = tx.try_send(pe);
             }
         }

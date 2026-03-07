@@ -2769,8 +2769,10 @@ All relative paths and commands execute from this directory.",
 }
 
 /// Run with the presence layer mediating between user and agent loop.
-/// The presence layer has its own small-model provider and conversation,
-/// delegates tasks to the agent loop via a channel, and narrates events.
+///
+/// The presence layer runs in its own background task, handling user input
+/// and narrating agent events via `PresenceLayer::run()`. This function
+/// dispatches task envelopes produced by presence to the actual agent loop.
 #[allow(clippy::too_many_arguments)]
 async fn run_with_presence(
     task: Option<String>,
@@ -2779,9 +2781,10 @@ async fn run_with_presence(
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
     log_dir: PathBuf,
-    mut user_rx: tokio::sync::mpsc::Receiver<String>,
+    user_rx: tokio::sync::mpsc::Receiver<String>,
     response_tx: tokio::sync::mpsc::Sender<String>,
     presence_event_rx: tokio::sync::mpsc::Receiver<presence::PresenceEvent>,
+    agent_state: Arc<Mutex<presence::AgentStateSnapshot>>,
     force_direct: bool,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
@@ -2797,23 +2800,14 @@ async fn run_with_presence(
         model: presence_provider.model().to_string(),
     });
 
-    // 2. Resolve presence system prompt
-    let presence_prompt = prompts::resolve_system_prompt(
-        &sub_agent::SubAgentRole::Presence,
-        Some(&project.root),
-    )?;
+    // 2. Resolve presence system prompt (independent of sub-agent role system)
+    let presence_prompt = prompts::resolve_presence_prompt(Some(&project.root));
 
     // 3. Create channels
     let (task_tx, mut task_rx) = tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
-    let fallback_task_tx = task_tx.clone(); // keep a handle for fallback if presence fails
-    // The presence_event_rx is fed by the TUI via App.forward_to_presence() →
-    // presence_event_tx, which was created and wired by the caller (TUI branch).
-    let presence_event_rx = presence_event_rx;
+    let fallback_task_tx = task_tx.clone();
 
-    // 4. Create shared agent state
-    let agent_state = Arc::new(Mutex::new(presence::AgentStateSnapshot::default()));
-
-    // 5. Create presence layer
+    // 4. Create presence layer
     let context_window = project.config.presence.context_window;
     let mut presence = presence::PresenceLayer::new(
         presence_provider,
@@ -2828,7 +2822,7 @@ async fn run_with_presence(
         project.root.clone(),
     );
 
-    // 8. Send initial task to presence (if provided), with a timeout so a
+    // 6. Send initial task to presence (if provided), with a timeout so a
     //    slow or misconfigured presence provider doesn't freeze the TUI.
     let mut presence_failed_task: Option<String> = None;
     if let Some(ref task_str) = task {
@@ -2869,8 +2863,7 @@ async fn run_with_presence(
     }
 
     // If presence failed on the initial task, inject the task directly into
-    // the task channel so the agent loop still runs. The user sees the warning
-    // above and can quit or continue.
+    // the task channel so the agent loop still runs.
     if let Some(failed_task) = presence_failed_task {
         let envelope = presence::TaskEnvelope {
             task: failed_task,
@@ -2881,96 +2874,88 @@ async fn run_with_presence(
     }
     drop(fallback_task_tx);
 
-    // 9. Main loop: process tasks from presence + user follow-ups
+    // 7. Spawn presence.run() as a background task for user input + event narration.
+    //    This loop handles both user messages and agent events, forwarding
+    //    responses to the TUI via response_tx.
+    let _presence_handle = tokio::spawn(async move {
+        presence.run(user_rx, response_tx).await;
+    });
+
+    // 8. Main loop: dispatch task envelopes from presence to agent loops.
     let mut cumulative_stats = LoopStats::default();
     let project_root = project.root.clone();
 
-    loop {
-        tokio::select! {
-            // User sends follow-up text → route to presence
-            Some(input) = user_rx.recv() => {
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(30),
-                    presence.process_user_input(&input),
-                ).await {
-                    Ok(Ok(response)) if !response.is_empty() => {
-                        let _ = response_tx.send(response).await;
-                    }
-                    Ok(Err(e)) => {
-                        let _ = response_tx.send(format!("Presence error: {}", e)).await;
-                    }
-                    Err(_) => {
-                        let _ = response_tx.send("Presence provider timed out.".to_string()).await;
-                    }
-                    _ => {}
-                }
-            }
-            // Presence submitted a task → run agent loop
-            Some(envelope) = task_rx.recv() => {
-                slog(&session_log, |l| {
-                    l.info(&format!("Presence dispatched task: {}", envelope.task));
+    while let Some(envelope) = task_rx.recv().await {
+        slog(&session_log, |l| {
+            l.info(&format!("Presence dispatched task: {}", envelope.task));
+        });
+
+        let task_provider = match provider::select_provider() {
+            Ok(p) => p,
+            Err(e) => {
+                bus.send(AppEvent::PresenceLog {
+                    message: format!("Provider error: {}", e),
+                    level: Some(tui::app::LogLevel::Error),
+                    turn: None,
                 });
-
-                // Create a fresh provider for each dispatched task
-                let task_provider = match provider::select_provider() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = response_tx.send(format!("Provider error: {}", e)).await;
-                        continue;
-                    }
-                };
-                let task_project = match Project::from_root(project_root.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = response_tx.send(format!("Project error: {}", e)).await;
-                        continue;
-                    }
-                };
-
-                let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-                drop(follow_up_tx); // single-round for delegated tasks
-
-                let result = if force_direct || envelope.force_direct || is_simple_task(&envelope.task) {
-                    run_direct_mode(
-                        task_provider,
-                        envelope.task,
-                        task_project,
-                        Some(bus.clone()),
-                        autonomy.clone(),
-                        session_log.clone(),
-                        log_dir.clone(),
-                        None,
-                        follow_up_rx,
-                    )
-                    .await
-                } else {
-                    run_user_mode(
-                        task_provider,
-                        envelope.task,
-                        task_project,
-                        Some(bus.clone()),
-                        autonomy.clone(),
-                        session_log.clone(),
-                    )
-                    .await
-                };
-
-                match result {
-                    Ok(stats) => {
-                        cumulative_stats.turns += stats.turns;
-                        cumulative_stats.rounds += stats.rounds;
-                        cumulative_stats.usage.prompt_tokens += stats.usage.prompt_tokens;
-                        cumulative_stats.usage.completion_tokens += stats.usage.completion_tokens;
-                        cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
-                    }
-                    Err(e) => {
-                        let _ = response_tx
-                            .send(format!("Task error: {}", e))
-                            .await;
-                    }
-                }
+                continue;
             }
-            else => break,
+        };
+        let task_project = match Project::from_root(project_root.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                bus.send(AppEvent::PresenceLog {
+                    message: format!("Project error: {}", e),
+                    level: Some(tui::app::LogLevel::Error),
+                    turn: None,
+                });
+                continue;
+            }
+        };
+
+        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+        drop(follow_up_tx); // single-round for delegated tasks
+
+        let result = if force_direct || envelope.force_direct || is_simple_task(&envelope.task) {
+            run_direct_mode(
+                task_provider,
+                envelope.task,
+                task_project,
+                Some(bus.clone()),
+                autonomy.clone(),
+                session_log.clone(),
+                log_dir.clone(),
+                None,
+                follow_up_rx,
+            )
+            .await
+        } else {
+            run_user_mode(
+                task_provider,
+                envelope.task,
+                task_project,
+                Some(bus.clone()),
+                autonomy.clone(),
+                session_log.clone(),
+            )
+            .await
+        };
+
+        match result {
+            Ok(stats) => {
+                cumulative_stats.turns += stats.turns;
+                cumulative_stats.rounds += stats.rounds;
+                cumulative_stats.usage.prompt_tokens += stats.usage.prompt_tokens;
+                cumulative_stats.usage.completion_tokens += stats.usage.completion_tokens;
+                cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
+            }
+            Err(e) => {
+                bus.send(AppEvent::PresenceLog {
+                    message: format!("Task error: {}", e),
+                    level: Some(tui::app::LogLevel::Error),
+                    turn: None,
+                });
+            }
         }
     }
 
@@ -3870,7 +3855,8 @@ async fn main() -> Result<(), CallerError> {
         }
 
         // If presence is active, create channels for user ↔ presence communication
-        let (presence_user_rx, presence_event_rx_for_task) = if use_presence {
+        // and the shared agent state snapshot.
+        let (presence_user_rx, presence_event_rx_for_task, presence_agent_state) = if use_presence {
             let (presence_tx, presence_user_rx) =
                 tokio::sync::mpsc::channel::<String>(4);
             app.set_presence_sender(presence_tx);
@@ -3880,15 +3866,19 @@ async fn main() -> Result<(), CallerError> {
                 tokio::sync::mpsc::channel::<presence::PresenceEvent>(64);
             app.set_presence_event_sender(presence_event_tx);
 
+            // Shared agent state: updated by TUI (via forward_to_presence), read by presence tools
+            let agent_state = Arc::new(std::sync::Mutex::new(presence::AgentStateSnapshot::default()));
+            app.set_presence_agent_state(agent_state.clone());
+
             app.log(tui::app::LogLevel::Info, "Presence layer active".to_string());
             // If there's an initial task, set the phase to Thinking immediately
             // so the TUI doesn't sit at "Idle" during the presence API call.
             if task.is_some() {
                 app.current_phase = tui::app::Phase::Thinking;
             }
-            (Some(presence_user_rx), Some(presence_event_rx))
+            (Some(presence_user_rx), Some(presence_event_rx), Some(agent_state))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // Spawn the agent loop in a background task
@@ -3907,6 +3897,7 @@ async fn main() -> Result<(), CallerError> {
             // Presence mode: the presence layer mediates between user and agent
             let presence_user_rx = presence_user_rx.unwrap();
             let presence_event_rx = presence_event_rx_for_task.unwrap();
+            let agent_state = presence_agent_state.unwrap();
             let (response_tx, mut response_rx) =
                 tokio::sync::mpsc::channel::<String>(8);
 
@@ -3945,6 +3936,7 @@ async fn main() -> Result<(), CallerError> {
                     presence_user_rx,
                     response_tx,
                     presence_event_rx,
+                    agent_state,
                     force_direct,
                 )
                 .await;

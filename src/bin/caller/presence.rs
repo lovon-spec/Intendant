@@ -88,7 +88,6 @@ pub struct TaskEnvelope {
 
 /// Filtered events pushed to the presence layer from the agent loop.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum PresenceEvent {
     PhaseChanged { phase: String },
     TaskComplete { reason: String },
@@ -120,6 +119,11 @@ pub struct AgentStateSnapshot {
     pub active_workers: Vec<String>,
 }
 
+/// Minimum interval between phase-change narrations. Phase events arriving
+/// faster than this are skipped so the model doesn't narrate "Thinking..."
+/// immediately followed by "Running your code..." half a second later.
+const NARRATION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The running presence layer instance.
 pub struct PresenceLayer {
     provider: Box<dyn ChatProvider>,
@@ -128,7 +132,6 @@ pub struct PresenceLayer {
     /// Channel to submit tasks to the agent loop.
     task_tx: mpsc::Sender<TaskEnvelope>,
     /// Channel to receive filtered events from the agent loop.
-    #[allow(dead_code)]
     event_rx: mpsc::Receiver<PresenceEvent>,
     /// Shared agent state snapshot, updated by the event listener.
     agent_state: Arc<Mutex<AgentStateSnapshot>>,
@@ -140,9 +143,10 @@ pub struct PresenceLayer {
     project_root: PathBuf,
     /// Presence interaction turn counter (incremented per process_user_input / handle_event).
     turn: usize,
+    /// Timestamp of the last phase-change narration (for debounce).
+    last_narration_at: std::time::Instant,
 }
 
-#[allow(dead_code)]
 impl PresenceLayer {
     /// Create a new presence layer.
     pub fn new(
@@ -169,6 +173,7 @@ impl PresenceLayer {
             log_dir,
             project_root,
             turn: 0,
+            last_narration_at: std::time::Instant::now() - NARRATION_DEBOUNCE,
         }
     }
 
@@ -218,7 +223,19 @@ impl PresenceLayer {
     }
 
     /// Inject a PresenceEvent into the conversation and let the model narrate.
+    ///
+    /// PhaseChanged events are debounced: if two arrive within 500ms, the
+    /// second is silently dropped so the model doesn't narrate every rapid
+    /// phase transition (e.g. thinking → running in quick succession).
     pub async fn handle_event(&mut self, event: PresenceEvent) -> Result<Option<String>, CallerError> {
+        // Debounce phase-change narrations
+        if matches!(event, PresenceEvent::PhaseChanged { .. }) {
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_narration_at) < NARRATION_DEBOUNCE {
+                return Ok(None);
+            }
+            self.last_narration_at = now;
+        }
         self.turn += 1;
         let event_text = format_event(&event);
         self.conversation.add_user(format!("[Event] {}", event_text));
@@ -683,30 +700,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
     }
 }
 
-/// Spawn a background task that listens to an EventBus receiver and forwards
-/// filtered events to the presence layer, while updating the AgentStateSnapshot.
-pub fn spawn_event_listener(
-    mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
-    presence_tx: mpsc::Sender<PresenceEvent>,
-    agent_state: Arc<Mutex<AgentStateSnapshot>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut last_phase = String::new();
-        while let Some(event) = event_rx.recv().await {
-            // Update agent state snapshot
-            update_agent_state(&event, &agent_state);
-
-            // Filter and forward to presence
-            if let Some(pe) = filter_event(&event, &mut last_phase) {
-                if presence_tx.send(pe).await.is_err() {
-                    break; // presence layer dropped
-                }
-            }
-        }
-    })
-}
-
-fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot>>) {
+pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot>>) {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     match event {
         AppEvent::TurnStarted {
@@ -756,38 +750,6 @@ fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot>>) 
     }
 }
 
-/// Update the agent state snapshot from a PresenceEvent (used by the TUI-side
-/// forwarder to keep the snapshot in sync without needing the EventBus receiver).
-pub fn update_agent_state_from_presence_event(
-    event: &PresenceEvent,
-    state: &Arc<Mutex<AgentStateSnapshot>>,
-) {
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    match event {
-        PresenceEvent::PhaseChanged { phase } => {
-            s.phase = phase.clone();
-        }
-        PresenceEvent::TaskComplete { reason } => {
-            s.phase = format!("done: {}", reason);
-        }
-        PresenceEvent::ApprovalNeeded { preview, .. } => {
-            s.phase = "waiting_approval".to_string();
-            s.last_command_preview = preview.clone();
-        }
-        PresenceEvent::HumanQuestion { .. } => {
-            s.phase = "waiting_human".to_string();
-        }
-        PresenceEvent::BudgetWarning { pct, .. } => {
-            s.budget_pct = *pct;
-        }
-        PresenceEvent::RoundComplete { .. } => {
-            s.phase = "waiting_followup".to_string();
-        }
-        PresenceEvent::Error { .. } => {
-            s.phase = "error".to_string();
-        }
-    }
-}
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -797,7 +759,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn format_event(event: &PresenceEvent) -> String {
     match event {
         PresenceEvent::PhaseChanged { phase } => format!("Phase changed to: {}", phase),
