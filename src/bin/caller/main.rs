@@ -128,7 +128,7 @@ fn print_help() {
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
-    println!("    --live [PORT]          Enable live gateway (audio/video/text, default port: 8765; implies --mcp)");
+    println!("    --live [PORT]          Serve TUI via web (xterm.js + optional voice, default port: 8765)");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -271,7 +271,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--live" | "--voice-gateway" => {
                 flags.live = true;
-                flags.mcp = true; // --live implies --mcp
+                // --live serves the TUI via web (xterm.js). Use --live --mcp
+                // for voice-only MCP mode without the web TUI.
                 // Optional port argument (next arg if it's numeric)
                 if i + 1 < args.len() && args[i + 1].parse::<u16>().is_ok() {
                     flags.live_port = args[i + 1].parse().unwrap();
@@ -3471,9 +3472,10 @@ async fn main() -> Result<(), CallerError> {
         return Ok(());
     }
 
-    // Determine whether to use TUI (needed early for task resolution)
-    let use_tui =
-        !flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal();
+    // Determine whether to use TUI (needed early for task resolution).
+    // --live forces TUI mode (served via web) even without a real terminal.
+    let use_tui = flags.live
+        || (!flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal());
 
     // Task resolution: MCP and TUI modes allow starting without a task.
     // MCP mode must NOT call get_task_from_flags_or_env() because it would
@@ -3758,17 +3760,21 @@ async fn main() -> Result<(), CallerError> {
         // TUI mode
         let (bus, event_rx) = EventBus::new();
 
-        // Spawn background tasks
-        let _crossterm_handle = tui::event::spawn_crossterm_reader(bus.clone());
+        // Spawn background tasks.
+        // In web mode (--live), key events come from WebSocket, not the terminal.
+        let _crossterm_handle = if !flags.live {
+            Some(tui::event::spawn_crossterm_reader(bus.clone()))
+        } else {
+            None
+        };
         let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 100);
         let _human_monitor = tui::event::spawn_human_question_monitor(
             bus.clone(),
             tui::event::shared_question_path(log_dir.join("human_question")),
         );
 
-        // Create TUI
-        let mut terminal = tui::Tui::new()
-            .map_err(|e| CallerError::Tui(format!("Failed to initialize TUI: {}", e)))?;
+        // TUI is created later — just before run() — so that web mode
+        // (--live) can use WebTui instead of the real terminal backend.
 
         // Create app state
         let mut app = tui::app::App::new(
@@ -4039,8 +4045,24 @@ async fn main() -> Result<(), CallerError> {
             })
         };
 
-        // Run the TUI event loop (blocks until quit)
-        let _ = terminal.run(&mut app, event_rx).await;
+        // Run the TUI event loop (blocks until quit).
+        // In web mode (--live), render to a buffer and stream to xterm.js.
+        // In terminal mode, render directly to stdout.
+        if flags.live {
+            let broadcast_tx = app.control_tx.clone().unwrap_or_else(|| {
+                let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
+                app.set_control_socket(tx.clone());
+                tx
+            });
+            eprintln!("Web TUI: http://0.0.0.0:{}", flags.live_port);
+            let mut web_tui = tui::web::WebTui::new(120, 40, broadcast_tx)
+                .map_err(|e| CallerError::Tui(format!("Failed to initialize Web TUI: {}", e)))?;
+            let _ = web_tui.run(&mut app, event_rx).await;
+        } else {
+            let mut terminal = tui::Tui::new()
+                .map_err(|e| CallerError::Tui(format!("Failed to initialize TUI: {}", e)))?;
+            let _ = terminal.run(&mut app, event_rx).await;
+        }
 
         // Drop the App (and its follow_up_tx) so the round loop's recv()
         // returns None and exits gracefully, allowing write_summary to run.
@@ -4054,9 +4076,6 @@ async fn main() -> Result<(), CallerError> {
         }
 
         control::cleanup();
-        terminal
-            .restore()
-            .map_err(|e| CallerError::Tui(e.to_string()))?;
     } else {
         // Headless mode always has a task (enforced above).
         let task = task.unwrap();

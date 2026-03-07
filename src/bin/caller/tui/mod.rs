@@ -2,6 +2,7 @@ pub mod app;
 pub mod event;
 pub mod layout;
 pub mod theme;
+pub mod web;
 pub mod widgets;
 
 use app::App;
@@ -48,56 +49,7 @@ impl Tui {
     /// Render one frame of the TUI.
     pub fn draw(&mut self, app: &mut App) -> io::Result<()> {
         self.terminal.draw(|f| {
-            let area = f.area();
-            let bottom_height = app.bottom_panel_height();
-            let app_layout = layout::calculate_layout(area, &app.panels, bottom_height);
-
-            if let Some(status_area) = app_layout.status_bar {
-                widgets::render_status_bar(f, status_area, app);
-            }
-
-            if let Some(action_area) = app_layout.action_panel {
-                widgets::render_action_panel(f, action_area, app);
-            }
-
-            if let Some(log_area) = app_layout.log_panel {
-                widgets::render_log_panel(f, log_area, app);
-            }
-
-            if let Some(bottom_area) = app_layout.bottom_panel {
-                match app.mode {
-                    app::AppMode::Approval => {
-                        if let Some(pending) = app.pending_approvals.front() {
-                            widgets::render_approval_panel(
-                                f,
-                                bottom_area,
-                                &pending.command_preview,
-                                &pending.category,
-                            );
-                        }
-                    }
-                    app::AppMode::AskHuman => {
-                        let question = app.human_question.clone().unwrap_or_default();
-                        widgets::render_input_panel(f, bottom_area, &question, app);
-                    }
-                    app::AppMode::FollowUp => {
-                        widgets::render_follow_up_panel(f, bottom_area, app);
-                    }
-                    _ => {
-                        if app.is_follow_up_browsing() {
-                            widgets::render_follow_up_reminder(f, bottom_area, app);
-                        }
-                    }
-                }
-            }
-
-            // Help overlay on top
-            if app.mode == app::AppMode::Help {
-                widgets::render_help_overlay(f, area);
-            }
-            if app.mode == app::AppMode::Inspect {
-                widgets::render_inspect_overlay(f, area, app);
-            }
+            render_frame(f, app);
         })?;
         Ok(())
     }
@@ -122,6 +74,60 @@ impl Tui {
         }
 
         Ok(())
+    }
+}
+
+/// Shared render function used by both `Tui` (terminal) and `WebTui` (browser).
+pub fn render_frame(f: &mut ratatui::Frame, app: &mut App) {
+    let area = f.area();
+    let bottom_height = app.bottom_panel_height();
+    let app_layout = layout::calculate_layout(area, &app.panels, bottom_height);
+
+    if let Some(status_area) = app_layout.status_bar {
+        widgets::render_status_bar(f, status_area, app);
+    }
+
+    if let Some(action_area) = app_layout.action_panel {
+        widgets::render_action_panel(f, action_area, app);
+    }
+
+    if let Some(log_area) = app_layout.log_panel {
+        widgets::render_log_panel(f, log_area, app);
+    }
+
+    if let Some(bottom_area) = app_layout.bottom_panel {
+        match app.mode {
+            app::AppMode::Approval => {
+                if let Some(pending) = app.pending_approvals.front() {
+                    widgets::render_approval_panel(
+                        f,
+                        bottom_area,
+                        &pending.command_preview,
+                        &pending.category,
+                    );
+                }
+            }
+            app::AppMode::AskHuman => {
+                let question = app.human_question.clone().unwrap_or_default();
+                widgets::render_input_panel(f, bottom_area, &question, app);
+            }
+            app::AppMode::FollowUp => {
+                widgets::render_follow_up_panel(f, bottom_area, app);
+            }
+            _ => {
+                if app.is_follow_up_browsing() {
+                    widgets::render_follow_up_reminder(f, bottom_area, app);
+                }
+            }
+        }
+    }
+
+    // Help overlay on top
+    if app.mode == app::AppMode::Help {
+        widgets::render_help_overlay(f, area);
+    }
+    if app.mode == app::AppMode::Inspect {
+        widgets::render_inspect_overlay(f, area, app);
     }
 }
 

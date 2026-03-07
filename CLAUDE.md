@@ -48,13 +48,14 @@ src/
         ├── mcp_client.rs    # MCP client: connects to external MCP servers, discovers tools, proxies calls
         ├── sandbox.rs       # Landlock filesystem sandboxing (Linux): read/write path policies, process restriction
         ├── vision.rs        # Xvfb display management, x11vnc co-process, per-provider resolution, display :99 preference with orphan reclaim
-        ├── live_gateway.rs  # WebSocket gateway for live interaction (serves static/live.html, /config endpoint, bridges EventBus)
+        ├── live_gateway.rs  # WebSocket gateway: serves live.html, streams TUI (ANSI via xterm.js), bridges EventBus + key/resize input
         ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
-            ├── mod.rs       # Tui struct: terminal init/restore, panic hook, render+event loop
+            ├── mod.rs       # Tui struct: terminal init/restore, render_frame(), render+event loop
             ├── app.rs       # App state machine, event dispatch, askHuman/approval modes
             ├── event.rs     # AppEvent enum, EventBus (mpsc wrapper), crossterm adapter, askHuman monitor
+            ├── web.rs       # WebTui: buffer-backed ratatui backend, ANSI→WebSocket broadcast, web key parsing
             ├── widgets.rs   # StatusBar, LogPanel, ActionPanel, InputPanel, ApprovalPanel, FollowUpPanel, InspectOverlay rendering
             ├── layout.rs    # Panel sizing with constraints, responsive to terminal size
             └── theme.rs     # Color/style constants (Catppuccin Mocha-inspired)
@@ -65,7 +66,7 @@ SysPrompt_orchestrator.md    # Orchestrator agent prompt
 SysPrompt_research.md        # Research sub-agent prompt
 SysPrompt_implementation.md  # Implementation sub-agent prompt
 static/
-└── live.html                # Self-contained live interaction UI (Gemini Live + OpenAI Realtime APIs, provider abstraction)
+└── live.html                # Web TUI (xterm.js terminal + optional voice overlay via Gemini Live / OpenAI Realtime)
 ```
 
 ## Build and Run
@@ -93,8 +94,8 @@ Running the CLI (requires `.env` with API key):
 ./target/release/intendant --mcp "task"                    # Run as MCP server on stdio
 ./target/release/intendant --json "echo hello"             # JSONL output to stdout (implies --no-tui)
 ./target/release/intendant --sandbox "run tests"           # Enable Landlock filesystem sandboxing
-./target/release/intendant --live                          # Live gateway (audio/video/text) on port 8765 (implies --mcp)
-./target/release/intendant --live 9000                     # Live gateway on custom port (implies --mcp)
+./target/release/intendant --live                          # Serve TUI via web (xterm.js + voice) on port 8765
+./target/release/intendant --live 9000                     # Web TUI on custom port
 ./target/release/intendant --direct "complex task"         # Force single-agent mode (skip orchestrator)
 ./target/release/intendant --control-socket "task"         # Enable Unix control socket
 echo "task" | ./target/release/intendant                   # Auto-detects non-TTY, runs headless
@@ -132,6 +133,7 @@ Test coverage includes:
 - **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
 - **caller/tui/theme.rs**: Budget color thresholds, spinner frames, action style variants, autonomy color variants
 - **caller/tui/mod.rs**: TestBackend rendering (default state, log entries, approval panel, help overlay, all phases, verbose modes, small terminal)
+- **caller/tui/web.rs**: SharedWriter (write+take, clone shares buffer), web key parsing (enter, ctrl+c, arrows, chars, F-keys, space, escape, modifiers, unknown keys), broadcast_term base64 format
 - **caller/agent_runner.rs**: askHuman detection in JSON input, sandboxed execution
 - **caller/session_log.rs**: UUID-based session directories, session metadata (write_meta, find_latest_session, find_session_by_id), directory structure creation, JSONL event validity, turn tracking, model response file creation, agent input pretty-printing, agent output file creation (stdout/stderr split), approval log searchability, JSON extraction logging, summary file creation, multi-turn file separation, messages input logging, reasoning content logging (full and summary-only)
 - **caller/tools.rs**: Tool definitions, provider format conversion, tool count validation

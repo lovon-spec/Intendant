@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Intendant Live</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
 <style>
 :root {
   --base: #1e1e2e;
@@ -11,17 +12,13 @@
   --crust: #11111b;
   --surface0: #313244;
   --surface1: #45475a;
-  --surface2: #585b70;
   --text: #cdd6f4;
   --subtext0: #a6adc8;
-  --subtext1: #bac2de;
   --blue: #89b4fa;
   --green: #a6e3a1;
   --red: #f38ba8;
-  --yellow: #f9e2af;
   --mauve: #cba6f7;
   --peach: #fab387;
-  --teal: #94e2d5;
   --overlay0: #6c7086;
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -29,183 +26,103 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
   background: var(--base);
   color: var(--text);
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
-/* Status bar */
-.status-bar {
-  background: var(--mantle);
-  padding: 10px 16px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  border-bottom: 1px solid var(--surface0);
-  flex-shrink: 0;
-}
-.status-dot {
-  width: 10px; height: 10px;
-  border-radius: 50%;
-  background: var(--surface2);
-  transition: background 0.3s;
-}
-.status-dot.connected { background: var(--green); }
-.status-dot.error { background: var(--red); }
-.status-label {
-  font-size: 13px;
-  color: var(--subtext0);
-}
-.status-phase {
-  margin-left: auto;
-  font-size: 13px;
-  color: var(--mauve);
-  font-weight: 600;
+/* Terminal container — fills entire viewport */
+#terminal-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
 }
 
-/* Main area */
-.main-area {
-  flex: 1;
+/* Voice overlay — floating controls */
+.voice-overlay {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 24px;
-  padding: 20px;
+  align-items: flex-end;
+  gap: 8px;
+  z-index: 50;
 }
-
-/* Mic button */
 .mic-btn {
-  width: 100px; height: 100px;
+  width: 56px;
+  height: 56px;
   border-radius: 50%;
-  border: 3px solid var(--surface1);
-  background: var(--surface0);
-  color: var(--text);
-  font-size: 36px;
+  border: 2px solid var(--surface1);
+  background: var(--mantle);
+  color: var(--subtext0);
+  font-size: 24px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: all 0.2s;
-  -webkit-tap-highlight-color: transparent;
-  user-select: none;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
 }
-.mic-btn:hover { border-color: var(--blue); }
-.mic-btn.active {
-  border-color: var(--red);
-  background: rgba(243, 139, 168, 0.15);
-  animation: pulse 1.5s ease-in-out infinite;
-}
-@keyframes pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(243, 139, 168, 0.3); }
-  50% { box-shadow: 0 0 0 16px rgba(243, 139, 168, 0); }
-}
+.mic-btn:hover { border-color: var(--blue); color: var(--text); }
+.mic-btn.active { border-color: var(--red); color: var(--red); background: rgba(243,139,168,0.1); }
+.mic-btn.active:hover { background: rgba(243,139,168,0.2); }
 
-/* Waveform */
-.waveform {
-  width: 80%;
-  max-width: 400px;
-  height: 80px;
-  border-radius: 8px;
-  background: var(--crust);
-}
-
-/* Audio status */
-.audio-status {
-  font-size: 12px;
-  color: var(--subtext0);
-  text-align: center;
-  min-height: 16px;
-}
-.audio-status .active { color: var(--green); }
-.audio-status .sending { color: var(--peach); }
-.audio-status .receiving { color: var(--blue); }
-
-/* Mode toggle */
-.mode-toggle {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-.mode-toggle label {
-  font-size: 13px;
-  color: var(--subtext0);
-  cursor: pointer;
-}
-.mode-toggle input {
-  accent-color: var(--blue);
-}
-
-/* Text input bar */
-.text-input-bar {
-  width: 90%;
-  max-width: 500px;
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
-}
-.text-input-bar input {
-  flex: 1;
-  padding: 8px 12px;
-  border-radius: 6px;
-  border: 1px solid var(--surface1);
-  background: var(--surface0);
-  color: var(--text);
-  font-size: 14px;
-  outline: none;
-}
-.text-input-bar input:focus { border-color: var(--blue); }
-.text-input-bar button {
-  padding: 8px 16px;
-  border-radius: 6px;
-  border: none;
-  background: var(--blue);
-  color: var(--crust);
-  font-weight: 600;
-  font-size: 14px;
-  cursor: pointer;
-}
-.text-input-bar button:hover { opacity: 0.9; }
-
-/* Event log */
-.log-panel {
+.voice-status {
   background: var(--mantle);
-  border-top: 1px solid var(--surface0);
-  max-height: 35vh;
-  overflow-y: auto;
-  flex-shrink: 0;
-}
-.log-toggle {
-  display: flex;
-  align-items: center;
-  padding: 8px 16px;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--subtext0);
-  gap: 8px;
-  user-select: none;
-}
-.log-toggle .arrow { transition: transform 0.2s; }
-.log-toggle .arrow.open { transform: rotate(90deg); }
-.log-entries {
-  padding: 0 16px 8px;
-  display: none;
-}
-.log-entries.open { display: block; }
-.log-entry {
+  border: 1px solid var(--surface0);
+  border-radius: 8px;
+  padding: 6px 12px;
   font-size: 12px;
-  font-family: monospace;
-  padding: 3px 0;
-  border-bottom: 1px solid var(--surface0);
-  color: var(--subtext1);
-  word-break: break-word;
+  color: var(--subtext0);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  max-width: 250px;
+  text-align: right;
 }
-.log-entry.event { color: var(--teal); }
-.log-entry.error { color: var(--red); }
-.log-entry.info { color: var(--blue); }
+.voice-status.connected { border-color: var(--green); }
+.voice-status.error { border-color: var(--red); color: var(--red); }
+.voice-status.hidden { display: none; }
 
-/* Settings dialog */
+/* Connection status bar */
+.conn-bar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 12px;
+  z-index: 50;
+  background: rgba(24,24,37,0.85);
+  border-bottom-left-radius: 8px;
+  font-size: 12px;
+}
+.conn-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--overlay0);
+}
+.conn-dot.ok { background: var(--green); }
+.conn-dot.err { background: var(--red); }
+.conn-label { color: var(--subtext0); }
+
+/* Settings gear */
+.settings-btn {
+  position: fixed;
+  top: 6px;
+  right: 180px;
+  background: none;
+  border: none;
+  color: var(--overlay0);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px;
+  z-index: 50;
+}
+.settings-btn:hover { color: var(--text); }
+
+/* Dialogs */
 .dialog-overlay {
   position: fixed;
   inset: 0;
@@ -224,104 +141,49 @@ body {
   width: 90%;
   max-width: 400px;
 }
-.dialog h2 {
-  font-size: 18px;
-  margin-bottom: 16px;
-  color: var(--text);
-}
-.dialog label {
-  font-size: 13px;
-  color: var(--subtext0);
-  display: block;
-  margin-bottom: 4px;
-}
+.dialog h2 { font-size: 18px; margin-bottom: 16px; color: var(--text); }
+.dialog label { font-size: 13px; color: var(--subtext0); display: block; margin-bottom: 4px; }
 .dialog input {
-  width: 100%;
-  padding: 8px 12px;
-  border-radius: 6px;
-  border: 1px solid var(--surface1);
-  background: var(--surface0);
-  color: var(--text);
-  font-size: 14px;
-  margin-bottom: 12px;
-  outline: none;
+  width: 100%; padding: 8px 12px; border-radius: 6px;
+  border: 1px solid var(--surface1); background: var(--surface0);
+  color: var(--text); font-size: 14px; margin-bottom: 12px; outline: none;
 }
 .dialog input:focus { border-color: var(--blue); }
-.dialog .btn-row {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-}
+.dialog .btn-row { display: flex; gap: 8px; justify-content: flex-end; }
 .dialog button {
-  padding: 8px 16px;
-  border-radius: 6px;
-  border: none;
-  cursor: pointer;
-  font-size: 14px;
+  padding: 8px 16px; border-radius: 6px; border: none;
+  cursor: pointer; font-size: 14px;
 }
-.dialog .btn-primary {
-  background: var(--blue);
-  color: var(--crust);
-  font-weight: 600;
-}
-.dialog .btn-secondary {
-  background: var(--surface1);
-  color: var(--text);
-}
-
-/* Settings gear */
-.settings-btn {
-  background: none;
-  border: none;
-  color: var(--subtext0);
-  font-size: 18px;
-  cursor: pointer;
-  padding: 4px;
-}
-.settings-btn:hover { color: var(--text); }
+.dialog .btn-primary { background: var(--blue); color: var(--crust); font-weight: 600; }
+.dialog .btn-secondary { background: var(--surface1); color: var(--text); }
 </style>
 </head>
 <body>
 
-<div class="status-bar">
-  <div class="status-dot" id="intendantDot"></div>
-  <span class="status-label" id="intendantLabel">Intendant</span>
-  <div class="status-dot" id="modelDot"></div>
-  <span class="status-label" id="modelLabel">Model</span>
-  <span class="status-phase" id="phaseLabel">Idle</span>
-  <button class="settings-btn" id="settingsBtn" title="Settings">&#9881;</button>
+<div id="terminal-container"></div>
+
+<!-- Connection status -->
+<div class="conn-bar">
+  <div class="conn-dot" id="intDot"></div>
+  <span class="conn-label" id="intLabel">Server</span>
+  <div class="conn-dot" id="voiceDot"></div>
+  <span class="conn-label" id="voiceLabel">Voice</span>
 </div>
 
-<div class="main-area">
-  <canvas class="waveform" id="waveform" width="400" height="80"></canvas>
-  <div class="audio-status" id="audioStatus"></div>
-  <button class="mic-btn" id="micBtn">&#127908;</button>
-  <div class="mode-toggle">
-    <input type="checkbox" id="alwaysOn">
-    <label for="alwaysOn">Always-on</label>
-  </div>
-  <div class="text-input-bar">
-    <input type="text" id="textInput" placeholder="Type a message...">
-    <button id="textSend">Send</button>
-  </div>
-</div>
+<button class="settings-btn" id="settingsBtn" title="Settings">&#9881;</button>
 
-<div class="log-panel">
-  <div class="log-toggle" id="logToggle">
-    <span class="arrow" id="logArrow">&#9654;</span>
-    <span>Event Log</span>
-  </div>
-  <div class="log-entries" id="logEntries"></div>
+<!-- Voice overlay -->
+<div class="voice-overlay">
+  <div class="voice-status hidden" id="voiceStatus"></div>
+  <button class="mic-btn" id="micBtn" title="Toggle voice (push to talk)">&#127908;</button>
 </div>
 
 <!-- Settings dialog -->
 <div class="dialog-overlay hidden" id="settingsDialog">
   <div class="dialog">
-    <h2>Settings</h2>
+    <h2>Voice Settings</h2>
     <label for="apiKeyInput" id="apiKeyLabel">API Key</label>
-    <input type="password" id="apiKeyInput" placeholder="Enter API key...">
-    <label for="serverUrlInput">Intendant Server</label>
-    <input type="text" id="serverUrlInput" placeholder="ws://host:8765">
+    <input type="password" id="apiKeyInput" placeholder="Enter API key for voice...">
     <div class="btn-row">
       <button class="btn-secondary" id="settingsCancel">Cancel</button>
       <button class="btn-primary" id="settingsSave">Save</button>
@@ -329,26 +191,152 @@ body {
   </div>
 </div>
 
-<!-- First-run API key dialog -->
+<!-- First-run dialog -->
 <div class="dialog-overlay hidden" id="firstRunDialog">
   <div class="dialog">
     <h2>Welcome to Intendant Live</h2>
     <p style="color:var(--subtext0);font-size:13px;margin-bottom:16px;" id="firstRunDesc">
-      Enter your API key to enable live interaction.
+      The TUI is ready. Optionally enter an API key to enable voice interaction.
     </p>
-    <label for="firstRunKeyInput" id="firstRunKeyLabel">API Key</label>
-    <input type="password" id="firstRunKeyInput" placeholder="Enter API key...">
+    <label for="firstRunKeyInput" id="firstRunKeyLabel">API Key (optional)</label>
+    <input type="password" id="firstRunKeyInput" placeholder="Enter API key for voice...">
     <div class="btn-row">
-      <button class="btn-primary" id="firstRunSave">Connect</button>
+      <button class="btn-secondary" id="firstRunSkip">Skip (text only)</button>
+      <button class="btn-primary" id="firstRunSave">Connect Voice</button>
     </div>
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
 <script>
+// ============================================================
+// Terminal Setup
+// ============================================================
+const term = new Terminal({
+  cursorBlink: true,
+  fontSize: 14,
+  fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+  theme: {
+    background: '#1e1e2e',
+    foreground: '#cdd6f4',
+    cursor: '#f5e0dc',
+    selectionBackground: '#585b70',
+    black: '#45475a', brightBlack: '#585b70',
+    red: '#f38ba8', brightRed: '#f38ba8',
+    green: '#a6e3a1', brightGreen: '#a6e3a1',
+    yellow: '#f9e2af', brightYellow: '#f9e2af',
+    blue: '#89b4fa', brightBlue: '#89b4fa',
+    magenta: '#cba6f7', brightMagenta: '#cba6f7',
+    cyan: '#94e2d5', brightCyan: '#94e2d5',
+    white: '#bac2de', brightWhite: '#cdd6f4',
+  },
+  allowProposedApi: true,
+});
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal-container'));
+fitAddon.fit();
+
+// Resize terminal when window resizes
+window.addEventListener('resize', () => {
+  fitAddon.fit();
+  sendResize();
+});
+
+// ============================================================
+// WebSocket — connects to the Intendant live gateway
+// ============================================================
+let ws = null;
+let wsConnected = false;
+const intDot = document.getElementById('intDot');
+const intLabel = document.getElementById('intLabel');
+
+function getServerUrl() {
+  const saved = localStorage.getItem('intendant_server_url');
+  if (saved) return saved;
+  return `ws://${location.hostname || 'localhost'}:${location.port || '8765'}`;
+}
+
+function connectWs() {
+  if (ws) try { ws.close(); } catch(_) {}
+  const url = getServerUrl();
+  try { ws = new WebSocket(url); } catch(e) { return; }
+
+  ws.onopen = () => {
+    wsConnected = true;
+    intDot.className = 'conn-dot ok';
+    intLabel.textContent = 'Server';
+    // Send initial resize so the server knows our terminal size
+    sendResize();
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.t === 'term') {
+        // Terminal data — decode base64 and write to xterm.js
+        const bytes = atob(msg.d);
+        const arr = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+        term.write(arr);
+      } else if (msg.event) {
+        // Intendant event — forward to voice model for narration
+        handleIntendantEvent(msg);
+      }
+    } catch(_) {}
+  };
+
+  ws.onclose = () => {
+    wsConnected = false;
+    intDot.className = 'conn-dot err';
+    // Attempt reconnect after 3 seconds
+    setTimeout(connectWs, 3000);
+  };
+
+  ws.onerror = () => {
+    intDot.className = 'conn-dot err';
+  };
+}
+
+function sendResize() {
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({ t: 'resize', cols: term.cols, rows: term.rows }));
+  }
+}
+
+// Forward keyboard input from xterm.js to the server
+term.onKey(({ domEvent }) => {
+  if (!ws || !wsConnected) return;
+  ws.send(JSON.stringify({
+    t: 'key',
+    key: domEvent.key,
+    ctrl: domEvent.ctrlKey,
+    alt: domEvent.altKey,
+    shift: domEvent.shiftKey,
+  }));
+});
+
+// ============================================================
+// Voice Model — direct browser-to-API connection (low latency)
+// ============================================================
+let gatewayConfig = null;
+let modelProvider = null;
+let micActive = false;
+let modelConnected = false;
+let audioCtx = null;
+let mediaStream = null;
+let scriptNode = null;
+let analyserNode = null;
+const voiceDot = document.getElementById('voiceDot');
+const voiceLabel = document.getElementById('voiceLabel');
+const voiceStatus = document.getElementById('voiceStatus');
+const micBtn = document.getElementById('micBtn');
+
 // --- Provider Abstraction ---
 class LiveProvider {
   constructor(callbacks) {
-    this.cb = callbacks; // { onReady, onAudio, onText, onToolCall, onInterrupted, onError }
+    this.cb = callbacks;
     this.ws = null;
     this.connected = false;
   }
@@ -362,7 +350,6 @@ class LiveProvider {
     this.connected = false;
   }
   getApiKeyName() { return 'API Key'; }
-  getApiKeyLink() { return null; }
   getStorageKey() { return 'intendant_api_key'; }
 }
 
@@ -376,30 +363,19 @@ class GeminiProvider extends LiveProvider {
   connect(config) {
     if (config && config.model) this.model = config.model;
     if (config && config.input_sample_rate) this.inputSampleRate = config.input_sample_rate;
-
     const key = this.getApiKey();
-    if (!key) { this.cb.onError('No Gemini API key configured'); return; }
-
+    if (!key) { this.cb.onError('No Gemini API key'); return; }
     this.disconnect();
     const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${key}`;
-
-    try { this.ws = new WebSocket(url); }
-    catch(e) { this.cb.onError(`Connection error: ${e}`); return; }
-
-    this.ws.onopen = () => {
-      this.connected = true;
-      this.sendSetup(SYSTEM_PROMPT, TOOLS);
-    };
+    try { this.ws = new WebSocket(url); } catch(e) { this.cb.onError(`${e}`); return; }
+    this.ws.onopen = () => { this.connected = true; this.sendSetup(VOICE_PROMPT, VOICE_TOOLS); };
     this.ws.onmessage = async (e) => {
       try {
         const text = typeof e.data === 'string' ? e.data : await e.data.text();
         this.handleMessage(JSON.parse(text));
-      } catch(err) { this.cb.onError(`Parse error: ${err}`); }
+      } catch(err) { this.cb.onError(`${err}`); }
     };
-    this.ws.onclose = (e) => {
-      this.connected = false;
-      this.cb.onError(`Disconnected (code: ${e.code})`);
-    };
+    this.ws.onclose = (e) => { this.connected = false; this.cb.onError(`Disconnected (${e.code})`); };
     this.ws.onerror = () => { this.cb.onError('WebSocket error'); };
   }
 
@@ -430,10 +406,7 @@ class GeminiProvider extends LiveProvider {
   sendText(text) {
     if (!this.ws || !this.connected) return;
     this.ws.send(JSON.stringify({
-      client_content: {
-        turns: [{ role: 'user', parts: [{ text }] }],
-        turn_complete: true
-      }
+      client_content: { turns: [{ role: 'user', parts: [{ text }] }], turn_complete: true }
     }));
   }
 
@@ -441,29 +414,22 @@ class GeminiProvider extends LiveProvider {
     if (!this.ws || !this.connected) return;
     this.ws.send(JSON.stringify({
       tool_response: {
-        function_responses: [{
-          name: call.name,
-          id: call.id || call.name,
-          response: result
-        }]
+        function_responses: [{ name: call.name, id: call.id || call.name, response: result }]
       }
     }));
   }
 
   handleMessage(msg) {
     if (msg.setupComplete) { this.cb.onReady(); return; }
-
     if (msg.toolCall && msg.toolCall.functionCalls) {
       for (const fc of msg.toolCall.functionCalls) this.cb.onToolCall(fc);
       return;
     }
     if (msg.toolCallCancellation) return;
-
     const response = msg.serverContent;
     if (!response) return;
     if (response.turnComplete) return;
     if (response.interrupted) { this.cb.onInterrupted(); return; }
-
     if (response.modelTurn && response.modelTurn.parts) {
       for (const part of response.modelTurn.parts) {
         if (part.inlineData && part.inlineData.mimeType && part.inlineData.mimeType.startsWith('audio/'))
@@ -476,7 +442,6 @@ class GeminiProvider extends LiveProvider {
 
   getApiKey() { return localStorage.getItem(this.getStorageKey()) || ''; }
   getApiKeyName() { return 'Gemini API Key'; }
-  getApiKeyLink() { return 'https://aistudio.google.com/apikey'; }
   getStorageKey() { return 'intendant_gemini_key'; }
 }
 
@@ -490,57 +455,29 @@ class OpenAIProvider extends LiveProvider {
   async connect(config) {
     if (config && config.model) this.model = config.model;
     if (config && config.input_sample_rate) this.inputSampleRate = config.input_sample_rate;
-
     const key = this.getApiKey();
-    if (!key) { this.cb.onError('No OpenAI API key configured'); return; }
-
+    if (!key) { this.cb.onError('No OpenAI API key'); return; }
     this.disconnect();
-
-    // Get ephemeral token
     let ephemeralKey;
     try {
       const resp = await fetch('https://api.openai.com/v1/realtime/sessions', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${key}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: this.model,
-          modalities: ['audio', 'text'],
-          voice: 'alloy',
-        }),
+        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: this.model, modalities: ['audio', 'text'], voice: 'alloy' }),
       });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       ephemeralKey = data.client_secret?.value;
-      if (!ephemeralKey) throw new Error('No client_secret in session response');
-    } catch(e) {
-      this.cb.onError(`Session creation failed: ${e.message}`);
-      return;
-    }
+      if (!ephemeralKey) throw new Error('No client_secret');
+    } catch(e) { this.cb.onError(`Session: ${e.message}`); return; }
 
     const url = `wss://api.openai.com/v1/realtime?model=${this.model}`;
     try {
-      this.ws = new WebSocket(url, [
-        'realtime',
-        `openai-insecure-api-key.${ephemeralKey}`,
-        'openai-beta.realtime-v1',
-      ]);
-    } catch(e) { this.cb.onError(`Connection error: ${e}`); return; }
-
-    this.ws.onopen = () => {
-      this.connected = true;
-      this.sendSetup(SYSTEM_PROMPT, TOOLS);
-    };
-    this.ws.onmessage = (e) => {
-      try { this.handleMessage(JSON.parse(e.data)); }
-      catch(err) { this.cb.onError(`Parse error: ${err}`); }
-    };
-    this.ws.onclose = (e) => {
-      this.connected = false;
-      this.cb.onError(`Disconnected (code: ${e.code})`);
-    };
+      this.ws = new WebSocket(url, ['realtime', `openai-insecure-api-key.${ephemeralKey}`, 'openai-beta.realtime-v1']);
+    } catch(e) { this.cb.onError(`${e}`); return; }
+    this.ws.onopen = () => { this.connected = true; this.sendSetup(VOICE_PROMPT, VOICE_TOOLS); };
+    this.ws.onmessage = (e) => { try { this.handleMessage(JSON.parse(e.data)); } catch(err) { this.cb.onError(`${err}`); } };
+    this.ws.onclose = (e) => { this.connected = false; this.cb.onError(`Disconnected (${e.code})`); };
     this.ws.onerror = () => { this.cb.onError('WebSocket error'); };
   }
 
@@ -554,33 +491,21 @@ class OpenAIProvider extends LiveProvider {
         voice: 'alloy',
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
-        tools: tools.map(t => ({
-          type: 'function',
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters,
-        })),
+        tools: tools.map(t => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters })),
       }
     }));
   }
 
   sendAudio(base64pcm) {
     if (!this.ws || !this.connected) return;
-    this.ws.send(JSON.stringify({
-      type: 'input_audio_buffer.append',
-      audio: base64pcm,
-    }));
+    this.ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: base64pcm }));
   }
 
   sendText(text) {
     if (!this.ws || !this.connected) return;
     this.ws.send(JSON.stringify({
       type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text }],
-      }
+      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] }
     }));
     this.ws.send(JSON.stringify({ type: 'response.create' }));
   }
@@ -589,11 +514,7 @@ class OpenAIProvider extends LiveProvider {
     if (!this.ws || !this.connected) return;
     this.ws.send(JSON.stringify({
       type: 'conversation.item.create',
-      item: {
-        type: 'function_call_output',
-        call_id: call.call_id || call.id || call.name,
-        output: JSON.stringify(result),
-      }
+      item: { type: 'function_call_output', call_id: call.call_id || call.id || call.name, output: JSON.stringify(result) }
     }));
     this.ws.send(JSON.stringify({ type: 'response.create' }));
   }
@@ -602,375 +523,97 @@ class OpenAIProvider extends LiveProvider {
     switch (msg.type) {
       case 'session.created':
       case 'session.updated':
-        this.cb.onReady();
-        break;
+        this.cb.onReady(); break;
       case 'response.audio.delta':
-        if (msg.delta) this.cb.onAudio(msg.delta);
-        break;
+        if (msg.delta) this.cb.onAudio(msg.delta); break;
       case 'response.text.delta':
-        if (msg.delta) this.cb.onText(msg.delta);
-        break;
+        if (msg.delta) this.cb.onText(msg.delta); break;
       case 'response.function_call_arguments.done':
-        this.cb.onToolCall({
-          name: msg.name,
-          args: JSON.parse(msg.arguments || '{}'),
-          id: msg.item_id,
-          call_id: msg.call_id,
-        });
+        this.cb.onToolCall({ name: msg.name, args: JSON.parse(msg.arguments || '{}'), id: msg.item_id, call_id: msg.call_id });
         break;
       case 'input_audio_buffer.speech_started':
-        this.cb.onInterrupted();
-        break;
+        this.cb.onInterrupted(); break;
     }
   }
 
   getApiKey() { return localStorage.getItem(this.getStorageKey()) || ''; }
   getApiKeyName() { return 'OpenAI API Key'; }
-  getApiKeyLink() { return 'https://platform.openai.com/api-keys'; }
   getStorageKey() { return 'intendant_openai_key'; }
 }
 
-function createProvider(providerName, callbacks) {
-  if (providerName === 'openai') return new OpenAIProvider(callbacks);
+function createProvider(name, callbacks) {
+  if (name === 'openai') return new OpenAIProvider(callbacks);
   return new GeminiProvider(callbacks);
 }
 
-// --- Shared Tool Definitions & System Prompt ---
-const SYSTEM_PROMPT = `You are Intendant. You are an AI agent that builds software. You speak to the user via voice. Be concise and conversational (1-3 sentences). Always speak in first person — you ARE the agent, not a relay.
+// --- Voice system prompt & tools ---
+// The voice model only handles approvals and questions — the TUI shows everything else.
+const VOICE_PROMPT = `You are Intendant, a software engineering AI agent. You speak to the user via voice. Be concise (1-3 sentences). Speak in first person — you ARE the agent.
 
-## Who you are
-You are a software engineering agent. You think with multiple internal systems — some for conversation (that's you right now), some for deep coding, some for research. The user doesn't need to know about these internals. From their perspective, they're talking to one entity: you.
+When the system tells you an approval is needed, ask the user naturally: "I want to run X, is that ok?"
+When the system tells you a question was asked, relay it naturally in your own voice.
+When the system tells you work is done, tell the user briefly what happened.
 
-When you run a command, say "I'm running..." not "The agent is running...". When you need approval, say "I want to run X, is that ok?" not "Intendant needs approval for X". When you finish a task, say "I'm done" not "The task is complete".
+Do NOT narrate status changes. The user can see the TUI for that.`;
 
-## Your capabilities
-- submit_task(description): Start working on something, or continue after finishing a task
-- check_status(): Check what you're currently doing (use when you lose track)
-- approve_action(id): Approve a command you flagged for review (id comes from system events)
-- deny_action(id): Cancel a command you flagged
-- skip_action(id): Skip a command and move on
-- respond_to_question(text): Answer a question your coding system surfaced
-- set_autonomy(level): Change how much you ask before acting (low/medium/high/full)
-
-## How to behave
-- When the user asks you to do something, use submit_task with a clear description
-- When you surface an approval request, tell the user what you want to do and ask permission in first person
-- When you finish a round of work, let the user know what you accomplished and ask what's next
-- If you're unsure what you're doing, use check_status to refresh your awareness
-- Never break character. You are not a voice assistant controlling a separate agent. You ARE the agent.
-- Do NOT explain internal reasoning — just act and talk naturally`;
-
-const TOOLS = [
-  { name: 'submit_task', description: 'Submit a new task for Intendant to work on',
-    parameters: { type: 'object', properties: { description: { type: 'string', description: 'What the user wants done' } }, required: ['description'] } },
-  { name: 'check_status', description: 'Check the current status of Intendant',
-    parameters: { type: 'object', properties: {} } },
-  { name: 'approve_action', description: 'Approve a pending command that needs user authorization',
-    parameters: { type: 'object', properties: { id: { type: 'integer', description: 'The approval ID (turn number)' } }, required: ['id'] } },
-  { name: 'deny_action', description: 'Deny/block a pending command',
-    parameters: { type: 'object', properties: { id: { type: 'integer', description: 'The approval ID (turn number)' } }, required: ['id'] } },
-  { name: 'skip_action', description: 'Skip a pending command without executing it',
-    parameters: { type: 'object', properties: { id: { type: 'integer', description: 'The approval ID (turn number)' } }, required: ['id'] } },
-  { name: 'respond_to_question', description: 'Respond to a question asked by the agent',
-    parameters: { type: 'object', properties: { text: { type: 'string', description: 'The response text' } }, required: ['text'] } },
-  { name: 'set_autonomy', description: 'Change the autonomy level (how much the agent can do without asking)',
-    parameters: { type: 'object', properties: { level: { type: 'string', description: 'Autonomy level: low, medium, high, or full', enum: ['low', 'medium', 'high', 'full'] } }, required: ['level'] } },
-  { name: 'query_detail', description: 'Query detailed information: current_turn, last_output, worker, diff, logs, or file',
-    parameters: { type: 'object', properties: { scope: { type: 'string', description: 'What to query', enum: ['current_turn', 'last_output', 'worker', 'diff', 'logs', 'file'] }, target: { type: 'string', description: 'Target path (required for file scope)' } }, required: ['scope'] } },
-  { name: 'recall_memory', description: 'Search knowledge store and session logs for past context and findings',
-    parameters: { type: 'object', properties: { keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to search for' }, tags: { type: 'array', items: { type: 'string' }, description: 'Filter by tags' }, channel: { type: 'string', description: 'Filter by knowledge channel' } } } }
+const VOICE_TOOLS = [
+  { name: 'submit_task', description: 'Start a new coding task',
+    parameters: { type: 'object', properties: { description: { type: 'string' } }, required: ['description'] } },
+  { name: 'approve_action', description: 'Approve a pending command',
+    parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
+  { name: 'deny_action', description: 'Deny a pending command',
+    parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
+  { name: 'respond_to_question', description: 'Answer a question from the agent',
+    parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+  { name: 'set_autonomy', description: 'Change autonomy level',
+    parameters: { type: 'object', properties: { level: { type: 'string', enum: ['low','medium','high','full'] } }, required: ['level'] } },
 ];
 
-// --- State ---
-let modelProvider = null;
-let intendantWs = null;
-let audioCtx = null;
-let mediaStream = null;
-let scriptNode = null;
-let micActive = false;
-let alwaysOn = false;
-let modelConnected = false;
-let intendantConnected = false;
-let analyserNode = null;
-let animFrameId = null;
-let audioChunksSent = 0;
-let audioChunksReceived = 0;
-let gatewayConfig = null;
-
-// --- DOM refs ---
-const micBtn = document.getElementById('micBtn');
-const waveformCanvas = document.getElementById('waveform');
-const waveformCtx = waveformCanvas.getContext('2d');
-const audioStatus = document.getElementById('audioStatus');
-const alwaysOnCb = document.getElementById('alwaysOn');
-const intendantDot = document.getElementById('intendantDot');
-const modelDot = document.getElementById('modelDot');
-const intendantLabel = document.getElementById('intendantLabel');
-const modelLabel = document.getElementById('modelLabel');
-const phaseLabel = document.getElementById('phaseLabel');
-const logToggle = document.getElementById('logToggle');
-const logArrow = document.getElementById('logArrow');
-const logEntries = document.getElementById('logEntries');
-const settingsBtn = document.getElementById('settingsBtn');
-const settingsDialog = document.getElementById('settingsDialog');
-const settingsCancel = document.getElementById('settingsCancel');
-const settingsSave = document.getElementById('settingsSave');
-const apiKeyInput = document.getElementById('apiKeyInput');
-const apiKeyLabel = document.getElementById('apiKeyLabel');
-const serverUrlInput = document.getElementById('serverUrlInput');
-const firstRunDialog = document.getElementById('firstRunDialog');
-const firstRunSave = document.getElementById('firstRunSave');
-const firstRunKeyInput = document.getElementById('firstRunKeyInput');
-const firstRunKeyLabel = document.getElementById('firstRunKeyLabel');
-const firstRunDesc = document.getElementById('firstRunDesc');
-const textInput = document.getElementById('textInput');
-const textSend = document.getElementById('textSend');
-
-// --- Logging ---
-function addLog(text, cls = '') {
-  const el = document.createElement('div');
-  el.className = 'log-entry ' + cls;
-  el.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
-  logEntries.appendChild(el);
-  logEntries.scrollTop = logEntries.scrollHeight;
-}
-
-// Log toggle
-logToggle.addEventListener('click', () => {
-  const open = logEntries.classList.toggle('open');
-  logArrow.classList.toggle('open', open);
-});
-
-// --- Settings ---
-function getApiKey() {
-  if (!modelProvider) return '';
-  return localStorage.getItem(modelProvider.getStorageKey()) || '';
-}
-function setApiKey(k) {
-  if (!modelProvider) return;
-  localStorage.setItem(modelProvider.getStorageKey(), k);
-}
-function getServerUrl() {
-  const saved = localStorage.getItem('intendant_server_url');
-  if (saved) return saved;
-  return `ws://${location.hostname || 'localhost'}:${location.port || '8765'}`;
-}
-function setServerUrl(u) { localStorage.setItem('intendant_server_url', u); }
-
-settingsBtn.addEventListener('click', () => {
-  apiKeyInput.value = getApiKey();
-  serverUrlInput.value = getServerUrl();
-  if (modelProvider) apiKeyLabel.textContent = modelProvider.getApiKeyName();
-  settingsDialog.classList.remove('hidden');
-});
-settingsCancel.addEventListener('click', () => settingsDialog.classList.add('hidden'));
-settingsSave.addEventListener('click', () => {
-  setApiKey(apiKeyInput.value.trim());
-  setServerUrl(serverUrlInput.value.trim());
-  settingsDialog.classList.add('hidden');
-  connectAll();
-});
-
-firstRunSave.addEventListener('click', () => {
-  const key = firstRunKeyInput.value.trim();
-  if (!key) return;
-  setApiKey(key);
-  firstRunDialog.classList.add('hidden');
-  connectAll();
-});
-
-// --- Text Input ---
-function sendTextMessage() {
-  const text = textInput.value.trim();
-  if (!text) return;
-  textInput.value = '';
-
-  addLog(`You: ${text}`, 'info');
-
-  // Send to model provider if connected
-  if (modelProvider && modelProvider.connected) {
-    modelProvider.sendText(text);
-  }
-
-  // Also send to intendant as a start_task if it looks like a task
-  if (intendantWs && intendantConnected) {
-    sendToIntendant({ action: 'start_task', task: text });
-  }
-}
-
-textSend.addEventListener('click', sendTextMessage);
-textInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') sendTextMessage();
-});
-
-// --- Intendant WebSocket ---
-function connectIntendant() {
-  if (intendantWs) {
-    try { intendantWs.close(); } catch(_) {}
-  }
-  const url = getServerUrl();
-  addLog(`Connecting to Intendant: ${url}`, 'info');
-  try {
-    intendantWs = new WebSocket(url);
-  } catch(e) {
-    addLog(`Intendant connection error: ${e}`, 'error');
-    return;
-  }
-
-  intendantWs.onopen = () => {
-    intendantConnected = true;
-    intendantDot.className = 'status-dot connected';
-    intendantLabel.textContent = 'Intendant';
-    addLog('Connected to Intendant', 'info');
-    intendantWs.send(JSON.stringify({ action: 'status' }));
-  };
-
-  intendantWs.onmessage = (e) => {
-    try {
-      const evt = JSON.parse(e.data);
-      handleIntendantEvent(evt);
-    } catch(err) {
-      addLog(`Parse error: ${err}`, 'error');
-    }
-  };
-
-  intendantWs.onclose = () => {
-    intendantConnected = false;
-    intendantDot.className = 'status-dot';
-    addLog('Disconnected from Intendant', 'error');
-  };
-
-  intendantWs.onerror = () => {
-    intendantDot.className = 'status-dot error';
-  };
-}
-
+// --- Handle events from Intendant for voice narration ---
 function handleIntendantEvent(evt) {
   const eventType = evt.event;
-  addLog(`${eventType}: ${JSON.stringify(evt).substring(0, 200)}`, 'event');
-
-  if (eventType === 'status') phaseLabel.textContent = evt.phase || 'Idle';
-  else if (eventType === 'turn_started') phaseLabel.textContent = 'Thinking';
-  else if (eventType === 'task_complete') phaseLabel.textContent = 'Done';
-  else if (eventType === 'approval_required') phaseLabel.textContent = 'Approval';
-  else if (eventType === 'ask_human') phaseLabel.textContent = 'Question';
-
-  // Inject notable events into model for narration
+  // Only narrate actionable events via voice — the TUI shows everything
   if (modelProvider && modelProvider.connected) {
-    const injectEvents = ['approval_required', 'ask_human', 'task_complete',
-                          'round_complete', 'agent_output', 'command_result'];
-    if (injectEvents.includes(eventType)) {
-      const summary = buildEventSummary(evt);
-      if (summary) modelProvider.sendText(summary);
+    if (eventType === 'approval_required') {
+      modelProvider.sendText(`[System: approval needed] You want to run: "${evt.command}" (id: ${evt.id}). Ask the user.`);
+    } else if (eventType === 'ask_human') {
+      modelProvider.sendText(`[System: question] "${evt.question}". Ask the user naturally.`);
+    } else if (eventType === 'task_complete') {
+      modelProvider.sendText(`[System: done] ${evt.reason}. Tell the user briefly.`);
     }
+    // Status changes, agent output, etc. are NOT narrated — user sees the TUI
   }
 }
 
-function buildEventSummary(evt) {
-  switch (evt.event) {
-    case 'approval_required':
-      return `[System: you need approval] You want to run: "${evt.command}" (id: ${evt.id}). Ask the user for permission in first person.`;
-    case 'ask_human':
-      return `[System: you have a question for the user] "${evt.question}". Ask them naturally in your own voice.`;
-    case 'task_complete':
-      return `[System: your work is done] Reason: ${evt.reason}. Tell the user what you accomplished.`;
-    case 'round_complete':
-      return `[System: you finished a round of work] Round ${evt.round}, ${evt.turns_in_round} turns. Let the user know what you did and ask what's next.`;
-    case 'agent_output':
-      if (evt.stdout && evt.stdout.length > 100) {
-        return `[System: your last command produced] ${evt.stdout.substring(0, 200)}`;
-      }
-      return null;
-    case 'command_result':
-      if (!evt.ok) return `[System: a command failed] ${evt.action}: ${evt.message}`;
-      return null;
-    default:
-      return null;
-  }
-}
-
-function sendToIntendant(msg) {
-  if (intendantWs && intendantConnected) {
-    intendantWs.send(JSON.stringify(msg));
-    addLog(`Sent: ${JSON.stringify(msg).substring(0, 200)}`, 'info');
-  } else {
-    addLog('Not connected to Intendant', 'error');
-  }
-}
-
-// --- Tool Call Handling ---
+// --- Voice tool call handling ---
 function handleToolCall(call) {
   const name = call.name;
   const args = call.args || {};
-  if (!name) {
-    addLog(`Tool call with no name: ${JSON.stringify(call).substring(0, 300)}`, 'error');
-    return;
-  }
-  addLog(`Tool call: ${name}(${JSON.stringify(args)})`, 'info');
-
   let controlMsg = null;
   switch (name) {
     case 'submit_task':
-      controlMsg = { action: 'start_task', task: args.description || '' };
-      break;
-    case 'check_status':
-      controlMsg = { action: 'status' };
-      break;
+      controlMsg = { action: 'start_task', task: args.description || '' }; break;
     case 'approve_action':
-      controlMsg = { action: 'approve', id: args.id };
-      break;
+      controlMsg = { action: 'approve', id: args.id }; break;
     case 'deny_action':
-      controlMsg = { action: 'deny', id: args.id };
-      break;
-    case 'skip_action':
-      controlMsg = { action: 'skip', id: args.id };
-      break;
+      controlMsg = { action: 'deny', id: args.id }; break;
     case 'respond_to_question':
-      controlMsg = { action: 'input', text: args.text || '' };
-      break;
+      controlMsg = { action: 'input', text: args.text || '' }; break;
     case 'set_autonomy':
-      controlMsg = { action: 'set_autonomy', level: args.level || 'medium' };
-      break;
-    case 'query_detail':
-      controlMsg = { action: 'query_detail', scope: args.scope || 'current_turn', target: args.target || null };
-      break;
-    case 'recall_memory':
-      controlMsg = { action: 'recall_memory', keywords: args.keywords || null, tags: args.tags || null, channel: args.channel || null };
-      break;
+      controlMsg = { action: 'set_autonomy', level: args.level || 'medium' }; break;
     default:
-      addLog(`Unknown function: ${name}`, 'error');
-      if (modelProvider) modelProvider.sendToolResponse(call, { error: 'unknown function' });
+      if (modelProvider) modelProvider.sendToolResponse(call, { error: 'unknown' });
       return;
   }
-
-  sendToIntendant(controlMsg);
-
-  // Listen for command_result to send tool response back
-  const resultHandler = (e) => {
-    try {
-      const evt = JSON.parse(e.data);
-      if (evt.event === 'command_result' || evt.event === 'status') {
-        if (modelProvider) modelProvider.sendToolResponse(call, evt);
-        intendantWs.removeEventListener('message', resultHandler);
-      }
-    } catch(_) {}
-  };
-
-  if (intendantWs && name !== 'check_status') {
-    intendantWs.addEventListener('message', resultHandler);
-    setTimeout(() => {
-      intendantWs.removeEventListener('message', resultHandler);
-      if (modelProvider) modelProvider.sendToolResponse(call, { ok: true, message: 'sent' });
-    }, 5000);
-  } else if (name === 'check_status') {
-    intendantWs.addEventListener('message', resultHandler);
-    setTimeout(() => {
-      intendantWs.removeEventListener('message', resultHandler);
-    }, 3000);
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify(controlMsg));
   }
+  if (modelProvider) modelProvider.sendToolResponse(call, { ok: true });
 }
 
-// --- Audio capture ---
+// ============================================================
+// Audio Capture & Playback
+// ============================================================
 function downsample(float32, fromRate, toRate) {
   if (fromRate === toRate) return float32;
   const ratio = fromRate / toRate;
@@ -986,79 +629,54 @@ function downsample(float32, fromRate, toRate) {
   return out;
 }
 
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
 async function startMic() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    addLog('Microphone access requires HTTPS or localhost. Try: ssh -L 8765:localhost:8765 host', 'error');
+    showVoiceStatus('Mic requires HTTPS or localhost', true);
     micActive = false;
     micBtn.classList.remove('active');
     return;
   }
-  if (!audioCtx) {
-    audioCtx = new AudioContext();
-  }
-  if (audioCtx.state === 'suspended') {
-    await audioCtx.resume();
-  }
-  addLog(`AudioContext: ${audioCtx.sampleRate} Hz, state: ${audioCtx.state}`, 'info');
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
 
   if (!mediaStream) {
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true }
-      });
-      addLog(`Microphone access granted (${mediaStream.getAudioTracks()[0].label})`, 'info');
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true } });
     } catch(e) {
-      addLog(`Microphone access denied: ${e.message}`, 'error');
+      showVoiceStatus(`Mic denied: ${e.message}`, true);
       micActive = false;
       micBtn.classList.remove('active');
       return;
     }
   }
   const source = audioCtx.createMediaStreamSource(mediaStream);
-
-  analyserNode = audioCtx.createAnalyser();
-  analyserNode.fftSize = 2048;
-  source.connect(analyserNode);
-
-  const nativeSR = audioCtx.sampleRate;
   const targetSR = gatewayConfig ? gatewayConfig.input_sample_rate : 16000;
+  const nativeSR = audioCtx.sampleRate;
   scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
-  audioChunksSent = 0;
   scriptNode.onaudioprocess = (e) => {
-    if (!micActive) return;
+    if (!micActive || !modelProvider || !modelProvider.connected) return;
     const float32 = e.inputBuffer.getChannelData(0);
-
-    if (modelProvider && modelProvider.connected) {
-      const resampled = downsample(float32, nativeSR, targetSR);
-      const pcm16 = new Int16Array(resampled.length);
-      for (let i = 0; i < resampled.length; i++) {
-        pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
-      }
-      const b64 = arrayBufferToBase64(pcm16.buffer);
-      modelProvider.sendAudio(b64);
-      audioChunksSent++;
-    }
+    const resampled = downsample(float32, nativeSR, targetSR);
+    const pcm16 = new Int16Array(resampled.length);
+    for (let i = 0; i < resampled.length; i++)
+      pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
+    modelProvider.sendAudio(arrayBufferToBase64(pcm16.buffer));
   };
   source.connect(scriptNode);
   scriptNode.connect(audioCtx.destination);
-
-  startWaveformLoop();
-  updateAudioStatus();
-  addLog('Audio pipeline started', 'info');
+  showVoiceStatus('Mic active — speak now');
 }
 
 function stopMic() {
-  if (scriptNode) {
-    scriptNode.disconnect();
-    scriptNode = null;
-  }
-  analyserNode = null;
-  if (animFrameId) {
-    cancelAnimationFrame(animFrameId);
-    animFrameId = null;
-  }
-  clearWaveform();
-  audioStatus.textContent = '';
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  hideVoiceStatus();
 }
 
 // --- Audio playback ---
@@ -1067,15 +685,13 @@ let isPlaying = false;
 
 function playAudioChunk(b64data) {
   const outRate = gatewayConfig ? gatewayConfig.output_sample_rate : 24000;
-  if (!audioCtx) {
-    audioCtx = new AudioContext({ sampleRate: outRate });
-  }
-  const bytes = base64ToArrayBuffer(b64data);
-  const pcm16 = new Int16Array(bytes);
+  if (!audioCtx) audioCtx = new AudioContext({ sampleRate: outRate });
+  const binary = atob(b64data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const pcm16 = new Int16Array(bytes.buffer);
   const float32 = new Float32Array(pcm16.length);
-  for (let i = 0; i < pcm16.length; i++) {
-    float32[i] = pcm16[i] / 32768.0;
-  }
+  for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
   const buffer = audioCtx.createBuffer(1, float32.length, outRate);
   buffer.copyToChannel(float32, 0);
   audioQueue.push(buffer);
@@ -1083,10 +699,7 @@ function playAudioChunk(b64data) {
 }
 
 function playNext() {
-  if (audioQueue.length === 0) {
-    isPlaying = false;
-    return;
-  }
+  if (audioQueue.length === 0) { isPlaying = false; return; }
   isPlaying = true;
   const buffer = audioQueue.shift();
   const src = audioCtx.createBufferSource();
@@ -1096,203 +709,116 @@ function playNext() {
   src.start();
 }
 
-// --- Waveform ---
-function startWaveformLoop() {
-  if (animFrameId) return;
-  const draw = () => {
-    animFrameId = requestAnimationFrame(draw);
-    if (!analyserNode) return;
-    const bufLen = analyserNode.fftSize;
-    const data = new Float32Array(bufLen);
-    analyserNode.getFloatTimeDomainData(data);
-
-    const w = waveformCanvas.width;
-    const h = waveformCanvas.height;
-
-    waveformCtx.fillStyle = '#11111b';
-    waveformCtx.fillRect(0, 0, w, h);
-
-    waveformCtx.strokeStyle = micActive ? '#f38ba8' : '#585b70';
-    waveformCtx.lineWidth = 2;
-    waveformCtx.beginPath();
-    const step = bufLen / w;
-    for (let i = 0; i < w; i++) {
-      const v = data[Math.floor(i * step)] || 0;
-      const y = (v + 1) * h / 2;
-      if (i === 0) waveformCtx.moveTo(i, y);
-      else waveformCtx.lineTo(i, y);
-    }
-    waveformCtx.stroke();
-
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-    const rms = Math.sqrt(sum / data.length);
-    const level = Math.min(1, rms * 8);
-    const barH = 4;
-    waveformCtx.fillStyle = level > 0.02 ? '#a6e3a1' : '#45475a';
-    waveformCtx.fillRect(0, h - barH, w * level, barH);
-  };
-  draw();
+// ============================================================
+// Voice Status
+// ============================================================
+function showVoiceStatus(text, isError) {
+  voiceStatus.textContent = text;
+  voiceStatus.className = 'voice-status' + (isError ? ' error' : '');
+}
+function hideVoiceStatus() {
+  voiceStatus.className = 'voice-status hidden';
 }
 
-function clearWaveform() {
-  waveformCtx.fillStyle = '#11111b';
-  waveformCtx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
-}
-
-function updateAudioStatus() {
-  if (!micActive) {
-    audioStatus.textContent = '';
-    return;
-  }
-  const parts = [];
-  parts.push('<span class="active">Mic active</span>');
-  if (modelConnected) {
-    parts.push(`<span class="sending">${audioChunksSent} chunks sent</span>`);
-  } else {
-    parts.push('Model not connected');
-  }
-  if (audioChunksReceived > 0) {
-    parts.push(`<span class="receiving">${audioChunksReceived} chunks received</span>`);
-  }
-  audioStatus.innerHTML = parts.join(' &middot; ');
-}
-
-setInterval(() => { if (micActive) updateAudioStatus(); }, 500);
-
-// --- Utilities ---
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-function base64ToArrayBuffer(b64) {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
-
-// --- Mic button ---
+// ============================================================
+// Mic Button
+// ============================================================
 micBtn.addEventListener('click', async () => {
   micActive = !micActive;
   micBtn.classList.toggle('active', micActive);
   if (micActive) {
-    audioChunksSent = 0;
-    audioChunksReceived = 0;
     await startMic();
-    addLog('Mic on' + (modelConnected ? ' — speak now' : ' — waiting for model connection'), 'info');
-    phaseLabel.textContent = modelConnected ? 'Listening' : 'Mic on (no model)';
-  } else if (!alwaysOn) {
+  } else {
     stopMic();
-    addLog(`Mic off (sent ${audioChunksSent} chunks, received ${audioChunksReceived})`, 'info');
-    phaseLabel.textContent = 'Idle';
   }
 });
 
-alwaysOnCb.addEventListener('change', async () => {
-  alwaysOn = alwaysOnCb.checked;
-  if (alwaysOn && !micActive) {
-    micActive = true;
-    micBtn.classList.add('active');
-    await startMic();
-    addLog('Always-on mic enabled', 'info');
+// ============================================================
+// Settings
+// ============================================================
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsDialog = document.getElementById('settingsDialog');
+const settingsCancel = document.getElementById('settingsCancel');
+const settingsSave = document.getElementById('settingsSave');
+const apiKeyInput = document.getElementById('apiKeyInput');
+const apiKeyLabel = document.getElementById('apiKeyLabel');
+const firstRunDialog = document.getElementById('firstRunDialog');
+const firstRunSave = document.getElementById('firstRunSave');
+const firstRunSkip = document.getElementById('firstRunSkip');
+const firstRunKeyInput = document.getElementById('firstRunKeyInput');
+
+settingsBtn.addEventListener('click', () => {
+  if (modelProvider) {
+    apiKeyInput.value = localStorage.getItem(modelProvider.getStorageKey()) || '';
+    apiKeyLabel.textContent = modelProvider.getApiKeyName();
   }
+  settingsDialog.classList.remove('hidden');
+});
+settingsCancel.addEventListener('click', () => settingsDialog.classList.add('hidden'));
+settingsSave.addEventListener('click', () => {
+  if (modelProvider) localStorage.setItem(modelProvider.getStorageKey(), apiKeyInput.value.trim());
+  settingsDialog.classList.add('hidden');
+  connectVoice();
+});
+firstRunSave.addEventListener('click', () => {
+  const key = firstRunKeyInput.value.trim();
+  if (key && modelProvider) localStorage.setItem(modelProvider.getStorageKey(), key);
+  firstRunDialog.classList.add('hidden');
+  if (key) connectVoice();
+});
+firstRunSkip.addEventListener('click', () => {
+  firstRunDialog.classList.add('hidden');
 });
 
-// --- Init ---
-function connectModel() {
+// ============================================================
+// Init
+// ============================================================
+function connectVoice() {
   if (!modelProvider) return;
-
   const key = localStorage.getItem(modelProvider.getStorageKey());
-  if (!key) {
-    addLog(`No ${modelProvider.getApiKeyName()} — model disabled`, 'error');
-    return;
-  }
-
-  addLog(`Connecting to ${gatewayConfig ? gatewayConfig.provider : 'model'}...`, 'info');
+  if (!key) return;
   modelProvider.connect(gatewayConfig);
 }
 
-function connectAll() {
-  connectIntendant();
-  connectModel();
-}
-
 async function init() {
-  // Fetch config from live gateway
+  // 1. Connect to Intendant (TUI over WebSocket)
+  connectWs();
+
+  // 2. Fetch config for voice model
   try {
     const resp = await fetch('/config');
-    if (resp.ok) {
-      gatewayConfig = await resp.json();
-      addLog(`Config: ${gatewayConfig.provider} / ${gatewayConfig.model}`, 'info');
-    }
-  } catch(e) {
-    addLog('Could not fetch /config, using defaults', 'info');
-  }
+    if (resp.ok) gatewayConfig = await resp.json();
+  } catch(_) {}
 
   const providerName = gatewayConfig ? gatewayConfig.provider : 'gemini';
 
-  // Create the appropriate provider
+  // 3. Create voice provider
   modelProvider = createProvider(providerName, {
     onReady: () => {
       modelConnected = true;
-      modelDot.className = 'status-dot connected';
-      modelLabel.textContent = providerName.charAt(0).toUpperCase() + providerName.slice(1);
-      addLog('Model session ready — you can speak now', 'info');
-      phaseLabel.textContent = 'Ready';
+      voiceDot.className = 'conn-dot ok';
+      voiceLabel.textContent = providerName.charAt(0).toUpperCase() + providerName.slice(1);
+      showVoiceStatus('Voice ready');
+      setTimeout(hideVoiceStatus, 3000);
     },
-    onAudio: (b64data) => {
-      audioChunksReceived++;
-      playAudioChunk(b64data);
-      if (audioChunksReceived === 1) {
-        addLog('Receiving audio...', 'info');
-        phaseLabel.textContent = 'Speaking';
-      }
-    },
-    onText: (text) => {
-      addLog(`Model: ${text}`, 'info');
-    },
-    onToolCall: (call) => {
-      handleToolCall(call);
-    },
-    onInterrupted: () => {
-      addLog('Model interrupted', 'event');
-    },
+    onAudio: (b64) => { playAudioChunk(b64); },
+    onText: (text) => { showVoiceStatus(text); setTimeout(hideVoiceStatus, 5000); },
+    onToolCall: (call) => { handleToolCall(call); },
+    onInterrupted: () => {},
     onError: (msg) => {
       modelConnected = false;
-      modelDot.className = 'status-dot error';
-      addLog(`Model: ${msg}`, 'error');
+      voiceDot.className = 'conn-dot err';
+      showVoiceStatus(msg, true);
     }
   });
 
-  // Update UI labels based on provider
-  modelLabel.textContent = providerName.charAt(0).toUpperCase() + providerName.slice(1);
-
-  // Update first-run dialog
-  firstRunKeyLabel.textContent = modelProvider.getApiKeyName();
-  const link = modelProvider.getApiKeyLink();
-  if (link) {
-    firstRunDesc.innerHTML = `Enter your ${modelProvider.getApiKeyName()} to enable live interaction. ` +
-      `Get one at <a href="${link}" target="_blank" style="color:var(--blue);">${link.replace('https://', '')}</a>`;
-  }
-
-  // Update settings dialog
-  apiKeyLabel.textContent = modelProvider.getApiKeyName();
-
-  // Check for API key
+  // 4. Check for existing API key
   const existingKey = localStorage.getItem(modelProvider.getStorageKey());
-  if (!existingKey) {
-    firstRunDialog.classList.remove('hidden');
-  } else {
-    connectAll();
+  if (existingKey) {
+    connectVoice();
   }
+  // Don't show first-run dialog by default — voice is optional.
+  // User can click the settings gear to set up voice.
 }
 
 window.addEventListener('load', init);

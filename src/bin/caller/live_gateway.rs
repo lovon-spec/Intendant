@@ -89,17 +89,37 @@ pub fn spawn_live_gateway(
                     let mut outbound_rx = broadcast_tx.subscribe();
 
                     // Inbound: WebSocket → EventBus
+                    // Handles three message types:
+                    //   {"t":"key", "key":"Enter", ...}  → AppEvent::Key
+                    //   {"t":"resize", "cols":N, "rows":N} → AppEvent::Resize
+                    //   {"action":"status", ...}         → AppEvent::ControlCommand
                     let bus_inbound = bus.clone();
                     let inbound = tokio::spawn(async move {
                         while let Some(Ok(msg)) = ws_rx.next().await {
                             if let Message::Text(text) = msg {
                                 let trimmed = text.trim();
-                                if !trimmed.is_empty() {
-                                    if let Ok(ctrl) =
-                                        serde_json::from_str::<ControlMsg>(trimmed)
-                                    {
-                                        bus_inbound
-                                            .send(AppEvent::ControlCommand(ctrl));
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                // Try to parse as JSON for type-tagged messages
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                                    match json.get("t").and_then(|v| v.as_str()) {
+                                        Some("key") => {
+                                            if let Some(key_event) = crate::tui::web::parse_web_key(&json) {
+                                                bus_inbound.send(AppEvent::Key(key_event));
+                                            }
+                                        }
+                                        Some("resize") => {
+                                            let cols = json["cols"].as_u64().unwrap_or(80) as u16;
+                                            let rows = json["rows"].as_u64().unwrap_or(24) as u16;
+                                            bus_inbound.send(AppEvent::Resize(cols, rows));
+                                        }
+                                        _ => {
+                                            // Fall through to ControlMsg parsing
+                                            if let Ok(ctrl) = serde_json::from_value::<ControlMsg>(json) {
+                                                bus_inbound.send(AppEvent::ControlCommand(ctrl));
+                                            }
+                                        }
                                     }
                                 }
                             }
