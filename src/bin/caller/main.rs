@@ -3921,11 +3921,8 @@ async fn main() -> Result<(), CallerError> {
                                 level: None,
                                 turn: None,
                             });
-                            // Reset to follow-up phase after presence responds
-                            bus_for_responses.send(AppEvent::RoundComplete {
-                                round: 0,
-                                turns_in_round: 0,
-                            });
+                            // Switch to follow-up mode after presence responds
+                            bus_for_responses.send(AppEvent::PresenceReady);
                         }
                     }
                 }

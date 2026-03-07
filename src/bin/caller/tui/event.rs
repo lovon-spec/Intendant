@@ -128,6 +128,11 @@ pub enum AppEvent {
         turns_in_round: usize,
     },
 
+    /// Presence layer responded — switch to follow-up mode without logging
+    /// a fake round completion. Emitted by the response forwarder after each
+    /// presence narration so the user can type a follow-up.
+    PresenceReady,
+
     // TUI internal
     Tick,
     #[allow(dead_code)]

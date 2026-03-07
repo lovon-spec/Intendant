@@ -692,6 +692,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceLog { .. }
+        | AppEvent::PresenceReady
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -1047,6 +1048,21 @@ mod tests {
             text: "hi".to_string(),
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
+    }
+
+    #[test]
+    fn filter_event_presence_ready_is_pull_only() {
+        let mut last_phase = String::new();
+
+        // PresenceReady → pull-only (never forwarded to presence)
+        assert!(filter_event(&AppEvent::PresenceReady, &mut last_phase).is_none());
+
+        // RoundComplete → pushed (all real rounds)
+        let event = AppEvent::RoundComplete {
+            round: 1,
+            turns_in_round: 5,
+        };
+        assert!(filter_event(&event, &mut last_phase).is_some());
     }
 
     #[test]

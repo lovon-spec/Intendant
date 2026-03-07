@@ -1529,6 +1529,19 @@ impl App {
                 }
                 self.broadcast_usage_update();
             }
+            AppEvent::PresenceReady => {
+                // Switch to follow-up mode so the user can respond to presence,
+                // but don't log a fake round completion.
+                if self.current_phase != Phase::WaitingApproval {
+                    self.current_phase = Phase::WaitingFollowUp;
+                    self.mode = AppMode::FollowUp;
+                    if self.follow_up_textarea.is_none() {
+                        let mut textarea = tui_textarea::TextArea::default();
+                        textarea.set_cursor_line_style(ratatui::style::Style::default());
+                        self.follow_up_textarea = Some(textarea);
+                    }
+                }
+            }
             AppEvent::Tick => {
                 self.tick_count += 1;
                 // Update autonomy display

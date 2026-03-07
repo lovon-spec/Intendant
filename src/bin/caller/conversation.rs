@@ -47,7 +47,7 @@ pub struct Message {
     pub images: Option<Vec<ImageData>>,
     /// Raw output items from the API response (for verbatim echo-back).
     /// Used by OpenAI Responses API to echo reasoning + function_call items together.
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_output: Option<Vec<serde_json::Value>>,
     #[serde(skip)]
     pub layer: Option<MessageLayer>,

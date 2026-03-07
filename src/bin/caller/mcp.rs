@@ -1936,6 +1936,11 @@ pub fn spawn_event_listener(
                     AppEvent::PresenceLog { message, level, .. } => {
                         s.push_log(level.unwrap_or(LogLevel::Info), format!("[presence] {}", message));
                     }
+                    AppEvent::PresenceReady => {
+                        if !matches!(s.phase, Phase::WaitingApproval) {
+                            s.set_phase(Phase::WaitingFollowUp);
+                        }
+                    }
                 }
             }
 
