@@ -3,128 +3,38 @@ use crate::error::CallerError;
 use crate::knowledge::{self, KnowledgeQuery};
 use crate::provider::ChatProvider;
 use crate::session_log;
-use crate::tools::ToolDefinition;
 use crate::tui::event::{AppEvent, ControlMsg, EventBus};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-/// Configuration for the presence layer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PresenceConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+// Re-export types from presence-core so existing callers don't break.
+pub use presence_core::{
+    AgentStateSnapshot, PresenceConfig, PresenceEvent, PresenceUsage,
+    TaskEnvelope, DEFAULT_TEXT_MODEL, NARRATION_DEBOUNCE_MS, PRESENCE_TURN_OFFSET,
+    PREFERRED_TEXT_MODEL, DEFAULT_TEXT_PROVIDER,
+    format_event, truncate,
+    PresenceAction, dispatch_tool_call,
+};
 
-    // --- Text mode (TUI / MCP) ---
-    /// Provider name for text mode (e.g. "gemini", "anthropic", "openai").
-    /// Default: auto-detect (prefers gemini when GEMINI_API_KEY is set).
-    #[serde(default)]
-    pub provider: Option<String>,
-    /// Model for text mode. Default: "gemini-2.5-flash".
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Context window size for the text-mode presence conversation.
-    #[serde(default = "default_context_window")]
-    pub context_window: u64,
-
-    // --- Live mode (audio/video gateway) ---
-    /// Provider for live (audio/video) mode. Default: auto-detect.
-    #[serde(default)]
-    pub live_provider: Option<String>,
-    /// Model for live (audio/video) mode.
-    #[serde(default)]
-    pub live_model: Option<String>,
-    /// Context window for the live-mode conversation.
-    #[serde(default = "default_live_context_window")]
-    pub live_context_window: u64,
+// Re-export presence_tools with conversion to the main crate's ToolDefinition.
+pub fn presence_tools() -> Vec<crate::tools::ToolDefinition> {
+    presence_core::presence_tools()
+        .into_iter()
+        .map(|t| crate::tools::ToolDefinition {
+            name: t.name,
+            description: t.description,
+            parameters: t.parameters,
+        })
+        .collect()
 }
 
-fn default_true() -> bool {
-    true
-}
+/// Debounce duration for phase-change narrations (from presence-core constant).
+const NARRATION_DEBOUNCE: std::time::Duration =
+    std::time::Duration::from_millis(NARRATION_DEBOUNCE_MS);
 
-fn default_context_window() -> u64 {
-    1_048_576
-}
-
-fn default_live_context_window() -> u64 {
-    32_768
-}
-
-/// Default text presence model.
-pub const DEFAULT_TEXT_MODEL: &str = "gemini-2.5-flash";
-/// Preferred text presence model (Gemini 3 Flash, when available).
-#[allow(dead_code)]
-pub const PREFERRED_TEXT_MODEL: &str = "gemini-3-flash-preview";
-/// Default text presence provider.
-#[allow(dead_code)]
-pub const DEFAULT_TEXT_PROVIDER: &str = "gemini";
-
-impl Default for PresenceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            provider: None,
-            model: None,
-            context_window: default_context_window(),
-            live_provider: None,
-            live_model: None,
-            live_context_window: default_live_context_window(),
-        }
-    }
-}
-
-/// A structured task submission from presence to the agent loop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskEnvelope {
-    pub task: String,
-    #[serde(default)]
-    pub force_direct: bool,
-    #[serde(default)]
-    pub context_hints: Vec<String>,
-}
-
-/// Filtered events pushed to the presence layer from the agent loop.
-#[derive(Debug, Clone)]
-pub enum PresenceEvent {
-    PhaseChanged { phase: String },
-    TaskComplete { reason: String },
-    ApprovalNeeded { id: u64, preview: String, category: String },
-    HumanQuestion { question: String },
-    BudgetWarning { pct: f64, remaining: u64 },
-    RoundComplete { round: usize, turns_in_round: usize },
-    Error { message: String },
-}
-
-/// Token usage snapshot from the presence layer.
-#[derive(Debug, Clone)]
-pub struct PresenceUsage {
-    pub total_tokens: u64,
-    pub context_window: u64,
-    pub usage_pct: f64,
-    pub provider: String,
-    pub model: String,
-}
-
-/// Queryable snapshot of the agent's current state.
-#[derive(Debug, Clone, Default)]
-pub struct AgentStateSnapshot {
-    pub phase: String,
-    pub turn: usize,
-    pub budget_pct: f64,
-    pub last_output_summary: String,
-    pub last_command_preview: String,
-    pub active_workers: Vec<String>,
-}
-
-/// Minimum interval between phase-change narrations. Phase events arriving
-/// faster than this are skipped so the model doesn't narrate "Thinking..."
-/// immediately followed by "Running your code..." half a second later.
-const NARRATION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// The running presence layer instance.
+/// The running presence layer instance (platform-specific, uses tokio + ChatProvider).
 pub struct PresenceLayer {
     provider: Box<dyn ChatProvider>,
     conversation: Conversation,
@@ -197,16 +107,11 @@ impl PresenceLayer {
         }
     }
 
-    /// Emit a presence log with the current turn number.
-    /// Presence turns are offset by `PRESENCE_TURN_OFFSET` so they never
-    /// collide with agent turns (which start at 1) in the TUI collapse logic.
-    const PRESENCE_TURN_OFFSET: usize = 100_000;
-
     fn plog(&self, message: String, level: Option<crate::tui::app::LogLevel>) {
         self.bus.send(AppEvent::PresenceLog {
             message,
             level,
-            turn: Some(Self::PRESENCE_TURN_OFFSET + self.turn),
+            turn: Some(PRESENCE_TURN_OFFSET + self.turn),
         });
     }
 
@@ -223,10 +128,6 @@ impl PresenceLayer {
     }
 
     /// Inject a PresenceEvent into the conversation and let the model narrate.
-    ///
-    /// PhaseChanged events are debounced: if two arrive within 500ms, the
-    /// second is silently dropped so the model doesn't narrate every rapid
-    /// phase transition (e.g. thinking → running in quick succession).
     pub async fn handle_event(&mut self, event: PresenceEvent) -> Result<Option<String>, CallerError> {
         // Debounce phase-change narrations
         if matches!(event, PresenceEvent::PhaseChanged { .. }) {
@@ -253,21 +154,18 @@ impl PresenceLayer {
         const MAX_TOOL_ROUNDS: usize = 10;
 
         for round in 0..MAX_TOOL_ROUNDS {
-            // Emit a visible log before the (potentially slow) API call so the
-            // TUI isn't blank while waiting.
             self.plog(
                 if round == 0 {
                     format!("Thinking ({})...", self.provider.model())
                 } else {
                     format!("Thinking (tool round {})...", round + 1)
                 },
-                None, // Info — visible at Normal verbosity
+                None,
             );
 
             let messages = self.conversation.messages().to_vec();
             let response = self.provider.chat(&messages).await?;
 
-            // Debug: token usage per call
             self.plog(
                 format!(
                     "Tokens: {} prompt + {} completion = {} total",
@@ -282,7 +180,6 @@ impl PresenceLayer {
             self.conversation.auto_compact();
 
             if response.tool_calls.is_empty() {
-                // Pure text response — return it
                 if !response.content.is_empty() {
                     self.conversation.add_assistant(response.content.clone());
                 }
@@ -293,12 +190,10 @@ impl PresenceLayer {
             let tool_names: Vec<&str> = response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
             self.plog(format!("Tool call: {}", tool_names.join(", ")), None);
 
-            // Verbose: model reasoning text alongside tool calls
             if !response.content.is_empty() {
                 self.plog(format!("Model text: {}", response.content), Some(LogLevel::Agent));
             }
 
-            // Debug: full tool call arguments
             for tc in &response.tool_calls {
                 self.plog(format!("{}({})", tc.name, tc.arguments), Some(LogLevel::Debug));
             }
@@ -322,7 +217,6 @@ impl PresenceLayer {
 
             for tc in &response.tool_calls {
                 let result = self.handle_presence_tool_call(&tc.name, &tc.arguments).await;
-                // Debug: tool call result
                 let result_preview = if result.len() > 200 {
                     format!("{}...", &result[..200])
                 } else {
@@ -340,67 +234,57 @@ impl PresenceLayer {
         Ok("I've reached my tool call limit for this request.".to_string())
     }
 
-    /// Execute a presence tool call and return the result string.
+    /// Execute a presence tool call using presence-core dispatch + platform I/O.
     pub async fn handle_presence_tool_call(&mut self, name: &str, args_json: &str) -> String {
         let args: Value = serde_json::from_str(args_json).unwrap_or(json!({}));
+        let state_snapshot = self.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
-        match name {
-            "submit_task" => self.handle_submit_task(&args).await,
-            "check_status" => self.handle_check_status(),
-            "query_detail" => self.handle_query_detail(&args).await,
-            "recall_memory" => self.handle_recall_memory(&args),
-            "approve_action" => self.handle_approve(&args),
-            "deny_action" => self.handle_deny(&args),
-            "skip_action" => self.handle_skip(&args),
-            "respond_to_question" => self.handle_respond(&args),
-            "set_autonomy" => self.handle_set_autonomy(&args),
-            _ => format!("Unknown tool: {}", name),
-        }
-    }
+        let action = dispatch_tool_call(name, &args, &state_snapshot);
 
-    async fn handle_submit_task(&self, args: &Value) -> String {
-        let task = args["task"].as_str().unwrap_or("").to_string();
-        if task.is_empty() {
-            return "Error: task is required".to_string();
-        }
-        let force_direct = args["force_direct"].as_bool().unwrap_or(false);
-        let context_hints = args["context_hints"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-
-        let envelope = TaskEnvelope {
-            task: task.clone(),
-            force_direct,
-            context_hints,
-        };
-
-        match self.task_tx.send(envelope).await {
-            Ok(()) => {
-                self.plog(format!("Dispatched task: {}", task), None);
-                format!("Task submitted: {}", task)
+        match action {
+            PresenceAction::TextResult(text) => text,
+            PresenceAction::SubmitTask(envelope) => {
+                let task = envelope.task.clone();
+                match self.task_tx.send(envelope).await {
+                    Ok(()) => {
+                        self.plog(format!("Dispatched task: {}", task), None);
+                        format!("Task submitted: {}", task)
+                    }
+                    Err(_) => "Error: task channel closed".to_string(),
+                }
             }
-            Err(_) => "Error: task channel closed".to_string(),
+            PresenceAction::Approve { id } => {
+                self.bus.send(AppEvent::ControlCommand(ControlMsg::Approve { id }));
+                format!("Approved action {}", id)
+            }
+            PresenceAction::Deny { id } => {
+                self.bus.send(AppEvent::ControlCommand(ControlMsg::Deny { id }));
+                format!("Denied action {}", id)
+            }
+            PresenceAction::Skip { id } => {
+                self.bus.send(AppEvent::ControlCommand(ControlMsg::Skip { id }));
+                format!("Skipped action {}", id)
+            }
+            PresenceAction::Respond { text } => {
+                self.bus.send(AppEvent::ControlCommand(ControlMsg::Input {
+                    text: text.clone(),
+                }));
+                format!("Sent response: {}", text)
+            }
+            PresenceAction::SetAutonomy { level } => {
+                self.bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
+                    level: level.clone(),
+                }));
+                format!("Autonomy set to {}", level)
+            }
+            PresenceAction::NeedsIO { tool_name, args } => {
+                match tool_name.as_str() {
+                    "query_detail" => self.handle_query_detail(&args).await,
+                    "recall_memory" => self.handle_recall_memory(&args),
+                    _ => format!("Unknown IO tool: {}", tool_name),
+                }
+            }
         }
-    }
-
-    fn handle_check_status(&self) -> String {
-        let state = self.agent_state.lock().unwrap_or_else(|e| e.into_inner());
-        let s = &*state;
-        let mut parts = Vec::new();
-        parts.push(format!("Phase: {}", s.phase));
-        parts.push(format!("Turn: {}", s.turn));
-        parts.push(format!("Budget: {:.0}%", s.budget_pct * 100.0));
-        if !s.last_command_preview.is_empty() {
-            parts.push(format!("Last command: {}", s.last_command_preview));
-        }
-        if !s.last_output_summary.is_empty() {
-            parts.push(format!("Last output: {}", s.last_output_summary));
-        }
-        if !s.active_workers.is_empty() {
-            parts.push(format!("Workers: {}", s.active_workers.join(", ")));
-        }
-        parts.join("\n")
     }
 
     async fn handle_query_detail(&self, args: &Value) -> String {
@@ -532,43 +416,6 @@ impl PresenceLayer {
         }
     }
 
-    fn handle_approve(&self, args: &Value) -> String {
-        let id = args["id"].as_u64().unwrap_or(0);
-        self.bus.send(AppEvent::ControlCommand(ControlMsg::Approve { id }));
-        format!("Approved action {}", id)
-    }
-
-    fn handle_deny(&self, args: &Value) -> String {
-        let id = args["id"].as_u64().unwrap_or(0);
-        self.bus.send(AppEvent::ControlCommand(ControlMsg::Deny { id }));
-        format!("Denied action {}", id)
-    }
-
-    fn handle_skip(&self, args: &Value) -> String {
-        let id = args["id"].as_u64().unwrap_or(0);
-        self.bus.send(AppEvent::ControlCommand(ControlMsg::Skip { id }));
-        format!("Skipped action {}", id)
-    }
-
-    fn handle_respond(&self, args: &Value) -> String {
-        let text = args["text"].as_str().unwrap_or("").to_string();
-        if text.is_empty() {
-            return "Error: text is required".to_string();
-        }
-        self.bus.send(AppEvent::ControlCommand(ControlMsg::Input {
-            text: text.clone(),
-        }));
-        format!("Sent response: {}", text)
-    }
-
-    fn handle_set_autonomy(&self, args: &Value) -> String {
-        let level = args["level"].as_str().unwrap_or("medium").to_string();
-        self.bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
-            level: level.clone(),
-        }));
-        format!("Autonomy set to {}", level)
-    }
-
     /// Main run loop: listen for events and user input, process both.
     pub async fn run(
         &mut self,
@@ -605,6 +452,10 @@ impl PresenceLayer {
 }
 
 /// Filter an AppEvent into a PresenceEvent, returning None for pull-only events.
+///
+/// This function stays in the main crate because it depends on the AppEvent enum
+/// which is tied to the TUI event system. The WASM client will deserialize
+/// PresenceEvents directly from WebSocket JSON instead.
 pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<PresenceEvent> {
     match event {
         AppEvent::ModelResponse { .. } => {
@@ -751,200 +602,6 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
     }
 }
 
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
-}
-
-fn format_event(event: &PresenceEvent) -> String {
-    match event {
-        PresenceEvent::PhaseChanged { phase } => format!("Phase changed to: {}", phase),
-        PresenceEvent::TaskComplete { reason } => format!("Task complete: {}", reason),
-        PresenceEvent::ApprovalNeeded {
-            id,
-            preview,
-            category,
-        } => format!(
-            "Approval needed (id={}, category={}): {}",
-            id, category, preview
-        ),
-        PresenceEvent::HumanQuestion { question } => {
-            format!("Worker has a question: {}", question)
-        }
-        PresenceEvent::BudgetWarning { pct, remaining } => {
-            format!(
-                "Budget warning: {:.0}% used, {} tokens remaining",
-                pct * 100.0,
-                remaining
-            )
-        }
-        PresenceEvent::RoundComplete {
-            round,
-            turns_in_round,
-        } => format!("Round {} complete ({} turns)", round, turns_in_round),
-        PresenceEvent::Error { message } => format!("Error: {}", message),
-    }
-}
-
-/// Return the 9 presence tool definitions for native tool calling.
-pub fn presence_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "submit_task".to_string(),
-            description: "Submit a coding task for workers to execute. Use for any multi-step work like implementing features, fixing bugs, running tests, or research.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "The task description."
-                    },
-                    "force_direct": {
-                        "type": "boolean",
-                        "description": "Force single-agent mode (no orchestrator). Default false."
-                    },
-                    "context_hints": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional hints to inject into the worker's context."
-                    }
-                },
-                "required": ["task"]
-            }),
-        },
-        ToolDefinition {
-            name: "check_status".to_string(),
-            description: "Check current agent status: phase, turn, budget, last command, workers."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "query_detail".to_string(),
-            description: "Query detailed information. Scopes: current_turn, last_output, worker, diff, logs, file.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "scope": {
-                        "type": "string",
-                        "enum": ["current_turn", "last_output", "worker", "diff", "logs", "file"],
-                        "description": "What to query."
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "Target path (required for 'file' scope)."
-                    }
-                },
-                "required": ["scope"]
-            }),
-        },
-        ToolDefinition {
-            name: "recall_memory".to_string(),
-            description:
-                "Search knowledge store and session logs for past context, decisions, and findings."
-                    .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "keywords": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Keywords to search for."
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Filter by tags."
-                    },
-                    "channel": {
-                        "type": "string",
-                        "description": "Filter by knowledge channel."
-                    }
-                },
-                "required": []
-            }),
-        },
-        ToolDefinition {
-            name: "approve_action".to_string(),
-            description: "Approve a pending action that requires user consent.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "integer",
-                        "description": "The approval ID."
-                    }
-                },
-                "required": ["id"]
-            }),
-        },
-        ToolDefinition {
-            name: "deny_action".to_string(),
-            description: "Deny a pending action, stopping the current command.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "integer",
-                        "description": "The approval ID."
-                    }
-                },
-                "required": ["id"]
-            }),
-        },
-        ToolDefinition {
-            name: "skip_action".to_string(),
-            description: "Skip a pending action, continuing with the next command.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "integer",
-                        "description": "The approval ID."
-                    }
-                },
-                "required": ["id"]
-            }),
-        },
-        ToolDefinition {
-            name: "respond_to_question".to_string(),
-            description: "Respond to a question from the worker (askHuman).".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "The response text."
-                    }
-                },
-                "required": ["text"]
-            }),
-        },
-        ToolDefinition {
-            name: "set_autonomy".to_string(),
-            description: "Set the autonomy level: low (ask for everything), medium (ask for writes/deletes), high (ask for destructive only), full (no approval needed).".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "level": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high", "full"],
-                        "description": "The autonomy level."
-                    }
-                },
-                "required": ["level"]
-            }),
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,27 +661,23 @@ mod tests {
     fn filter_event_push_events() {
         let mut last_phase = String::new();
 
-        // TaskComplete → push
         let event = AppEvent::TaskComplete {
             reason: "done".to_string(),
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
 
-        // BudgetWarning → push
         let event = AppEvent::BudgetWarning {
             pct: 0.9,
             remaining: 1000,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
 
-        // RoundComplete → push
         let event = AppEvent::RoundComplete {
             round: 1,
             turns_in_round: 5,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
 
-        // LoopError → push
         let event = AppEvent::LoopError("oops".to_string());
         assert!(filter_event(&event, &mut last_phase).is_some());
     }
@@ -1033,17 +686,14 @@ mod tests {
     fn filter_event_pull_only() {
         let mut last_phase = String::new();
 
-        // AgentOutput → pull only
         let event = AppEvent::AgentOutput {
             stdout: "hello".to_string(),
             stderr: String::new(),
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
 
-        // Tick → pull only
         assert!(filter_event(&AppEvent::Tick, &mut last_phase).is_none());
 
-        // ModelResponseDelta → pull only
         let event = AppEvent::ModelResponseDelta {
             text: "hi".to_string(),
         };
@@ -1054,10 +704,8 @@ mod tests {
     fn filter_event_presence_ready_is_pull_only() {
         let mut last_phase = String::new();
 
-        // PresenceReady → pull-only (never forwarded to presence)
         assert!(filter_event(&AppEvent::PresenceReady, &mut last_phase).is_none());
 
-        // RoundComplete → pushed (all real rounds)
         let event = AppEvent::RoundComplete {
             round: 1,
             turns_in_round: 5,
@@ -1069,7 +717,6 @@ mod tests {
     fn filter_event_phase_change_dedup() {
         let mut last_phase = String::new();
 
-        // First ModelResponse → phase change
         let event = AppEvent::ModelResponse {
             turn: 1,
             content: "hi".to_string(),
@@ -1192,9 +839,6 @@ mod tests {
 
     #[test]
     fn truncate_long_string() {
-        let long = "a".repeat(100);
-        let result = truncate(&long, 10);
-        assert_eq!(result.len(), 13); // 10 + "..."
-        assert!(result.ends_with("..."));
+        assert_eq!(truncate("hello world", 5), "hello...");
     }
 }

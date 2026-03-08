@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/presence-core"]
+
 [package]
 name = "intendant"
 version = "0.1.0"
@@ -36,6 +39,7 @@ rmcp = { version = "0.16", features = ["server", "transport-io", "client", "tran
 schemars = "1"
 base64 = "0.22"
 tokio-tungstenite = "0.24"
+presence-core = { path = "crates/presence-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
