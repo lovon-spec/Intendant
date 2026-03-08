@@ -70,6 +70,12 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 
 # Verbose output (show debug-level log entries)
 ./target/release/intendant --verbose "echo hello"
+
+# Web TUI (remote terminal + optional voice, default port 8765)
+./target/release/intendant --web
+
+# Web TUI on custom port
+./target/release/intendant --web 9000
 ```
 
 ## Testing

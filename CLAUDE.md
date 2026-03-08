@@ -44,21 +44,34 @@ src/
         ├── frontend.rs      # Shared frontend contract for TUI and MCP (UserAction enum, state queries, StatusSnapshot, ModelUsageSnapshot)
         ├── tools.rs         # Native tool definitions (11 tools), provider format conversion, extra tool registration for MCP client
         ├── tool_batch.rs    # Tool call batch assembly/disassembly: separates runtime vs caller-handled vs MCP tool calls, maps results back to per-tool responses
+        ├── presence.rs      # Presence layer: server-side PresenceLayer, tool dispatch, standalone query functions, event filtering, agent state tracking
         ├── mcp.rs           # MCP server implementation (rmcp-based, stdio transport, hot-reload)
         ├── mcp_client.rs    # MCP client: connects to external MCP servers, discovers tools, proxies calls
         ├── sandbox.rs       # Landlock filesystem sandboxing (Linux): read/write path policies, process restriction
         ├── vision.rs        # Xvfb display management, x11vnc co-process, per-provider resolution, display :99 preference with orphan reclaim
-        ├── web_gateway.rs   # WebSocket gateway: serves web TUI (xterm.js), streams TUI ANSI, bridges EventBus + key/resize input
+        ├── web_gateway.rs   # WebSocket gateway: serves web TUI (xterm.js), streams TUI ANSI, bridges EventBus + key/resize input, tool request/response protocol
         ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
             ├── mod.rs       # Tui struct: terminal init/restore, render_frame(), render+event loop
-            ├── app.rs       # App state machine, event dispatch, askHuman/approval modes
-            ├── event.rs     # AppEvent enum, EventBus (mpsc wrapper), crossterm adapter, askHuman monitor
+            ├── app.rs       # App state machine, event dispatch, askHuman/approval modes, presence pause/resume
+            ├── event.rs     # AppEvent enum (including LiveConnected/LiveDisconnected), EventBus (mpsc wrapper), crossterm adapter, askHuman monitor
             ├── web.rs       # WebTui: buffer-backed ratatui backend, ANSI→WebSocket broadcast, web key parsing
             ├── widgets.rs   # StatusBar, LogPanel, ActionPanel, InputPanel, ApprovalPanel, FollowUpPanel, InspectOverlay rendering
             ├── layout.rs    # Panel sizing with constraints, responsive to terminal size
             └── theme.rs     # Color/style constants (Catppuccin Mocha-inspired)
+crates/
+└── presence-core/           # WASM-compatible workspace crate for presence logic
+    ├── Cargo.toml           # Minimal deps: serde + serde_json only (no tokio/reqwest)
+    ├── src/
+    │   ├── lib.rs           # Re-exports all modules
+    │   ├── types.rs         # PresenceConfig, TaskEnvelope, PresenceEvent, AgentStateSnapshot, constants
+    │   ├── dispatch.rs      # PresenceAction enum, dispatch_tool_call() — pure logic dispatch
+    │   ├── format.rs        # format_event(), truncate() (unicode-safe)
+    │   ├── tools.rs         # 9 presence tool definitions (provider-agnostic)
+    │   └── prompt.rs        # DEFAULT_PRESENCE_PROMPT via include_str!
+    └── prompts/
+        └── SysPrompt_presence.md  # Presence system prompt
 SysPrompt.md                 # Default system prompt (direct mode, text-based JSON extraction)
 SysPrompt_tools.md           # Condensed prompt for native tool calling mode
 SysPrompt_user.md            # User-facing mode prompt
@@ -66,7 +79,7 @@ SysPrompt_orchestrator.md    # Orchestrator agent prompt
 SysPrompt_research.md        # Research sub-agent prompt
 SysPrompt_implementation.md  # Implementation sub-agent prompt
 static/
-└── live.html                # Web TUI (xterm.js terminal + optional voice overlay via Gemini Live / OpenAI Realtime)
+└── live.html                # Web TUI (xterm.js terminal + live model presence via Gemini Live / OpenAI Realtime)
 ```
 
 ## Build and Run
@@ -127,7 +140,8 @@ Test coverage includes:
 - **caller/error.rs**: Display formatting, type conversions (including Tui variant)
 - **caller/autonomy.rs**: Autonomy levels (display, parse, cycle), action categories, approval rules, needs_approval logic, command classification (exec, destructive, network, file write, askHuman, browse), batch classification
 - **caller/control.rs**: Socket path, outbound event serialization (including usage/usage_update), broadcast, server lifecycle
-- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses, follow-up input), event dispatch (all AppEvent variants including OrchestratorProgress, ModelResponseDelta, RoundComplete), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON), streaming buffer accumulation
+- **caller/presence.rs**: Event filtering (push-worthy vs pull-only, phase dedup, LiveConnected/LiveDisconnected), agent state updates, standalone query functions
+- **caller/tui/app.rs**: App defaults, logging (ring buffer), scrolling, key handling (quit, verbose, help, scroll, approval responses, follow-up input), event dispatch (all AppEvent variants including OrchestratorProgress, ModelResponseDelta, RoundComplete, LiveConnected/LiveDisconnected), bottom panel heights, model summary formatting (exec, edit, multiple commands, done signal, askHuman, invalid JSON), streaming buffer accumulation
 - **caller/tui/event.rs**: EventBus send/receive/clone, ControlMsg deserialization (all variants), serialization roundtrip, ApprovalResponse variants
 - **caller/tui/layout.rs**: Layout calculation (all panel combos, with/without bottom panel, hidden panels, small terminal)
 - **caller/tui/widgets.rs**: Log entry formatting (all levels, verbose/non-verbose), string truncation
@@ -143,6 +157,7 @@ Test coverage includes:
 - **caller/mcp.rs**: MCP state management, process_action_sync, resource definitions, tool parameter schemas, event-to-state mappings
 - **caller/mcp_client.rs**: Tool name parsing (`mcp__<server>_<tool>`), routing validation, connection lifecycle
 - **caller/sandbox.rs**: Default config construction, disabled config skip, write path setup
+- **caller/web_gateway.rs**: Default port, HTML embedding, config serialization, config building (gemini/openai/explicit provider), WebSocket lifecycle, WebSocket echo (control message roundtrip), broadcast-to-WebSocket, HTTP serves HTML, HTTP serves config, live_connected/live_disconnected events, tool_request bootstrap (state_snapshot on connect), tool_request/tool_response roundtrip (check_status), tool_request action dispatch (approve → ControlCommand)
 - **caller/conversation.rs** (additional): Auto-compaction threshold, compaction preserves system+tail, too-few-messages guard
 
 ## Architecture Details
@@ -301,6 +316,43 @@ Display allocation prefers `:99` for a predictable VNC port (5999). If `:99` is 
 
 An `x11vnc` server is launched alongside Xvfb as a best-effort co-process (port = `5900 + display_id`). If `x11vnc` is not installed, the display still works normally. The VNC URL is logged to the TUI/stderr on success. Both Xvfb and x11vnc are killed on drop via `XvfbGuard`.
 
+### Presence Layer
+
+The presence layer is the conversational interface between the user and the agent system. It mediates all interaction: the user talks to presence, presence delegates work via `submit_task`, and narrates progress as events stream back from the agent loop.
+
+**Architecture**: Only one presence model is active at a time — either server-side text presence OR browser-side live presence (Gemini Live / OpenAI Realtime). Never both simultaneously.
+
+**Server-side presence** (`presence.rs`): `PresenceLayer` wraps a small/fast text model (e.g., gemini-2.0-flash). It maintains its own `Conversation`, processes user input via `process_user_input()`, narrates agent events via `handle_event()`, and dispatches tasks via `TaskEnvelope` on a channel. The presence layer has 9 tools defined in `presence-core`:
+- **Action tools**: `submit_task`, `approve_action`, `deny_action`, `skip_action`, `respond_to_question`, `set_autonomy` — dispatch via EventBus as ControlMsg
+- **Query tools**: `check_status` (reads AgentStateSnapshot), `query_detail` (git diff, logs, files), `recall_memory` (knowledge store + session log fallback)
+
+Tool dispatch uses `presence_core::dispatch_tool_call()` which returns a `PresenceAction` enum. Pure-logic tools return `TextResult`/`SubmitTask`/`Approve`/etc. I/O tools return `NeedsIO` for the platform layer to handle. The standalone functions `query_detail()`, `recall_memory()`, and `handle_tool_query()` are shared between `PresenceLayer` and the web gateway.
+
+**Browser-side live presence** (`static/live.html`): When the user connects a live model (Gemini Live / OpenAI Realtime) from the browser, it sends `{"t":"live_connected"}` over WebSocket. The server pauses the `PresenceLayer` via a shared `AtomicBool` flag. Events continue streaming to the browser; the live model narrates them directly. Tool calls from the live model go through the `tool_request`/`tool_response` WebSocket protocol (see Web Gateway). When the live model disconnects, `{"t":"live_disconnected"}` resumes server-side presence.
+
+**presence-core** (`crates/presence-core/`): WASM-compatible workspace crate containing types, tool definitions, dispatch logic, event formatting, and the presence system prompt. No tokio/reqwest dependencies. Compiles to both native and `wasm32-unknown-unknown`. The main crate re-exports its types and converts `ToolDefinition` to the provider-specific format.
+
+### Web Gateway
+
+`--web` (default port 8765) serves the web TUI and bridges WebSocket connections to the EventBus. The gateway handles:
+
+**Inbound messages** (browser → server):
+- `{"t":"key",...}` → `AppEvent::Key` (terminal input)
+- `{"t":"resize","cols":N,"rows":N}` → `AppEvent::Resize`
+- `{"t":"live_connected"}` / `{"t":"live_disconnected"}` → presence mutual exclusion
+- `{"t":"tool_request","id":"...","tool":"...","args":{}}` → tool dispatch + per-connection response
+- `{"action":"..."}` → `AppEvent::ControlCommand(ControlMsg)` (same as Unix control socket)
+
+**Outbound messages** (server → browser):
+- `{"t":"term","d":"..."}` — base64-encoded TUI ANSI frames (broadcast)
+- `{"t":"state_snapshot","state":{...}}` — full `AgentStateSnapshot` sent on connect (per-connection)
+- `{"t":"tool_response","id":"...","result":"..."}` — response to a tool_request (per-connection)
+- `{"event":"..."}` — `OutboundEvent` from `control.rs` (broadcast): status, agent_output, approval_required, task_complete, usage_update, etc.
+
+The gateway uses a dual-channel outbound architecture: a `broadcast::Receiver` for events shared across all clients, and an `mpsc::unbounded_channel` per connection for direct responses (bootstrap snapshots, tool responses). Both are merged via `tokio::select!` in the outbound task.
+
+`WebQueryCtx` provides the query context (shared `AgentStateSnapshot`, project root, log dir, knowledge path) for handling `tool_request` messages. When presence is active, this is populated from the same `AgentStateSnapshot` used by `PresenceLayer`. Action tools (approve, deny, etc.) dispatch via EventBus; query tools (check_status, query_detail, recall_memory) call `presence::handle_tool_query()`.
+
 ## Code Conventions
 
 - **Rust 2021 edition** with default rustfmt and clippy settings (no .rustfmt.toml or .clippy.toml)
@@ -338,7 +390,8 @@ An `x11vnc` server is launched alongside Xvfb as a best-effort co-process (port 
 | `tui-textarea` | Text input widget for askHuman responses |
 | `tokio-stream` | Stream utilities for crossterm EventStream |
 | `base64` | Encoding screenshot data to base64 for vision API calls |
-| `tokio-tungstenite` | WebSocket server/client for live gateway |
+| `tokio-tungstenite` | WebSocket server/client for web gateway |
+| `presence-core` (workspace) | WASM-compatible presence logic (types, tools, dispatch, format, prompt) |
 | `tempfile` (dev) | Temporary directories in tests |
 
 ## Environment Requirements

@@ -62,3 +62,32 @@ When approval is needed, the agent loop pauses and the TUI shows the command pre
 ### Action Classification
 
 Action categories are determined by analyzing command JSON: shell commands are classified by inspecting for destructive patterns (`rm`, `kill`, `dd`, `mkfs`, `sudo`), network operations (`curl`, `wget`, `ssh`), file operations, etc.
+
+## Web TUI
+
+The `--web` flag serves the TUI remotely via WebSocket using xterm.js. The full ratatui interface is rendered server-side into an ANSI buffer and streamed to connected browsers.
+
+### Running
+
+```bash
+# Default port 8765
+./target/release/intendant --web
+
+# Custom port
+./target/release/intendant --web 9000
+```
+
+Open `http://<host>:8765/` in a browser. The terminal renders the same layout as the native TUI — status bar, log panel, action panel, approval/input panels. Key presses and terminal resizes in the browser are sent back to the server.
+
+### Voice Overlay
+
+The web TUI includes an optional voice overlay for browser-side live model interaction (Gemini Live / OpenAI Realtime). When activated:
+
+- The browser connects directly to the model's realtime API for low-latency voice I/O
+- The live model receives agent events and narrates progress in first person
+- Tool calls from the live model are routed through the WebSocket protocol to the server
+- Server-side presence is automatically paused (mutual exclusion)
+
+Voice requires an API key (Gemini or OpenAI), stored in browser localStorage. The remote TUI works without voice enabled.
+
+See [Web Gateway](./integrations.md#web-gateway) for the full WebSocket protocol documentation.

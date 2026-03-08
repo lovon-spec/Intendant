@@ -25,7 +25,7 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   +--> Auto-compaction: triggers at 90% context usage, preserves system+tail messages
   +--> Optional control socket (--control-socket): /tmp/intendant-<pid>.sock (JSON-line protocol)
   |       status (with session_id, task), usage, usage_update events
-  +--> Live gateway (--live): WebSocket + Gemini Live / OpenAI Realtime APIs for voice/text control
+  +--> Web gateway (--web): WebSocket server for remote TUI + browser-side live model (voice/text)
   +--> Token budget tracking (context-window-aware loop termination)
   +--> Sub-agent spawning via env vars (INTENDANT_ROLE, INTENDANT_ID, etc.)
   +--> Git worktree isolation for implementation agents
@@ -73,6 +73,20 @@ When the presence layer is enabled (default, disable with `--no-presence` or `[p
 - Handles status queries, memory recall, and autonomy changes directly without involving the agent loop
 - Uses its own system prompt (`SysPrompt_presence.md`) — standalone, not appended to the base prompt
 - Follow-up input in the TUI is routed through the presence layer when active
+
+Presence can run in two modes, but only one is active at a time (mutual exclusion):
+
+#### Server-Side Text Presence
+
+The default mode. A text model (e.g. `gemini-2.5-flash`) runs server-side inside `PresenceLayer`, processing events and generating narration text displayed in the TUI.
+
+#### Browser-Side Live Presence
+
+When `--web` is used and a browser connects a live model (Gemini Live / OpenAI Realtime), the browser sends a `live_connected` message over WebSocket. This sets a shared `AtomicBool` flag that pauses server-side presence — `PresenceLayer::handle_event()` returns `Ok(None)` while paused. The browser's live model takes over as the conversational front-end, using the same 9 tools via the WebSocket tool request/response protocol.
+
+When the browser's live model disconnects (page close, error), a `live_disconnected` message is sent and server-side presence resumes automatically.
+
+Both modes share the same tool implementations via standalone query functions (`query_detail()`, `recall_memory()`, `handle_tool_query()`) in `presence.rs`.
 
 ### Orchestrator Checkpointing
 

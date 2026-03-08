@@ -57,62 +57,141 @@ When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/int
 echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
 ```
 
-## Live Gateway
+## Web Gateway
 
-The `--live` flag starts a WebSocket server that enables voice and text control of Intendant from a browser. It supports both the Gemini Live API and OpenAI Realtime API via a provider abstraction. `--live` implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically.
+The `--web` flag starts a WebSocket server that serves a remote TUI (xterm.js) and optionally enables browser-side live model interaction (voice/text) via the Gemini Live API or OpenAI Realtime API. `--web` implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically.
 
 ### How It Works
 
 ```
-Browser ──WebSocket──> Intendant live gateway (port 8765)
+Browser ──WebSocket──> Intendant web gateway (port 8765)
   │                              │
-  │  (audio / text)              │ (ControlMsg JSON, same as control socket)
+  │  Terminal I/O (ANSI)         │  Events (broadcast to all clients)
+  │  Key/resize input            │  Tool responses (per-connection direct channel)
+  │  Tool requests               │  State snapshot (on connect)
+  │  live_connected/disconnected │
   v                              v
-Model API (Gemini/OpenAI)  EventBus / broadcast channel
-  │                              │
-  │  (function calls)            │ (OutboundEvent JSON)
-  v                              v
-JS provider bridge ──────> Intendant agent loop
+xterm.js terminal           EventBus + AgentStateSnapshot
+  +                              │
+Optional: browser-side           │  Dual outbound channels:
+live model (Gemini/OpenAI)       │  - broadcast::Receiver (events)
+  │                              │  - mpsc::unbounded (direct responses)
+  │  (function calls → tool_request)
+  v
+Intendant agent loop
 ```
 
-The browser connects directly to the model's realtime API for low-latency voice I/O, and to the Intendant gateway for control messages. A JS provider bridge translates model function calls (`submit_task`, `approve_action`, `check_status`, etc.) into Intendant `ControlMsg` JSON and injects Intendant events back into the model session for voice narration. A text input bar also allows typed messages.
+The web gateway has two layers:
 
-The live gateway serves a `/config` endpoint that returns the configured provider and model as JSON, which the frontend uses to select the correct provider adapter.
+1. **Remote TUI** — The TUI renders to a buffer-backed ratatui backend (`WebTui`). ANSI output is broadcast to all connected WebSocket clients as base64-encoded `{"t":"term","d":"..."}` messages. Key presses and terminal resizes from the browser are sent back and injected into the TUI event loop.
+
+2. **Presence bridge** (optional) — When a browser connects a live model (Gemini Live / OpenAI Realtime), the model uses 9 presence tools that map to `tool_request` WebSocket messages. The gateway handles these server-side and returns `tool_response` messages on a per-connection direct channel.
+
+### WebSocket Protocol
+
+#### Inbound Messages (browser → server)
+
+| Message | Description |
+|---------|-------------|
+| `{"t":"key","key":"..."}` | Keyboard input (crossterm key format) |
+| `{"t":"resize","cols":N,"rows":N}` | Terminal resize |
+| `{"t":"live_connected"}` | Browser live model connected — pauses server-side presence |
+| `{"t":"live_disconnected"}` | Browser live model disconnected — resumes server-side presence |
+| `{"t":"tool_request","id":"...","tool":"...","args":{}}` | Presence tool call from browser live model |
+
+#### Outbound Messages (server → browser)
+
+| Message | Description |
+|---------|-------------|
+| `{"t":"term","d":"<base64>"}` | TUI ANSI output (broadcast) |
+| `{"t":"state_snapshot","state":{...}}` | Full `AgentStateSnapshot` on connect (bootstrap) |
+| `{"t":"event","event":{...}}` | Agent event from EventBus (broadcast) |
+| `{"t":"tool_response","id":"...","result":"..."}` | Response to a tool_request (direct, per-connection) |
+
+#### Tool Request/Response Protocol
+
+The browser live model calls presence tools via tagged request/response messages:
+
+```json
+// Browser sends:
+{"t":"tool_request","id":"req-42","tool":"check_status","args":{}}
+
+// Server responds (on direct channel):
+{"t":"tool_response","id":"req-42","result":"Phase: Running agent (turn 5). Budget: 23% used."}
+```
+
+**Action tools** (`submit_task`, `approve_action`, `deny_action`, `skip_action`, `respond_to_question`, `set_autonomy`) are dispatched via the EventBus — the same path as TUI key presses and control socket commands.
+
+**Query tools** (`check_status`, `query_detail`, `recall_memory`) are handled synchronously server-side via `presence::handle_tool_query()`, which reads from the shared `AgentStateSnapshot`, project files, and knowledge store.
+
+#### State Bootstrap
+
+On WebSocket connect, if a `WebQueryCtx` is available (presence layer active), the server sends a `state_snapshot` message containing the full `AgentStateSnapshot`. This lets the browser reconstruct agent state without replaying the event history:
+
+```json
+{
+  "t": "state_snapshot",
+  "state": {
+    "phase": "thinking",
+    "turn": 3,
+    "budget_pct": 8.5,
+    "autonomy": "medium",
+    "last_command": "cargo test",
+    "pending_approval": null,
+    "pending_question": null
+  }
+}
+```
+
+Subsequent state changes arrive as incremental `event` messages.
+
+### Mutual Exclusion
+
+Only one presence model runs at a time — server-side text or browser-side live:
+
+1. Browser connects live model → sends `{"t":"live_connected"}`
+2. Web gateway emits `AppEvent::LiveConnected` → sets shared `AtomicBool` pause flag
+3. Server-side `PresenceLayer::handle_event()` returns `Ok(None)` while paused
+4. Browser live model handles all presence duties (narration, tool calls, user interaction)
+5. Browser disconnects → sends `{"t":"live_disconnected"}`
+6. Web gateway emits `AppEvent::LiveDisconnected` → clears pause flag
+7. Server-side presence resumes
 
 ### Running
 
 ```bash
-# Start idle, waiting for tasks via live UI
-./target/release/intendant --live
+# Start idle, waiting for tasks via web UI (default port 8765)
+./target/release/intendant --web
 
 # Custom port
-./target/release/intendant --live 9000
+./target/release/intendant --web 9000
 ```
 
-Open `http://<host>:8765/` on your phone or browser. On first visit, enter your API key (Gemini or OpenAI depending on configuration; stored in browser localStorage, never sent to Intendant).
+Open `http://<host>:8765/` on your phone or browser. The xterm.js terminal shows the full TUI remotely. To enable voice, enter your API key on first visit (Gemini or OpenAI; stored in browser localStorage, never sent to Intendant).
 
-### Provider Configuration
+### HTTP Endpoints
 
-The live gateway auto-detects the provider from `presence.audio_model` in `intendant.toml`, or falls back to environment variable detection (`GEMINI_API_KEY` → Gemini, `OPENAI_API_KEY` → OpenAI).
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Serves `static/live.html` (xterm.js terminal + optional voice overlay) |
+| `GET /config` | Returns configured live model provider/model as JSON |
+| `GET /ws` | WebSocket upgrade endpoint |
 
 ### Requirements
 
 - **Microphone access requires a secure context**: Use `localhost` (via SSH tunnel: `ssh -L 8765:localhost:8765 host`), or set browser flags for insecure origins.
-- **API key**: Gemini (free tier from Google AI Studio) or OpenAI. The key is used browser-side only.
+- **API key for voice**: Gemini (free tier from Google AI Studio) or OpenAI. The key is used browser-side only. Voice is optional — the remote TUI works without it.
 
-### Voice Identity
+### Supported Tools (Browser Live Model)
 
-The live gateway speaks in first person as Intendant — "I'm running your tests now" rather than "The agent is running tests." Event narration from the agent loop is rewritten into first-person system messages before being injected into the model session.
-
-### Supported Voice Commands
-
-| Voice command | Maps to |
-|---|---|
-| "List files in /tmp" | `submit_task({description: "list files in /tmp"})` |
-| "What's the status?" | `check_status()` |
-| "Approve that" | `approve_action({id: N})` |
-| "No, skip it" | `skip_action({id: N})` |
-| "Set autonomy to full" | `set_autonomy({level: "full"})` |
-| "The answer is PostgreSQL" | `respond_to_question({text: "PostgreSQL"})` |
-| "Show me the diff" | `query_detail({scope: "diff"})` |
-| "What do you know about auth?" | `recall_memory({keywords: ["auth"]})` |
+| Tool | Type | Description |
+|------|------|-------------|
+| `submit_task` | Action | Submit a new task to the agent loop |
+| `approve_action` | Action | Approve a pending action |
+| `deny_action` | Action | Deny a pending action |
+| `skip_action` | Action | Skip a pending action |
+| `respond_to_question` | Action | Answer an `askHuman` question |
+| `set_autonomy` | Action | Change autonomy level |
+| `check_status` | Query | Get current agent phase, turn, budget |
+| `query_detail` | Query | Get git diff, file contents, or log details |
+| `recall_memory` | Query | Search the knowledge store by keywords/channel |

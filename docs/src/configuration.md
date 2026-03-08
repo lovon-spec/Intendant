@@ -18,7 +18,7 @@
 | `--no-presence` | Disable the presence layer (direct agent interaction) |
 | `--continue` | Resume most recent session for this project |
 | `--resume <id>` | Resume specific session by ID or prefix |
-| `--live` | Start live gateway for voice/text interaction (default port 8765, implies `--mcp`) |
+| `--web` | Start web gateway for remote TUI + optional voice/text interaction (default port 8765, implies `--mcp`) |
 
 The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
 
@@ -77,7 +77,7 @@ destructive = "ask"           # ask before destructive commands (default)
 enabled = true                # enable the conversational presence layer (default: true)
 provider = "gemini"           # provider for the presence model (optional, falls back to PROVIDER)
 model = "gemini-2.5-flash"    # model for the presence layer (optional)
-audio_model = "gemini-2.5-flash-live"  # model for live gateway audio mode (optional)
+audio_model = "gemini-2.5-flash-live"  # model for browser-side live presence (optional)
 context_window = 32768        # context window for the presence conversation (default: 32768)
 
 [sandbox]
