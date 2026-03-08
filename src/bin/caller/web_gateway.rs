@@ -7,18 +7,18 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const DEFAULT_PORT: u16 = 8765;
 
-const LIVE_HTML: &str = include_str!("../../../static/live.html");
+const WEB_HTML: &str = include_str!("../../../static/live.html");
 
-/// Configuration sent to the live frontend via `/config`.
+/// Configuration sent to the web frontend via `/config`.
 #[derive(Clone, Debug, Serialize)]
-pub struct LiveGatewayConfig {
+pub struct WebGatewayConfig {
     pub provider: String,
     pub model: String,
     pub input_sample_rate: u32,
     pub output_sample_rate: u32,
 }
 
-impl Default for LiveGatewayConfig {
+impl Default for WebGatewayConfig {
     fn default() -> Self {
         Self {
             provider: "gemini".to_string(),
@@ -29,18 +29,18 @@ impl Default for LiveGatewayConfig {
     }
 }
 
-/// Spawn the live gateway HTTP/WebSocket server.
+/// Spawn the web gateway HTTP/WebSocket server.
 ///
-/// - `GET /config` returns a JSON `LiveGatewayConfig`.
-/// - `GET /` (and any other path) returns `live.html`.
+/// - `GET /config` returns a JSON `WebGatewayConfig`.
+/// - `GET /` (and any other path) returns the web TUI page.
 /// - WebSocket connections are bridged to the EventBus (inbound control
 ///   messages) and broadcast channel (outbound events), mirroring the
 ///   Unix control socket in `control.rs`.
-pub fn spawn_live_gateway(
+pub fn spawn_web_gateway(
     port: u16,
     bus: EventBus,
     broadcast_tx: broadcast::Sender<String>,
-    config: LiveGatewayConfig,
+    config: WebGatewayConfig,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -162,7 +162,7 @@ pub fn spawn_live_gateway(
                     let (content_type, body) = if is_config {
                         ("application/json", config_json.as_str())
                     } else {
-                        ("text/html; charset=utf-8", LIVE_HTML)
+                        ("text/html; charset=utf-8", WEB_HTML)
                     };
 
                     let response = format!(
@@ -185,9 +185,9 @@ pub fn spawn_live_gateway(
     })
 }
 
-/// Build a `LiveGatewayConfig` from the presence config's live fields,
+/// Build a `WebGatewayConfig` from the presence config's live fields,
 /// falling back to environment variable detection.
-pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> LiveGatewayConfig {
+pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> WebGatewayConfig {
     // If an explicit provider is given, use it directly.
     if let Some(provider) = live_provider {
         let model = live_model.unwrap_or_else(|| match provider {
@@ -199,7 +199,7 @@ pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> Li
         } else {
             (16000, 24000)
         };
-        return LiveGatewayConfig {
+        return WebGatewayConfig {
             provider: provider.to_string(),
             model: model.to_string(),
             input_sample_rate: input_rate,
@@ -210,14 +210,14 @@ pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> Li
     // If an explicit live model is given, detect provider from the model name.
     if let Some(model) = live_model {
         if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
-            return LiveGatewayConfig {
+            return WebGatewayConfig {
                 provider: "openai".to_string(),
                 model: model.to_string(),
                 input_sample_rate: 24000,
                 output_sample_rate: 24000,
             };
         }
-        return LiveGatewayConfig {
+        return WebGatewayConfig {
             provider: "gemini".to_string(),
             model: model.to_string(),
             input_sample_rate: 16000,
@@ -227,14 +227,14 @@ pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> Li
 
     // Fall back to env var detection
     if std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("GEMINI_API_KEY").is_err() {
-        LiveGatewayConfig {
+        WebGatewayConfig {
             provider: "openai".to_string(),
             model: "gpt-4o-realtime-preview".to_string(),
             input_sample_rate: 24000,
             output_sample_rate: 24000,
         }
     } else {
-        LiveGatewayConfig::default()
+        WebGatewayConfig::default()
     }
 }
 
@@ -251,13 +251,13 @@ mod tests {
 
     #[test]
     fn test_live_html_embedded() {
-        assert!(!LIVE_HTML.is_empty());
-        assert!(LIVE_HTML.contains("<!DOCTYPE html>"));
+        assert!(!WEB_HTML.is_empty());
+        assert!(WEB_HTML.contains("<!DOCTYPE html>"));
     }
 
     #[test]
     fn test_live_gateway_config_default() {
-        let config = LiveGatewayConfig::default();
+        let config = WebGatewayConfig::default();
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
         assert_eq!(config.output_sample_rate, 24000);
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_live_gateway_config_serialize() {
-        let config = LiveGatewayConfig::default();
+        let config = WebGatewayConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"provider\":\"gemini\""));
         assert!(json.contains("\"input_sample_rate\":16000"));
@@ -302,11 +302,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_live_gateway_lifecycle() {
+    async fn test_spawn_web_gateway_lifecycle() {
         let (bus, _rx) = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
-        let config = LiveGatewayConfig::default();
-        let handle = spawn_live_gateway(0, bus, broadcast_tx, config);
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(0, bus, broadcast_tx, config);
 
         // Give it a moment to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -324,8 +324,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let config = LiveGatewayConfig::default();
-        let handle = spawn_live_gateway(port, bus, broadcast_tx, config);
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -363,8 +363,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let config = LiveGatewayConfig::default();
-        let handle = spawn_live_gateway(port, bus, broadcast_tx.clone(), config);
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -414,8 +414,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let config = LiveGatewayConfig::default();
-        let handle = spawn_live_gateway(port, bus, broadcast_tx, config);
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -451,13 +451,13 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let config = LiveGatewayConfig {
+        let config = WebGatewayConfig {
             provider: "openai".to_string(),
             model: "gpt-4o-realtime-preview".to_string(),
             input_sample_rate: 24000,
             output_sample_rate: 24000,
         };
-        let handle = spawn_live_gateway(port, bus, broadcast_tx, config);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config

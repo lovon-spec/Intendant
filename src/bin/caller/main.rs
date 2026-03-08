@@ -19,7 +19,7 @@ mod tools;
 mod tui;
 mod user_mode;
 mod vision;
-mod live_gateway;
+mod web_gateway;
 mod worktree;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
@@ -101,9 +101,9 @@ struct CliFlags {
     direct: bool,
     /// --no-presence: Disable the presence layer (direct agent interaction).
     no_presence: bool,
-    /// --live [PORT]: Enable live gateway WebSocket server (implies --mcp).
-    live: bool,
-    live_port: u16,
+    /// --web [PORT]: Serve TUI via web (xterm.js + optional voice).
+    web: bool,
+    web_port: u16,
 }
 
 fn print_help() {
@@ -128,7 +128,7 @@ fn print_help() {
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
-    println!("    --live [PORT]          Serve TUI via web (xterm.js + optional voice, default port: 8765)");
+    println!("    --web [PORT]           Serve TUI via web (xterm.js + optional voice, default port: 8765)");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -172,8 +172,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         sandbox: false,
         direct: false,
         no_presence: false,
-        live: false,
-        live_port: live_gateway::DEFAULT_PORT,
+        web: false,
+        web_port: web_gateway::DEFAULT_PORT,
     };
 
     let mut task_parts = Vec::new();
@@ -269,13 +269,13 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 flags.no_presence = true;
                 i += 1;
             }
-            "--live" | "--voice-gateway" => {
-                flags.live = true;
-                // --live serves the TUI via web (xterm.js). Use --live --mcp
+            "--web" => {
+                flags.web = true;
+                // --web serves the TUI via web (xterm.js). Use --web --mcp
                 // for voice-only MCP mode without the web TUI.
                 // Optional port argument (next arg if it's numeric)
                 if i + 1 < args.len() && args[i + 1].parse::<u16>().is_ok() {
-                    flags.live_port = args[i + 1].parse().unwrap();
+                    flags.web_port = args[i + 1].parse().unwrap();
                     i += 2;
                 } else {
                     i += 1;
@@ -1047,8 +1047,8 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             direct: false,
             no_presence: false,
-            live: false,
-            live_port: live_gateway::DEFAULT_PORT,
+            web: false,
+            web_port: web_gateway::DEFAULT_PORT,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -1059,13 +1059,13 @@ Also: {"source": "bare"}"#;
         assert!(!flags.json_output);
         assert!(!flags.direct);
         assert!(!flags.no_presence);
-        assert!(!flags.live);
-        assert_eq!(flags.live_port, 8765);
+        assert!(!flags.web);
+        assert_eq!(flags.web_port, 8765);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
     }
 
     #[test]
-    fn cli_live_flag() {
+    fn cli_web_flag() {
         let flags = CliFlags {
             task: None,
             provider: None,
@@ -1082,15 +1082,15 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             direct: false,
             no_presence: false,
-            live: true,
-            live_port: live_gateway::DEFAULT_PORT,
+            web: true,
+            web_port: web_gateway::DEFAULT_PORT,
         };
-        assert!(flags.live);
-        assert_eq!(flags.live_port, live_gateway::DEFAULT_PORT);
+        assert!(flags.web);
+        assert_eq!(flags.web_port, web_gateway::DEFAULT_PORT);
     }
 
     #[test]
-    fn cli_live_with_port() {
+    fn cli_web_with_port() {
         let flags = CliFlags {
             task: None,
             provider: None,
@@ -1107,11 +1107,11 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             direct: false,
             no_presence: false,
-            live: true,
-            live_port: 9000,
+            web: true,
+            web_port: 9000,
         };
-        assert!(flags.live);
-        assert_eq!(flags.live_port, 9000);
+        assert!(flags.web);
+        assert_eq!(flags.web_port, 9000);
     }
 
     #[test]
@@ -3473,8 +3473,8 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Determine whether to use TUI (needed early for task resolution).
-    // --live forces TUI mode (served via web) even without a real terminal.
-    let use_tui = flags.live
+    // --web forces TUI mode (served via web) even without a real terminal.
+    let use_tui = flags.web
         || (!flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal());
 
     // Task resolution: MCP and TUI modes allow starting without a task.
@@ -3523,33 +3523,33 @@ async fn main() -> Result<(), CallerError> {
             None
         };
 
-        // Live gateway (WebSocket)
-        let _live_handle = if flags.live {
+        // Web gateway (WebSocket)
+        let _web_handle = if flags.web {
             let broadcast_tx = if let Some(ref tx) = mcp_control_tx {
                 tx.clone()
             } else {
                 let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
                 tx
             };
-            let config = live_gateway::build_config(
+            let config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
             );
-            let handle = live_gateway::spawn_live_gateway(
-                flags.live_port,
+            let handle = web_gateway::spawn_web_gateway(
+                flags.web_port,
                 bus.clone(),
                 broadcast_tx,
                 config,
             );
             slog(&session_log, |l| {
                 l.info(&format!(
-                    "Live gateway: http://0.0.0.0:{}",
-                    flags.live_port
+                    "Web TUI: http://0.0.0.0:{}",
+                    flags.web_port
                 ))
             });
             eprintln!(
-                "Live gateway: http://0.0.0.0:{}",
-                flags.live_port
+                "Web TUI: http://0.0.0.0:{}",
+                flags.web_port
             );
             Some(handle)
         } else {
@@ -3761,8 +3761,8 @@ async fn main() -> Result<(), CallerError> {
         let (bus, event_rx) = EventBus::new();
 
         // Spawn background tasks.
-        // In web mode (--live), key events come from WebSocket, not the terminal.
-        let _crossterm_handle = if !flags.live {
+        // In web mode (--web), key events come from WebSocket, not the terminal.
+        let _crossterm_handle = if !flags.web {
             Some(tui::event::spawn_crossterm_reader(bus.clone()))
         } else {
             None
@@ -3774,7 +3774,7 @@ async fn main() -> Result<(), CallerError> {
         );
 
         // TUI is created later — just before run() — so that web mode
-        // (--live) can use WebTui instead of the real terminal backend.
+        // (--web) can use WebTui instead of the real terminal backend.
 
         // Create app state
         let mut app = tui::app::App::new(
@@ -3802,8 +3802,8 @@ async fn main() -> Result<(), CallerError> {
             );
         }
 
-        // Live gateway (WebSocket) — shares broadcast channel with control socket if both enabled
-        let _live_handle = if flags.live {
+        // Web gateway (WebSocket) — shares broadcast channel with control socket if both enabled
+        let _web_handle = if flags.web {
             let broadcast_tx = if let Some(ref tx) = app.control_tx {
                 tx.clone()
             } else {
@@ -3811,19 +3811,19 @@ async fn main() -> Result<(), CallerError> {
                 app.set_control_socket(tx.clone());
                 tx
             };
-            let config = live_gateway::build_config(
+            let config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
             );
-            let handle = live_gateway::spawn_live_gateway(
-                flags.live_port,
+            let handle = web_gateway::spawn_web_gateway(
+                flags.web_port,
                 bus.clone(),
                 broadcast_tx,
                 config,
             );
             app.log(
                 tui::app::LogLevel::Info,
-                format!("Live gateway: http://0.0.0.0:{}", flags.live_port),
+                format!("Web TUI: http://0.0.0.0:{}", flags.web_port),
             );
             Some(handle)
         } else {
@@ -4043,15 +4043,15 @@ async fn main() -> Result<(), CallerError> {
         };
 
         // Run the TUI event loop (blocks until quit).
-        // In web mode (--live), render to a buffer and stream to xterm.js.
+        // In web mode (--web), render to a buffer and stream to xterm.js.
         // In terminal mode, render directly to stdout.
-        if flags.live {
+        if flags.web {
             let broadcast_tx = app.control_tx.clone().unwrap_or_else(|| {
                 let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
                 app.set_control_socket(tx.clone());
                 tx
             });
-            eprintln!("Web TUI: http://0.0.0.0:{}", flags.live_port);
+            eprintln!("Web TUI: http://0.0.0.0:{}", flags.web_port);
             let mut web_tui = tui::web::WebTui::new(120, 40, broadcast_tx)
                 .map_err(|e| CallerError::Tui(format!("Failed to initialize Web TUI: {}", e)))?;
             let _ = web_tui.run(&mut app, event_rx).await;
@@ -4079,23 +4079,23 @@ async fn main() -> Result<(), CallerError> {
 
         // Headless mode (--no-tui or non-TTY)
 
-        // Live gateway in headless mode needs an EventBus + broadcast channel
-        let headless_bus = if flags.live {
+        // Web gateway in headless mode needs an EventBus + broadcast channel
+        let headless_bus = if flags.web {
             let (bus, _rx) = EventBus::new();
             let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
-            let config = live_gateway::build_config(
+            let config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
             );
-            let _live_handle = live_gateway::spawn_live_gateway(
-                flags.live_port,
+            let _web_handle = web_gateway::spawn_web_gateway(
+                flags.web_port,
                 bus.clone(),
                 broadcast_tx,
                 config,
             );
             eprintln!(
-                "Live gateway: http://0.0.0.0:{}",
-                flags.live_port
+                "Web TUI: http://0.0.0.0:{}",
+                flags.web_port
             );
             Some(bus)
         } else {

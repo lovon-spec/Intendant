@@ -48,7 +48,7 @@ src/
         ├── mcp_client.rs    # MCP client: connects to external MCP servers, discovers tools, proxies calls
         ├── sandbox.rs       # Landlock filesystem sandboxing (Linux): read/write path policies, process restriction
         ├── vision.rs        # Xvfb display management, x11vnc co-process, per-provider resolution, display :99 preference with orphan reclaim
-        ├── live_gateway.rs  # WebSocket gateway: serves live.html, streams TUI (ANSI via xterm.js), bridges EventBus + key/resize input
+        ├── web_gateway.rs   # WebSocket gateway: serves web TUI (xterm.js), streams TUI ANSI, bridges EventBus + key/resize input
         ├── session_log.rs   # UUID-based session directories, structured event logging, conversation persistence
         ├── error.rs         # CallerError enum (includes Tui variant)
         └── tui/
@@ -94,8 +94,8 @@ Running the CLI (requires `.env` with API key):
 ./target/release/intendant --mcp "task"                    # Run as MCP server on stdio
 ./target/release/intendant --json "echo hello"             # JSONL output to stdout (implies --no-tui)
 ./target/release/intendant --sandbox "run tests"           # Enable Landlock filesystem sandboxing
-./target/release/intendant --live                          # Serve TUI via web (xterm.js + voice) on port 8765
-./target/release/intendant --live 9000                     # Web TUI on custom port
+./target/release/intendant --web                           # Serve TUI via web (xterm.js + voice) on port 8765
+./target/release/intendant --web 9000                      # Web TUI on custom port
 ./target/release/intendant --direct "complex task"         # Force single-agent mode (skip orchestrator)
 ./target/release/intendant --control-socket "task"         # Enable Unix control socket
 echo "task" | ./target/release/intendant                   # Auto-detects non-TTY, runs headless
