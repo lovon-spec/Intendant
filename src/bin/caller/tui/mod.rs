@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use event::AppEvent;
+use crate::event::AppEvent;
 use ratatui::prelude::*;
 use std::io;
 use tokio::sync::mpsc;

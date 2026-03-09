@@ -3,6 +3,7 @@ mod autonomy;
 mod control;
 mod conversation;
 mod error;
+mod event;
 mod frontend;
 mod knowledge;
 mod mcp;
@@ -17,6 +18,7 @@ mod sub_agent;
 mod tool_batch;
 mod tools;
 mod tui;
+mod types;
 mod user_mode;
 mod vision;
 mod web_gateway;
@@ -25,6 +27,7 @@ mod worktree;
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
 use conversation::Conversation;
 use error::CallerError;
+use event::{AppEvent, EventBus};
 use project::Project;
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -32,7 +35,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
-use tui::event::{AppEvent, EventBus};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
 
@@ -2050,25 +2052,25 @@ async fn run_agent_loop(
                         responder: tx,
                     });
                     match rx.await {
-                        Ok(tui::event::ApprovalResponse::Approve) => {
+                        Ok(event::ApprovalResponse::Approve) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
                         }
-                        Ok(tui::event::ApprovalResponse::ApproveAll) => {
+                        Ok(event::ApprovalResponse::ApproveAll) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approve-all")
                             });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
                         }
-                        Ok(tui::event::ApprovalResponse::Skip) => {
+                        Ok(event::ApprovalResponse::Skip) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "skipped")
                             });
                             should_skip = true;
                         }
-                        Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
+                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
@@ -2363,25 +2365,25 @@ Proceed with explicit assumptions and continue without additional questions."
                         responder: tx,
                     });
                     match rx.await {
-                        Ok(tui::event::ApprovalResponse::Approve) => {
+                        Ok(event::ApprovalResponse::Approve) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
                         }
-                        Ok(tui::event::ApprovalResponse::ApproveAll) => {
+                        Ok(event::ApprovalResponse::ApproveAll) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "approve-all")
                             });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
                         }
-                        Ok(tui::event::ApprovalResponse::Skip) => {
+                        Ok(event::ApprovalResponse::Skip) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "skipped")
                             });
                             should_skip = true;
                         }
-                        Ok(tui::event::ApprovalResponse::Deny) | Err(_) => {
+                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
@@ -2846,7 +2848,7 @@ async fn run_with_presence(
                          Submitting task directly.",
                         e
                     ),
-                    level: Some(tui::app::LogLevel::Warn),
+                    level: Some(types::LogLevel::Warn),
                     turn: None,
                 });
                 presence_failed_task = Some(task_str.clone());
@@ -2856,7 +2858,7 @@ async fn run_with_presence(
                     message: "Presence provider timed out (30s). Use --no-presence or --direct to bypass. \
                          Submitting task directly."
                         .to_string(),
-                    level: Some(tui::app::LogLevel::Warn),
+                    level: Some(types::LogLevel::Warn),
                     turn: None,
                 });
                 presence_failed_task = Some(task_str.clone());
@@ -2898,7 +2900,7 @@ async fn run_with_presence(
             Err(e) => {
                 bus.send(AppEvent::PresenceLog {
                     message: format!("Provider error: {}", e),
-                    level: Some(tui::app::LogLevel::Error),
+                    level: Some(types::LogLevel::Error),
                     turn: None,
                 });
                 continue;
@@ -2909,7 +2911,7 @@ async fn run_with_presence(
             Err(e) => {
                 bus.send(AppEvent::PresenceLog {
                     message: format!("Project error: {}", e),
-                    level: Some(tui::app::LogLevel::Error),
+                    level: Some(types::LogLevel::Error),
                     turn: None,
                 });
                 continue;
@@ -2955,7 +2957,7 @@ async fn run_with_presence(
             Err(e) => {
                 bus.send(AppEvent::PresenceLog {
                     message: format!("Task error: {}", e),
-                    level: Some(tui::app::LogLevel::Error),
+                    level: Some(types::LogLevel::Error),
                     turn: None,
                 });
             }
@@ -3508,10 +3510,10 @@ async fn main() -> Result<(), CallerError> {
         // MCP mode — speaks Model Context Protocol on stdio.
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
         let (bus, event_rx) = EventBus::new();
-        let human_question_path = tui::event::shared_question_path(log_dir.join("human_question"));
+        let human_question_path = event::shared_question_path(log_dir.join("human_question"));
         let _human_monitor =
-            tui::event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
-        let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 1000);
+            event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
+        let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
         let mcp_control_tx = if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             slog(&session_log, |l| {
@@ -3727,7 +3729,7 @@ async fn main() -> Result<(), CallerError> {
                 (launcher)(initial_task, bus.clone()).await
             };
             let mut s = mcp_state.write().await;
-            s.phase = tui::app::Phase::Thinking;
+            s.phase = types::Phase::Thinking;
             s.task_handle = Some(handle);
         }
 
@@ -3770,10 +3772,10 @@ async fn main() -> Result<(), CallerError> {
         } else {
             None
         };
-        let _tick_handle = tui::event::spawn_tick_timer(bus.clone(), 100);
-        let _human_monitor = tui::event::spawn_human_question_monitor(
+        let _tick_handle = event::spawn_tick_timer(bus.clone(), 100);
+        let _human_monitor = event::spawn_human_question_monitor(
             bus.clone(),
-            tui::event::shared_question_path(log_dir.join("human_question")),
+            event::shared_question_path(log_dir.join("human_question")),
         );
 
         // TUI is created later — just before run() — so that web mode
@@ -3792,15 +3794,15 @@ async fn main() -> Result<(), CallerError> {
         app.project_root = Some(project.root.clone());
         app.knowledge_path = Some(project.memory_path());
         app.verbosity = if flags.verbose {
-            tui::app::Verbosity::Debug
+            types::Verbosity::Debug
         } else {
-            tui::app::Verbosity::Normal
+            types::Verbosity::Normal
         };
         if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             app.set_control_socket(control_tx);
             app.log(
-                tui::app::LogLevel::Info,
+                types::LogLevel::Info,
                 format!("Control socket: {}", control::socket_path().display()),
             );
         }
@@ -3822,7 +3824,7 @@ async fn main() -> Result<(), CallerError> {
         };
 
         if let Some(ref t) = task {
-            app.log(tui::app::LogLevel::Info, format!("Task: {}", t));
+            app.log(types::LogLevel::Info, format!("Task: {}", t));
         }
 
         // Determine if presence layer should be active.
@@ -3840,13 +3842,13 @@ async fn main() -> Result<(), CallerError> {
         // If no task was provided, start in follow-up mode so the user sees
         // the input panel immediately.
         if task.is_none() {
-            app.current_phase = tui::app::Phase::WaitingFollowUp;
+            app.current_phase = types::Phase::WaitingFollowUp;
             app.mode = tui::app::AppMode::FollowUp;
             let mut textarea = tui_textarea::TextArea::default();
             textarea.set_cursor_line_style(ratatui::style::Style::default());
             app.follow_up_textarea = Some(textarea);
             app.log(
-                tui::app::LogLevel::Info,
+                types::LogLevel::Info,
                 "Ready. Enter a task to get started.".to_string(),
             );
         }
@@ -3867,11 +3869,11 @@ async fn main() -> Result<(), CallerError> {
             let agent_state = Arc::new(std::sync::Mutex::new(presence::AgentStateSnapshot::default()));
             app.set_presence_agent_state(agent_state.clone());
 
-            app.log(tui::app::LogLevel::Info, "Presence layer active".to_string());
+            app.log(types::LogLevel::Info, "Presence layer active".to_string());
             // If there's an initial task, set the phase to Thinking immediately
             // so the TUI doesn't sit at "Idle" during the presence API call.
             if task.is_some() {
-                app.current_phase = tui::app::Phase::Thinking;
+                app.current_phase = types::Phase::Thinking;
             }
             (Some(presence_user_rx), Some(presence_event_rx), Some(agent_state))
         } else {
@@ -3900,7 +3902,7 @@ async fn main() -> Result<(), CallerError> {
                 query_ctx,
             );
             app.log(
-                tui::app::LogLevel::Info,
+                types::LogLevel::Info,
                 format!("Web TUI: http://0.0.0.0:{}", flags.web_port),
             );
             Some(handle)

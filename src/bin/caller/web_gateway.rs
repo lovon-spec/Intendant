@@ -1,5 +1,5 @@
 use crate::presence::{self, AgentStateSnapshot};
-use crate::tui::event::{AppEvent, ControlMsg, EventBus};
+use crate::event::{AppEvent, ControlMsg, EventBus};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -387,7 +387,7 @@ pub fn build_config(live_provider: Option<&str>, live_model: Option<&str>) -> We
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::OutboundEvent;
+    use crate::types::OutboundEvent;
     use tokio::io::AsyncWriteExt;
 
     #[test]

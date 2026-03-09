@@ -1,68 +1,11 @@
-use crate::tui::event::{AppEvent, ControlMsg, EventBus};
-use serde::Serialize;
+use crate::event::{AppEvent, ControlMsg, EventBus};
+use crate::types::OutboundEvent;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
-
-/// Events sent to connected control socket clients.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-#[allow(dead_code)]
-pub enum OutboundEvent {
-    TurnStarted {
-        turn: usize,
-        budget_pct: f64,
-    },
-    AgentOutput {
-        stdout: String,
-        stderr: String,
-    },
-    ApprovalRequired {
-        id: u64,
-        command: String,
-    },
-    AskHuman {
-        question: String,
-    },
-    TaskComplete {
-        reason: String,
-    },
-    RoundComplete {
-        round: usize,
-        turns_in_round: usize,
-    },
-    DisplayReady {
-        display_id: u32,
-        vnc_port: Option<u32>,
-    },
-    Status {
-        turn: usize,
-        phase: String,
-        autonomy: String,
-        session_id: String,
-        task: String,
-    },
-    Usage {
-        main: crate::frontend::ModelUsageSnapshot,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        presence: Option<crate::frontend::ModelUsageSnapshot>,
-    },
-    UsageUpdate {
-        main: crate::frontend::ModelUsageSnapshot,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        presence: Option<crate::frontend::ModelUsageSnapshot>,
-    },
-    CommandResult {
-        action: String,
-        ok: bool,
-        message: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        data: Option<serde_json::Value>,
-    },
-}
 
 /// Get the socket path for this process.
 pub fn socket_path() -> PathBuf {

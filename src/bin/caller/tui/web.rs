@@ -3,7 +3,7 @@
 //! messages arrive from the browser and are injected as `AppEvent`s.
 
 use super::app::App;
-use super::event::AppEvent;
+use crate::event::AppEvent;
 use crossterm::execute;
 use crossterm::terminal::EnterAlternateScreen;
 use ratatui::prelude::*;

@@ -3,7 +3,7 @@ use crate::error::CallerError;
 use crate::knowledge::{self, KnowledgeQuery};
 use crate::provider::ChatProvider;
 use crate::session_log;
-use crate::tui::event::{AppEvent, ControlMsg, EventBus};
+use crate::event::{AppEvent, ControlMsg, EventBus};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,7 +161,7 @@ impl PresenceLayer {
         }
     }
 
-    fn plog(&self, message: String, level: Option<crate::tui::app::LogLevel>) {
+    fn plog(&self, message: String, level: Option<crate::types::LogLevel>) {
         self.bus.send(AppEvent::PresenceLog {
             message,
             level,
@@ -208,7 +208,7 @@ impl PresenceLayer {
 
     /// Run the model in a loop, handling tool calls until a text response is produced.
     async fn run_model_loop(&mut self) -> Result<String, CallerError> {
-        use crate::tui::app::LogLevel;
+        use crate::types::LogLevel;
         const MAX_TOOL_ROUNDS: usize = 10;
 
         for round in 0..MAX_TOOL_ROUNDS {

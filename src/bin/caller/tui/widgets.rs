@@ -1,4 +1,5 @@
-use crate::tui::app::{App, AppMode, LogEntry, LogLevel, LogTab, Phase};
+use crate::tui::app::{App, AppMode, LogEntry, LogTab};
+use crate::types::{LogLevel, Phase};
 use crate::tui::theme;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

@@ -33,13 +33,14 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::autonomy::{AutonomyLevel, SharedAutonomy};
-use crate::control::{self, OutboundEvent};
+use crate::control;
+use crate::types::OutboundEvent;
 use crate::frontend::{
     self, ActionOutcome, ApprovalSnapshot, HumanQuestionSnapshot, LogEntrySnapshot, StateResult,
     StatusSnapshot, UserAction,
 };
-use crate::tui::app::{LogLevel, Phase, Verbosity};
-use crate::tui::event::{AppEvent, ApprovalResponse, ControlMsg, EventBus};
+use crate::event::{AppEvent, ApprovalResponse, ControlMsg, EventBus};
+use crate::types::{LogLevel, Phase, Verbosity};
 
 // ---------------------------------------------------------------------------
 // Task launcher: allows MCP to start agent loops on demand
@@ -1654,7 +1655,7 @@ pub fn spawn_event_listener(
     mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     peer: Arc<Mutex<Option<rmcp::Peer<RoleServer>>>>,
     bus: EventBus,
-    human_question_path: Option<crate::tui::event::SharedQuestionPath>,
+    human_question_path: Option<crate::event::SharedQuestionPath>,
     control_tx: Option<broadcast::Sender<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -3203,7 +3204,7 @@ pub async fn run_mcp_server(
     bus: EventBus,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     reloaded: bool,
-    human_question_path: Option<crate::tui::event::SharedQuestionPath>,
+    human_question_path: Option<crate::event::SharedQuestionPath>,
     control_tx: Option<broadcast::Sender<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = IntendantServer::new(state.clone(), bus.clone());

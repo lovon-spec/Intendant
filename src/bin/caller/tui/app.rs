@@ -1,7 +1,9 @@
 use crate::autonomy::SharedAutonomy;
-use crate::control::{self, OutboundEvent};
+use crate::control;
+use crate::event::{AppEvent, ApprovalResponse, ControlMsg};
+pub use crate::types::{LogLevel, Phase, Verbosity};
+use crate::types::OutboundEvent;
 use crate::{knowledge, session_log};
-use crate::tui::event::{AppEvent, ApprovalResponse, ControlMsg};
 use crate::tui::layout::PanelConfig;
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,19 +11,6 @@ use std::collections::{HashSet, VecDeque};
 use tokio::sync::oneshot;
 
 const MAX_LOG_ENTRIES: usize = 10_000;
-
-/// Current phase of the agent loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Phase {
-    Thinking,
-    RunningAgent,
-    Orchestrating,
-    WaitingApproval,
-    WaitingHuman,
-    WaitingFollowUp,
-    Idle,
-    Done,
-}
 
 /// The current interactive mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,18 +21,6 @@ pub enum AppMode {
     Approval,
     Inspect,
     FollowUp,
-}
-
-/// Log entry severity / source.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogLevel {
-    Info,
-    Model,
-    Agent,
-    Error,
-    Warn,
-    SubAgent,
-    Debug,
 }
 
 /// Which subsystem produced a log entry.
@@ -84,51 +61,6 @@ impl LogTab {
             Self::All => true,
             Self::Agent => source != LogSource::Presence,
             Self::Presence => source != LogSource::Agent,
-        }
-    }
-}
-
-/// Log verbosity profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verbosity {
-    Quiet,
-    Normal,
-    Verbose,
-    Debug,
-}
-
-impl Verbosity {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Quiet => Self::Normal,
-            Self::Normal => Self::Verbose,
-            Self::Verbose => Self::Debug,
-            Self::Debug => Self::Quiet,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Quiet => "Quiet",
-            Self::Normal => "Normal",
-            Self::Verbose => "Verbose",
-            Self::Debug => "Debug",
-        }
-    }
-
-    pub fn includes(self, level: &LogLevel) -> bool {
-        match self {
-            Self::Quiet => matches!(level, LogLevel::Warn | LogLevel::Error),
-            Self::Normal => matches!(
-                level,
-                LogLevel::Info
-                    | LogLevel::Model
-                    | LogLevel::Warn
-                    | LogLevel::Error
-                    | LogLevel::SubAgent
-            ),
-            Self::Verbose => !matches!(level, LogLevel::Debug),
-            Self::Debug => true,
         }
     }
 }

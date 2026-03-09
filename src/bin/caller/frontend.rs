@@ -8,7 +8,7 @@
 //! **Rule**: never use `_ =>` wildcards when matching on these types.
 
 use crate::autonomy::AutonomyLevel;
-use crate::tui::app::{LogLevel, Verbosity};
+use crate::types::{LogLevel, Verbosity};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
