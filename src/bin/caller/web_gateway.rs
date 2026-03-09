@@ -11,8 +11,6 @@ use tokio_tungstenite::tungstenite::Message;
 pub const DEFAULT_PORT: u16 = 8765;
 
 const WEB_HTML: &str = include_str!("../../../static/live.html");
-const WASM_JS: &str = include_str!("../../../static/wasm/presence_core.js");
-const WASM_BIN: &[u8] = include_bytes!("../../../static/wasm/presence_core_bg.wasm");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 
@@ -316,9 +314,7 @@ pub fn spawn_web_gateway(
                     let request_line = header_text.lines().next().unwrap_or("");
 
                     // Route WASM binaries (need async write_all for large payloads)
-                    let wasm_binary = if request_line.contains("/wasm/presence_core_bg.wasm") {
-                        Some(WASM_BIN)
-                    } else if request_line.contains("/wasm-web/presence_web_bg.wasm") {
+                    let wasm_binary = if request_line.contains("/wasm-web/presence_web_bg.wasm") {
                         Some(WASM_WEB_BIN)
                     } else {
                         None
@@ -338,9 +334,7 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(wasm_data).await;
                     } else {
-                        let (content_type, body) = if request_line.contains("/wasm/presence_core.js") {
-                            ("application/javascript", WASM_JS)
-                        } else if request_line.contains("/wasm-web/presence_web.js") {
+                        let (content_type, body) = if request_line.contains("/wasm-web/presence_web.js") {
                             ("application/javascript", WASM_WEB_JS)
                         } else if request_line.contains("/config") {
                             ("application/json", config_json.as_str())
