@@ -208,7 +208,7 @@ impl PresenceWeb {
     pub fn connect_voice(
         &self,
         provider: &str,
-        api_key: &str,
+        token: &str,
         model: Option<String>,
         input_sample_rate: Option<u32>,
     ) {
@@ -223,7 +223,7 @@ impl PresenceWeb {
             "gemini" => {
                 let mut gemini = gemini::GeminiProvider::new(self.callbacks.clone());
                 gemini.connect(
-                    api_key,
+                    token,
                     model.as_deref(),
                     input_sample_rate,
                     prompt,
@@ -233,18 +233,8 @@ impl PresenceWeb {
             }
             "openai" => {
                 let mut openai = openai::OpenAIProvider::new(self.callbacks.clone());
-                // OpenAI connect is async — spawn it
-                let model_clone = model.clone();
-                let prompt = prompt.to_string();
-                let tools_js_clone = tools_js.clone();
-                let api_key = api_key.to_string();
-                let openai_cell = self.openai.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    openai
-                        .connect(&api_key, model_clone.as_deref(), &prompt, &tools_js_clone)
-                        .await;
-                    *openai_cell.borrow_mut() = Some(openai);
-                });
+                openai.connect(token, model.as_deref(), prompt, &tools_js);
+                *self.openai.borrow_mut() = Some(openai);
             }
             _ => {
                 self.callbacks

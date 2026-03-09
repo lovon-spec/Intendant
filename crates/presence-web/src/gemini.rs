@@ -39,7 +39,7 @@ impl GeminiProvider {
 
     pub fn connect(
         &mut self,
-        api_key: &str,
+        token: &str,
         model: Option<&str>,
         input_sample_rate: Option<u32>,
         system_prompt: &str,
@@ -54,7 +54,7 @@ impl GeminiProvider {
 
         self.disconnect();
 
-        let url = format!("{}?key={}", API_BASE, api_key);
+        let url = format!("{}?access_token={}", API_BASE, token);
         let ws = match WebSocket::new(&url) {
             Ok(ws) => ws,
             Err(e) => {

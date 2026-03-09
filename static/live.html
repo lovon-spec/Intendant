@@ -107,55 +107,6 @@ body {
 .conn-dot.err { background: var(--red); }
 .conn-label { color: var(--subtext0); }
 
-/* Settings gear */
-.settings-btn {
-  position: fixed;
-  top: 6px;
-  right: 180px;
-  background: none;
-  border: none;
-  color: var(--overlay0);
-  font-size: 16px;
-  cursor: pointer;
-  padding: 4px;
-  z-index: 50;
-}
-.settings-btn:hover { color: var(--text); }
-
-/* Dialogs */
-.dialog-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-}
-.dialog-overlay.hidden { display: none; }
-.dialog {
-  background: var(--mantle);
-  border: 1px solid var(--surface1);
-  border-radius: 12px;
-  padding: 24px;
-  width: 90%;
-  max-width: 400px;
-}
-.dialog h2 { font-size: 18px; margin-bottom: 16px; color: var(--text); }
-.dialog label { font-size: 13px; color: var(--subtext0); display: block; margin-bottom: 4px; }
-.dialog input {
-  width: 100%; padding: 8px 12px; border-radius: 6px;
-  border: 1px solid var(--surface1); background: var(--surface0);
-  color: var(--text); font-size: 14px; margin-bottom: 12px; outline: none;
-}
-.dialog input:focus { border-color: var(--blue); }
-.dialog .btn-row { display: flex; gap: 8px; justify-content: flex-end; }
-.dialog button {
-  padding: 8px 16px; border-radius: 6px; border: none;
-  cursor: pointer; font-size: 14px;
-}
-.dialog .btn-primary { background: var(--blue); color: var(--crust); font-weight: 600; }
-.dialog .btn-secondary { background: var(--surface1); color: var(--text); }
 </style>
 </head>
 <body>
@@ -170,41 +121,10 @@ body {
   <span class="conn-label" id="voiceLabel">Voice</span>
 </div>
 
-<button class="settings-btn" id="settingsBtn" title="Settings">&#9881;</button>
-
 <!-- Voice overlay -->
 <div class="voice-overlay">
   <div class="voice-status hidden" id="voiceStatus"></div>
   <button class="mic-btn" id="micBtn" title="Toggle voice (push to talk)">&#127908;</button>
-</div>
-
-<!-- Settings dialog -->
-<div class="dialog-overlay hidden" id="settingsDialog">
-  <div class="dialog">
-    <h2>Voice Settings</h2>
-    <label for="apiKeyInput" id="apiKeyLabel">API Key</label>
-    <input type="password" id="apiKeyInput" placeholder="Enter API key for voice...">
-    <div class="btn-row">
-      <button class="btn-secondary" id="settingsCancel">Cancel</button>
-      <button class="btn-primary" id="settingsSave">Save</button>
-    </div>
-  </div>
-</div>
-
-<!-- First-run dialog -->
-<div class="dialog-overlay hidden" id="firstRunDialog">
-  <div class="dialog">
-    <h2>Welcome to Intendant Live</h2>
-    <p style="color:var(--subtext0);font-size:13px;margin-bottom:16px;" id="firstRunDesc">
-      The TUI is ready. Optionally enter an API key to enable voice interaction.
-    </p>
-    <label for="firstRunKeyInput" id="firstRunKeyLabel">API Key (optional)</label>
-    <input type="password" id="firstRunKeyInput" placeholder="Enter API key for voice...">
-    <div class="btn-row">
-      <button class="btn-secondary" id="firstRunSkip">Skip (text only)</button>
-      <button class="btn-primary" id="firstRunSave">Connect Voice</button>
-    </div>
-  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
@@ -267,16 +187,6 @@ function getServerUrl() {
   const saved = localStorage.getItem('intendant_server_url');
   if (saved) return saved;
   return `ws://${location.hostname || 'localhost'}:${location.port || '8765'}`;
-}
-
-function getStorageKey() {
-  return (gatewayConfig && gatewayConfig.provider === 'openai')
-    ? 'intendant_openai_key' : 'intendant_gemini_key';
-}
-
-function getApiKeyName() {
-  return (gatewayConfig && gatewayConfig.provider === 'openai')
-    ? 'OpenAI API Key' : 'Gemini API Key';
 }
 
 function presenceActionToControlMsg(action) {
@@ -418,55 +328,36 @@ function playNext() {
 // Mic Button
 // ============================================================
 micBtn.addEventListener('click', async () => {
+  if (!modelConnected) connectVoice();
   micActive = !micActive;
   micBtn.classList.toggle('active', micActive);
   if (micActive) await startMic(); else stopMic();
 });
 
 // ============================================================
-// Settings
+// Voice connection — fetches ephemeral token from server
 // ============================================================
-const settingsBtn = document.getElementById('settingsBtn');
-const settingsDialog = document.getElementById('settingsDialog');
-const settingsCancel = document.getElementById('settingsCancel');
-const settingsSave = document.getElementById('settingsSave');
-const apiKeyInput = document.getElementById('apiKeyInput');
-const apiKeyLabel = document.getElementById('apiKeyLabel');
-const firstRunDialog = document.getElementById('firstRunDialog');
-const firstRunSave = document.getElementById('firstRunSave');
-const firstRunSkip = document.getElementById('firstRunSkip');
-const firstRunKeyInput = document.getElementById('firstRunKeyInput');
-
-settingsBtn.addEventListener('click', () => {
-  apiKeyInput.value = localStorage.getItem(getStorageKey()) || '';
-  apiKeyLabel.textContent = getApiKeyName();
-  settingsDialog.classList.remove('hidden');
-});
-settingsCancel.addEventListener('click', () => settingsDialog.classList.add('hidden'));
-settingsSave.addEventListener('click', () => {
-  localStorage.setItem(getStorageKey(), apiKeyInput.value.trim());
-  settingsDialog.classList.add('hidden');
-  connectVoice();
-});
-firstRunSave.addEventListener('click', () => {
-  const key = firstRunKeyInput.value.trim();
-  if (key) localStorage.setItem(getStorageKey(), key);
-  firstRunDialog.classList.add('hidden');
-  if (key) connectVoice();
-});
-firstRunSkip.addEventListener('click', () => firstRunDialog.classList.add('hidden'));
-
-// ============================================================
-// Voice connection — delegates to PresenceWeb WASM
-// ============================================================
-function connectVoice() {
-  if (!pw) return;
-  const key = localStorage.getItem(getStorageKey());
-  if (!key) return;
+let voiceConnecting = false;
+async function connectVoice() {
+  if (!pw || voiceConnecting) return;
+  voiceConnecting = true;
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   const model = (gatewayConfig && gatewayConfig.model) || null;
   const inputRate = (gatewayConfig && gatewayConfig.input_sample_rate) || null;
-  pw.connect_voice(provider, key, model, inputRate);
+  try {
+    showVoiceStatus('Connecting...');
+    const resp = await fetch('/session', { method: 'POST' });
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error(err || `HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    pw.connect_voice(provider, data.token, model, inputRate);
+  } catch (e) {
+    showVoiceStatus(`Session failed: ${e.message}`, true);
+  } finally {
+    voiceConnecting = false;
+  }
 }
 
 // ============================================================
@@ -597,9 +488,8 @@ async function init() {
     if (resp.ok) gatewayConfig = await resp.json();
   } catch(_) {}
 
-  // 5. Connect voice if API key exists
-  const existingKey = localStorage.getItem(getStorageKey());
-  if (existingKey) connectVoice();
+  // 5. Auto-connect voice (server handles credentials)
+  connectVoice();
 }
 
 // Clean disconnect on tab close

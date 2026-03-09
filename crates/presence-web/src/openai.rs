@@ -2,13 +2,11 @@
 
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{CloseEvent, MessageEvent, Request, RequestInit, RequestMode, Response, WebSocket};
+use web_sys::{CloseEvent, MessageEvent, WebSocket};
 
 use crate::callbacks::Callbacks;
 
 const DEFAULT_MODEL: &str = "gpt-4o-realtime-preview";
-const SESSION_URL: &str = "https://api.openai.com/v1/realtime/sessions";
 
 pub struct OpenAIProvider {
     ws: Option<WebSocket>,
@@ -35,11 +33,10 @@ impl OpenAIProvider {
         }
     }
 
-    /// Connect to OpenAI Realtime. This is async because it first fetches
-    /// an ephemeral session key via REST, then opens the WebSocket.
-    pub async fn connect(
+    /// Connect to OpenAI Realtime using a server-minted client secret.
+    pub fn connect(
         &mut self,
-        api_key: &str,
+        client_secret: &str,
         model: Option<&str>,
         system_prompt: &str,
         tools: &JsValue,
@@ -50,23 +47,13 @@ impl OpenAIProvider {
 
         self.disconnect();
 
-        // Step 1: Fetch ephemeral session key
-        let ephemeral_key = match self.fetch_session_key(api_key).await {
-            Ok(key) => key,
-            Err(e) => {
-                self.callbacks
-                    .invoke_error(&format!("OpenAI session: {}", e));
-                return;
-            }
-        };
-
-        // Step 2: Open WebSocket with subprotocols
+        // Open WebSocket with server-minted client secret
         let url = format!("wss://api.openai.com/v1/realtime?model={}", self.model);
         let protocols = js_sys::Array::new();
         protocols.push(&JsValue::from_str("realtime"));
         protocols.push(&JsValue::from_str(&format!(
             "openai-insecure-api-key.{}",
-            ephemeral_key
+            client_secret
         )));
         protocols.push(&JsValue::from_str("openai-beta.realtime-v1"));
 
@@ -119,53 +106,6 @@ impl OpenAIProvider {
         self._onmessage = Some(onmessage);
         self._onclose = Some(onclose);
         self._onerror = Some(onerror);
-    }
-
-    async fn fetch_session_key(&self, api_key: &str) -> Result<String, String> {
-        let opts = RequestInit::new();
-        opts.set_method("POST");
-        opts.set_mode(RequestMode::Cors);
-
-        let body = serde_json::json!({
-            "model": self.model,
-            "modalities": ["audio", "text"],
-            "voice": "alloy"
-        });
-        opts.set_body(&JsValue::from_str(&body.to_string()));
-
-        let request =
-            Request::new_with_str_and_init(SESSION_URL, &opts).map_err(|e| format!("{:?}", e))?;
-
-        request
-            .headers()
-            .set("Authorization", &format!("Bearer {}", api_key))
-            .map_err(|e| format!("{:?}", e))?;
-        request
-            .headers()
-            .set("Content-Type", "application/json")
-            .map_err(|e| format!("{:?}", e))?;
-
-        let window = web_sys::window().ok_or("no window")?;
-        let resp_value = JsFuture::from(window.fetch_with_request(&request))
-            .await
-            .map_err(|e| format!("{:?}", e))?;
-
-        let resp: Response = resp_value.dyn_into().map_err(|_| "not a Response")?;
-        if !resp.ok() {
-            return Err(format!("HTTP {}", resp.status()));
-        }
-
-        let json = JsFuture::from(resp.json().map_err(|e| format!("{:?}", e))?)
-            .await
-            .map_err(|e| format!("{:?}", e))?;
-
-        let data: serde_json::Value =
-            serde_wasm_bindgen::from_value(json).map_err(|e| format!("{}", e))?;
-
-        data["client_secret"]["value"]
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| "No client_secret in response".to_string())
     }
 
     fn build_setup_message(system_prompt: &str, tools: &JsValue) -> String {

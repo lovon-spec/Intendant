@@ -12,7 +12,7 @@ export class PresenceWeb {
     free(): void;
     [Symbol.dispose](): void;
     connect_server(url: string): void;
-    connect_voice(provider: string, api_key: string, model?: string | null, input_sample_rate?: number | null): void;
+    connect_voice(provider: string, token: string, model?: string | null, input_sample_rate?: number | null): void;
     disconnect_voice(): void;
     dispatch_tool(tool_name: string, args: any): any;
     /**
@@ -165,9 +165,7 @@ export interface InitOutput {
     readonly wasmpresence_phase: (a: number) => [number, number];
     readonly wasmpresence_set_state: (a: number, b: any) => void;
     readonly wasmpresence_update_from_event: (a: number, b: any) => any;
-    readonly wasm_bindgen__closure__destroy__h596701db06228d63: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__h83c8c2db16b120ac: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h307adac6b5245fc7: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__ha067de4be952b5b6: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;

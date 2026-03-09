@@ -10,6 +10,86 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const DEFAULT_PORT: u16 = 8765;
 
+/// Mint a short-lived vendor session token server-side so the browser
+/// never handles (or stores) a long-lived API key.
+async fn mint_session_token(provider: &str, model: &str) -> Result<String, String> {
+    match provider {
+        "openai" => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .map_err(|_| "OPENAI_API_KEY not set on server".to_string())?;
+            let body = serde_json::json!({
+                "session": {
+                    "type": "realtime",
+                    "model": model,
+                    "modalities": ["audio", "text"],
+                    "voice": "alloy",
+                },
+                "expires_after": {
+                    "anchor": "created_at",
+                    "seconds": 600,
+                }
+            });
+            let resp = reqwest::Client::new()
+                .post("https://api.openai.com/v1/realtime/client_secrets")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("OpenAI request failed: {}", e))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("OpenAI HTTP {}: {}", status, text));
+            }
+            let data: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("OpenAI parse failed: {}", e))?;
+            let token = data["value"]
+                .as_str()
+                .ok_or("No 'value' in OpenAI response")?;
+            let expires_at = data["expires_at"].as_i64().unwrap_or(0);
+            Ok(serde_json::json!({ "token": token, "expires_at": expires_at }).to_string())
+        }
+        "gemini" => {
+            let api_key = std::env::var("GEMINI_API_KEY")
+                .map_err(|_| "GEMINI_API_KEY not set on server".to_string())?;
+            let body = serde_json::json!({
+                "config": {
+                    "uses": 1,
+                    "live_connect_constraints": {
+                        "model": format!("models/{}", model),
+                    }
+                }
+            });
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1alpha/authTokens?key={}",
+                api_key
+            );
+            let resp = reqwest::Client::new()
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Gemini request failed: {}", e))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("Gemini HTTP {}: {}", status, text));
+            }
+            let data: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Gemini parse failed: {}", e))?;
+            let token = data["name"]
+                .as_str()
+                .ok_or("No 'name' in Gemini response")?;
+            Ok(serde_json::json!({ "token": token }).to_string())
+        }
+        _ => Err(format!("Unknown provider: {}", provider)),
+    }
+}
+
 const WEB_HTML: &str = include_str!("../../../static/live.html");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
@@ -59,6 +139,8 @@ pub fn spawn_web_gateway(
     query_ctx: Option<WebQueryCtx>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+    let session_provider = config.provider.clone();
+    let session_model = config.model.clone();
 
     tokio::spawn(async move {
         let addr = format!("0.0.0.0:{}", port);
@@ -80,6 +162,8 @@ pub fn spawn_web_gateway(
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
             let query_ctx = query_ctx.clone();
+            let session_provider = session_provider.clone();
+            let session_model = session_model.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -301,6 +385,23 @@ pub fn spawn_web_gateway(
                         let _ = stream.try_write(header.as_bytes());
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(wasm_data).await;
+                    } else if request_line.starts_with("POST") && request_line.contains("/session") {
+                        let result = mint_session_token(&session_provider, &session_model).await;
+                        let (status, body) = match result {
+                            Ok(json) => ("200 OK", json),
+                            Err(msg) => ("502 Bad Gateway", serde_json::json!({"error": msg}).to_string()),
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            status, body.len(), body
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else {
                         let (content_type, body) = if request_line.contains("/wasm-web/presence_web.js") {
                             ("application/javascript", WASM_WEB_JS)
@@ -967,6 +1068,43 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "expected timeout, got {:?}", result);
+
+        handle.abort();
+    }
+
+    /// POST /session returns 502 when no API key is configured.
+    #[tokio::test]
+    async fn test_post_session_no_api_key() {
+        let (bus, _rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // POST /session without any API key env var set
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+        )
+        .await;
+
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(response_str.contains("502 Bad Gateway"), "response: {}", response_str);
+        assert!(response_str.contains("not set on server"), "response: {}", response_str);
 
         handle.abort();
     }
