@@ -11,12 +11,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 // Re-export types from presence-core so existing callers don't break.
+#[allow(unused_imports)]
 pub use presence_core::{
     AgentStateSnapshot, PresenceConfig, PresenceEvent, PresenceUsage,
     TaskEnvelope, DEFAULT_TEXT_MODEL, NARRATION_DEBOUNCE_MS, PRESENCE_TURN_OFFSET,
     PREFERRED_TEXT_MODEL, DEFAULT_TEXT_PROVIDER,
     format_event, truncate,
     PresenceAction, dispatch_tool_call,
+    PresenceConnect, PresenceWelcome, PresenceCheckpoint, PresenceCheckpointAck,
+    PresenceEventWindow, SequencedPresenceEvent, VoiceLog,
 };
 
 /// Convert a `PresenceAction` to a `(ControlMsg, confirmation_text)` pair.
@@ -642,13 +645,88 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceLog { .. }
         | AppEvent::PresenceReady
-        | AppEvent::LiveConnected
-        | AppEvent::LiveDisconnected
+        | AppEvent::PresenceConnected { .. }
+        | AppEvent::PresenceDisconnected
+        | AppEvent::VoiceLog { .. }
+        | AppEvent::PresenceCheckpointReceived { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
         | AppEvent::Tick
         | AppEvent::Quit => None,
+    }
+}
+
+// ── PresenceSession: server-authoritative presence state ──
+
+/// Checkpoint state recorded from a browser presence model.
+#[derive(Debug, Clone)]
+pub struct CheckpointState {
+    pub summary: String,
+    pub last_event_seq: u64,
+}
+
+/// Server-side presence session state.
+/// Tracks the event replay window and checkpoint state for browser reconnection.
+pub struct PresenceSession {
+    session_id: String,
+    event_window: PresenceEventWindow,
+    last_checkpoint: Option<CheckpointState>,
+    connected: bool,
+}
+
+impl PresenceSession {
+    /// Create a new presence session.
+    pub fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            event_window: PresenceEventWindow::default(),
+            last_checkpoint: None,
+            connected: false,
+        }
+    }
+
+    /// Record a presence event into the replay window. Returns the assigned seq.
+    pub fn record_event(&mut self, event: PresenceEvent) -> u64 {
+        self.event_window.push(event)
+    }
+
+    /// Build a welcome message for a connecting presence client.
+    /// Replays all events since `last_event_seq` from the window.
+    pub fn build_welcome(
+        &self,
+        last_event_seq: u64,
+        state: &AgentStateSnapshot,
+    ) -> PresenceWelcome {
+        PresenceWelcome {
+            session_id: self.session_id.clone(),
+            state: state.clone(),
+            events: self.event_window.since(last_event_seq),
+            last_checkpoint_summary: self.last_checkpoint.as_ref().map(|c| c.summary.clone()),
+            current_seq: self.event_window.current_seq(),
+        }
+    }
+
+    /// Record a checkpoint from the browser presence model.
+    pub fn record_checkpoint(&mut self, checkpoint: PresenceCheckpoint) -> PresenceCheckpointAck {
+        let seq = checkpoint.last_event_seq;
+        self.last_checkpoint = Some(CheckpointState {
+            summary: checkpoint.summary,
+            last_event_seq: checkpoint.last_event_seq,
+        });
+        PresenceCheckpointAck { seq }
+    }
+
+    pub fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }
 
@@ -944,10 +1022,21 @@ mod tests {
     }
 
     #[test]
-    fn filter_event_live_connected_is_pull_only() {
+    fn filter_event_presence_connected_is_pull_only() {
         let mut last_phase = String::new();
-        assert!(filter_event(&AppEvent::LiveConnected, &mut last_phase).is_none());
-        assert!(filter_event(&AppEvent::LiveDisconnected, &mut last_phase).is_none());
+        assert!(filter_event(
+            &AppEvent::PresenceConnected { server_session_id: None, last_event_seq: 0 },
+            &mut last_phase
+        ).is_none());
+        assert!(filter_event(&AppEvent::PresenceDisconnected, &mut last_phase).is_none());
+        assert!(filter_event(
+            &AppEvent::VoiceLog { text: "hi".to_string(), seq: 1, tool_context: None },
+            &mut last_phase
+        ).is_none());
+        assert!(filter_event(
+            &AppEvent::PresenceCheckpointReceived { summary: "test".to_string(), last_event_seq: 1 },
+            &mut last_phase
+        ).is_none());
     }
 
     #[test]
@@ -958,5 +1047,89 @@ mod tests {
     #[test]
     fn truncate_long_string() {
         assert_eq!(truncate("hello world", 5), "hello...");
+    }
+
+    // ── PresenceSession tests ──
+
+    #[test]
+    fn presence_session_new() {
+        let session = PresenceSession::new("sess-1".to_string());
+        assert_eq!(session.session_id(), "sess-1");
+        assert!(!session.is_connected());
+    }
+
+    #[test]
+    fn presence_session_record_event() {
+        let mut session = PresenceSession::new("sess-1".to_string());
+        let seq = session.record_event(PresenceEvent::PhaseChanged {
+            phase: "thinking".to_string(),
+        });
+        assert_eq!(seq, 1);
+        let seq2 = session.record_event(PresenceEvent::TaskComplete {
+            reason: "done".to_string(),
+        });
+        assert_eq!(seq2, 2);
+    }
+
+    #[test]
+    fn presence_session_build_welcome() {
+        let mut session = PresenceSession::new("sess-1".to_string());
+        session.record_event(PresenceEvent::PhaseChanged {
+            phase: "thinking".to_string(),
+        });
+        session.record_event(PresenceEvent::TaskComplete {
+            reason: "done".to_string(),
+        });
+
+        let state = AgentStateSnapshot {
+            phase: "idle".to_string(),
+            turn: 5,
+            ..Default::default()
+        };
+
+        // Replay all events (last_event_seq = 0)
+        let welcome = session.build_welcome(0, &state);
+        assert_eq!(welcome.session_id, "sess-1");
+        assert_eq!(welcome.events.len(), 2);
+        assert_eq!(welcome.current_seq, 2);
+        assert_eq!(welcome.state.phase, "idle");
+        assert!(welcome.last_checkpoint_summary.is_none());
+
+        // Replay since seq 1 (only event 2)
+        let welcome = session.build_welcome(1, &state);
+        assert_eq!(welcome.events.len(), 1);
+        assert_eq!(welcome.events[0].seq, 2);
+    }
+
+    #[test]
+    fn presence_session_checkpoint() {
+        let mut session = PresenceSession::new("sess-1".to_string());
+        session.record_event(PresenceEvent::PhaseChanged {
+            phase: "thinking".to_string(),
+        });
+
+        let checkpoint = PresenceCheckpoint {
+            summary: "Agent is running tests".to_string(),
+            last_event_seq: 1,
+        };
+        let ack = session.record_checkpoint(checkpoint);
+        assert_eq!(ack.seq, 1);
+
+        let state = AgentStateSnapshot::default();
+        let welcome = session.build_welcome(0, &state);
+        assert_eq!(
+            welcome.last_checkpoint_summary.as_deref(),
+            Some("Agent is running tests")
+        );
+    }
+
+    #[test]
+    fn presence_session_connected_state() {
+        let mut session = PresenceSession::new("sess-1".to_string());
+        assert!(!session.is_connected());
+        session.set_connected(true);
+        assert!(session.is_connected());
+        session.set_connected(false);
+        assert!(!session.is_connected());
     }
 }

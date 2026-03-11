@@ -166,6 +166,12 @@ pub struct App {
     // Project paths for query_detail and recall_memory socket commands
     pub project_root: Option<std::path::PathBuf>,
     pub knowledge_path: Option<std::path::PathBuf>,
+
+    // Shared session log for voice log persistence
+    pub session_log: Option<std::sync::Arc<std::sync::Mutex<crate::session_log::SessionLog>>>,
+
+    // Shared presence session for event window population
+    pub presence_session: Option<std::sync::Arc<std::sync::Mutex<crate::presence::PresenceSession>>>,
 }
 
 impl App {
@@ -221,6 +227,8 @@ impl App {
             presence_paused: None,
             project_root: None,
             knowledge_path: None,
+            session_log: None,
+            presence_session: None,
         }
     }
 
@@ -298,6 +306,12 @@ impl App {
         // Filter and forward push-worthy events to presence
         if let Some(ref tx) = self.presence_event_tx {
             if let Some(pe) = crate::presence::filter_event(event, &mut self.last_presence_phase) {
+                // Record into the presence session event window (for browser replay)
+                if let Some(ref ps) = self.presence_session {
+                    if let Ok(mut session) = ps.lock() {
+                        session.record_event(pe.clone());
+                    }
+                }
                 let _ = tx.try_send(pe);
             }
         }
@@ -1481,16 +1495,45 @@ impl App {
                     }
                 }
             }
-            AppEvent::LiveConnected => {
-                self.log(LogLevel::Info, "Browser live model connected — server presence paused".to_string());
+            AppEvent::PresenceConnected { .. } => {
+                self.log(LogLevel::Info, "Browser presence connected — server presence paused".to_string());
                 if let Some(ref flag) = self.presence_paused {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            AppEvent::LiveDisconnected => {
-                self.log(LogLevel::Info, "Browser live model disconnected — server presence resumed".to_string());
+            AppEvent::PresenceDisconnected => {
+                self.log(LogLevel::Info, "Browser presence disconnected — server presence resumed".to_string());
                 if let Some(ref flag) = self.presence_paused {
                     flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            AppEvent::VoiceLog { ref text, seq, ref tool_context } => {
+                let ctx = tool_context.as_deref().unwrap_or("");
+                let msg = if ctx.is_empty() {
+                    format!("[voice #{seq}] {text}")
+                } else {
+                    format!("[voice #{seq} ({})] {text}", ctx)
+                };
+                self.log_sourced(LogLevel::Info, msg, LogSource::Presence, None);
+                // Persist to session log
+                if let Some(ref sl) = self.session_log {
+                    if let Ok(mut log) = sl.lock() {
+                        log.voice_log(text, seq, tool_context.as_deref());
+                    }
+                }
+            }
+            AppEvent::PresenceCheckpointReceived { ref summary, last_event_seq } => {
+                self.log_sourced(
+                    LogLevel::Debug,
+                    format!("Presence checkpoint at seq {}: {}", last_event_seq, summary),
+                    LogSource::Presence,
+                    None,
+                );
+                // Persist to session log
+                if let Some(ref sl) = self.session_log {
+                    if let Ok(mut log) = sl.lock() {
+                        log.presence_checkpoint(summary, last_event_seq);
+                    }
                 }
             }
             AppEvent::Tick => {

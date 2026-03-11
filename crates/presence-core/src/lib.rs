@@ -7,7 +7,7 @@ pub mod prompt;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
-// Re-exports for convenience
+// Re-exports for convenience (includes protocol types: PresenceConnect, PresenceWelcome, etc.)
 pub use types::*;
 pub use dispatch::{PresenceAction, dispatch_tool_call};
 pub use format::{format_event, truncate};

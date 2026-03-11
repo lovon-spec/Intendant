@@ -3880,6 +3880,16 @@ async fn main() -> Result<(), CallerError> {
             (None, None, None)
         };
 
+        // Create the shared PresenceSession for event replay and checkpoints
+        let presence_session = {
+            let sid = session_log.lock()
+                .map(|l| l.session_id().to_string())
+                .unwrap_or_default();
+            Arc::new(Mutex::new(presence::PresenceSession::new(sid)))
+        };
+        app.presence_session = Some(presence_session.clone());
+        app.session_log = Some(session_log.clone());
+
         // Deferred web gateway spawn — now we have the agent state for tool queries
         let _web_handle = if let Some(broadcast_tx) = web_broadcast_tx {
             let query_ctx = presence_agent_state.as_ref().map(|state| {
@@ -3888,6 +3898,7 @@ async fn main() -> Result<(), CallerError> {
                     project_root: project.root.clone(),
                     log_dir: log_dir.clone(),
                     knowledge_path: project.memory_path(),
+                    presence_session: Some(presence_session.clone()),
                 }
             });
             let config = web_gateway::build_config(
@@ -3930,7 +3941,7 @@ async fn main() -> Result<(), CallerError> {
             let (response_tx, mut response_rx) =
                 tokio::sync::mpsc::channel::<String>(8);
 
-            // Shared paused flag: toggled by LiveConnected/LiveDisconnected events
+            // Shared paused flag: toggled by PresenceConnected/PresenceDisconnected events
             let presence_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.set_presence_paused_flag(presence_paused.clone());
 

@@ -155,6 +155,31 @@ impl PresenceWeb {
                             serde_wasm_bindgen::to_value(&msg).unwrap_or(JsValue::NULL);
                         cb.invoke_state_snapshot(&snapshot_js);
                     }
+                    Some("presence_welcome") => {
+                        // Update presence state from welcome
+                        if let Some(state) = msg.get("state") {
+                            let state_js =
+                                serde_wasm_bindgen::to_value(state).unwrap_or(JsValue::NULL);
+                            presence.borrow_mut().set_state(state_js);
+                        }
+                        // Replay events from the window
+                        if let Some(events) = msg.get("events").and_then(|v| v.as_array()) {
+                            for event in events {
+                                if let Some(inner) = event.get("event") {
+                                    let event_js =
+                                        serde_wasm_bindgen::to_value(inner).unwrap_or(JsValue::NULL);
+                                    presence.borrow_mut().update_from_event(event_js);
+                                }
+                            }
+                        }
+                        // Notify JS (same callback as state_snapshot)
+                        let welcome_js =
+                            serde_wasm_bindgen::to_value(&msg).unwrap_or(JsValue::NULL);
+                        cb.invoke_state_snapshot(&welcome_js);
+                    }
+                    Some("presence_checkpoint_ack") => {
+                        // Acknowledged — no action needed on browser side
+                    }
                     Some("tool_response") => {
                         if let Some(id) = msg["id"].as_str() {
                             let resolver = pending.borrow_mut().remove(id);
@@ -380,5 +405,17 @@ impl PresenceWeb {
     #[wasm_bindgen]
     pub fn get_prompt(&self) -> String {
         presence_core::DEFAULT_PRESENCE_PROMPT.to_string()
+    }
+
+    /// Send a voice transcript log entry to the server.
+    #[wasm_bindgen]
+    pub fn send_voice_log(&self, text: &str, tool_context: Option<String>) {
+        self.server.borrow_mut().send_voice_log(text, tool_context.as_deref());
+    }
+
+    /// Send a presence checkpoint to the server.
+    #[wasm_bindgen]
+    pub fn send_presence_checkpoint(&self, summary: &str) {
+        self.server.borrow().send_presence_checkpoint(summary);
     }
 }

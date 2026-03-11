@@ -137,10 +137,24 @@ pub enum AppEvent {
     /// presence narration so the user can type a follow-up.
     PresenceReady,
 
-    /// Browser-side live model connected — server-side presence should pause.
-    LiveConnected,
-    /// Browser-side live model disconnected — server-side presence should resume.
-    LiveDisconnected,
+    /// Browser-side presence connected — server-side presence should pause.
+    PresenceConnected {
+        server_session_id: Option<String>,
+        last_event_seq: u64,
+    },
+    /// Browser-side presence disconnected — server-side presence should resume.
+    PresenceDisconnected,
+    /// Voice transcript log from browser presence model.
+    VoiceLog {
+        text: String,
+        seq: u64,
+        tool_context: Option<String>,
+    },
+    /// Context checkpoint received from browser presence model.
+    PresenceCheckpointReceived {
+        summary: String,
+        last_event_seq: u64,
+    },
 
     // TUI internal
     Tick,

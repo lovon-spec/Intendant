@@ -213,6 +213,117 @@ pub const NARRATION_DEBOUNCE_MS: u64 = 500;
 /// Presence turn offset to avoid collisions with agent turns in TUI collapse logic.
 pub const PRESENCE_TURN_OFFSET: usize = 100_000;
 
+// ── Presence session protocol types ──
+
+/// Browser → server: initiate presence handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresenceConnect {
+    /// If reconnecting, the session ID from a previous `PresenceWelcome`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_session_id: Option<String>,
+    /// Last event sequence number the client has seen (for replay).
+    #[serde(default)]
+    pub last_event_seq: u64,
+}
+
+/// Server → browser: welcome response with state + replay window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresenceWelcome {
+    pub session_id: String,
+    pub state: AgentStateSnapshot,
+    pub events: Vec<SequencedPresenceEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_summary: Option<String>,
+    pub current_seq: u64,
+}
+
+/// A `PresenceEvent` with a monotonic sequence number.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequencedPresenceEvent {
+    pub seq: u64,
+    pub event: PresenceEvent,
+}
+
+/// Browser → server: voice transcript log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceLog {
+    pub text: String,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_context: Option<String>,
+}
+
+/// Browser → server: context checkpoint from presence model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresenceCheckpoint {
+    pub summary: String,
+    pub last_event_seq: u64,
+}
+
+/// Server → browser: acknowledgement of a checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresenceCheckpointAck {
+    pub seq: u64,
+}
+
+/// Bounded ring buffer of sequenced presence events for replay on reconnect.
+#[derive(Debug, Clone)]
+pub struct PresenceEventWindow {
+    events: Vec<SequencedPresenceEvent>,
+    capacity: usize,
+    next_seq: u64,
+}
+
+impl PresenceEventWindow {
+    /// Create a new event window with the given capacity (default 200).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            events: Vec::with_capacity(capacity),
+            capacity,
+            next_seq: 1,
+        }
+    }
+
+    /// Push a new event, assigning the next sequence number. Returns the assigned seq.
+    pub fn push(&mut self, event: PresenceEvent) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.events.push(SequencedPresenceEvent { seq, event });
+        // Trim from the front if over capacity
+        if self.events.len() > self.capacity {
+            let excess = self.events.len() - self.capacity;
+            self.events.drain(..excess);
+        }
+        seq
+    }
+
+    /// Return all events with seq > `since_seq`.
+    pub fn since(&self, since_seq: u64) -> Vec<SequencedPresenceEvent> {
+        self.events
+            .iter()
+            .filter(|e| e.seq > since_seq)
+            .cloned()
+            .collect()
+    }
+
+    /// The current (latest assigned) sequence number, or 0 if no events pushed.
+    pub fn current_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
+    /// Clear all events and reset the sequence counter.
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.next_seq = 1;
+    }
+}
+
+impl Default for PresenceEventWindow {
+    fn default() -> Self {
+        Self::new(200)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +507,189 @@ mod tests {
         assert_eq!(s.phase, "running_agent");
         assert_eq!(s.last_command_preview, "cargo test");
         assert!(s.pending_approval.is_none());
+    }
+
+    // ── Presence protocol type tests ──
+
+    #[test]
+    fn presence_connect_roundtrip() {
+        let msg = PresenceConnect {
+            server_session_id: Some("sess-123".to_string()),
+            last_event_seq: 42,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: PresenceConnect = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.server_session_id.as_deref(), Some("sess-123"));
+        assert_eq!(back.last_event_seq, 42);
+    }
+
+    #[test]
+    fn presence_connect_minimal() {
+        let json = r#"{"last_event_seq":0}"#;
+        let msg: PresenceConnect = serde_json::from_str(json).unwrap();
+        assert!(msg.server_session_id.is_none());
+        assert_eq!(msg.last_event_seq, 0);
+    }
+
+    #[test]
+    fn presence_welcome_roundtrip() {
+        let welcome = PresenceWelcome {
+            session_id: "sess-abc".to_string(),
+            state: AgentStateSnapshot::default(),
+            events: vec![SequencedPresenceEvent {
+                seq: 1,
+                event: PresenceEvent::PhaseChanged {
+                    phase: "thinking".to_string(),
+                },
+            }],
+            last_checkpoint_summary: Some("All good".to_string()),
+            current_seq: 1,
+        };
+        let json = serde_json::to_string(&welcome).unwrap();
+        let back: PresenceWelcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_id, "sess-abc");
+        assert_eq!(back.events.len(), 1);
+        assert_eq!(back.events[0].seq, 1);
+        assert_eq!(back.current_seq, 1);
+        assert_eq!(back.last_checkpoint_summary.as_deref(), Some("All good"));
+    }
+
+    #[test]
+    fn sequenced_presence_event_roundtrip() {
+        let se = SequencedPresenceEvent {
+            seq: 5,
+            event: PresenceEvent::TaskComplete {
+                reason: "done".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&se).unwrap();
+        let back: SequencedPresenceEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.seq, 5);
+        match back.event {
+            PresenceEvent::TaskComplete { reason } => assert_eq!(reason, "done"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn voice_log_roundtrip() {
+        let vl = VoiceLog {
+            text: "hello world".to_string(),
+            seq: 3,
+            tool_context: Some("check_status".to_string()),
+        };
+        let json = serde_json::to_string(&vl).unwrap();
+        let back: VoiceLog = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.text, "hello world");
+        assert_eq!(back.seq, 3);
+        assert_eq!(back.tool_context.as_deref(), Some("check_status"));
+    }
+
+    #[test]
+    fn voice_log_minimal() {
+        let json = r#"{"text":"hi","seq":1}"#;
+        let vl: VoiceLog = serde_json::from_str(json).unwrap();
+        assert_eq!(vl.text, "hi");
+        assert!(vl.tool_context.is_none());
+    }
+
+    #[test]
+    fn presence_checkpoint_roundtrip() {
+        let cp = PresenceCheckpoint {
+            summary: "Agent completed 3 tasks".to_string(),
+            last_event_seq: 15,
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        let back: PresenceCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.summary, "Agent completed 3 tasks");
+        assert_eq!(back.last_event_seq, 15);
+    }
+
+    #[test]
+    fn presence_checkpoint_ack_roundtrip() {
+        let ack = PresenceCheckpointAck { seq: 15 };
+        let json = serde_json::to_string(&ack).unwrap();
+        let back: PresenceCheckpointAck = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.seq, 15);
+    }
+
+    // ── PresenceEventWindow tests ──
+
+    #[test]
+    fn event_window_push_and_since() {
+        let mut w = PresenceEventWindow::new(10);
+        assert_eq!(w.current_seq(), 0);
+
+        let s1 = w.push(PresenceEvent::PhaseChanged {
+            phase: "thinking".to_string(),
+        });
+        assert_eq!(s1, 1);
+        assert_eq!(w.current_seq(), 1);
+
+        let s2 = w.push(PresenceEvent::TaskComplete {
+            reason: "done".to_string(),
+        });
+        assert_eq!(s2, 2);
+        assert_eq!(w.current_seq(), 2);
+
+        // since(0) → all events
+        let all = w.since(0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].seq, 1);
+        assert_eq!(all[1].seq, 2);
+
+        // since(1) → only event 2
+        let after1 = w.since(1);
+        assert_eq!(after1.len(), 1);
+        assert_eq!(after1[0].seq, 2);
+
+        // since(2) → empty
+        assert!(w.since(2).is_empty());
+    }
+
+    #[test]
+    fn event_window_capacity_trimming() {
+        let mut w = PresenceEventWindow::new(3);
+        for i in 0..5 {
+            w.push(PresenceEvent::PhaseChanged {
+                phase: format!("phase_{}", i),
+            });
+        }
+        assert_eq!(w.current_seq(), 5);
+        // Only last 3 events should remain
+        let all = w.since(0);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].seq, 3);
+        assert_eq!(all[1].seq, 4);
+        assert_eq!(all[2].seq, 5);
+    }
+
+    #[test]
+    fn event_window_clear() {
+        let mut w = PresenceEventWindow::new(10);
+        w.push(PresenceEvent::PhaseChanged {
+            phase: "thinking".to_string(),
+        });
+        w.push(PresenceEvent::TaskComplete {
+            reason: "done".to_string(),
+        });
+        assert_eq!(w.current_seq(), 2);
+
+        w.clear();
+        assert_eq!(w.current_seq(), 0);
+        assert!(w.since(0).is_empty());
+
+        // New events start from seq 1 again
+        let s = w.push(PresenceEvent::PhaseChanged {
+            phase: "idle".to_string(),
+        });
+        assert_eq!(s, 1);
+    }
+
+    #[test]
+    fn event_window_default_capacity() {
+        let w = PresenceEventWindow::default();
+        assert_eq!(w.capacity, 200);
+        assert_eq!(w.current_seq(), 0);
     }
 }

@@ -1,7 +1,7 @@
 //! Server WebSocket connection to the intendant web gateway.
 //!
-//! Handles: TUI ANSI frames, state snapshots, tool requests/responses,
-//! outbound events, keyboard/resize input, live_connected/disconnected.
+//! Handles: TUI ANSI frames, state snapshots, presence_welcome, tool requests/responses,
+//! outbound events, keyboard/resize input, presence_connect/disconnect, voice_log.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -18,7 +18,7 @@ pub struct ServerConnection {
     ws: Option<WebSocket>,
     url: String,
     connected: bool,
-    /// Whether the voice model is live (for re-sending live_connected on reconnect).
+    /// Whether the voice model is live (for re-sending presence_connect on reconnect).
     voice_live: bool,
     callbacks: Rc<Callbacks>,
     /// Closures must be stored to prevent drop while WebSocket holds references.
@@ -26,9 +26,15 @@ pub struct ServerConnection {
     _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
     _onclose: Option<Closure<dyn FnMut(CloseEvent)>>,
     _onerror: Option<Closure<dyn FnMut()>>,
-    /// Handles server messages (term, state_snapshot, tool_response, events).
+    /// Handles server messages (term, state_snapshot, presence_welcome, tool_response, events).
     /// Stored as a shared handler so the main module can process messages.
     on_message_handler: Option<Rc<RefCell<Box<dyn FnMut(serde_json::Value)>>>>,
+    /// Voice log sequence counter (monotonic).
+    voice_log_seq: u64,
+    /// Last event sequence number from the server.
+    last_event_seq: u64,
+    /// Server session ID (from presence_welcome, sent on reconnect).
+    server_session_id: Option<String>,
 }
 
 impl ServerConnection {
@@ -44,6 +50,9 @@ impl ServerConnection {
             _onclose: None,
             _onerror: None,
             on_message_handler: None,
+            voice_log_seq: 0,
+            last_event_seq: 0,
+            server_session_id: None,
         }
     }
 
@@ -92,12 +101,20 @@ impl ServerConnection {
 
         let connected_open = connected_flag.clone();
         let voice_open = voice_live_flag.clone();
+        let session_id_ref = Rc::new(RefCell::new(self.server_session_id.clone()));
+        let last_seq_ref = Rc::new(RefCell::new(self.last_event_seq));
+        let session_id_open = session_id_ref.clone();
+        let last_seq_open = last_seq_ref.clone();
         let onopen = Closure::wrap(Box::new(move || {
             *connected_open.borrow_mut() = true;
             callbacks_open.invoke_server_state(true);
-            // Re-send live_connected if voice model was active before reconnect
+            // Re-send presence_connect if voice model was active before reconnect
             if *voice_open.borrow() {
-                let msg = serde_json::json!({"t": "live_connected"});
+                let msg = serde_json::json!({
+                    "t": "presence_connect",
+                    "server_session_id": *session_id_open.borrow(),
+                    "last_event_seq": *last_seq_open.borrow(),
+                });
                 let _ = ws_clone.send_with_str(&msg.to_string());
             }
         }) as Box<dyn FnMut()>);
@@ -195,14 +212,61 @@ impl ServerConnection {
         self.send_json(&msg);
     }
 
-    /// Send live_connected notification.
-    pub fn send_live_connected(&self) {
-        self.send_json(&serde_json::json!({"t": "live_connected"}));
+    /// Send presence_connect notification (replaces live_connected).
+    pub fn send_presence_connect(&self) {
+        let msg = serde_json::json!({
+            "t": "presence_connect",
+            "server_session_id": self.server_session_id,
+            "last_event_seq": self.last_event_seq,
+        });
+        self.send_json(&msg);
     }
 
-    /// Send live_disconnected notification.
+    /// Send presence_disconnect notification (replaces live_disconnected).
+    pub fn send_presence_disconnect(&self) {
+        self.send_json(&serde_json::json!({"t": "presence_disconnect"}));
+    }
+
+    /// Send live_connected notification (legacy, kept for backward compatibility).
+    pub fn send_live_connected(&self) {
+        self.send_presence_connect();
+    }
+
+    /// Send live_disconnected notification (legacy, kept for backward compatibility).
     pub fn send_live_disconnected(&self) {
-        self.send_json(&serde_json::json!({"t": "live_disconnected"}));
+        self.send_presence_disconnect();
+    }
+
+    /// Send a voice transcript log entry.
+    pub fn send_voice_log(&mut self, text: &str, tool_context: Option<&str>) {
+        self.voice_log_seq += 1;
+        let msg = serde_json::json!({
+            "t": "voice_log",
+            "text": text,
+            "seq": self.voice_log_seq,
+            "tool_context": tool_context,
+        });
+        self.send_json(&msg);
+    }
+
+    /// Send a presence checkpoint.
+    pub fn send_presence_checkpoint(&self, summary: &str) {
+        let msg = serde_json::json!({
+            "t": "presence_checkpoint",
+            "summary": summary,
+            "last_event_seq": self.last_event_seq,
+        });
+        self.send_json(&msg);
+    }
+
+    /// Update the last event sequence number (call when receiving server events).
+    pub fn set_last_event_seq(&mut self, seq: u64) {
+        self.last_event_seq = seq;
+    }
+
+    /// Set the server session ID (from presence_welcome).
+    pub fn set_server_session_id(&mut self, id: Option<String>) {
+        self.server_session_id = id;
     }
 
     /// Send a tool_request to the server.

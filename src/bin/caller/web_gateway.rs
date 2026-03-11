@@ -102,6 +102,8 @@ pub struct WebQueryCtx {
     pub project_root: PathBuf,
     pub log_dir: PathBuf,
     pub knowledge_path: PathBuf,
+    /// Server-authoritative presence session (event window + checkpoint state).
+    pub presence_session: Option<Arc<Mutex<crate::presence::PresenceSession>>>,
 }
 
 /// Configuration sent to the web frontend via `/config`.
@@ -210,19 +212,21 @@ pub fn spawn_web_gateway(
                     // Handles message types:
                     //   {"t":"key", "key":"Enter", ...}  → AppEvent::Key
                     //   {"t":"resize", "cols":N, "rows":N} → AppEvent::Resize
-                    //   {"t":"live_connected"}           → AppEvent::LiveConnected
-                    //   {"t":"live_disconnected"}        → AppEvent::LiveDisconnected
+                    //   {"t":"presence_connect",...}     → AppEvent::PresenceConnected
+                    //   {"t":"presence_disconnect"}      → AppEvent::PresenceDisconnected
+                    //   {"t":"voice_log",...}             → AppEvent::VoiceLog
+                    //   {"t":"presence_checkpoint",...}   → AppEvent::PresenceCheckpointReceived
                     //   {"t":"tool_request", "id":"...", "tool":"...", "args":{}} → tool_response
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
                     let bus_inbound = bus.clone();
                     let query_ctx_inbound = query_ctx.clone();
                     let direct_tx_inbound = direct_tx.clone();
                     let inbound = tokio::spawn(async move {
-                        // Track whether this connection has an active live model,
-                        // so we can auto-send LiveDisconnected if the WebSocket drops
-                        // without a clean live_disconnected message (e.g. tab close
+                        // Track whether this connection has an active presence model,
+                        // so we can auto-send PresenceDisconnected if the WebSocket drops
+                        // without a clean presence_disconnect message (e.g. tab close
                         // before beforeunload fires, network failure).
-                        let mut is_live_connected = false;
+                        let mut is_presence_connected = false;
 
                         while let Some(Ok(msg)) = ws_rx.next().await {
                             if let Message::Text(text) = msg {
@@ -243,13 +247,104 @@ pub fn spawn_web_gateway(
                                             let rows = json["rows"].as_u64().unwrap_or(24) as u16;
                                             bus_inbound.send(AppEvent::Resize(cols, rows));
                                         }
+                                        // Legacy: keep accepting live_connected/live_disconnected
+                                        // for older clients, mapping to the new protocol
                                         Some("live_connected") => {
-                                            is_live_connected = true;
-                                            bus_inbound.send(AppEvent::LiveConnected);
+                                            is_presence_connected = true;
+                                            bus_inbound.send(AppEvent::PresenceConnected {
+                                                server_session_id: None,
+                                                last_event_seq: 0,
+                                            });
                                         }
                                         Some("live_disconnected") => {
-                                            is_live_connected = false;
-                                            bus_inbound.send(AppEvent::LiveDisconnected);
+                                            is_presence_connected = false;
+                                            bus_inbound.send(AppEvent::PresenceDisconnected);
+                                        }
+                                        Some("presence_connect") => {
+                                            is_presence_connected = true;
+                                            let server_session_id = json.get("server_session_id")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
+                                            let last_event_seq = json.get("last_event_seq")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0);
+
+                                            // Send welcome with replay window if presence session is available
+                                            if let Some(ref ctx) = query_ctx_inbound {
+                                                if let Some(ref ps) = ctx.presence_session {
+                                                    let mut session = ps.lock().unwrap_or_else(|e| e.into_inner());
+                                                    session.set_connected(true);
+                                                    let state = ctx.agent_state.lock()
+                                                        .unwrap_or_else(|e| e.into_inner())
+                                                        .clone();
+                                                    let welcome = session.build_welcome(last_event_seq, &state);
+                                                    let welcome_msg = serde_json::json!({
+                                                        "t": "presence_welcome",
+                                                        "session_id": welcome.session_id,
+                                                        "state": welcome.state,
+                                                        "events": welcome.events,
+                                                        "last_checkpoint_summary": welcome.last_checkpoint_summary,
+                                                        "current_seq": welcome.current_seq,
+                                                    });
+                                                    let _ = direct_tx_inbound.send(welcome_msg.to_string());
+                                                }
+                                            }
+
+                                            bus_inbound.send(AppEvent::PresenceConnected {
+                                                server_session_id,
+                                                last_event_seq,
+                                            });
+                                        }
+                                        Some("presence_disconnect") => {
+                                            is_presence_connected = false;
+                                            if let Some(ref ctx) = query_ctx_inbound {
+                                                if let Some(ref ps) = ctx.presence_session {
+                                                    ps.lock().unwrap_or_else(|e| e.into_inner())
+                                                        .set_connected(false);
+                                                }
+                                            }
+                                            bus_inbound.send(AppEvent::PresenceDisconnected);
+                                        }
+                                        Some("voice_log") => {
+                                            let text = json["text"].as_str().unwrap_or("").to_string();
+                                            let seq = json["seq"].as_u64().unwrap_or(0);
+                                            let tool_context = json.get("tool_context")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
+                                            bus_inbound.send(AppEvent::VoiceLog {
+                                                text,
+                                                seq,
+                                                tool_context,
+                                            });
+                                        }
+                                        Some("presence_checkpoint") => {
+                                            let summary = json["summary"].as_str().unwrap_or("").to_string();
+                                            let last_event_seq = json.get("last_event_seq")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0);
+
+                                            // Record checkpoint and send ack
+                                            if let Some(ref ctx) = query_ctx_inbound {
+                                                if let Some(ref ps) = ctx.presence_session {
+                                                    let checkpoint = presence_core::PresenceCheckpoint {
+                                                        summary: summary.clone(),
+                                                        last_event_seq,
+                                                    };
+                                                    let ack = ps.lock()
+                                                        .unwrap_or_else(|e| e.into_inner())
+                                                        .record_checkpoint(checkpoint);
+                                                    let ack_msg = serde_json::json!({
+                                                        "t": "presence_checkpoint_ack",
+                                                        "seq": ack.seq,
+                                                    });
+                                                    let _ = direct_tx_inbound.send(ack_msg.to_string());
+                                                }
+                                            }
+
+                                            bus_inbound.send(AppEvent::PresenceCheckpointReceived {
+                                                summary,
+                                                last_event_seq,
+                                            });
                                         }
                                         Some("tool_request") => {
                                             let req_id = json["id"].as_str().unwrap_or("").to_string();
@@ -311,10 +406,10 @@ pub fn spawn_web_gateway(
                         }
 
                         // WebSocket closed — auto-resume server presence if this
-                        // client had an active live model (covers tab close without
+                        // client had an active presence model (covers tab close without
                         // beforeunload, network drops, etc.)
-                        if is_live_connected {
-                            bus_inbound.send(AppEvent::LiveDisconnected);
+                        if is_presence_connected {
+                            bus_inbound.send(AppEvent::PresenceDisconnected);
                         }
                     });
 
@@ -732,7 +827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_live_connected_disconnected() {
+    async fn test_presence_connect_disconnect() {
         let (bus, mut rx) = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
@@ -747,7 +842,62 @@ mod tests {
         let url = format!("ws://127.0.0.1:{}", port);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
-        // Send live_connected
+        // Send presence_connect (new protocol)
+        ws.send(Message::Text(r#"{"t":"presence_connect","server_session_id":"sess-1","last_event_seq":5}"#.into()))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+        match event {
+            AppEvent::PresenceConnected { server_session_id, last_event_seq } => {
+                assert_eq!(server_session_id.as_deref(), Some("sess-1"));
+                assert_eq!(last_event_seq, 5);
+            }
+            _ => panic!("expected PresenceConnected, got {:?}", event),
+        }
+
+        // Send presence_disconnect
+        ws.send(Message::Text(r#"{"t":"presence_disconnect"}"#.into()))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+        assert!(matches!(event, AppEvent::PresenceDisconnected));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_legacy_live_connected_maps_to_presence() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Legacy live_connected should map to PresenceConnected
         ws.send(Message::Text(r#"{"t":"live_connected"}"#.into()))
             .await
             .unwrap();
@@ -760,9 +910,15 @@ mod tests {
         .expect("timeout")
         .expect("channel closed");
 
-        assert!(matches!(event, AppEvent::LiveConnected));
+        match event {
+            AppEvent::PresenceConnected { server_session_id, last_event_seq } => {
+                assert!(server_session_id.is_none());
+                assert_eq!(last_event_seq, 0);
+            }
+            _ => panic!("expected PresenceConnected"),
+        }
 
-        // Send live_disconnected
+        // Legacy live_disconnected
         ws.send(Message::Text(r#"{"t":"live_disconnected"}"#.into()))
             .await
             .unwrap();
@@ -775,7 +931,47 @@ mod tests {
         .expect("timeout")
         .expect("channel closed");
 
-        assert!(matches!(event, AppEvent::LiveDisconnected));
+        assert!(matches!(event, AppEvent::PresenceDisconnected));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_voice_log_forwarding() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        ws.send(Message::Text(r#"{"t":"voice_log","text":"hello","seq":3,"tool_context":"check_status"}"#.into()))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+        match event {
+            AppEvent::VoiceLog { text, seq, tool_context } => {
+                assert_eq!(text, "hello");
+                assert_eq!(seq, 3);
+                assert_eq!(tool_context.as_deref(), Some("check_status"));
+            }
+            _ => panic!("expected VoiceLog"),
+        }
 
         handle.abort();
     }
@@ -801,6 +997,7 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             log_dir: PathBuf::from("/tmp"),
             knowledge_path: PathBuf::from("/tmp/knowledge.json"),
+            presence_session: None,
         });
 
         let config = WebGatewayConfig::default();
@@ -854,6 +1051,7 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             log_dir: PathBuf::from("/tmp"),
             knowledge_path: PathBuf::from("/tmp/knowledge.json"),
+            presence_session: None,
         });
 
         let config = WebGatewayConfig::default();
@@ -916,6 +1114,7 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             log_dir: PathBuf::from("/tmp"),
             knowledge_path: PathBuf::from("/tmp/knowledge.json"),
+            presence_session: None,
         });
 
         let config = WebGatewayConfig::default();
@@ -975,11 +1174,11 @@ mod tests {
         handle.abort();
     }
 
-    /// When a WebSocket client that sent `live_connected` drops without
-    /// sending `live_disconnected`, the server should auto-emit
-    /// `LiveDisconnected` to resume server-side presence.
+    /// When a WebSocket client that sent `presence_connect` drops without
+    /// sending `presence_disconnect`, the server should auto-emit
+    /// `PresenceDisconnected` to resume server-side presence.
     #[tokio::test]
-    async fn test_ws_drop_auto_sends_live_disconnected() {
+    async fn test_ws_drop_auto_sends_presence_disconnected() {
         let (bus, mut rx) = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
@@ -994,8 +1193,8 @@ mod tests {
         let url = format!("ws://127.0.0.1:{}", port);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
-        // Send live_connected
-        ws.send(Message::Text(r#"{"t":"live_connected"}"#.into()))
+        // Send presence_connect
+        ws.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
             .await
             .unwrap();
 
@@ -1006,29 +1205,29 @@ mod tests {
         .await
         .expect("timeout")
         .expect("channel closed");
-        assert!(matches!(event, AppEvent::LiveConnected));
+        assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
-        // Drop the WebSocket WITHOUT sending live_disconnected
+        // Drop the WebSocket WITHOUT sending presence_disconnect
         ws.close(None).await.unwrap();
 
-        // Server should auto-send LiveDisconnected
+        // Server should auto-send PresenceDisconnected
         let event = tokio::time::timeout(
             tokio::time::Duration::from_secs(2),
             rx.recv(),
         )
         .await
-        .expect("timeout waiting for auto LiveDisconnected")
+        .expect("timeout waiting for auto PresenceDisconnected")
         .expect("channel closed");
 
-        assert!(matches!(event, AppEvent::LiveDisconnected));
+        assert!(matches!(event, AppEvent::PresenceDisconnected));
 
         handle.abort();
     }
 
-    /// When a client that never sent `live_connected` drops, no
-    /// `LiveDisconnected` should be emitted.
+    /// When a client that never sent `presence_connect` drops, no
+    /// `PresenceDisconnected` should be emitted.
     #[tokio::test]
-    async fn test_ws_drop_no_auto_disconnect_without_live() {
+    async fn test_ws_drop_no_auto_disconnect_without_presence() {
         let (bus, mut rx) = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
@@ -1061,7 +1260,7 @@ mod tests {
         // Drop the WebSocket
         ws.close(None).await.unwrap();
 
-        // Should NOT receive LiveDisconnected — only a timeout
+        // Should NOT receive PresenceDisconnected — only a timeout
         let result = tokio::time::timeout(
             tokio::time::Duration::from_millis(500),
             rx.recv(),

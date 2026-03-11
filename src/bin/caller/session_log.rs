@@ -324,6 +324,39 @@ impl SessionLog {
         });
     }
 
+    /// Log a voice transcript from the browser presence model.
+    pub fn voice_log(&mut self, text: &str, seq: u64, tool_context: Option<&str>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "voice_log".to_string(),
+            level: Some("info".to_string()),
+            message: Some(text.to_string()),
+            data: Some(serde_json::json!({
+                "seq": seq,
+                "tool_context": tool_context,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a presence checkpoint (context summary from browser model).
+    pub fn presence_checkpoint(&mut self, summary: &str, last_event_seq: u64) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "presence_checkpoint".to_string(),
+            level: Some("info".to_string()),
+            message: Some(summary.to_string()),
+            data: Some(serde_json::json!({
+                "last_event_seq": last_event_seq,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     pub fn error(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
@@ -1190,5 +1223,51 @@ mod tests {
 
         let entries = recent_entries(&log_dir, 100);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn voice_log_writes_jsonl_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.voice_log("hello world", 5, Some("check_status"));
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["event"], "voice_log");
+        assert_eq!(last["message"], "hello world");
+        assert_eq!(last["data"]["seq"], 5);
+        assert_eq!(last["data"]["tool_context"], "check_status");
+    }
+
+    #[test]
+    fn voice_log_without_tool_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.voice_log("hi", 1, None);
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["event"], "voice_log");
+        assert_eq!(last["message"], "hi");
+        assert!(last["data"]["tool_context"].is_null());
+    }
+
+    #[test]
+    fn presence_checkpoint_writes_jsonl_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.presence_checkpoint("Agent completed 3 tasks", 15);
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["event"], "presence_checkpoint");
+        assert_eq!(last["message"], "Agent completed 3 tasks");
+        assert_eq!(last["data"]["last_event_seq"], 15);
     }
 }
