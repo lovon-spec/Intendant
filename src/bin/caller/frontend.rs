@@ -405,6 +405,7 @@ mod tests {
             (LogLevel::Error, "error"),
             (LogLevel::Warn, "warn"),
             (LogLevel::SubAgent, "subagent"),
+            (LogLevel::Detail, "detail"),
             (LogLevel::Debug, "debug"),
         ];
         for (level, expected) in levels {
@@ -422,6 +423,7 @@ pub fn log_level_to_str(level: &LogLevel) -> &'static str {
         LogLevel::Error => "error",
         LogLevel::Warn => "warn",
         LogLevel::SubAgent => "subagent",
+        LogLevel::Detail => "detail",
         LogLevel::Debug => "debug",
     }
 }
@@ -436,6 +438,7 @@ pub fn parse_log_level(s: &str) -> Option<LogLevel> {
         "error" => Some(LogLevel::Error),
         "warn" => Some(LogLevel::Warn),
         "subagent" => Some(LogLevel::SubAgent),
+        "detail" => Some(LogLevel::Detail),
         "debug" => Some(LogLevel::Debug),
         _ => None,
     }

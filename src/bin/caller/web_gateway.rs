@@ -235,12 +235,15 @@ pub fn spawn_web_gateway(
                     //   {"t":"presence_disconnect"}      → AppEvent::PresenceDisconnected
                     //   {"t":"voice_log",...}             → AppEvent::VoiceLog
                     //   {"t":"presence_checkpoint",...}   → AppEvent::PresenceCheckpointReceived
+                    //   {"t":"voice_diagnostic",...}      → AppEvent::VoiceDiagnostic
                     //   {"t":"tool_request", "id":"...", "tool":"...", "args":{}} → tool_response
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
                     let bus_inbound = bus.clone();
                     let query_ctx_inbound = query_ctx.clone();
                     let direct_tx_inbound = direct_tx.clone();
                     let voice_debug_inbound = voice_debug.clone();
+                    let live_provider = session_provider.clone();
+                    let live_model = session_model.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -275,6 +278,8 @@ pub fn spawn_web_gateway(
                                             bus_inbound.send(AppEvent::PresenceConnected {
                                                 server_session_id: None,
                                                 last_event_seq: 0,
+                                                live_provider: Some(live_provider.clone()),
+                                                live_model: Some(live_model.clone()),
                                             });
                                         }
                                         Some("live_disconnected") => {
@@ -316,6 +321,8 @@ pub fn spawn_web_gateway(
                                             bus_inbound.send(AppEvent::PresenceConnected {
                                                 server_session_id,
                                                 last_event_seq,
+                                                live_provider: Some(live_provider.clone()),
+                                                live_model: Some(live_model.clone()),
                                             });
                                         }
                                         Some("presence_disconnect") => {
@@ -373,6 +380,14 @@ pub fn spawn_web_gateway(
                                             bus_inbound.send(AppEvent::PresenceCheckpointReceived {
                                                 summary,
                                                 last_event_seq,
+                                            });
+                                        }
+                                        Some("voice_diagnostic") => {
+                                            let kind = json["kind"].as_str().unwrap_or("unknown").to_string();
+                                            let detail = json["detail"].as_str().unwrap_or("").to_string();
+                                            bus_inbound.send(AppEvent::VoiceDiagnostic {
+                                                kind,
+                                                detail,
                                             });
                                         }
                                         Some("tool_request") => {
@@ -908,7 +923,7 @@ mod tests {
         .expect("channel closed");
 
         match event {
-            AppEvent::PresenceConnected { server_session_id, last_event_seq } => {
+            AppEvent::PresenceConnected { server_session_id, last_event_seq, .. } => {
                 assert_eq!(server_session_id.as_deref(), Some("sess-1"));
                 assert_eq!(last_event_seq, 5);
             }
@@ -963,7 +978,7 @@ mod tests {
         .expect("channel closed");
 
         match event {
-            AppEvent::PresenceConnected { server_session_id, last_event_seq } => {
+            AppEvent::PresenceConnected { server_session_id, last_event_seq, .. } => {
                 assert!(server_session_id.is_none());
                 assert_eq!(last_event_seq, 0);
             }

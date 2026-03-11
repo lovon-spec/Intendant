@@ -645,6 +645,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::PresenceDisconnected
         | AppEvent::VoiceLog { .. }
         | AppEvent::PresenceCheckpointReceived { .. }
+        | AppEvent::VoiceDiagnostic { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -1021,7 +1022,7 @@ mod tests {
     fn filter_event_presence_connected_is_pull_only() {
         let mut last_phase = String::new();
         assert!(filter_event(
-            &AppEvent::PresenceConnected { server_session_id: None, last_event_seq: 0 },
+            &AppEvent::PresenceConnected { server_session_id: None, last_event_seq: 0, live_provider: None, live_model: None },
             &mut last_phase
         ).is_none());
         assert!(filter_event(&AppEvent::PresenceDisconnected, &mut last_phase).is_none());

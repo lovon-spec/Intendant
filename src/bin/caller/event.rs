@@ -141,6 +141,10 @@ pub enum AppEvent {
     PresenceConnected {
         server_session_id: Option<String>,
         last_event_seq: u64,
+        /// Live model provider name (e.g. "gemini", "openai").
+        live_provider: Option<String>,
+        /// Live model name (e.g. "gemini-2.5-flash-native-audio-preview-12-2025").
+        live_model: Option<String>,
     },
     /// Browser-side presence disconnected — server-side presence should resume.
     PresenceDisconnected,
@@ -154,6 +158,11 @@ pub enum AppEvent {
     PresenceCheckpointReceived {
         summary: String,
         last_event_seq: u64,
+    },
+    /// Diagnostic from browser voice/presence layer (errors, silence, disconnects).
+    VoiceDiagnostic {
+        kind: String,
+        detail: String,
     },
 
     // TUI internal

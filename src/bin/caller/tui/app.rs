@@ -1178,7 +1178,7 @@ impl App {
                 self.current_phase = Phase::Thinking;
                 self.broadcast_control(OutboundEvent::TurnStarted { turn, budget_pct });
                 self.log_sourced(
-                    LogLevel::Debug,
+                    LogLevel::Detail,
                     format!("Turn {} started ({:.0}% budget)", turn, budget_pct),
                     LogSource::Agent,
                     Some(turn),
@@ -1211,7 +1211,7 @@ impl App {
                     );
                 }
                 self.log_sourced(
-                    LogLevel::Info,
+                    LogLevel::Detail,
                     format!(
                         "tokens: prompt={} completion={} total={}",
                         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
@@ -1257,7 +1257,7 @@ impl App {
             } => {
                 self.current_phase = Phase::RunningAgent;
                 self.log_sourced(
-                    LogLevel::Debug,
+                    LogLevel::Detail,
                     format!("Agent running (turn {}): {}", turn, commands_preview),
                     LogSource::Agent,
                     Some(turn),
@@ -1310,7 +1310,7 @@ impl App {
             }
             AppEvent::ContextManagement { turn } => {
                 self.log_sourced(
-                    LogLevel::Debug,
+                    LogLevel::Detail,
                     format!("Context management (turn {})", turn),
                     LogSource::Agent,
                     Some(turn),
@@ -1376,7 +1376,7 @@ impl App {
                 self.log(LogLevel::Info, format!("Human question: {}", question));
             }
             AppEvent::HumanResponseSent => {
-                self.log(LogLevel::Info, "Human prompt closed by runtime".to_string());
+                self.log(LogLevel::Detail, "Human prompt closed by runtime".to_string());
             }
             AppEvent::ApprovalRequired {
                 id,
@@ -1414,7 +1414,7 @@ impl App {
             AppEvent::AutoApproved { preview } => {
                 let t = self.turn;
                 self.log_sourced(
-                    LogLevel::Info,
+                    LogLevel::Detail,
                     format!("auto-approved: {}", preview),
                     LogSource::Agent,
                     if t > 0 { Some(t) } else { None },
@@ -1457,7 +1457,7 @@ impl App {
                 } else {
                     format!("Display :{} ready", display_id)
                 };
-                self.log(LogLevel::Info, log_msg);
+                self.log(LogLevel::Detail, log_msg);
                 self.broadcast_control(OutboundEvent::DisplayReady {
                     display_id,
                     vnc_port,
@@ -1495,14 +1495,21 @@ impl App {
                     }
                 }
             }
-            AppEvent::PresenceConnected { .. } => {
-                self.log(LogLevel::Info, "Browser presence connected — server presence paused".to_string());
+            AppEvent::PresenceConnected { live_provider, live_model, .. } => {
+                self.log(LogLevel::Detail, "Browser presence connected — server presence paused".to_string());
                 if let Some(ref flag) = self.presence_paused {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Update displayed model/provider to the live model
+                if let Some(provider) = live_provider {
+                    self.presence_provider_name = Some(provider);
+                }
+                if let Some(model) = live_model {
+                    self.presence_model_name = Some(model);
+                }
             }
             AppEvent::PresenceDisconnected => {
-                self.log(LogLevel::Info, "Browser presence disconnected — server presence resumed".to_string());
+                self.log(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string());
                 if let Some(ref flag) = self.presence_paused {
                     flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1514,7 +1521,7 @@ impl App {
                 } else {
                     format!("[voice #{seq} ({})] {text}", ctx)
                 };
-                self.log_sourced(LogLevel::Info, msg, LogSource::Presence, None);
+                self.log_sourced(LogLevel::Detail, msg, LogSource::Presence, None);
                 // Persist to session log
                 if let Some(ref sl) = self.session_log {
                     if let Ok(mut log) = sl.lock() {
@@ -1524,7 +1531,7 @@ impl App {
             }
             AppEvent::PresenceCheckpointReceived { ref summary, last_event_seq } => {
                 self.log_sourced(
-                    LogLevel::Debug,
+                    LogLevel::Detail,
                     format!("Presence checkpoint at seq {}: {}", last_event_seq, summary),
                     LogSource::Presence,
                     None,
@@ -1535,6 +1542,10 @@ impl App {
                         log.presence_checkpoint(summary, last_event_seq);
                     }
                 }
+            }
+            AppEvent::VoiceDiagnostic { kind, detail } => {
+                let msg = format!("[voice:{}] {}", kind, detail);
+                self.log_sourced(LogLevel::Warn, msg, LogSource::Presence, None);
             }
             AppEvent::Tick => {
                 self.tick_count += 1;

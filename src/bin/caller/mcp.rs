@@ -1704,7 +1704,7 @@ pub fn spawn_event_listener(
                         s.budget_pct = budget_pct;
                         s.set_phase(Phase::Thinking);
                         s.push_log(
-                            LogLevel::Info,
+                            LogLevel::Detail,
                             format!("Turn {} started (budget: {:.1}%)", turn, budget_pct),
                         );
                         resource_changed = Some("intendant://status");
@@ -1791,7 +1791,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ContextManagement { turn } => {
-                        s.push_log(LogLevel::Debug, format!("[T{}] Context management", turn));
+                        s.push_log(LogLevel::Detail, format!("[T{}] Context management", turn));
                     }
 
                     AppEvent::TaskComplete { reason } => {
@@ -1846,7 +1846,7 @@ pub fn spawn_event_listener(
                     AppEvent::HumanResponseSent => {
                         s.human_question = None;
                         s.set_phase(Phase::RunningAgent);
-                        s.push_log(LogLevel::Info, "Human response sent".to_string());
+                        s.push_log(LogLevel::Detail, "Human response sent".to_string());
                         resource_changed = Some("intendant://pending-input");
                     }
 
@@ -1879,7 +1879,7 @@ pub fn spawn_event_listener(
                         } else {
                             format!("Display :{}", display_id)
                         };
-                        s.push_log(LogLevel::Info, info);
+                        s.push_log(LogLevel::Detail, info);
                         resource_changed = Some("intendant://logs");
                     }
 
@@ -1896,7 +1896,7 @@ pub fn spawn_event_listener(
 
                     AppEvent::AutoApproved { ref preview } => {
                         s.push_log(
-                            LogLevel::Info,
+                            LogLevel::Detail,
                             format!("auto-approved: {}", preview),
                         );
                         resource_changed = Some("intendant://logs");
@@ -1943,16 +1943,19 @@ pub fn spawn_event_listener(
                         }
                     }
                     AppEvent::PresenceConnected { .. } => {
-                        s.push_log(LogLevel::Info, "Browser presence connected — server presence paused".to_string());
+                        s.push_log(LogLevel::Detail, "Browser presence connected — server presence paused".to_string());
                     }
                     AppEvent::PresenceDisconnected => {
-                        s.push_log(LogLevel::Info, "Browser presence disconnected — server presence resumed".to_string());
+                        s.push_log(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string());
                     }
                     AppEvent::VoiceLog { ref text, seq, .. } => {
-                        s.push_log(LogLevel::Info, format!("[presence voice #{}] {}", seq, text));
+                        s.push_log(LogLevel::Detail, format!("[presence voice #{}] {}", seq, text));
                     }
                     AppEvent::PresenceCheckpointReceived { .. } => {
-                        // Debug-level, no user-visible log
+                        // Detail-level, no user-visible log
+                    }
+                    AppEvent::VoiceDiagnostic { kind, detail } => {
+                        s.push_log(LogLevel::Warn, format!("[voice:{}] {}", kind, detail));
                     }
                 }
             }

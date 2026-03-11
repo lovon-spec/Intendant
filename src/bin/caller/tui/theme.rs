@@ -29,6 +29,7 @@ pub const LOG_AGENT_FG: Color = Color::Rgb(148, 226, 213);
 pub const LOG_ERROR_FG: Color = Color::Rgb(243, 139, 168);
 pub const LOG_WARN_FG: Color = Color::Rgb(249, 226, 175);
 pub const LOG_SUBAGENT_FG: Color = Color::Rgb(203, 166, 247);
+pub const LOG_DETAIL_FG: Color = Color::Rgb(162, 168, 190);
 
 // Approval panel
 pub const APPROVAL_BG: Color = Color::Rgb(49, 50, 68);

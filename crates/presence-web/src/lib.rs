@@ -427,6 +427,12 @@ impl PresenceWeb {
         self.server.borrow().send_presence_checkpoint(summary);
     }
 
+    /// Send a voice diagnostic to the server (errors, silence, disconnects).
+    #[wasm_bindgen]
+    pub fn send_voice_diagnostic(&self, kind: &str, detail: &str) {
+        self.server.borrow().send_voice_diagnostic(kind, detail);
+    }
+
     // --- High-level handlers (consolidate JS logic into WASM) ---
 
     /// Handle a voice model tool call end-to-end.

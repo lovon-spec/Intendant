@@ -107,6 +107,72 @@ body {
 .conn-dot.err { background: var(--red); }
 .conn-label { color: var(--subtext0); }
 
+/* Settings button */
+.settings-btn {
+  position: fixed;
+  top: 6px;
+  right: 180px;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid var(--surface1);
+  background: transparent;
+  color: var(--subtext0);
+  font-size: 16px;
+  cursor: pointer;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.settings-btn:hover { color: var(--text); border-color: var(--blue); }
+
+/* Dialog overlay + modal */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.dialog-overlay.hidden { display: none; }
+.dialog {
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 12px;
+  padding: 24px;
+  width: 90%;
+  max-width: 400px;
+}
+.dialog h2 { font-size: 18px; margin-bottom: 16px; }
+.dialog p { color: var(--subtext0); font-size: 13px; margin-bottom: 16px; }
+.dialog label { display: block; font-size: 13px; color: var(--subtext0); margin-bottom: 6px; }
+.dialog input {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+.dialog input:focus { outline: none; border-color: var(--blue); }
+.dialog .btn-row { display: flex; gap: 8px; justify-content: flex-end; }
+.dialog button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+}
+.dialog .btn-primary { background: var(--blue); color: var(--crust); font-weight: 600; }
+.dialog .btn-primary:hover { opacity: 0.9; }
+.dialog .btn-secondary { background: var(--surface1); color: var(--text); }
+.dialog .btn-secondary:hover { opacity: 0.9; }
+
 </style>
 </head>
 <body>
@@ -121,10 +187,40 @@ body {
   <span class="conn-label" id="voiceLabel">Voice</span>
 </div>
 
+<!-- Settings button -->
+<button class="settings-btn" id="settingsBtn" title="Settings">&#9881;</button>
+
 <!-- Voice overlay -->
 <div class="voice-overlay">
   <div class="voice-status hidden" id="voiceStatus"></div>
   <button class="mic-btn" id="micBtn" title="Toggle voice (push to talk)">&#127908;</button>
+</div>
+
+<!-- API key dialog (settings) -->
+<div class="dialog-overlay hidden" id="settingsDialog">
+  <div class="dialog">
+    <h2>Voice Settings</h2>
+    <label for="apiKeyInput" id="apiKeyLabel">API Key</label>
+    <input type="password" id="apiKeyInput" placeholder="Enter API key for voice...">
+    <div class="btn-row">
+      <button class="btn-secondary" id="settingsCancel">Cancel</button>
+      <button class="btn-primary" id="settingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- First-run dialog -->
+<div class="dialog-overlay hidden" id="firstRunDialog">
+  <div class="dialog">
+    <h2>Voice Setup</h2>
+    <p id="firstRunDesc">Enter an API key to enable voice interaction with tool support.</p>
+    <label for="firstRunKeyInput" id="firstRunKeyLabel">API Key</label>
+    <input type="password" id="firstRunKeyInput" placeholder="Enter API key for voice...">
+    <div class="btn-row">
+      <button class="btn-secondary" id="firstRunSkip">Skip</button>
+      <button class="btn-primary" id="firstRunSave">Connect Voice</button>
+    </div>
+  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
@@ -180,6 +276,17 @@ const voiceDot = document.getElementById('voiceDot');
 const voiceLabel = document.getElementById('voiceLabel');
 const voiceStatus = document.getElementById('voiceStatus');
 const micBtn = document.getElementById('micBtn');
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsDialog = document.getElementById('settingsDialog');
+const settingsCancel = document.getElementById('settingsCancel');
+const settingsSave = document.getElementById('settingsSave');
+const apiKeyInput = document.getElementById('apiKeyInput');
+const apiKeyLabel = document.getElementById('apiKeyLabel');
+const firstRunDialog = document.getElementById('firstRunDialog');
+const firstRunSave = document.getElementById('firstRunSave');
+const firstRunSkip = document.getElementById('firstRunSkip');
+const firstRunKeyInput = document.getElementById('firstRunKeyInput');
+const firstRunKeyLabel = document.getElementById('firstRunKeyLabel');
 
 // ============================================================
 // Helpers
@@ -188,6 +295,15 @@ function getServerUrl() {
   const saved = localStorage.getItem('intendant_server_url');
   if (saved) return saved;
   return `ws://${location.hostname || 'localhost'}:${location.port || '8765'}`;
+}
+
+function getStorageKey() {
+  const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+  return provider === 'openai' ? 'openai_api_key' : 'gemini_api_key';
+}
+function getApiKeyName() {
+  const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+  return provider === 'openai' ? 'OpenAI API Key' : 'Gemini API Key';
 }
 
 function showVoiceStatus(text, isError) {
@@ -321,44 +437,76 @@ function playNext() {
 // Mic Button
 // ============================================================
 micBtn.addEventListener('click', async () => {
-  if (!modelConnected) connectVoice();
+  if (!modelConnected) {
+    const apiKey = localStorage.getItem(getStorageKey());
+    if (!apiKey) {
+      // No key — show first-run dialog instead of connecting
+      showFirstRunDialog();
+      return;
+    }
+    connectVoice();
+  }
   micActive = !micActive;
   micBtn.classList.toggle('active', micActive);
   if (micActive) await startMic(); else stopMic();
 });
 
 // ============================================================
-// Voice connection — API key (localStorage) or ephemeral token
+// Voice connection — requires API key in localStorage
 // ============================================================
 let voiceConnecting = false;
-async function connectVoice() {
+function connectVoice() {
   if (!pw || voiceConnecting) return;
+  const apiKey = localStorage.getItem(getStorageKey());
+  if (!apiKey) {
+    showFirstRunDialog();
+    return;
+  }
   voiceConnecting = true;
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   const model = (gatewayConfig && gatewayConfig.model) || null;
   const inputRate = (gatewayConfig && gatewayConfig.input_sample_rate) || null;
-  try {
-    showVoiceStatus('Connecting...');
-    const lsKey = provider === 'gemini' ? 'gemini_api_key'
-                : provider === 'openai' ? 'openai_api_key' : null;
-    const apiKey = lsKey && localStorage.getItem(lsKey);
-    if (apiKey) {
-      pw.connect_voice(provider, apiKey, model, inputRate);
-    } else {
-      const resp = await fetch('/session', { method: 'POST' });
-      if (!resp.ok) {
-        const err = await resp.text();
-        throw new Error(err || `HTTP ${resp.status}`);
-      }
-      const data = await resp.json();
-      pw.connect_voice(provider, data.token, model, inputRate);
-    }
-  } catch (e) {
-    showVoiceStatus(`Session failed: ${e.message}`, true);
-  } finally {
-    voiceConnecting = false;
-  }
+  showVoiceStatus('Connecting...');
+  pw.connect_voice(provider, apiKey, model, inputRate);
+  voiceConnecting = false;
 }
+
+// ============================================================
+// Settings & First-Run Dialogs
+// ============================================================
+function showFirstRunDialog() {
+  firstRunKeyLabel.textContent = getApiKeyName();
+  firstRunKeyInput.value = '';
+  firstRunDialog.classList.remove('hidden');
+  firstRunKeyInput.focus();
+}
+
+settingsBtn.addEventListener('click', () => {
+  apiKeyInput.value = localStorage.getItem(getStorageKey()) || '';
+  apiKeyLabel.textContent = getApiKeyName();
+  settingsDialog.classList.remove('hidden');
+  apiKeyInput.focus();
+});
+
+settingsCancel.addEventListener('click', () => settingsDialog.classList.add('hidden'));
+
+settingsSave.addEventListener('click', () => {
+  const key = apiKeyInput.value.trim();
+  if (key) localStorage.setItem(getStorageKey(), key);
+  settingsDialog.classList.add('hidden');
+  if (key && !modelConnected) connectVoice();
+});
+
+firstRunSave.addEventListener('click', () => {
+  const key = firstRunKeyInput.value.trim();
+  if (key) {
+    localStorage.setItem(getStorageKey(), key);
+    firstRunDialog.classList.add('hidden');
+    connectVoice();
+  }
+});
+
+firstRunSkip.addEventListener('click', () => firstRunDialog.classList.add('hidden'));
 
 // ============================================================
 // Init — loads presence-web WASM and wires everything up
@@ -408,6 +556,7 @@ async function init() {
     showVoiceStatus('Voice ready');
     setTimeout(hideVoiceStatus, 3000);
     pw.inject_pending_approval_if_any();
+    try { pw.send_voice_diagnostic('connected', provider + ' voice model ready'); } catch(_) {}
   });
 
   pw.set_on_voice_audio((b64) => playAudioChunk(b64));
@@ -427,11 +576,15 @@ async function init() {
     }
   });
 
-  pw.set_on_voice_interrupted(() => {});
+  pw.set_on_voice_interrupted(() => {
+    try { pw.send_voice_diagnostic('interrupted', 'voice model interrupted by user'); } catch(_) {}
+  });
   pw.set_on_error((msg) => {
     modelConnected = false;
     voiceDot.className = 'conn-dot err';
     showVoiceStatus(msg, true);
+    // Send diagnostic to server for TUI logging
+    try { pw.send_voice_diagnostic('error', msg); } catch(_) {}
   });
 
   term.onKey(({ domEvent }) => {
@@ -447,8 +600,13 @@ async function init() {
     if (resp.ok) gatewayConfig = await resp.json();
   } catch(_) {}
 
-  // 5. Auto-connect voice
-  connectVoice();
+  // 5. Connect voice if key exists, otherwise show first-run dialog
+  const storedKey = localStorage.getItem(getStorageKey());
+  if (storedKey) {
+    connectVoice();
+  } else {
+    showFirstRunDialog();
+  }
 }
 
 window.addEventListener('beforeunload', () => {

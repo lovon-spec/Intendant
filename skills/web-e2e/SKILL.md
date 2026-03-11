@@ -190,6 +190,9 @@ DISPLAY=:50 import -window root /tmp/web-e2e-screenshot.png
   Use `Serializer::new().serialize_maps_as_objects(true)` for any value passed to JS callbacks.
 - **`response_modalities` must be `["AUDIO"]` only**: Adding `"TEXT"` causes
   WebSocket close code 1007 ("Invalid argument") on the constrained endpoint.
+  Note: `["AUDIO"]` mode still sends BOTH audio AND text parts — the model
+  outputs text alongside audio. The restriction is about what you request, not
+  what the model produces.
 - **Firefox WASM cache**: After rebuilding WASM, you MUST clear the cache manually:
   `rm -rf ~/.mozilla/firefox/*/cache2/ ~/.cache/mozilla/firefox/*/cache2/`
   then relaunch Firefox. Ctrl+Shift+R is NOT sufficient.

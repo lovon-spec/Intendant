@@ -259,6 +259,16 @@ impl ServerConnection {
         self.send_json(&msg);
     }
 
+    /// Send a voice diagnostic to the server (errors, silence, disconnects).
+    pub fn send_voice_diagnostic(&self, kind: &str, detail: &str) {
+        let msg = serde_json::json!({
+            "t": "voice_diagnostic",
+            "kind": kind,
+            "detail": detail,
+        });
+        self.send_json(&msg);
+    }
+
     /// Update the last event sequence number (call when receiving server events).
     pub fn set_last_event_seq(&mut self, seq: u64) {
         self.last_event_seq = seq;

@@ -35,6 +35,9 @@ pub enum LogLevel {
     Error,
     Warn,
     SubAgent,
+    /// Operational detail — visible at Verbose and Debug, hidden at Normal.
+    /// Use for token counts, auto-approved commands, presence lifecycle, etc.
+    Detail,
     Debug,
 }
 
@@ -79,6 +82,16 @@ impl Verbosity {
             ),
             Self::Verbose => !matches!(level, LogLevel::Debug),
             Self::Debug => true,
+        }
+    }
+
+    /// Short indicator shown in log panel for each verbosity level.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Quiet => "Warn+Error only",
+            Self::Normal => "Key events",
+            Self::Verbose => "+detail, agent output",
+            Self::Debug => "+raw model/JSON",
         }
     }
 }

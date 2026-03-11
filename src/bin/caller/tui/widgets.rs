@@ -322,6 +322,7 @@ fn format_log_entry_with_turn(
         LogLevel::Error => Span::styled("E ", Style::default().fg(theme::LOG_ERROR_FG)),
         LogLevel::Warn => Span::styled("W ", Style::default().fg(theme::LOG_WARN_FG)),
         LogLevel::SubAgent => Span::styled("S ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
+        LogLevel::Detail => Span::styled("· ", Style::default().fg(theme::LOG_DETAIL_FG)),
         LogLevel::Debug => Span::styled("D ", Style::default().fg(theme::LOG_DIM_FG)),
     };
     spans.push(level_span);
@@ -334,6 +335,7 @@ fn format_log_entry_with_turn(
         LogLevel::Error => theme::LOG_ERROR_FG,
         LogLevel::Warn => theme::LOG_WARN_FG,
         LogLevel::SubAgent => theme::LOG_SUBAGENT_FG,
+        LogLevel::Detail => theme::LOG_DETAIL_FG,
         LogLevel::Debug => theme::LOG_DIM_FG,
     };
     spans.push(Span::styled(
@@ -373,6 +375,7 @@ pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
         LogLevel::Error => "ERROR",
         LogLevel::Warn => "WARN",
         LogLevel::SubAgent => "SUB",
+        LogLevel::Detail => "DETAIL",
         LogLevel::Debug => "DEBUG",
     };
 
@@ -765,6 +768,7 @@ mod tests {
             LogLevel::Error,
             LogLevel::Warn,
             LogLevel::SubAgent,
+            LogLevel::Detail,
             LogLevel::Debug,
         ];
         for level in levels {
