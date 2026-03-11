@@ -143,6 +143,10 @@ pub struct App {
     pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// When presence layer is active, follow-up input goes here instead.
     pub presence_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Direct task dispatch channel — bypasses server-side presence entirely.
+    /// Used by StartTask (from browser live model, control socket, MCP) so
+    /// tasks don't get re-processed by the server-side presence model.
+    pub task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
 
     // Vision display info (shown in status bar when active)
     pub display_info: Option<String>,
@@ -215,6 +219,7 @@ impl App {
             follow_up_textarea: None,
             follow_up_tx: None,
             presence_tx: None,
+            task_tx: None,
             display_info: None,
             presence_provider_name: None,
             presence_model_name: None,
@@ -238,6 +243,10 @@ impl App {
 
     pub fn set_presence_sender(&mut self, tx: tokio::sync::mpsc::Sender<String>) {
         self.presence_tx = Some(tx);
+    }
+
+    pub fn set_task_sender(&mut self, tx: tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>) {
+        self.task_tx = Some(tx);
     }
 
     pub fn set_presence_event_sender(
@@ -1000,21 +1009,33 @@ impl App {
                     format!("Verbosity set to {} via control socket", new_verbosity.label()),
                 );
             }
-            ControlMsg::StartTask { task, .. } => {
-                // In TUI mode, treat start_task as a follow-up when possible.
+            ControlMsg::StartTask { task, orchestrate } => {
+                // StartTask is an explicit command — bypass server-side presence
+                // and dispatch directly to the worker task channel. This avoids
+                // the server-side presence re-processing decisions the browser
+                // live model (or control socket / MCP) already made.
                 if self.current_phase == Phase::WaitingFollowUp
                     || self.current_phase == Phase::Done
                 {
-                    if let Some(ref tx) = self.presence_tx {
-                        let _ = tx.try_send(task.clone());
+                    let dispatched = if let Some(ref tx) = self.task_tx {
+                        let envelope = presence_core::TaskEnvelope {
+                            task: task.clone(),
+                            force_direct: orchestrate == Some(false),
+                            context_hints: vec![],
+                        };
+                        tx.try_send(envelope).is_ok()
                     } else if let Some(ref tx) = self.follow_up_tx {
-                        let _ = tx.try_send(task.clone());
+                        tx.try_send(task.clone()).is_ok()
+                    } else {
+                        false
+                    };
+                    if dispatched {
+                        self.follow_up_textarea = None;
+                        self.mode = AppMode::Normal;
+                        self.current_phase = Phase::Thinking;
+                        self.round += 1;
+                        self.log(LogLevel::Info, format!("Task dispatched: {}", truncate_str(&task, 80)));
                     }
-                    self.follow_up_textarea = None;
-                    self.mode = AppMode::Normal;
-                    self.current_phase = Phase::Thinking;
-                    self.round += 1;
-                    self.log(LogLevel::Info, format!("Task started via control socket: {}", truncate_str(&task, 80)));
                 } else if self.current_phase == Phase::Idle {
                     self.log(
                         LogLevel::Warn,

@@ -2790,6 +2790,8 @@ async fn run_with_presence(
     agent_state: Arc<Mutex<presence::AgentStateSnapshot>>,
     force_direct: bool,
     presence_paused: Arc<std::sync::atomic::AtomicBool>,
+    task_tx: tokio::sync::mpsc::Sender<presence::TaskEnvelope>,
+    mut task_rx: tokio::sync::mpsc::Receiver<presence::TaskEnvelope>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
     let presence_provider = provider::select_presence_provider(
@@ -2807,8 +2809,7 @@ async fn run_with_presence(
     // 2. Resolve presence system prompt (independent of sub-agent role system)
     let presence_prompt = prompts::resolve_presence_prompt(Some(&project.root));
 
-    // 3. Create channels
-    let (task_tx, mut task_rx) = tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
+    // 3. task_tx/task_rx are now created by the caller and passed in.
     let fallback_task_tx = task_tx.clone();
 
     // 4. Create presence layer
@@ -3945,6 +3946,12 @@ async fn main() -> Result<(), CallerError> {
             let presence_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.set_presence_paused_flag(presence_paused.clone());
 
+            // Task dispatch channel: StartTask from browser/control/MCP goes
+            // directly here, bypassing server-side presence.
+            let (task_tx, task_rx) =
+                tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
+            app.set_task_sender(task_tx.clone());
+
             // Forward presence responses to TUI as log entries + reset phase
             let bus_for_responses = bus_clone.clone();
             let _response_forwarder = tokio::spawn(async move {
@@ -3980,6 +3987,8 @@ async fn main() -> Result<(), CallerError> {
                     agent_state,
                     force_direct,
                     presence_paused,
+                    task_tx,
+                    task_rx,
                 )
                 .await;
 

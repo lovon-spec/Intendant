@@ -94,7 +94,8 @@ pub struct PresenceLayer {
     /// Timestamp of the last phase-change narration (for debounce).
     last_narration_at: std::time::Instant,
     /// When true, the presence layer is paused (browser live model is active).
-    /// Events are silently dropped; user input is still forwarded as tasks.
+    /// All events and user input are silently dropped — the browser live model
+    /// IS the presence and dispatches tasks directly via task_tx.
     paused: Arc<AtomicBool>,
 }
 
@@ -141,7 +142,12 @@ impl PresenceLayer {
     }
 
     /// Process text input from the user, returning the model's response.
+    /// When paused (browser live model active), input is dropped — the browser
+    /// live model dispatches tasks directly via task_tx.
     pub async fn process_user_input(&mut self, input: &str) -> Result<String, CallerError> {
+        if self.is_paused() {
+            return Ok(String::new());
+        }
         self.turn += 1;
         self.conversation.add_user(input.to_string());
         let result = self.run_model_loop().await;
