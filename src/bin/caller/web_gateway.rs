@@ -99,6 +99,7 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
 }
 
 const WEB_HTML: &str = include_str!("../../../static/live.html");
+const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 
@@ -549,6 +550,8 @@ pub fn spawn_web_gateway(
                     } else {
                         let (content_type, body) = if request_line.contains("/wasm-web/presence_web.js") {
                             ("application/javascript", WASM_WEB_JS)
+                        } else if request_line.contains("/audio-processor.js") {
+                            ("application/javascript", AUDIO_PROCESSOR_JS)
                         } else if request_line.contains("/config") {
                             ("application/json", config_json.as_str())
                         } else {
@@ -1353,6 +1356,42 @@ mod tests {
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("502 Bad Gateway"), "response: {}", response_str);
         assert!(response_str.contains("not set on server"), "response: {}", response_str);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_serves_audio_processor_js() {
+        let (bus, _rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+        )
+        .await;
+
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(response_str.contains("200 OK"), "response: {}", response_str);
+        assert!(response_str.contains("application/javascript"), "response: {}", response_str);
+        assert!(response_str.contains("AudioCaptureProcessor"), "response: {}", response_str);
 
         handle.abort();
     }

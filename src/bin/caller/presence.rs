@@ -25,6 +25,7 @@ pub use presence_core::{
 /// Convert a `PresenceAction` to a `(ControlMsg, confirmation_text)` pair.
 /// Returns `None` for `TextResult` and `NeedsIO` which need separate handling.
 pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, String)> {
+    let confirmation = presence_core::action_confirmation(action);
     match action {
         PresenceAction::SubmitTask(envelope) => {
             let orchestrate = if envelope.force_direct { Some(false) } else { None };
@@ -33,29 +34,24 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                     task: envelope.task.clone(),
                     orchestrate,
                 },
-                format!("Task submitted: {}", envelope.task),
+                confirmation,
             ))
         }
-        PresenceAction::Approve { id } => Some((
-            ControlMsg::Approve { id: *id },
-            format!("Approved action {}", id),
-        )),
-        PresenceAction::Deny { id } => Some((
-            ControlMsg::Deny { id: *id },
-            format!("Denied action {}", id),
-        )),
-        PresenceAction::Skip { id } => Some((
-            ControlMsg::Skip { id: *id },
-            format!("Skipped action {}", id),
-        )),
-        PresenceAction::Respond { text } => Some((
-            ControlMsg::Input { text: text.clone() },
-            format!("Sent response: {}", text),
-        )),
-        PresenceAction::SetAutonomy { level } => Some((
-            ControlMsg::SetAutonomy { level: level.clone() },
-            format!("Autonomy set to {}", level),
-        )),
+        PresenceAction::Approve { id } => {
+            Some((ControlMsg::Approve { id: *id }, confirmation))
+        }
+        PresenceAction::Deny { id } => {
+            Some((ControlMsg::Deny { id: *id }, confirmation))
+        }
+        PresenceAction::Skip { id } => {
+            Some((ControlMsg::Skip { id: *id }, confirmation))
+        }
+        PresenceAction::Respond { text } => {
+            Some((ControlMsg::Input { text: text.clone() }, confirmation))
+        }
+        PresenceAction::SetAutonomy { level } => {
+            Some((ControlMsg::SetAutonomy { level: level.clone() }, confirmation))
+        }
         PresenceAction::TextResult(_) | PresenceAction::NeedsIO { .. } => None,
     }
 }

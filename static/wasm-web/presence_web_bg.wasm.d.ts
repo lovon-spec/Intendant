@@ -9,7 +9,10 @@ export const presenceweb_dispatch_tool: (a: number, b: number, c: number, d: any
 export const presenceweb_get_prompt: (a: number) => [number, number];
 export const presenceweb_get_state: (a: number) => any;
 export const presenceweb_get_tools: (a: number) => any;
+export const presenceweb_handle_server_event: (a: number, b: any) => number;
+export const presenceweb_handle_voice_tool_call: (a: number, b: any) => any;
 export const presenceweb_has_pending_approval: (a: number) => number;
+export const presenceweb_inject_pending_approval_if_any: (a: number) => number;
 export const presenceweb_new: () => number;
 export const presenceweb_phase: (a: number) => [number, number];
 export const presenceweb_reconnect_server: (a: number, b: number, c: number) => void;

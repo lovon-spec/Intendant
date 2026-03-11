@@ -3,7 +3,7 @@ use serde_json::Value;
 
 /// Actions produced by tool call dispatch.
 /// The platform layer (native or WASM) interprets and executes these.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum PresenceAction {
     /// Tool produced a text result directly (no I/O needed).
@@ -25,6 +25,21 @@ pub enum PresenceAction {
         tool_name: String,
         args: Value,
     },
+}
+
+/// Human-readable confirmation text for an action that was dispatched.
+pub fn action_confirmation(action: &PresenceAction) -> String {
+    match action {
+        PresenceAction::SubmitTask(envelope) => format!("Task submitted: {}", envelope.task),
+        PresenceAction::Approve { id } => format!("Approved action {}", id),
+        PresenceAction::Deny { id } => format!("Denied action {}", id),
+        PresenceAction::Skip { id } => format!("Skipped action {}", id),
+        PresenceAction::Respond { text } => format!("Sent response: {}", text),
+        PresenceAction::SetAutonomy { level } => format!("Autonomy set to {}", level),
+        PresenceAction::TextResult(_) | PresenceAction::NeedsIO { .. } => {
+            "Action dispatched".to_string()
+        }
+    }
 }
 
 /// Dispatch a presence tool call. Pure-logic tools return immediately;
@@ -291,6 +306,54 @@ mod tests {
                 assert!(text.contains("Unknown tool"));
             }
             _ => panic!("expected TextResult"),
+        }
+    }
+
+    #[test]
+    fn action_confirmation_all_variants() {
+        assert_eq!(
+            action_confirmation(&PresenceAction::SubmitTask(TaskEnvelope {
+                task: "fix bug".to_string(),
+                force_direct: false,
+                context_hints: vec![],
+            })),
+            "Task submitted: fix bug"
+        );
+        assert_eq!(action_confirmation(&PresenceAction::Approve { id: 42 }), "Approved action 42");
+        assert_eq!(action_confirmation(&PresenceAction::Deny { id: 7 }), "Denied action 7");
+        assert_eq!(action_confirmation(&PresenceAction::Skip { id: 3 }), "Skipped action 3");
+        assert_eq!(
+            action_confirmation(&PresenceAction::Respond { text: "yes".to_string() }),
+            "Sent response: yes"
+        );
+        assert_eq!(
+            action_confirmation(&PresenceAction::SetAutonomy { level: "full".to_string() }),
+            "Autonomy set to full"
+        );
+        assert_eq!(
+            action_confirmation(&PresenceAction::TextResult("ok".to_string())),
+            "Action dispatched"
+        );
+        assert_eq!(
+            action_confirmation(&PresenceAction::NeedsIO {
+                tool_name: "q".to_string(),
+                args: json!({}),
+            }),
+            "Action dispatched"
+        );
+    }
+
+    #[test]
+    fn presence_action_serde_roundtrip() {
+        let actions = vec![
+            PresenceAction::Approve { id: 1 },
+            PresenceAction::TextResult("hello".to_string()),
+            PresenceAction::NeedsIO { tool_name: "q".to_string(), args: json!({"x": 1}) },
+        ];
+        for action in actions {
+            let json = serde_json::to_string(&action).unwrap();
+            let back: PresenceAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
     }
 }

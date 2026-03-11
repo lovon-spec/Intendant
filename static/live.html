@@ -171,7 +171,8 @@ let micActive = false;
 let modelConnected = false;
 let audioCtx = null;
 let mediaStream = null;
-let scriptNode = null;
+let workletNode = null;
+let workletReady = false;
 
 const intDot = document.getElementById('intDot');
 const intLabel = document.getElementById('intLabel');
@@ -189,37 +190,6 @@ function getServerUrl() {
   return `ws://${location.hostname || 'localhost'}:${location.port || '8765'}`;
 }
 
-function presenceActionToControlMsg(action) {
-  switch (action.type) {
-    case 'SubmitTask': {
-      const msg = { action: 'start_task', task: action.data.task };
-      if (action.data.force_direct) msg.orchestrate = false;
-      return msg;
-    }
-    case 'Approve': return { action: 'approve', id: action.data.id };
-    case 'Deny': return { action: 'deny', id: action.data.id };
-    case 'Skip': return { action: 'skip', id: action.data.id };
-    case 'Respond': return { action: 'input', text: action.data.text };
-    case 'SetAutonomy': return { action: 'set_autonomy', level: action.data.level };
-    default: return null;
-  }
-}
-
-function actionConfirmation(action) {
-  switch (action.type) {
-    case 'SubmitTask': return `Task submitted: ${action.data.task}`;
-    case 'Approve': return `Approved action ${action.data.id}`;
-    case 'Deny': return `Denied action ${action.data.id}`;
-    case 'Skip': return `Skipped action ${action.data.id}`;
-    case 'Respond': return `Sent response: ${action.data.text}`;
-    case 'SetAutonomy': return `Autonomy set to ${action.data.level}`;
-    default: return 'Action dispatched';
-  }
-}
-
-// ============================================================
-// Voice Status
-// ============================================================
 function showVoiceStatus(text, isError) {
   voiceStatus.textContent = text;
   voiceStatus.className = 'voice-status' + (isError ? ' error' : '');
@@ -229,7 +199,7 @@ function hideVoiceStatus() {
 }
 
 // ============================================================
-// Audio Capture & Playback
+// Audio Capture (AudioWorklet) & Playback
 // ============================================================
 function downsample(float32, fromRate, toRate) {
   if (fromRate === toRate) return float32;
@@ -262,36 +232,59 @@ async function startMic() {
   }
   if (!audioCtx) audioCtx = new AudioContext();
   if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+  // Load AudioWorklet module (once)
+  if (!workletReady) {
+    try {
+      await audioCtx.audioWorklet.addModule('/audio-processor.js');
+      workletReady = true;
+    } catch (e) {
+      showVoiceStatus(`AudioWorklet failed: ${e.message}`, true);
+      micActive = false;
+      micBtn.classList.remove('active');
+      return;
+    }
+  }
+
   if (!mediaStream) {
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true } });
-    } catch(e) {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true }
+      });
+    } catch (e) {
       showVoiceStatus(`Mic denied: ${e.message}`, true);
       micActive = false;
       micBtn.classList.remove('active');
       return;
     }
   }
+
   const source = audioCtx.createMediaStreamSource(mediaStream);
   const targetSR = gatewayConfig ? gatewayConfig.input_sample_rate : 16000;
   const nativeSR = audioCtx.sampleRate;
-  scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
-  scriptNode.onaudioprocess = (e) => {
-    if (!micActive || !modelConnected || !pw) return;
-    const float32 = e.inputBuffer.getChannelData(0);
-    const resampled = downsample(float32, nativeSR, targetSR);
+
+  workletNode = new AudioWorkletNode(audioCtx, 'audio-capture-processor', {
+    processorOptions: { bufferSize: 4096 }
+  });
+  workletNode.port.onmessage = (e) => {
+    if (e.data.type !== 'audio' || !micActive || !modelConnected || !pw) return;
+    const resampled = downsample(e.data.data, nativeSR, targetSR);
     const pcm16 = new Int16Array(resampled.length);
     for (let i = 0; i < resampled.length; i++)
       pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
     pw.send_audio(arrayBufferToBase64(pcm16.buffer));
   };
-  source.connect(scriptNode);
-  scriptNode.connect(audioCtx.destination);
+  source.connect(workletNode);
+  workletNode.connect(audioCtx.destination);
   showVoiceStatus('Mic active \u2014 speak now');
 }
 
 function stopMic() {
-  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (workletNode) {
+    workletNode.port.postMessage({ type: 'mute' });
+    workletNode.disconnect();
+    workletNode = null;
+  }
   hideVoiceStatus();
 }
 
@@ -346,8 +339,6 @@ async function connectVoice() {
   const inputRate = (gatewayConfig && gatewayConfig.input_sample_rate) || null;
   try {
     showVoiceStatus('Connecting...');
-    // Prefer API key from localStorage (supports tool calling).
-    // Fall back to server-minted ephemeral token (no tool calls on Gemini).
     const lsKey = provider === 'gemini' ? 'gemini_api_key'
                 : provider === 'openai' ? 'openai_api_key' : null;
     const apiKey = lsKey && localStorage.getItem(lsKey);
@@ -373,7 +364,7 @@ async function connectVoice() {
 // Init — loads presence-web WASM and wires everything up
 // ============================================================
 async function init() {
-  // 1. Load presence-web WASM (includes presence-core + all WebSocket protocols)
+  // 1. Load presence-web WASM
   try {
     const wasm = await import('/wasm-web/presence_web.js');
     await wasm.default('/wasm-web/presence_web_bg.wasm');
@@ -386,9 +377,8 @@ async function init() {
     return;
   }
 
-  // 2. Set up WASM -> JS callbacks
+  // 2. WASM -> JS callbacks (only UI/audio concerns remain in JS)
 
-  // Terminal data (base64-encoded ANSI frames)
   pw.set_on_term((b64) => {
     const bytes = atob(b64);
     const arr = new Uint8Array(bytes.length);
@@ -396,44 +386,20 @@ async function init() {
     term.write(arr);
   });
 
-  // Server connection state
   pw.set_on_server_state((connected) => {
     intDot.className = 'conn-dot ' + (connected ? 'ok' : 'err');
     intLabel.textContent = 'Server';
     if (connected) pw.send_resize(term.cols, term.rows);
   });
 
-  // Bootstrap state snapshot (presence state already updated in WASM)
   pw.set_on_state_snapshot(() => {
-    if (modelConnected && pw.has_pending_approval()) {
-      const state = pw.get_state();
-      const pa = state.pending_approval;
-      if (pa) {
-        pw.send_text(
-          `[System: approval needed] You want to run: "${pa.command_preview}" (id: ${pa.id}, category: ${pa.category}). Ask the user if this is okay.`
-        );
-      }
-    }
+    if (modelConnected) pw.inject_pending_approval_if_any();
   });
 
-  // Server events (presence state already updated in WASM)
   pw.set_on_server_event((evt) => {
-    if (!modelConnected) return;
-    const eventType = evt.event;
-    if (eventType === 'approval_required') {
-      pw.send_text(`[System: approval needed] You want to run: "${evt.command}" (id: ${evt.id}). Ask the user.`);
-    } else if (eventType === 'ask_human') {
-      pw.send_text(`[System: question] "${evt.question}". Ask the user naturally.`);
-    } else if (eventType === 'task_complete') {
-      pw.send_text(`[System: done] ${evt.reason}. Tell the user briefly.`);
-    } else if (eventType === 'status' && evt.phase) {
-      if (evt.phase === 'running_agent' || evt.phase === 'thinking') {
-        pw.send_text(`[System: phase] Now ${evt.phase === 'running_agent' ? 'running commands' : 'thinking'}.`);
-      }
-    }
+    if (modelConnected) pw.handle_server_event(evt);
   });
 
-  // Voice model ready
   pw.set_on_voice_ready(() => {
     modelConnected = true;
     voiceDot.className = 'conn-dot ok';
@@ -441,42 +407,23 @@ async function init() {
     voiceLabel.textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
     showVoiceStatus('Voice ready');
     setTimeout(hideVoiceStatus, 3000);
-    if (pw.has_pending_approval()) {
-      const state = pw.get_state();
-      const pa = state.pending_approval;
-      if (pa) {
-        pw.send_text(
-          `[System: approval needed] You want to run: "${pa.command_preview}" (id: ${pa.id}, category: ${pa.category}). Ask the user if this is okay.`
-        );
-      }
-    }
+    pw.inject_pending_approval_if_any();
   });
 
-  // Voice audio and text
   pw.set_on_voice_audio((b64) => playAudioChunk(b64));
+
   pw.set_on_voice_text((text) => {
     showVoiceStatus(text);
     setTimeout(hideVoiceStatus, 5000);
-    // Forward voice text to server for TUI logging
     pw.send_voice_log(text, undefined);
   });
 
-  // Voice tool calls — dispatch via WASM, route by action type
   pw.set_on_voice_tool_call((call) => {
-    const action = pw.dispatch_tool(call.name, call.args || {});
-    // Log tool call to server for TUI display
-    pw.send_voice_log(`[tool] ${call.name}(${JSON.stringify(call.args || {})})`, call.name);
-
-    if (action.type === 'TextResult') {
-      pw.send_voice_tool_response(call, { result: action.data });
-    } else if (action.type === 'NeedsIO') {
-      pw.send_tool_request(action.data.tool_name, action.data.args, (result) => {
-        pw.send_voice_tool_response(call, typeof result === 'string' ? { result } : result);
+    const result = pw.handle_voice_tool_call(call);
+    if (result && result.needs_io) {
+      pw.send_tool_request(result.tool_name, result.args, (response) => {
+        pw.send_voice_tool_response(call, typeof response === 'string' ? { result: response } : response);
       });
-    } else {
-      const msg = presenceActionToControlMsg(action);
-      if (msg) pw.send_server_action(msg);
-      pw.send_voice_tool_response(call, { result: actionConfirmation(action) });
     }
   });
 
@@ -487,12 +434,11 @@ async function init() {
     showVoiceStatus(msg, true);
   });
 
-  // Forward keyboard input via WASM
   term.onKey(({ domEvent }) => {
     if (pw) pw.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
   });
 
-  // 3. Connect to server (WebSocket managed by WASM)
+  // 3. Connect to server
   pw.connect_server(getServerUrl());
 
   // 4. Fetch voice config
@@ -501,11 +447,10 @@ async function init() {
     if (resp.ok) gatewayConfig = await resp.json();
   } catch(_) {}
 
-  // 5. Auto-connect voice (server handles credentials)
+  // 5. Auto-connect voice
   connectVoice();
 }
 
-// Clean disconnect on tab close
 window.addEventListener('beforeunload', () => {
   if (modelConnected && pw) pw.disconnect_voice();
 });

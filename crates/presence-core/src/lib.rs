@@ -9,7 +9,7 @@ pub mod wasm;
 
 // Re-exports for convenience (includes protocol types: PresenceConnect, PresenceWelcome, etc.)
 pub use types::*;
-pub use dispatch::{PresenceAction, dispatch_tool_call};
+pub use dispatch::{PresenceAction, action_confirmation, dispatch_tool_call};
 pub use format::{format_event, truncate};
 pub use tools::{ToolDefinition, presence_tools};
 pub use prompt::DEFAULT_PRESENCE_PROMPT;

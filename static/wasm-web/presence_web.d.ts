@@ -24,7 +24,28 @@ export class PresenceWeb {
      * Get presence tools as JS array (from presence-core).
      */
     get_tools(): any;
+    /**
+     * Handle a server event by injecting system text into the voice model.
+     * Returns true if a message was sent to the voice model.
+     */
+    handle_server_event(evt: any): boolean;
+    /**
+     * Handle a voice model tool call end-to-end.
+     *
+     * - Dispatches the tool via presence-core
+     * - Sends voice log to server
+     * - For `TextResult` and action types: sends voice tool response, dispatches
+     *   server action if needed, returns `JsValue::NULL`
+     * - For `NeedsIO`: returns `{ needs_io: true, tool_name, args }` so JS can
+     *   do the async server roundtrip and call `send_voice_tool_response` itself
+     */
+    handle_voice_tool_call(call: any): any;
     has_pending_approval(): boolean;
+    /**
+     * If the agent has a pending approval, inject it into the voice model.
+     * Returns true if a message was sent.
+     */
+    inject_pending_approval_if_any(): boolean;
     constructor();
     phase(): string;
     reconnect_server(url: string): void;
@@ -139,7 +160,10 @@ export interface InitOutput {
     readonly presenceweb_get_prompt: (a: number) => [number, number];
     readonly presenceweb_get_state: (a: number) => any;
     readonly presenceweb_get_tools: (a: number) => any;
+    readonly presenceweb_handle_server_event: (a: number, b: any) => number;
+    readonly presenceweb_handle_voice_tool_call: (a: number, b: any) => any;
     readonly presenceweb_has_pending_approval: (a: number) => number;
+    readonly presenceweb_inject_pending_approval_if_any: (a: number) => number;
     readonly presenceweb_new: () => number;
     readonly presenceweb_phase: (a: number) => [number, number];
     readonly presenceweb_reconnect_server: (a: number, b: number, c: number) => void;

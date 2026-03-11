@@ -18,7 +18,15 @@ use std::rc::Rc;
 use callbacks::Callbacks;
 use js_sys::Function;
 use presence_core::wasm::WasmPresence;
+use presence_core::PresenceAction;
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
+
+/// Serialize a serde_json::Value to JsValue with maps as plain JS objects.
+fn to_js(val: &serde_json::Value) -> JsValue {
+    val.serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+        .unwrap_or(JsValue::NULL)
+}
 
 /// Main entry point for the browser presence layer.
 ///
@@ -417,5 +425,179 @@ impl PresenceWeb {
     #[wasm_bindgen]
     pub fn send_presence_checkpoint(&self, summary: &str) {
         self.server.borrow().send_presence_checkpoint(summary);
+    }
+
+    // --- High-level handlers (consolidate JS logic into WASM) ---
+
+    /// Handle a voice model tool call end-to-end.
+    ///
+    /// - Dispatches the tool via presence-core
+    /// - Sends voice log to server
+    /// - For `TextResult` and action types: sends voice tool response, dispatches
+    ///   server action if needed, returns `JsValue::NULL`
+    /// - For `NeedsIO`: returns `{ needs_io: true, tool_name, args }` so JS can
+    ///   do the async server roundtrip and call `send_voice_tool_response` itself
+    #[wasm_bindgen]
+    pub fn handle_voice_tool_call(&self, call: JsValue) -> JsValue {
+        let call_val: serde_json::Value =
+            serde_wasm_bindgen::from_value(call.clone()).unwrap_or_default();
+        let name = call_val["name"].as_str().unwrap_or("").to_string();
+        let args_val = call_val.get("args").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+
+        // Dispatch tool
+        let args_js = to_js(&args_val);
+        let action_js = self.presence.borrow().dispatch(&name, args_js);
+        let action: PresenceAction =
+            serde_wasm_bindgen::from_value(action_js).unwrap_or(PresenceAction::TextResult(
+                format!("dispatch error for {}", name),
+            ));
+
+        // Log
+        let args_str = serde_json::to_string(&args_val).unwrap_or_default();
+        let log_text = format!("[tool] {}({})", name, args_str);
+        self.send_voice_log(&log_text, Some(name));
+
+        match &action {
+            PresenceAction::TextResult(text) => {
+                let result = serde_json::json!({"result": text});
+                self.send_voice_tool_response(call, to_js(&result));
+                JsValue::NULL
+            }
+            PresenceAction::NeedsIO { tool_name, args } => {
+                let ret = serde_json::json!({
+                    "needs_io": true,
+                    "tool_name": tool_name,
+                    "args": args,
+                });
+                to_js(&ret)
+            }
+            _ => {
+                // Action type (Approve, Deny, Skip, SubmitTask, etc.)
+                let confirmation = presence_core::action_confirmation(&action);
+                let msg = self.action_to_server_msg(&action);
+                if !msg.is_null() {
+                    self.send_server_action(msg);
+                }
+                let result = serde_json::json!({"result": confirmation});
+                self.send_voice_tool_response(call, to_js(&result));
+                JsValue::NULL
+            }
+        }
+    }
+
+    /// Convert a PresenceAction to a server control message (JSON).
+    /// Returns JsValue::NULL for TextResult/NeedsIO.
+    fn action_to_server_msg(&self, action: &PresenceAction) -> JsValue {
+        let msg = match action {
+            PresenceAction::SubmitTask(envelope) => {
+                let mut obj = serde_json::json!({
+                    "action": "start_task",
+                    "task": envelope.task,
+                });
+                if envelope.force_direct {
+                    obj["orchestrate"] = serde_json::Value::Bool(false);
+                }
+                Some(obj)
+            }
+            PresenceAction::Approve { id } => {
+                Some(serde_json::json!({"action": "approve", "id": id}))
+            }
+            PresenceAction::Deny { id } => {
+                Some(serde_json::json!({"action": "deny", "id": id}))
+            }
+            PresenceAction::Skip { id } => {
+                Some(serde_json::json!({"action": "skip", "id": id}))
+            }
+            PresenceAction::Respond { text } => {
+                Some(serde_json::json!({"action": "input", "text": text}))
+            }
+            PresenceAction::SetAutonomy { level } => {
+                Some(serde_json::json!({"action": "set_autonomy", "level": level}))
+            }
+            PresenceAction::TextResult(_) | PresenceAction::NeedsIO { .. } => None,
+        };
+        match msg {
+            Some(val) => to_js(&val),
+            None => JsValue::NULL,
+        }
+    }
+
+    /// Handle a server event by injecting system text into the voice model.
+    /// Returns true if a message was sent to the voice model.
+    #[wasm_bindgen]
+    pub fn handle_server_event(&self, evt: JsValue) -> bool {
+        let Ok(evt_val) = serde_wasm_bindgen::from_value::<serde_json::Value>(evt) else {
+            return false;
+        };
+        let event_type = evt_val
+            .get("event")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let text = match event_type {
+            "approval_required" => {
+                let cmd = evt_val["command"].as_str().unwrap_or("");
+                let id = &evt_val["id"];
+                Some(format!(
+                    "[System: approval needed] You want to run: \"{}\" (id: {}). Ask the user.",
+                    cmd, id
+                ))
+            }
+            "ask_human" => {
+                let q = evt_val["question"].as_str().unwrap_or("");
+                Some(format!(
+                    "[System: question] \"{}\". Ask the user naturally.",
+                    q
+                ))
+            }
+            "task_complete" => {
+                let reason = evt_val["reason"].as_str().unwrap_or("");
+                Some(format!(
+                    "[System: done] {}. Tell the user briefly.",
+                    reason
+                ))
+            }
+            "status" => {
+                let phase = evt_val["phase"].as_str().unwrap_or("");
+                match phase {
+                    "running_agent" => {
+                        Some("[System: phase] Now running commands.".to_string())
+                    }
+                    "thinking" => Some("[System: phase] Now thinking.".to_string()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            self.send_text(&text);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// If the agent has a pending approval, inject it into the voice model.
+    /// Returns true if a message was sent.
+    #[wasm_bindgen]
+    pub fn inject_pending_approval_if_any(&self) -> bool {
+        if !self.has_pending_approval() {
+            return false;
+        }
+        let state_js = self.presence.borrow().get_state();
+        let Ok(state) = serde_wasm_bindgen::from_value::<serde_json::Value>(state_js) else {
+            return false;
+        };
+        if let Some(pa) = state.get("pending_approval") {
+            let cmd = pa["command_preview"].as_str().unwrap_or("");
+            let id = &pa["id"];
+            let cat = pa["category"].as_str().unwrap_or("");
+            self.send_text(&format!(
+                "[System: approval needed] You want to run: \"{}\" (id: {}, category: {}). Ask the user if this is okay.",
+                cmd, id, cat
+            ));
+            true
+        } else {
+            false
+        }
     }
 }

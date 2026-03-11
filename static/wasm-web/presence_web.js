@@ -87,10 +87,45 @@ export class PresenceWeb {
         return ret;
     }
     /**
+     * Handle a server event by injecting system text into the voice model.
+     * Returns true if a message was sent to the voice model.
+     * @param {any} evt
+     * @returns {boolean}
+     */
+    handle_server_event(evt) {
+        const ret = wasm.presenceweb_handle_server_event(this.__wbg_ptr, evt);
+        return ret !== 0;
+    }
+    /**
+     * Handle a voice model tool call end-to-end.
+     *
+     * - Dispatches the tool via presence-core
+     * - Sends voice log to server
+     * - For `TextResult` and action types: sends voice tool response, dispatches
+     *   server action if needed, returns `JsValue::NULL`
+     * - For `NeedsIO`: returns `{ needs_io: true, tool_name, args }` so JS can
+     *   do the async server roundtrip and call `send_voice_tool_response` itself
+     * @param {any} call
+     * @returns {any}
+     */
+    handle_voice_tool_call(call) {
+        const ret = wasm.presenceweb_handle_voice_tool_call(this.__wbg_ptr, call);
+        return ret;
+    }
+    /**
      * @returns {boolean}
      */
     has_pending_approval() {
         const ret = wasm.presenceweb_has_pending_approval(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * If the agent has a pending approval, inject it into the voice model.
+     * Returns true if a message was sent.
+     * @returns {boolean}
+     */
+    inject_pending_approval_if_any() {
+        const ret = wasm.presenceweb_inject_pending_approval_if_any(this.__wbg_ptr);
         return ret !== 0;
     }
     constructor() {
@@ -468,6 +503,10 @@ function __wbg_get_imports() {
             const ret = typeof(arg0) === 'function';
             return ret;
         },
+        __wbg___wbindgen_is_null_ac34f5003991759a: function(arg0) {
+            const ret = arg0 === null;
+            return ret;
+        },
         __wbg___wbindgen_is_object_5ae8e5880f2c1fbd: function(arg0) {
             const val = arg0;
             const ret = typeof(val) === 'object' && val !== null;
@@ -704,17 +743,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 71, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 74, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 92, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 95, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 71, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 74, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 92, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 95, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 71, function: Function { arguments: [], shim_idx: 72, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 92, function: Function { arguments: [], shim_idx: 93, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__ha067de4be952b5b6);
             return ret;
         },
