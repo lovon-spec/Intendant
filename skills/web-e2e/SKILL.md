@@ -11,12 +11,6 @@ disable-model-invocation: true
 
 # Test --web Live Mode E2E
 
-## Prerequisites
-
-```bash
-sudo apt-get install -y x11vnc firefox-esr xdotool
-```
-
 ## Key Differences from TUI E2E
 
 - **No xterm needed**: `--web` uses `WebTui` (buffer-backed ratatui backend).
@@ -24,9 +18,10 @@ sudo apt-get install -y x11vnc firefox-esr xdotool
 - **Firefox is the UI**: Open Firefox on the Xvfb display pointing to
   `http://localhost:8765`. The browser renders the TUI via xterm.js and
   provides voice model controls.
-- **Voice model connects from browser**: Gemini Live / OpenAI Realtime API
-  keys are stored in browser localStorage. The live model is a direct
-  browser-to-API WebSocket connection (low latency).
+- **Voice model connects from browser**: The server holds permanent API keys
+  and mints ephemeral tokens via `POST /session`. The browser clicks the mic
+  button, fetches an ephemeral token, and connects directly to the vendor
+  WebSocket (Gemini Live / OpenAI Realtime). No localStorage needed.
 - **Control is via browser**: No `--control-socket` or socat needed. The
   browser IS the control interface (approval buttons, voice commands, etc.)
 
@@ -49,9 +44,9 @@ sleep 0.5
 
 # 3. Launch intendant --web as background process (no xterm needed)
 > /tmp/intendant-web-stderr.log
-nohup bash -c 'cd /home/user/projects/intendant-codex-fork && source .env && \
-  ./target/release/intendant --direct --autonomy low --web \
-  "your task here" 2>/tmp/intendant-web-stderr.log' > /dev/null 2>&1 &
+cd /home/user/projects/intendant-codex-fork && source .env && \
+  nohup ./target/release/intendant --direct --autonomy low --web \
+  "your task here" > /dev/null 2>/tmp/intendant-web-stderr.log &
 
 # 4. Wait for web gateway to start
 sleep 3
@@ -61,100 +56,86 @@ cat /tmp/intendant-web-stderr.log  # Should show "Web TUI: http://0.0.0.0:8765"
 DISPLAY=:50 nohup firefox --new-window http://localhost:8765 > /dev/null 2>&1 &
 ```
 
-## Inject API Keys (Voice Model)
+## Debugging
 
-Voice model API keys are stored in browser localStorage. If an API key was
-previously saved in Firefox on this display, the live model **auto-connects**
-on page load — no manual setup needed.
+**Use `curl` and the `/debug` endpoint for all debugging — no screenshots needed.**
 
-For first-time setup, three options:
-
-**Option A — Click Settings gear in browser (simplest):**
-The web TUI has a settings gear icon (top-right). Click it, paste the
-API key, click Save. The voice model will auto-connect.
-
-**Option B — Set via Web Console:**
-Open Firefox DevTools with **F12** (NOT Ctrl+Shift+K — that opens just the
-console but F12 is more reliable for toggling), then click the Console tab:
-```js
-// For Gemini Live:
-localStorage.setItem('intendant_gemini_key', 'YOUR_KEY');
-// For OpenAI Realtime:
-localStorage.setItem('intendant_openai_key', 'YOUR_KEY');
-```
-Refresh the page to trigger auto-connect.
-
-**Option C — Set via xdotool (programmatic):**
 ```bash
-DISPLAY=:50 xdotool search --name "Intendant Live" windowactivate --sync
-DISPLAY=:50 xdotool key F12
-sleep 2
-DISPLAY=:50 xdotool mousemove 400 658 click 1
-sleep 0.3
-DISPLAY=:50 xdotool type --clearmodifiers "localStorage.setItem('intendant_gemini_key', 'YOUR_KEY')"
-DISPLAY=:50 xdotool key Return
-sleep 0.3
-DISPLAY=:50 xdotool key F12
+# Server state: agent phase, pending approvals, voice connection, voice logs
+curl -s http://localhost:8765/debug | python3 -m json.tool
+
+# Config: provider, model, sample rates (no secrets)
+curl -s http://localhost:8765/config
+
+# Session: mint ephemeral token (called by browser on mic click)
+curl -s -X POST http://localhost:8765/session
 ```
+
+The `/debug` endpoint returns:
+- `agent_state`: phase, turn, budget, pending_approval, last_command
+- `voice.connected`: whether browser voice model is connected
+- `voice.voice_log_count`: number of voice text/tool logs received
+- `voice.last_voice_log`: most recent voice model text response
+
+**Test Gemini WebSocket from terminal** (requires `pip3 install websockets`):
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8765/session | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+python3 - "$TOKEN" << 'PYEOF'
+import asyncio, json, websockets, sys
+TOKEN = sys.argv[1]
+async def test():
+    url = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token={TOKEN}"
+    async with websockets.connect(url) as ws:
+        print("Connected!")
+        setup = {"setup": {"system_instruction": {"parts": [{"text": "Say hello"}]}, "tools": [{"function_declarations": []}]}}
+        await ws.send(json.dumps(setup))
+        msg = await asyncio.wait_for(ws.recv(), timeout=10)
+        print(f"Response: {msg[:200]}")  # Should show setupComplete
+asyncio.run(test())
+PYEOF
+```
+
+**For browser-side JS debugging** (only needed for WASM/JS errors):
+
+Firefox `--start-debugger-server` requires `devtools.debugger.remote-enabled=true`
+in the Firefox profile's `user.js`. Once enabled, connect with a raw socket script
+(see `/tmp/ff-eval.py` if it exists from prior runs) — no pip dependencies needed.
 
 ## Simulating Voice Input
 
 Since there's no real microphone on a headless display, simulate voice input
-by sending text directly to the live model via the browser console.
+by sending text directly to the live model via the Firefox debugger or
+`pw.send_text()` from the browser console.
 
-**IMPORTANT**: The voice model needs *context* to call tools. For approvals,
-include the system event format so the model knows what to approve:
-
+**Via Firefox debugger** (if `--start-debugger-server 6000` is active):
 ```bash
-# Open console
-DISPLAY=:50 xdotool search --name "Intendant Live" windowactivate --sync
+python3 /tmp/ff-eval.py "window.__presenceWeb.send_text('Hello, what is happening?')"
+```
+
+**Via xdotool** (open DevTools F12 → Console tab → type):
+```bash
 DISPLAY=:50 xdotool key F12
 sleep 2
 DISPLAY=:50 xdotool mousemove 400 658 click 1
 sleep 0.3
-
-# Send text to live model (simulates voice)
-DISPLAY=:50 xdotool type --clearmodifiers 'modelProvider.sendText("[System: approval needed] Agent wants to run: ls -la /tmp (id: 1). User says yes. Call approve_action with id 1.")'
+DISPLAY=:50 xdotool type --clearmodifiers 'pw.send_text("Hello, what are you working on?")'
 DISPLAY=:50 xdotool key Return
 ```
 
-### What works as sendText input:
-- **Task submission**: `modelProvider.sendText("Create a hello world file in /tmp")`
-  — model calls `submit_task`
-- **Approval with context**: `modelProvider.sendText("[System: approval needed] Agent wants to run: COMMAND (id: N). User says yes. Call approve_action with id N.")`
-  — model calls `approve_action`
-- **Status queries**: `modelProvider.sendText("What are you working on?")`
-  — model calls `check_status`
-- **Vague requests** (e.g. "yes go ahead" without context): model responds
-  with **audio only** (blocked by AudioContext on headless displays). This is
-  NOT a bug — it works fine with real voice because audio playback is allowed
-  after a user gesture.
-
-### AudioContext warning
-On headless displays, you'll see:
-```
-An AudioContext was prevented from starting automatically. It must be created
-or resumed after a user gesture on the page.
-```
-This is expected — the browser blocks audio playback without user interaction.
-Audio works fine when a real user clicks the mic button. For E2E testing,
-only text-based tool calls matter.
+Then check `curl -s http://localhost:8765/debug` to see voice logs.
 
 ## Keyboard Input via xdotool
 
-For TUI keyboard shortcuts (approve, quit, etc.), click inside the xterm.js
-terminal first to give it focus, then send keys:
+Click inside the xterm.js terminal first to give it focus, then send keys:
 
 ```bash
-# Click inside the terminal area, then send 'y' to approve
 DISPLAY=:50 xdotool mousemove 500 300 click 1
 sleep 0.2
-DISPLAY=:50 xdotool key y
+DISPLAY=:50 xdotool key y   # approve
 ```
 
 **Gotcha**: If the follow-up text input panel is active, keyboard shortcuts
-(v for verbosity, q for quit, etc.) go into the text input instead. Press
-Escape first to dismiss the follow-up panel, then send the shortcut.
+go into the text input. Press Escape first to dismiss it.
 
 ## Screenshot
 
@@ -162,66 +143,33 @@ Escape first to dismiss the follow-up panel, then send the shortcut.
 DISPLAY=:50 import -window root /tmp/web-e2e-screenshot.png
 ```
 
-## What to Verify
+## Known Gotchas
 
-### Core functionality
-1. **Web TUI renders in Firefox**: xterm.js shows the TUI with status bar,
-   log panel, action panel. Dark Catppuccin theme, colored text.
-
-2. **Server connection**: Green "Server" dot in the top-right connection bar.
-
-3. **Server-side presence**: Log entries like "[presence] Thinking..." and
-   narration of the task before live model connects.
-
-4. **Voice model auto-connect**: If API key exists in localStorage, the
-   live model auto-connects on page load. Green second dot (Gemini/OpenAI).
-
-### Mutual exclusion
-5. **Live model connects**: Log shows "Browser live model connected — server
-   presence paused". Server presence stops narrating.
-
-6. **Browser disconnect**: Close Firefox (Ctrl+Q) or close tab. Log shows
-   "Browser live model disconnected — server presence resumed". Server
-   presence resumes. This tests `beforeunload` + server-side auto-cleanup
-   on WebSocket drop.
-
-7. **Browser reconnect**: Open Firefox again. Bootstrap `state_snapshot` is
-   sent (TUI renders immediately). If live model auto-reconnects, log shows
-   "Browser live model connected — server presence paused" again.
-
-### Voice model tool calls
-8. **approve_action**: Send text with approval context → model calls
-   `approve_action` → log shows "Approved via control socket (turn N)".
-
-9. **submit_task**: Send text requesting work → model calls `submit_task`
-   → new task starts in the agent loop.
-
-10. **check_status**: Send "what are you working on?" → model calls
-    `check_status` → tool_request/tool_response roundtrip via WebSocket.
-
-## Config Endpoint
-
-```bash
-curl http://localhost:8765/config
-# Returns: {"provider":"gemini","model":"gemini-2.5-flash-native-audio-preview-12-2025",...}
-```
-
-## Verified Results (March 2026)
-
-All tests passed on the first E2E run:
-
-| Test | Result | Notes |
-|------|--------|-------|
-| Web TUI renders in Firefox | PASS | Full Catppuccin theme, all panels visible |
-| Server-side presence narrates | PASS | "[presence] I need your approval to write..." |
-| Gemini Live auto-connects | PASS | Saved API key in localStorage triggers auto-connect |
-| Mutual exclusion (connect) | PASS | "Browser live model connected — server presence paused" |
-| Approval via keyboard (y key) | PASS | Approval panel accepts browser keyboard input |
-| Approval via voice model tool | PASS | `approve_action` called via tool_request protocol |
-| Task submission via voice model | PASS | `submit_task` called, new round started |
-| Disconnect (Ctrl+Q Firefox) | PASS | "Browser live model disconnected — server presence resumed" |
-| Reconnect (reopen Firefox) | PASS | Bootstrap state_snapshot + live_connected re-sent |
-| Follow-up round via voice | PASS | Round 2 completed with voice-controlled approval |
+- **Ephemeral tokens require `BidiGenerateContentConstrained`**: The non-constrained
+  `BidiGenerateContent` returns WebSocket close code 1008 with ephemeral tokens.
+- **Constrained endpoint sends binary frames**: Unlike the text-frame
+  `BidiGenerateContent`, `BidiGenerateContentConstrained` sends ArrayBuffer
+  WebSocket frames. The WASM must set `ws.set_binary_type(BinaryType::Arraybuffer)`
+  before connecting — default `Blob` type silently drops binary messages.
+- **Constrained endpoint does NOT support tool calling**: With ephemeral tokens,
+  the model narrates about calling tools but never actually emits `toolCall` messages.
+  Tool calls work with `BidiGenerateContent` + API key auth. This is a Gemini API
+  limitation — a WebSocket proxy would be needed to fix.
+- **`response_modalities` must be `["AUDIO"]` only**: Adding `"TEXT"` causes
+  WebSocket close code 1007 ("Invalid argument") on the constrained endpoint.
+- **Firefox WASM cache**: After rebuilding WASM, you MUST clear the cache manually:
+  `rm -rf ~/.mozilla/firefox/*/cache2/ ~/.cache/mozilla/firefox/*/cache2/`
+  then relaunch Firefox. Ctrl+Shift+R is NOT sufficient.
+- **WASM rebuild**: From `crates/presence-web/`:
+  `wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web`
+  Then `cargo build --release -p intendant` (use `-p intendant` to skip WASM-only crate).
+- **Gemini REST token endpoint**: `POST /v1alpha/auth_tokens` (snake_case, NOT
+  camelCase `authTokens`). Body uses flat fields, NOT wrapped in `"config"`.
+  Use `bidi_generate_content_setup` to bake model+config into the token.
+- **AudioContext warning** on headless displays is expected and harmless.
+- **Follow-up panel** captures keystrokes — Escape first before sending shortcuts.
+- **Firefox profile lock**: If Firefox won't start, remove lock files:
+  `rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock`
 
 ## Cleanup
 

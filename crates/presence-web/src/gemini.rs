@@ -4,9 +4,25 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use web_sys::{CloseEvent, MessageEvent, WebSocket};
 
+use serde::Serialize;
+
 use crate::callbacks::Callbacks;
 
+/// Serialize a serde_json::Value into a JsValue with maps as plain JS objects
+/// (not ES6 Map). This is required because serde-wasm-bindgen 0.6+ defaults
+/// to Map, which makes Object.keys() return [] and property access fail.
+fn to_js_object(val: &serde_json::Value) -> JsValue {
+    val.serialize(
+        &serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true),
+    )
+    .unwrap_or(JsValue::NULL)
+}
+
 const DEFAULT_MODEL: &str = "gemini-2.5-flash-native-audio-preview-12-2025";
+/// Constrained endpoint — used with ephemeral tokens (baked model+config).
+const API_BASE_CONSTRAINED: &str =
+    "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained";
+/// Non-constrained endpoint — used with API keys (supports tool calling).
 const API_BASE: &str =
     "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent";
 
@@ -54,7 +70,16 @@ impl GeminiProvider {
 
         self.disconnect();
 
-        let url = format!("{}?access_token={}", API_BASE, token);
+        // Detect auth mode: ephemeral tokens start with "auth_tokens/",
+        // everything else is treated as an API key.
+        let is_ephemeral = token.starts_with("auth_tokens/");
+        let url = if is_ephemeral {
+            // Constrained endpoint — model+config baked in token, binary frames, no tool calls
+            format!("{}?access_token={}", API_BASE_CONSTRAINED, token)
+        } else {
+            // Non-constrained endpoint — API key auth, text frames, tool calls work
+            format!("{}?key={}", API_BASE, token)
+        };
         let ws = match WebSocket::new(&url) {
             Ok(ws) => ws,
             Err(e) => {
@@ -64,8 +89,18 @@ impl GeminiProvider {
             }
         };
 
-        // Build setup message
-        let setup_msg = self.build_setup_message(system_prompt, tools);
+        // BidiGenerateContentConstrained sends binary frames; non-constrained sends text.
+        // Set ArrayBuffer type for both — text frames still work as string.
+        ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+
+        // Build setup message. With ephemeral tokens (constrained), model+generation_config
+        // are baked into the token, so we only send tools + system_instruction.
+        // With API keys (non-constrained), we send the full setup including model+config.
+        let setup_msg = if is_ephemeral {
+            self.build_setup_message(system_prompt, tools)
+        } else {
+            self.build_full_setup_message(system_prompt, tools)
+        };
 
         // onopen — send setup
         let ws_setup = ws.clone();
@@ -75,9 +110,20 @@ impl GeminiProvider {
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
 
         // onmessage — parse Gemini protocol
+        // BidiGenerateContentConstrained sends binary (ArrayBuffer) frames,
+        // while BidiGenerateContent sends text frames. Handle both.
         let callbacks = self.callbacks.clone();
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
-            if let Some(text) = e.data().as_string() {
+            let text = if let Some(s) = e.data().as_string() {
+                Some(s)
+            } else if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+                let arr = js_sys::Uint8Array::new(&buf);
+                let bytes = arr.to_vec();
+                String::from_utf8(bytes).ok()
+            } else {
+                None
+            };
+            if let Some(text) = text {
                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
                     Self::handle_message_static(&callbacks, &msg);
                 }
@@ -106,8 +152,28 @@ impl GeminiProvider {
         self._onerror = Some(onerror);
     }
 
+    /// Setup message for BidiGenerateContentConstrained (ephemeral tokens).
+    /// Model + generation_config are baked into the token; only send tools + system prompt.
     fn build_setup_message(&self, system_prompt: &str, tools: &JsValue) -> String {
-        // Convert tools JsValue to serde_json::Value
+        let tools_val: serde_json::Value =
+            serde_wasm_bindgen::from_value(tools.clone()).unwrap_or(serde_json::Value::Array(vec![]));
+
+        let setup = serde_json::json!({
+            "setup": {
+                "system_instruction": {
+                    "parts": [{ "text": system_prompt }]
+                },
+                "tools": [{
+                    "function_declarations": tools_val
+                }]
+            }
+        });
+        setup.to_string()
+    }
+
+    /// Full setup message for BidiGenerateContent (API key auth).
+    /// Includes model, generation_config, tools, and system prompt.
+    fn build_full_setup_message(&self, system_prompt: &str, tools: &JsValue) -> String {
         let tools_val: serde_json::Value =
             serde_wasm_bindgen::from_value(tools.clone()).unwrap_or(serde_json::Value::Array(vec![]));
 
@@ -146,7 +212,7 @@ impl GeminiProvider {
         if let Some(tool_call) = msg.get("toolCall") {
             if let Some(fcs) = tool_call.get("functionCalls").and_then(|v| v.as_array()) {
                 for fc in fcs {
-                    let call_js = serde_wasm_bindgen::to_value(fc).unwrap_or(JsValue::NULL);
+                    let call_js = to_js_object(fc);
                     callbacks.invoke_voice_tool_call(&call_js);
                 }
             }
@@ -187,9 +253,7 @@ impl GeminiProvider {
                         }
                         // Function call in model turn
                         if part.get("functionCall").is_some() {
-                            let call_js =
-                                serde_wasm_bindgen::to_value(part.get("functionCall").unwrap())
-                                    .unwrap_or(JsValue::NULL);
+                            let call_js = to_js_object(part.get("functionCall").unwrap());
                             callbacks.invoke_voice_tool_call(&call_js);
                         }
                     }
