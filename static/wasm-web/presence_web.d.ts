@@ -30,6 +30,10 @@ export class PresenceWeb {
     reconnect_server(url: string): void;
     send_audio(base64_pcm: string): void;
     send_key(key: string, ctrl: boolean, alt: boolean, shift: boolean): void;
+    /**
+     * Send a presence checkpoint to the server.
+     */
+    send_presence_checkpoint(summary: string): void;
     send_resize(cols: number, rows: number): void;
     send_server_action(action: any): void;
     send_text(text: string): void;
@@ -37,6 +41,10 @@ export class PresenceWeb {
      * Send a tool_request to the server, with a JS callback for the response.
      */
     send_tool_request(tool: string, args: any, on_result: Function): void;
+    /**
+     * Send a voice transcript log entry to the server.
+     */
+    send_voice_log(text: string, tool_context?: string | null): void;
     send_voice_tool_response(call: any, result: any): void;
     set_on_error(f: Function): void;
     set_on_server_event(f: Function): void;
@@ -137,10 +145,12 @@ export interface InitOutput {
     readonly presenceweb_reconnect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_audio: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_key: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_resize: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_server_action: (a: number, b: any) => void;
     readonly presenceweb_send_text: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_tool_request: (a: number, b: number, c: number, d: any, e: any) => void;
+    readonly presenceweb_send_voice_log: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_send_voice_tool_response: (a: number, b: any, c: any) => void;
     readonly presenceweb_set_on_error: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_event: (a: number, b: any) => void;

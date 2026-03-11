@@ -55,15 +55,23 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
             let api_key = std::env::var("GEMINI_API_KEY")
                 .map_err(|_| "GEMINI_API_KEY not set on server".to_string())?;
             let body = serde_json::json!({
-                "config": {
-                    "uses": 1,
-                    "live_connect_constraints": {
-                        "model": format!("models/{}", model),
+                "uses": 1,
+                "bidi_generate_content_setup": {
+                    "model": format!("models/{}", model),
+                    "generation_config": {
+                        "response_modalities": ["AUDIO"],
+                        "speech_config": {
+                            "voice_config": {
+                                "prebuilt_voice_config": {
+                                    "voice_name": "Aoede"
+                                }
+                            }
+                        }
                     }
                 }
             });
             let url = format!(
-                "https://generativelanguage.googleapis.com/v1alpha/authTokens?key={}",
+                "https://generativelanguage.googleapis.com/v1alpha/auth_tokens?key={}",
                 api_key
             );
             let resp = reqwest::Client::new()
@@ -106,6 +114,14 @@ pub struct WebQueryCtx {
     pub presence_session: Option<Arc<Mutex<crate::presence::PresenceSession>>>,
 }
 
+/// Debug state for the voice model, tracked server-side from WebSocket messages.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct VoiceDebugState {
+    pub connected: bool,
+    pub voice_log_count: u32,
+    pub last_voice_log: String,
+}
+
 /// Configuration sent to the web frontend via `/config`.
 #[derive(Clone, Debug, Serialize)]
 pub struct WebGatewayConfig {
@@ -143,6 +159,7 @@ pub fn spawn_web_gateway(
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let session_provider = config.provider.clone();
     let session_model = config.model.clone();
+    let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
 
     tokio::spawn(async move {
         let addr = format!("0.0.0.0:{}", port);
@@ -164,6 +181,7 @@ pub fn spawn_web_gateway(
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
             let query_ctx = query_ctx.clone();
+            let voice_debug = voice_debug.clone();
             let session_provider = session_provider.clone();
             let session_model = session_model.clone();
 
@@ -221,6 +239,7 @@ pub fn spawn_web_gateway(
                     let bus_inbound = bus.clone();
                     let query_ctx_inbound = query_ctx.clone();
                     let direct_tx_inbound = direct_tx.clone();
+                    let voice_debug_inbound = voice_debug.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -251,6 +270,7 @@ pub fn spawn_web_gateway(
                                         // for older clients, mapping to the new protocol
                                         Some("live_connected") => {
                                             is_presence_connected = true;
+                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = true;
                                             bus_inbound.send(AppEvent::PresenceConnected {
                                                 server_session_id: None,
                                                 last_event_seq: 0,
@@ -258,10 +278,12 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("live_disconnected") => {
                                             is_presence_connected = false;
+                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = false;
                                             bus_inbound.send(AppEvent::PresenceDisconnected);
                                         }
                                         Some("presence_connect") => {
                                             is_presence_connected = true;
+                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = true;
                                             let server_session_id = json.get("server_session_id")
                                                 .and_then(|v| v.as_str())
                                                 .map(String::from);
@@ -297,6 +319,7 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("presence_disconnect") => {
                                             is_presence_connected = false;
+                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = false;
                                             if let Some(ref ctx) = query_ctx_inbound {
                                                 if let Some(ref ps) = ctx.presence_session {
                                                     ps.lock().unwrap_or_else(|e| e.into_inner())
@@ -311,6 +334,11 @@ pub fn spawn_web_gateway(
                                             let tool_context = json.get("tool_context")
                                                 .and_then(|v| v.as_str())
                                                 .map(String::from);
+                                            {
+                                                let mut vd = voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner());
+                                                vd.voice_log_count += 1;
+                                                vd.last_voice_log = text.clone();
+                                            }
                                             bus_inbound.send(AppEvent::VoiceLog {
                                                 text,
                                                 seq,
@@ -494,6 +522,27 @@ pub fn spawn_web_gateway(
                              \r\n\
                              {}",
                             status, body.len(), body
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/debug") {
+                        // Debug endpoint: returns agent state + voice connection info
+                        let state = query_ctx.as_ref()
+                            .map(|ctx| ctx.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone());
+                        let vd = voice_debug.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let debug_json = serde_json::json!({
+                            "agent_state": state,
+                            "voice": vd,
+                        }).to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            debug_json.len(),
+                            debug_json
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;

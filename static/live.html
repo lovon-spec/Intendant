@@ -335,7 +335,7 @@ micBtn.addEventListener('click', async () => {
 });
 
 // ============================================================
-// Voice connection — fetches ephemeral token from server
+// Voice connection — API key (localStorage) or ephemeral token
 // ============================================================
 let voiceConnecting = false;
 async function connectVoice() {
@@ -346,13 +346,22 @@ async function connectVoice() {
   const inputRate = (gatewayConfig && gatewayConfig.input_sample_rate) || null;
   try {
     showVoiceStatus('Connecting...');
-    const resp = await fetch('/session', { method: 'POST' });
-    if (!resp.ok) {
-      const err = await resp.text();
-      throw new Error(err || `HTTP ${resp.status}`);
+    // Prefer API key from localStorage (supports tool calling).
+    // Fall back to server-minted ephemeral token (no tool calls on Gemini).
+    const lsKey = provider === 'gemini' ? 'gemini_api_key'
+                : provider === 'openai' ? 'openai_api_key' : null;
+    const apiKey = lsKey && localStorage.getItem(lsKey);
+    if (apiKey) {
+      pw.connect_voice(provider, apiKey, model, inputRate);
+    } else {
+      const resp = await fetch('/session', { method: 'POST' });
+      if (!resp.ok) {
+        const err = await resp.text();
+        throw new Error(err || `HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      pw.connect_voice(provider, data.token, model, inputRate);
     }
-    const data = await resp.json();
-    pw.connect_voice(provider, data.token, model, inputRate);
   } catch (e) {
     showVoiceStatus(`Session failed: ${e.message}`, true);
   } finally {
@@ -448,11 +457,15 @@ async function init() {
   pw.set_on_voice_text((text) => {
     showVoiceStatus(text);
     setTimeout(hideVoiceStatus, 5000);
+    // Forward voice text to server for TUI logging
+    pw.send_voice_log(text, undefined);
   });
 
   // Voice tool calls — dispatch via WASM, route by action type
   pw.set_on_voice_tool_call((call) => {
     const action = pw.dispatch_tool(call.name, call.args || {});
+    // Log tool call to server for TUI display
+    pw.send_voice_log(`[tool] ${call.name}(${JSON.stringify(call.args || {})})`, call.name);
 
     if (action.type === 'TextResult') {
       pw.send_voice_tool_response(call, { result: action.data });

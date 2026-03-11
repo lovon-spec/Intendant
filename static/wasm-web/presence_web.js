@@ -142,6 +142,15 @@ export class PresenceWeb {
         wasm.presenceweb_send_key(this.__wbg_ptr, ptr0, len0, ctrl, alt, shift);
     }
     /**
+     * Send a presence checkpoint to the server.
+     * @param {string} summary
+     */
+    send_presence_checkpoint(summary) {
+        const ptr0 = passStringToWasm0(summary, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.presenceweb_send_presence_checkpoint(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
      * @param {number} cols
      * @param {number} rows
      */
@@ -172,6 +181,18 @@ export class PresenceWeb {
         const ptr0 = passStringToWasm0(tool, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         wasm.presenceweb_send_tool_request(this.__wbg_ptr, ptr0, len0, args, on_result);
+    }
+    /**
+     * Send a voice transcript log entry to the server.
+     * @param {string} text
+     * @param {string | null} [tool_context]
+     */
+    send_voice_log(text, tool_context) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        var ptr1 = isLikeNone(tool_context) ? 0 : passStringToWasm0(tool_context, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len1 = WASM_VECTOR_LEN;
+        wasm.presenceweb_send_voice_log(this.__wbg_ptr, ptr0, len0, ptr1, len1);
     }
     /**
      * @param {any} call
@@ -644,6 +665,9 @@ function __wbg_get_imports() {
         __wbg_set_3f1d0b984ed272ed: function(arg0, arg1, arg2) {
             arg0[arg1] = arg2;
         },
+        __wbg_set_binaryType_5bbf62e9f705dc1a: function(arg0, arg1) {
+            arg0.binaryType = __wbindgen_enum_BinaryType[arg1];
+        },
         __wbg_set_f43e577aea94465b: function(arg0, arg1, arg2) {
             arg0[arg1 >>> 0] = arg2;
         },
@@ -738,6 +762,8 @@ function wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1(arg0, arg
     wasm.wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1(arg0, arg1, arg2);
 }
 
+
+const __wbindgen_enum_BinaryType = ["blob", "arraybuffer"];
 const PresenceWebFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_presenceweb_free(ptr >>> 0, 1));
