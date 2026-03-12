@@ -120,6 +120,11 @@ impl PresenceWeb {
     }
 
     #[wasm_bindgen]
+    pub fn set_on_diagnostic(&self, f: Function) {
+        *self.callbacks.on_diagnostic.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
     pub fn set_on_state_snapshot(&self, f: Function) {
         *self.callbacks.on_state_snapshot.borrow_mut() = Some(f);
     }
@@ -310,7 +315,7 @@ impl PresenceWeb {
     pub fn send_audio(&self, base64_pcm: &str) {
         match self.active_provider.borrow().as_str() {
             "gemini" => {
-                if let Some(ref g) = *self.gemini.borrow() {
+                if let Some(ref mut g) = *self.gemini.borrow_mut() {
                     g.send_audio(base64_pcm);
                 }
             }

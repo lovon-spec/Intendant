@@ -31,6 +31,8 @@ pub struct Callbacks {
     pub on_voice_interrupted: RefCell<Option<Function>>,
     /// Error from any connection.
     pub on_error: RefCell<Option<Function>>,
+    /// Diagnostic event (kind, detail) — for debug logging.
+    pub on_diagnostic: RefCell<Option<Function>>,
 }
 
 impl Callbacks {
@@ -91,6 +93,16 @@ impl Callbacks {
     pub fn invoke_error(&self, msg: &str) {
         if let Some(ref f) = *self.on_error.borrow() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_str(msg));
+        }
+    }
+
+    pub fn invoke_diagnostic(&self, kind: &str, detail: &str) {
+        if let Some(ref f) = *self.on_diagnostic.borrow() {
+            let _ = f.call2(
+                &JsValue::NULL,
+                &JsValue::from_str(kind),
+                &JsValue::from_str(detail),
+            );
         }
     }
 }

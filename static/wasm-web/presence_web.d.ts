@@ -71,6 +71,7 @@ export class PresenceWeb {
      */
     send_voice_log(text: string, tool_context?: string | null): void;
     send_voice_tool_response(call: any, result: any): void;
+    set_on_diagnostic(f: Function): void;
     set_on_error(f: Function): void;
     set_on_server_event(f: Function): void;
     set_on_server_state(f: Function): void;
@@ -181,6 +182,7 @@ export interface InitOutput {
     readonly presenceweb_send_voice_diagnostic: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_send_voice_log: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_send_voice_tool_response: (a: number, b: any, c: any) => void;
+    readonly presenceweb_set_on_diagnostic: (a: number, b: any) => void;
     readonly presenceweb_set_on_error: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_event: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_state: (a: number, b: any) => void;

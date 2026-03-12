@@ -36,6 +36,8 @@ pub struct GeminiProvider {
     _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
     _onclose: Option<Closure<dyn FnMut(CloseEvent)>>,
     _onerror: Option<Closure<dyn FnMut()>>,
+    /// Audio send counter for sampled diagnostics.
+    audio_send_count: u64,
 }
 
 impl GeminiProvider {
@@ -50,6 +52,7 @@ impl GeminiProvider {
             _onmessage: None,
             _onclose: None,
             _onerror: None,
+            audio_send_count: 0,
         }
     }
 
@@ -134,7 +137,14 @@ impl GeminiProvider {
         // onclose
         let callbacks_close = self.callbacks.clone();
         let onclose = Closure::wrap(Box::new(move |e: CloseEvent| {
-            callbacks_close.invoke_error(&format!("Gemini disconnected ({})", e.code()));
+            let reason = e.reason();
+            let detail = if reason.is_empty() {
+                format!("Gemini disconnected (code={})", e.code())
+            } else {
+                format!("Gemini disconnected (code={}, reason={})", e.code(), reason)
+            };
+            callbacks_close.invoke_diagnostic("gemini_close", &detail);
+            callbacks_close.invoke_error(&detail);
         }) as Box<dyn FnMut(CloseEvent)>);
         ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 
@@ -204,6 +214,7 @@ impl GeminiProvider {
     fn handle_message_static(callbacks: &Callbacks, msg: &serde_json::Value) {
         // setupComplete
         if msg.get("setupComplete").is_some() {
+            callbacks.invoke_diagnostic("gemini_msg", "setupComplete");
             callbacks.invoke_voice_ready();
             return;
         }
@@ -211,6 +222,10 @@ impl GeminiProvider {
         // toolCall
         if let Some(tool_call) = msg.get("toolCall") {
             if let Some(fcs) = tool_call.get("functionCalls").and_then(|v| v.as_array()) {
+                let names: Vec<&str> = fcs.iter()
+                    .filter_map(|fc| fc.get("name").and_then(|v| v.as_str()))
+                    .collect();
+                callbacks.invoke_diagnostic("gemini_msg", &format!("toolCall: {}", names.join(", ")));
                 for fc in fcs {
                     let call_js = to_js_object(fc);
                     callbacks.invoke_voice_tool_call(&call_js);
@@ -221,25 +236,32 @@ impl GeminiProvider {
 
         // toolCallCancellation — ignore
         if msg.get("toolCallCancellation").is_some() {
+            callbacks.invoke_diagnostic("gemini_msg", "toolCallCancellation");
             return;
         }
 
         // serverContent
         if let Some(response) = msg.get("serverContent") {
             if response.get("turnComplete").is_some() {
+                callbacks.invoke_diagnostic("gemini_msg", "turnComplete");
                 return;
             }
             if response.get("interrupted").is_some() {
+                callbacks.invoke_diagnostic("gemini_msg", "interrupted");
                 callbacks.invoke_voice_interrupted();
                 return;
             }
             if let Some(model_turn) = response.get("modelTurn") {
                 if let Some(parts) = model_turn.get("parts").and_then(|v| v.as_array()) {
+                    let mut has_audio = false;
+                    let mut has_text = false;
+                    let mut has_tool = false;
                     for part in parts {
                         // Audio data
                         if let Some(inline) = part.get("inlineData") {
                             if let Some(mime) = inline.get("mimeType").and_then(|v| v.as_str()) {
                                 if mime.starts_with("audio/") {
+                                    has_audio = true;
                                     if let Some(data) = inline.get("data").and_then(|v| v.as_str())
                                     {
                                         callbacks.invoke_voice_audio(data);
@@ -249,20 +271,30 @@ impl GeminiProvider {
                         }
                         // Text
                         if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                            has_text = true;
                             callbacks.invoke_voice_text(text);
                         }
                         // Function call in model turn
                         if part.get("functionCall").is_some() {
+                            has_tool = true;
                             let call_js = to_js_object(part.get("functionCall").unwrap());
                             callbacks.invoke_voice_tool_call(&call_js);
                         }
                     }
+                    let mut kinds = Vec::new();
+                    if has_audio { kinds.push("audio"); }
+                    if has_text { kinds.push("text"); }
+                    if has_tool { kinds.push("functionCall"); }
+                    callbacks.invoke_diagnostic(
+                        "gemini_msg",
+                        &format!("serverContent({})", kinds.join("+")),
+                    );
                 }
             }
         }
     }
 
-    pub fn send_audio(&self, base64_pcm: &str) {
+    pub fn send_audio(&mut self, base64_pcm: &str) {
         if let Some(ref ws) = self.ws {
             let msg = serde_json::json!({
                 "realtime_input": {
@@ -273,6 +305,16 @@ impl GeminiProvider {
                 }
             });
             let _ = ws.send_with_str(&msg.to_string());
+            self.audio_send_count += 1;
+            // Log every 100th audio chunk so we can verify audio is flowing
+            if self.audio_send_count % 100 == 1 {
+                self.callbacks.invoke_diagnostic(
+                    "audio_send",
+                    &format!("chunk #{} ({}B)", self.audio_send_count, base64_pcm.len()),
+                );
+            }
+        } else {
+            self.callbacks.invoke_diagnostic("audio_send", "DROPPED — no WebSocket");
         }
     }
 

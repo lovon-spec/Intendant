@@ -382,8 +382,19 @@ async function startMic() {
   workletNode = new AudioWorkletNode(audioCtx, 'audio-capture-processor', {
     processorOptions: { bufferSize: 4096 }
   });
+  let audioDropLogCount = 0;
   workletNode.port.onmessage = (e) => {
-    if (e.data.type !== 'audio' || !micActive || !modelConnected || !pw) return;
+    if (e.data.type !== 'audio') return;
+    if (!micActive || !modelConnected || !pw) {
+      audioDropLogCount++;
+      // Log first drop and every 100th after
+      if (audioDropLogCount === 1 || audioDropLogCount % 100 === 0) {
+        const reason = !micActive ? 'mic_off' : !modelConnected ? 'model_disconnected' : 'no_pw';
+        try { pw && pw.send_voice_diagnostic('audio_drop', `reason=${reason} count=${audioDropLogCount}`); } catch(_) {}
+      }
+      return;
+    }
+    audioDropLogCount = 0; // Reset when audio flows normally
     const resampled = downsample(e.data.data, nativeSR, targetSR);
     const pcm16 = new Int16Array(resampled.length);
     for (let i = 0; i < resampled.length; i++)
@@ -580,11 +591,17 @@ async function init() {
     try { pw.send_voice_diagnostic('interrupted', 'voice model interrupted by user'); } catch(_) {}
   });
   pw.set_on_error((msg) => {
-    modelConnected = false;
-    voiceDot.className = 'conn-dot err';
+    // Only kill voice for voice model errors, not server errors
+    if (!msg.startsWith('Server')) {
+      modelConnected = false;
+      voiceDot.className = 'conn-dot err';
+    }
     showVoiceStatus(msg, true);
     // Send diagnostic to server for TUI logging
     try { pw.send_voice_diagnostic('error', msg); } catch(_) {}
+  });
+  pw.set_on_diagnostic((kind, detail) => {
+    try { pw.send_voice_diagnostic(kind, detail); } catch(_) {}
   });
 
   term.onKey(({ domEvent }) => {

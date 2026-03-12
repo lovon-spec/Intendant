@@ -26,6 +26,7 @@ export const presenceweb_send_tool_request: (a: number, b: number, c: number, d:
 export const presenceweb_send_voice_diagnostic: (a: number, b: number, c: number, d: number, e: number) => void;
 export const presenceweb_send_voice_log: (a: number, b: number, c: number, d: number, e: number) => void;
 export const presenceweb_send_voice_tool_response: (a: number, b: any, c: any) => void;
+export const presenceweb_set_on_diagnostic: (a: number, b: any) => void;
 export const presenceweb_set_on_error: (a: number, b: any) => void;
 export const presenceweb_set_on_server_event: (a: number, b: any) => void;
 export const presenceweb_set_on_server_state: (a: number, b: any) => void;
