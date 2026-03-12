@@ -19,11 +19,10 @@ use callbacks::Callbacks;
 use js_sys::Function;
 use presence_core::wasm::WasmPresence;
 use presence_core::PresenceAction;
-use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
-/// Serialize a serde_json::Value to JsValue with maps as plain JS objects.
-fn to_js(val: &serde_json::Value) -> JsValue {
+/// Serialize any Serialize value to JsValue with maps as plain JS objects.
+fn to_js(val: &impl serde::Serialize) -> JsValue {
     val.serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
         .unwrap_or(JsValue::NULL)
 }
@@ -164,36 +163,26 @@ impl PresenceWeb {
                     Some("state_snapshot") => {
                         // Update presence state from bootstrap/reconnect
                         if let Some(state) = msg.get("state") {
-                            let state_js =
-                                serde_wasm_bindgen::to_value(state).unwrap_or(JsValue::NULL);
-                            presence.borrow_mut().set_state(state_js);
+                            presence.borrow_mut().set_state(to_js(state));
                         }
                         // Notify JS for voice model narration
-                        let snapshot_js =
-                            serde_wasm_bindgen::to_value(&msg).unwrap_or(JsValue::NULL);
-                        cb.invoke_state_snapshot(&snapshot_js);
+                        cb.invoke_state_snapshot(&to_js(&msg));
                     }
                     Some("presence_welcome") => {
                         // Update presence state from welcome
                         if let Some(state) = msg.get("state") {
-                            let state_js =
-                                serde_wasm_bindgen::to_value(state).unwrap_or(JsValue::NULL);
-                            presence.borrow_mut().set_state(state_js);
+                            presence.borrow_mut().set_state(to_js(state));
                         }
                         // Replay events from the window
                         if let Some(events) = msg.get("events").and_then(|v| v.as_array()) {
                             for event in events {
                                 if let Some(inner) = event.get("event") {
-                                    let event_js =
-                                        serde_wasm_bindgen::to_value(inner).unwrap_or(JsValue::NULL);
-                                    presence.borrow_mut().update_from_event(event_js);
+                                    presence.borrow_mut().update_from_event(to_js(inner));
                                 }
                             }
                         }
                         // Notify JS (same callback as state_snapshot)
-                        let welcome_js =
-                            serde_wasm_bindgen::to_value(&msg).unwrap_or(JsValue::NULL);
-                        cb.invoke_state_snapshot(&welcome_js);
+                        cb.invoke_state_snapshot(&to_js(&msg));
                     }
                     Some("presence_checkpoint_ack") => {
                         // Acknowledged — no action needed on browser side
@@ -202,10 +191,9 @@ impl PresenceWeb {
                         if let Some(id) = msg["id"].as_str() {
                             let resolver = pending.borrow_mut().remove(id);
                             if let Some(f) = resolver {
-                                let result_js = serde_wasm_bindgen::to_value(
-                                    &msg.get("result").unwrap_or(&serde_json::Value::Null),
-                                )
-                                .unwrap_or(JsValue::NULL);
+                                let result_js = to_js(
+                                    msg.get("result").unwrap_or(&serde_json::Value::Null),
+                                );
                                 let _ = f.call1(&JsValue::NULL, &result_js);
                             }
                         }
@@ -225,8 +213,7 @@ impl PresenceWeb {
                     _ => {
                         // Event messages (have "event" field)
                         if msg.get("event").is_some() {
-                            let event_js =
-                                serde_wasm_bindgen::to_value(&msg).unwrap_or(JsValue::NULL);
+                            let event_js = to_js(&msg);
                             // Update presence state (drop borrow before callback)
                             presence.borrow_mut().update_from_event(event_js.clone());
                             // Notify JS for voice model narration
@@ -268,8 +255,7 @@ impl PresenceWeb {
         input_sample_rate: Option<u32>,
     ) {
         let tools_val = presence_core::presence_tools();
-        let tools_js =
-            serde_wasm_bindgen::to_value(&tools_val).unwrap_or(JsValue::NULL);
+        let tools_js = to_js(&tools_val);
         let prompt = presence_core::DEFAULT_PRESENCE_PROMPT;
 
         *self.active_provider.borrow_mut() = provider.to_string();
@@ -439,7 +425,7 @@ impl PresenceWeb {
     /// Get presence tools as JS array (from presence-core).
     #[wasm_bindgen]
     pub fn get_tools(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&presence_core::presence_tools()).unwrap_or(JsValue::NULL)
+        to_js(&presence_core::presence_tools())
     }
 
     /// Get presence system prompt (from presence-core).

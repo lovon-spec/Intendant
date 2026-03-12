@@ -418,16 +418,17 @@ function stopMic() {
 const audioQueue = [];
 let isPlaying = false;
 
+let playbackCtx = null;
 function playAudioChunk(b64data) {
   const outRate = gatewayConfig ? gatewayConfig.output_sample_rate : 24000;
-  if (!audioCtx) audioCtx = new AudioContext({ sampleRate: outRate });
+  if (!playbackCtx) playbackCtx = new AudioContext({ sampleRate: outRate });
   const binary = atob(b64data);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   const pcm16 = new Int16Array(bytes.buffer);
   const float32 = new Float32Array(pcm16.length);
   for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
-  const buffer = audioCtx.createBuffer(1, float32.length, outRate);
+  const buffer = playbackCtx.createBuffer(1, float32.length, outRate);
   buffer.copyToChannel(float32, 0);
   audioQueue.push(buffer);
   if (!isPlaying) playNext();
@@ -437,9 +438,9 @@ function playNext() {
   if (audioQueue.length === 0) { isPlaying = false; return; }
   isPlaying = true;
   const buffer = audioQueue.shift();
-  const src = audioCtx.createBufferSource();
+  const src = playbackCtx.createBufferSource();
   src.buffer = buffer;
-  src.connect(audioCtx.destination);
+  src.connect(playbackCtx.destination);
   src.onended = playNext;
   src.start();
 }
