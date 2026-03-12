@@ -176,6 +176,10 @@ pub struct App {
 
     // Shared presence session for event window population
     pub presence_session: Option<std::sync::Arc<std::sync::Mutex<crate::presence::PresenceSession>>>,
+
+    // Voice turn counter — increments on each voice session (PresenceConnected).
+    // Used to group voice diagnostics/logs for collapse in the TUI.
+    pub voice_turn: usize,
 }
 
 impl App {
@@ -234,6 +238,7 @@ impl App {
             knowledge_path: None,
             session_log: None,
             presence_session: None,
+            voice_turn: 0,
         }
     }
 
@@ -1527,12 +1532,14 @@ impl App {
                 }
             }
             AppEvent::PresenceConnected { live_provider, live_model, .. } => {
+                // New voice session — increment turn for collapsing
+                self.voice_turn += 1;
                 let p_display = live_provider.as_deref().unwrap_or("unknown");
                 let m_display = live_model.as_deref().unwrap_or("unknown");
-                self.log(LogLevel::Detail, format!(
+                self.log_sourced(LogLevel::Detail, format!(
                     "Browser presence connected ({}:{}) — server presence paused",
                     p_display, m_display
-                ));
+                ), LogSource::Presence, Some(self.voice_turn));
                 if let Some(ref flag) = self.presence_paused {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1554,7 +1561,8 @@ impl App {
                 }
             }
             AppEvent::PresenceDisconnected => {
-                self.log(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string());
+                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                self.log_sourced(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string(), LogSource::Presence, vt);
                 if let Some(ref flag) = self.presence_paused {
                     flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1574,7 +1582,8 @@ impl App {
                 };
                 // Tool calls at Detail, voice text at Info (visible at Normal)
                 let lvl = if ctx.is_empty() { LogLevel::Info } else { LogLevel::Detail };
-                self.log_sourced(lvl, msg, LogSource::Presence, None);
+                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                self.log_sourced(lvl, msg, LogSource::Presence, vt);
                 // Persist to session log
                 if let Some(ref sl) = self.session_log {
                     if let Ok(mut log) = sl.lock() {
@@ -1596,9 +1605,15 @@ impl App {
                     }
                 }
             }
-            AppEvent::VoiceDiagnostic { kind, detail } => {
+            AppEvent::VoiceDiagnostic { ref kind, ref detail } => {
                 let msg = format!("[voice:{}] {}", kind, detail);
-                self.log_sourced(LogLevel::Debug, msg, LogSource::Presence, None);
+                // Errors/disconnects at Warn (always visible), routine at Debug
+                let lvl = match kind.as_str() {
+                    "error" | "gemini_close" => LogLevel::Warn,
+                    _ => LogLevel::Debug,
+                };
+                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                self.log_sourced(lvl, msg, LogSource::Presence, vt);
             }
             AppEvent::Tick => {
                 self.tick_count += 1;

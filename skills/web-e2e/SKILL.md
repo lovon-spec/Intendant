@@ -193,9 +193,9 @@ DISPLAY=:50 import -window root /tmp/web-e2e-screenshot.png
   Note: `["AUDIO"]` mode still sends BOTH audio AND text parts — the model
   outputs text alongside audio. The restriction is about what you request, not
   what the model produces.
-- **Firefox WASM cache**: After rebuilding WASM, you MUST clear the cache manually:
-  `rm -rf ~/.mozilla/firefox/*/cache2/ ~/.cache/mozilla/firefox/*/cache2/`
-  then relaunch Firefox. Ctrl+Shift+R is NOT sufficient.
+- **WASM cache**: Content-hash versioning (`?v=<hash>`) on WASM/JS URLs means
+  browsers automatically fetch new assets after rebuilds. No manual cache
+  clearing needed.
 - **WASM rebuild**: From `crates/presence-web/`:
   `wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web`
   Then `cargo build --release -p intendant` (use `-p intendant` to skip WASM-only crate).
