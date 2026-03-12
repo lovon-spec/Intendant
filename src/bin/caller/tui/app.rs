@@ -1596,7 +1596,7 @@ impl App {
             }
             AppEvent::VoiceDiagnostic { kind, detail } => {
                 let msg = format!("[voice:{}] {}", kind, detail);
-                self.log_sourced(LogLevel::Warn, msg, LogSource::Presence, None);
+                self.log_sourced(LogLevel::Debug, msg, LogSource::Presence, None);
             }
             AppEvent::Tick => {
                 self.tick_count += 1;

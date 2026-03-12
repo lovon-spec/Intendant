@@ -1,5 +1,6 @@
 //! Gemini Live (BidiGenerateContent) WebSocket voice provider.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use web_sys::{CloseEvent, MessageEvent, WebSocket};
@@ -36,8 +37,8 @@ pub struct GeminiProvider {
     _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
     _onclose: Option<Closure<dyn FnMut(CloseEvent)>>,
     _onerror: Option<Closure<dyn FnMut()>>,
-    /// Audio send counter for sampled diagnostics.
-    audio_send_count: u64,
+    /// Audio send counter for diagnostics.
+    audio_send_count: Cell<u64>,
 }
 
 impl GeminiProvider {
@@ -52,7 +53,7 @@ impl GeminiProvider {
             _onmessage: None,
             _onclose: None,
             _onerror: None,
-            audio_send_count: 0,
+            audio_send_count: Cell::new(0),
         }
     }
 
@@ -294,7 +295,7 @@ impl GeminiProvider {
         }
     }
 
-    pub fn send_audio(&mut self, base64_pcm: &str) {
+    pub fn send_audio(&self, base64_pcm: &str) {
         if let Some(ref ws) = self.ws {
             let msg = serde_json::json!({
                 "realtime_input": {
@@ -305,10 +306,11 @@ impl GeminiProvider {
                 }
             });
             let _ = ws.send_with_str(&msg.to_string());
-            self.audio_send_count += 1;
+            let count = self.audio_send_count.get() + 1;
+            self.audio_send_count.set(count);
             self.callbacks.invoke_diagnostic(
                 "audio_send",
-                &format!("chunk #{} ({}B)", self.audio_send_count, base64_pcm.len()),
+                &format!("chunk #{} ({}B)", count, base64_pcm.len()),
             );
         } else {
             self.callbacks.invoke_diagnostic("audio_send", "DROPPED — no WebSocket");
