@@ -151,6 +151,17 @@ impl Default for WebGatewayConfig {
 /// - WebSocket connections are bridged to the EventBus (inbound control
 ///   messages) and broadcast channel (outbound events), mirroring the
 ///   Unix control socket in `control.rs`.
+/// Compute a short content hash for cache-busting embedded static assets.
+/// When the WASM or JS changes (i.e. a new build), the hash changes,
+/// the URL changes, and browsers fetch the new version.
+fn asset_version_hash() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    WASM_WEB_BIN.hash(&mut hasher);
+    WASM_WEB_JS.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 pub fn spawn_web_gateway(
     port: u16,
     bus: EventBus,
@@ -159,9 +170,23 @@ pub fn spawn_web_gateway(
     query_ctx: Option<WebQueryCtx>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+
+    // Inject content-hash version into WASM/JS URLs for cache-busting.
+    let v = asset_version_hash();
+    let web_html = WEB_HTML
+        .replace(
+            "/wasm-web/presence_web.js",
+            &format!("/wasm-web/presence_web.js?v={}", v),
+        )
+        .replace(
+            "/wasm-web/presence_web_bg.wasm",
+            &format!("/wasm-web/presence_web_bg.wasm?v={}", v),
+        );
     let session_provider = config.provider.clone();
     let session_model = config.model.clone();
     let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
+
+    let web_html = Arc::new(web_html);
 
     tokio::spawn(async move {
         let addr = format!("0.0.0.0:{}", port);
@@ -186,6 +211,7 @@ pub fn spawn_web_gateway(
             let voice_debug = voice_debug.clone();
             let session_provider = session_provider.clone();
             let session_model = session_model.clone();
+            let web_html = web_html.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -562,7 +588,7 @@ pub fn spawn_web_gateway(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/wasm\r\n\
                              Content-Length: {}\r\n\
-                             Cache-Control: public, max-age=60\r\n\
+                             Cache-Control: public, max-age=31536000, immutable\r\n\
                              Connection: close\r\n\
                              \r\n",
                             wasm_data.len()
@@ -609,25 +635,27 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else {
-                        let (content_type, body) = if request_line.contains("/wasm-web/presence_web.js") {
-                            ("application/javascript", WASM_WEB_JS)
+                        let (content_type, body, cache) = if request_line.contains("/wasm-web/presence_web.js") {
+                            ("application/javascript", WASM_WEB_JS.to_string(), "public, max-age=31536000, immutable")
                         } else if request_line.contains("/audio-processor.js") {
-                            ("application/javascript", AUDIO_PROCESSOR_JS)
+                            ("application/javascript", AUDIO_PROCESSOR_JS.to_string(), "no-cache")
                         } else if request_line.contains("/config") {
-                            ("application/json", config_json.as_str())
+                            ("application/json", config_json.clone(), "no-cache")
                         } else {
-                            ("text/html; charset=utf-8", WEB_HTML)
+                            ("text/html; charset=utf-8", web_html.to_string(), "no-cache")
                         };
 
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: {}\r\n\
                              Content-Length: {}\r\n\
+                             Cache-Control: {}\r\n\
                              Connection: close\r\n\
                              \r\n\
                              {}",
                             content_type,
                             body.len(),
+                            cache,
                             body
                         );
                         let _ = stream.try_write(response.as_bytes());
