@@ -1572,7 +1572,9 @@ impl App {
                 } else {
                     format!("[voice #{seq} ({})] {text}", ctx)
                 };
-                self.log_sourced(LogLevel::Detail, msg, LogSource::Presence, None);
+                // Tool calls at Detail, voice text at Info (visible at Normal)
+                let lvl = if ctx.is_empty() { LogLevel::Info } else { LogLevel::Detail };
+                self.log_sourced(lvl, msg, LogSource::Presence, None);
                 // Persist to session log
                 if let Some(ref sl) = self.session_log {
                     if let Ok(mut log) = sl.lock() {
