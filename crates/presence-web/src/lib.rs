@@ -275,9 +275,18 @@ impl PresenceWeb {
             }
         }
 
-        // Notify server of live model connection
+        // Tell server which voice model we connected, then mark live
+        let actual_model = model.as_deref().unwrap_or(match provider {
+            "gemini" => "gemini-2.5-flash-native-audio-preview-12-2025",
+            "openai" => "gpt-4o-realtime-preview",
+            _ => "unknown",
+        });
+        {
+            let mut srv = self.server.borrow_mut();
+            srv.set_active_voice(provider, actual_model);
+            srv.set_voice_live(true);
+        }
         self.server.borrow().send_live_connected();
-        self.server.borrow_mut().set_voice_live(true);
     }
 
     #[wasm_bindgen]
@@ -290,9 +299,11 @@ impl PresenceWeb {
         }
         *self.active_provider.borrow_mut() = String::new();
 
-        // Notify server
+        // Notify server and clear voice state
         self.server.borrow().send_live_disconnected();
-        self.server.borrow_mut().set_voice_live(false);
+        let mut srv = self.server.borrow_mut();
+        srv.set_voice_live(false);
+        srv.set_active_voice("", "");
     }
 
     #[wasm_bindgen]
@@ -560,6 +571,16 @@ impl PresenceWeb {
                 Some(format!(
                     "[System: done] {}. Tell the user briefly.",
                     reason
+                ))
+            }
+            "round_complete" => {
+                let round = evt_val["round"].as_u64().unwrap_or(0);
+                let turns = evt_val["turns_in_round"].as_u64().unwrap_or(0);
+                Some(format!(
+                    "[System: round {} complete ({} turns)] The task finished. \
+                     Summarize what was done and ask the user if they need anything else. \
+                     If they give you a new task, use submit_task.",
+                    round, turns
                 ))
             }
             "status" => {

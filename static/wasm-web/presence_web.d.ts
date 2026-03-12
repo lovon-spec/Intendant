@@ -63,6 +63,10 @@ export class PresenceWeb {
      */
     send_tool_request(tool: string, args: any, on_result: Function): void;
     /**
+     * Send a voice diagnostic to the server (errors, silence, disconnects).
+     */
+    send_voice_diagnostic(kind: string, detail: string): void;
+    /**
      * Send a voice transcript log entry to the server.
      */
     send_voice_log(text: string, tool_context?: string | null): void;
@@ -174,6 +178,7 @@ export interface InitOutput {
     readonly presenceweb_send_server_action: (a: number, b: any) => void;
     readonly presenceweb_send_text: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_tool_request: (a: number, b: number, c: number, d: any, e: any) => void;
+    readonly presenceweb_send_voice_diagnostic: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_send_voice_log: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_send_voice_tool_response: (a: number, b: any, c: any) => void;
     readonly presenceweb_set_on_error: (a: number, b: any) => void;

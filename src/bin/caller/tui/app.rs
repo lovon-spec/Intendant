@@ -1377,12 +1377,22 @@ impl App {
                 self.current_phase = Phase::Done;
             }
             AppEvent::PresenceLog { message, level, turn } => {
+                let lvl = level.unwrap_or(LogLevel::Info);
+                let is_debug = lvl == LogLevel::Debug;
                 self.log_sourced(
-                    level.unwrap_or(LogLevel::Info),
+                    lvl,
                     format!("[presence] {}", message),
                     LogSource::Presence,
                     turn,
                 );
+                // Persist debug-level presence logs (tool_request, tool_response, etc.) to session log
+                if is_debug {
+                    if let Some(ref sl) = self.session_log {
+                        if let Ok(mut log) = sl.lock() {
+                            log.debug(&message);
+                        }
+                    }
+                }
             }
             AppEvent::HumanQuestionDetected { question } => {
                 self.human_question = Some(question.clone());
@@ -1517,22 +1527,42 @@ impl App {
                 }
             }
             AppEvent::PresenceConnected { live_provider, live_model, .. } => {
-                self.log(LogLevel::Detail, "Browser presence connected — server presence paused".to_string());
+                let p_display = live_provider.as_deref().unwrap_or("unknown");
+                let m_display = live_model.as_deref().unwrap_or("unknown");
+                self.log(LogLevel::Detail, format!(
+                    "Browser presence connected ({}:{}) — server presence paused",
+                    p_display, m_display
+                ));
                 if let Some(ref flag) = self.presence_paused {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Update displayed model/provider to the live model
-                if let Some(provider) = live_provider {
-                    self.presence_provider_name = Some(provider);
+                if let Some(ref provider) = live_provider {
+                    self.presence_provider_name = Some(provider.clone());
                 }
-                if let Some(model) = live_model {
-                    self.presence_model_name = Some(model);
+                if let Some(ref model) = live_model {
+                    self.presence_model_name = Some(model.clone());
+                }
+                // Persist to session log
+                if let Some(ref sl) = self.session_log {
+                    if let Ok(mut log) = sl.lock() {
+                        log.presence_connected(
+                            live_provider.as_deref(),
+                            live_model.as_deref(),
+                        );
+                    }
                 }
             }
             AppEvent::PresenceDisconnected => {
                 self.log(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string());
                 if let Some(ref flag) = self.presence_paused {
                     flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Persist to session log
+                if let Some(ref sl) = self.session_log {
+                    if let Ok(mut log) = sl.lock() {
+                        log.presence_disconnected();
+                    }
                 }
             }
             AppEvent::VoiceLog { ref text, seq, ref tool_context } => {

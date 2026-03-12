@@ -1,5 +1,6 @@
 use crate::presence::{self, AgentStateSnapshot};
 use crate::event::{AppEvent, ControlMsg, EventBus};
+use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -275,11 +276,21 @@ pub fn spawn_web_gateway(
                                         Some("live_connected") => {
                                             is_presence_connected = true;
                                             voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = true;
+                                            let msg_provider = json.get("provider")
+                                                .and_then(|v| v.as_str())
+                                                .filter(|s| !s.is_empty())
+                                                .map(String::from)
+                                                .unwrap_or_else(|| live_provider.clone());
+                                            let msg_model = json.get("model")
+                                                .and_then(|v| v.as_str())
+                                                .filter(|s| !s.is_empty())
+                                                .map(String::from)
+                                                .unwrap_or_else(|| live_model.clone());
                                             bus_inbound.send(AppEvent::PresenceConnected {
                                                 server_session_id: None,
                                                 last_event_seq: 0,
-                                                live_provider: Some(live_provider.clone()),
-                                                live_model: Some(live_model.clone()),
+                                                live_provider: Some(msg_provider),
+                                                live_model: Some(msg_model),
                                             });
                                         }
                                         Some("live_disconnected") => {
@@ -296,6 +307,18 @@ pub fn spawn_web_gateway(
                                             let last_event_seq = json.get("last_event_seq")
                                                 .and_then(|v| v.as_u64())
                                                 .unwrap_or(0);
+                                            // Use provider/model from the browser if sent,
+                                            // fall back to config defaults.
+                                            let msg_provider = json.get("provider")
+                                                .and_then(|v| v.as_str())
+                                                .filter(|s| !s.is_empty())
+                                                .map(String::from)
+                                                .unwrap_or_else(|| live_provider.clone());
+                                            let msg_model = json.get("model")
+                                                .and_then(|v| v.as_str())
+                                                .filter(|s| !s.is_empty())
+                                                .map(String::from)
+                                                .unwrap_or_else(|| live_model.clone());
 
                                             // Send welcome with replay window if presence session is available
                                             if let Some(ref ctx) = query_ctx_inbound {
@@ -321,8 +344,8 @@ pub fn spawn_web_gateway(
                                             bus_inbound.send(AppEvent::PresenceConnected {
                                                 server_session_id,
                                                 last_event_seq,
-                                                live_provider: Some(live_provider.clone()),
-                                                live_model: Some(live_model.clone()),
+                                                live_provider: Some(msg_provider),
+                                                live_model: Some(msg_model),
                                             });
                                         }
                                         Some("presence_disconnect") => {
@@ -396,6 +419,17 @@ pub fn spawn_web_gateway(
                                             let args = json.get("args").cloned()
                                                 .unwrap_or(serde_json::Value::Object(Default::default()));
 
+                                            // Log the incoming tool request at Debug level
+                                            let args_preview = {
+                                                let s = serde_json::to_string(&args).unwrap_or_default();
+                                                if s.len() > 200 { format!("{}...", &s[..200]) } else { s }
+                                            };
+                                            bus_inbound.send(AppEvent::PresenceLog {
+                                                message: format!("[tool_request] {}({})", tool, args_preview),
+                                                level: Some(LogLevel::Debug),
+                                                turn: None,
+                                            });
+
                                             // Dispatch through presence-core (single canonical layer)
                                             let state = query_ctx_inbound.as_ref()
                                                 .map(|ctx| ctx.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone())
@@ -430,6 +464,18 @@ pub fn spawn_web_gateway(
                                                     _ => unreachable!(),
                                                 }
                                             };
+
+                                            // Log the tool response at Debug level
+                                            let result_preview = if result.len() > 200 {
+                                                format!("{}...", &result[..200])
+                                            } else {
+                                                result.clone()
+                                            };
+                                            bus_inbound.send(AppEvent::PresenceLog {
+                                                message: format!("[tool_response] {} → {}", tool, result_preview),
+                                                level: Some(LogLevel::Debug),
+                                                turn: None,
+                                            });
 
                                             let response = serde_json::json!({
                                                 "t": "tool_response",
@@ -1199,18 +1245,23 @@ mod tests {
         .unwrap();
 
         // Should emit a ControlCommand(Approve) on the EventBus
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
-
-        match event {
-            AppEvent::ControlCommand(ControlMsg::Approve { id }) => assert_eq!(id, 42),
-            _ => panic!("expected ControlCommand(Approve), got {:?}", event),
+        // (may be preceded by PresenceLog debug events)
+        let mut found = false;
+        for _ in 0..10 {
+            let event = tokio::time::timeout(
+                tokio::time::Duration::from_secs(2),
+                rx.recv(),
+            )
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+            if let AppEvent::ControlCommand(ControlMsg::Approve { id }) = event {
+                assert_eq!(id, 42);
+                found = true;
+                break;
+            }
         }
+        assert!(found, "expected ControlCommand(Approve)");
 
         // Should also get a tool_response back
         // Drain bootstrap first

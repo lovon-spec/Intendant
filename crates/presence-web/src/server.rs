@@ -20,6 +20,10 @@ pub struct ServerConnection {
     connected: bool,
     /// Whether the voice model is live (for re-sending presence_connect on reconnect).
     voice_live: bool,
+    /// Active voice provider name (e.g. "gemini", "openai") — sent in presence_connect.
+    active_provider: String,
+    /// Active voice model name — sent in presence_connect.
+    active_model: String,
     callbacks: Rc<Callbacks>,
     /// Closures must be stored to prevent drop while WebSocket holds references.
     _onopen: Option<Closure<dyn FnMut()>>,
@@ -44,6 +48,8 @@ impl ServerConnection {
             url: String::new(),
             connected: false,
             voice_live: false,
+            active_provider: String::new(),
+            active_model: String::new(),
             callbacks,
             _onopen: None,
             _onmessage: None,
@@ -62,6 +68,12 @@ impl ServerConnection {
 
     pub fn set_voice_live(&mut self, live: bool) {
         self.voice_live = live;
+    }
+
+    /// Set the active voice provider and model (sent in presence_connect messages).
+    pub fn set_active_voice(&mut self, provider: &str, model: &str) {
+        self.active_provider = provider.to_string();
+        self.active_model = model.to_string();
     }
 
     /// Set a handler for parsed server messages.
@@ -103,18 +115,30 @@ impl ServerConnection {
         let voice_open = voice_live_flag.clone();
         let session_id_ref = Rc::new(RefCell::new(self.server_session_id.clone()));
         let last_seq_ref = Rc::new(RefCell::new(self.last_event_seq));
+        let provider_ref = Rc::new(RefCell::new(self.active_provider.clone()));
+        let model_ref = Rc::new(RefCell::new(self.active_model.clone()));
         let session_id_open = session_id_ref.clone();
         let last_seq_open = last_seq_ref.clone();
+        let provider_open = provider_ref.clone();
+        let model_open = model_ref.clone();
         let onopen = Closure::wrap(Box::new(move || {
             *connected_open.borrow_mut() = true;
             callbacks_open.invoke_server_state(true);
             // Re-send presence_connect if voice model was active before reconnect
             if *voice_open.borrow() {
-                let msg = serde_json::json!({
+                let mut msg = serde_json::json!({
                     "t": "presence_connect",
                     "server_session_id": *session_id_open.borrow(),
                     "last_event_seq": *last_seq_open.borrow(),
                 });
+                let p = provider_open.borrow();
+                if !p.is_empty() {
+                    msg["provider"] = serde_json::Value::String(p.clone());
+                }
+                let m = model_open.borrow();
+                if !m.is_empty() {
+                    msg["model"] = serde_json::Value::String(m.clone());
+                }
                 let _ = ws_clone.send_with_str(&msg.to_string());
             }
         }) as Box<dyn FnMut()>);
@@ -213,12 +237,19 @@ impl ServerConnection {
     }
 
     /// Send presence_connect notification (replaces live_connected).
+    /// Includes the active voice provider/model so the server can display the correct name.
     pub fn send_presence_connect(&self) {
-        let msg = serde_json::json!({
+        let mut msg = serde_json::json!({
             "t": "presence_connect",
             "server_session_id": self.server_session_id,
             "last_event_seq": self.last_event_seq,
         });
+        if !self.active_provider.is_empty() {
+            msg["provider"] = serde_json::Value::String(self.active_provider.clone());
+        }
+        if !self.active_model.is_empty() {
+            msg["model"] = serde_json::Value::String(self.active_model.clone());
+        }
         self.send_json(&msg);
     }
 

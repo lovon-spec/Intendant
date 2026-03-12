@@ -357,6 +357,73 @@ impl SessionLog {
         });
     }
 
+    /// Log a browser presence connect event.
+    pub fn presence_connected(&mut self, provider: Option<&str>, model: Option<&str>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "presence_connected".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Browser presence connected ({}:{})",
+                provider.unwrap_or("unknown"),
+                model.unwrap_or("unknown"),
+            )),
+            data: Some(serde_json::json!({
+                "provider": provider,
+                "model": model,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a browser presence disconnect event.
+    pub fn presence_disconnected(&mut self) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "presence_disconnected".to_string(),
+            level: Some("info".to_string()),
+            message: Some("Browser presence disconnected".to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a tool request received from the browser presence model.
+    pub fn tool_request(&mut self, tool: &str, args: &serde_json::Value) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "tool_request".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!("{}({})", tool, serde_json::to_string(args).unwrap_or_default())),
+            data: Some(serde_json::json!({
+                "tool": tool,
+                "args": args,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a tool response sent back to the browser presence model.
+    pub fn tool_response(&mut self, tool: &str, result: &str) {
+        let preview = if result.len() > 200 { &result[..200] } else { result };
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "tool_response".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!("{} → {}", tool, preview)),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
     pub fn error(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
@@ -1269,5 +1336,63 @@ mod tests {
         assert_eq!(last["event"], "presence_checkpoint");
         assert_eq!(last["message"], "Agent completed 3 tasks");
         assert_eq!(last["data"]["last_event_seq"], 15);
+    }
+
+    #[test]
+    fn presence_connected_writes_jsonl_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.presence_connected(Some("gemini"), Some("gemini-2.5-flash-native-audio"));
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["event"], "presence_connected");
+        assert_eq!(last["data"]["provider"], "gemini");
+        assert_eq!(last["data"]["model"], "gemini-2.5-flash-native-audio");
+    }
+
+    #[test]
+    fn presence_disconnected_writes_jsonl_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.presence_disconnected();
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["event"], "presence_disconnected");
+    }
+
+    #[test]
+    fn tool_request_writes_jsonl_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let args = serde_json::json!({"id": 42});
+        log.tool_request("approve_action", &args);
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["event"], "tool_request");
+        assert_eq!(last["data"]["tool"], "approve_action");
+        assert_eq!(last["data"]["args"]["id"], 42);
+    }
+
+    #[test]
+    fn tool_response_writes_jsonl_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.tool_response("check_status", "Phase: idle, Turn: 0");
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["event"], "tool_response");
+        assert!(last["message"].as_str().unwrap().contains("check_status"));
     }
 }
