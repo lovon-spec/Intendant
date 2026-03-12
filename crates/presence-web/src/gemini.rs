@@ -39,6 +39,9 @@ pub struct GeminiProvider {
     _onerror: Option<Closure<dyn FnMut()>>,
     /// Audio send counter for diagnostics.
     audio_send_count: Cell<u64>,
+    /// Pauses audio sending while a blocking tool call is pending.
+    /// Set to true on toolCall, cleared on tool_response send.
+    tool_call_pending: Rc<Cell<bool>>,
 }
 
 impl GeminiProvider {
@@ -54,6 +57,7 @@ impl GeminiProvider {
             _onclose: None,
             _onerror: None,
             audio_send_count: Cell::new(0),
+            tool_call_pending: Rc::new(Cell::new(false)),
         }
     }
 
@@ -117,6 +121,7 @@ impl GeminiProvider {
         // BidiGenerateContentConstrained sends binary (ArrayBuffer) frames,
         // while BidiGenerateContent sends text frames. Handle both.
         let callbacks = self.callbacks.clone();
+        let pending = self.tool_call_pending.clone();
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             let text = if let Some(s) = e.data().as_string() {
                 Some(s)
@@ -129,7 +134,7 @@ impl GeminiProvider {
             };
             if let Some(text) = text {
                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
-                    Self::handle_message_static(&callbacks, &msg);
+                    Self::handle_message_static(&callbacks, &pending, &msg);
                 }
             }
         }) as Box<dyn FnMut(MessageEvent)>);
@@ -212,7 +217,7 @@ impl GeminiProvider {
         setup.to_string()
     }
 
-    fn handle_message_static(callbacks: &Callbacks, msg: &serde_json::Value) {
+    fn handle_message_static(callbacks: &Callbacks, tool_call_pending: &Rc<Cell<bool>>, msg: &serde_json::Value) {
         // setupComplete
         if msg.get("setupComplete").is_some() {
             callbacks.invoke_diagnostic("gemini_msg", "setupComplete");
@@ -220,13 +225,14 @@ impl GeminiProvider {
             return;
         }
 
-        // toolCall
+        // toolCall — pause audio until tool_response is sent
         if let Some(tool_call) = msg.get("toolCall") {
             if let Some(fcs) = tool_call.get("functionCalls").and_then(|v| v.as_array()) {
+                tool_call_pending.set(true);
                 let names: Vec<&str> = fcs.iter()
                     .filter_map(|fc| fc.get("name").and_then(|v| v.as_str()))
                     .collect();
-                callbacks.invoke_diagnostic("gemini_msg", &format!("toolCall: {}", names.join(", ")));
+                callbacks.invoke_diagnostic("gemini_msg", &format!("toolCall: {} (audio paused)", names.join(", ")));
                 for fc in fcs {
                     let call_js = to_js_object(fc);
                     callbacks.invoke_voice_tool_call(&call_js);
@@ -235,9 +241,10 @@ impl GeminiProvider {
             return;
         }
 
-        // toolCallCancellation — ignore
+        // toolCallCancellation — resume audio
         if msg.get("toolCallCancellation").is_some() {
-            callbacks.invoke_diagnostic("gemini_msg", "toolCallCancellation");
+            tool_call_pending.set(false);
+            callbacks.invoke_diagnostic("gemini_msg", "toolCallCancellation (audio resumed)");
             return;
         }
 
@@ -275,9 +282,10 @@ impl GeminiProvider {
                             has_text = true;
                             callbacks.invoke_voice_text(text);
                         }
-                        // Function call in model turn
+                        // Function call in model turn — pause audio
                         if part.get("functionCall").is_some() {
                             has_tool = true;
+                            tool_call_pending.set(true);
                             let call_js = to_js_object(part.get("functionCall").unwrap());
                             callbacks.invoke_voice_tool_call(&call_js);
                         }
@@ -296,6 +304,11 @@ impl GeminiProvider {
     }
 
     pub fn send_audio(&self, base64_pcm: &str) {
+        // Gemini Live API requires audio to stop while a blocking tool call
+        // is pending. Sending audio during a tool call causes 1008 disconnect.
+        if self.tool_call_pending.get() {
+            return;
+        }
         if let Some(ref ws) = self.ws {
             let msg = serde_json::json!({
                 "realtime_input": {
@@ -352,6 +365,8 @@ impl GeminiProvider {
                 }
             });
             let _ = ws.send_with_str(&msg.to_string());
+            // Resume audio after tool response is sent
+            self.tool_call_pending.set(false);
         }
     }
 
