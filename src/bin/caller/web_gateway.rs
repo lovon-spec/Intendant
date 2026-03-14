@@ -644,8 +644,8 @@ pub fn spawn_web_gateway(
                              \r\n",
                             wasm_data.len()
                         );
-                        let _ = stream.try_write(header.as_bytes());
                         use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(wasm_data).await;
                     } else if request_line.starts_with("POST") && request_line.contains("/session") {
                         let result = mint_session_token(&session_provider, &session_model).await;
@@ -709,10 +709,9 @@ pub fn spawn_web_gateway(
                             cache,
                             body
                         );
-                        let _ = stream.try_write(response.as_bytes());
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     }
-                    // Give the client time to receive before dropping.
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 }
             });
         }
