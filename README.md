@@ -6,13 +6,13 @@ A Rust runtime for autonomous AI agents with process lifecycle management. Inten
 
 ```
                           ┌─────────────────────────────┐
-                          │     intendant (caller)       │
+                          │     intendant (caller)      │
                           │                             │
-  TUI / MCP / Web ◄─────┤  presence ── agent loop ──┐ │
+  TUI / MCP / Web   ◄─────┤ presence ── agent loop ── ┐ │
                           │     │           │         │ │
-                          │     │      ┌────┴────┐    │ │
-                          │     │      │ sub-agents│   │ │
-                          │     │      └─────────┘    │ │
+                          │     │     ┌─────┴─────┐   │ │
+                          │     │     │sub-agents │   │ │
+                          │     │     └───────────┘   │ │
                           └─────┼─────────────────────┼─┘
                                 │                     │
                                 v                     v
