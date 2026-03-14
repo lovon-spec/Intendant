@@ -159,6 +159,11 @@ impl OpenAIProvider {
                     callbacks.invoke_voice_text(delta);
                 }
             }
+            "response.audio_transcript.delta" => {
+                if let Some(delta) = msg["delta"].as_str() {
+                    callbacks.invoke_voice_transcript(delta);
+                }
+            }
             "response.function_call_arguments.done" => {
                 let call = serde_json::json!({
                     "name": msg["name"],

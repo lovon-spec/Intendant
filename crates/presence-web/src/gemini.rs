@@ -201,6 +201,7 @@ impl GeminiProvider {
                         }
                     }
                 },
+                "output_audio_transcription": {},
                 "system_instruction": {
                     "parts": [{ "text": system_prompt }]
                 },
@@ -243,6 +244,15 @@ impl GeminiProvider {
 
         // serverContent
         if let Some(response) = msg.get("serverContent") {
+            // Output audio transcription (text of what was spoken)
+            if let Some(transcript) = response.get("outputTranscription") {
+                if let Some(text) = transcript.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        callbacks.invoke_voice_transcript(text);
+                    }
+                }
+                return;
+            }
             if response.get("turnComplete").is_some() {
                 callbacks.invoke_diagnostic("gemini_msg", "turnComplete");
                 return;

@@ -23,8 +23,10 @@ pub struct Callbacks {
     pub on_voice_ready: RefCell<Option<Function>>,
     /// Voice audio chunk (base64 PCM).
     pub on_voice_audio: RefCell<Option<Function>>,
-    /// Voice text response.
+    /// Voice text response (thinking/reasoning — not what is spoken).
     pub on_voice_text: RefCell<Option<Function>>,
+    /// Voice transcript (text of what the model actually spoke).
+    pub on_voice_transcript: RefCell<Option<Function>>,
     /// Voice model tool call.
     pub on_voice_tool_call: RefCell<Option<Function>>,
     /// Voice model interrupted by user.
@@ -76,6 +78,12 @@ impl Callbacks {
 
     pub fn invoke_voice_text(&self, text: &str) {
         if let Some(ref f) = *self.on_voice_text.borrow() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
+        }
+    }
+
+    pub fn invoke_voice_transcript(&self, text: &str) {
+        if let Some(ref f) = *self.on_voice_transcript.borrow() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
         }
     }
