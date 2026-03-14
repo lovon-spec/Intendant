@@ -3054,12 +3054,12 @@ All relative paths and commands execute from this directory.",
                 let (brief, was_explicit) = parse_brief(&full);
                 if was_explicit {
                     slog(&session_log_for_summary, |l| {
-                        l.debug(&format!("Brief (model): {}", brief))
+                        l.debug(&format!("Task brief (model): {}", brief))
                     });
                 } else {
                     slog(&session_log_for_summary, |l| {
                         l.debug(&format!(
-                            "Brief (fallback — model did not include BRIEF: line): {}",
+                            "Task brief (fallback — model omitted BRIEF: line): {}",
                             brief
                         ))
                     });
@@ -3433,7 +3433,7 @@ async fn run_user_mode(
         l.info(&format!("Orchestrator result: {}", result_msg));
     });
     slog(&session_log, |l| {
-        l.debug(&format!("Orchestrator brief: {}", result.brief));
+        l.debug(&format!("Task brief (orchestrator): {}", result.brief));
     });
     emit(
         &bus,

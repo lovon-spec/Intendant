@@ -209,6 +209,16 @@ impl ServerConnection {
     /// Send a JSON message to the server.
     pub fn send_json(&self, msg: &serde_json::Value) -> bool {
         if let Some(ref ws) = self.ws {
+            if ws.ready_state() != 1 {
+                // WebSocket not in OPEN state — log and drop
+                web_sys::console::warn_1(
+                    &format!("[presence-web] send_json dropped (readyState={}): {}",
+                        ws.ready_state(),
+                        msg.get("t").and_then(|v| v.as_str()).or_else(|| msg.get("action").and_then(|v| v.as_str())).unwrap_or("?")
+                    ).into(),
+                );
+                return false;
+            }
             ws.send_with_str(&msg.to_string()).is_ok()
         } else {
             false

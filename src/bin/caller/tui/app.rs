@@ -92,6 +92,7 @@ pub struct App {
     pub auto_scroll: bool,
     pub verbosity: Verbosity,
     pub inspect_index: Option<usize>,
+    pub inspect_scroll: u16,
     pub log_tab: LogTab,
     pub expanded_turns: HashSet<usize>,
     pub focused_line: Option<usize>,
@@ -200,6 +201,7 @@ impl App {
             auto_scroll: true,
             verbosity: Verbosity::Normal,
             inspect_index: None,
+            inspect_scroll: 0,
             log_tab: LogTab::All,
             expanded_turns: HashSet::new(),
             focused_line: None,
@@ -642,28 +644,34 @@ impl App {
                 self.mode = AppMode::Normal;
                 true
             }
-            KeyCode::Up => {
+            // Up/Down scroll within the current entry
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.inspect_scroll = self.inspect_scroll.saturating_sub(1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.inspect_scroll = self.inspect_scroll.saturating_add(1);
+                true
+            }
+            // Left/Right navigate between entries
+            KeyCode::Left | KeyCode::PageUp => {
                 self.move_inspect(-1);
+                self.inspect_scroll = 0;
                 true
             }
-            KeyCode::Down => {
+            KeyCode::Right | KeyCode::PageDown => {
                 self.move_inspect(1);
-                true
-            }
-            KeyCode::PageUp => {
-                self.move_inspect(-20);
-                true
-            }
-            KeyCode::PageDown => {
-                self.move_inspect(20);
+                self.inspect_scroll = 0;
                 true
             }
             KeyCode::Home => {
                 self.jump_inspect_to_edge(true);
+                self.inspect_scroll = 0;
                 true
             }
             KeyCode::End => {
                 self.jump_inspect_to_edge(false);
+                self.inspect_scroll = 0;
                 true
             }
             KeyCode::Char('v') => {
@@ -700,6 +708,7 @@ impl App {
     fn open_inspect_mode(&mut self) -> bool {
         self.inspect_index = self.focus_index();
         if self.inspect_index.is_some() {
+            self.inspect_scroll = 0;
             self.mode = AppMode::Inspect;
             return true;
         }
@@ -1371,7 +1380,7 @@ impl App {
                 });
                 self.log(LogLevel::Info, format!("--- {} ---", reason));
                 if let Some(ref brief) = summary {
-                    self.log(LogLevel::Detail, format!("Brief: {}", brief));
+                    self.log(LogLevel::Detail, format!("Task brief: {}", brief));
                 }
                 // Create a follow-up textarea so the user can submit follow-ups
                 // after task completion (press f to reopen).

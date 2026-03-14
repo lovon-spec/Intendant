@@ -514,6 +514,12 @@ firstRunSave.addEventListener('click', () => {
 
 firstRunSkip.addEventListener('click', () => firstRunDialog.classList.add('hidden'));
 
+// Promise that resolves when server WebSocket is connected.
+// Voice connection must wait for this to avoid a race where tool calls
+// fire before the server link is ready to relay them.
+let serverConnectedResolve = null;
+let serverConnectedPromise = null;
+
 // ============================================================
 // Init — loads presence-web WASM and wires everything up
 // ============================================================
@@ -543,7 +549,11 @@ async function init() {
   pw.set_on_server_state((connected) => {
     intDot.className = 'conn-dot ' + (connected ? 'ok' : 'err');
     intLabel.textContent = 'Server';
-    if (connected) pw.send_resize(term.cols, term.rows);
+    if (connected) {
+      pw.send_resize(term.cols, term.rows);
+      // Resolve the server-connected promise so voice can connect
+      if (serverConnectedResolve) { serverConnectedResolve(); serverConnectedResolve = null; }
+    }
   });
 
   pw.set_on_state_snapshot(() => {
@@ -609,16 +619,20 @@ async function init() {
     if (pw) pw.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
   });
 
-  // 3. Connect to server
+  // 3. Connect to server (wait for it before connecting voice)
+  serverConnectedPromise = new Promise(r => { serverConnectedResolve = r; });
   pw.connect_server(getServerUrl());
 
-  // 4. Fetch voice config
+  // 4. Fetch voice config (in parallel with server connect)
   try {
     const resp = await fetch('/config');
     if (resp.ok) gatewayConfig = await resp.json();
   } catch(_) {}
 
-  // 5. Connect voice if key exists, otherwise show first-run dialog
+  // 5. Wait for server connection before connecting voice
+  await serverConnectedPromise;
+
+  // 6. Connect voice if key exists, otherwise show first-run dialog
   const storedKey = localStorage.getItem(getStorageKey());
   if (storedKey) {
     connectVoice();

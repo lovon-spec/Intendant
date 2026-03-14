@@ -520,7 +520,7 @@ pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
     }
     body.push(Line::default());
     body.push(Line::from(vec![Span::styled(
-        " Up/Down=next entry  PgUp/PgDn=jump  Enter/Esc/i=close ",
+        " ↑↓=scroll  ←→=prev/next entry  Esc/i=close ",
         Style::default().fg(theme::LOG_DIM_FG),
     )]));
 
@@ -535,7 +535,10 @@ pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
         ))
         .style(Style::default().bg(theme::HELP_BG));
 
-    let widget = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
+    let widget = Paragraph::new(body)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.inspect_scroll, 0));
     f.render_widget(widget, centered);
 }
 
