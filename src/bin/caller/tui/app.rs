@@ -177,9 +177,14 @@ pub struct App {
     // Shared presence session for event window population
     pub presence_session: Option<std::sync::Arc<std::sync::Mutex<crate::presence::PresenceSession>>>,
 
-    // Voice turn counter — increments on each voice session (PresenceConnected).
-    // Used to group voice diagnostics/logs for collapse in the TUI.
+    // Voice turn counter — increments on each voice model response (thinking block).
+    // Used to group voice logs per response for collapse in the TUI.
     pub voice_turn: usize,
+
+    // Voice transcript accumulation buffer — fragments are buffered and flushed
+    // as a single log entry when a boundary event arrives or after an idle period.
+    voice_transcript_buffer: String,
+    voice_transcript_idle_ticks: usize,
 }
 
 impl App {
@@ -239,6 +244,8 @@ impl App {
             session_log: None,
             presence_session: None,
             voice_turn: 0,
+            voice_transcript_buffer: String::new(),
+            voice_transcript_idle_ticks: 0,
         }
     }
 
@@ -358,6 +365,19 @@ impl App {
         });
         if self.auto_scroll {
             self.scroll_to_bottom();
+        }
+    }
+
+    /// Flush accumulated voice transcript fragments into a single Info log entry.
+    fn flush_voice_transcript(&mut self) {
+        if !self.voice_transcript_buffer.is_empty() {
+            let text = self.voice_transcript_buffer.trim().to_string();
+            if !text.is_empty() {
+                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                self.log_sourced(LogLevel::Info, text, LogSource::Presence, vt);
+            }
+            self.voice_transcript_buffer.clear();
+            self.voice_transcript_idle_ticks = 0;
         }
     }
 
@@ -1561,6 +1581,7 @@ impl App {
                 }
             }
             AppEvent::PresenceDisconnected => {
+                self.flush_voice_transcript();
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
                 self.log_sourced(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string(), LogSource::Presence, vt);
                 if let Some(ref flag) = self.presence_paused {
@@ -1574,25 +1595,45 @@ impl App {
                 }
             }
             AppEvent::VoiceLog { ref text, seq, ref tool_context } => {
-                let ctx = tool_context.as_deref().unwrap_or("");
-                let msg = if ctx.is_empty() {
-                    format!("[voice #{seq}] {text}")
-                } else {
-                    format!("[voice #{seq} ({})] {text}", ctx)
-                };
-                // Transcripts and plain voice text at Info (visible at Normal);
-                // tool calls and thinking at Detail (visible at Verbose).
-                let lvl = if ctx.is_empty() || ctx == "transcript" {
-                    LogLevel::Info
-                } else {
-                    LogLevel::Detail
-                };
-                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
-                self.log_sourced(lvl, msg, LogSource::Presence, vt);
-                // Persist to session log
+                // Always persist individual fragments to session log on disk.
                 if let Some(ref sl) = self.session_log {
                     if let Ok(mut log) = sl.lock() {
                         log.voice_log(text, seq, tool_context.as_deref());
+                    }
+                }
+
+                let ctx = tool_context.as_deref().unwrap_or("");
+                match ctx {
+                    "transcript" => {
+                        // Accumulate spoken-word fragments; flushed as a single
+                        // log entry on the next boundary event or after idle.
+                        self.voice_transcript_buffer.push_str(text);
+                        self.voice_transcript_idle_ticks = 0;
+                    }
+                    "" => {
+                        // Thinking block — flush pending transcript, start a
+                        // new voice turn so each response is independently
+                        // collapsible.
+                        self.flush_voice_transcript();
+                        self.voice_turn += 1;
+                        let vt = Some(self.voice_turn);
+                        self.log_sourced(
+                            LogLevel::Detail,
+                            format!("[voice] {}", text.trim()),
+                            LogSource::Presence,
+                            vt,
+                        );
+                    }
+                    _ => {
+                        // Tool call — flush pending transcript, log at Detail.
+                        self.flush_voice_transcript();
+                        let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                        self.log_sourced(
+                            LogLevel::Detail,
+                            format!("[voice] {}", text),
+                            LogSource::Presence,
+                            vt,
+                        );
                     }
                 }
             }
@@ -1627,6 +1668,13 @@ impl App {
                 if let Ok(state) = autonomy.try_read() {
                     self.autonomy_display = state.level.to_string();
                 };
+                // Flush voice transcript after idle period (500ms = 5 ticks)
+                if !self.voice_transcript_buffer.is_empty() {
+                    self.voice_transcript_idle_ticks += 1;
+                    if self.voice_transcript_idle_ticks >= 5 {
+                        self.flush_voice_transcript();
+                    }
+                }
             }
             AppEvent::Key(key) => {
                 self.handle_key(key);
@@ -2489,5 +2537,107 @@ mod tests {
             turn: None,
         });
         assert_eq!(app.log_entries[2].turn, None);
+    }
+
+    #[test]
+    fn voice_transcript_accumulates_and_flushes_on_thinking() {
+        let mut app = test_app();
+        // Simulate PresenceConnected (sets voice_turn=1)
+        app.voice_turn = 1;
+
+        // First thinking block → starts voice_turn=2
+        app.handle_event(AppEvent::VoiceLog {
+            text: "**Thinking**\n\nReasoning here.\n\n\n".to_string(),
+            seq: 1,
+            tool_context: None,
+        });
+        assert_eq!(app.voice_turn, 2);
+        // Thinking block logged at Detail
+        assert_eq!(app.log_entries.len(), 1);
+        assert_eq!(app.log_entries[0].level, LogLevel::Detail);
+        assert_eq!(app.log_entries[0].turn, Some(2));
+
+        // Transcript fragments accumulate
+        app.handle_event(AppEvent::VoiceLog {
+            text: "Hello".to_string(),
+            seq: 2,
+            tool_context: Some("transcript".to_string()),
+        });
+        app.handle_event(AppEvent::VoiceLog {
+            text: " world.".to_string(),
+            seq: 3,
+            tool_context: Some("transcript".to_string()),
+        });
+        // Still only 1 log entry — fragments are buffered
+        assert_eq!(app.log_entries.len(), 1);
+
+        // Next thinking block flushes the buffer and starts voice_turn=3
+        app.handle_event(AppEvent::VoiceLog {
+            text: "**Next thought**\n\n".to_string(),
+            seq: 4,
+            tool_context: None,
+        });
+        // Buffer flushed as single entry, then thinking logged
+        assert_eq!(app.log_entries.len(), 3);
+        assert_eq!(app.log_entries[1].level, LogLevel::Info);
+        assert_eq!(app.log_entries[1].content, "Hello world.");
+        assert_eq!(app.log_entries[1].turn, Some(2)); // belongs to previous turn
+        assert_eq!(app.log_entries[2].level, LogLevel::Detail);
+        assert_eq!(app.log_entries[2].turn, Some(3));
+        assert_eq!(app.voice_turn, 3);
+    }
+
+    #[test]
+    fn voice_transcript_flushes_on_tool_call() {
+        let mut app = test_app();
+        app.voice_turn = 2;
+
+        // Transcript fragments
+        app.handle_event(AppEvent::VoiceLog {
+            text: "Sure, ".to_string(),
+            seq: 1,
+            tool_context: Some("transcript".to_string()),
+        });
+        app.handle_event(AppEvent::VoiceLog {
+            text: "doing it.".to_string(),
+            seq: 2,
+            tool_context: Some("transcript".to_string()),
+        });
+        assert_eq!(app.log_entries.len(), 0);
+
+        // Tool call flushes buffer
+        app.handle_event(AppEvent::VoiceLog {
+            text: "[tool] submit_task({})".to_string(),
+            seq: 3,
+            tool_context: Some("submit_task".to_string()),
+        });
+        assert_eq!(app.log_entries.len(), 2);
+        assert_eq!(app.log_entries[0].content, "Sure, doing it.");
+        assert_eq!(app.log_entries[0].level, LogLevel::Info);
+        assert_eq!(app.log_entries[1].level, LogLevel::Detail);
+    }
+
+    #[test]
+    fn voice_transcript_flushes_on_tick_idle() {
+        let mut app = test_app();
+        app.voice_turn = 1;
+
+        app.handle_event(AppEvent::VoiceLog {
+            text: "Done.".to_string(),
+            seq: 1,
+            tool_context: Some("transcript".to_string()),
+        });
+        assert_eq!(app.log_entries.len(), 0);
+
+        // 4 ticks — not enough
+        for _ in 0..4 {
+            app.handle_event(AppEvent::Tick);
+        }
+        assert_eq!(app.log_entries.len(), 0);
+
+        // 5th tick — flush
+        app.handle_event(AppEvent::Tick);
+        assert_eq!(app.log_entries.len(), 1);
+        assert_eq!(app.log_entries[0].content, "Done.");
     }
 }
