@@ -568,8 +568,13 @@ async function init() {
   pw.set_on_voice_audio((b64) => playAudioChunk(b64));
 
   pw.set_on_voice_text((text) => {
-    // Voice text goes to TUI log panel via server, not as browser overlay
+    // Thinking/reasoning text — log with no tool_context
     pw.send_voice_log(text, undefined);
+  });
+
+  pw.set_on_voice_transcript((text) => {
+    // Transcript of what the model actually spoke
+    pw.send_voice_log(text, 'transcript');
   });
 
   pw.set_on_voice_tool_call((call) => {

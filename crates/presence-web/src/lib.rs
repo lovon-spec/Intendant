@@ -104,6 +104,11 @@ impl PresenceWeb {
     }
 
     #[wasm_bindgen]
+    pub fn set_on_voice_transcript(&self, f: Function) {
+        *self.callbacks.on_voice_transcript.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
     pub fn set_on_voice_tool_call(&self, f: Function) {
         *self.callbacks.on_voice_tool_call.borrow_mut() = Some(f);
     }

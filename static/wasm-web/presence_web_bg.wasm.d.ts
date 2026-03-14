@@ -38,6 +38,7 @@ export const presenceweb_set_on_voice_interrupted: (a: number, b: any) => void;
 export const presenceweb_set_on_voice_ready: (a: number, b: any) => void;
 export const presenceweb_set_on_voice_text: (a: number, b: any) => void;
 export const presenceweb_set_on_voice_tool_call: (a: number, b: any) => void;
+export const presenceweb_set_on_voice_transcript: (a: number, b: any) => void;
 export const presenceweb_set_state: (a: number, b: any) => void;
 export const presenceweb_update_from_event: (a: number, b: any) => any;
 export const __wbg_wasmpresence_free: (a: number, b: number) => void;

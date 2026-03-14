@@ -83,6 +83,7 @@ export class PresenceWeb {
     set_on_voice_ready(f: Function): void;
     set_on_voice_text(f: Function): void;
     set_on_voice_tool_call(f: Function): void;
+    set_on_voice_transcript(f: Function): void;
     set_state(state: any): void;
     update_from_event(event: any): any;
 }
@@ -195,6 +196,7 @@ export interface InitOutput {
     readonly presenceweb_set_on_voice_ready: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_text: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_tool_call: (a: number, b: any) => void;
+    readonly presenceweb_set_on_voice_transcript: (a: number, b: any) => void;
     readonly presenceweb_set_state: (a: number, b: any) => void;
     readonly presenceweb_update_from_event: (a: number, b: any) => any;
     readonly __wbg_wasmpresence_free: (a: number, b: number) => void;
