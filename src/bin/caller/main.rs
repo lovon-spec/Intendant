@@ -41,6 +41,15 @@ type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
 /// Module-level flag for --json output mode.
 static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
+/// Shared slot for JSON-mode approval responses.
+/// The stdin reader stores approval senders here; the agent loop awaits them.
+type JsonApprovalSlot =
+    Arc<Mutex<Option<(u64, tokio::sync::oneshot::Sender<event::ApprovalResponse>)>>>;
+
+fn new_json_approval_slot() -> JsonApprovalSlot {
+    Arc::new(Mutex::new(None))
+}
+
 /// Helper to write to the session log without propagating errors.
 fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
     if let Ok(mut l) = log.lock() {
@@ -444,6 +453,25 @@ fn has_ask_human_command(json_str: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract the question text from an askHuman command in a batch JSON string.
+fn extract_ask_human_question(json_str: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    parsed
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .and_then(|commands| {
+            commands.iter().find_map(|cmd| {
+                if cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman") {
+                    cmd.get("question")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
 fn has_capture_screen_command(json_str: &str) -> bool {
     let parsed: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
@@ -744,6 +772,10 @@ fn app_event_to_json(event: &AppEvent) -> Option<(&'static str, serde_json::Valu
                 "round": round,
                 "turns_in_round": turns_in_round,
             }),
+        )),
+        AppEvent::HumanQuestionDetected { question } => Some((
+            "human_question",
+            serde_json::json!({ "question": question }),
         )),
         _ => None, // Skip events that don't need JSON output (Key, Resize, Tick, etc.)
     }
@@ -1623,6 +1655,7 @@ async fn run_agent_loop(
     session_log: SharedSessionLog,
     log_dir: &std::path::Path,
     mcp_mgr: Option<&mcp_client::McpClientManager>,
+    json_approval: Option<&JsonApprovalSlot>,
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -1978,8 +2011,11 @@ async fn run_agent_loop(
             // Inject project context and normalize
             let json_str = normalize_command_batch(&inject_project_context(json_str, project));
 
-            // Headless askHuman check
-            if bus.is_none() && has_ask_human_command(&json_str) {
+            // Headless askHuman check — skip unless JSON mode (which handles it via stdin)
+            if bus.is_none()
+                && !JSON_OUTPUT.load(Ordering::Relaxed)
+                && has_ask_human_command(&json_str)
+            {
                 slog(&session_log, |l| {
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
@@ -1991,6 +2027,15 @@ async fn run_agent_loop(
                     );
                 }
                 continue;
+            }
+            // In JSON mode, emit the question so the stdin consumer can respond
+            if bus.is_none() && JSON_OUTPUT.load(Ordering::Relaxed) {
+                if let Some(question) = extract_ask_human_question(&json_str) {
+                    emit_json(
+                        "human_question",
+                        serde_json::json!({ "question": question }),
+                    );
+                }
             }
 
             // Autonomy / approval check (same as text path)
@@ -2086,17 +2131,72 @@ async fn run_agent_loop(
                     }
                 }
                 if bus.is_none() {
-                    slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                    });
-                    emit(
-                        &bus,
-                        || AppEvent::TaskComplete {
-                            reason: format!("Approval required in headless mode ({})", cat),
-                        },
-                        || println!("--- Approval required in headless mode ({}) ---", cat),
-                    );
-                    return Ok((loop_stats, LoopExitReason::Denied));
+                    if let Some(slot) = json_approval {
+                        // JSON mode: emit approval_required event and wait for stdin response
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        emit_json(
+                            "approval_required",
+                            serde_json::json!({
+                                "id": turn as u64,
+                                "command_preview": preview,
+                                "category": format!("{:?}", cat),
+                            }),
+                        );
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((turn as u64, tx));
+                        }
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                let mut state = autonomy.write().await;
+                                state.level = AutonomyLevel::Full;
+                            }
+                            Ok(event::ApprovalResponse::Skip) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "skipped")
+                                });
+                                should_skip = true;
+                            }
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                emit_json(
+                                    "done",
+                                    serde_json::json!({ "reason": "Denied by user" }),
+                                );
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
+                        }
+                    } else {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                        });
+                        emit(
+                            &bus,
+                            || AppEvent::TaskComplete {
+                                reason: format!(
+                                    "Approval required in headless mode ({})",
+                                    cat
+                                ),
+                            },
+                            || {
+                                println!(
+                                    "--- Approval required in headless mode ({}) ---",
+                                    cat
+                                )
+                            },
+                        );
+                        return Ok((loop_stats, LoopExitReason::Denied));
+                    }
                 }
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
@@ -2293,8 +2393,11 @@ async fn run_agent_loop(
             // Inject project context (memory_file) into commands and normalize aliases.
             let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
 
-            // In headless mode there is no askHuman input panel.
-            if bus.is_none() && has_ask_human_command(&json_str) {
+            // In headless mode there is no askHuman input panel — skip unless JSON mode.
+            if bus.is_none()
+                && !JSON_OUTPUT.load(Ordering::Relaxed)
+                && has_ask_human_command(&json_str)
+            {
                 slog(&session_log, |l| {
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
@@ -2304,6 +2407,15 @@ Proceed with explicit assumptions and continue without additional questions."
                         .to_string(),
                 );
                 continue;
+            }
+            // In JSON mode, emit the question so the stdin consumer can respond
+            if bus.is_none() && JSON_OUTPUT.load(Ordering::Relaxed) {
+                if let Some(question) = extract_ask_human_question(&json_str) {
+                    emit_json(
+                        "human_question",
+                        serde_json::json!({ "question": question }),
+                    );
+                }
             }
 
             // Check autonomy / approval for commands
@@ -2399,17 +2511,72 @@ Proceed with explicit assumptions and continue without additional questions."
                     }
                 }
                 if bus.is_none() {
-                    slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                    });
-                    emit(
-                        &bus,
-                        || AppEvent::TaskComplete {
-                            reason: format!("Approval required in headless mode ({})", cat),
-                        },
-                        || println!("--- Approval required in headless mode ({}) ---", cat),
-                    );
-                    return Ok((loop_stats, LoopExitReason::Denied));
+                    if let Some(slot) = json_approval {
+                        // JSON mode: emit approval_required event and wait for stdin response
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        emit_json(
+                            "approval_required",
+                            serde_json::json!({
+                                "id": turn as u64,
+                                "command_preview": preview,
+                                "category": format!("{:?}", cat),
+                            }),
+                        );
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((turn as u64, tx));
+                        }
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                let mut state = autonomy.write().await;
+                                state.level = AutonomyLevel::Full;
+                            }
+                            Ok(event::ApprovalResponse::Skip) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "skipped")
+                                });
+                                should_skip = true;
+                            }
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                emit_json(
+                                    "done",
+                                    serde_json::json!({ "reason": "Denied by user" }),
+                                );
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
+                        }
+                    } else {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                        });
+                        emit(
+                            &bus,
+                            || AppEvent::TaskComplete {
+                                reason: format!(
+                                    "Approval required in headless mode ({})",
+                                    cat
+                                ),
+                            },
+                            || {
+                                println!(
+                                    "--- Approval required in headless mode ({}) ---",
+                                    cat
+                                )
+                            },
+                        );
+                        return Ok((loop_stats, LoopExitReason::Denied));
+                    }
                 }
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
@@ -2537,6 +2704,7 @@ async fn run_round_loop(
     log_dir: &std::path::Path,
     mcp_mgr: Option<&mcp_client::McpClientManager>,
     mut follow_up_rx: FollowUpReceiver,
+    json_approval: Option<&JsonApprovalSlot>,
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
     let mut cumulative_stats = LoopStats::default();
@@ -2552,6 +2720,7 @@ async fn run_round_loop(
             session_log.clone(),
             log_dir,
             mcp_mgr,
+            json_approval,
         )
         .await?;
 
@@ -2726,6 +2895,7 @@ All relative paths and commands execute from this directory.",
         session_log,
         &log_dir,
         None, // no MCP client for sub-agents
+        None, // no JSON approval for sub-agents
     )
     .await;
 
@@ -2933,6 +3103,7 @@ async fn run_with_presence(
                 log_dir.clone(),
                 None,
                 follow_up_rx,
+                None, // no JSON approval in TUI/presence mode
             )
             .await
         } else {
@@ -3146,6 +3317,7 @@ async fn run_direct_mode(
     log_dir: PathBuf,
     mcp_mgr: Option<mcp_client::McpClientManager>,
     follow_up_rx: FollowUpReceiver,
+    json_approval: Option<JsonApprovalSlot>,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -3224,6 +3396,7 @@ async fn run_direct_mode(
         &log_dir,
         mcp_mgr.as_ref(),
         follow_up_rx,
+        json_approval.as_ref(),
     )
     .await
 }
@@ -3681,6 +3854,7 @@ async fn main() -> Result<(), CallerError> {
                             log_dir,
                             None,
                             follow_up_rx,
+                            None, // no JSON approval in MCP mode
                         )
                         .await
                     };
@@ -4051,6 +4225,7 @@ async fn main() -> Result<(), CallerError> {
                         log_dir_clone,
                         mcp_mgr,
                         follow_up_rx,
+                        None, // no JSON approval in TUI mode
                     )
                     .await
                 } else {
@@ -4158,11 +4333,18 @@ async fn main() -> Result<(), CallerError> {
         };
 
         // Create follow-up channel. In JSON mode, spawn a stdin reader to enable
-        // follow-up via stdin lines. Otherwise, drop the sender immediately so
-        // recv() returns None → single-round behavior.
+        // follow-up via stdin lines and JSON commands (approve, deny, input, etc.).
+        // Otherwise, drop the sender immediately so recv() returns None → single-round.
         let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let json_approval_slot = if flags.json_output {
+            Some(new_json_approval_slot())
+        } else {
+            None
+        };
         if flags.json_output {
-            // JSON mode: read follow-up lines from stdin
+            // JSON mode: read follow-up lines and control commands from stdin
+            let approval_slot = json_approval_slot.clone().unwrap();
+            let log_dir_for_stdin = log_dir.clone();
             tokio::spawn(async move {
                 let stdin = tokio::io::stdin();
                 let reader = tokio::io::BufReader::new(stdin);
@@ -4173,6 +4355,53 @@ async fn main() -> Result<(), CallerError> {
                     if line.is_empty() {
                         continue;
                     }
+                    // Try to parse as a JSON control command
+                    if line.starts_with('{') {
+                        if let Ok(msg) = serde_json::from_str::<event::ControlMsg>(&line) {
+                            match msg {
+                                event::ControlMsg::Approve { .. } => {
+                                    let mut guard = approval_slot.lock().unwrap();
+                                    if let Some((_id, tx)) = guard.take() {
+                                        let _ = tx.send(event::ApprovalResponse::Approve);
+                                    }
+                                }
+                                event::ControlMsg::Deny { .. } => {
+                                    let mut guard = approval_slot.lock().unwrap();
+                                    if let Some((_id, tx)) = guard.take() {
+                                        let _ = tx.send(event::ApprovalResponse::Deny);
+                                    }
+                                }
+                                event::ControlMsg::Skip { .. } => {
+                                    let mut guard = approval_slot.lock().unwrap();
+                                    if let Some((_id, tx)) = guard.take() {
+                                        let _ = tx.send(event::ApprovalResponse::Skip);
+                                    }
+                                }
+                                event::ControlMsg::ApproveAll { .. } => {
+                                    let mut guard = approval_slot.lock().unwrap();
+                                    if let Some((_id, tx)) = guard.take() {
+                                        let _ = tx.send(event::ApprovalResponse::ApproveAll);
+                                    }
+                                }
+                                event::ControlMsg::Input { text } => {
+                                    // Write human_response file for askHuman IPC
+                                    let resp_path =
+                                        log_dir_for_stdin.join("human_response");
+                                    let _ = std::fs::write(&resp_path, text.as_bytes());
+                                }
+                                event::ControlMsg::FollowUp { text } => {
+                                    if follow_up_tx.send(text).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    // Unknown command — ignore
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // Plain text → follow-up message
                     if follow_up_tx.send(line).await.is_err() {
                         break; // receiver dropped
                     }
@@ -4193,6 +4422,7 @@ async fn main() -> Result<(), CallerError> {
                 log_dir,
                 mcp_mgr,
                 follow_up_rx,
+                json_approval_slot,
             )
             .await
         } else {

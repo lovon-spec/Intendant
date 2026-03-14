@@ -80,6 +80,19 @@ SysPrompt_research.md        # Research sub-agent prompt
 SysPrompt_implementation.md  # Implementation sub-agent prompt
 static/
 └── live.html                # Web TUI (xterm.js terminal + live model presence via Gemini Live / OpenAI Realtime)
+tests/
+└── e2e/
+    ├── main.rs              # Integration test entry point
+    ├── harness.rs           # IntendantProcess, ControlSocketClient, WsClient, voice helpers
+    ├── test_basic.rs        # Tier 1: exec, approval, follow-up (--json mode, no display)
+    ├── test_control_socket.rs # Tier 2: status, usage, autonomy (control socket, needs display)
+    ├── test_web.rs          # Tier 3: WebSocket state_snapshot, tool_request, ANSI frames
+    └── test_voice.rs        # Tier 3: voice connection, submit+approve (needs browser + audio)
+skills/
+├── e2e/SKILL.md             # Automated integration test guide
+├── tui-e2e/SKILL.md         # Interactive TUI testing guide (screenshot-based)
+├── web-e2e/SKILL.md         # Interactive web/voice testing guide
+└── voice-e2e/SKILL.md       # Full audio pipeline testing guide
 ```
 
 ## Build and Run
@@ -117,11 +130,33 @@ echo "task" | ./target/release/intendant                   # Auto-detects non-TT
 ## Testing
 
 ```bash
-cargo test                # Run all tests
+cargo test --bins         # Run unit tests only (fast, no API keys needed)
 cargo test -- --list      # List all test names
 ```
 
-All tests are inline `#[cfg(test)]` modules in the same files as the code they test. Async tests use `#[tokio::test]`. The `tempfile` crate provides isolated temporary directories for tests that touch the filesystem.
+### Unit Tests
+
+All unit tests are inline `#[cfg(test)]` modules in the same files as the code they test. Async tests use `#[tokio::test]`. The `tempfile` crate provides isolated temporary directories for tests that touch the filesystem. These tests are deterministic, fast, and require no external services.
+
+### Integration Tests (`tests/e2e/`)
+
+Integration tests in `tests/e2e/` spawn a real intendant binary and exercise the full stack. **Every test makes real API calls** to an LLM provider, so they cost tokens and are non-deterministic. They are NOT suitable for CI/CD — run them manually or on a schedule.
+
+```bash
+cargo build --release                                    # Build binary first
+cargo test --test e2e test_basic -- --nocapture           # Tier 1: no display needed
+cargo test --test e2e test_control_socket -- --nocapture  # Tier 2: needs Xvfb
+cargo test --test e2e test_web -- --nocapture             # Tier 3: needs Xvfb
+cargo test --test e2e test_voice -- --nocapture           # Tier 3: needs Xvfb + Firefox + PulseAudio
+```
+
+**Tier 1 (JSON mode)**: Spawns `intendant --json --direct`, reads JSONL events from stdout, sends JSON commands (`{"action":"approve","id":N}`) and follow-up text on stdin. No display required.
+
+**Tier 2 (Control socket)**: Spawns `intendant --control-socket --direct` in TUI mode, connects to `/tmp/intendant-<pid>.sock`. Requires `DISPLAY` for TUI rendering.
+
+**Tier 3 (Web/Voice)**: Spawns `intendant --json --direct --web <port>`, connects via WebSocket and HTTP `/debug`. Voice tests additionally require Firefox, PulseAudio, and espeak-ng.
+
+VNC monitoring: Tier 2/3 tests use Xvfb on `:50` with x11vnc on port 5950. Connect with any VNC viewer to watch tests run graphically.
 
 Test coverage includes:
 - **agent.rs**: Process info operations, blocking command execution, path inspection, nonce reference replacement, process mapping, file editing, browsing, port waiting, human interaction, PTY sessions, memory storage/recall with tags and filters
@@ -159,6 +194,12 @@ Test coverage includes:
 - **caller/sandbox.rs**: Default config construction, disabled config skip, write path setup
 - **caller/web_gateway.rs**: Default port, HTML embedding, config serialization, config building (gemini/openai/explicit provider), WebSocket lifecycle, WebSocket echo (control message roundtrip), broadcast-to-WebSocket, HTTP serves HTML, HTTP serves config, live_connected/live_disconnected events, tool_request bootstrap (state_snapshot on connect), tool_request/tool_response roundtrip (check_status), tool_request action dispatch (approve → ControlCommand), auto-LiveDisconnected on WebSocket drop (with and without prior live_connected)
 - **caller/conversation.rs** (additional): Auto-compaction threshold, compaction preserves system+tail, too-few-messages guard
+
+Integration test coverage (requires API key, not run in CI):
+- **tests/e2e/test_basic.rs**: Full-stack exec via --json mode, approval approve/deny via stdin, multi-round follow-up
+- **tests/e2e/test_control_socket.rs**: Status/usage queries, autonomy change, approve via Unix control socket
+- **tests/e2e/test_web.rs**: WebSocket state_snapshot on connect, tool_request/response, ANSI term frames, /debug endpoint
+- **tests/e2e/test_voice.rs**: Voice connection via /debug polling, voice task submit and approval via espeak-ng
 
 ## Architecture Details
 
@@ -277,7 +318,17 @@ When context usage reaches 90% (`usage_fraction() >= 0.90`), `conversation.auto_
 
 ### JSON Output Mode
 
-`--json` flag enables JSONL structured output to stdout (implies `--no-tui`). Each line is a JSON object with `type` and `data` fields. Event types include: `turn_started`, `model_response`, `model_response_delta`, `agent_output`, `done`, `error`, `approval_required`, `budget_warning`.
+`--json` flag enables JSONL structured output to stdout (implies `--no-tui`). Each line is a JSON object with `type` and `data` fields. Event types include: `turn_started`, `model_response`, `model_response_delta`, `agent_output`, `done`, `error`, `approval_required`, `human_question`, `budget_warning`, `round_complete`, `context_management`.
+
+In JSON mode, stdin accepts both plain text (follow-up messages) and JSON commands using the same `ControlMsg` format as the Unix control socket:
+- `{"action":"approve","id":N}` — approve pending command
+- `{"action":"deny","id":N}` — deny pending command
+- `{"action":"skip","id":N}` — skip pending command
+- `{"action":"approve_all","id":N}` — approve and set autonomy to Full
+- `{"action":"input","text":"..."}` — respond to askHuman
+- `{"action":"follow_up","text":"..."}` — send follow-up task
+
+Lines not starting with `{` or not parseable as `ControlMsg` are treated as follow-up text. This makes `--json` mode fully interactive: approval flows, askHuman, and multi-round conversations all work without a TUI or control socket.
 
 ### MCP Client Support
 
@@ -403,4 +454,4 @@ The gateway uses a dual-channel outbound architecture: a `broadcast::Receiver` f
 
 ## CI/CD
 
-No CI/CD is currently configured. Run `cargo test` and `cargo clippy` locally before committing.
+No CI/CD is currently configured. Run `cargo test --bins` and `cargo clippy` locally before committing. Unit tests (`cargo test --bins`) are fast and deterministic — safe for CI. Integration tests (`cargo test --test e2e`) make real API calls to LLM providers — run them manually, not in CI.
