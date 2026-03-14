@@ -26,4 +26,14 @@ You have access to all agent functions: execAsAgent, captureScreen, inspectPath,
 
 Focus primarily on: editFile, execAsAgent (for builds/tests), inspectPath.
 
+## Final Response
+
+When your task is complete, end your final response with a spoken summary line:
+
+```
+BRIEF: <1-2 sentence summary of what was accomplished, suitable for reading aloud>
+```
+
+This brief is narrated to the user by the presence layer. Keep it conversational and concise.
+
 ===SYSTEM PROMPT END===

@@ -357,6 +357,21 @@ fn extract_json(text: &str) -> Option<&str> {
     None
 }
 
+/// Parse a `BRIEF: ...` line from the model's last response.
+/// Returns the brief text, or a fallback if not found.
+fn parse_brief(text: &str) -> String {
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("BRIEF:") {
+            let brief = rest.trim();
+            if !brief.is_empty() {
+                return brief.to_string();
+            }
+        }
+    }
+    "Task completed.".to_string()
+}
+
 /// Returns (json_string, had_context_directives).
 /// Empty json_string means no commands to execute.
 fn apply_context_directives(json_str: &str, conversation: &mut Conversation) -> (String, bool) {
@@ -869,6 +884,30 @@ Also: {"source": "bare"}"#;
         let json = extract_json(text).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(parsed["key"], "value");
+    }
+
+    #[test]
+    fn parse_brief_found() {
+        let text = "I did a bunch of work.\n\nBRIEF: Implemented the login feature and added tests.";
+        assert_eq!(parse_brief(text), "Implemented the login feature and added tests.");
+    }
+
+    #[test]
+    fn parse_brief_not_found() {
+        let text = "I did a bunch of work. No brief marker here.";
+        assert_eq!(parse_brief(text), "Task completed.");
+    }
+
+    #[test]
+    fn parse_brief_empty_value() {
+        let text = "Some output\nBRIEF:   \nMore text";
+        assert_eq!(parse_brief(text), "Task completed.");
+    }
+
+    #[test]
+    fn parse_brief_last_occurrence() {
+        let text = "BRIEF: first\nsome text\nBRIEF: second and final";
+        assert_eq!(parse_brief(text), "second and final");
     }
 
     #[test]
@@ -2931,17 +2970,23 @@ All relative paths and commands execute from this directory.",
 
     // Write result file
     if let Ok(result_path) = env::var("INTENDANT_RESULT_FILE") {
-        let (status, summary, usage) = match &result {
-            Ok(stats) => (
-                sub_agent::SubAgentStatus::Completed,
-                stats
+        let (status, summary, brief, usage) = match &result {
+            Ok(stats) => {
+                let full = stats
                     .last_response
                     .clone()
-                    .unwrap_or_else(|| "Task completed successfully".to_string()),
-                stats.usage.clone(),
-            ),
+                    .unwrap_or_else(|| "Task completed successfully".to_string());
+                let brief = parse_brief(&full);
+                (
+                    sub_agent::SubAgentStatus::Completed,
+                    full,
+                    brief,
+                    stats.usage.clone(),
+                )
+            }
             Err(e) => (
                 sub_agent::SubAgentStatus::Failed(e.to_string()),
+                format!("Task failed: {}", e),
                 format!("Task failed: {}", e),
                 provider::TokenUsage::default(),
             ),
@@ -2951,6 +2996,7 @@ All relative paths and commands execute from this directory.",
             id,
             status,
             summary,
+            brief,
             findings: vec![],
             artifacts: vec![],
             usage,
@@ -3274,6 +3320,7 @@ async fn run_user_mode(
                 id: spec.id.clone(),
                 status: sub_agent::SubAgentStatus::Failed(format!("Result parse error: {}", e)),
                 summary: "Orchestrator finished but result could not be parsed".to_string(),
+                brief: "Orchestrator result could not be parsed.".to_string(),
                 findings: vec![],
                 artifacts: vec![],
                 usage: provider::TokenUsage::default(),
@@ -3284,6 +3331,7 @@ async fn run_user_mode(
             id: spec.id.clone(),
             status: sub_agent::SubAgentStatus::Failed(format!("exit code: {}", exit_status)),
             summary: "Orchestrator exited without writing a result file".to_string(),
+            brief: "Orchestrator exited without a result.".to_string(),
             findings: vec![],
             artifacts: vec![],
             usage: provider::TokenUsage::default(),
@@ -3313,7 +3361,7 @@ async fn run_user_mode(
         &bus,
         || AppEvent::TaskComplete {
             reason: reason.clone(),
-            summary: Some(result_msg.clone()),
+            summary: Some(result.brief.clone()),
         },
         || println!("--- {} ---", reason),
     );

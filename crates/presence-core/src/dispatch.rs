@@ -111,6 +111,9 @@ fn handle_check_status(state: &AgentStateSnapshot) -> String {
             pa.command_preview, pa.id, pa.category
         ));
     }
+    if state.last_task_result.is_some() {
+        parts.push("Task result: available (use query_detail scope 'task_result' for details)".to_string());
+    }
     parts.join("\n")
 }
 

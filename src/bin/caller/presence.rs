@@ -461,6 +461,13 @@ pub async fn query_detail(
                 Err(e) => format!("Failed to read file: {}", e),
             }
         }
+        "task_result" => {
+            let state = agent_state.lock().unwrap_or_else(|e| e.into_inner());
+            match &state.last_task_result {
+                Some(result) => result.clone(),
+                None => "No task result available.".to_string(),
+            }
+        }
         _ => format!("Unknown scope: {}", scope),
     }
 }
@@ -790,6 +797,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
         }
         AppEvent::SubAgentResult { formatted } => {
             s.last_output_summary = truncate(formatted, 500);
+            s.last_task_result = Some(formatted.clone());
         }
         AppEvent::LoopError(msg) => {
             s.phase = format!("error: {}", msg);

@@ -114,6 +114,9 @@ pub struct AgentStateSnapshot {
     /// Cleared when the approval is resolved (agent starts running).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<PendingApprovalSnapshot>,
+    /// Full result text from the last completed task (available via `query_detail` scope `task_result`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_task_result: Option<String>,
 }
 
 /// Serializable snapshot of a pending approval for the live model bootstrap.
@@ -183,6 +186,7 @@ impl AgentStateSnapshot {
                 let summary = event["summary"].as_str().map(|s| s.to_string());
                 self.phase = "idle".to_string();
                 self.pending_approval = None;
+                self.last_task_result = Some("(available via query_detail)".to_string());
                 Some(PresenceEvent::TaskComplete { reason, summary })
             }
             "round_complete" => {

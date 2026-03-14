@@ -52,13 +52,13 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "query_detail".to_string(),
-            description: "Query detailed information. Scopes: current_turn, last_output, worker, diff, logs, file.".to_string(),
+            description: "Query detailed information. Scopes: current_turn, last_output, worker, diff, logs, file, task_result.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "scope": {
                         "type": "string",
-                        "enum": ["current_turn", "last_output", "worker", "diff", "logs", "file"],
+                        "enum": ["current_turn", "last_output", "worker", "diff", "logs", "file", "task_result"],
                         "description": "What to query."
                     },
                     "target": {
