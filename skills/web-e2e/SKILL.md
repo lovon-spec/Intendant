@@ -35,8 +35,9 @@ Always start `x11vnc` so the human can follow along via VNC on port 5950.
 ```bash
 # 1. Kill stale processes from prior runs
 pkill -f 'Xvfb :50' 2>/dev/null; pkill -f 'x11vnc.*:50' 2>/dev/null
-pkill -f 'intendant.*web' 2>/dev/null; pkill -f firefox 2>/dev/null
+pkill -f 'intendant.*web' 2>/dev/null; pkill -f 'firefox' 2>/dev/null
 sleep 0.5
+# NOTE: Use `pkill -f` (not `killall`) — the binary is `firefox-esr` on Debian.
 
 # 2. Start Xvfb + x11vnc (MANDATORY — human needs VNC to observe)
 nohup Xvfb :50 -screen 0 1280x720x24 > /dev/null 2>&1 &
