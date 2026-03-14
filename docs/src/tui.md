@@ -20,12 +20,23 @@
 └─────────────────────────────────────────────┘
 ```
 
+### Panels
+
+- **Status bar**: Provider, model, turn count, budget percentage, autonomy level
+- **Action panel**: Current phase with spinner — Thinking, RunningAgent, Orchestrating, WaitingApproval, WaitingHuman, WaitingFollowUp, Idle, Done
+- **Log panel**: Scrollable chronological log with color-coded levels (Info, Warning, Error, Debug)
+- **Approval panel**: Shown when an action needs user approval — command preview + category, y/s/a/n keys
+- **Input panel**: Shown when `askHuman` is triggered — `tui-textarea` for response
+- **Follow-up panel**: Shown when agent completes a round and awaits follow-up input
+- **Help overlay**: Key bindings reference (`?` key)
+- **Inspect overlay**: Detailed view of selected log entry
+
 ### Key Bindings
 
 | Key | Action |
 |-----|--------|
 | `q` / `Ctrl-C` | Quit |
-| `v` | Toggle verbose mode |
+| `v` | Toggle verbose mode (cycle through quiet/normal/verbose/debug) |
 | `?` | Help overlay |
 | `+` / `-` | Cycle autonomy level |
 | `Up`/`Down`/`PgUp`/`PgDn` | Scroll log |
@@ -35,6 +46,14 @@
 | `s` | Skip pending action |
 | `a` | Auto-approve all remaining |
 | `n` | Deny and stop |
+
+### Streaming Display
+
+When a model is generating a response, text deltas are forwarded to the TUI in real-time via `AppEvent::ModelResponseDelta` and accumulated in a streaming buffer. The buffer is cleared when the full response arrives. This gives immediate feedback during long model responses.
+
+### Theme
+
+The TUI uses a Catppuccin Mocha-inspired color scheme with budget-aware color thresholds (green → yellow → red as context fills up).
 
 ## Autonomy System
 
@@ -61,7 +80,19 @@ When approval is needed, the agent loop pauses and the TUI shows the command pre
 
 ### Action Classification
 
-Action categories are determined by analyzing command JSON: shell commands are classified by inspecting for destructive patterns (`rm`, `kill`, `dd`, `mkfs`, `sudo`), network operations (`curl`, `wget`, `ssh`), file operations, etc.
+Commands are classified into categories by inspecting the command JSON:
+
+| Category | Examples |
+|----------|----------|
+| FileRead | `inspectPath`, `recallMemory` |
+| FileWrite | `editFile`, `writeFile`, `storeMemory` |
+| FileDelete | Commands with `rm`, `rmdir` |
+| CommandExec | `execAsAgent`, `execPty` |
+| NetworkRequest | Commands with `curl`, `wget`, `ssh`, `git` |
+| Destructive | Commands with `rm -rf`, `kill`, `dd`, `mkfs`, `sudo` |
+| HumanInput | `askHuman` |
+
+Shell commands are further classified by inspecting the command string for destructive patterns, network tools, and file writes (redirects, `tee`, `mv`, `cp`). The `sudo` prefix is detected as Destructive and the actual command after `sudo` is also classified.
 
 ## Web TUI
 
@@ -79,6 +110,8 @@ The `--web` flag serves the TUI remotely via WebSocket using xterm.js. The full 
 
 Open `http://<host>:8765/` in a browser. The terminal renders the same layout as the native TUI — status bar, log panel, action panel, approval/input panels. Key presses and terminal resizes in the browser are sent back to the server.
 
+The `--web` flag implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically via the web UI or programmatically.
+
 ### Voice Overlay
 
 The web TUI includes an optional voice overlay for browser-side live model interaction (Gemini Live / OpenAI Realtime). When activated:
@@ -90,4 +123,4 @@ The web TUI includes an optional voice overlay for browser-side live model inter
 
 Voice requires an API key (Gemini or OpenAI), stored in browser localStorage. The remote TUI works without voice enabled.
 
-See [Web Gateway](./integrations.md#web-gateway) for the full WebSocket protocol documentation.
+See [Integrations — Web Gateway](./integrations.md#web-gateway) for the full WebSocket protocol documentation and [Presence Layer](./presence.md) for details on presence mutual exclusion.
