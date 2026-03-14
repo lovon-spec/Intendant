@@ -1370,6 +1370,9 @@ impl App {
                     summary: summary.clone(),
                 });
                 self.log(LogLevel::Info, format!("--- {} ---", reason));
+                if let Some(ref brief) = summary {
+                    self.log(LogLevel::Detail, format!("Brief: {}", brief));
+                }
                 // Create a follow-up textarea so the user can submit follow-ups
                 // after task completion (press f to reopen).
                 if self.follow_up_textarea.is_none()

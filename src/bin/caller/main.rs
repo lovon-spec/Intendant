@@ -358,18 +358,70 @@ fn extract_json(text: &str) -> Option<&str> {
 }
 
 /// Parse a `BRIEF: ...` line from the model's last response.
-/// Returns the brief text, or a fallback if not found.
-fn parse_brief(text: &str) -> String {
+/// Returns `(brief_text, was_explicit)` — `was_explicit` is false when falling back.
+fn parse_brief(text: &str) -> (String, bool) {
+    // Look for explicit BRIEF: marker (scan from end for last occurrence)
     for line in text.lines().rev() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("BRIEF:") {
             let brief = rest.trim();
             if !brief.is_empty() {
-                return brief.to_string();
+                return (brief.to_string(), true);
             }
         }
     }
-    "Task completed.".to_string()
+    // Fallback: extract first 1-2 sentences from the text
+    (extract_brief_from_text(text), false)
+}
+
+/// Extract a short brief from freeform text by taking the first 1-2 sentences.
+fn extract_brief_from_text(text: &str) -> String {
+    let cleaned = text.trim();
+    if cleaned.is_empty() {
+        return "Task completed.".to_string();
+    }
+    // Skip markdown headers and blank lines to find the first content line(s)
+    let mut sentences = String::new();
+    let mut sentence_count = 0;
+    for line in cleaned.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("```")
+            || trimmed.starts_with("BRIEF:")
+        {
+            if sentence_count > 0 {
+                break; // Stop at first blank/header after content
+            }
+            continue;
+        }
+        // Strip markdown formatting
+        let plain = trimmed
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim_start_matches("> ");
+        if !sentences.is_empty() {
+            sentences.push(' ');
+        }
+        sentences.push_str(plain);
+        sentence_count += 1;
+        if sentence_count >= 2 || sentences.len() > 200 {
+            break;
+        }
+    }
+    if sentences.is_empty() {
+        return "Task completed.".to_string();
+    }
+    // Truncate if still too long
+    if sentences.len() > 200 {
+        if let Some(pos) = sentences[..200].rfind(". ") {
+            sentences.truncate(pos + 1);
+        } else {
+            sentences.truncate(200);
+            sentences.push_str("...");
+        }
+    }
+    sentences
 }
 
 /// Returns (json_string, had_context_directives).
@@ -889,25 +941,48 @@ Also: {"source": "bare"}"#;
     #[test]
     fn parse_brief_found() {
         let text = "I did a bunch of work.\n\nBRIEF: Implemented the login feature and added tests.";
-        assert_eq!(parse_brief(text), "Implemented the login feature and added tests.");
+        let (brief, explicit) = parse_brief(text);
+        assert_eq!(brief, "Implemented the login feature and added tests.");
+        assert!(explicit);
     }
 
     #[test]
-    fn parse_brief_not_found() {
+    fn parse_brief_not_found_uses_fallback() {
         let text = "I did a bunch of work. No brief marker here.";
-        assert_eq!(parse_brief(text), "Task completed.");
+        let (brief, explicit) = parse_brief(text);
+        assert_eq!(brief, "I did a bunch of work. No brief marker here.");
+        assert!(!explicit);
     }
 
     #[test]
-    fn parse_brief_empty_value() {
+    fn parse_brief_empty_value_uses_fallback() {
         let text = "Some output\nBRIEF:   \nMore text";
-        assert_eq!(parse_brief(text), "Task completed.");
+        let (brief, explicit) = parse_brief(text);
+        assert_eq!(brief, "Some output");
+        assert!(!explicit);
     }
 
     #[test]
     fn parse_brief_last_occurrence() {
         let text = "BRIEF: first\nsome text\nBRIEF: second and final";
-        assert_eq!(parse_brief(text), "second and final");
+        let (brief, explicit) = parse_brief(text);
+        assert_eq!(brief, "second and final");
+        assert!(explicit);
+    }
+
+    #[test]
+    fn parse_brief_fallback_skips_headers() {
+        let text = "# Summary\n\nThis is the main finding. It was significant.";
+        let (brief, explicit) = parse_brief(text);
+        assert_eq!(brief, "This is the main finding. It was significant.");
+        assert!(!explicit);
+    }
+
+    #[test]
+    fn parse_brief_fallback_empty_text() {
+        let (brief, explicit) = parse_brief("");
+        assert_eq!(brief, "Task completed.");
+        assert!(!explicit);
     }
 
     #[test]
@@ -2976,7 +3051,19 @@ All relative paths and commands execute from this directory.",
                     .last_response
                     .clone()
                     .unwrap_or_else(|| "Task completed successfully".to_string());
-                let brief = parse_brief(&full);
+                let (brief, was_explicit) = parse_brief(&full);
+                if was_explicit {
+                    slog(&session_log_for_summary, |l| {
+                        l.debug(&format!("Brief (model): {}", brief))
+                    });
+                } else {
+                    slog(&session_log_for_summary, |l| {
+                        l.debug(&format!(
+                            "Brief (fallback — model did not include BRIEF: line): {}",
+                            brief
+                        ))
+                    });
+                }
                 (
                     sub_agent::SubAgentStatus::Completed,
                     full,
@@ -3344,6 +3431,9 @@ async fn run_user_mode(
     let result_msg = sub_agent::format_result_message(&result);
     slog(&session_log, |l| {
         l.info(&format!("Orchestrator result: {}", result_msg));
+    });
+    slog(&session_log, |l| {
+        l.debug(&format!("Orchestrator brief: {}", result.brief));
     });
     emit(
         &bus,
