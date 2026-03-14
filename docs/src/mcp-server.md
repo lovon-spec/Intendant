@@ -1,6 +1,6 @@
 # MCP Server
 
-The `--mcp` flag launches Intendant as a [Model Context Protocol](https://modelcontextprotocol.io/) server on stdio. This lets external AI agents (Claude Code, Codex, etc.) observe and control Intendant with full parity to the TUI — every action a human can take in the TUI is available as an MCP tool.
+The `--mcp` flag launches Intendant as a [Model Context Protocol](https://modelcontextprotocol.io/) server on stdio. This lets external AI agents (Claude Code, Codex, etc.) observe and control Intendant with full parity to the TUI — every action a human can take in the TUI is available as an MCP tool. The server also supports connecting to external MCP servers as a client (see [MCP Client](#mcp-client) below).
 
 ## Running
 
@@ -161,3 +161,30 @@ Controller loop monitoring files (for `restart_command` scripts):
 3. When an approval is needed, `get_pending_approval` returns the command preview — call `approve`, `deny`, or `skip`
 4. When `askHuman` triggers, `get_pending_input` returns the question — call `respond` with your answer
 5. Call `quit` when done
+
+## MCP Client
+
+Intendant can also act as an MCP **client**, connecting to external MCP servers configured in `intendant.toml`. This lets agents use tools from external servers (filesystem, GitHub, databases, etc.) alongside Intendant's native tools.
+
+### Configuration
+
+```toml
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[[mcp_servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp_servers.env]
+GITHUB_TOKEN = "ghp_..."
+```
+
+### How It Works
+
+At startup, `McpClientManager` connects to all configured servers via child process transport, discovers their tools, and registers them with the `mcp__<server>_<tool>` naming convention. For example, a `filesystem` server's `read_file` tool becomes `mcp__filesystem_read_file`.
+
+Tool calls with the `mcp__` prefix are routed through the MCP client manager to the appropriate server. If a server fails to connect at startup, it is skipped with a warning — other servers and native tools continue to work.
