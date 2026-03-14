@@ -1,12 +1,14 @@
 # Integrations
 
+This chapter covers the control socket (Unix domain socket) and web gateway (WebSocket) integration points. For the MCP server interface, see [MCP Server](./mcp-server.md). For the presence layer that mediates user interaction, see [Presence Layer](./presence.md).
+
 ## Control Socket
 
-When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/intendant-<pid>.sock`.
+When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/intendant-<pid>.sock`. This enables programmatic control of a running Intendant instance from external scripts and tools.
 
-- Outbound event broadcast is implemented.
-- Inbound command handling is implemented for status, approval, denial, human input, autonomy change, quit, controller-restart workflow commands, and controller-loop intervention commands (in MCP mode).
-- Socket server is opt-in via `--control-socket`.
+- Outbound event broadcast to all connected clients
+- Inbound command handling for status, approval, denial, human input, autonomy change, quit, controller-restart workflow commands, and controller-loop intervention commands (in MCP mode)
+- Socket server is opt-in via `--control-socket`
 
 ### Inbound Commands (JSON-line)
 
@@ -60,6 +62,8 @@ echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
 ## Web Gateway
 
 The `--web` flag starts a WebSocket server that serves a remote TUI (xterm.js) and optionally enables browser-side live model interaction (voice/text) via the Gemini Live API or OpenAI Realtime API. `--web` implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically.
+
+See [TUI & Autonomy — Web TUI](./tui.md#web-tui) for setup instructions and [Presence Layer](./presence.md) for details on the mutual exclusion between server-side and browser-side presence.
 
 ### How It Works
 

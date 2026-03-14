@@ -6,7 +6,7 @@
 |------|-------------|
 | `--provider <name>` | Force provider (`openai`, `anthropic`, or `gemini`) |
 | `--model <name>` | Override model name |
-| `--verbose` | Show debug-level log entries in TUI |
+| `--verbose` / `-v` | Show debug-level log entries in TUI |
 | `--no-tui` | Disable TUI, use plain text output |
 | `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
 | `--log-file <dir>` | Override session log directory |
@@ -16,9 +16,9 @@
 | `--sandbox` | Enable Landlock filesystem sandboxing (Linux kernel 5.13+) |
 | `--direct` | Force single-agent direct mode (skip orchestrator even for complex tasks) |
 | `--no-presence` | Disable the presence layer (direct agent interaction) |
-| `--continue` | Resume most recent session for this project |
-| `--resume <id>` | Resume specific session by ID or prefix |
-| `--web` | Start web gateway for remote TUI + optional voice/text interaction (default port 8765, implies `--mcp`) |
+| `--continue` / `-c` | Resume most recent session for this project |
+| `--resume <id>` / `-r <id>` | Resume specific session by ID or prefix |
+| `--web [PORT]` | Start web gateway for remote TUI + optional voice/text interaction (default port 8765) |
 
 The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
 
@@ -37,15 +37,25 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 | `STRUCTURED_OUTPUT` | `true` for gpt-5+/o3/o4 | Enable JSON object mode for deterministic parsing |
 | `REASONING_EFFORT` | — | Reasoning effort for GPT-5/o3/o4 models (`low`, `medium`, `high`) |
 | `REASONING_SUMMARY` | — | Reasoning summary mode (`auto`, `concise`, `detailed`) |
-| `INTENDANT_ROLE` | — | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |
-| `INTENDANT_ID` | — | Unique sub-agent identifier |
-| `INTENDANT_RESULT_FILE` | — | Path for sub-agent to write final results |
-| `INTENDANT_PROGRESS_FILE` | — | Path for sub-agent to write periodic progress |
-| `INTENDANT_TASK` | — | Task description for sub-agent mode |
-| `INTENDANT_PARENT_KNOWLEDGE` | — | Path to parent's knowledge store for inheritance |
-| `INTENDANT_LOG_DIR` | auto | Session log directory (set automatically by caller for the runtime) |
 | `PRESENCE_PROVIDER` | — | Override provider for the presence layer (fallback: `PROVIDER`) |
 | `PRESENCE_MODEL` | — | Override model for the presence layer |
+| `INTENDANT_LOG_DIR` | auto | Session log directory (set automatically by caller for the runtime) |
+
+### Sub-Agent Environment Variables
+
+These are set automatically when spawning sub-agents (see [Multi-Agent Orchestration](./multi-agent.md)):
+
+| Variable | Description |
+|----------|-------------|
+| `INTENDANT_ROLE` | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |
+| `INTENDANT_ID` | Unique sub-agent identifier |
+| `INTENDANT_TASK` | Task description for the sub-agent |
+| `INTENDANT_RESULT_FILE` | Path for sub-agent to write final results |
+| `INTENDANT_PROGRESS_FILE` | Path for sub-agent to write periodic progress |
+| `INTENDANT_PARENT_KNOWLEDGE` | Path to parent's knowledge store for inheritance |
+| `INTENDANT_INHERIT_MEMORY` | `1` to inherit project memory |
+| `INTENDANT_SANDBOX_WRITE_PATHS` | Landlock write paths (set by caller when sandboxing) |
+| `INTENDANT_MCP_RELOAD` | `1` when process was exec'd for MCP hot-reload |
 
 The agent runner hard timeout is 120s default, automatically extended to 600s when `askHuman` is present in the command batch.
 
@@ -99,7 +109,7 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 GITHUB_TOKEN = "ghp_..."
 ```
 
-When sandboxing is enabled (via `--sandbox` or `[sandbox].enabled = true`), runtime command execution is restricted to read-only filesystem access plus writes to project root, `/tmp`, session log directory, `~/.intendant`, and `extra_write_paths`.
+When sandboxing is enabled (via `--sandbox` or `[sandbox].enabled = true`), runtime command execution is restricted to read-only filesystem access plus writes to project root, `/tmp`, session log directory, `~/.intendant`, and `extra_write_paths`. On kernels without Landlock support, sandboxing is silently skipped.
 
 ## INTENDANT.md Project Instructions
 
@@ -120,6 +130,6 @@ Prompts are resolved using a 3-layer cascade (highest priority first):
 2. **Global config** — `~/.config/intendant/SysPrompt.md` or `SysPrompt_tools.md` (user-wide customization)
 3. **Compiled-in default** — always available, zero-config
 
-Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`, `SysPrompt_implementation.md`) follow the same cascade and are appended to the base prompt.
+Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`, `SysPrompt_implementation.md`) follow the same cascade and are appended to the base prompt. The presence layer uses its own standalone prompt (`SysPrompt_presence.md`).
 
 To customize prompts for a specific project, place your modified `.md` files in the project's git root. For user-wide customization, place them in `~/.config/intendant/`.

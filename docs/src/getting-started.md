@@ -71,17 +71,47 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 # Verbose output (show debug-level log entries)
 ./target/release/intendant --verbose "echo hello"
 
+# JSONL structured output (implies --no-tui)
+./target/release/intendant --json "echo hello"
+
+# Resume most recent session for this project
+./target/release/intendant --continue "fix that bug"
+
+# Resume specific session by ID or prefix
+./target/release/intendant --resume abc123 "continue"
+
+# Force single-agent mode (skip orchestrator)
+./target/release/intendant --direct "simple task"
+
 # Web TUI (remote terminal + optional voice, default port 8765)
 ./target/release/intendant --web
 
 # Web TUI on custom port
 ./target/release/intendant --web 9000
+
+# Enable filesystem sandboxing (Landlock, Linux 5.13+)
+./target/release/intendant --sandbox "run tests"
+
+# Run as MCP server (stdio transport)
+./target/release/intendant --mcp "Deploy the application"
+
+# Enable Unix control socket
+./target/release/intendant --control-socket "task"
+
+# Disable the presence layer
+./target/release/intendant --no-presence "task"
+
+# Pipe input (auto-detects non-TTY, runs headless)
+echo "task" | ./target/release/intendant
 ```
 
 ## Testing
 
 ```bash
-cargo test
+cargo test --bins         # Unit tests (fast, no API keys needed)
+cargo test -- --list      # List all test names
 ```
 
-The test suite covers both binaries. See [Session Logging](./session-logging.md) for the full test coverage summary.
+The test suite covers both binaries with inline `#[cfg(test)]` modules. See [Session Logging](./session-logging.md) for the full test coverage summary.
+
+Integration tests in `tests/e2e/` spawn a real binary and make real API calls — see [Architecture](./architecture.md) for details.
