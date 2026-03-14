@@ -1363,10 +1363,11 @@ impl App {
                     Some(turn),
                 );
             }
-            AppEvent::TaskComplete { reason } => {
+            AppEvent::TaskComplete { reason, summary } => {
                 self.current_phase = Phase::Done;
                 self.broadcast_control(OutboundEvent::TaskComplete {
                     reason: reason.clone(),
+                    summary: summary.clone(),
                 });
                 self.log(LogLevel::Info, format!("--- {} ---", reason));
                 // Create a follow-up textarea so the user can submit follow-ups
@@ -1959,6 +1960,7 @@ mod tests {
         let mut app = test_app();
         app.handle_event(AppEvent::TaskComplete {
             reason: "Task complete".to_string(),
+            summary: None,
         });
         assert_eq!(app.current_phase, Phase::Done);
     }

@@ -204,6 +204,7 @@ mod tests {
     fn outbound_event_task_complete_serialize() {
         let event = OutboundEvent::TaskComplete {
             reason: "done signal".to_string(),
+            summary: Some("files listed".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"task_complete\""));

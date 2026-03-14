@@ -4,7 +4,13 @@ use crate::types::PresenceEvent;
 pub fn format_event(event: &PresenceEvent) -> String {
     match event {
         PresenceEvent::PhaseChanged { phase } => format!("Phase changed to: {}", phase),
-        PresenceEvent::TaskComplete { reason } => format!("Task complete: {}", reason),
+        PresenceEvent::TaskComplete { reason, summary } => {
+            if let Some(s) = summary {
+                format!("Task complete ({}): {}", reason, s)
+            } else {
+                format!("Task complete: {}", reason)
+            }
+        }
         PresenceEvent::ApprovalNeeded {
             id,
             preview,
@@ -59,8 +65,18 @@ mod tests {
 
         let event = PresenceEvent::TaskComplete {
             reason: "done".to_string(),
+            summary: None,
         };
         assert_eq!(format_event(&event), "Task complete: done");
+
+        let event = PresenceEvent::TaskComplete {
+            reason: "done".to_string(),
+            summary: Some("analyzed project".to_string()),
+        };
+        assert_eq!(
+            format_event(&event),
+            "Task complete (done): analyzed project"
+        );
 
         let event = PresenceEvent::Error {
             message: "oops".to_string(),

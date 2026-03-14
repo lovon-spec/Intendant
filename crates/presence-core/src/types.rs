@@ -79,7 +79,11 @@ pub struct TaskEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PresenceEvent {
     PhaseChanged { phase: String },
-    TaskComplete { reason: String },
+    TaskComplete {
+        reason: String,
+        #[serde(default)]
+        summary: Option<String>,
+    },
     ApprovalNeeded { id: u64, preview: String, category: String },
     HumanQuestion { question: String },
     BudgetWarning { pct: f64, remaining: u64 },
@@ -176,9 +180,10 @@ impl AgentStateSnapshot {
             }
             "task_complete" => {
                 let reason = event["reason"].as_str().unwrap_or("done").to_string();
+                let summary = event["summary"].as_str().map(|s| s.to_string());
                 self.phase = "idle".to_string();
                 self.pending_approval = None;
-                Some(PresenceEvent::TaskComplete { reason })
+                Some(PresenceEvent::TaskComplete { reason, summary })
             }
             "round_complete" => {
                 self.phase = "idle".to_string();
@@ -560,13 +565,17 @@ mod tests {
             seq: 5,
             event: PresenceEvent::TaskComplete {
                 reason: "done".to_string(),
+                summary: Some("result text".to_string()),
             },
         };
         let json = serde_json::to_string(&se).unwrap();
         let back: SequencedPresenceEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back.seq, 5);
         match back.event {
-            PresenceEvent::TaskComplete { reason } => assert_eq!(reason, "done"),
+            PresenceEvent::TaskComplete { reason, summary } => {
+                assert_eq!(reason, "done");
+                assert_eq!(summary.as_deref(), Some("result text"));
+            }
             _ => panic!("wrong variant"),
         }
     }
@@ -628,6 +637,7 @@ mod tests {
 
         let s2 = w.push(PresenceEvent::TaskComplete {
             reason: "done".to_string(),
+            summary: None,
         });
         assert_eq!(s2, 2);
         assert_eq!(w.current_seq(), 2);
@@ -672,6 +682,7 @@ mod tests {
         });
         w.push(PresenceEvent::TaskComplete {
             reason: "done".to_string(),
+            summary: None,
         });
         assert_eq!(w.current_seq(), 2);
 

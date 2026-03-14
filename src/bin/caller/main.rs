@@ -759,8 +759,12 @@ fn app_event_to_json(event: &AppEvent) -> Option<(&'static str, serde_json::Valu
                 "category": format!("{:?}", category),
             }),
         )),
-        AppEvent::TaskComplete { reason } => {
-            Some(("done", serde_json::json!({ "reason": reason })))
+        AppEvent::TaskComplete { reason, summary } => {
+            let mut data = serde_json::json!({ "reason": reason });
+            if let Some(ref s) = summary {
+                data["summary"] = serde_json::json!(s);
+            }
+            Some(("done", data))
         }
         AppEvent::ContextManagement { turn } => {
             Some(("context_management", serde_json::json!({ "turn": turn })))
@@ -2087,6 +2091,7 @@ async fn run_agent_loop(
                         &bus,
                         || AppEvent::TaskComplete {
                             reason: format!("Denied by policy ({})", cat),
+                            summary: None,
                         },
                         || println!("--- Denied by policy ({}) ---", cat),
                     );
@@ -2128,6 +2133,7 @@ async fn run_agent_loop(
                                 &bus,
                                 || AppEvent::TaskComplete {
                                     reason: "Denied by user".to_string(),
+                                    summary: None,
                                 },
                                 || println!("--- Denied by user ---"),
                             );
@@ -2192,6 +2198,7 @@ async fn run_agent_loop(
                                     "Approval required in headless mode ({})",
                                     cat
                                 ),
+                                summary: None,
                             },
                             || {
                                 println!(
@@ -2293,6 +2300,7 @@ async fn run_agent_loop(
                         &bus,
                         || AppEvent::TaskComplete {
                             reason: "Task complete".to_string(),
+                            summary: None,
                         },
                         || println!("--- Task complete ---"),
                     );
@@ -2376,6 +2384,7 @@ async fn run_agent_loop(
                             &bus,
                             || AppEvent::TaskComplete {
                                 reason: "Task complete".to_string(),
+                                summary: None,
                             },
                             || println!("--- Task complete ---"),
                         );
@@ -2467,6 +2476,7 @@ Proceed with explicit assumptions and continue without additional questions."
                         &bus,
                         || AppEvent::TaskComplete {
                             reason: format!("Denied by policy ({})", cat),
+                            summary: None,
                         },
                         || println!("--- Denied by policy ({}) ---", cat),
                     );
@@ -2508,6 +2518,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 &bus,
                                 || AppEvent::TaskComplete {
                                     reason: "Denied by user".to_string(),
+                                    summary: None,
                                 },
                                 || println!("--- Denied by user ---"),
                             );
@@ -2572,6 +2583,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     "Approval required in headless mode ({})",
                                     cat
                                 ),
+                                summary: None,
                             },
                             || {
                                 println!(
@@ -3301,6 +3313,7 @@ async fn run_user_mode(
         &bus,
         || AppEvent::TaskComplete {
             reason: reason.clone(),
+            summary: Some(result_msg.clone()),
         },
         || println!("--- {} ---", reason),
     );

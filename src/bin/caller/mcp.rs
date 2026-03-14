@@ -1794,7 +1794,7 @@ pub fn spawn_event_listener(
                         s.push_log(LogLevel::Detail, format!("[T{}] Context management", turn));
                     }
 
-                    AppEvent::TaskComplete { reason } => {
+                    AppEvent::TaskComplete { reason, .. } => {
                         s.set_phase(Phase::Done);
                         s.push_log(LogLevel::Info, format!("Task complete: {}", reason));
                         resource_changed = Some("intendant://status");

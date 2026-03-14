@@ -63,6 +63,7 @@ pub enum AppEvent {
     },
     TaskComplete {
         reason: String,
+        summary: Option<String>,
     },
     BudgetWarning {
         pct: f64,

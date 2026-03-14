@@ -123,6 +123,8 @@ pub enum OutboundEvent {
     },
     TaskComplete {
         reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     RoundComplete {
         round: usize,

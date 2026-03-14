@@ -588,10 +588,16 @@ impl PresenceWeb {
             }
             "task_complete" => {
                 let reason = evt_val["reason"].as_str().unwrap_or("");
+                let summary = evt_val["summary"].as_str().unwrap_or("");
+                let detail = if summary.is_empty() {
+                    reason.to_string()
+                } else {
+                    format!("{}\n\nResult:\n{}", reason, summary)
+                };
                 Some(format!(
-                    "[System: done] {}. Tell the user briefly and ask if they need anything else. \
-                     If they give you a new task, use submit_task.",
-                    reason
+                    "[System: done] {}. Tell the user briefly what was accomplished and ask \
+                     if they need anything else. If they give you a new task, use submit_task.",
+                    detail
                 ))
             }
             // round_complete is intentionally NOT injected — task_complete already

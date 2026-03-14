@@ -580,10 +580,11 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 None
             }
         }
-        AppEvent::TaskComplete { reason } => {
+        AppEvent::TaskComplete { reason, summary } => {
             *last_phase = "done".to_string();
             Some(PresenceEvent::TaskComplete {
                 reason: reason.clone(),
+                summary: summary.clone(),
             })
         }
         AppEvent::ApprovalRequired {
@@ -762,7 +763,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             };
             s.last_output_summary = truncate(&combined, 500);
         }
-        AppEvent::TaskComplete { reason } => {
+        AppEvent::TaskComplete { reason, .. } => {
             s.phase = format!("done: {}", reason);
         }
         AppEvent::RoundComplete { .. } => {
@@ -858,6 +859,7 @@ mod tests {
 
         let event = AppEvent::TaskComplete {
             reason: "done".to_string(),
+            summary: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
 
@@ -997,6 +999,7 @@ mod tests {
         update_agent_state(
             &AppEvent::TaskComplete {
                 reason: "done_signal".to_string(),
+                summary: None,
             },
             &state,
         );
@@ -1032,6 +1035,7 @@ mod tests {
 
         let s = format_event(&PresenceEvent::TaskComplete {
             reason: "done".to_string(),
+            summary: None,
         });
         assert!(s.contains("done"));
 
@@ -1087,6 +1091,7 @@ mod tests {
         assert_eq!(seq, 1);
         let seq2 = session.record_event(PresenceEvent::TaskComplete {
             reason: "done".to_string(),
+            summary: None,
         });
         assert_eq!(seq2, 2);
     }
@@ -1099,6 +1104,7 @@ mod tests {
         });
         session.record_event(PresenceEvent::TaskComplete {
             reason: "done".to_string(),
+            summary: None,
         });
 
         let state = AgentStateSnapshot {
