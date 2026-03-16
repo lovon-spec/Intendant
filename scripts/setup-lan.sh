@@ -104,6 +104,10 @@ recert() {
     systemctl restart nginx
     info "done — nginx restarted with new cert"
     info "no changes needed on your phone (same CA)"
+    warn "if you get certificate errors, clear your browser's cache/history:"
+    warn "  iOS Safari: Settings → Safari → Clear History and Website Data"
+    warn "  Android Chrome: Settings → Privacy → Clear Browsing Data"
+    warn "  Desktop: clear SSL state or restart browser"
 }
 
 generate_certs() {
