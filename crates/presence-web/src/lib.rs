@@ -134,6 +134,11 @@ impl PresenceWeb {
     }
 
     #[wasm_bindgen]
+    pub fn set_on_session_changed(&self, f: Function) {
+        *self.callbacks.on_session_changed.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
     pub fn set_on_state_snapshot(&self, f: Function) {
         *self.callbacks.on_state_snapshot.borrow_mut() = Some(f);
     }
@@ -155,6 +160,7 @@ impl PresenceWeb {
             let cb = self.callbacks.clone();
             let pending = pending;
             let presence = presence;
+            let last_session_id: RefCell<Option<String>> = RefCell::new(None);
             Box::new(move |msg: serde_json::Value| {
                 // Route by message type
                 let t = msg.get("t").and_then(|v| v.as_str());
@@ -174,6 +180,22 @@ impl PresenceWeb {
                         cb.invoke_state_snapshot(&to_js(&msg));
                     }
                     Some("presence_welcome") => {
+                        // Detect server session change (binary restarted).
+                        // If the session ID differs, the voice model's Gemini
+                        // context is stale — JS must reconnect it.
+                        if let Some(sid) = msg.get("session_id").and_then(|v| v.as_str()) {
+                            let mut last = last_session_id.borrow_mut();
+                            if let Some(ref prev) = *last {
+                                if prev != sid {
+                                    cb.invoke_diagnostic(
+                                        "session_changed",
+                                        &format!("{} → {}", prev, sid),
+                                    );
+                                    cb.invoke_session_changed();
+                                }
+                            }
+                            *last = Some(sid.to_string());
+                        }
                         // Update presence state from welcome
                         if let Some(state) = msg.get("state") {
                             presence.borrow_mut().set_state(to_js(state));
@@ -406,8 +428,23 @@ impl PresenceWeb {
 
     #[wasm_bindgen]
     pub fn send_server_action(&self, action: JsValue) {
-        if let Ok(val) = serde_wasm_bindgen::from_value::<serde_json::Value>(action) {
-            self.server.borrow().send_action(&val);
+        match serde_wasm_bindgen::from_value::<serde_json::Value>(action) {
+            Ok(val) => {
+                let sent = self.server.borrow().send_action(&val);
+                if !sent {
+                    let action_type = val.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                    self.callbacks.invoke_diagnostic(
+                        "action_drop",
+                        &format!("send_server_action({}) failed — server WebSocket not ready", action_type),
+                    );
+                }
+            }
+            Err(e) => {
+                self.callbacks.invoke_diagnostic(
+                    "action_drop",
+                    &format!("send_server_action: JsValue deserialization failed: {:?}", e),
+                );
+            }
         }
     }
 

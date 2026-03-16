@@ -1070,10 +1070,15 @@ impl App {
                         self.current_phase = Phase::Thinking;
                         self.round += 1;
                         self.log(LogLevel::Info, format!("Task dispatched: {}", truncate_str(&task, 80)));
-                    } else if self.current_phase == Phase::Idle {
+                    } else {
                         self.log(
                             LogLevel::Warn,
-                            "start_task: task channel not ready yet — try again shortly".to_string(),
+                            format!(
+                                "start_task: dispatch failed (phase: {:?}, task_tx: {}, follow_up_tx: {})",
+                                self.current_phase,
+                                self.task_tx.is_some(),
+                                self.follow_up_tx.is_some(),
+                            ),
                         );
                     }
                 } else {

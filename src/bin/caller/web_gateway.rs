@@ -563,8 +563,26 @@ pub fn spawn_web_gateway(
                                         }
                                         _ => {
                                             // Fall through to ControlMsg parsing
-                                            if let Ok(ctrl) = serde_json::from_value::<ControlMsg>(json) {
-                                                bus_inbound.send(AppEvent::ControlCommand(ctrl));
+                                            match serde_json::from_value::<ControlMsg>(json) {
+                                                Ok(ctrl) => {
+                                                    bus_inbound.send(AppEvent::PresenceLog {
+                                                        message: format!("[ws] ControlMsg: {:?}",
+                                                            match &ctrl {
+                                                                ControlMsg::StartTask { task, .. } => format!("StartTask({})", &task[..task.len().min(60)]),
+                                                                other => format!("{:?}", other),
+                                                            }),
+                                                        level: Some(LogLevel::Debug),
+                                                        turn: None,
+                                                    });
+                                                    bus_inbound.send(AppEvent::ControlCommand(ctrl));
+                                                }
+                                                Err(e) => {
+                                                    bus_inbound.send(AppEvent::PresenceLog {
+                                                        message: format!("[ws] ControlMsg parse failed: {}", e),
+                                                        level: Some(LogLevel::Warn),
+                                                        turn: None,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -871,18 +889,23 @@ mod tests {
             .unwrap();
 
         // Verify the EventBus receives the ControlCommand
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        // (may be preceded by a PresenceLog debug event from the diagnostic logging)
+        let mut found = false;
+        for _ in 0..5 {
+            let event = tokio::time::timeout(
+                tokio::time::Duration::from_secs(2),
+                rx.recv(),
+            )
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
-        match event {
-            AppEvent::ControlCommand(ControlMsg::Status) => {}
-            _ => panic!("expected ControlCommand(Status), got {:?}", event),
+            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status)) {
+                found = true;
+                break;
+            }
         }
+        assert!(found, "expected ControlCommand(Status)");
 
         handle.abort();
     }

@@ -346,8 +346,8 @@ impl ServerConnection {
         self.send_json(&msg);
     }
 
-    /// Send a ControlMsg action to the server.
-    pub fn send_action(&self, action: &serde_json::Value) {
-        self.send_json(action);
+    /// Send a ControlMsg action to the server. Returns true if sent.
+    pub fn send_action(&self, action: &serde_json::Value) -> bool {
+        self.send_json(action)
     }
 }

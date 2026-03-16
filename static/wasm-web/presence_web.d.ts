@@ -76,6 +76,7 @@ export class PresenceWeb {
     set_on_inject_voice_text(f: Function): void;
     set_on_server_event(f: Function): void;
     set_on_server_state(f: Function): void;
+    set_on_session_changed(f: Function): void;
     set_on_state_snapshot(f: Function): void;
     set_on_term(f: Function): void;
     set_on_voice_audio(f: Function): void;
@@ -189,6 +190,7 @@ export interface InitOutput {
     readonly presenceweb_set_on_inject_voice_text: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_event: (a: number, b: any) => void;
     readonly presenceweb_set_on_server_state: (a: number, b: any) => void;
+    readonly presenceweb_set_on_session_changed: (a: number, b: any) => void;
     readonly presenceweb_set_on_state_snapshot: (a: number, b: any) => void;
     readonly presenceweb_set_on_term: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_audio: (a: number, b: any) => void;

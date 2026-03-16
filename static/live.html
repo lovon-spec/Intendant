@@ -613,6 +613,17 @@ async function init() {
   pw.set_on_diagnostic((kind, detail) => {
     try { pw.send_voice_diagnostic(kind, detail); } catch(_) {}
   });
+  pw.set_on_session_changed(() => {
+    // Server binary restarted — voice model has stale Gemini context.
+    // Reconnect to get a fresh session.
+    if (modelConnected) {
+      console.log('[presence-web] Server session changed — reconnecting voice model');
+      pw.disconnect_voice();
+      modelConnected = false;
+      voiceDot.className = 'conn-dot err';
+      connectVoice();
+    }
+  });
   pw.set_on_inject_voice_text((text) => {
     // Async query results from server — inject into voice model as system text
     pw.send_text(text);

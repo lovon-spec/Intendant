@@ -31,6 +31,7 @@ export const presenceweb_set_on_error: (a: number, b: any) => void;
 export const presenceweb_set_on_inject_voice_text: (a: number, b: any) => void;
 export const presenceweb_set_on_server_event: (a: number, b: any) => void;
 export const presenceweb_set_on_server_state: (a: number, b: any) => void;
+export const presenceweb_set_on_session_changed: (a: number, b: any) => void;
 export const presenceweb_set_on_state_snapshot: (a: number, b: any) => void;
 export const presenceweb_set_on_term: (a: number, b: any) => void;
 export const presenceweb_set_on_voice_audio: (a: number, b: any) => void;

@@ -37,6 +37,8 @@ pub struct Callbacks {
     pub on_diagnostic: RefCell<Option<Function>>,
     /// Inject system text into the active voice model (for async query results).
     pub on_inject_voice_text: RefCell<Option<Function>>,
+    /// Server session changed (binary restarted). Voice model should reconnect.
+    pub on_session_changed: RefCell<Option<Function>>,
 }
 
 impl Callbacks {
@@ -119,6 +121,12 @@ impl Callbacks {
     pub fn invoke_inject_voice_text(&self, text: &str) {
         if let Some(ref f) = *self.on_inject_voice_text.borrow() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
+        }
+    }
+
+    pub fn invoke_session_changed(&self) {
+        if let Some(ref f) = *self.on_session_changed.borrow() {
+            let _ = f.call0(&JsValue::NULL);
         }
     }
 }
