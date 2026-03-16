@@ -25,6 +25,7 @@ HTTPS_PORT=8443
 CERT_SERVE_PORT=9999
 TUNNEL_TARGET=""
 ACTION="setup"
+FORCE=false
 LAN_IP=""
 P12_PASS=""
 
@@ -44,6 +45,7 @@ parse_args() {
             --tunnel)   TUNNEL_TARGET="$2"; shift 2 ;;
             --port)     HTTPS_PORT="$2"; shift 2 ;;
             --recert)   ACTION="recert"; shift ;;
+            --force)    FORCE=true; shift ;;
             --remove)   ACTION="remove"; shift ;;
             -h|--help)  usage ;;
             *)          die "unknown option: $1" ;;
@@ -64,13 +66,22 @@ generate_server_cert() {
         -key "$CERT_DIR/server.key" \
         -out "$CERT_DIR/server.csr" \
         -subj "/CN=$LAN_IP" 2>/dev/null
+
+    # iOS requires: <=825 days, serverAuth EKU, CA:FALSE, SAN
     openssl x509 -req \
         -in "$CERT_DIR/server.csr" \
         -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
-        -days 3650 -out "$CERT_DIR/server.crt" \
-        -extfile <(echo "subjectAltName=IP:$LAN_IP") 2>/dev/null
+        -days 825 -out "$CERT_DIR/server.crt" \
+        -extfile <(cat <<EXTFILE
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=IP:$LAN_IP
+EXTFILE
+        ) 2>/dev/null
+
     rm -f "$CERT_DIR/server.csr"
-    info "server cert issued for $LAN_IP"
+    info "server cert issued for $LAN_IP (valid 825 days)"
 }
 
 recert() {
@@ -83,8 +94,8 @@ recert() {
     old_ip=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -ext subjectAltName 2>/dev/null \
         | grep -oP 'IP Address:\K[0-9.]+' || echo "unknown")
 
-    if [[ "$old_ip" == "$LAN_IP" ]]; then
-        info "server cert already matches $LAN_IP — nothing to do"
+    if [[ "$old_ip" == "$LAN_IP" ]] && ! $FORCE; then
+        info "server cert already matches $LAN_IP — nothing to do (use --force to regenerate)"
         exit 0
     fi
 
