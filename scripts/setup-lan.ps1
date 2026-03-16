@@ -266,15 +266,17 @@ function Run-Wizard {
     # Step 5: Execute
     Write-Host ""
 
+    # Set up port forwarding FIRST — setup-lan.sh will start a temporary
+    # HTTP server for cert download, which needs to be reachable from the phone
+    Info "setting up Windows port forwarding..."
+    Add-PortForwarding
+    Add-FirewallRule
+
     Info "copying setup script to guest..."
     Copy-ScriptToGuest
 
     Info "running setup on guest (follow the prompts there)..."
     Invoke-GuestCommand "sudo /tmp/setup-lan.sh --port $($script:Port)"
-
-    Info "setting up Windows port forwarding..."
-    Add-PortForwarding
-    Add-FirewallRule
 
     # Save config for future --recert / --remove
     Save-Config
