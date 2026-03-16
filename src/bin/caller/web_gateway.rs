@@ -101,8 +101,6 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
 
 const WEB_HTML: &str = include_str!("../../../static/live.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
-const AUDIO_PLAYBACK_PROCESSOR_JS: &str =
-    include_str!("../../../static/audio-playback-processor.js");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 
@@ -690,8 +688,6 @@ pub fn spawn_web_gateway(
                     } else {
                         let (content_type, body, cache) = if request_line.contains("/wasm-web/presence_web.js") {
                             ("application/javascript", WASM_WEB_JS.to_string(), "public, max-age=31536000, immutable")
-                        } else if request_line.contains("/audio-playback-processor.js") {
-                            ("application/javascript", AUDIO_PLAYBACK_PROCESSOR_JS.to_string(), "no-cache")
                         } else if request_line.contains("/audio-processor.js") {
                             ("application/javascript", AUDIO_PROCESSOR_JS.to_string(), "no-cache")
                         } else if request_line.contains("/config") {
