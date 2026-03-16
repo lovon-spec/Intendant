@@ -407,11 +407,24 @@ function stopMic() {
   hideVoiceStatus();
 }
 
-const audioQueue = [];
-let isPlaying = false;
+// Playback via AudioWorklet — resamples model PCM to native rate on the audio
+// thread and outputs a continuous sample stream. No BufferSourceNode scheduling,
+// no buffer boundaries, no clicks.
+let playbackNode = null;
+let playbackReady = false;
+
+async function ensurePlaybackWorklet() {
+  if (playbackReady) return;
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  await audioCtx.audioWorklet.addModule('/audio-playback-processor.js');
+  playbackNode = new AudioWorkletNode(audioCtx, 'audio-playback-processor');
+  playbackNode.connect(audioCtx.destination);
+  playbackReady = true;
+}
 
 function playAudioChunk(b64data) {
-  if (!audioCtx) return;
+  if (!playbackNode) return;
   const outRate = gatewayConfig ? gatewayConfig.output_sample_rate : 24000;
   const binary = atob(b64data);
   const bytes = new Uint8Array(binary.length);
@@ -419,21 +432,7 @@ function playAudioChunk(b64data) {
   const pcm16 = new Int16Array(bytes.buffer);
   const float32 = new Float32Array(pcm16.length);
   for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
-  const buffer = audioCtx.createBuffer(1, float32.length, outRate);
-  buffer.copyToChannel(float32, 0);
-  audioQueue.push(buffer);
-  if (!isPlaying) playNext();
-}
-
-function playNext() {
-  if (audioQueue.length === 0) { isPlaying = false; return; }
-  isPlaying = true;
-  const buffer = audioQueue.shift();
-  const src = audioCtx.createBufferSource();
-  src.buffer = buffer;
-  src.connect(audioCtx.destination);
-  src.onended = playNext;
-  src.start();
+  playbackNode.port.postMessage({ type: 'audio', data: float32, rate: outRate });
 }
 
 // ============================================================
@@ -458,7 +457,7 @@ micBtn.addEventListener('click', async () => {
 // Voice connection — requires API key in localStorage
 // ============================================================
 let voiceConnecting = false;
-function connectVoice() {
+async function connectVoice() {
   if (!pw || voiceConnecting) return;
   const apiKey = localStorage.getItem(getStorageKey());
   if (!apiKey) {
@@ -466,9 +465,8 @@ function connectVoice() {
     return;
   }
   voiceConnecting = true;
-  // Ensure shared AudioContext exists for playback (mic will reuse it)
-  if (!audioCtx) audioCtx = new AudioContext();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  // Ensure shared AudioContext + playback worklet are ready before audio arrives
+  await ensurePlaybackWorklet();
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   const model = (gatewayConfig && gatewayConfig.model) || null;
   const inputRate = (gatewayConfig && gatewayConfig.input_sample_rate) || null;
@@ -602,6 +600,7 @@ async function init() {
     if (!msg.startsWith('Server')) {
       modelConnected = false;
       voiceDot.className = 'conn-dot err';
+      if (playbackNode) playbackNode.port.postMessage({ type: 'clear' });
     }
     showVoiceStatus(msg, true);
     // Send diagnostic to server for TUI logging
