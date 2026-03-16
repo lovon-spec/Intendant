@@ -420,8 +420,10 @@ function playAudioChunk(b64data) {
   const pcm16 = new Int16Array(bytes.buffer);
   const float32 = new Float32Array(pcm16.length);
   for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
-  const buffer = audioCtx.createBuffer(1, float32.length, outRate);
-  buffer.copyToChannel(float32, 0);
+  const nativeRate = audioCtx.sampleRate;
+  const resampled = (outRate !== nativeRate) ? downsample(float32, outRate, nativeRate) : float32;
+  const buffer = audioCtx.createBuffer(1, resampled.length, nativeRate);
+  buffer.copyToChannel(resampled, 0);
   audioQueue.push(buffer);
   if (!isPlaying) playNext();
 }
