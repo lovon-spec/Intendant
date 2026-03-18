@@ -177,6 +177,12 @@ export class PresenceWeb {
         wasm.presenceweb_send_key(this.__wbg_ptr, ptr0, len0, ctrl, alt, shift);
     }
     /**
+     * Request to become the active voice owner (triggers handover from current active).
+     */
+    send_make_active() {
+        wasm.presenceweb_send_make_active(this.__wbg_ptr);
+    }
+    /**
      * Send a presence checkpoint to the server.
      * @param {string} summary
      */
@@ -218,6 +224,15 @@ export class PresenceWeb {
         wasm.presenceweb_send_tool_request(this.__wbg_ptr, ptr0, len0, args, on_result);
     }
     /**
+     * Send raw PCM16 audio (base64-encoded) to the server for transcription.
+     * @param {string} base64_pcm
+     */
+    send_user_audio(base64_pcm) {
+        const ptr0 = passStringToWasm0(base64_pcm, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.presenceweb_send_user_audio(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
      * Send a voice diagnostic to the server (errors, silence, disconnects).
      * @param {string} kind
      * @param {string} detail
@@ -251,6 +266,12 @@ export class PresenceWeb {
     /**
      * @param {Function} f
      */
+    set_on_active_granted(f) {
+        wasm.presenceweb_set_on_active_granted(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
     set_on_diagnostic(f) {
         wasm.presenceweb_set_on_diagnostic(this.__wbg_ptr, f);
     }
@@ -259,6 +280,12 @@ export class PresenceWeb {
      */
     set_on_error(f) {
         wasm.presenceweb_set_on_error(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_force_disconnect(f) {
+        wasm.presenceweb_set_on_force_disconnect(this.__wbg_ptr, f);
     }
     /**
      * @param {Function} f
@@ -797,17 +824,17 @@ function __wbg_get_imports() {
             console.warn(arg0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 98, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 101, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 102, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 105, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 98, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 101, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 102, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 105, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 98, function: Function { arguments: [], shim_idx: 99, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 102, function: Function { arguments: [], shim_idx: 103, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__ha067de4be952b5b6);
             return ret;
         },

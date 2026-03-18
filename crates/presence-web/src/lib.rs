@@ -148,6 +148,16 @@ impl PresenceWeb {
         *self.callbacks.on_server_event.borrow_mut() = Some(f);
     }
 
+    #[wasm_bindgen]
+    pub fn set_on_force_disconnect(&self, f: Function) {
+        *self.callbacks.on_force_disconnect.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
+    pub fn set_on_active_granted(&self, f: Function) {
+        *self.callbacks.on_active_granted.borrow_mut() = Some(f);
+    }
+
     // --- Server connection ---
 
     #[wasm_bindgen]
@@ -214,6 +224,14 @@ impl PresenceWeb {
                     Some("presence_checkpoint_ack") => {
                         // Acknowledged — no action needed on browser side
                     }
+                    Some("force_disconnect_voice") => {
+                        let reason = msg["reason"].as_str().unwrap_or("unknown");
+                        cb.invoke_force_disconnect(reason);
+                    }
+                    Some("active_granted") => {
+                        let handover_context = msg["handover_context"].as_str().unwrap_or("");
+                        cb.invoke_active_granted(handover_context);
+                    }
                     Some("tool_response") => {
                         if let Some(id) = msg["id"].as_str() {
                             let resolver = pending.borrow_mut().remove(id);
@@ -259,6 +277,12 @@ impl PresenceWeb {
     #[wasm_bindgen]
     pub fn reconnect_server(&self, url: &str) {
         self.server.borrow_mut().connect(url);
+    }
+
+    /// Request to become the active voice owner (triggers handover from current active).
+    #[wasm_bindgen]
+    pub fn send_make_active(&self) {
+        self.server.borrow().send_make_active();
     }
 
     #[wasm_bindgen]

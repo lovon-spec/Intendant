@@ -359,4 +359,9 @@ impl ServerConnection {
     pub fn send_action(&self, action: &serde_json::Value) -> bool {
         self.send_json(action)
     }
+
+    /// Request to become the active voice owner (triggers handover from current active).
+    pub fn send_make_active(&self) {
+        self.send_json(&serde_json::json!({"t": "make_active"}));
+    }
 }

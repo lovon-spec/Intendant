@@ -745,6 +745,11 @@ impl PresenceSession {
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+
+    /// Get the last checkpoint summary, if any.
+    pub fn last_checkpoint_summary(&self) -> Option<String> {
+        self.last_checkpoint.as_ref().map(|c| c.summary.clone())
+    }
 }
 
 pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot>>) {

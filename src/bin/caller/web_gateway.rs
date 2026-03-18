@@ -6,8 +6,15 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+
+/// Tracks which WebSocket connection currently owns the voice model (is "active").
+/// Only one connection can be active at a time; all others are "passive" (TUI-only).
+struct ActivePresence {
+    connection_id: String,
+    direct_tx: mpsc::UnboundedSender<String>,
+}
 
 pub const DEFAULT_PORT: u16 = 8765;
 
@@ -190,6 +197,7 @@ pub fn spawn_web_gateway(
     let session_provider = config.provider.clone();
     let session_model = config.model.clone();
     let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
+    let active_presence: Arc<Mutex<Option<ActivePresence>>> = Arc::new(Mutex::new(None));
 
     let web_html = Arc::new(web_html);
 
@@ -218,6 +226,7 @@ pub fn spawn_web_gateway(
             let session_model = session_model.clone();
             let web_html = web_html.clone();
             let transcriber = transcriber.clone();
+            let active_presence = active_presence.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -243,12 +252,15 @@ pub fn spawn_web_gateway(
                     let (mut ws_tx, mut ws_rx) = ws_stream.split();
                     let mut outbound_rx = broadcast_tx.subscribe();
 
+                    // Per-connection identity for active/passive tracking
+                    let connection_id = uuid::Uuid::new_v4().to_string();
+
                     // Direct response channel: tool_response and state_snapshot
                     // messages for this specific connection (not broadcast).
                     let (direct_tx, mut direct_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<String>();
+                        mpsc::unbounded_channel::<String>();
 
-                    // Send bootstrap state snapshot on connect
+                    // Send bootstrap state snapshot on connect (with connection_id)
                     if let Some(ref ctx) = query_ctx {
                         let state = ctx.agent_state.lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -256,6 +268,7 @@ pub fn spawn_web_gateway(
                         let bootstrap = serde_json::json!({
                             "t": "state_snapshot",
                             "state": state,
+                            "connection_id": connection_id,
                         });
                         let _ = direct_tx.send(bootstrap.to_string());
                     }
@@ -278,12 +291,16 @@ pub fn spawn_web_gateway(
                     let live_provider = session_provider.clone();
                     let live_model = session_model.clone();
                     let transcriber_inbound = transcriber.clone();
+                    let active_presence_inbound = active_presence.clone();
+                    let connection_id_inbound = connection_id.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
                         // without a clean presence_disconnect message (e.g. tab close
                         // before beforeunload fires, network failure).
                         let mut is_presence_connected = false;
+                        // Whether this connection is the active voice owner
+                        let mut is_active = false;
 
                         // Per-connection audio transcription buffer.
                         // PCM16 bytes are accumulated and drained every ~3s.
@@ -326,17 +343,39 @@ pub fn spawn_web_gateway(
                                                 .filter(|s| !s.is_empty())
                                                 .map(String::from)
                                                 .unwrap_or_else(|| live_model.clone());
-                                            bus_inbound.send(AppEvent::PresenceConnected {
-                                                server_session_id: None,
-                                                last_event_seq: 0,
-                                                live_provider: Some(msg_provider),
-                                                live_model: Some(msg_model),
-                                            });
+                                            // Legacy clients always become active (first-connect wins)
+                                            let becomes_active = {
+                                                let slot = active_presence_inbound.lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                slot.is_none()
+                                            };
+                                            if becomes_active {
+                                                *active_presence_inbound.lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) = Some(ActivePresence {
+                                                    connection_id: connection_id_inbound.clone(),
+                                                    direct_tx: direct_tx_inbound.clone(),
+                                                });
+                                                is_active = true;
+                                                bus_inbound.send(AppEvent::PresenceConnected {
+                                                    server_session_id: None,
+                                                    last_event_seq: 0,
+                                                    live_provider: Some(msg_provider),
+                                                    live_model: Some(msg_model),
+                                                });
+                                            }
                                         }
                                         Some("live_disconnected") => {
                                             is_presence_connected = false;
                                             voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = false;
-                                            bus_inbound.send(AppEvent::PresenceDisconnected);
+                                            if is_active {
+                                                let mut slot = active_presence_inbound.lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                if slot.as_ref().map(|a| a.connection_id == connection_id_inbound).unwrap_or(false) {
+                                                    *slot = None;
+                                                }
+                                                is_active = false;
+                                                bus_inbound.send(AppEvent::PresenceDisconnected);
+                                            }
                                         }
                                         Some("presence_connect") => {
                                             is_presence_connected = true;
@@ -360,11 +399,30 @@ pub fn spawn_web_gateway(
                                                 .map(String::from)
                                                 .unwrap_or_else(|| live_model.clone());
 
+                                            // Determine if this connection becomes active or passive
+                                            let becomes_active = {
+                                                let slot = active_presence_inbound.lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                slot.is_none()
+                                            };
+
+                                            if becomes_active {
+                                                // First-connect wins: grant active status
+                                                *active_presence_inbound.lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) = Some(ActivePresence {
+                                                    connection_id: connection_id_inbound.clone(),
+                                                    direct_tx: direct_tx_inbound.clone(),
+                                                });
+                                                is_active = true;
+                                            }
+
                                             // Send welcome with replay window if presence session is available
                                             if let Some(ref ctx) = query_ctx_inbound {
                                                 if let Some(ref ps) = ctx.presence_session {
                                                     let mut session = ps.lock().unwrap_or_else(|e| e.into_inner());
-                                                    session.set_connected(true);
+                                                    if becomes_active {
+                                                        session.set_connected(true);
+                                                    }
                                                     let state = ctx.agent_state.lock()
                                                         .unwrap_or_else(|e| e.into_inner())
                                                         .clone();
@@ -376,17 +434,29 @@ pub fn spawn_web_gateway(
                                                         "events": welcome.events,
                                                         "last_checkpoint_summary": welcome.last_checkpoint_summary,
                                                         "current_seq": welcome.current_seq,
+                                                        "is_active": becomes_active,
                                                     });
                                                     let _ = direct_tx_inbound.send(welcome_msg.to_string());
                                                 }
+                                            } else {
+                                                // No presence session — still send a minimal welcome with is_active
+                                                let welcome_msg = serde_json::json!({
+                                                    "t": "presence_welcome",
+                                                    "is_active": becomes_active,
+                                                });
+                                                let _ = direct_tx_inbound.send(welcome_msg.to_string());
                                             }
 
-                                            bus_inbound.send(AppEvent::PresenceConnected {
-                                                server_session_id,
-                                                last_event_seq,
-                                                live_provider: Some(msg_provider),
-                                                live_model: Some(msg_model),
-                                            });
+                                            // Only emit PresenceConnected for the active browser
+                                            // (passive browsers don't pause server-side presence)
+                                            if becomes_active {
+                                                bus_inbound.send(AppEvent::PresenceConnected {
+                                                    server_session_id,
+                                                    last_event_seq,
+                                                    live_provider: Some(msg_provider),
+                                                    live_model: Some(msg_model),
+                                                });
+                                            }
                                         }
                                         Some("presence_disconnect") => {
                                             is_presence_connected = false;
@@ -397,7 +467,69 @@ pub fn spawn_web_gateway(
                                                         .set_connected(false);
                                                 }
                                             }
-                                            bus_inbound.send(AppEvent::PresenceDisconnected);
+                                            // Only emit PresenceDisconnected if this was the active browser
+                                            if is_active {
+                                                // Clear the active slot
+                                                let mut slot = active_presence_inbound.lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                if slot.as_ref().map(|a| a.connection_id == connection_id_inbound).unwrap_or(false) {
+                                                    *slot = None;
+                                                }
+                                                is_active = false;
+                                                bus_inbound.send(AppEvent::PresenceDisconnected);
+                                            }
+                                        }
+                                        Some("make_active") => {
+                                            // Request to become the active voice owner
+                                            let mut slot = active_presence_inbound.lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+
+                                            // Tell old active to disconnect voice
+                                            if let Some(ref old) = *slot {
+                                                if old.connection_id != connection_id_inbound {
+                                                    let force_msg = serde_json::json!({
+                                                        "t": "force_disconnect_voice",
+                                                        "reason": "handover",
+                                                    });
+                                                    let _ = old.direct_tx.send(force_msg.to_string());
+                                                }
+                                            }
+
+                                            // Install this connection as new active
+                                            *slot = Some(ActivePresence {
+                                                connection_id: connection_id_inbound.clone(),
+                                                direct_tx: direct_tx_inbound.clone(),
+                                            });
+                                            drop(slot);
+
+                                            is_active = true;
+                                            is_presence_connected = true;
+                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = true;
+
+                                            // Build handover context from latest checkpoint
+                                            let handover_context = query_ctx_inbound.as_ref()
+                                                .and_then(|ctx| ctx.presence_session.as_ref())
+                                                .and_then(|ps| {
+                                                    let session = ps.lock().unwrap_or_else(|e| e.into_inner());
+                                                    session.last_checkpoint_summary()
+                                                })
+                                                .unwrap_or_default();
+
+                                            // Send active_granted to this connection
+                                            let granted_msg = serde_json::json!({
+                                                "t": "active_granted",
+                                                "is_active": true,
+                                                "handover_context": handover_context,
+                                            });
+                                            let _ = direct_tx_inbound.send(granted_msg.to_string());
+
+                                            // Emit PresenceConnected for the new active browser
+                                            bus_inbound.send(AppEvent::PresenceConnected {
+                                                server_session_id: None,
+                                                last_event_seq: 0,
+                                                live_provider: Some(live_provider.clone()),
+                                                live_model: Some(live_model.clone()),
+                                            });
                                         }
                                         Some("voice_log") => {
                                             let text = json["text"].as_str().unwrap_or("").to_string();
@@ -644,10 +776,17 @@ pub fn spawn_web_gateway(
                             }
                         }
 
-                        // WebSocket closed — auto-resume server presence if this
-                        // client had an active presence model (covers tab close without
-                        // beforeunload, network drops, etc.)
-                        if is_presence_connected {
+                        // WebSocket closed — clean up active slot and auto-resume
+                        // server presence if this was the active browser (covers tab
+                        // close without beforeunload, network drops, etc.)
+                        if is_active {
+                            let mut slot = active_presence_inbound.lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if slot.as_ref().map(|a| a.connection_id == connection_id_inbound).unwrap_or(false) {
+                                *slot = None;
+                            }
+                        }
+                        if is_presence_connected && is_active {
                             bus_inbound.send(AppEvent::PresenceDisconnected);
                         }
                     });
@@ -1624,6 +1763,298 @@ mod tests {
         assert!(response_str.contains("200 OK"), "response: {}", response_str);
         assert!(response_str.contains("application/javascript"), "response: {}", response_str);
         assert!(response_str.contains("AudioCaptureProcessor"), "response: {}", response_str);
+
+        handle.abort();
+    }
+
+    /// First browser to send presence_connect should become active.
+    #[tokio::test]
+    async fn test_first_browser_becomes_active() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Send presence_connect
+        ws.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+            .await
+            .unwrap();
+
+        // Should get PresenceConnected on the bus (active browser emits it)
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+        assert!(matches!(event, AppEvent::PresenceConnected { .. }));
+
+        // Should receive a presence_welcome with is_active: true via direct channel
+        // (We need to read WS messages to find it)
+        let (_ws_tx_split, mut ws_rx) = ws.split();
+        let msg = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            ws_rx.next(),
+        )
+        .await
+        .expect("timeout")
+        .unwrap()
+        .unwrap();
+
+        if let Message::Text(text) = msg {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["t"], "presence_welcome");
+            assert_eq!(json["is_active"], true);
+        } else {
+            panic!("expected text message");
+        }
+
+        handle.abort();
+    }
+
+    /// Second browser to send presence_connect should be passive (no PresenceConnected emitted).
+    #[tokio::test]
+    async fn test_second_browser_is_passive() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+
+        // First browser connects — becomes active
+        let (mut ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws1.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+            .await
+            .unwrap();
+
+        // Drain PresenceConnected from first browser
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+        assert!(matches!(event, AppEvent::PresenceConnected { .. }));
+
+        // Second browser connects — should be passive
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws2.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+            .await
+            .unwrap();
+
+        // Should NOT receive PresenceConnected on bus (passive)
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            rx.recv(),
+        )
+        .await;
+        assert!(result.is_err(), "passive browser should not emit PresenceConnected");
+
+        // Second browser should receive welcome with is_active: false
+        // Drain bootstrap state_snapshot first
+        let (_ws2_tx, mut ws2_rx) = ws2.split();
+        let mut found_welcome = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(2), ws2_rx.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if json["t"] == "presence_welcome" {
+                            assert_eq!(json["is_active"], false, "second browser should be passive");
+                            found_welcome = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(found_welcome, "second browser should receive presence_welcome");
+
+        handle.abort();
+    }
+
+    /// When second browser sends make_active, the first should receive force_disconnect_voice.
+    #[tokio::test]
+    async fn test_make_active_handover() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+
+        // Browser 1 connects and becomes active
+        let (ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (mut ws1_tx, mut ws1_rx) = ws1.split();
+        ws1_tx.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+            .await
+            .unwrap();
+
+        // Drain PresenceConnected
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await.expect("timeout").expect("closed");
+        assert!(matches!(event, AppEvent::PresenceConnected { .. }));
+
+        // Drain ws1's bootstrap + welcome messages
+        for _ in 0..3 {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_millis(300), ws1_rx.next()).await;
+        }
+
+        // Browser 2 connects (passive — no presence_connect yet, just make_active)
+        let (ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (mut ws2_tx, mut ws2_rx) = ws2.split();
+
+        // Drain ws2's bootstrap state_snapshot
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(300), ws2_rx.next()).await;
+
+        // Browser 2 sends make_active
+        ws2_tx.send(Message::Text(r#"{"t":"make_active"}"#.into()))
+            .await
+            .unwrap();
+
+        // Browser 1 should receive force_disconnect_voice
+        let mut found_force_disconnect = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(2), ws1_rx.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if json["t"] == "force_disconnect_voice" {
+                            assert_eq!(json["reason"], "handover");
+                            found_force_disconnect = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(found_force_disconnect, "browser 1 should receive force_disconnect_voice");
+
+        // Browser 2 should receive active_granted
+        let mut found_active_granted = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(2), ws2_rx.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if json["t"] == "active_granted" {
+                            assert_eq!(json["is_active"], true);
+                            found_active_granted = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(found_active_granted, "browser 2 should receive active_granted");
+
+        // EventBus should have received a new PresenceConnected for browser 2
+        let mut found_connected = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some(AppEvent::PresenceConnected { .. })) => {
+                    found_connected = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(found_connected, "make_active should emit PresenceConnected");
+
+        handle.abort();
+    }
+
+    /// When the active browser drops, the next browser to connect should get active.
+    #[tokio::test]
+    async fn test_active_drop_clears_slot() {
+        let (bus, mut rx) = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+
+        // First browser connects and becomes active
+        let (mut ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws1.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+            .await
+            .unwrap();
+
+        // Drain PresenceConnected
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await.expect("timeout").expect("closed");
+        assert!(matches!(event, AppEvent::PresenceConnected { .. }));
+
+        // Drop the active browser
+        ws1.close(None).await.unwrap();
+
+        // Should get PresenceDisconnected
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await.expect("timeout").expect("closed");
+        assert!(matches!(event, AppEvent::PresenceDisconnected));
+
+        // Give server a moment to process the drop
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Second browser connects — should now become active
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws2.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+            .await
+            .unwrap();
+
+        // Should get PresenceConnected (new active)
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await.expect("timeout").expect("closed");
+        assert!(matches!(event, AppEvent::PresenceConnected { .. }));
+
+        // Should receive welcome with is_active: true
+        let (_ws2_tx, mut ws2_rx) = ws2.split();
+        let mut found_welcome = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(2), ws2_rx.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if json["t"] == "presence_welcome" {
+                            assert_eq!(json["is_active"], true);
+                            found_welcome = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(found_welcome, "new browser should be active after old one dropped");
 
         handle.abort();
     }

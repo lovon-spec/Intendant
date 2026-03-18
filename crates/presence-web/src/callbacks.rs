@@ -39,6 +39,10 @@ pub struct Callbacks {
     pub on_inject_voice_text: RefCell<Option<Function>>,
     /// Server session changed (binary restarted). Voice model should reconnect.
     pub on_session_changed: RefCell<Option<Function>>,
+    /// Server tells this browser to disconnect its voice model (handover to another browser).
+    pub on_force_disconnect: RefCell<Option<Function>>,
+    /// Server confirms this browser is now the active voice owner.
+    pub on_active_granted: RefCell<Option<Function>>,
 }
 
 impl Callbacks {
@@ -127,6 +131,18 @@ impl Callbacks {
     pub fn invoke_session_changed(&self) {
         if let Some(ref f) = *self.on_session_changed.borrow() {
             let _ = f.call0(&JsValue::NULL);
+        }
+    }
+
+    pub fn invoke_force_disconnect(&self, reason: &str) {
+        if let Some(ref f) = *self.on_force_disconnect.borrow() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(reason));
+        }
+    }
+
+    pub fn invoke_active_granted(&self, handover_context: &str) {
+        if let Some(ref f) = *self.on_active_granted.borrow() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(handover_context));
         }
     }
 }

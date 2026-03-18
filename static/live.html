@@ -68,6 +68,21 @@ body {
 .mic-btn:hover { border-color: var(--blue); color: var(--text); }
 .mic-btn.active { border-color: var(--red); color: var(--red); background: rgba(243,139,168,0.1); }
 .mic-btn.active:hover { background: rgba(243,139,168,0.2); }
+.mic-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.mic-btn:disabled:hover { border-color: var(--surface1); color: var(--subtext0); }
+
+.make-active-btn {
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--surface1);
+  background: var(--mantle);
+  color: var(--peach);
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+.make-active-btn:hover { border-color: var(--peach); background: rgba(250,179,135,0.1); }
+.make-active-btn.hidden { display: none; }
 
 .voice-status {
   background: var(--mantle);
@@ -185,6 +200,7 @@ body {
 <!-- Voice overlay -->
 <div class="voice-overlay">
   <div class="voice-status hidden" id="voiceStatus"></div>
+  <button class="make-active-btn hidden" id="makeActiveBtn">Make Active</button>
   <button class="mic-btn" id="micBtn" title="Toggle voice (push to talk)">&#127908;</button>
 </div>
 
@@ -261,6 +277,7 @@ let audioCtx = null;
 let mediaStream = null;
 let workletNode = null;
 let workletReady = false;
+let isActiveBrowser = true; // Assume active until server tells us otherwise
 
 const intDot = document.getElementById('intDot');
 const intLabel = document.getElementById('intLabel');
@@ -279,6 +296,7 @@ const firstRunSave = document.getElementById('firstRunSave');
 const firstRunSkip = document.getElementById('firstRunSkip');
 const firstRunKeyInput = document.getElementById('firstRunKeyInput');
 const firstRunKeyLabel = document.getElementById('firstRunKeyLabel');
+const makeActiveBtn = document.getElementById('makeActiveBtn');
 
 // ============================================================
 // Helpers
@@ -297,6 +315,14 @@ function getStorageKey() {
 function getApiKeyName() {
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   return provider === 'openai' ? 'OpenAI API Key' : 'Gemini API Key';
+}
+
+function updateActivePassiveUI() {
+  micBtn.disabled = !isActiveBrowser;
+  makeActiveBtn.classList.toggle('hidden', isActiveBrowser);
+  if (!isActiveBrowser) {
+    voiceLabel.textContent = 'Passive';
+  }
 }
 
 function showVoiceStatus(text, isError) {
@@ -447,6 +473,7 @@ function playNext() {
 // Mic Button
 // ============================================================
 micBtn.addEventListener('click', async () => {
+  if (!isActiveBrowser) return;
   if (!modelConnected) {
     const apiKey = localStorage.getItem(getStorageKey());
     if (!apiKey) {
@@ -462,11 +489,22 @@ micBtn.addEventListener('click', async () => {
 });
 
 // ============================================================
+// Make Active Button
+// ============================================================
+makeActiveBtn.addEventListener('click', () => {
+  if (pw && !isActiveBrowser) {
+    pw.send_make_active();
+    makeActiveBtn.disabled = true;
+    showVoiceStatus('Requesting active...');
+  }
+});
+
+// ============================================================
 // Voice connection — requires API key in localStorage
 // ============================================================
 let voiceConnecting = false;
 function connectVoice() {
-  if (!pw || voiceConnecting) return;
+  if (!pw || voiceConnecting || !isActiveBrowser) return;
   const apiKey = localStorage.getItem(getStorageKey());
   if (!apiKey) {
     showFirstRunDialog();
@@ -563,7 +601,12 @@ async function init() {
     }
   });
 
-  pw.set_on_state_snapshot(() => {
+  pw.set_on_state_snapshot((msg) => {
+    // Read is_active from presence_welcome
+    if (msg && msg.is_active !== undefined) {
+      isActiveBrowser = msg.is_active;
+      updateActivePassiveUI();
+    }
     if (modelConnected) pw.inject_pending_approval_if_any();
   });
 
@@ -633,6 +676,44 @@ async function init() {
     pw.send_text(text);
   });
 
+  pw.set_on_force_disconnect((reason) => {
+    // Another browser took over as active — disconnect our voice model
+    console.log('[presence-web] Force disconnect:', reason);
+    if (modelConnected) {
+      pw.disconnect_voice();
+      modelConnected = false;
+      micActive = false;
+      micBtn.classList.remove('active');
+      stopMic();
+    }
+    isActiveBrowser = false;
+    voiceDot.className = 'conn-dot';
+    voiceLabel.textContent = 'Passive';
+    updateActivePassiveUI();
+    showVoiceStatus('Voice handed to another browser');
+    setTimeout(hideVoiceStatus, 5000);
+  });
+
+  pw.set_on_active_granted((handoverContext) => {
+    // We are now the active voice owner — connect voice
+    console.log('[presence-web] Active granted, handover context:', handoverContext ? handoverContext.substring(0, 80) : '(none)');
+    isActiveBrowser = true;
+    makeActiveBtn.disabled = false;
+    updateActivePassiveUI();
+    connectVoice();
+    // Inject handover context once voice model is ready
+    if (handoverContext) {
+      const waitForVoice = () => {
+        if (modelConnected) {
+          pw.send_text('[System: handover context] ' + handoverContext + '. Full history available via recall_memory.');
+        } else {
+          setTimeout(waitForVoice, 200);
+        }
+      };
+      setTimeout(waitForVoice, 500);
+    }
+  });
+
   term.onKey(({ domEvent }) => {
     if (pw) pw.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
   });
@@ -650,11 +731,11 @@ async function init() {
   // 5. Wait for server connection before connecting voice
   await serverConnectedPromise;
 
-  // 6. Connect voice if key exists, otherwise show first-run dialog
+  // 6. Connect voice if key exists and we're active, otherwise show first-run dialog
   const storedKey = localStorage.getItem(getStorageKey());
-  if (storedKey) {
+  if (storedKey && isActiveBrowser) {
     connectVoice();
-  } else {
+  } else if (!storedKey && isActiveBrowser) {
     showFirstRunDialog();
   }
 }
