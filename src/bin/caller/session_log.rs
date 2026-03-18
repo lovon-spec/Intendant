@@ -846,7 +846,9 @@ pub fn recent_conversation(log_dir: &Path, max_entries: usize) -> Vec<Conversati
         }
     }
 
-    turns.sort_by_key(|t| t.seq);
+    // Entries are already in chronological order from the JSONL file —
+    // don't sort by seq since user_transcript and voice_log have independent
+    // sequence counters that would interleave incorrectly.
     let start = turns.len().saturating_sub(max_entries);
     turns[start..].to_vec()
 }
