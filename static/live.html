@@ -278,6 +278,8 @@ let mediaStream = null;
 let workletNode = null;
 let workletReady = false;
 let isActiveBrowser = true; // Assume active until server tells us otherwise
+let storedConversationCtx = null; // Conversation context from welcome/handover for voice priming
+let currentSessionId = null;      // Current server session ID for IndexedDB caching
 
 const intDot = document.getElementById('intDot');
 const intLabel = document.getElementById('intLabel');
@@ -331,6 +333,83 @@ function showVoiceStatus(text, isError) {
 }
 function hideVoiceStatus() {
   voiceStatus.className = 'voice-status hidden';
+}
+
+// ============================================================
+// IndexedDB L1 Cache (Feature C)
+// ============================================================
+const IDB_NAME = 'intendant_presence';
+const IDB_VERSION = 1;
+const IDB_STORE = 'sessions';
+const IDB_MAX_AGE_MS = 3600_000; // 1 hour
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE, { keyPath: 'session_id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSave(sessionId, data) {
+  try {
+    const db = await idbOpen();
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put({
+      session_id: sessionId,
+      conversation_context: data.conversation_context || null,
+      checkpoint_summary: data.checkpoint_summary || null,
+      saved_at: Date.now(),
+    });
+    db.close();
+  } catch (_) { /* IndexedDB not available — ignore */ }
+}
+
+async function idbLoad(sessionId) {
+  try {
+    const db = await idbOpen();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(sessionId);
+      req.onsuccess = () => {
+        db.close();
+        const row = req.result;
+        if (row && (Date.now() - row.saved_at) < IDB_MAX_AGE_MS) {
+          resolve(row);
+        } else {
+          resolve(null);
+        }
+      };
+      req.onerror = () => { db.close(); resolve(null); };
+    });
+  } catch (_) { return null; }
+}
+
+async function idbClear() {
+  try {
+    const db = await idbOpen();
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    const store = tx.objectStore(IDB_STORE);
+    const req = store.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (cursor) {
+        if ((Date.now() - cursor.value.saved_at) >= IDB_MAX_AGE_MS) {
+          cursor.delete();
+        }
+        cursor.continue();
+      } else {
+        db.close();
+      }
+    };
+    req.onerror = () => db.close();
+  } catch (_) { /* ignore */ }
 }
 
 // ============================================================
@@ -607,6 +686,19 @@ async function init() {
       isActiveBrowser = msg.is_active;
       updateActivePassiveUI();
     }
+    // Store conversation context for voice priming (Feature A)
+    if (msg && msg.conversation_context) {
+      storedConversationCtx = msg.conversation_context;
+    }
+    // Track session ID for IndexedDB caching
+    if (msg && msg.session_id) {
+      currentSessionId = msg.session_id;
+      // Save to IndexedDB (Feature C)
+      idbSave(msg.session_id, {
+        conversation_context: msg.conversation_context || storedConversationCtx,
+        checkpoint_summary: msg.last_checkpoint_summary || null,
+      });
+    }
     if (modelConnected) pw.inject_pending_approval_if_any();
   });
 
@@ -621,6 +713,11 @@ async function init() {
     voiceLabel.textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
     showVoiceStatus('Voice ready');
     setTimeout(hideVoiceStatus, 3000);
+    // Inject conversation context for session priming (Feature A)
+    if (storedConversationCtx) {
+      pw.send_text('[System: conversation so far]\n' + storedConversationCtx);
+      storedConversationCtx = null; // Only inject once per voice connect
+    }
     pw.inject_pending_approval_if_any();
     try { pw.send_voice_diagnostic('connected', provider + ' voice model ready'); } catch(_) {}
   });
@@ -694,12 +791,14 @@ async function init() {
     setTimeout(hideVoiceStatus, 5000);
   });
 
-  pw.set_on_active_granted((handoverContext) => {
+  pw.set_on_active_granted((handoverContext, conversationContext) => {
     // We are now the active voice owner — connect voice
     console.log('[presence-web] Active granted, handover context:', handoverContext ? handoverContext.substring(0, 80) : '(none)');
     isActiveBrowser = true;
     makeActiveBtn.disabled = false;
     updateActivePassiveUI();
+    // Store conversation context for injection on voice ready
+    if (conversationContext) storedConversationCtx = conversationContext;
     connectVoice();
     // Inject handover context once voice model is ready
     if (handoverContext) {
@@ -727,6 +826,32 @@ async function init() {
     const resp = await fetch('/config');
     if (resp.ok) gatewayConfig = await resp.json();
   } catch(_) {}
+
+  // 4b. Try IndexedDB L1 cache for conversation context (Feature C)
+  // Pre-populate storedConversationCtx so voice can start warm even before
+  // the server sends the welcome message.
+  idbClear(); // Clean up stale sessions
+  try {
+    // We don't know the session ID yet — try all cached entries and use the most recent
+    const db = await idbOpen();
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).openCursor(null, 'prev');
+    await new Promise((resolve) => {
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (cursor && !storedConversationCtx) {
+          const row = cursor.value;
+          if ((Date.now() - row.saved_at) < IDB_MAX_AGE_MS && row.conversation_context) {
+            storedConversationCtx = row.conversation_context;
+            console.log('[L1 cache] Loaded conversation context from IndexedDB');
+          }
+        }
+        resolve();
+      };
+      req.onerror = () => resolve();
+    });
+    db.close();
+  } catch (_) { /* IndexedDB not available */ }
 
   // 5. Wait for server connection before connecting voice
   await serverConnectedPromise;

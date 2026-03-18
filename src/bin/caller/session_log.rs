@@ -794,6 +794,105 @@ impl Drop for SessionLog {
     }
 }
 
+/// A reconstructed conversation turn from voice_log / user_transcript events.
+#[derive(Debug, Clone)]
+pub struct ConversationTurn {
+    pub role: String, // "user" or "model"
+    pub text: String,
+    pub seq: u64,
+}
+
+/// Reconstruct recent conversation turns from voice_log and user_transcript events
+/// in session.jsonl. Returns the last `max_entries` turns ordered by seq.
+pub fn recent_conversation(log_dir: &Path, max_entries: usize) -> Vec<ConversationTurn> {
+    let path = log_dir.join("session.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut turns: Vec<ConversationTurn> = Vec::new();
+    for line in content.lines() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let event = val["event"].as_str().unwrap_or("");
+        let text = val["message"].as_str().unwrap_or("").to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let seq = val["data"]["seq"].as_u64().unwrap_or(0);
+
+        match event {
+            "user_transcript" => {
+                turns.push(ConversationTurn {
+                    role: "user".to_string(),
+                    text,
+                    seq,
+                });
+            }
+            "voice_log" => {
+                // Only include transcript entries (model speech), not tool calls
+                let tool_ctx = val["data"]["tool_context"].as_str().unwrap_or("");
+                if tool_ctx == "transcript" {
+                    turns.push(ConversationTurn {
+                        role: "model".to_string(),
+                        text,
+                        seq,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    turns.sort_by_key(|t| t.seq);
+    let start = turns.len().saturating_sub(max_entries);
+    turns[start..].to_vec()
+}
+
+/// Search voice_log and user_transcript entries for keyword matches.
+/// Returns formatted results (up to `max_results`).
+pub fn search_voice_entries(
+    log_dir: &Path,
+    keywords: &[String],
+    max_results: usize,
+) -> Vec<String> {
+    let path = log_dir.join("session.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+    for line in content.lines() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let event = val["event"].as_str().unwrap_or("");
+        if event != "voice_log" && event != "user_transcript" {
+            continue;
+        }
+        let text = val["message"].as_str().unwrap_or("");
+        if text.is_empty() {
+            continue;
+        }
+        let lower = text.to_lowercase();
+        if keywords.iter().any(|kw| lower.contains(&kw.to_lowercase())) {
+            let role = if event == "user_transcript" {
+                "User"
+            } else {
+                "Model"
+            };
+            results.push(format!("[{}] {}", role, text));
+            if results.len() >= max_results {
+                break;
+            }
+        }
+    }
+    results
+}
+
 /// Read the last `count` lines from the session.jsonl file in the given log directory.
 /// Returns an empty vec if the file doesn't exist or can't be read.
 pub fn recent_entries(log_dir: &std::path::Path, count: usize) -> Vec<String> {
@@ -1423,5 +1522,105 @@ mod tests {
         let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last["event"], "tool_response");
         assert!(last["message"].as_str().unwrap().contains("check_status"));
+    }
+
+    #[test]
+    fn recent_conversation_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = recent_conversation(dir.path(), 10);
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn recent_conversation_reconstructs_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+
+        log.user_transcript("what's in this project?", 1);
+        log.voice_log("It's an autonomous agent runtime.", 2, Some("transcript"));
+        log.voice_log("[tool] check_status({})", 3, Some("check_status"));
+        log.user_transcript("can you fix the auth bug?", 4);
+        log.voice_log("I'll submit that task now.", 5, Some("transcript"));
+
+        let turns = recent_conversation(&log_dir, 10);
+        assert_eq!(turns.len(), 4); // tool call excluded
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "what's in this project?");
+        assert_eq!(turns[1].role, "model");
+        assert_eq!(turns[1].text, "It's an autonomous agent runtime.");
+        assert_eq!(turns[2].role, "user");
+        assert_eq!(turns[3].role, "model");
+    }
+
+    #[test]
+    fn recent_conversation_respects_max_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+
+        for i in 0..10 {
+            log.user_transcript(&format!("msg {}", i), i);
+        }
+
+        let turns = recent_conversation(&log_dir, 3);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].text, "msg 7");
+        assert_eq!(turns[2].text, "msg 9");
+    }
+
+    #[test]
+    fn search_voice_entries_finds_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+
+        log.user_transcript("fix the authentication bug", 1);
+        log.voice_log("I'll check the auth module.", 2, Some("transcript"));
+        log.user_transcript("also check the database", 3);
+        log.voice_log("[tool] check_status({})", 4, Some("check_status"));
+
+        let results = search_voice_entries(
+            &log_dir,
+            &["auth".to_string()],
+            10,
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results[0].starts_with("[User]"));
+        assert!(results[1].starts_with("[Model]"));
+    }
+
+    #[test]
+    fn search_voice_entries_respects_max_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+
+        for i in 0..10 {
+            log.user_transcript(&format!("test message {}", i), i);
+        }
+
+        let results = search_voice_entries(
+            &log_dir,
+            &["test".to_string()],
+            3,
+        );
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn search_voice_entries_empty_on_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+
+        log.user_transcript("hello world", 1);
+
+        let results = search_voice_entries(
+            &log_dir,
+            &["nonexistent".to_string()],
+            10,
+        );
+        assert!(results.is_empty());
     }
 }

@@ -230,7 +230,8 @@ impl PresenceWeb {
                     }
                     Some("active_granted") => {
                         let handover_context = msg["handover_context"].as_str().unwrap_or("");
-                        cb.invoke_active_granted(handover_context);
+                        let conversation_context = msg["conversation_context"].as_str().unwrap_or("");
+                        cb.invoke_active_granted(handover_context, conversation_context);
                     }
                     Some("tool_response") => {
                         if let Some(id) = msg["id"].as_str() {

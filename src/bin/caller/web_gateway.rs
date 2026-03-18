@@ -418,6 +418,9 @@ pub fn spawn_web_gateway(
 
                                             // Send welcome with replay window if presence session is available
                                             if let Some(ref ctx) = query_ctx_inbound {
+                                                // Build conversation context from recent voice transcripts
+                                                let conversation_ctx = presence::build_conversation_context(&ctx.log_dir, 20);
+
                                                 if let Some(ref ps) = ctx.presence_session {
                                                     let mut session = ps.lock().unwrap_or_else(|e| e.into_inner());
                                                     if becomes_active {
@@ -435,6 +438,14 @@ pub fn spawn_web_gateway(
                                                         "last_checkpoint_summary": welcome.last_checkpoint_summary,
                                                         "current_seq": welcome.current_seq,
                                                         "is_active": becomes_active,
+                                                        "conversation_context": conversation_ctx,
+                                                    });
+                                                    let _ = direct_tx_inbound.send(welcome_msg.to_string());
+                                                } else {
+                                                    let welcome_msg = serde_json::json!({
+                                                        "t": "presence_welcome",
+                                                        "is_active": becomes_active,
+                                                        "conversation_context": conversation_ctx,
                                                     });
                                                     let _ = direct_tx_inbound.send(welcome_msg.to_string());
                                                 }
@@ -515,11 +526,16 @@ pub fn spawn_web_gateway(
                                                 })
                                                 .unwrap_or_default();
 
+                                            // Build conversation context from recent voice transcripts
+                                            let conversation_ctx = query_ctx_inbound.as_ref()
+                                                .and_then(|ctx| presence::build_conversation_context(&ctx.log_dir, 20));
+
                                             // Send active_granted to this connection
                                             let granted_msg = serde_json::json!({
                                                 "t": "active_granted",
                                                 "is_active": true,
                                                 "handover_context": handover_context,
+                                                "conversation_context": conversation_ctx,
                                             });
                                             let _ = direct_tx_inbound.send(granted_msg.to_string());
 

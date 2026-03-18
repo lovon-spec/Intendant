@@ -140,9 +140,13 @@ impl Callbacks {
         }
     }
 
-    pub fn invoke_active_granted(&self, handover_context: &str) {
+    pub fn invoke_active_granted(&self, handover_context: &str, conversation_context: &str) {
         if let Some(ref f) = *self.on_active_granted.borrow() {
-            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(handover_context));
+            let _ = f.call2(
+                &JsValue::NULL,
+                &JsValue::from_str(handover_context),
+                &JsValue::from_str(conversation_context),
+            );
         }
     }
 }

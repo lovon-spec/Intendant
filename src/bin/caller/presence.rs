@@ -472,13 +472,14 @@ pub async fn query_detail(
     }
 }
 
-/// Handle a `recall_memory` tool call: query knowledge store with optional fallback to session logs.
+/// Handle a `recall_memory` tool call: query knowledge store AND voice transcripts.
+/// Results from both sources are merged and returned.
 pub fn recall_memory(
     knowledge_path: &std::path::Path,
     log_dir: &std::path::Path,
     args: &Value,
 ) -> String {
-    let keywords = args["keywords"]
+    let keywords: Option<Vec<String>> = args["keywords"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
     let tags = args["tags"]
@@ -487,46 +488,83 @@ pub fn recall_memory(
     let channel = args["channel"].as_str().map(String::from);
 
     let query = KnowledgeQuery {
-        keywords,
+        keywords: keywords.clone(),
         tags,
         channel,
         ..Default::default()
     };
 
+    let mut sections: Vec<String> = Vec::new();
+
+    // Source 1: Knowledge store
     match knowledge::load(knowledge_path) {
         Ok(store) => {
             let results = knowledge::query(&store, &query);
-            if results.is_empty() {
-                // Fall back to session log search
-                let entries = session_log::recent_entries(log_dir, 100);
-                if let Some(ref kws) = query.keywords {
-                    let matched: Vec<&String> = entries
-                        .iter()
-                        .filter(|e| {
-                            let lower = e.to_lowercase();
-                            kws.iter().any(|kw| lower.contains(&kw.to_lowercase()))
-                        })
-                        .take(10)
-                        .collect();
-                    if matched.is_empty() {
-                        "No memories found.".to_string()
-                    } else {
-                        matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
-                    }
-                } else {
-                    "No memories found.".to_string()
-                }
-            } else {
-                results
+            if !results.is_empty() {
+                let formatted: Vec<String> = results
                     .iter()
                     .take(10)
                     .map(|e| format!("[{}] {}: {}", e.channel, e.key, e.summary))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .collect();
+                sections.push(formatted.join("\n"));
             }
         }
-        Err(e) => format!("Failed to load knowledge: {}", e),
+        Err(_) => {}
     }
+
+    // Source 2: Voice transcript search
+    if let Some(ref kws) = keywords {
+        let voice_results = session_log::search_voice_entries(log_dir, kws, 5);
+        if !voice_results.is_empty() {
+            sections.push(format!(
+                "--- Conversation history ---\n{}",
+                voice_results.join("\n")
+            ));
+        }
+    }
+
+    // Source 3: Fall back to raw session log if nothing found
+    if sections.is_empty() {
+        let entries = session_log::recent_entries(log_dir, 100);
+        if let Some(ref kws) = keywords {
+            let matched: Vec<&String> = entries
+                .iter()
+                .filter(|e| {
+                    let lower = e.to_lowercase();
+                    kws.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+                })
+                .take(10)
+                .collect();
+            if !matched.is_empty() {
+                sections.push(
+                    matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"),
+                );
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        "No memories found.".to_string()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+/// Build a formatted conversation context string from recent voice_log and
+/// user_transcript entries. Returns `None` if no conversation turns are found.
+pub fn build_conversation_context(log_dir: &std::path::Path, max_turns: usize) -> Option<String> {
+    let turns = session_log::recent_conversation(log_dir, max_turns);
+    if turns.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = turns
+        .iter()
+        .map(|t| {
+            let role = if t.role == "user" { "User" } else { "Model" };
+            format!("{}: {}", role, t.text)
+        })
+        .collect();
+    Some(lines.join("\n"))
 }
 
 /// Handle a tool query by name. Used by both the server-side PresenceLayer and
@@ -1197,5 +1235,45 @@ mod tests {
         assert!(!session.is_connected()); // doesn't underflow
         session.set_connected(true);
         assert!(session.is_connected());
+    }
+
+    #[test]
+    fn build_conversation_context_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(build_conversation_context(dir.path(), 10).is_none());
+    }
+
+    #[test]
+    fn build_conversation_context_formats_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = session_log::SessionLog::open(log_dir.clone()).unwrap();
+
+        log.user_transcript("what's in this project?", 1);
+        log.voice_log("It's an agent runtime.", 2, Some("transcript"));
+        log.user_transcript("fix the bug", 3);
+
+        let ctx = build_conversation_context(&log_dir, 10).unwrap();
+        assert!(ctx.contains("User: what's in this project?"));
+        assert!(ctx.contains("Model: It's an agent runtime."));
+        assert!(ctx.contains("User: fix the bug"));
+    }
+
+    #[test]
+    fn recall_memory_merges_voice_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = session_log::SessionLog::open(log_dir.clone()).unwrap();
+
+        log.user_transcript("fix the auth module", 1);
+        log.voice_log("I'll check auth now.", 2, Some("transcript"));
+
+        let knowledge_path = dir.path().join("knowledge.json");
+        let args = serde_json::json!({"keywords": ["auth"]});
+        let result = recall_memory(&knowledge_path, &log_dir, &args);
+
+        // Should find voice transcript results
+        assert!(result.contains("Conversation history"));
+        assert!(result.contains("auth"));
     }
 }
