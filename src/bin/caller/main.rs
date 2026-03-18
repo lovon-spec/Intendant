@@ -4351,7 +4351,7 @@ async fn main() -> Result<(), CallerError> {
             let agent_state = Arc::new(std::sync::Mutex::new(presence::AgentStateSnapshot::default()));
             app.set_presence_agent_state(agent_state.clone());
 
-            app.log(types::LogLevel::Info, "Presence layer active".to_string());
+            app.log_sourced(types::LogLevel::Info, "Presence layer active".to_string(), tui::app::LogSource::Presence, None);
             // If there's an initial task, set the phase to Thinking immediately
             // so the TUI doesn't sit at "Idle" during the presence API call.
             if task.is_some() {

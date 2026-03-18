@@ -371,7 +371,7 @@ fn format_log_entry_with_turn(
         | (LogLevel::Detail, LogSource::Presence) =>
             Span::styled("Servr ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
         (LogLevel::Info, _) =>
-            Span::styled("      ", Style::default().fg(theme::LOG_FG)),
+            Span::styled("    ℹ ", Style::default().fg(theme::LOG_DIM_FG)),
         (LogLevel::Model, _) =>
             Span::styled("Workr ", Style::default().fg(theme::LOG_MODEL_FG)),
         (LogLevel::Agent, _) =>
