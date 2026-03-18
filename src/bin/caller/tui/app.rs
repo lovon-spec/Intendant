@@ -1072,7 +1072,7 @@ impl App {
                         self.mode = AppMode::Normal;
                         self.current_phase = Phase::Thinking;
                         self.round += 1;
-                        self.log(LogLevel::Info, format!("Task dispatched: {}", truncate_str(&task, 80)));
+                        self.log_sourced(LogLevel::Info, format!("[runtime] Task dispatched: {}", truncate_str(&task, 80)), LogSource::Live, None);
                     } else {
                         self.log(
                             LogLevel::Warn,
