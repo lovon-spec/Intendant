@@ -1707,9 +1707,9 @@ impl App {
                         log.user_transcript(text, seq);
                     }
                 }
-                // Log at Info level
-                let msg = format!("[transcript] {}", text);
-                self.log(LogLevel::Info, msg);
+                // Log at Info level with Presence source (shows "Voice" label)
+                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                self.log_sourced(LogLevel::Info, format!("[You] {}", text), LogSource::Presence, vt);
                 // Broadcast as outbound event
                 self.broadcast_control(OutboundEvent::UserTranscript {
                     text: text.clone(),

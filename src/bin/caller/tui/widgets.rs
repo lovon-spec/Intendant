@@ -313,8 +313,8 @@ fn build_tab_title(active: LogTab) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Width of the prefix area: marker(2) + timestamp(9) + level(2) = 13 display columns.
-const LOG_PREFIX_WIDTH: usize = 13;
+/// Width of the prefix area: marker(2) + timestamp(9) + label(6) = 17 display columns.
+const LOG_PREFIX_WIDTH: usize = 17;
 
 /// Format a log entry with turn collapse/expand indicator and optional focus highlight.
 ///
@@ -360,29 +360,28 @@ fn format_log_entry_with_turn(
         Style::default().fg(theme::LOG_DIM_FG),
     ));
 
-    // Level/source indicator: combine LogLevel with LogSource for clarity.
-    // Presence entries (voice model) get "P" prefix; worker model gets "W".
+    // Source/level label: spelled-out names for clarity.
+    // 6 chars wide (padded) to align content columns.
     let level_span = match (&entry.level, &entry.source) {
-        (LogLevel::Info, LogSource::Presence) =>
-            Span::styled("P ", Style::default().fg(theme::LOG_PRESENCE_FG)),
-        (LogLevel::Detail, LogSource::Presence) =>
-            Span::styled("P ", Style::default().fg(theme::LOG_DETAIL_FG)),
+        (LogLevel::Info, LogSource::Presence)
+        | (LogLevel::Detail, LogSource::Presence) =>
+            Span::styled("Live  ", Style::default().fg(theme::LOG_PRESENCE_FG)),
         (LogLevel::Info, _) =>
-            Span::styled("  ", Style::default().fg(theme::LOG_FG)),
+            Span::styled("      ", Style::default().fg(theme::LOG_FG)),
         (LogLevel::Model, _) =>
-            Span::styled("W ", Style::default().fg(theme::LOG_MODEL_FG)),
+            Span::styled("Workr ", Style::default().fg(theme::LOG_MODEL_FG)),
         (LogLevel::Agent, _) =>
-            Span::styled("A ", Style::default().fg(theme::LOG_AGENT_FG)),
+            Span::styled("Agent ", Style::default().fg(theme::LOG_AGENT_FG)),
         (LogLevel::Error, _) =>
-            Span::styled("E ", Style::default().fg(theme::LOG_ERROR_FG)),
+            Span::styled("Error ", Style::default().fg(theme::LOG_ERROR_FG)),
         (LogLevel::Warn, _) =>
-            Span::styled("! ", Style::default().fg(theme::LOG_WARN_FG)),
+            Span::styled("Warn  ", Style::default().fg(theme::LOG_WARN_FG)),
         (LogLevel::SubAgent, _) =>
-            Span::styled("S ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
+            Span::styled("Sub   ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
         (LogLevel::Detail, _) =>
-            Span::styled("· ", Style::default().fg(theme::LOG_DETAIL_FG)),
+            Span::styled("    · ", Style::default().fg(theme::LOG_DETAIL_FG)),
         (LogLevel::Debug, _) =>
-            Span::styled("D ", Style::default().fg(theme::LOG_DIM_FG)),
+            Span::styled("Debug ", Style::default().fg(theme::LOG_DIM_FG)),
     };
     prefix.push(level_span);
 
