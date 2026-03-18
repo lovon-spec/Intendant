@@ -296,6 +296,13 @@ impl PresenceWeb {
         self.server.borrow().send_resize(cols, rows);
     }
 
+    /// Set passive mode — this browser will never request active status.
+    /// Use for observer/follow-along mode.
+    #[wasm_bindgen]
+    pub fn set_passive_mode(&self, passive: bool) {
+        self.server.borrow_mut().set_passive_mode(passive);
+    }
+
     // --- Voice model ---
 
     #[wasm_bindgen]

@@ -28,6 +28,9 @@ pub struct ServerConnection {
     /// Active voice model name — sent in presence_connect.
     /// Shared via Rc so the onopen closure sees updates from set_active_voice().
     active_model: Rc<RefCell<String>>,
+    /// When true, this browser never requests active status (observer mode).
+    /// Shared via Rc so the onopen closure sees updates from set_passive_mode().
+    passive_mode: Rc<RefCell<bool>>,
     callbacks: Rc<Callbacks>,
     /// Closures must be stored to prevent drop while WebSocket holds references.
     _onopen: Option<Closure<dyn FnMut()>>,
@@ -54,6 +57,7 @@ impl ServerConnection {
             voice_live: Rc::new(RefCell::new(false)),
             active_provider: Rc::new(RefCell::new(String::new())),
             active_model: Rc::new(RefCell::new(String::new())),
+            passive_mode: Rc::new(RefCell::new(false)),
             callbacks,
             _onopen: None,
             _onmessage: None,
@@ -78,6 +82,11 @@ impl ServerConnection {
     pub fn set_active_voice(&mut self, provider: &str, model: &str) {
         *self.active_provider.borrow_mut() = provider.to_string();
         *self.active_model.borrow_mut() = model.to_string();
+    }
+
+    /// Set passive mode — this browser will never request active status.
+    pub fn set_passive_mode(&mut self, passive: bool) {
+        *self.passive_mode.borrow_mut() = passive;
     }
 
     /// Set a handler for parsed server messages.
@@ -122,6 +131,7 @@ impl ServerConnection {
         let last_seq_open = Rc::new(RefCell::new(self.last_event_seq));
         let provider_open = self.active_provider.clone();
         let model_open = self.active_model.clone();
+        let passive_open = self.passive_mode.clone();
         let onopen = Closure::wrap(Box::new(move || {
             *connected_open.borrow_mut() = true;
             callbacks_open.invoke_server_state(true);
@@ -139,6 +149,9 @@ impl ServerConnection {
                 let m = model_open.borrow();
                 if !m.is_empty() {
                     msg["model"] = serde_json::Value::String(m.clone());
+                }
+                if *passive_open.borrow() {
+                    msg["passive"] = serde_json::Value::Bool(true);
                 }
                 let _ = ws_clone.send_with_str(&msg.to_string());
             }
@@ -262,6 +275,9 @@ impl ServerConnection {
         let m = self.active_model.borrow();
         if !m.is_empty() {
             msg["model"] = serde_json::Value::String(m.clone());
+        }
+        if *self.passive_mode.borrow() {
+            msg["passive"] = serde_json::Value::Bool(true);
         }
         self.send_json(&msg);
     }

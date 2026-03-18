@@ -210,6 +210,10 @@ body {
     <h2>Voice Settings</h2>
     <label for="apiKeyInput" id="apiKeyLabel">API Key</label>
     <input type="password" id="apiKeyInput" placeholder="Enter API key for voice...">
+    <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;cursor:pointer;">
+      <input type="checkbox" id="passiveModeCheckbox">
+      Always passive (observe only, never take voice control)
+    </label>
     <div class="btn-row">
       <button class="btn-secondary" id="settingsCancel">Cancel</button>
       <button class="btn-primary" id="settingsSave">Save</button>
@@ -614,6 +618,8 @@ function showFirstRunDialog() {
 settingsBtn.addEventListener('click', () => {
   apiKeyInput.value = localStorage.getItem(getStorageKey()) || '';
   apiKeyLabel.textContent = getApiKeyName();
+  document.getElementById('passiveModeCheckbox').checked =
+    localStorage.getItem('intendant_passive_mode') === 'true';
   settingsDialog.classList.remove('hidden');
   apiKeyInput.focus();
 });
@@ -623,8 +629,11 @@ settingsCancel.addEventListener('click', () => settingsDialog.classList.add('hid
 settingsSave.addEventListener('click', () => {
   const key = apiKeyInput.value.trim();
   if (key) localStorage.setItem(getStorageKey(), key);
+  const passive = document.getElementById('passiveModeCheckbox').checked;
+  localStorage.setItem('intendant_passive_mode', passive ? 'true' : 'false');
+  if (pw) pw.set_passive_mode(passive);
   settingsDialog.classList.add('hidden');
-  if (key && !modelConnected) connectVoice();
+  if (key && !modelConnected && !passive) connectVoice();
 });
 
 firstRunSave.addEventListener('click', () => {
@@ -856,11 +865,15 @@ async function init() {
   // 5. Wait for server connection before connecting voice
   await serverConnectedPromise;
 
-  // 6. Connect voice if key exists and we're active, otherwise show first-run dialog
+  // 6. Apply passive mode setting before connecting voice
+  const passiveMode = localStorage.getItem('intendant_passive_mode') === 'true';
+  if (passiveMode && pw) pw.set_passive_mode(true);
+
+  // 7. Connect voice if key exists and not in passive mode, otherwise show first-run dialog
   const storedKey = localStorage.getItem(getStorageKey());
-  if (storedKey && isActiveBrowser) {
+  if (storedKey && !passiveMode) {
     connectVoice();
-  } else if (!storedKey && isActiveBrowser) {
+  } else if (!storedKey && !passiveMode) {
     showFirstRunDialog();
   }
 }

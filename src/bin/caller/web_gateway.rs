@@ -399,8 +399,14 @@ pub fn spawn_web_gateway(
                                                 .map(String::from)
                                                 .unwrap_or_else(|| live_model.clone());
 
-                                            // Determine if this connection becomes active or passive
-                                            let becomes_active = {
+                                            // Determine if this connection becomes active or passive.
+                                            // Browsers can request always-passive mode (observer/follow-along).
+                                            let force_passive = json.get("passive")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            let becomes_active = if force_passive {
+                                                false
+                                            } else {
                                                 let slot = active_presence_inbound.lock()
                                                     .unwrap_or_else(|e| e.into_inner());
                                                 slot.is_none()
