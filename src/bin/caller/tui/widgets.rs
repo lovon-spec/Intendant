@@ -363,9 +363,13 @@ fn format_log_entry_with_turn(
     // Source/level label: spelled-out names for clarity.
     // 6 chars wide (padded) to align content columns.
     let level_span = match (&entry.level, &entry.source) {
+        // Browser live presence (voice/video)
+        (_, LogSource::Live) =>
+            Span::styled("Live  ", Style::default().fg(theme::LOG_PRESENCE_FG)),
+        // Server-side text presence model
         (LogLevel::Info, LogSource::Presence)
         | (LogLevel::Detail, LogSource::Presence) =>
-            Span::styled("Live  ", Style::default().fg(theme::LOG_PRESENCE_FG)),
+            Span::styled("Servr ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
         (LogLevel::Info, _) =>
             Span::styled("      ", Style::default().fg(theme::LOG_FG)),
         (LogLevel::Model, _) =>

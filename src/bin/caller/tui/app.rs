@@ -28,7 +28,10 @@ pub enum AppMode {
 pub enum LogSource {
     System,
     Agent,
+    /// Server-side text presence model.
     Presence,
+    /// Browser-side live presence (voice/video).
+    Live,
 }
 
 /// Which log tab is active.
@@ -59,7 +62,7 @@ impl LogTab {
     pub fn includes(self, source: LogSource) -> bool {
         match self {
             Self::All => true,
-            Self::Agent => source != LogSource::Presence,
+            Self::Agent => !matches!(source, LogSource::Presence | LogSource::Live),
             Self::Presence => source != LogSource::Agent,
         }
     }
@@ -376,7 +379,7 @@ impl App {
             let text = self.voice_transcript_buffer.trim().to_string();
             if !text.is_empty() {
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
-                self.log_sourced(LogLevel::Info, format!("[Presence] {}", text), LogSource::Presence, vt);
+                self.log_sourced(LogLevel::Info, format!("[Presence] {}", text), LogSource::Live, vt);
             }
             self.voice_transcript_buffer.clear();
             self.voice_transcript_idle_ticks = 0;
@@ -1427,12 +1430,6 @@ impl App {
             AppEvent::PresenceLog { message, level, turn } => {
                 let lvl = level.unwrap_or(LogLevel::Info);
                 let is_debug = lvl == LogLevel::Debug;
-                self.log_sourced(
-                    lvl,
-                    format!("[presence] {}", message),
-                    LogSource::Presence,
-                    turn,
-                );
                 // Persist debug-level presence logs (tool_request, tool_response, etc.) to session log
                 if is_debug {
                     if let Some(ref sl) = self.session_log {
@@ -1441,6 +1438,12 @@ impl App {
                         }
                     }
                 }
+                self.log_sourced(
+                    lvl,
+                    message,
+                    LogSource::Presence,
+                    turn,
+                );
             }
             AppEvent::HumanQuestionDetected { question } => {
                 self.human_question = Some(question.clone());
@@ -1584,12 +1587,12 @@ impl App {
                     self.log_sourced(LogLevel::Detail, format!(
                         "Browser presence connected ({}:{}) — server presence paused ({})",
                         p_display, m_display, count
-                    ), LogSource::Presence, Some(self.voice_turn));
+                    ), LogSource::Live, Some(self.voice_turn));
                 } else {
                     self.log_sourced(LogLevel::Detail, format!(
                         "Browser presence connected ({}:{})",
                         p_display, m_display
-                    ), LogSource::Presence, Some(self.voice_turn));
+                    ), LogSource::Live, Some(self.voice_turn));
                 }
                 // Update displayed model/provider to the live model
                 if let Some(ref provider) = live_provider {
@@ -1619,12 +1622,12 @@ impl App {
                     );
                     let count = flag.load(std::sync::atomic::Ordering::Relaxed);
                     if count == 0 {
-                        self.log_sourced(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string(), LogSource::Presence, vt);
+                        self.log_sourced(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string(), LogSource::Live, vt);
                     } else {
-                        self.log_sourced(LogLevel::Detail, format!("Browser presence disconnected ({} still connected)", count), LogSource::Presence, vt);
+                        self.log_sourced(LogLevel::Detail, format!("Browser presence disconnected ({} still connected)", count), LogSource::Live, vt);
                     }
                 } else {
-                    self.log_sourced(LogLevel::Detail, "Browser presence disconnected".to_string(), LogSource::Presence, vt);
+                    self.log_sourced(LogLevel::Detail, "Browser presence disconnected".to_string(), LogSource::Live, vt);
                 }
                 // Persist to session log
                 if let Some(ref sl) = self.session_log {
@@ -1659,7 +1662,7 @@ impl App {
                         self.log_sourced(
                             LogLevel::Detail,
                             format!("[voice] {}", text.trim()),
-                            LogSource::Presence,
+                            LogSource::Live,
                             vt,
                         );
                     }
@@ -1670,7 +1673,7 @@ impl App {
                         self.log_sourced(
                             LogLevel::Detail,
                             format!("[voice] {}", text),
-                            LogSource::Presence,
+                            LogSource::Live,
                             vt,
                         );
                     }
@@ -1680,7 +1683,7 @@ impl App {
                 self.log_sourced(
                     LogLevel::Detail,
                     format!("Presence checkpoint at seq {}: {}", last_event_seq, summary),
-                    LogSource::Presence,
+                    LogSource::Live,
                     None,
                 );
                 // Persist to session log
@@ -1698,7 +1701,7 @@ impl App {
                     _ => LogLevel::Debug,
                 };
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
-                self.log_sourced(lvl, msg, LogSource::Presence, vt);
+                self.log_sourced(lvl, msg, LogSource::Live, vt);
             }
             AppEvent::UserTranscript { ref text, seq } => {
                 // Persist to session log
@@ -1709,7 +1712,7 @@ impl App {
                 }
                 // Log at Info level with Presence source (shows "Voice" label)
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
-                self.log_sourced(LogLevel::Info, format!("[You] {}", text), LogSource::Presence, vt);
+                self.log_sourced(LogLevel::Info, format!("[You] {}", text), LogSource::Live, vt);
                 // Broadcast as outbound event
                 self.broadcast_control(OutboundEvent::UserTranscript {
                     text: text.clone(),
