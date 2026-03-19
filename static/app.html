@@ -1333,10 +1333,17 @@ function handleEvent(msg) {
       // Streaming text — could accumulate for real-time display
       break;
 
-    case 'agent_started':
-      addLogEntry('detail', `Running: ${msg.commands_preview}`, undefined, SOURCE_LABELS.agent);
+    case 'agent_started': {
+      const preview = msg.commands_preview || '';
+      // If running on a display, show link to Displays tab
+      const hasDisplay = displaySlots.size > 0;
+      if (hasDisplay) {
+        addLogEntryWithDisplayLink('detail', `Running on display`, Array.from(displaySlots.keys())[0], SOURCE_LABELS.agent);
+      }
+      addLogEntry('detail', `Running: ${preview}`, undefined, SOURCE_LABELS.agent);
       setPhase('running');
       break;
+    }
 
     case 'agent_output':
       if (msg.stdout) addLogEntry('agent', formatAgentOutput(msg.stdout), undefined, SOURCE_LABELS.agent);
@@ -1433,7 +1440,7 @@ function handleEvent(msg) {
       break;
 
     case 'display_ready':
-      addLogEntry('info', `Display :${msg.display_id} ready${msg.vnc_port ? ' (VNC port ' + msg.vnc_port + ')' : ''}`, undefined, SOURCE_LABELS.system);
+      addLogEntryWithDisplayLink('info', `Display :${msg.display_id} ready`, msg.display_id, SOURCE_LABELS.system);
       if (msg.vnc_port) addDisplaySlot(msg.display_id, msg.vnc_port);
       break;
 
@@ -1662,6 +1669,51 @@ function addLogEntry(level, content, turn, source) {
   if (autoScroll) {
     stream.scrollTop = stream.scrollHeight;
   }
+}
+
+// Add a log entry with a clickable link to the Displays tab
+function addLogEntryWithDisplayLink(level, text, displayId, source) {
+  const stream = document.getElementById('log-stream');
+
+  const entry = document.createElement('div');
+  entry.className = 'log-entry level-' + level;
+  entry.dataset.level = level;
+
+  const visible = VERBOSITY_LEVELS[verbosity] || VERBOSITY_LEVELS.normal;
+  if (!visible.includes(level)) entry.style.display = 'none';
+
+  const icon = document.createElement('span');
+  icon.className = 'log-icon';
+  icon.textContent = LEVEL_ICONS[level] || '\u2022';
+  icon.title = LEVEL_TOOLTIPS[level] || level;
+
+  const ts = document.createElement('span');
+  ts.className = 'log-ts';
+  ts.textContent = new Date().toLocaleTimeString('en-US', { hour12: false });
+
+  const lvl = document.createElement('span');
+  lvl.className = 'log-level';
+  lvl.textContent = source || SOURCE_LABELS.system;
+
+  const cnt = document.createElement('span');
+  cnt.className = 'log-content';
+  cnt.textContent = text + ' ';
+
+  const link = document.createElement('a');
+  link.textContent = `:${displayId} \u2192 Displays`;
+  link.href = '#';
+  link.style.cssText = 'color:var(--blue);text-decoration:underline;cursor:pointer;font-size:12px';
+  link.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); switchTab('displays'); });
+  cnt.appendChild(link);
+
+  entry.appendChild(icon);
+  entry.appendChild(ts);
+  entry.appendChild(lvl);
+  entry.appendChild(cnt);
+  stream.appendChild(entry);
+
+  logEntryCount++;
+  if (autoScroll) stream.scrollTop = stream.scrollHeight;
 }
 
 // Auto-scroll detection
