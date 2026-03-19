@@ -33,14 +33,10 @@ use project::Project;
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
-
-/// Module-level flag for --json output mode.
-static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 /// Shared slot for JSON-mode approval responses.
 /// The stdin reader stores approval senders here; the agent loop awaits them.
@@ -622,7 +618,7 @@ async fn maybe_auto_launch_xvfb(
     xvfb_guard: &mut Option<vision::XvfbGuard>,
     provider_name: &str,
     session_log: &SharedSessionLog,
-    bus: &Option<EventBus>,
+    bus: &EventBus,
 ) {
     if xvfb_guard.is_some() {
         return;
@@ -654,14 +650,10 @@ async fn maybe_auto_launch_xvfb(
                 });
             }
             let display_id = config.display_id;
-            emit(
-                bus,
-                || AppEvent::DisplayReady {
-                    display_id,
-                    vnc_port,
-                },
-                || {},
-            );
+            bus.send(AppEvent::DisplayReady {
+                display_id,
+                vnc_port,
+            });
             *xvfb_guard = Some(guard);
         }
         Err(e) => {
@@ -733,134 +725,6 @@ fn normalize_command_batch(json_str: &str) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
 
-/// Emit a JSONL event to stdout (used in --json mode).
-fn emit_json(event_type: &str, data: serde_json::Value) {
-    let event = serde_json::json!({
-        "type": event_type,
-        "data": data,
-    });
-    if let Ok(line) = serde_json::to_string(&event) {
-        println!("{}", line);
-    }
-}
-
-/// Macro-like helper for conditional output: TUI event bus, JSON, or println.
-fn emit(bus: &Option<EventBus>, event_fn: impl FnOnce() -> AppEvent, fallback: impl FnOnce()) {
-    if let Some(bus) = bus {
-        bus.send(event_fn());
-    } else if JSON_OUTPUT.load(Ordering::Relaxed) {
-        let event = event_fn();
-        if let Some((event_type, data)) = app_event_to_json(&event) {
-            emit_json(event_type, data);
-        }
-    } else {
-        fallback();
-    }
-}
-
-/// Convert an AppEvent to a (type, data) pair for JSON output.
-fn app_event_to_json(event: &AppEvent) -> Option<(&'static str, serde_json::Value)> {
-    match event {
-        AppEvent::TurnStarted {
-            turn,
-            budget_pct,
-            remaining,
-        } => Some((
-            "turn_started",
-            serde_json::json!({
-                "turn": turn,
-                "budget_pct": budget_pct,
-                "remaining": remaining,
-            }),
-        )),
-        AppEvent::ModelResponse {
-            turn,
-            content,
-            usage,
-            reasoning,
-        } => Some((
-            "model_response",
-            serde_json::json!({
-                "turn": turn,
-                "content": content,
-                "usage": {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
-                },
-                "reasoning": reasoning,
-            }),
-        )),
-        AppEvent::ModelResponseDelta { ref text } => Some((
-            "model_response_delta",
-            serde_json::json!({
-                "text": text,
-            }),
-        )),
-        AppEvent::AgentOutput { stdout, stderr } => Some((
-            "agent_output",
-            serde_json::json!({
-                "stdout": stdout,
-                "stderr": stderr,
-            }),
-        )),
-        AppEvent::DoneSignal { message } => Some((
-            "done",
-            serde_json::json!({
-                "message": message,
-            }),
-        )),
-        AppEvent::LoopError(msg) => Some(("error", serde_json::json!({ "message": msg }))),
-        AppEvent::BudgetWarning { pct, remaining } => Some((
-            "budget_warning",
-            serde_json::json!({
-                "pct": pct,
-                "remaining": remaining,
-            }),
-        )),
-        AppEvent::BudgetExhausted { remaining } => Some((
-            "budget_exhausted",
-            serde_json::json!({ "remaining": remaining }),
-        )),
-        AppEvent::ApprovalRequired {
-            id,
-            command_preview,
-            category,
-        } => Some((
-            "approval_required",
-            serde_json::json!({
-                "id": id,
-                "command_preview": command_preview,
-                "category": format!("{:?}", category),
-            }),
-        )),
-        AppEvent::TaskComplete { reason, summary } => {
-            let mut data = serde_json::json!({ "reason": reason });
-            if let Some(ref s) = summary {
-                data["summary"] = serde_json::json!(s);
-            }
-            Some(("done", data))
-        }
-        AppEvent::ContextManagement { turn } => {
-            Some(("context_management", serde_json::json!({ "turn": turn })))
-        }
-        AppEvent::RoundComplete {
-            round,
-            turns_in_round,
-        } => Some((
-            "round_complete",
-            serde_json::json!({
-                "round": round,
-                "turns_in_round": turns_in_round,
-            }),
-        )),
-        AppEvent::HumanQuestionDetected { question } => Some((
-            "human_question",
-            serde_json::json!({ "question": question }),
-        )),
-        _ => None, // Skip events that don't need JSON output (Key, Resize, Tick, etc.)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1281,49 +1145,6 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn emit_json_format() {
-        // Test that emit_json produces valid JSONL
-        let data = serde_json::json!({"turn": 1, "content": "hello"});
-        let event = serde_json::json!({
-            "type": "model_response",
-            "data": data,
-        });
-        let line = serde_json::to_string(&event).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(parsed["type"], "model_response");
-        assert_eq!(parsed["data"]["turn"], 1);
-    }
-
-    #[test]
-    fn app_event_to_json_turn_started() {
-        let event = AppEvent::TurnStarted {
-            turn: 5,
-            budget_pct: 42.0,
-            remaining: 100_000,
-        };
-        let (event_type, data) = app_event_to_json(&event).unwrap();
-        assert_eq!(event_type, "turn_started");
-        assert_eq!(data["turn"], 5);
-        assert_eq!(data["remaining"], 100_000);
-    }
-
-    #[test]
-    fn app_event_to_json_done_signal() {
-        let event = AppEvent::DoneSignal {
-            message: Some("All done".to_string()),
-        };
-        let (event_type, data) = app_event_to_json(&event).unwrap();
-        assert_eq!(event_type, "done");
-        assert_eq!(data["message"], "All done");
-    }
-
-    #[test]
-    fn app_event_to_json_skips_tick() {
-        let event = AppEvent::Tick;
-        assert!(app_event_to_json(&event).is_none());
-    }
-
-    #[test]
     fn format_command_preview_exec() {
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls -la /tmp"}]}"#;
         let preview = format_command_preview(json);
@@ -1470,34 +1291,6 @@ Also: {"source": "bare"}"#;
         assert!(!has_exec_command("not json"));
     }
 
-    #[test]
-    fn emit_with_bus() {
-        let bus = EventBus::new();
-        let mut rx = bus.subscribe();
-        let bus_opt = Some(bus);
-        emit(
-            &bus_opt,
-            || AppEvent::Tick,
-            || panic!("should not be called"),
-        );
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            match rx.recv().await.unwrap() {
-                AppEvent::Tick => {}
-                _ => panic!("expected Tick"),
-            }
-        });
-    }
-
-    #[test]
-    fn emit_without_bus() {
-        let bus_opt: Option<EventBus> = None;
-        let mut called = false;
-        emit(&bus_opt, || AppEvent::Tick, || called = true);
-        assert!(called);
-    }
 
     // --- assemble_batch_from_tool_calls tests ---
 
@@ -1783,13 +1576,16 @@ async fn run_agent_loop(
     conversation: &mut Conversation,
     project: &Project,
     sub_agent_mode: Option<&(String, sub_agent::SubAgentRole)>,
-    bus: Option<EventBus>,
+    bus: &EventBus,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
     log_dir: &std::path::Path,
     mcp_mgr: Option<&mcp_client::McpClientManager>,
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
+    // When true, askHuman is unavailable and approvals without a json_approval
+    // slot are auto-denied (headless non-JSON mode).
+    headless: bool,
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -1809,16 +1605,7 @@ async fn run_agent_loop(
                     remaining
                 ))
             });
-            emit(
-                &bus,
-                || AppEvent::BudgetExhausted { remaining },
-                || {
-                    println!(
-                        "--- Context budget exhausted ({} tokens remaining) ---",
-                        remaining
-                    )
-                },
-            );
+            bus.send(AppEvent::BudgetExhausted { remaining });
             exit_reason = LoopExitReason::BudgetExhausted;
             break;
         }
@@ -1829,21 +1616,11 @@ async fn run_agent_loop(
 
         slog(&session_log, |l| l.turn_start(turn, budget_pct, remaining));
 
-        emit(
-            &bus,
-            || AppEvent::TurnStarted {
-                turn,
-                budget_pct,
-                remaining,
-            },
-            || {
-                println!(
-                    "[Turn {}] Sending to model... {}",
-                    turn,
-                    conversation.budget_summary()
-                )
-            },
-        );
+        bus.send(AppEvent::TurnStarted {
+            turn,
+            budget_pct,
+            remaining,
+        });
 
         // Log the full messages array being sent to the API
         slog(&session_log, |l| {
@@ -1860,9 +1637,7 @@ async fn run_agent_loop(
                 let stream_bus = bus.clone();
                 let on_stream_event = move |event: crate::provider::StreamEvent| {
                     if let crate::provider::StreamEvent::Delta(ref text) = event {
-                        if let Some(ref b) = stream_bus {
-                            b.send(AppEvent::ModelResponseDelta { text: text.clone() });
-                        }
+                        stream_bus.send(AppEvent::ModelResponseDelta { text: text.clone() });
                     }
                 };
                 match provider
@@ -1892,11 +1667,7 @@ async fn run_agent_loop(
                             continue;
                         }
                         slog(&session_log, |l| l.error(&format!("API error: {}", e)));
-                        emit(
-                            &bus,
-                            || AppEvent::LoopError(e.to_string()),
-                            || eprintln!("Error: {}", e),
-                        );
+                        bus.send(AppEvent::LoopError(e.to_string()));
                         return Err(e);
                     }
                 }
@@ -1908,11 +1679,7 @@ async fn run_agent_loop(
                         CallerError::Provider("Stream failed after retries".to_string())
                     });
                     slog(&session_log, |l| l.error(&format!("API error: {}", e)));
-                    emit(
-                        &bus,
-                        || AppEvent::LoopError(e.to_string()),
-                        || eprintln!("Error: {}", e),
-                    );
+                    bus.send(AppEvent::LoopError(e.to_string()));
                     return Err(e);
                 }
             }
@@ -1924,11 +1691,7 @@ async fn run_agent_loop(
             slog(&session_log, |l| {
                 l.info(&format!("Auto-compacted conversation at turn {}", turn))
             });
-            emit(
-                &bus,
-                || AppEvent::ContextManagement { turn },
-                || eprintln!("Context compacted at turn {}", turn),
-            );
+            bus.send(AppEvent::ContextManagement { turn });
         }
 
         loop_stats.turns = turn;
@@ -1991,16 +1754,7 @@ async fn run_agent_loop(
                     pct, remaining
                 ))
             });
-            emit(
-                &bus,
-                || AppEvent::BudgetWarning { pct, remaining },
-                || {
-                    eprintln!(
-                        "WARNING: Context budget is running low ({:.0}% used, {} tokens remaining)",
-                        pct, remaining,
-                    )
-                },
-            );
+            bus.send(AppEvent::BudgetWarning { pct, remaining });
             budget_warning_shown = true;
         }
 
@@ -2022,19 +1776,12 @@ async fn run_agent_loop(
             }
         }
 
-        emit(
-            &bus,
-            || AppEvent::ModelResponse {
-                turn,
-                content: response.content.clone(),
-                usage: response.usage.clone(),
-                reasoning: response.reasoning_summary.clone(),
-            },
-            || {
-                println!("Model response:\n{}", response.content);
-                println!();
-            },
-        );
+        bus.send(AppEvent::ModelResponse {
+            turn,
+            content: response.content.clone(),
+            usage: response.usage.clone(),
+            reasoning: response.reasoning_summary.clone(),
+        });
 
         // ====== TOOL CALL PATH vs TEXT EXTRACTION PATH ======
         if has_tool_calls {
@@ -2088,18 +1835,9 @@ async fn run_agent_loop(
                 ) {
                     conversation.add_tool_result(&call_id, &tool_name, "OK");
                 }
-                emit(
-                    &bus,
-                    || AppEvent::DoneSignal {
-                        message: batch.done_message.clone(),
-                    },
-                    || {
-                        if let Some(ref msg) = batch.done_message {
-                            println!("{}", msg);
-                        }
-                        println!("--- Task complete ---");
-                    },
-                );
+                bus.send(AppEvent::DoneSignal {
+                    message: batch.done_message.clone(),
+                });
                 exit_reason = LoopExitReason::DoneSignal;
                 break;
             }
@@ -2149,8 +1887,8 @@ async fn run_agent_loop(
             let json_str = normalize_command_batch(&inject_project_context(json_str, project));
 
             // Headless askHuman check — skip unless JSON mode (which handles it via stdin)
-            if bus.is_none()
-                && !JSON_OUTPUT.load(Ordering::Relaxed)
+            if headless
+                && json_approval.is_none()
                 && has_ask_human_command(&json_str)
             {
                 slog(&session_log, |l| {
@@ -2165,13 +1903,10 @@ async fn run_agent_loop(
                 }
                 continue;
             }
-            // In JSON mode, emit the question so the stdin consumer can respond
-            if bus.is_none() && JSON_OUTPUT.load(Ordering::Relaxed) {
+            // In JSON mode, emit the question so the outbound broadcaster prints it
+            if json_approval.is_some() {
                 if let Some(question) = extract_ask_human_question(&json_str) {
-                    emit_json(
-                        "human_question",
-                        serde_json::json!({ "question": question }),
-                    );
+                    bus.send(AppEvent::HumanQuestionDetected { question });
                 }
             }
 
@@ -2187,12 +1922,10 @@ async fn run_agent_loop(
                         }
                         let rule = autonomy_state.rules.rule_for(cat);
                         if matches!(rule, autonomy::ApprovalRule::Deny) {
-                            // Deny is highest priority — pick highest severity among denies
                             if need.is_none_or(|(prev, _)| cat.severity() > prev.severity()) {
                                 need = Some((cat, true));
                             }
                         } else if autonomy_state.needs_approval(cat) {
-                            // Among non-deny approvals, pick highest severity
                             if need.is_none_or(|(prev, was_deny)| {
                                 !was_deny && cat.severity() > prev.severity()
                             }) {
@@ -2215,21 +1948,72 @@ async fn run_agent_loop(
                     slog(&session_log, |l| {
                         l.approval(&cat.to_string(), &preview, "denied-policy")
                     });
-                    emit(
-                        &bus,
-                        || AppEvent::TaskComplete {
-                            reason: format!("Denied by policy ({})", cat),
-                            summary: None,
-                        },
-                        || println!("--- Denied by policy ({}) ---", cat),
-                    );
+                    bus.send(AppEvent::TaskComplete {
+                        reason: format!("Denied by policy ({})", cat),
+                        summary: None,
+                    });
                     return Ok((loop_stats, LoopExitReason::Denied));
                 }
 
-                if let Some(ref bus_ref) = bus {
+                if let Some(slot) = json_approval {
+                    // JSON mode: emit approval event and wait for stdin response
+                    bus.send(AppEvent::ApprovalRequired {
+                        id: turn as u64,
+                        command_preview: preview.clone(),
+                        category: cat,
+                    });
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    {
+                        let mut guard = slot.lock().unwrap();
+                        *guard = Some((turn as u64, tx));
+                    }
+                    match rx.await {
+                        Ok(event::ApprovalResponse::Approve) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "approved")
+                            });
+                        }
+                        Ok(event::ApprovalResponse::ApproveAll) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "approve-all")
+                            });
+                            let mut state = autonomy.write().await;
+                            state.level = AutonomyLevel::Full;
+                        }
+                        Ok(event::ApprovalResponse::Skip) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "skipped")
+                            });
+                            should_skip = true;
+                        }
+                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "denied")
+                            });
+                            bus.send(AppEvent::TaskComplete {
+                                reason: "Denied by user".to_string(),
+                                summary: None,
+                            });
+                            return Ok((loop_stats, LoopExitReason::Denied));
+                        }
+                    }
+                } else if headless {
+                    slog(&session_log, |l| {
+                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                    });
+                    bus.send(AppEvent::TaskComplete {
+                        reason: format!(
+                            "Approval required in headless mode ({})",
+                            cat
+                        ),
+                        summary: None,
+                    });
+                    return Ok((loop_stats, LoopExitReason::Denied));
+                } else {
+                    // Interactive mode (TUI/MCP): approval via registry
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     approval_registry.lock().unwrap().insert(turn as u64, tx);
-                    bus_ref.send(AppEvent::ApprovalRequired {
+                    bus.send(AppEvent::ApprovalRequired {
                         id: turn as u64,
                         command_preview: preview.clone(),
                         category: cat,
@@ -2257,98 +2041,21 @@ async fn run_agent_loop(
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
-                            emit(
-                                &bus,
-                                || AppEvent::TaskComplete {
-                                    reason: "Denied by user".to_string(),
-                                    summary: None,
-                                },
-                                || println!("--- Denied by user ---"),
-                            );
+                            bus.send(AppEvent::TaskComplete {
+                                reason: "Denied by user".to_string(),
+                                summary: None,
+                            });
                             return Ok((loop_stats, LoopExitReason::Denied));
                         }
-                    }
-                }
-                if bus.is_none() {
-                    if let Some(slot) = json_approval {
-                        // JSON mode: emit approval_required event and wait for stdin response
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        emit_json(
-                            "approval_required",
-                            serde_json::json!({
-                                "id": turn as u64,
-                                "command_preview": preview,
-                                "category": format!("{:?}", cat),
-                            }),
-                        );
-                        {
-                            let mut guard = slot.lock().unwrap();
-                            *guard = Some((turn as u64, tx));
-                        }
-                        match rx.await {
-                            Ok(event::ApprovalResponse::Approve) => {
-                                slog(&session_log, |l| {
-                                    l.approval(&cat.to_string(), &preview, "approved")
-                                });
-                            }
-                            Ok(event::ApprovalResponse::ApproveAll) => {
-                                slog(&session_log, |l| {
-                                    l.approval(&cat.to_string(), &preview, "approve-all")
-                                });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
-                            }
-                            Ok(event::ApprovalResponse::Skip) => {
-                                slog(&session_log, |l| {
-                                    l.approval(&cat.to_string(), &preview, "skipped")
-                                });
-                                should_skip = true;
-                            }
-                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                                slog(&session_log, |l| {
-                                    l.approval(&cat.to_string(), &preview, "denied")
-                                });
-                                emit_json(
-                                    "done",
-                                    serde_json::json!({ "reason": "Denied by user" }),
-                                );
-                                return Ok((loop_stats, LoopExitReason::Denied));
-                            }
-                        }
-                    } else {
-                        slog(&session_log, |l| {
-                            l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                        });
-                        emit(
-                            &bus,
-                            || AppEvent::TaskComplete {
-                                reason: format!(
-                                    "Approval required in headless mode ({})",
-                                    cat
-                                ),
-                                summary: None,
-                            },
-                            || {
-                                println!(
-                                    "--- Approval required in headless mode ({}) ---",
-                                    cat
-                                )
-                            },
-                        );
-                        return Ok((loop_stats, LoopExitReason::Denied));
                     }
                 }
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
                 let preview = format_command_preview(&json_str);
                 if !preview.is_empty() {
-                    emit(
-                        &bus,
-                        || AppEvent::AutoApproved {
-                            preview: preview.clone(),
-                        },
-                        || {},
-                    );
+                    bus.send(AppEvent::AutoApproved {
+                        preview: preview.clone(),
+                    });
                 }
             }
 
@@ -2361,17 +2068,13 @@ async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, &bus)
+            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, bus)
                 .await;
             let preview = json_str.chars().take(300).collect::<String>();
-            emit(
-                &bus,
-                || AppEvent::AgentStarted {
-                    turn,
-                    commands_preview: preview.clone(),
-                },
-                || println!("[Turn {}] Running agent...", turn),
-            );
+            bus.send(AppEvent::AgentStarted {
+                turn,
+                commands_preview: preview.clone(),
+            });
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
 
@@ -2380,19 +2083,10 @@ async fn run_agent_loop(
                 l.agent_output(&output.stdout, &output.stderr)
             });
 
-            emit(
-                &bus,
-                || AppEvent::AgentOutput {
-                    stdout: output.stdout.clone(),
-                    stderr: output.stderr.clone(),
-                },
-                || {
-                    println!("Agent stdout:\n{}", output.stdout);
-                    if !output.stderr.is_empty() {
-                        eprintln!("Agent stderr:\n{}", output.stderr);
-                    }
-                },
-            );
+            bus.send(AppEvent::AgentOutput {
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+            });
 
             // Map results back to individual tool responses
             let tool_results = map_results_to_tool_responses(
@@ -2425,14 +2119,10 @@ async fn run_agent_loop(
                         l.info("No JSON found in response — task complete")
                     });
                     let brief: String = response.content.chars().take(500).collect();
-                    emit(
-                        &bus,
-                        || AppEvent::TaskComplete {
-                            reason: "Task complete".to_string(),
-                            summary: if brief.is_empty() { None } else { Some(brief.clone()) },
-                        },
-                        || println!("--- Task complete ---"),
-                    );
+                    bus.send(AppEvent::TaskComplete {
+                        reason: "Task complete".to_string(),
+                        summary: if brief.is_empty() { None } else { Some(brief.clone()) },
+                    });
                     exit_reason = LoopExitReason::TaskComplete;
                     break;
                 }
@@ -2440,13 +2130,9 @@ async fn run_agent_loop(
 
             slog(&session_log, |l| l.json_extracted(&json_str));
 
-            emit(
-                &bus,
-                || AppEvent::JsonExtracted {
-                    preview: json_str.chars().take(100).collect(),
-                },
-                || {},
-            );
+            bus.send(AppEvent::JsonExtracted {
+                preview: json_str.chars().take(100).collect(),
+            });
 
             // Check for explicit done signal (used in structured output / JSON mode)
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
@@ -2465,18 +2151,9 @@ async fn run_agent_loop(
                             message.as_deref().unwrap_or("(no message)")
                         ))
                     });
-                    emit(
-                        &bus,
-                        || AppEvent::DoneSignal {
-                            message: message.clone(),
-                        },
-                        || {
-                            if let Some(ref msg) = message {
-                                println!("{}", msg);
-                            }
-                            println!("--- Task complete ---");
-                        },
-                    );
+                    bus.send(AppEvent::DoneSignal {
+                        message: message.clone(),
+                    });
                     exit_reason = LoopExitReason::DoneSignal;
                     break;
                 }
@@ -2496,11 +2173,7 @@ async fn run_agent_loop(
                     slog(&session_log, |l| {
                         l.debug(&format!("Turn {}: context management only", turn))
                     });
-                    emit(
-                        &bus,
-                        || AppEvent::ContextManagement { turn },
-                        || println!("[Turn {}] Context management only, continuing...", turn),
-                    );
+                    bus.send(AppEvent::ContextManagement { turn });
                     conversation.add_user("Context updated.".to_string());
                     continue;
                 } else {
@@ -2510,14 +2183,10 @@ async fn run_agent_loop(
                             l.info("No commands across consecutive turns — task complete")
                         });
                         let brief: String = response.content.chars().take(500).collect();
-                        emit(
-                            &bus,
-                            || AppEvent::TaskComplete {
-                                reason: "Task complete".to_string(),
-                                summary: if brief.is_empty() { None } else { Some(brief.clone()) },
-                            },
-                            || println!("--- Task complete ---"),
-                        );
+                        bus.send(AppEvent::TaskComplete {
+                            reason: "Task complete".to_string(),
+                            summary: if brief.is_empty() { None } else { Some(brief.clone()) },
+                        });
                         exit_reason = LoopExitReason::TaskComplete;
                         break;
                     }
@@ -2538,8 +2207,8 @@ async fn run_agent_loop(
             let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
 
             // In headless mode there is no askHuman input panel — skip unless JSON mode.
-            if bus.is_none()
-                && !JSON_OUTPUT.load(Ordering::Relaxed)
+            if headless
+                && json_approval.is_none()
                 && has_ask_human_command(&json_str)
             {
                 slog(&session_log, |l| {
@@ -2552,13 +2221,10 @@ Proceed with explicit assumptions and continue without additional questions."
                 );
                 continue;
             }
-            // In JSON mode, emit the question so the stdin consumer can respond
-            if bus.is_none() && JSON_OUTPUT.load(Ordering::Relaxed) {
+            // In JSON mode, emit the question so the outbound broadcaster prints it
+            if json_approval.is_some() {
                 if let Some(question) = extract_ask_human_question(&json_str) {
-                    emit_json(
-                        "human_question",
-                        serde_json::json!({ "question": question }),
-                    );
+                    bus.send(AppEvent::HumanQuestionDetected { question });
                 }
             }
 
@@ -2574,12 +2240,10 @@ Proceed with explicit assumptions and continue without additional questions."
                         }
                         let rule = autonomy_state.rules.rule_for(cat);
                         if matches!(rule, autonomy::ApprovalRule::Deny) {
-                            // Deny is highest priority — pick highest severity among denies
                             if need.is_none_or(|(prev, _)| cat.severity() > prev.severity()) {
                                 need = Some((cat, true));
                             }
                         } else if autonomy_state.needs_approval(cat) {
-                            // Among non-deny approvals, pick highest severity
                             if need.is_none_or(|(prev, was_deny)| {
                                 !was_deny && cat.severity() > prev.severity()
                             }) {
@@ -2602,21 +2266,72 @@ Proceed with explicit assumptions and continue without additional questions."
                     slog(&session_log, |l| {
                         l.approval(&cat.to_string(), &preview, "denied-policy")
                     });
-                    emit(
-                        &bus,
-                        || AppEvent::TaskComplete {
-                            reason: format!("Denied by policy ({})", cat),
-                            summary: None,
-                        },
-                        || println!("--- Denied by policy ({}) ---", cat),
-                    );
+                    bus.send(AppEvent::TaskComplete {
+                        reason: format!("Denied by policy ({})", cat),
+                        summary: None,
+                    });
                     return Ok((loop_stats, LoopExitReason::Denied));
                 }
 
-                if let Some(ref bus_ref) = bus {
+                if let Some(slot) = json_approval {
+                    // JSON mode: emit approval event and wait for stdin response
+                    bus.send(AppEvent::ApprovalRequired {
+                        id: turn as u64,
+                        command_preview: preview.clone(),
+                        category: cat,
+                    });
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    {
+                        let mut guard = slot.lock().unwrap();
+                        *guard = Some((turn as u64, tx));
+                    }
+                    match rx.await {
+                        Ok(event::ApprovalResponse::Approve) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "approved")
+                            });
+                        }
+                        Ok(event::ApprovalResponse::ApproveAll) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "approve-all")
+                            });
+                            let mut state = autonomy.write().await;
+                            state.level = AutonomyLevel::Full;
+                        }
+                        Ok(event::ApprovalResponse::Skip) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "skipped")
+                            });
+                            should_skip = true;
+                        }
+                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                            slog(&session_log, |l| {
+                                l.approval(&cat.to_string(), &preview, "denied")
+                            });
+                            bus.send(AppEvent::TaskComplete {
+                                reason: "Denied by user".to_string(),
+                                summary: None,
+                            });
+                            return Ok((loop_stats, LoopExitReason::Denied));
+                        }
+                    }
+                } else if headless {
+                    slog(&session_log, |l| {
+                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                    });
+                    bus.send(AppEvent::TaskComplete {
+                        reason: format!(
+                            "Approval required in headless mode ({})",
+                            cat
+                        ),
+                        summary: None,
+                    });
+                    return Ok((loop_stats, LoopExitReason::Denied));
+                } else {
+                    // Interactive mode (TUI/MCP): approval via registry
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     approval_registry.lock().unwrap().insert(turn as u64, tx);
-                    bus_ref.send(AppEvent::ApprovalRequired {
+                    bus.send(AppEvent::ApprovalRequired {
                         id: turn as u64,
                         command_preview: preview.clone(),
                         category: cat,
@@ -2644,98 +2359,21 @@ Proceed with explicit assumptions and continue without additional questions."
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
-                            emit(
-                                &bus,
-                                || AppEvent::TaskComplete {
-                                    reason: "Denied by user".to_string(),
-                                    summary: None,
-                                },
-                                || println!("--- Denied by user ---"),
-                            );
+                            bus.send(AppEvent::TaskComplete {
+                                reason: "Denied by user".to_string(),
+                                summary: None,
+                            });
                             return Ok((loop_stats, LoopExitReason::Denied));
                         }
-                    }
-                }
-                if bus.is_none() {
-                    if let Some(slot) = json_approval {
-                        // JSON mode: emit approval_required event and wait for stdin response
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        emit_json(
-                            "approval_required",
-                            serde_json::json!({
-                                "id": turn as u64,
-                                "command_preview": preview,
-                                "category": format!("{:?}", cat),
-                            }),
-                        );
-                        {
-                            let mut guard = slot.lock().unwrap();
-                            *guard = Some((turn as u64, tx));
-                        }
-                        match rx.await {
-                            Ok(event::ApprovalResponse::Approve) => {
-                                slog(&session_log, |l| {
-                                    l.approval(&cat.to_string(), &preview, "approved")
-                                });
-                            }
-                            Ok(event::ApprovalResponse::ApproveAll) => {
-                                slog(&session_log, |l| {
-                                    l.approval(&cat.to_string(), &preview, "approve-all")
-                                });
-                                let mut state = autonomy.write().await;
-                                state.level = AutonomyLevel::Full;
-                            }
-                            Ok(event::ApprovalResponse::Skip) => {
-                                slog(&session_log, |l| {
-                                    l.approval(&cat.to_string(), &preview, "skipped")
-                                });
-                                should_skip = true;
-                            }
-                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                                slog(&session_log, |l| {
-                                    l.approval(&cat.to_string(), &preview, "denied")
-                                });
-                                emit_json(
-                                    "done",
-                                    serde_json::json!({ "reason": "Denied by user" }),
-                                );
-                                return Ok((loop_stats, LoopExitReason::Denied));
-                            }
-                        }
-                    } else {
-                        slog(&session_log, |l| {
-                            l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                        });
-                        emit(
-                            &bus,
-                            || AppEvent::TaskComplete {
-                                reason: format!(
-                                    "Approval required in headless mode ({})",
-                                    cat
-                                ),
-                                summary: None,
-                            },
-                            || {
-                                println!(
-                                    "--- Approval required in headless mode ({}) ---",
-                                    cat
-                                )
-                            },
-                        );
-                        return Ok((loop_stats, LoopExitReason::Denied));
                     }
                 }
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
                 let preview = format_command_preview(&json_str);
                 if !preview.is_empty() {
-                    emit(
-                        &bus,
-                        || AppEvent::AutoApproved {
-                            preview: preview.clone(),
-                        },
-                        || {},
-                    );
+                    bus.send(AppEvent::AutoApproved {
+                        preview: preview.clone(),
+                    });
                 }
             }
 
@@ -2746,18 +2384,14 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, &bus)
+            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, bus)
                 .await;
 
             let preview = json_str.chars().take(300).collect::<String>();
-            emit(
-                &bus,
-                || AppEvent::AgentStarted {
-                    turn,
-                    commands_preview: preview.clone(),
-                },
-                || println!("[Turn {}] Running agent...", turn),
-            );
+            bus.send(AppEvent::AgentStarted {
+                turn,
+                commands_preview: preview.clone(),
+            });
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
 
@@ -2766,19 +2400,10 @@ Proceed with explicit assumptions and continue without additional questions."
                 l.agent_output(&output.stdout, &output.stderr)
             });
 
-            emit(
-                &bus,
-                || AppEvent::AgentOutput {
-                    stdout: output.stdout.clone(),
-                    stderr: output.stderr.clone(),
-                },
-                || {
-                    println!("Agent stdout:\n{}", output.stdout);
-                    if !output.stderr.is_empty() {
-                        eprintln!("Agent stderr:\n{}", output.stderr);
-                    }
-                },
-            );
+            bus.send(AppEvent::AgentOutput {
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+            });
 
             // Check for completed sub-agent results
             let sub_agent_dir = project.sub_agent_dir();
@@ -2793,13 +2418,9 @@ Proceed with explicit assumptions and continue without additional questions."
                     slog(&session_log, |l| {
                         l.info(&format!("Sub-agent result: {}", msg))
                     });
-                    emit(
-                        &bus,
-                        || AppEvent::SubAgentResult {
-                            formatted: msg.clone(),
-                        },
-                        || println!("{}", msg),
-                    );
+                    bus.send(AppEvent::SubAgentResult {
+                        formatted: msg.clone(),
+                    });
                 }
             }
 
@@ -2824,11 +2445,7 @@ Proceed with explicit assumptions and continue without additional questions."
             slog(&session_log, |l| {
                 l.warn(&format!("Safety cap ({}) reached", SAFETY_CAP))
             });
-            emit(
-                &bus,
-                || AppEvent::SafetyCapReached,
-                || println!("--- Safety cap ({}) reached ---", SAFETY_CAP),
-            );
+            bus.send(AppEvent::SafetyCapReached);
             exit_reason = LoopExitReason::SafetyCapReached;
         }
     }
@@ -2845,7 +2462,7 @@ async fn run_round_loop(
     conversation: &mut Conversation,
     project: &Project,
     sub_agent_mode: Option<&(String, sub_agent::SubAgentRole)>,
-    bus: Option<EventBus>,
+    bus: &EventBus,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
     log_dir: &std::path::Path,
@@ -2853,6 +2470,7 @@ async fn run_round_loop(
     mut follow_up_rx: FollowUpReceiver,
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
+    headless: bool,
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
     let mut cumulative_stats = LoopStats::default();
@@ -2863,13 +2481,14 @@ async fn run_round_loop(
             conversation,
             project,
             sub_agent_mode,
-            bus.clone(),
+            bus,
             autonomy.clone(),
             session_log.clone(),
             log_dir,
             mcp_mgr,
             json_approval,
             approval_registry,
+            headless,
         )
         .await?;
 
@@ -2889,14 +2508,10 @@ async fn run_round_loop(
             LoopExitReason::DoneSignal | LoopExitReason::TaskComplete => {
                 // Emit RoundComplete event
                 let turns_in_round = stats.turns;
-                emit(
-                    &bus,
-                    || AppEvent::RoundComplete {
-                        round,
-                        turns_in_round,
-                    },
-                    || println!("--- Round {} complete ({} turns) ---", round, turns_in_round),
-                );
+                bus.send(AppEvent::RoundComplete {
+                    round,
+                    turns_in_round,
+                });
 
                 // Wait for follow-up message
                 match follow_up_rx.recv().await {
@@ -3034,19 +2649,21 @@ All relative paths and commands execute from this directory.",
 
     let sub_agent_info = (id.clone(), role);
     let session_log_for_summary = session_log.clone();
+    let sub_agent_bus = EventBus::new();
     let sub_agent_registry = event::ApprovalRegistry::default();
     let result = run_agent_loop(
         provider.as_ref(),
         &mut conversation,
         &project,
         Some(&sub_agent_info),
-        None, // no TUI for sub-agents
+        &sub_agent_bus,
         autonomy,
         session_log,
         &log_dir,
         None, // no MCP client for sub-agents
         None, // no JSON approval for sub-agents
         &sub_agent_registry,
+        true, // headless (sub-agents have no interactive UI)
     )
     .await;
 
@@ -3270,7 +2887,7 @@ async fn run_with_presence(
                 task_provider,
                 envelope.task,
                 task_project,
-                Some(bus.clone()),
+                bus.clone(),
                 autonomy.clone(),
                 session_log.clone(),
                 log_dir.clone(),
@@ -3278,6 +2895,7 @@ async fn run_with_presence(
                 follow_up_rx,
                 None, // no JSON approval in TUI/presence mode
                 event::ApprovalRegistry::default(),
+                false, // not headless — presence has interactive UI
             )
             .await
         } else {
@@ -3285,7 +2903,7 @@ async fn run_with_presence(
                 task_provider,
                 envelope.task,
                 task_project,
-                Some(bus.clone()),
+                bus.clone(),
                 autonomy.clone(),
                 session_log.clone(),
             )
@@ -3318,7 +2936,7 @@ async fn run_with_presence(
 fn tail_orchestrator_log(
     log_path: &Path,
     offset: u64,
-    bus: &Option<EventBus>,
+    bus: &EventBus,
     session_log: &SharedSessionLog,
 ) -> u64 {
     use std::io::{BufRead, Seek, SeekFrom};
@@ -3416,10 +3034,10 @@ fn tail_orchestrator_log(
             l.debug(&prefixed);
         });
 
-        emit(bus, || AppEvent::OrchestratorLog {
+        bus.send(AppEvent::OrchestratorLog {
             message: prefixed.clone(),
             level: tui_level,
-        }, || {});
+        });
     }
     new_offset
 }
@@ -3428,22 +3046,18 @@ async fn run_user_mode(
     _provider: Box<dyn provider::ChatProvider>,
     task: String,
     project: Project,
-    bus: Option<EventBus>,
+    bus: EventBus,
     _autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
 ) -> Result<LoopStats, CallerError> {
     slog(&session_log, |l| {
         l.info("Mode: user (orchestrator subprocess)");
     });
-    emit(
-        &bus,
-        || AppEvent::OrchestratorProgress {
-            turn: 0,
-            status: "spawning".to_string(),
-            last_action: String::new(),
-        },
-        || println!("Mode: user (spawning orchestrator subprocess)"),
-    );
+    bus.send(AppEvent::OrchestratorProgress {
+        turn: 0,
+        status: "spawning".to_string(),
+        last_action: String::new(),
+    });
 
     // Build orchestrator spec
     let caller_path = user_mode::get_caller_path();
@@ -3517,15 +3131,11 @@ async fn run_user_mode(
                         slog(&session_log, |l| {
                             l.info(&format!("Orchestrator progress: {}", user_msg));
                         });
-                        emit(
-                            &bus,
-                            || AppEvent::OrchestratorProgress {
-                                turn: progress.turn,
-                                status: progress.status.clone(),
-                                last_action: progress.last_action.clone(),
-                            },
-                            || println!("{}", user_msg),
-                        );
+                        bus.send(AppEvent::OrchestratorProgress {
+                            turn: progress.turn,
+                            status: progress.status.clone(),
+                            last_action: progress.last_action.clone(),
+                        });
                     }
                 }
 
@@ -3594,26 +3204,18 @@ async fn run_user_mode(
     slog(&session_log, |l| {
         l.debug(&format!("Task brief (orchestrator): {}", result.brief));
     });
-    emit(
-        &bus,
-        || AppEvent::SubAgentResult {
-            formatted: result_msg.clone(),
-        },
-        || println!("{}", result_msg),
-    );
+    bus.send(AppEvent::SubAgentResult {
+        formatted: result_msg.clone(),
+    });
 
     let reason = match &result.status {
         sub_agent::SubAgentStatus::Completed => "Task complete".to_string(),
         sub_agent::SubAgentStatus::Failed(reason) => format!("Orchestrator failed: {}", reason),
     };
-    emit(
-        &bus,
-        || AppEvent::TaskComplete {
-            reason: reason.clone(),
-            summary: Some(result.brief.clone()),
-        },
-        || println!("--- {} ---", reason),
-    );
+    bus.send(AppEvent::TaskComplete {
+        reason: reason.clone(),
+        summary: Some(result.brief.clone()),
+    });
 
     Ok(loop_stats)
 }
@@ -3622,7 +3224,7 @@ async fn run_direct_mode(
     provider: Box<dyn provider::ChatProvider>,
     task: String,
     project: Project,
-    bus: Option<EventBus>,
+    bus: EventBus,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
     log_dir: PathBuf,
@@ -3630,6 +3232,7 @@ async fn run_direct_mode(
     follow_up_rx: FollowUpReceiver,
     json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
+    headless: bool,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -3645,7 +3248,7 @@ async fn run_direct_mode(
             provider.context_window()
         ));
     });
-    if bus.is_none() {
+    if headless {
         println!(
             "Provider: {} (context window: {})",
             provider.name(),
@@ -3692,7 +3295,7 @@ async fn run_direct_mode(
         tools::register_extra_tools(mgr.all_tools());
     }
 
-    if bus.is_none() {
+    if headless {
         println!("Task: {}", task);
         println!("---");
     }
@@ -3702,7 +3305,7 @@ async fn run_direct_mode(
         &mut conversation,
         &project,
         None,
-        bus,
+        &bus,
         autonomy,
         session_log,
         &log_dir,
@@ -3710,6 +3313,7 @@ async fn run_direct_mode(
         follow_up_rx,
         json_approval.as_ref(),
         &approval_registry,
+        headless,
     )
     .await
 }
@@ -3843,9 +3447,6 @@ async fn main() -> Result<(), CallerError> {
 
     // Override env vars from CLI flags before provider selection
     let flags = parse_cli_flags()?;
-    if flags.json_output {
-        JSON_OUTPUT.store(true, Ordering::Relaxed);
-    }
     if let Some(ref p) = flags.provider {
         env::set_var("PROVIDER", p);
     }
@@ -4020,14 +3621,31 @@ async fn main() -> Result<(), CallerError> {
             None
         };
 
+        // Outbound event broadcast channel — shared by control socket, web gateway,
+        // and the outbound broadcaster.  If control socket is active, reuse its
+        // channel; otherwise create a standalone one when web or broadcaster needs it.
+        let outbound_tx = if let Some(ref tx) = mcp_control_tx {
+            tx.clone()
+        } else if flags.web {
+            let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
+            tx
+        } else {
+            // No control socket, no web — create a channel anyway so the
+            // outbound broadcaster can still run (receivers just drop events).
+            let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
+            tx
+        };
+
+        // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
+        // shared broadcast channel.
+        let _outbound_broadcaster = event::spawn_outbound_broadcaster(
+            bus.subscribe(),
+            outbound_tx.clone(),
+        );
+
         // Web gateway (WebSocket)
         let _web_handle = if flags.web {
-            let broadcast_tx = if let Some(ref tx) = mcp_control_tx {
-                tx.clone()
-            } else {
-                let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
-                tx
-            };
+            let broadcast_tx = outbound_tx.clone();
             let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
                 if project.config.transcription.enabled {
                     match transcription::WhisperTranscriber::new(&project.config.transcription) {
@@ -4173,7 +3791,7 @@ async fn main() -> Result<(), CallerError> {
                             provider,
                             task_str,
                             project,
-                            Some(bus_clone.clone()),
+                            bus_clone.clone(),
                             autonomy,
                             session_log,
                         )
@@ -4183,7 +3801,7 @@ async fn main() -> Result<(), CallerError> {
                             provider,
                             task_str,
                             project,
-                            Some(bus_clone.clone()),
+                            bus_clone.clone(),
                             autonomy,
                             session_log,
                             log_dir,
@@ -4191,6 +3809,7 @@ async fn main() -> Result<(), CallerError> {
                             follow_up_rx,
                             None, // no JSON approval in MCP mode
                             approval_registry,
+                            false, // not headless — MCP has interactive approval
                         )
                         .await
                     };
@@ -4337,6 +3956,14 @@ async fn main() -> Result<(), CallerError> {
                 tx
             };
             Some(tx)
+        } else {
+            None
+        };
+
+        // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
+        // shared broadcast channel (control socket / web gateway).
+        let _outbound_broadcaster = if let Some(ref tx) = app.control_tx {
+            Some(event::spawn_outbound_broadcaster(bus.subscribe(), tx.clone()))
         } else {
             None
         };
@@ -4579,7 +4206,7 @@ async fn main() -> Result<(), CallerError> {
                         provider,
                         task_str,
                         project,
-                        Some(bus_clone.clone()),
+                        bus_clone.clone(),
                         autonomy_clone,
                         session_log_clone,
                         log_dir_clone,
@@ -4587,6 +4214,7 @@ async fn main() -> Result<(), CallerError> {
                         follow_up_rx,
                         None, // no JSON approval in TUI mode
                         approval_registry_clone,
+                        false, // not headless — TUI handles approval
                     )
                     .await
                 } else {
@@ -4594,7 +4222,7 @@ async fn main() -> Result<(), CallerError> {
                         provider,
                         task_str,
                         project,
-                        Some(bus_clone.clone()),
+                        bus_clone.clone(),
                         autonomy_clone,
                         session_log_clone,
                     )
@@ -4663,11 +4291,33 @@ async fn main() -> Result<(), CallerError> {
         let task = task.unwrap();
 
         // Headless mode (--no-tui or non-TTY)
+        let bus = EventBus::new();
 
-        // Web gateway in headless mode needs an EventBus + broadcast channel
-        let headless_bus = if flags.web {
-            let bus = EventBus::new();
-            let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+        // Outbound broadcast channel — shared by web gateway and JSON stdout subscriber
+        let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+
+        // Wire outbound broadcaster: converts AppEvents to OutboundEvents
+        let _outbound_broadcaster = event::spawn_outbound_broadcaster(
+            bus.subscribe(),
+            outbound_tx.clone(),
+        );
+
+        // JSON stdout subscriber: prints OutboundEvents as JSONL to stdout
+        if flags.json_output {
+            let mut json_rx = outbound_tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match json_rx.recv().await {
+                        Ok(line) => { println!("{}", line); }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
+        // Web gateway in headless mode
+        if flags.web {
             let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
                 if project.config.transcription.enabled {
                     match transcription::WhisperTranscriber::new(&project.config.transcription) {
@@ -4688,7 +4338,7 @@ async fn main() -> Result<(), CallerError> {
             let _web_handle = web_gateway::spawn_web_gateway(
                 flags.web_port,
                 bus.clone(),
-                broadcast_tx,
+                outbound_tx.clone(),
                 config,
                 None, // Headless mode: no presence query context
                 transcriber,
@@ -4698,10 +4348,7 @@ async fn main() -> Result<(), CallerError> {
                 "Web TUI: http://0.0.0.0:{}",
                 flags.web_port
             );
-            Some(bus)
-        } else {
-            None
-        };
+        }
 
         let mcp_mgr = if !project.config.mcp_servers.is_empty() {
             Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
@@ -4793,7 +4440,7 @@ async fn main() -> Result<(), CallerError> {
                 provider,
                 task.clone(),
                 project,
-                headless_bus,
+                bus,
                 autonomy,
                 session_log.clone(),
                 log_dir,
@@ -4801,6 +4448,7 @@ async fn main() -> Result<(), CallerError> {
                 follow_up_rx,
                 json_approval_slot,
                 event::ApprovalRegistry::default(),
+                true, // headless mode
             )
             .await
         } else {
@@ -4808,7 +4456,7 @@ async fn main() -> Result<(), CallerError> {
                 provider,
                 task.clone(),
                 project,
-                None,
+                EventBus::new(), // user_mode spawns orchestrator subprocess
                 autonomy,
                 session_log.clone(),
             )

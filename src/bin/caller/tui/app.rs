@@ -1305,7 +1305,6 @@ impl App {
                 self.turn = turn;
                 self.budget_pct = budget_pct;
                 self.current_phase = Phase::Thinking;
-                self.broadcast_control(OutboundEvent::TurnStarted { turn, budget_pct });
                 self.log_sourced(
                     LogLevel::Detail,
                     format!("Turn {} started ({:.0}% budget)", turn, budget_pct),
@@ -1322,7 +1321,6 @@ impl App {
                 self.turn = turn;
                 self.session_tokens += usage.total_tokens;
                 self.streaming_buffer.clear();
-                self.broadcast_usage_update();
                 // Show human-readable command summary at Model level (visible at Normal verbosity)
                 let summary = format_model_summary(&content);
                 self.log_sourced(
@@ -1331,12 +1329,6 @@ impl App {
                     LogSource::Agent,
                     Some(turn),
                 );
-                // Broadcast model summary to web UI / control socket
-                self.broadcast_control(OutboundEvent::ModelSummary {
-                    turn,
-                    summary: summary.clone(),
-                    reasoning_summary: reasoning.clone(),
-                });
                 if let Some(ref reasoning_text) = reasoning {
                     self.log_sourced(
                         LogLevel::Model,
@@ -1399,10 +1391,6 @@ impl App {
                 );
             }
             AppEvent::AgentOutput { stdout, stderr } => {
-                self.broadcast_control(OutboundEvent::AgentOutput {
-                    stdout: stdout.clone(),
-                    stderr: stderr.clone(),
-                });
                 let t = self.turn;
                 let turn_opt = if t > 0 { Some(t) } else { None };
                 if !stdout.is_empty() {
@@ -1457,10 +1445,6 @@ impl App {
             }
             AppEvent::TaskComplete { reason, summary } => {
                 self.current_phase = Phase::Done;
-                self.broadcast_control(OutboundEvent::TaskComplete {
-                    reason: reason.clone(),
-                    summary: summary.clone(),
-                });
                 self.log(LogLevel::Info, format!("--- {} ---", reason));
                 if let Some(ref brief) = summary {
                     self.log(LogLevel::Detail, format!("Task brief: {}", brief));
@@ -1520,9 +1504,6 @@ impl App {
                 self.human_question = Some(question.clone());
                 self.current_phase = Phase::WaitingHuman;
                 self.mode = AppMode::AskHuman;
-                self.broadcast_control(OutboundEvent::AskHuman {
-                    question: question.clone(),
-                });
                 let mut textarea = tui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.human_textarea = Some(textarea);
@@ -1554,10 +1535,6 @@ impl App {
                     LogSource::Agent,
                     if t > 0 { Some(t) } else { None },
                 );
-                self.broadcast_control(OutboundEvent::ApprovalRequired {
-                    id,
-                    command: command_preview,
-                });
             }
             AppEvent::ControlCommand(msg) => {
                 self.handle_control_command(msg);
@@ -1578,10 +1555,6 @@ impl App {
                 self.round = round;
                 self.current_phase = Phase::WaitingFollowUp;
                 self.mode = AppMode::FollowUp;
-                self.broadcast_control(OutboundEvent::RoundComplete {
-                    round,
-                    turns_in_round,
-                });
                 let mut textarea = tui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.follow_up_textarea = Some(textarea);
@@ -1609,10 +1582,6 @@ impl App {
                     format!("Display :{} ready", display_id)
                 };
                 self.log(LogLevel::Detail, log_msg);
-                self.broadcast_control(OutboundEvent::DisplayReady {
-                    display_id,
-                    vnc_port,
-                });
             }
             AppEvent::SessionDirChanged { .. } => {
                 // Only relevant for MCP mode; TUI ignores this.
@@ -1631,7 +1600,6 @@ impl App {
                     self.presence_provider_name = Some(provider);
                     self.presence_model_name = Some(model);
                 }
-                self.broadcast_usage_update();
             }
             AppEvent::PresenceReady => {
                 // Switch to follow-up mode so the user can respond to presence,
@@ -1782,11 +1750,6 @@ impl App {
                 // Log at Info level — no turn grouping so user speech is never
                 // collapsed inside a voice model response.
                 self.log_sourced(LogLevel::Info, format!("[You] {}", text), LogSource::Live, None);
-                // Broadcast as outbound event
-                self.broadcast_control(OutboundEvent::UserTranscript {
-                    text: text.clone(),
-                    seq,
-                });
             }
             AppEvent::Tick => {
                 self.tick_count += 1;
