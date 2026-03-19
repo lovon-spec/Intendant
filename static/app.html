@@ -750,25 +750,30 @@ html, body {
 // ── Pricing table (USD per token) ──
 // cached = price for tokens served from prompt cache (subset of input)
 const PRICING = {
-  // OpenAI (cached = 50% of input)
-  'gpt-5':            { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
-  'gpt-5.2-codex':    { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
+  // OpenAI (cached = 50% of input unless noted)
+  'gpt-5.4':          { input: 2.5e-6, cached: 1.25e-6, output: 15.0e-6 },
+  'gpt-5.4-mini':     { input: 0.5e-6, cached: 0.25e-6, output: 3.0e-6 },
+  'gpt-5.4-nano':     { input: 0.15e-6, cached: 0.075e-6, output: 0.6e-6 },
+  'gpt-5.2-codex':    { input: 1.75e-6, cached: 0.175e-6, output: 7.0e-6 },
+  'gpt-5':            { input: 1.25e-6, cached: 0.625e-6, output: 10.0e-6 },
+  'gpt-5-mini':       { input: 0.25e-6, cached: 0.125e-6, output: 2.0e-6 },
   'gpt-4.1':          { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
   'gpt-4.1-mini':     { input: 0.4e-6, cached: 0.2e-6, output: 1.6e-6 },
   'gpt-4.1-nano':     { input: 0.1e-6, cached: 0.05e-6, output: 0.4e-6 },
   'o3':               { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
-  'o3-pro':           { input: 20.0e-6, cached: 10.0e-6, output: 80.0e-6 },
+  'o3-pro':           { input: 150.0e-6, cached: 75.0e-6, output: 600.0e-6 },
   'o4-mini':          { input: 1.1e-6, cached: 0.55e-6, output: 4.4e-6 },
   // Anthropic (cached = 10% of input)
-  'claude-opus-4-6':              { input: 15.0e-6, cached: 1.5e-6, output: 75.0e-6 },
+  'claude-opus-4-6':              { input: 5.0e-6, cached: 0.5e-6, output: 25.0e-6 },
   'claude-sonnet-4-6':            { input: 3.0e-6, cached: 0.3e-6, output: 15.0e-6 },
   'claude-sonnet-4-5-20250929':   { input: 3.0e-6, cached: 0.3e-6, output: 15.0e-6 },
   'claude-opus-4-5-20250929':     { input: 15.0e-6, cached: 1.5e-6, output: 75.0e-6 },
-  'claude-haiku-4-5':             { input: 0.8e-6, cached: 0.08e-6, output: 4.0e-6 },
-  // Gemini (cached = 25% of input)
-  'gemini-2.5-pro':   { input: 1.25e-6, cached: 0.3125e-6, output: 10.0e-6 },
-  'gemini-2.5-flash': { input: 0.15e-6, cached: 0.0375e-6, output: 0.6e-6 },
-  'gemini-2.0-flash': { input: 0.1e-6, cached: 0.025e-6, output: 0.4e-6 },
+  'claude-haiku-4-5':             { input: 0.25e-6, cached: 0.025e-6, output: 1.25e-6 },
+  // Gemini (cached = ~10% of input)
+  'gemini-2.5-pro':       { input: 1.25e-6, cached: 0.125e-6, output: 10.0e-6 },
+  'gemini-2.5-flash':     { input: 0.3e-6, cached: 0.03e-6, output: 2.5e-6 },
+  'gemini-2.5-flash-lite': { input: 0.1e-6, cached: 0.01e-6, output: 0.4e-6 },
+  'gemini-2.0-flash':     { input: 0.1e-6, cached: 0.01e-6, output: 0.4e-6 },
 };
 
 // ── Spinner ──
