@@ -34,8 +34,20 @@ Always start `x11vnc` so the human can follow along via VNC on port 5950.
 
 ```bash
 # 1. Kill stale processes from prior runs
-pkill -f 'Xvfb :50' 2>/dev/null; pkill -f 'x11vnc.*:50' 2>/dev/null
-pkill -f 'intendant.*web' 2>/dev/null; pkill -f 'firefox' 2>/dev/null
+# IMPORTANT: Run each pkill as a SEPARATE Bash tool call and verify with pgrep.
+# Chaining pkill with ; can fail silently (exit codes abort the chain).
+# Old Firefox processes are especially dangerous — they hold API keys in
+# localStorage and auto-connect voice, stealing the active slot.
+pkill -f 'Xvfb :50' 2>/dev/null; echo "done"
+# then separately:
+pkill -f 'x11vnc.*:50' 2>/dev/null; echo "done"
+# then separately:
+pkill -f firefox 2>/dev/null; echo "done"
+# then separately:
+pkill -f intendant 2>/dev/null; echo "done"
+# then VERIFY all dead:
+pgrep -c firefox 2>/dev/null || echo "0 firefox"
+pgrep -c intendant 2>/dev/null || echo "0 intendant"
 sleep 0.5
 # NOTE: Use `pkill -f` (not `killall`) — the binary is `firefox-esr` on Debian.
 
