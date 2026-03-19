@@ -1037,6 +1037,67 @@ function handleEvent(msg) {
       addLogEntry('presence', `[voice] ${msg.text}`);
       break;
 
+    case 'model_response_delta':
+      // Streaming text delta — could be used for live display
+      break;
+
+    case 'model_response':
+      addLogEntry('model', `T${msg.turn}: ${msg.summary}`);
+      if (msg.reasoning_summary) addLogEntry('detail', `Reasoning: ${msg.reasoning_summary}`);
+      break;
+
+    case 'agent_started':
+      addLogEntry('detail', `Running (T${msg.turn}): ${msg.commands_preview}`);
+      setPhase('running');
+      break;
+
+    case 'done_signal':
+      if (msg.message) addLogEntry('info', msg.message);
+      setPhase('done');
+      break;
+
+    case 'auto_approved':
+      addLogEntry('detail', `Auto-approved: ${msg.preview}`);
+      break;
+
+    case 'context_management':
+      addLogEntry('detail', `Context compacted (turn ${msg.turn})`);
+      break;
+
+    case 'budget_warning':
+      addLogEntry('warn', `Budget warning: ${msg.pct.toFixed(0)}% used (${msg.remaining.toLocaleString()} remaining)`);
+      updateBudget(msg.pct);
+      break;
+
+    case 'budget_exhausted':
+      addLogEntry('error', `Budget exhausted (${msg.remaining.toLocaleString()} remaining)`);
+      updateBudget(100);
+      setPhase('done');
+      break;
+
+    case 'loop_error':
+      addLogEntry('error', msg.message);
+      setPhase('done');
+      break;
+
+    case 'sub_agent_result':
+      addLogEntry('subagent', msg.summary);
+      break;
+
+    case 'orchestrator_progress':
+      addLogEntry('subagent', msg.status);
+      setPhase('orchestrating');
+      break;
+
+    case 'human_response_sent':
+      addLogEntry('detail', 'Human response sent');
+      break;
+
+    case 'safety_cap_reached':
+      addLogEntry('error', 'Safety cap reached');
+      setPhase('done');
+      break;
+
     default:
       // Unknown events logged at debug level
       addLogEntry('debug', `[${msg.event}] ${JSON.stringify(msg)}`);

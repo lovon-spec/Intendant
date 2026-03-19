@@ -14,8 +14,6 @@ use crossterm::{
 use crate::event::AppEvent;
 use ratatui::prelude::*;
 use std::io;
-use tokio::sync::mpsc;
-
 /// Manages the terminal state and rendering.
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,

@@ -662,14 +662,6 @@ impl App {
         })
     }
 
-    /// Broadcast a usage update to all connected control socket clients.
-    fn broadcast_usage_update(&self) {
-        self.broadcast_control(OutboundEvent::UsageUpdate {
-            main: self.main_usage_snapshot(),
-            presence: self.presence_usage_snapshot(),
-        });
-    }
-
     /// Forward a filtered event to the presence layer (non-blocking).
     ///
     /// Delegates to `presence::filter_event()` which provides stateful phase

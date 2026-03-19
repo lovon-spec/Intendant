@@ -11,7 +11,7 @@ use crossterm::event::KeyEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+
 
 /// Shared registry for pending approval responders.
 ///
@@ -887,5 +887,119 @@ mod tests {
             }
             _ => panic!("expected RecallMemory"),
         }
+    }
+
+    // --- app_event_to_outbound tests ---
+
+    #[test]
+    fn outbound_turn_started() {
+        let event = AppEvent::TurnStarted {
+            turn: 5,
+            budget_pct: 42.0,
+            remaining: 100_000,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"turn_started\""));
+        assert!(json.contains("\"turn\":5"));
+    }
+
+    #[test]
+    fn outbound_done_signal() {
+        let event = AppEvent::DoneSignal {
+            message: Some("All done".to_string()),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"done_signal\""));
+        assert!(json.contains("\"All done\""));
+    }
+
+    #[test]
+    fn outbound_skips_tick() {
+        assert!(app_event_to_outbound(&AppEvent::Tick).is_none());
+    }
+
+    #[test]
+    fn outbound_skips_key() {
+        let event = AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app_event_to_outbound(&event).is_none());
+    }
+
+    #[test]
+    fn outbound_agent_output() {
+        let event = AppEvent::AgentOutput {
+            stdout: "hello".to_string(),
+            stderr: "".to_string(),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"agent_output\""));
+        assert!(json.contains("\"hello\""));
+    }
+
+    #[test]
+    fn outbound_approval_required() {
+        let event = AppEvent::ApprovalRequired {
+            id: 42,
+            command_preview: "rm -rf /tmp".to_string(),
+            category: crate::autonomy::ActionCategory::Destructive,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"approval_required\""));
+        assert!(json.contains("\"id\":42"));
+    }
+
+    #[test]
+    fn outbound_budget_warning() {
+        let event = AppEvent::BudgetWarning {
+            pct: 85.0,
+            remaining: 10_000,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"budget_warning\""));
+    }
+
+    #[test]
+    fn outbound_model_response_delta() {
+        let event = AppEvent::ModelResponseDelta {
+            text: "hello".to_string(),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"model_response_delta\""));
+    }
+
+    #[test]
+    fn outbound_auto_approved() {
+        let event = AppEvent::AutoApproved {
+            preview: "exec: ls".to_string(),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"auto_approved\""));
+    }
+
+    #[test]
+    fn outbound_broadcast_multiple_subscribers() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let mut rx1 = bus.subscribe();
+            let mut rx2 = bus.subscribe();
+            bus.send(AppEvent::Tick);
+
+            // Both subscribers should receive the event
+            assert!(matches!(rx1.recv().await, Ok(AppEvent::Tick)));
+            assert!(matches!(rx2.recv().await, Ok(AppEvent::Tick)));
+        });
     }
 }
