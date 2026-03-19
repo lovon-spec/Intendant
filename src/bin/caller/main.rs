@@ -1584,6 +1584,7 @@ async fn run_agent_loop(
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
     context_injection: &event::ContextInjectionQueue,
+    mut xvfb_guard: &mut Option<vision::XvfbGuard>,
     // When true, askHuman is unavailable and approvals without a json_approval
     // slot are auto-denied (headless non-JSON mode).
     headless: bool,
@@ -1593,7 +1594,6 @@ async fn run_agent_loop(
     let mut loop_stats = LoopStats::default();
     let mut seen_sub_agent_results: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    let mut xvfb_guard: Option<vision::XvfbGuard> = None;
     let mut exit_reason = LoopExitReason::TaskComplete;
 
     for turn in 1..=SAFETY_CAP {
@@ -2484,6 +2484,7 @@ async fn run_round_loop(
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
     let mut cumulative_stats = LoopStats::default();
+    let mut xvfb_guard: Option<vision::XvfbGuard> = None;
 
     loop {
         let (stats, exit_reason) = run_agent_loop(
@@ -2499,6 +2500,7 @@ async fn run_round_loop(
             json_approval,
             approval_registry,
             context_injection,
+            &mut xvfb_guard,
             headless,
         )
         .await?;
@@ -2675,6 +2677,7 @@ All relative paths and commands execute from this directory.",
         None, // no JSON approval for sub-agents
         &sub_agent_registry,
         &event::ContextInjectionQueue::default(),
+        &mut None, // sub-agents get their own display if needed
         true, // headless (sub-agents have no interactive UI)
     )
     .await;
