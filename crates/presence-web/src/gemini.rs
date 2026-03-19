@@ -117,6 +117,11 @@ impl GeminiProvider {
         // BidiGenerateContentConstrained sends binary (ArrayBuffer) frames,
         // while BidiGenerateContent sends text frames. Handle both.
         let callbacks = self.callbacks.clone();
+        // Per-turn counters for hallucination detection diagnostics.
+        let turn_tool_calls = Rc::new(Cell::new(0u32));
+        let turn_has_speech = Rc::new(Cell::new(false));
+        let turn_tool_calls_inner = turn_tool_calls.clone();
+        let turn_has_speech_inner = turn_has_speech.clone();
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             let text = if let Some(s) = e.data().as_string() {
                 Some(s)
@@ -129,7 +134,10 @@ impl GeminiProvider {
             };
             if let Some(text) = text {
                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
-                    Self::handle_message_static(&callbacks, &msg);
+                    Self::handle_message_static(
+                        &callbacks, &msg,
+                        &turn_tool_calls_inner, &turn_has_speech_inner,
+                    );
                 }
             }
         }) as Box<dyn FnMut(MessageEvent)>);
@@ -213,7 +221,12 @@ impl GeminiProvider {
         setup.to_string()
     }
 
-    fn handle_message_static(callbacks: &Callbacks, msg: &serde_json::Value) {
+    fn handle_message_static(
+        callbacks: &Callbacks,
+        msg: &serde_json::Value,
+        turn_tool_calls: &Cell<u32>,
+        turn_has_speech: &Cell<bool>,
+    ) {
         // setupComplete
         if msg.get("setupComplete").is_some() {
             callbacks.invoke_diagnostic("gemini_msg", "setupComplete");
@@ -224,6 +237,7 @@ impl GeminiProvider {
         // toolCall
         if let Some(tool_call) = msg.get("toolCall") {
             if let Some(fcs) = tool_call.get("functionCalls").and_then(|v| v.as_array()) {
+                turn_tool_calls.set(turn_tool_calls.get() + fcs.len() as u32);
                 let names: Vec<&str> = fcs.iter()
                     .filter_map(|fc| fc.get("name").and_then(|v| v.as_str()))
                     .collect();
@@ -248,13 +262,28 @@ impl GeminiProvider {
             if let Some(transcript) = response.get("outputTranscription") {
                 if let Some(text) = transcript.get("text").and_then(|v| v.as_str()) {
                     if !text.is_empty() {
+                        turn_has_speech.set(true);
                         callbacks.invoke_voice_transcript(text);
                     }
                 }
                 return;
             }
             if response.get("turnComplete").is_some() {
-                callbacks.invoke_diagnostic("gemini_msg", "turnComplete");
+                let tools = turn_tool_calls.get();
+                let spoke = turn_has_speech.get();
+                if spoke && tools == 0 {
+                    callbacks.invoke_diagnostic(
+                        "no_tool_turn",
+                        "Model spoke without calling any tool — possible hallucination",
+                    );
+                }
+                callbacks.invoke_diagnostic(
+                    "gemini_msg",
+                    &format!("turnComplete (tools={}, spoke={})", tools, spoke),
+                );
+                // Reset for next turn
+                turn_tool_calls.set(0);
+                turn_has_speech.set(false);
                 return;
             }
             if response.get("interrupted").is_some() {
@@ -288,6 +317,7 @@ impl GeminiProvider {
                         // Function call in model turn
                         if part.get("functionCall").is_some() {
                             has_tool = true;
+                            turn_tool_calls.set(turn_tool_calls.get() + 1);
                             let call_js = to_js_object(part.get("functionCall").unwrap());
                             callbacks.invoke_voice_tool_call(&call_js);
                         }
