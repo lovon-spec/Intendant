@@ -1297,6 +1297,27 @@ impl App {
                     data: None,
                 });
             }
+            ControlMsg::TakeDisplay { display_id } => {
+                self.log(
+                    LogLevel::Warn,
+                    format!("User has taken manual control of display :{}", display_id),
+                );
+                self.broadcast_control(OutboundEvent::DisplayTaken { display_id });
+            }
+            ControlMsg::ReleaseDisplay { display_id, note } => {
+                let msg = format!(
+                    "User released control of display :{}{}",
+                    display_id,
+                    note.as_ref()
+                        .map(|n| format!(". Note: {}", n))
+                        .unwrap_or_default()
+                );
+                self.log(LogLevel::Info, msg);
+                self.broadcast_control(OutboundEvent::DisplayReleased {
+                    display_id,
+                    note,
+                });
+            }
             ControlMsg::Quit => {
                 self.should_quit = true;
             }
@@ -1604,6 +1625,22 @@ impl App {
                     format!("Display :{} ready", display_id)
                 };
                 self.log(LogLevel::Detail, log_msg);
+            }
+            AppEvent::DisplayTaken { display_id } => {
+                self.log(
+                    LogLevel::Warn,
+                    format!("User has taken manual control of display :{}", display_id),
+                );
+            }
+            AppEvent::DisplayReleased { display_id, note } => {
+                let msg = format!(
+                    "User released control of display :{}{}",
+                    display_id,
+                    note.as_ref()
+                        .map(|n| format!(". Note: {}", n))
+                        .unwrap_or_default()
+                );
+                self.log(LogLevel::Info, msg);
             }
             AppEvent::SessionDirChanged { .. } => {
                 // Only relevant for MCP mode; TUI ignores this.

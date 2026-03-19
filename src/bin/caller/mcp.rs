@@ -1599,6 +1599,16 @@ async fn handle_control_command_mcp(
             );
             None
         }
+        ControlMsg::TakeDisplay { display_id } => {
+            bus.send(AppEvent::DisplayTaken { display_id });
+            emit_control_result(control_tx, "take_display", true, format!("Took control of :{}", display_id), None);
+            Some(RESOURCE_LOGS_URI)
+        }
+        ControlMsg::ReleaseDisplay { display_id, note } => {
+            bus.send(AppEvent::DisplayReleased { display_id, note: note.clone() });
+            emit_control_result(control_tx, "release_display", true, format!("Released control of :{}", display_id), None);
+            Some(RESOURCE_LOGS_URI)
+        }
         ControlMsg::Quit => {
             let action = UserAction::Quit;
             let mut s = state.write().await;
@@ -1896,6 +1906,29 @@ pub fn spawn_event_listener(
                             format!("Display :{}", display_id)
                         };
                         s.push_log(LogLevel::Detail, info);
+                        resource_changed = Some("intendant://logs");
+                    }
+
+                    AppEvent::DisplayTaken { display_id } => {
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("User took control of display :{}", display_id),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
+
+                    AppEvent::DisplayReleased {
+                        display_id,
+                        ref note,
+                    } => {
+                        let msg = format!(
+                            "User released control of display :{}{}",
+                            display_id,
+                            note.as_ref()
+                                .map(|n| format!(". Note: {}", n))
+                                .unwrap_or_default()
+                        );
+                        s.push_log(LogLevel::Info, msg);
                         resource_changed = Some("intendant://logs");
                     }
 

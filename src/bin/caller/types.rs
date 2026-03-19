@@ -134,6 +134,14 @@ pub enum OutboundEvent {
         display_id: u32,
         vnc_port: Option<u32>,
     },
+    DisplayTaken {
+        display_id: u32,
+    },
+    DisplayReleased {
+        display_id: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     Status {
         turn: usize,
         phase: String,

@@ -287,6 +287,101 @@ fn asset_version_hash() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Bidirectional proxy: WebSocket (noVNC) ↔ TCP (x11vnc RFB).
+///
+/// noVNC sends/receives VNC protocol data as WebSocket binary frames.
+/// This function accepts the WebSocket handshake, connects to the local
+/// x11vnc TCP port, and forwards data in both directions until either
+/// side disconnects.
+async fn handle_vnc_proxy(stream: tokio::net::TcpStream, vnc_port: u32) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+        stream,
+        VncWsCallback,
+    )
+    .await
+    {
+        Ok(ws) => ws,
+        Err(_) => return,
+    };
+
+    let tcp = match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", vnc_port)).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+    // WS → TCP: binary frames from noVNC to x11vnc
+    let ws_to_tcp = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            match msg {
+                Message::Binary(data) => {
+                    if tcp_write.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // TCP → WS: VNC data from x11vnc to noVNC as binary frames
+    let tcp_to_ws = tokio::spawn(async move {
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = match tcp_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if ws_tx
+                .send(Message::Binary(buf[..n].to_vec().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // When either direction closes, abort both
+    tokio::select! {
+        _ = ws_to_tcp => {}
+        _ = tcp_to_ws => {}
+    }
+}
+
+/// WebSocket handshake callback that adds the `Sec-WebSocket-Protocol: binary`
+/// header when the client requests it. noVNC requires this sub-protocol.
+struct VncWsCallback;
+
+impl tokio_tungstenite::tungstenite::handshake::server::Callback for VncWsCallback {
+    fn on_request(
+        self,
+        request: &tokio_tungstenite::tungstenite::http::Request<()>,
+        mut response: tokio_tungstenite::tungstenite::http::Response<()>,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::http::Response<()>,
+        tokio_tungstenite::tungstenite::http::Response<Option<String>>,
+    > {
+        // noVNC sends Sec-WebSocket-Protocol: binary
+        if let Some(proto) = request.headers().get("sec-websocket-protocol") {
+            if let Ok(s) = proto.to_str() {
+                if s.contains("binary") {
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        "binary".parse().unwrap(),
+                    );
+                }
+            }
+        }
+        Ok(response)
+    }
+}
+
 pub fn spawn_web_gateway(
     port: u16,
     bus: EventBus,
@@ -317,17 +412,30 @@ pub fn spawn_web_gateway(
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).
     let last_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache the latest VNC port from display_ready events for the /vnc proxy.
+    let last_vnc_port: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
     {
-        let cache = last_usage_json.clone();
+        let usage_cache = last_usage_json.clone();
+        let vnc_cache = last_vnc_port.clone();
         let mut usage_rx = broadcast_tx.subscribe();
         tokio::spawn(async move {
             loop {
                 match usage_rx.recv().await {
                     Ok(line) => {
+                        // Cache VNC port from display_ready events
+                        if line.contains("\"event\":\"display_ready\"") {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                                if let Some(port) = parsed.get("vnc_port").and_then(|v| v.as_u64()) {
+                                    if let Ok(mut guard) = vnc_cache.lock() {
+                                        *guard = Some(port as u32);
+                                    }
+                                }
+                            }
+                        }
                         if line.contains("\"event\":\"usage_update\"")
                             || line.contains("\"event\":\"usage\"")
                         {
-                            if let Ok(mut guard) = cache.lock() {
+                            if let Ok(mut guard) = usage_cache.lock() {
                                 *guard = Some(line);
                             }
                         }
@@ -370,6 +478,7 @@ pub fn spawn_web_gateway(
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let last_usage_json = last_usage_json.clone();
+            let last_vnc_port = last_vnc_port.clone();
             let web_tui_tx = web_tui_tx.clone();
 
             tokio::spawn(async move {
@@ -388,6 +497,26 @@ pub fn spawn_web_gateway(
                     .any(|l| l.to_lowercase().contains("upgrade: websocket"));
 
                 if is_websocket {
+                    // Detect /vnc path for VNC proxy before accepting
+                    let request_line = header_text.lines().next().unwrap_or("");
+                    let is_vnc_proxy = request_line.contains("/vnc");
+
+                    if is_vnc_proxy {
+                        // VNC WebSocket-to-TCP proxy
+                        let vnc_port = if let Some(port_str) = request_line.split("port=").nth(1) {
+                            port_str.split_whitespace().next()
+                                .and_then(|s| s.split('&').next())
+                                .and_then(|s| s.parse::<u32>().ok())
+                        } else {
+                            None
+                        }.or_else(|| last_vnc_port.lock().ok().and_then(|g| *g));
+
+                        let Some(port) = vnc_port else { return };
+
+                        handle_vnc_proxy(stream, port).await;
+                        return;
+                    }
+
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
                         Err(_) => return,

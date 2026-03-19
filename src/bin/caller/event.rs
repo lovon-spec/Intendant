@@ -110,6 +110,15 @@ pub enum AppEvent {
         vnc_port: Option<u32>,
     },
 
+    // Display takeover
+    DisplayTaken {
+        display_id: u32,
+    },
+    DisplayReleased {
+        display_id: u32,
+        note: Option<String>,
+    },
+
     // Session directory changed (MCP per-task isolation)
     SessionDirChanged {
         path: std::path::PathBuf,
@@ -284,6 +293,14 @@ pub enum ControlMsg {
     FollowUp {
         text: String,
     },
+    TakeDisplay {
+        display_id: u32,
+    },
+    ReleaseDisplay {
+        display_id: u32,
+        #[serde(default)]
+        note: Option<String>,
+    },
     QueryDetail {
         scope: String,
         #[serde(default)]
@@ -401,6 +418,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             display_id: *display_id,
             vnc_port: *vnc_port,
         }),
+        AppEvent::DisplayTaken { display_id } => Some(OutboundEvent::DisplayTaken {
+            display_id: *display_id,
+        }),
+        AppEvent::DisplayReleased { display_id, note } => {
+            Some(OutboundEvent::DisplayReleased {
+                display_id: *display_id,
+                note: note.clone(),
+            })
+        }
         AppEvent::ContextManagement { turn } => Some(OutboundEvent::ContextManagement {
             turn: *turn,
         }),
@@ -779,6 +805,11 @@ mod tests {
                 keywords: Some(vec!["auth".to_string()]),
                 tags: None,
                 channel: Some("project_state".to_string()),
+            },
+            ControlMsg::TakeDisplay { display_id: 99 },
+            ControlMsg::ReleaseDisplay {
+                display_id: 99,
+                note: Some("done testing".to_string()),
             },
             ControlMsg::Usage,
             ControlMsg::Quit,
