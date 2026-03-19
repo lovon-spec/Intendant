@@ -660,8 +660,10 @@ pub fn spawn_web_gateway(
                                                                 let n = audio_buf.len() / 2;
                                                                 if n > 0 { (sum_sq / n as f64).sqrt() } else { 0.0 }
                                                             };
-                                                            if rms < 200.0 {
-                                                                // Near-silence — skip transcription
+                                                            if rms < 1000.0 {
+                                                                // Below speech threshold — skip transcription.
+                                                                // Whisper hallucinates aggressively on low-energy
+                                                                // audio ("Thank you", "Bye bye", etc).
                                                                 audio_buf.clear();
                                                                 continue;
                                                             }
