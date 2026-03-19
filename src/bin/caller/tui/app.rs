@@ -522,6 +522,9 @@ pub struct App {
     pub presence_provider_name: Option<String>,
     pub presence_model_name: Option<String>,
     pub presence_tokens: u64,
+    pub presence_prompt_tokens: u64,
+    pub presence_completion_tokens: u64,
+    pub presence_cached_tokens: u64,
     pub presence_usage_pct: f64,
     pub presence_context_window: u64,
 
@@ -598,6 +601,9 @@ impl App {
             presence_provider_name: None,
             presence_model_name: None,
             presence_tokens: 0,
+            presence_prompt_tokens: 0,
+            presence_completion_tokens: 0,
+            presence_cached_tokens: 0,
             presence_usage_pct: 0.0,
             presence_context_window: 0,
             presence_event_tx: None,
@@ -667,9 +673,9 @@ impl App {
                 tokens_used: self.presence_tokens,
                 context_window: self.presence_context_window,
                 usage_pct: self.presence_usage_pct,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                cached_tokens: 0,
+                prompt_tokens: self.presence_prompt_tokens,
+                completion_tokens: self.presence_completion_tokens,
+                cached_tokens: self.presence_cached_tokens,
             }
         })
     }
@@ -1608,9 +1614,14 @@ impl App {
                 usage_pct,
                 provider,
                 model,
-                ..
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
             } => {
                 self.presence_tokens = total_tokens;
+                self.presence_prompt_tokens = prompt_tokens;
+                self.presence_completion_tokens = completion_tokens;
+                self.presence_cached_tokens = cached_tokens;
                 self.presence_context_window = context_window;
                 self.presence_usage_pct = usage_pct;
                 if self.presence_provider_name.is_none() {
