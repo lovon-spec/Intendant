@@ -650,7 +650,7 @@ impl PresenceWeb {
                 let cmd = evt_val["command"].as_str().unwrap_or("");
                 let id = &evt_val["id"];
                 Some(format!(
-                    "[System: approval needed] You want to run: \"{}\" (id: {}). Ask the user.",
+                    "[System: approval needed] Command: \"{}\" (id: {}). You MUST ask the user and wait for their explicit yes/no. Do NOT approve on your own.",
                     cmd, id
                 ))
             }
@@ -715,7 +715,7 @@ impl PresenceWeb {
             let id = &pa["id"];
             let cat = pa["category"].as_str().unwrap_or("");
             self.send_text(&format!(
-                "[System: approval needed] You want to run: \"{}\" (id: {}, category: {}). Ask the user if this is okay.",
+                "[System: approval needed] Command: \"{}\" (id: {}, category: {}). You MUST ask the user and wait for their explicit yes/no. Do NOT approve on your own.",
                 cmd, id, cat
             ));
             true
