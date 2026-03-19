@@ -118,6 +118,8 @@ struct CliFlags {
     /// --web [PORT]: Serve TUI via web (xterm.js + optional voice).
     web: bool,
     web_port: u16,
+    /// --transcription: Enable user speech transcription.
+    transcription: bool,
 }
 
 fn print_help() {
@@ -143,6 +145,7 @@ fn print_help() {
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]           Serve TUI via web (xterm.js + optional voice, default port: 8765)");
+    println!("    --transcription       Enable user speech transcription");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -188,6 +191,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         no_presence: false,
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
+        transcription: false,
     };
 
     let mut task_parts = Vec::new();
@@ -294,6 +298,10 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 } else {
                     i += 1;
                 }
+            }
+            "--transcription" => {
+                flags.transcription = true;
+                i += 1;
             }
             other => {
                 if other.starts_with('-') {
@@ -1204,6 +1212,7 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            transcription: false,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -1215,6 +1224,7 @@ Also: {"source": "bare"}"#;
         assert!(!flags.direct);
         assert!(!flags.no_presence);
         assert!(!flags.web);
+        assert!(!flags.transcription);
         assert_eq!(flags.web_port, 8765);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
     }
@@ -1239,6 +1249,7 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
+            transcription: false,
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, web_gateway::DEFAULT_PORT);
@@ -1264,6 +1275,7 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: 9000,
+            transcription: false,
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, 9000);
@@ -3815,7 +3827,7 @@ async fn main() -> Result<(), CallerError> {
 
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
     dotenvy::dotenv().ok();
-    let project = Project::detect()?;
+    let mut project = Project::detect()?;
     dotenvy::from_path(project.root.join(".env")).ok();
     if let Some(config_dir) = dirs::config_dir() {
         dotenvy::from_path(config_dir.join("intendant").join(".env")).ok();
@@ -3895,6 +3907,11 @@ async fn main() -> Result<(), CallerError> {
     };
 
     configure_sandbox_env(&flags, &project, &log_dir);
+
+    // CLI --transcription flag overrides config file setting
+    if flags.transcription {
+        project.config.transcription.enabled = true;
+    }
 
     // Install SIGTERM handler to mark session as interrupted before exit.
     // Rust's Drop trait does not run when the process is killed by a signal,
