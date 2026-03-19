@@ -485,6 +485,9 @@ pub struct App {
 
     // Token tracking
     pub session_tokens: u64,
+    pub session_prompt_tokens: u64,
+    pub session_completion_tokens: u64,
+    pub session_cached_tokens: u64,
     pub context_window: u64,
 
     // Session metadata
@@ -577,6 +580,9 @@ impl App {
             approval_registry: ApprovalRegistry::default(),
             log_dir,
             session_tokens: 0,
+            session_prompt_tokens: 0,
+            session_completion_tokens: 0,
+            session_cached_tokens: 0,
             context_window: 0,
             session_id: String::new(),
             task_description: String::new(),
@@ -646,6 +652,9 @@ impl App {
             tokens_used: self.session_tokens,
             context_window: self.context_window,
             usage_pct: self.budget_pct,
+            prompt_tokens: self.session_prompt_tokens,
+            completion_tokens: self.session_completion_tokens,
+            cached_tokens: self.session_cached_tokens,
         }
     }
 
@@ -658,6 +667,9 @@ impl App {
                 tokens_used: self.presence_tokens,
                 context_window: self.presence_context_window,
                 usage_pct: self.presence_usage_pct,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cached_tokens: 0,
             }
         })
     }
@@ -1312,6 +1324,9 @@ impl App {
             } => {
                 self.turn = turn;
                 self.session_tokens += usage.total_tokens;
+                self.session_prompt_tokens += usage.prompt_tokens;
+                self.session_completion_tokens += usage.completion_tokens;
+                self.session_cached_tokens += usage.cached_tokens;
                 self.streaming_buffer.clear();
                 // Show human-readable command summary at Model level (visible at Normal verbosity)
                 let summary = format_model_summary(&content);
@@ -2309,6 +2324,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+            ..Default::default()
             },
             reasoning: None,
         });
@@ -2496,6 +2512,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 total_tokens: 120,
+            ..Default::default()
             },
             reasoning: None,
         });

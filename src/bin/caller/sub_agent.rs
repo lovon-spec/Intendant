@@ -376,6 +376,7 @@ mod tests {
                 prompt_tokens: 1000,
                 completion_tokens: 500,
                 total_tokens: 1500,
+            ..Default::default()
             },
         };
         std::fs::write(&path, serde_json::to_string(&result).unwrap()).unwrap();
@@ -492,6 +493,7 @@ mod tests {
                 prompt_tokens: 1000,
                 completion_tokens: 500,
                 total_tokens: 1500,
+            ..Default::default()
             },
         };
         let msg = format_result_message(&result);
@@ -607,6 +609,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+            ..Default::default()
             },
         };
         let json = serde_json::to_string(&result).unwrap();
