@@ -748,22 +748,23 @@ html, body {
 'use strict';
 
 // ── Pricing table (USD per token) ──
+// cached = price for tokens served from prompt cache (subset of input)
 const PRICING = {
-  // OpenAI
-  'gpt-4.1':          { input: 2.0e-6, output: 8.0e-6 },
-  'gpt-4.1-mini':     { input: 0.4e-6, output: 1.6e-6 },
-  'gpt-4.1-nano':     { input: 0.1e-6, output: 0.4e-6 },
-  'gpt-5':            { input: 2.0e-6, output: 8.0e-6 },
-  'o3':               { input: 2.0e-6, output: 8.0e-6 },
-  'o4-mini':          { input: 1.1e-6, output: 4.4e-6 },
-  // Anthropic
-  'claude-sonnet-4-5-20250929': { input: 3.0e-6, output: 15.0e-6 },
-  'claude-opus-4-5-20250929':   { input: 15.0e-6, output: 75.0e-6 },
-  'claude-haiku-3-5':           { input: 0.8e-6, output: 4.0e-6 },
-  // Gemini
-  'gemini-2.5-pro':   { input: 1.25e-6, output: 10.0e-6 },
-  'gemini-2.5-flash': { input: 0.15e-6, output: 0.6e-6 },
-  'gemini-2.0-flash': { input: 0.1e-6, output: 0.4e-6 },
+  // OpenAI (cached = 50% of input)
+  'gpt-4.1':          { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
+  'gpt-4.1-mini':     { input: 0.4e-6, cached: 0.2e-6, output: 1.6e-6 },
+  'gpt-4.1-nano':     { input: 0.1e-6, cached: 0.05e-6, output: 0.4e-6 },
+  'gpt-5':            { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
+  'o3':               { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
+  'o4-mini':          { input: 1.1e-6, cached: 0.55e-6, output: 4.4e-6 },
+  // Anthropic (cached = 10% of input)
+  'claude-sonnet-4-5-20250929': { input: 3.0e-6, cached: 0.3e-6, output: 15.0e-6 },
+  'claude-opus-4-5-20250929':   { input: 15.0e-6, cached: 1.5e-6, output: 75.0e-6 },
+  'claude-haiku-3-5':           { input: 0.8e-6, cached: 0.08e-6, output: 4.0e-6 },
+  // Gemini (cached = 25% of input)
+  'gemini-2.5-pro':   { input: 1.25e-6, cached: 0.3125e-6, output: 10.0e-6 },
+  'gemini-2.5-flash': { input: 0.15e-6, cached: 0.0375e-6, output: 0.6e-6 },
+  'gemini-2.0-flash': { input: 0.1e-6, cached: 0.025e-6, output: 0.4e-6 },
 };
 
 // ── Spinner ──
@@ -1445,14 +1446,18 @@ function renderUsageTab() {
     const card = renderUsageCard(m.label, m.data);
     cardsEl.appendChild(card);
 
-    // Estimate cost
+    // Estimate cost using per-type pricing
     const pricing = findPricing(m.data.model);
     if (pricing) {
-      // Without prompt/completion breakdown, use blended rate
-      const blended = (pricing.input + pricing.output) / 2;
-      const cost = m.data.tokens_used * blended;
+      const prompt = m.data.prompt_tokens || 0;
+      const completion = m.data.completion_tokens || 0;
+      const cached = m.data.cached_tokens || 0;
+      const uncachedInput = prompt - cached;
+      const inputCost = uncachedInput * pricing.input + cached * (pricing.cached || pricing.input);
+      const outputCost = completion * pricing.output;
+      const cost = inputCost + outputCost;
       totalCost += cost;
-      costLines.push({ label: m.label, cost: cost, model: m.data.model });
+      costLines.push({ label: m.label, cost, inputCost, outputCost, model: m.data.model });
     }
   }
 
@@ -1463,6 +1468,10 @@ function renderUsageTab() {
     grid.innerHTML = '';
     for (const cl of costLines) {
       grid.innerHTML += `<span class="label">${cl.label}</span><span class="value">$${cl.cost.toFixed(4)}</span>`;
+      if (cl.inputCost !== undefined) {
+        grid.innerHTML += `<span class="label" style="padding-left:12px;font-size:11px">Input</span><span class="value" style="font-size:11px;font-weight:normal">$${cl.inputCost.toFixed(4)}</span>`;
+        grid.innerHTML += `<span class="label" style="padding-left:12px;font-size:11px">Output</span><span class="value" style="font-size:11px;font-weight:normal">$${cl.outputCost.toFixed(4)}</span>`;
+      }
     }
     if (costLines.length > 1) {
       grid.innerHTML += `<span class="label" style="font-weight:600;color:var(--text)">Total</span><span class="value">$${totalCost.toFixed(4)}</span>`;
@@ -1494,6 +1503,10 @@ function renderUsageCard(label, data) {
   card.className = 'usage-card';
 
   const color = budgetColor(data.usage_pct);
+  const prompt = data.prompt_tokens || 0;
+  const completion = data.completion_tokens || 0;
+  const cached = data.cached_tokens || 0;
+  const uncachedInput = prompt - cached;
 
   card.innerHTML = `
     <div class="card-title">${label}</div>
@@ -1511,12 +1524,16 @@ function renderUsageCard(label, data) {
       </div>
     </div>
     <div class="token-breakdown">
-      <span class="label">Total tokens</span>
-      <span class="value">${data.tokens_used.toLocaleString()}</span>
-      <span class="label">Context window</span>
-      <span class="value">${data.context_window.toLocaleString()}</span>
-      <span class="label">Remaining</span>
-      <span class="value">${(data.context_window - data.tokens_used).toLocaleString()}</span>
+      <span class="label">Input tokens</span>
+      <span class="value">${prompt.toLocaleString()}</span>
+      <span class="label" style="padding-left:12px">Cached</span>
+      <span class="value" style="color:var(--green)">${cached.toLocaleString()}${prompt > 0 ? ' (' + (cached / prompt * 100).toFixed(0) + '%)' : ''}</span>
+      <span class="label" style="padding-left:12px">Uncached</span>
+      <span class="value">${uncachedInput.toLocaleString()}</span>
+      <span class="label">Output tokens</span>
+      <span class="value">${completion.toLocaleString()}</span>
+      <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Remaining</span>
+      <span class="value" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${(data.context_window - data.tokens_used).toLocaleString()}</span>
     </div>
   `;
   return card;
