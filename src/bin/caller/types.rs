@@ -162,4 +162,10 @@ pub enum OutboundEvent {
         text: String,
         seq: u64,
     },
+    ModelSummary {
+        turn: usize,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_summary: Option<String>,
+    },
 }
