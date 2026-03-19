@@ -931,7 +931,7 @@ function loadNoVNC(cb) {
   script.type = 'module';
   // Create a shim that imports RFB and exposes it globally
   script.textContent = `
-    import RFB from 'https://cdn.jsdelivr.net/npm/@novnc/novnc@1.5.0/core/rfb.js';
+    import RFB from 'https://cdn.jsdelivr.net/gh/novnc/noVNC@v1.6.0/core/rfb.js';
     window.__noVNC_RFB = RFB;
     window.dispatchEvent(new Event('novnc-loaded'));
   `;
