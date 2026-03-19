@@ -231,6 +231,7 @@ html, body {
   text-align: center;
   font-size: 12px;
   padding-top: 2px;
+  position: relative;
 }
 .log-entry .log-ts {
   color: var(--overlay1);
@@ -254,15 +255,30 @@ html, body {
   word-break: break-word;
 }
 /* Collapsible long entries */
+.log-entry.collapsible {
+  cursor: pointer;
+}
+.log-entry.collapsible .log-icon {
+  color: var(--overlay0);
+}
+.log-entry.collapsible .log-icon::before {
+  content: '\25B8';  /* ▸ right-pointing triangle */
+  font-size: 10px;
+  position: absolute;
+  left: 3px;
+}
+.log-entry.collapsible.expanded .log-icon::before {
+  content: '\25BE';  /* ▾ down-pointing triangle */
+}
 .log-entry.collapsible .log-content {
   max-height: 1.5em;
   overflow: hidden;
-  cursor: pointer;
   position: relative;
 }
 .log-entry.collapsible .log-content::after {
-  content: ' ...';
+  content: ' \2026';  /* ellipsis */
   color: var(--overlay0);
+  font-style: italic;
 }
 .log-entry.collapsible.expanded .log-content {
   max-height: none;
