@@ -755,7 +755,7 @@ const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','�
 let spinnerIdx = 0;
 let spinnerInterval = null;
 
-// ── Log level symbols ──
+// ── Log level symbols + tooltips ──
 const LEVEL_ICONS = {
   info:     '\u2139',  // i
   model:    '\u2726',  // star
@@ -766,6 +766,17 @@ const LEVEL_ICONS = {
   detail:   '\u00B7',  // middle dot
   debug:    '\u2022',  // bullet
   presence: '\u25C9',  // circle dot
+};
+const LEVEL_TOOLTIPS = {
+  info:     'Info \u2014 general status update',
+  model:    'Model \u2014 LLM response or action',
+  agent:    'Agent \u2014 command execution output',
+  error:    'Error \u2014 something went wrong',
+  warn:     'Warning \u2014 needs attention',
+  subagent: 'Sub-agent \u2014 delegated worker output',
+  detail:   'Detail \u2014 verbose context (enable in Verbose mode)',
+  debug:    'Debug \u2014 internal diagnostics (enable in Debug mode)',
+  presence: 'Presence \u2014 live model interaction',
 };
 
 // Verbosity → which log levels to show
@@ -947,8 +958,13 @@ function handleEvent(msg) {
       }
       break;
 
+    case 'model_summary':
+      addLogEntry('model', `T${msg.turn}: ${msg.summary}`);
+      if (msg.reasoning_summary) addLogEntry('detail', `Reasoning: ${msg.reasoning_summary}`);
+      break;
+
     case 'agent_output':
-      if (msg.stdout) addLogEntry('agent', msg.stdout);
+      if (msg.stdout) addLogEntry('agent', formatAgentOutput(msg.stdout));
       if (msg.stderr) addLogEntry('warn', msg.stderr);
       setPhase('running');
       break;
@@ -1004,6 +1020,7 @@ function handleEvent(msg) {
       usageData.presence = msg.presence || null;
       if (usageData.main) {
         updateBudget(usageData.main.usage_pct);
+        addLogEntry('detail', `tokens: ${usageData.main.tokens_used.toLocaleString()} / ${usageData.main.context_window.toLocaleString()} (${usageData.main.usage_pct.toFixed(1)}%)`);
       }
       renderUsageTab();
       break;
@@ -1153,6 +1170,7 @@ function addLogEntry(level, content, turn) {
   const icon = document.createElement('span');
   icon.className = 'log-icon';
   icon.textContent = LEVEL_ICONS[level] || '\u2022';
+  icon.title = LEVEL_TOOLTIPS[level] || level;
 
   const ts = document.createElement('span');
   ts.className = 'log-ts';
@@ -1468,6 +1486,54 @@ function initTerminal() {
     document.head.appendChild(fitScript);
   };
   document.head.appendChild(script);
+}
+
+// ── Agent Output Formatting ──
+// The runtime emits JSON lines. Each line is either a status update or a result.
+// We parse and display a human-readable summary.
+function formatAgentOutput(raw) {
+  const lines = raw.trim().split('\n');
+  const parts = [];
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj.type === 'result' && obj.data) {
+        // data is a JSON-encoded string with the actual result
+        let data;
+        try { data = typeof obj.data === 'string' ? JSON.parse(obj.data) : obj.data; } catch { data = obj.data; }
+        if (data.stdout_tail) {
+          const out = data.stdout_tail.trim();
+          if (out) parts.push(out);
+        }
+        if (data.stderr_tail) {
+          const err = data.stderr_tail.trim();
+          if (err) parts.push('[stderr] ' + err);
+        }
+        if (data.content) {
+          parts.push(data.content);
+        }
+        if (data.exists !== undefined) {
+          parts.push('exists: ' + data.exists);
+        }
+        if (data.exit_code !== undefined && data.exit_code !== 0) {
+          parts.push('exit code: ' + data.exit_code);
+        }
+        // If we couldn't extract anything useful, show the data as-is
+        if (parts.length === 0 && typeof data === 'object') {
+          parts.push(JSON.stringify(data, null, 2));
+        }
+      } else if (obj.type === 'status') {
+        // Skip status lines (running/completed) — not useful to display
+      } else {
+        // Unknown type, show raw
+        parts.push(line);
+      }
+    } catch {
+      // Not JSON, show as-is
+      parts.push(line);
+    }
+  }
+  return parts.length > 0 ? parts.join('\n') : raw;
 }
 
 // ── Init ──

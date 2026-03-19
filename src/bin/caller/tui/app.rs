@@ -1321,6 +1321,12 @@ impl App {
                     LogSource::Agent,
                     Some(turn),
                 );
+                // Broadcast model summary to web UI / control socket
+                self.broadcast_control(OutboundEvent::ModelSummary {
+                    turn,
+                    summary: summary.clone(),
+                    reasoning_summary: reasoning.clone(),
+                });
                 if let Some(ref reasoning_text) = reasoning {
                     self.log_sourced(
                         LogLevel::Model,
