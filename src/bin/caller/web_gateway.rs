@@ -218,14 +218,27 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
             }
             "agent_input" => ("agent", message.to_string(), "detail"),
             "agent_output" => {
-                // Extract stdout_tail from agent output if available
-                let stdout = obj.get("data")
-                    .and_then(|d| d.get("stdout_tail"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(message);
-                let trimmed = stdout.trim();
-                if trimmed.is_empty() { continue; }
-                ("agent", trimmed.to_string(), "agent")
+                // The message field contains raw runtime JSON lines.
+                // Parse each line to extract stdout_tail for display.
+                let mut parts = Vec::new();
+                for json_line in message.lines() {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_line) {
+                        if parsed.get("type").and_then(|v| v.as_str()) == Some("result") {
+                            if let Some(data_str) = parsed.get("data").and_then(|v| v.as_str()) {
+                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                    if let Some(stdout) = data.get("stdout_tail").and_then(|v| v.as_str()) {
+                                        let trimmed = stdout.trim();
+                                        if !trimmed.is_empty() {
+                                            parts.push(trimmed.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if parts.is_empty() { continue; }
+                ("agent", parts.join("\n"), "agent")
             }
             "info" => {
                 // General info entries — detect presence vs system
