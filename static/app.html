@@ -566,10 +566,18 @@ html, body {
 .displays-container {
   flex: 1;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
   color: var(--overlay0);
   font-size: 14px;
+  overflow: hidden;
+}
+.displays-container.has-displays {
+  align-items: stretch;
+  justify-content: stretch;
+}
+.displays-container:not(.has-displays) {
+  align-items: center;
+  justify-content: center;
 }
 .displays-placeholder {
   text-align: center;
@@ -579,6 +587,78 @@ html, body {
   font-size: 48px;
   margin-bottom: 12px;
   opacity: 0.5;
+}
+.display-slot {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.display-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+}
+.display-label {
+  font-weight: 600;
+  color: var(--blue);
+  font-family: monospace;
+}
+.display-status {
+  font-size: 12px;
+  color: var(--overlay0);
+}
+.display-status.connected { color: var(--green); }
+.display-status.error { color: var(--red); }
+.display-toolbar .take-control-btn,
+.display-toolbar .release-control-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  margin-left: auto;
+}
+.display-toolbar .take-control-btn:hover {
+  background: var(--blue);
+  color: var(--base);
+  border-color: var(--blue);
+}
+.display-toolbar .release-control-btn {
+  background: var(--peach);
+  color: var(--base);
+  border-color: var(--peach);
+}
+.display-toolbar .release-control-btn:hover {
+  background: var(--red);
+  border-color: var(--red);
+}
+.display-toolbar .release-note {
+  padding: 2px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+  width: 160px;
+}
+.display-canvas {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: #000;
+}
+.display-canvas canvas {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100% !important;
+  height: 100% !important;
 }
 
 /* ── Usage empty state ── */
@@ -719,11 +799,11 @@ html, body {
 
     <!-- Displays Tab -->
     <div id="tab-displays" class="tab-pane">
-      <div class="displays-container">
-        <div class="displays-placeholder">
+      <div class="displays-container" id="displays-container">
+        <div class="displays-placeholder" id="displays-placeholder">
           <div class="icon">&#x1f5b5;</div>
-          <div>Display streaming coming soon</div>
-          <div style="font-size:12px;margin-top:8px;color:var(--surface2)">VNC / WebRTC displays will appear here</div>
+          <div>No displays active</div>
+          <div style="font-size:12px;margin-top:8px;color:var(--surface2)">Displays will appear when the agent launches a GUI</div>
         </div>
       </div>
     </div>
@@ -838,6 +918,169 @@ let fitAddon = null;
 let termInitialized = false;
 let termBuffer = []; // buffer term data before init
 
+// Displays
+const displaySlots = new Map(); // displayId → DisplaySlot
+let noVNCLoaded = false;
+let noVNCLoadCallbacks = [];
+
+function loadNoVNC(cb) {
+  if (noVNCLoaded) { cb(); return; }
+  noVNCLoadCallbacks.push(cb);
+  if (noVNCLoadCallbacks.length > 1) return; // already loading
+  const script = document.createElement('script');
+  script.type = 'module';
+  // Create a shim that imports RFB and exposes it globally
+  script.textContent = `
+    import RFB from 'https://cdn.jsdelivr.net/npm/@novnc/novnc@1.5.0/core/rfb.js';
+    window.__noVNC_RFB = RFB;
+    window.dispatchEvent(new Event('novnc-loaded'));
+  `;
+  window.addEventListener('novnc-loaded', () => {
+    noVNCLoaded = true;
+    for (const fn of noVNCLoadCallbacks) fn();
+    noVNCLoadCallbacks = [];
+  }, { once: true });
+  document.head.appendChild(script);
+}
+
+class DisplaySlot {
+  constructor(displayId, vncPort) {
+    this.displayId = displayId;
+    this.vncPort = vncPort;
+    this.rfb = null;
+    this.interactive = false;
+    this.connected = false;
+
+    // Build DOM
+    this.el = document.createElement('div');
+    this.el.className = 'display-slot';
+    this.el.innerHTML = `
+      <div class="display-toolbar">
+        <span class="display-label">:${displayId}</span>
+        <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
+        <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
+        <button class="take-control-btn" id="ds-take-${displayId}">Take Control</button>
+        <button class="release-control-btn" id="ds-release-${displayId}" style="display:none">Release</button>
+      </div>
+      <div class="display-canvas" id="display-canvas-${displayId}"></div>
+    `;
+
+    this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
+    this.noteInput = this.el.querySelector(`#ds-note-${displayId}`);
+    this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
+    this.releaseBtn = this.el.querySelector(`#ds-release-${displayId}`);
+    this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
+
+    this.takeBtn.addEventListener('click', () => this.takeControl());
+    this.releaseBtn.addEventListener('click', () => this.releaseControl());
+  }
+
+  connectPassive() {
+    loadNoVNC(() => this._connectVNC());
+  }
+
+  _connectVNC() {
+    const RFB = window.__noVNC_RFB;
+    if (!RFB) return;
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${proto}//${location.host}/vnc?port=${this.vncPort}`;
+
+    try {
+      this.rfb = new RFB(this.canvasEl, wsUrl);
+      this.rfb.viewOnly = true;
+      this.rfb.scaleViewport = true;
+      this.rfb.resizeSession = false;
+      this.rfb.background = '#1e1e2e';
+
+      this.rfb.addEventListener('connect', () => {
+        this.connected = true;
+        this.statusEl.textContent = 'Connected (view-only)';
+        this.statusEl.className = 'display-status connected';
+      });
+
+      this.rfb.addEventListener('disconnect', (e) => {
+        this.connected = false;
+        this.statusEl.textContent = e.detail.clean ? 'Disconnected' : 'Connection lost';
+        this.statusEl.className = 'display-status error';
+        // Auto-reconnect after 3s if not clean disconnect
+        if (!e.detail.clean) {
+          setTimeout(() => {
+            if (!this.connected) this._connectVNC();
+          }, 3000);
+        }
+      });
+
+      this.rfb.addEventListener('securityfailure', () => {
+        this.statusEl.textContent = 'Security error';
+        this.statusEl.className = 'display-status error';
+      });
+    } catch (err) {
+      this.statusEl.textContent = 'Failed to connect';
+      this.statusEl.className = 'display-status error';
+    }
+  }
+
+  takeControl() {
+    if (!this.rfb) return;
+    this.interactive = true;
+    this.rfb.viewOnly = false;
+    this.rfb.focus();
+    this.takeBtn.style.display = 'none';
+    this.releaseBtn.style.display = '';
+    this.noteInput.style.display = '';
+    this.statusEl.textContent = 'Interactive';
+    this.statusEl.className = 'display-status connected';
+    // Notify server
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ action: 'take_display', display_id: this.displayId }));
+    }
+  }
+
+  releaseControl() {
+    if (!this.rfb) return;
+    this.interactive = false;
+    this.rfb.viewOnly = true;
+    const note = this.noteInput.value.trim() || undefined;
+    this.noteInput.value = '';
+    this.noteInput.style.display = 'none';
+    this.takeBtn.style.display = '';
+    this.releaseBtn.style.display = 'none';
+    this.statusEl.textContent = this.connected ? 'Connected (view-only)' : 'Disconnected';
+    // Notify server
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const msg = { action: 'release_display', display_id: this.displayId };
+      if (note) msg.note = note;
+      ws.send(JSON.stringify(msg));
+    }
+  }
+
+  disconnect() {
+    if (this.rfb) {
+      this.rfb.disconnect();
+      this.rfb = null;
+    }
+    this.connected = false;
+  }
+}
+
+function addDisplaySlot(displayId, vncPort) {
+  if (displaySlots.has(displayId)) return; // already exists
+  if (!vncPort) return; // no VNC port, can't stream
+
+  const slot = new DisplaySlot(displayId, vncPort);
+  displaySlots.set(displayId, slot);
+
+  const container = document.getElementById('displays-container');
+  const placeholder = document.getElementById('displays-placeholder');
+  if (placeholder) placeholder.style.display = 'none';
+  container.classList.add('has-displays');
+  container.appendChild(slot.el);
+
+  // Auto-connect if displays tab is active, otherwise connect when switched
+  slot.connectPassive();
+}
+
 // ── Tab Switching ──
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
@@ -859,6 +1102,17 @@ function switchTab(tabId) {
     const badge = document.getElementById('badge-activity');
     badge.classList.remove('visible');
     badge.textContent = '';
+  }
+  // Trigger noVNC rescale when switching to displays tab
+  // (noVNC checks container size which is 0 when tab is hidden)
+  if (tabId === 'displays') {
+    requestAnimationFrame(() => {
+      for (const slot of displaySlots.values()) {
+        if (slot.rfb) {
+          slot.rfb.scaleViewport = true;
+        }
+      }
+    });
   }
 }
 
@@ -1180,6 +1434,15 @@ function handleEvent(msg) {
 
     case 'display_ready':
       addLogEntry('info', `Display :${msg.display_id} ready${msg.vnc_port ? ' (VNC port ' + msg.vnc_port + ')' : ''}`, undefined, SOURCE_LABELS.system);
+      if (msg.vnc_port) addDisplaySlot(msg.display_id, msg.vnc_port);
+      break;
+
+    case 'display_taken':
+      addLogEntry('warn', `User took control of display :${msg.display_id}`, undefined, SOURCE_LABELS.system);
+      break;
+
+    case 'display_released':
+      addLogEntry('info', `User released control of display :${msg.display_id}${msg.note ? '. Note: ' + msg.note : ''}`, undefined, SOURCE_LABELS.system);
       break;
 
     case 'command_result':
