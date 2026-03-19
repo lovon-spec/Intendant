@@ -1,0 +1,1363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Intendant</title>
+<style>
+:root {
+  --base: #1e1e2e;
+  --mantle: #181825;
+  --crust: #11111b;
+  --surface0: #313244;
+  --surface1: #45475a;
+  --surface2: #585b70;
+  --overlay0: #6c7086;
+  --overlay1: #7f849c;
+  --text: #cdd6f4;
+  --subtext0: #a6adc8;
+  --subtext1: #bac2de;
+  --blue: #89b4fa;
+  --green: #a6e3a1;
+  --teal: #94e2d5;
+  --yellow: #f9e2af;
+  --peach: #fab387;
+  --red: #f38ba8;
+  --mauve: #cba6f7;
+  --lavender: #b4befe;
+  --sapphire: #74c7ec;
+
+  --log-info: var(--text);
+  --log-model: var(--blue);
+  --log-agent: var(--teal);
+  --log-error: var(--red);
+  --log-warn: var(--yellow);
+  --log-subagent: var(--mauve);
+  --log-detail: #a2a8be;
+  --log-debug: var(--overlay1);
+  --log-presence: var(--green);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%; width: 100%;
+  background: var(--base);
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  overflow: hidden;
+  -webkit-text-size-adjust: none;
+}
+
+/* ── Layout ── */
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* ── Status Bar ── */
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--crust);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.status-bar .provider { color: var(--blue); }
+.status-bar .model { color: var(--green); }
+.status-bar .turn { color: var(--yellow); }
+.status-bar .session { color: var(--overlay1); font-size: 11px; }
+.status-bar .autonomy { font-weight: 600; }
+.status-bar .sep { color: var(--surface2); }
+.budget-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.budget-bar .bar-track {
+  display: inline-block;
+  width: 60px;
+  height: 6px;
+  background: var(--surface0);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.budget-bar .bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s, background 0.3s;
+}
+.budget-pct { font-size: 11px; }
+
+/* ── Connection Dot ── */
+.conn-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.conn-dot.ok { background: var(--green); }
+.conn-dot.err { background: var(--red); }
+
+/* ── Tab Bar ── */
+.tab-bar {
+  display: flex;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.tab-btn {
+  padding: 8px 16px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--overlay1);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+  position: relative;
+}
+.tab-btn:hover { color: var(--subtext1); }
+.tab-btn.active {
+  color: var(--blue);
+  border-bottom-color: var(--blue);
+}
+.tab-btn .badge {
+  position: absolute;
+  top: 4px; right: 4px;
+  min-width: 16px; height: 16px;
+  border-radius: 8px;
+  background: var(--red);
+  color: var(--crust);
+  font-size: 10px;
+  font-weight: 700;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+.tab-btn .badge.visible { display: flex; }
+
+/* ── Tab Content ── */
+.tab-content {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+.tab-pane {
+  display: none;
+  flex-direction: column;
+  position: absolute;
+  inset: 0;
+}
+.tab-pane.active {
+  display: flex;
+}
+
+/* ── Phase Banner ── */
+.phase-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.phase-banner .spinner {
+  display: inline-block;
+  width: 14px;
+  text-align: center;
+}
+.phase-banner.phase-thinking .phase-text { color: #b4befe; }
+.phase-banner.phase-running .phase-text { color: var(--teal); }
+.phase-banner.phase-waiting .phase-text { color: var(--yellow); }
+.phase-banner.phase-done .phase-text { color: var(--green); }
+.phase-banner.phase-idle .phase-text { color: var(--overlay1); }
+
+/* ── Log Stream ── */
+.log-stream {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 0;
+  scroll-behavior: smooth;
+}
+.log-entry {
+  display: flex;
+  padding: 1px 12px;
+  line-height: 1.5;
+  font-size: 13px;
+}
+.log-entry:hover { background: var(--mantle); }
+.log-entry .log-ts {
+  color: var(--overlay1);
+  width: 70px;
+  flex-shrink: 0;
+  font-size: 11px;
+  padding-top: 1px;
+}
+.log-entry .log-level {
+  width: 52px;
+  flex-shrink: 0;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  padding-top: 1px;
+}
+.log-entry .log-content {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* Log level colors */
+.log-entry.level-info .log-level { color: var(--log-info); }
+.log-entry.level-model .log-level { color: var(--log-model); }
+.log-entry.level-agent .log-level { color: var(--log-agent); }
+.log-entry.level-error .log-level { color: var(--log-error); }
+.log-entry.level-warn .log-level { color: var(--log-warn); }
+.log-entry.level-subagent .log-level { color: var(--log-subagent); }
+.log-entry.level-detail .log-level { color: var(--log-detail); }
+.log-entry.level-debug .log-level { color: var(--log-debug); }
+.log-entry.level-presence .log-level { color: var(--log-presence); }
+
+.log-entry.level-model .log-content { color: var(--log-model); }
+.log-entry.level-agent .log-content { color: var(--log-agent); }
+.log-entry.level-error .log-content { color: var(--log-error); }
+.log-entry.level-warn .log-content { color: var(--log-warn); }
+.log-entry.level-subagent .log-content { color: var(--log-subagent); }
+.log-entry.level-presence .log-content { color: var(--log-presence); }
+
+/* Turn separator */
+.log-turn-sep {
+  padding: 6px 12px 2px;
+  font-size: 11px;
+  color: var(--overlay0);
+  border-top: 1px solid var(--surface0);
+  margin-top: 4px;
+}
+.log-turn-sep:first-child { border-top: none; margin-top: 0; }
+
+/* Scroll-to-bottom button */
+.scroll-bottom-btn {
+  position: absolute;
+  bottom: 12px;
+  right: 20px;
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  color: var(--text);
+  font-size: 16px;
+  cursor: pointer;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  transition: background 0.15s;
+}
+.scroll-bottom-btn:hover { background: var(--surface1); }
+.scroll-bottom-btn.visible { display: flex; }
+
+/* ── Bottom Panels (Approval / Input / Follow-up) ── */
+.bottom-panel {
+  flex-shrink: 0;
+  border-top: 1px solid var(--surface0);
+  background: var(--surface0);
+  display: none;
+}
+.bottom-panel.visible { display: block; }
+
+.bottom-panel .panel-header {
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--yellow);
+}
+.bottom-panel .panel-body {
+  padding: 4px 12px 8px;
+}
+
+/* Approval */
+.approval-command {
+  padding: 6px 10px;
+  background: var(--mantle);
+  border-radius: 4px;
+  font-size: 13px;
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.approval-category {
+  font-size: 11px;
+  color: var(--overlay1);
+  margin-bottom: 8px;
+}
+.approval-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.approval-actions button {
+  padding: 6px 14px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--mantle);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.approval-actions button:hover {
+  background: var(--surface1);
+  border-color: var(--overlay0);
+}
+.approval-actions button.approve { border-color: var(--green); color: var(--green); }
+.approval-actions button.deny { border-color: var(--red); color: var(--red); }
+
+/* Input / Follow-up */
+.input-question {
+  padding: 4px 0 8px;
+  color: var(--blue);
+  font-size: 13px;
+}
+.input-area {
+  display: flex;
+  gap: 8px;
+}
+.input-area textarea {
+  flex: 1;
+  padding: 6px 10px;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  resize: none;
+  min-height: 36px;
+  max-height: 100px;
+}
+.input-area textarea:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.input-area button {
+  padding: 6px 16px;
+  background: var(--blue);
+  border: none;
+  border-radius: 4px;
+  color: var(--crust);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  align-self: flex-end;
+}
+.input-area button:hover { opacity: 0.9; }
+
+/* ── Usage Tab ── */
+.usage-container {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+.usage-cards {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 24px;
+}
+.usage-card {
+  flex: 1;
+  min-width: 280px;
+  max-width: 420px;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 8px;
+  padding: 16px;
+}
+.usage-card .card-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--overlay1);
+  margin-bottom: 4px;
+}
+.usage-card .card-model {
+  font-size: 14px;
+  color: var(--text);
+  margin-bottom: 12px;
+}
+.usage-card .card-model .provider { color: var(--blue); }
+.usage-card .card-model .model-name { color: var(--green); }
+
+/* Token progress bar */
+.token-bar {
+  margin-bottom: 12px;
+}
+.token-bar .bar-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.token-bar .bar-label .tokens { color: var(--text); }
+.token-bar .bar-label .pct { font-weight: 600; }
+.token-bar .bar-track {
+  width: 100%;
+  height: 8px;
+  background: var(--surface0);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.token-bar .bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s, background 0.3s;
+}
+
+/* Token breakdown */
+.token-breakdown {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+}
+.token-breakdown .label { color: var(--overlay1); }
+.token-breakdown .value { color: var(--text); text-align: right; }
+
+/* Cost summary */
+.cost-section {
+  margin-top: 24px;
+  padding: 16px;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 8px;
+}
+.cost-section .cost-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--overlay1);
+  margin-bottom: 12px;
+}
+.cost-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 16px;
+  font-size: 13px;
+}
+.cost-grid .label { color: var(--overlay1); }
+.cost-grid .value { text-align: right; color: var(--green); font-weight: 600; }
+
+/* Token history */
+.token-history {
+  margin-top: 24px;
+}
+.token-history .history-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--overlay1);
+  margin-bottom: 8px;
+}
+.history-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 80px;
+  padding: 0 4px;
+}
+.history-bar {
+  flex: 1;
+  min-width: 3px;
+  max-width: 12px;
+  background: var(--blue);
+  border-radius: 2px 2px 0 0;
+  opacity: 0.7;
+  transition: height 0.3s, opacity 0.15s;
+}
+.history-bar:hover { opacity: 1; }
+
+/* ── Terminal Tab ── */
+.terminal-container {
+  flex: 1;
+  position: relative;
+}
+
+/* ── Displays Tab ── */
+.displays-container {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--overlay0);
+  font-size: 14px;
+}
+.displays-placeholder {
+  text-align: center;
+  padding: 24px;
+}
+.displays-placeholder .icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+  opacity: 0.5;
+}
+
+/* ── Usage empty state ── */
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--overlay0);
+  font-size: 14px;
+}
+
+/* ── Mobile ── */
+@media (max-width: 600px) {
+  .status-bar { font-size: 11px; gap: 8px; padding: 4px 8px; }
+  .status-bar .session { display: none; }
+  .tab-btn { padding: 8px 12px; font-size: 12px; }
+  .log-entry { padding: 1px 8px; }
+  .log-entry .log-ts { width: 55px; font-size: 10px; }
+  .log-entry .log-level { width: 44px; font-size: 10px; }
+  .usage-card { min-width: unset; }
+  .usage-cards { flex-direction: column; }
+  .budget-bar .bar-track { width: 40px; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Status Bar -->
+  <div class="status-bar" id="status-bar">
+    <span class="provider" id="sb-provider">--</span>
+    <span class="sep">/</span>
+    <span class="model" id="sb-model">--</span>
+    <span class="sep">|</span>
+    <span class="turn" id="sb-turn">T0</span>
+    <span class="sep">|</span>
+    <div class="budget-bar">
+      <div class="bar-track"><div class="bar-fill" id="sb-budget-fill"></div></div>
+      <span class="budget-pct" id="sb-budget-pct">0%</span>
+    </div>
+    <span class="sep">|</span>
+    <span class="autonomy" id="sb-autonomy">Medium</span>
+    <span class="session" id="sb-session"></span>
+    <span class="conn-dot err" id="sb-conn"></span>
+  </div>
+
+  <!-- Tab Bar -->
+  <nav class="tab-bar">
+    <button class="tab-btn active" data-tab="activity">Activity<span class="badge" id="badge-activity"></span></button>
+    <button class="tab-btn" data-tab="usage">Usage</button>
+    <button class="tab-btn" data-tab="terminal">Terminal</button>
+    <button class="tab-btn" data-tab="displays">Displays</button>
+  </nav>
+
+  <!-- Tab Content -->
+  <div class="tab-content">
+
+    <!-- Activity Tab -->
+    <div id="tab-activity" class="tab-pane active">
+      <div class="phase-banner phase-idle" id="phase-banner">
+        <span class="spinner" id="phase-spinner"></span>
+        <span class="phase-text" id="phase-text">Idle</span>
+      </div>
+      <div class="log-stream" id="log-stream"></div>
+      <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
+
+      <!-- Approval Panel -->
+      <div class="bottom-panel" id="approval-panel">
+        <div class="panel-header">Approval Required</div>
+        <div class="panel-body">
+          <div class="approval-command" id="approval-command"></div>
+          <div class="approval-category" id="approval-category"></div>
+          <div class="approval-actions">
+            <button class="approve" onclick="sendApproval('approve')">Approve (y)</button>
+            <button onclick="sendApproval('skip')">Skip (s)</button>
+            <button onclick="sendApproval('approve_all')">Approve All (a)</button>
+            <button class="deny" onclick="sendApproval('deny')">Deny (n)</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- AskHuman Panel -->
+      <div class="bottom-panel" id="human-panel">
+        <div class="panel-header">Question</div>
+        <div class="panel-body">
+          <div class="input-question" id="human-question"></div>
+          <div class="input-area">
+            <textarea id="human-input" rows="2" placeholder="Type your response..."></textarea>
+            <button onclick="sendHumanResponse()">Send</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Follow-up Panel -->
+      <div class="bottom-panel" id="followup-panel">
+        <div class="panel-header">Follow Up</div>
+        <div class="panel-body">
+          <div class="input-area">
+            <textarea id="followup-input" rows="2" placeholder="Type follow-up message..."></textarea>
+            <button onclick="sendFollowUp()">Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Usage Tab -->
+    <div id="tab-usage" class="tab-pane">
+      <div class="usage-container" id="usage-container">
+        <div class="empty-state" id="usage-empty">Waiting for usage data...</div>
+        <div class="usage-cards" id="usage-cards" style="display:none"></div>
+        <div class="cost-section" id="cost-section" style="display:none">
+          <div class="cost-title">Estimated Cost</div>
+          <div class="cost-grid" id="cost-grid"></div>
+        </div>
+        <div class="token-history" id="token-history" style="display:none">
+          <div class="history-title">Tokens per Turn</div>
+          <div class="history-chart" id="history-chart"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Terminal Tab -->
+    <div id="tab-terminal" class="tab-pane">
+      <div class="terminal-container" id="terminal-container"></div>
+    </div>
+
+    <!-- Displays Tab -->
+    <div id="tab-displays" class="tab-pane">
+      <div class="displays-container">
+        <div class="displays-placeholder">
+          <div class="icon">&#x1f5b5;</div>
+          <div>Display streaming coming soon</div>
+          <div style="font-size:12px;margin-top:8px;color:var(--surface2)">VNC / WebRTC displays will appear here</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- xterm.js (loaded lazily for Terminal tab) -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.css" id="xterm-css" disabled>
+
+<script>
+'use strict';
+
+// ── Pricing table (USD per token) ──
+const PRICING = {
+  // OpenAI
+  'gpt-4.1':          { input: 2.0e-6, output: 8.0e-6 },
+  'gpt-4.1-mini':     { input: 0.4e-6, output: 1.6e-6 },
+  'gpt-4.1-nano':     { input: 0.1e-6, output: 0.4e-6 },
+  'gpt-5':            { input: 2.0e-6, output: 8.0e-6 },
+  'o3':               { input: 2.0e-6, output: 8.0e-6 },
+  'o4-mini':          { input: 1.1e-6, output: 4.4e-6 },
+  // Anthropic
+  'claude-sonnet-4-5-20250929': { input: 3.0e-6, output: 15.0e-6 },
+  'claude-opus-4-5-20250929':   { input: 15.0e-6, output: 75.0e-6 },
+  'claude-haiku-3-5':           { input: 0.8e-6, output: 4.0e-6 },
+  // Gemini
+  'gemini-2.5-pro':   { input: 1.25e-6, output: 10.0e-6 },
+  'gemini-2.5-flash': { input: 0.15e-6, output: 0.6e-6 },
+  'gemini-2.0-flash': { input: 0.1e-6, output: 0.4e-6 },
+};
+
+// ── Spinner ──
+const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+let spinnerIdx = 0;
+let spinnerInterval = null;
+
+// ── State ──
+let ws = null;
+let connected = false;
+let currentPhase = 'idle';
+let pendingApprovalId = null;
+let activeTab = 'activity';
+let autoScroll = true;
+let logEntryCount = 0;
+const MAX_LOG_ENTRIES = 10000;
+
+// Usage tracking
+let usageData = { main: null, presence: null };
+let tokenHistory = []; // [{turn, tokens}]
+let lastTotalTokens = 0;
+
+// Terminal (lazy)
+let term = null;
+let fitAddon = null;
+let termInitialized = false;
+let termBuffer = []; // buffer term data before init
+
+// ── Tab Switching ──
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
+
+function switchTab(tabId) {
+  activeTab = tabId;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tabId));
+
+  if (tabId === 'terminal' && !termInitialized) {
+    initTerminal();
+  }
+  if (tabId === 'terminal' && term) {
+    requestAnimationFrame(() => fitAddon && fitAddon.fit());
+  }
+  // Clear activity badge when switching to activity
+  if (tabId === 'activity') {
+    const badge = document.getElementById('badge-activity');
+    badge.classList.remove('visible');
+    badge.textContent = '';
+  }
+}
+
+// ── Keyboard shortcuts ──
+document.addEventListener('keydown', (e) => {
+  // Don't intercept when typing in input fields
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+
+  if (activeTab === 'activity' && pendingApprovalId !== null) {
+    if (e.key === 'y') { sendApproval('approve'); e.preventDefault(); }
+    else if (e.key === 's') { sendApproval('skip'); e.preventDefault(); }
+    else if (e.key === 'a') { sendApproval('approve_all'); e.preventDefault(); }
+    else if (e.key === 'n') { sendApproval('deny'); e.preventDefault(); }
+  }
+});
+
+// ── WebSocket ──
+function getWsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return proto + '//' + location.host;
+}
+
+function connectWs() {
+  ws = new WebSocket(getWsUrl());
+
+  ws.onopen = () => {
+    connected = true;
+    document.getElementById('sb-conn').className = 'conn-dot ok';
+    // Request current state so late-connecting browsers get populated
+    sendJson({ action: 'usage' });
+    sendJson({ action: 'status' });
+  };
+
+  ws.onclose = () => {
+    connected = false;
+    document.getElementById('sb-conn').className = 'conn-dot err';
+    // Reconnect after 2s
+    setTimeout(connectWs, 2000);
+  };
+
+  ws.onerror = () => {
+    connected = false;
+    document.getElementById('sb-conn').className = 'conn-dot err';
+  };
+
+  ws.onmessage = (evt) => {
+    if (typeof evt.data !== 'string') return;
+    try {
+      const msg = JSON.parse(evt.data);
+      routeMessage(msg);
+    } catch (e) {
+      // ignore non-JSON
+    }
+  };
+}
+
+function sendJson(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+// ── Message Router ──
+function routeMessage(msg) {
+  // TUI ANSI frames → terminal
+  if (msg.t === 'term') {
+    handleTermData(msg.d);
+    return;
+  }
+
+  // Bootstrap state snapshot
+  if (msg.t === 'state_snapshot') {
+    handleStateSnapshot(msg);
+    return;
+  }
+
+  // OutboundEvent (broadcast)
+  if (msg.event) {
+    handleEvent(msg);
+    return;
+  }
+}
+
+// ── State Snapshot ──
+function handleStateSnapshot(msg) {
+  const s = msg.state;
+  if (!s) return;
+  updateStatusBar({
+    turn: s.turn || 0,
+    budget_pct: s.budget_pct || 0,
+    phase: s.phase || 'idle',
+  });
+  if (s.phase) setPhase(s.phase);
+
+  // Restore pending approval from snapshot
+  if (s.pending_approval && s.pending_approval.id) {
+    pendingApprovalId = s.pending_approval.id;
+    document.getElementById('approval-command').textContent = s.pending_approval.command_preview || '';
+    document.getElementById('approval-category').textContent =
+      s.pending_approval.category ? 'Category: ' + s.pending_approval.category : '';
+    showBottomPanel('approval-panel');
+    addLogEntry('warn', `Approval required: ${s.pending_approval.command_preview || ''}`);
+  }
+
+  // Show follow-up panel if waiting for follow-up
+  const np = (s.phase || '').replace(/_/g, '');
+  if (np === 'waitingfollowup' || np === 'idle' || np === 'done') {
+    showBottomPanel('followup-panel');
+  }
+}
+
+// ── Event Handler ──
+function handleEvent(msg) {
+  switch (msg.event) {
+    case 'turn_started':
+      addLogEntry('info', `Turn ${msg.turn} started`, msg.turn);
+      updateBudget(msg.budget_pct);
+      document.getElementById('sb-turn').textContent = 'T' + msg.turn;
+      setPhase('thinking');
+      // Track token delta for history
+      if (usageData.main && msg.turn > 1) {
+        tokenHistory.push({ turn: msg.turn - 1, tokens: usageData.main.tokens_used - lastTotalTokens });
+        lastTotalTokens = usageData.main.tokens_used;
+      }
+      break;
+
+    case 'agent_output':
+      if (msg.stdout) addLogEntry('agent', msg.stdout);
+      if (msg.stderr) addLogEntry('warn', msg.stderr);
+      setPhase('running');
+      break;
+
+    case 'approval_required':
+      pendingApprovalId = msg.id;
+      document.getElementById('approval-command').textContent = msg.command || '';
+      document.getElementById('approval-category').textContent = msg.category ? 'Category: ' + msg.category : '';
+      showBottomPanel('approval-panel');
+      setPhase('waiting');
+      addLogEntry('warn', `Approval required: ${msg.command}`);
+      // Badge on activity tab if not viewing it
+      if (activeTab !== 'activity') {
+        const badge = document.getElementById('badge-activity');
+        badge.textContent = '!';
+        badge.classList.add('visible');
+      }
+      break;
+
+    case 'ask_human':
+      document.getElementById('human-question').textContent = msg.question || '';
+      showBottomPanel('human-panel');
+      setPhase('waiting');
+      addLogEntry('info', `Question: ${msg.question}`);
+      if (activeTab !== 'activity') {
+        const badge = document.getElementById('badge-activity');
+        badge.textContent = '?';
+        badge.classList.add('visible');
+      }
+      break;
+
+    case 'task_complete':
+      hideAllBottomPanels();
+      setPhase('done');
+      addLogEntry('info', `Task complete: ${msg.reason}${msg.summary ? ' — ' + msg.summary : ''}`);
+      showBottomPanel('followup-panel');
+      break;
+
+    case 'round_complete':
+      setPhase('idle');
+      addLogEntry('info', `Round ${msg.round} complete (${msg.turns_in_round} turns)`);
+      showBottomPanel('followup-panel');
+      break;
+
+    case 'status':
+      updateStatusBar(msg);
+      if (msg.phase) setPhase(msg.phase);
+      break;
+
+    case 'usage':
+    case 'usage_update':
+      usageData.main = msg.main || null;
+      usageData.presence = msg.presence || null;
+      if (usageData.main) {
+        updateBudget(usageData.main.usage_pct);
+      }
+      renderUsageTab();
+      break;
+
+    case 'display_ready':
+      addLogEntry('info', `Display :${msg.display_id} ready${msg.vnc_port ? ' (VNC port ' + msg.vnc_port + ')' : ''}`);
+      break;
+
+    case 'command_result':
+      addLogEntry(msg.ok ? 'detail' : 'error', `[${msg.action}] ${msg.message}`);
+      break;
+
+    case 'user_transcript':
+      addLogEntry('presence', `[voice] ${msg.text}`);
+      break;
+
+    default:
+      // Unknown events logged at debug level
+      addLogEntry('debug', `[${msg.event}] ${JSON.stringify(msg)}`);
+  }
+}
+
+// ── Status Bar ──
+function updateStatusBar(data) {
+  if (data.provider) document.getElementById('sb-provider').textContent = data.provider;
+  if (data.model) document.getElementById('sb-model').textContent = data.model;
+  if (data.turn !== undefined) document.getElementById('sb-turn').textContent = 'T' + data.turn;
+  if (data.budget_pct !== undefined) updateBudget(data.budget_pct);
+  if (data.autonomy) {
+    const el = document.getElementById('sb-autonomy');
+    el.textContent = data.autonomy;
+    el.style.color = autonomyColor(data.autonomy);
+  }
+  if (data.session_id) {
+    document.getElementById('sb-session').textContent = data.session_id.substring(0, 8);
+  }
+}
+
+function updateBudget(pct) {
+  const fill = document.getElementById('sb-budget-fill');
+  const label = document.getElementById('sb-budget-pct');
+  fill.style.width = Math.min(pct, 100) + '%';
+  fill.style.background = budgetColor(pct);
+  label.textContent = pct.toFixed(1) + '%';
+  label.style.color = budgetColor(pct);
+}
+
+function budgetColor(pct) {
+  if (pct < 50) return '#a6e3a1';
+  if (pct < 85) return '#f9e2af';
+  return '#f38ba8';
+}
+
+function autonomyColor(level) {
+  switch (level) {
+    case 'Low': return '#f38ba8';
+    case 'Medium': return '#f9e2af';
+    case 'High': return '#94e2d5';
+    case 'Full': return '#a6e3a1';
+    default: return '#f9e2af';
+  }
+}
+
+// ── Phase Banner ──
+function setPhase(phase) {
+  currentPhase = phase;
+  const banner = document.getElementById('phase-banner');
+  const text = document.getElementById('phase-text');
+
+  // Remove all phase classes
+  banner.className = 'phase-banner';
+
+  // Normalize phase: Debug format has no underscores (e.g. "waitingfollowup"),
+  // AgentStateSnapshot uses underscores (e.g. "waiting_followup").
+  const normalizedPhase = phase.replace('waiting_', 'waiting')
+    .replace('running_', 'running');
+
+  const labels = {
+    idle: 'Idle',
+    thinking: 'Thinking...',
+    running: 'Running Agent',
+    runningagent: 'Running Agent',
+    waiting: 'Waiting for Input',
+    waitingapproval: 'Waiting for Approval',
+    waitinghuman: 'Waiting for Response',
+    waitingfollowup: 'Waiting for Follow-up',
+    orchestrating: 'Orchestrating',
+    done: 'Done',
+  };
+
+  const phaseCategory =
+    normalizedPhase.startsWith('waiting') ? 'waiting' :
+    normalizedPhase.startsWith('running') ? 'running' :
+    normalizedPhase === 'orchestrating' ? 'thinking' :
+    normalizedPhase;
+
+  banner.classList.add('phase-' + phaseCategory);
+  text.textContent = labels[normalizedPhase] || labels[phase] || phase;
+
+  // Start/stop spinner
+  if (phase === 'idle' || phase === 'done') {
+    stopSpinner();
+  } else {
+    startSpinner();
+  }
+}
+
+function startSpinner() {
+  if (spinnerInterval) return;
+  const el = document.getElementById('phase-spinner');
+  spinnerInterval = setInterval(() => {
+    spinnerIdx = (spinnerIdx + 1) % SPINNER_FRAMES.length;
+    el.textContent = SPINNER_FRAMES[spinnerIdx];
+  }, 80);
+}
+
+function stopSpinner() {
+  if (spinnerInterval) {
+    clearInterval(spinnerInterval);
+    spinnerInterval = null;
+  }
+  document.getElementById('phase-spinner').textContent = currentPhase === 'done' ? '✓' : '';
+}
+
+// ── Log Stream ──
+function addLogEntry(level, content, turn) {
+  const stream = document.getElementById('log-stream');
+
+  // Turn separator
+  if (turn !== undefined) {
+    const sep = document.createElement('div');
+    sep.className = 'log-turn-sep';
+    sep.textContent = '── Turn ' + turn + ' ──';
+    stream.appendChild(sep);
+  }
+
+  const entry = document.createElement('div');
+  entry.className = 'log-entry level-' + level;
+
+  const ts = document.createElement('span');
+  ts.className = 'log-ts';
+  ts.textContent = new Date().toLocaleTimeString('en-US', { hour12: false });
+
+  const lvl = document.createElement('span');
+  lvl.className = 'log-level';
+  lvl.textContent = level;
+
+  const cnt = document.createElement('span');
+  cnt.className = 'log-content';
+  cnt.textContent = content;
+
+  entry.appendChild(ts);
+  entry.appendChild(lvl);
+  entry.appendChild(cnt);
+  stream.appendChild(entry);
+
+  logEntryCount++;
+  // Cap entries
+  if (logEntryCount > MAX_LOG_ENTRIES) {
+    const first = stream.querySelector('.log-entry, .log-turn-sep');
+    if (first) { stream.removeChild(first); logEntryCount--; }
+  }
+
+  // Auto-scroll
+  if (autoScroll) {
+    stream.scrollTop = stream.scrollHeight;
+  }
+}
+
+// Auto-scroll detection
+(function() {
+  const stream = document.getElementById('log-stream');
+  const btn = document.getElementById('scroll-bottom');
+
+  stream.addEventListener('scroll', () => {
+    const atBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 30;
+    autoScroll = atBottom;
+    btn.classList.toggle('visible', !atBottom);
+  });
+
+  btn.addEventListener('click', () => {
+    stream.scrollTop = stream.scrollHeight;
+    autoScroll = true;
+    btn.classList.remove('visible');
+  });
+})();
+
+// ── Bottom Panels ──
+function showBottomPanel(id) {
+  hideAllBottomPanels();
+  document.getElementById(id).classList.add('visible');
+}
+
+function hideAllBottomPanels() {
+  document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible'));
+}
+
+function sendApproval(action) {
+  if (pendingApprovalId === null) return;
+  sendJson({ action: action, id: pendingApprovalId });
+  pendingApprovalId = null;
+  hideAllBottomPanels();
+  setPhase('running');
+  addLogEntry('info', `Action: ${action}`);
+}
+
+function sendHumanResponse() {
+  const input = document.getElementById('human-input');
+  const text = input.value.trim();
+  if (!text) return;
+  sendJson({ action: 'input', text: text });
+  input.value = '';
+  hideAllBottomPanels();
+  setPhase('thinking');
+  addLogEntry('info', `Response: ${text}`);
+}
+
+function sendFollowUp() {
+  const input = document.getElementById('followup-input');
+  const text = input.value.trim();
+  if (!text) return;
+  sendJson({ action: 'follow_up', text: text });
+  input.value = '';
+  hideAllBottomPanels();
+  setPhase('thinking');
+  addLogEntry('info', `Follow-up: ${text}`);
+}
+
+// Enter to submit in textareas
+document.querySelectorAll('#human-input, #followup-input').forEach(ta => {
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (ta.id === 'human-input') sendHumanResponse();
+      else sendFollowUp();
+    }
+  });
+});
+
+// ── Usage Tab ──
+function renderUsageTab() {
+  const cardsEl = document.getElementById('usage-cards');
+  const emptyEl = document.getElementById('usage-empty');
+  const costEl = document.getElementById('cost-section');
+  const historyEl = document.getElementById('token-history');
+
+  if (!usageData.main) {
+    emptyEl.style.display = 'flex';
+    cardsEl.style.display = 'none';
+    costEl.style.display = 'none';
+    historyEl.style.display = 'none';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  cardsEl.style.display = 'flex';
+  cardsEl.innerHTML = '';
+
+  // Render cards
+  const models = [
+    { label: 'Main Model', data: usageData.main },
+  ];
+  if (usageData.presence) {
+    models.push({ label: 'Presence Model', data: usageData.presence });
+  }
+
+  let totalCost = 0;
+  const costLines = [];
+
+  for (const m of models) {
+    const card = renderUsageCard(m.label, m.data);
+    cardsEl.appendChild(card);
+
+    // Estimate cost
+    const pricing = findPricing(m.data.model);
+    if (pricing) {
+      // Without prompt/completion breakdown, use blended rate
+      const blended = (pricing.input + pricing.output) / 2;
+      const cost = m.data.tokens_used * blended;
+      totalCost += cost;
+      costLines.push({ label: m.label, cost: cost, model: m.data.model });
+    }
+  }
+
+  // Cost section
+  if (costLines.length > 0) {
+    costEl.style.display = 'block';
+    const grid = document.getElementById('cost-grid');
+    grid.innerHTML = '';
+    for (const cl of costLines) {
+      grid.innerHTML += `<span class="label">${cl.label}</span><span class="value">$${cl.cost.toFixed(4)}</span>`;
+    }
+    if (costLines.length > 1) {
+      grid.innerHTML += `<span class="label" style="font-weight:600;color:var(--text)">Total</span><span class="value">$${totalCost.toFixed(4)}</span>`;
+    }
+  } else {
+    costEl.style.display = 'none';
+  }
+
+  // Token history chart
+  if (tokenHistory.length > 0) {
+    historyEl.style.display = 'block';
+    const chart = document.getElementById('history-chart');
+    const maxTokens = Math.max(...tokenHistory.map(h => h.tokens), 1);
+    chart.innerHTML = '';
+    for (const h of tokenHistory) {
+      const bar = document.createElement('div');
+      bar.className = 'history-bar';
+      bar.style.height = Math.max((h.tokens / maxTokens) * 100, 2) + '%';
+      bar.title = `Turn ${h.turn}: ${h.tokens.toLocaleString()} tokens`;
+      chart.appendChild(bar);
+    }
+  } else {
+    historyEl.style.display = 'none';
+  }
+}
+
+function renderUsageCard(label, data) {
+  const card = document.createElement('div');
+  card.className = 'usage-card';
+
+  const color = budgetColor(data.usage_pct);
+
+  card.innerHTML = `
+    <div class="card-title">${label}</div>
+    <div class="card-model">
+      <span class="provider">${data.provider}</span> /
+      <span class="model-name">${data.model}</span>
+    </div>
+    <div class="token-bar">
+      <div class="bar-label">
+        <span class="tokens">${data.tokens_used.toLocaleString()} / ${data.context_window.toLocaleString()}</span>
+        <span class="pct" style="color:${color}">${data.usage_pct.toFixed(1)}%</span>
+      </div>
+      <div class="bar-track">
+        <div class="bar-fill" style="width:${Math.min(data.usage_pct, 100)}%;background:${color}"></div>
+      </div>
+    </div>
+    <div class="token-breakdown">
+      <span class="label">Total tokens</span>
+      <span class="value">${data.tokens_used.toLocaleString()}</span>
+      <span class="label">Context window</span>
+      <span class="value">${data.context_window.toLocaleString()}</span>
+      <span class="label">Remaining</span>
+      <span class="value">${(data.context_window - data.tokens_used).toLocaleString()}</span>
+    </div>
+  `;
+  return card;
+}
+
+function findPricing(model) {
+  // Try exact match first, then prefix match
+  if (PRICING[model]) return PRICING[model];
+  for (const key of Object.keys(PRICING)) {
+    if (model.startsWith(key) || model.includes(key)) return PRICING[key];
+  }
+  return null;
+}
+
+// ── Terminal Tab (lazy xterm.js) ──
+function handleTermData(base64data) {
+  if (term) {
+    const bytes = Uint8Array.from(atob(base64data), c => c.charCodeAt(0));
+    term.write(bytes);
+  } else {
+    termBuffer.push(base64data);
+  }
+}
+
+function initTerminal() {
+  if (termInitialized) return;
+  termInitialized = true;
+
+  // Enable CSS
+  document.getElementById('xterm-css').removeAttribute('disabled');
+
+  // Load xterm.js
+  const script = document.createElement('script');
+  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
+  script.onload = () => {
+    const fitScript = document.createElement('script');
+    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
+    fitScript.onload = () => {
+      term = new Terminal({
+        theme: {
+          background: '#1e1e2e',
+          foreground: '#cdd6f4',
+          cursor: '#f5e0dc',
+          cursorAccent: '#1e1e2e',
+          selectionBackground: '#45475a',
+          black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
+          blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
+          brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
+          brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
+          brightCyan: '#94e2d5', brightWhite: '#a6adc8',
+        },
+        fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
+        fontSize: 13,
+        allowProposedApi: true,
+      });
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+
+      // Send key events
+      term.onData(data => {
+        // Convert to key event format the server expects
+        for (const ch of data) {
+          sendJson({ t: 'key', key: ch });
+        }
+      });
+
+      // Replay buffered data
+      for (const b64 of termBuffer) {
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        term.write(bytes);
+      }
+      termBuffer = [];
+
+      // Resize handling
+      new ResizeObserver(() => {
+        if (fitAddon && activeTab === 'terminal') fitAddon.fit();
+      }).observe(document.getElementById('terminal-container'));
+
+      term.onResize(({ cols, rows }) => {
+        sendJson({ t: 'resize', cols, rows });
+      });
+    };
+    document.head.appendChild(fitScript);
+  };
+  document.head.appendChild(script);
+}
+
+// ── Init ──
+// Fetch config for provider/model info
+fetch('/config').then(r => r.json()).then(cfg => {
+  if (cfg.provider) document.getElementById('sb-provider').textContent = cfg.provider;
+  if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
+}).catch(() => {});
+
+connectWs();
+</script>
+</body>
+</html>

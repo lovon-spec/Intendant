@@ -107,6 +107,7 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
 }
 
 const WEB_HTML: &str = include_str!("../../../static/live.html");
+const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
@@ -201,6 +202,7 @@ pub fn spawn_web_gateway(
     let active_presence: Arc<Mutex<Option<ActivePresence>>> = Arc::new(Mutex::new(None));
 
     let web_html = Arc::new(web_html);
+    let app_html = Arc::new(APP_HTML.to_string());
 
     tokio::spawn(async move {
         let addr = format!("0.0.0.0:{}", port);
@@ -226,6 +228,7 @@ pub fn spawn_web_gateway(
             let session_provider = session_provider.clone();
             let session_model = session_model.clone();
             let web_html = web_html.clone();
+            let app_html = app_html.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let web_tui_tx = web_tui_tx.clone();
@@ -984,6 +987,8 @@ pub fn spawn_web_gateway(
                             ("application/javascript", AUDIO_PROCESSOR_JS.to_string(), "no-cache")
                         } else if request_line.contains("/config") {
                             ("application/json", config_json.clone(), "no-cache")
+                        } else if request_line.contains("/app") {
+                            ("text/html; charset=utf-8", app_html.to_string(), "no-cache")
                         } else {
                             ("text/html; charset=utf-8", web_html.to_string(), "no-cache")
                         };
@@ -1088,6 +1093,16 @@ mod tests {
     fn test_live_html_embedded() {
         assert!(!WEB_HTML.is_empty());
         assert!(WEB_HTML.contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn test_app_html_embedded() {
+        assert!(!APP_HTML.is_empty());
+        assert!(APP_HTML.contains("<!DOCTYPE html>"));
+        assert!(APP_HTML.contains("tab-activity"));
+        assert!(APP_HTML.contains("tab-usage"));
+        assert!(APP_HTML.contains("tab-terminal"));
+        assert!(APP_HTML.contains("tab-displays"));
     }
 
     #[test]
