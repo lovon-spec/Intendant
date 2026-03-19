@@ -804,6 +804,17 @@ impl App {
         }
     }
 
+    /// Human-readable source for approval log messages.
+    /// If a live browser voice model is active, approvals come from voice.
+    fn approval_source(&self) -> &'static str {
+        if let Some(ref flag) = self.presence_paused {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                return "voice";
+            }
+        }
+        "control socket"
+    }
+
     /// Whether we're browsing the log but a follow-up is still pending.
     pub fn is_follow_up_browsing(&self) -> bool {
         self.mode != AppMode::FollowUp
@@ -1003,10 +1014,8 @@ impl App {
             ControlMsg::Approve { id } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     let pending = self.pending_approvals.remove(pos).unwrap();
-                    self.log(
-                        LogLevel::Info,
-                        format!("Approved via control socket (turn {})", id),
-                    );
+                    let via = self.approval_source();
+                    self.log(LogLevel::Info, format!("Approved via {} (turn {})", via, id));
                     let _ = pending.responder.send(ApprovalResponse::Approve);
                     if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
@@ -1017,10 +1026,8 @@ impl App {
             ControlMsg::Deny { id } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     let pending = self.pending_approvals.remove(pos).unwrap();
-                    self.log(
-                        LogLevel::Info,
-                        format!("Denied via control socket (turn {})", id),
-                    );
+                    let via = self.approval_source();
+                    self.log(LogLevel::Info, format!("Denied via {} (turn {})", via, id));
                     let _ = pending.responder.send(ApprovalResponse::Deny);
                     if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
@@ -1031,10 +1038,8 @@ impl App {
             ControlMsg::Skip { id } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     let pending = self.pending_approvals.remove(pos).unwrap();
-                    self.log(
-                        LogLevel::Info,
-                        format!("Skipped via control socket (turn {})", id),
-                    );
+                    let via = self.approval_source();
+                    self.log(LogLevel::Info, format!("Skipped via {} (turn {})", via, id));
                     let _ = pending.responder.send(ApprovalResponse::Skip);
                     if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
@@ -1045,10 +1050,8 @@ impl App {
             ControlMsg::ApproveAll { id } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     let pending = self.pending_approvals.remove(pos).unwrap();
-                    self.log(
-                        LogLevel::Info,
-                        format!("Approve-all via control socket (turn {})", id),
-                    );
+                    let via = self.approval_source();
+                    self.log(LogLevel::Info, format!("Approve-all via {} (turn {})", via, id));
                     let _ = pending.responder.send(ApprovalResponse::ApproveAll);
                     self.set_autonomy_level("full");
                     if self.pending_approvals.is_empty() {
