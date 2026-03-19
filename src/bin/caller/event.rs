@@ -316,6 +316,153 @@ impl EventBus {
     }
 }
 
+/// Convert an AppEvent to an OutboundEvent for external consumers.
+/// Returns `None` for terminal-only events (Key, Resize, Tick, Quit, etc.)
+/// that external consumers don't need.
+pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundEvent> {
+    use crate::types::OutboundEvent;
+
+    match event {
+        AppEvent::TurnStarted {
+            turn, budget_pct, ..
+        } => Some(OutboundEvent::TurnStarted {
+            turn: *turn,
+            budget_pct: *budget_pct,
+        }),
+        AppEvent::ModelResponse {
+            turn,
+            content,
+            reasoning,
+            ..
+        } => {
+            let summary = crate::types::format_model_summary(content);
+            Some(OutboundEvent::ModelResponse {
+                turn: *turn,
+                summary,
+                reasoning_summary: reasoning.clone(),
+            })
+        }
+        AppEvent::ModelResponseDelta { text } => {
+            Some(OutboundEvent::ModelResponseDelta { text: text.clone() })
+        }
+        AppEvent::AgentStarted {
+            turn,
+            commands_preview,
+        } => Some(OutboundEvent::AgentStarted {
+            turn: *turn,
+            commands_preview: commands_preview.clone(),
+        }),
+        AppEvent::AgentOutput { stdout, stderr } => Some(OutboundEvent::AgentOutput {
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+        }),
+        AppEvent::DoneSignal { message } => Some(OutboundEvent::DoneSignal {
+            message: message.clone(),
+        }),
+        AppEvent::TaskComplete { reason, summary } => Some(OutboundEvent::TaskComplete {
+            reason: reason.clone(),
+            summary: summary.clone(),
+        }),
+        AppEvent::ApprovalRequired {
+            id,
+            command_preview,
+            ..
+        } => Some(OutboundEvent::ApprovalRequired {
+            id: *id,
+            command: command_preview.clone(),
+        }),
+        AppEvent::AutoApproved { preview } => Some(OutboundEvent::AutoApproved {
+            preview: preview.clone(),
+        }),
+        AppEvent::HumanQuestionDetected { question } => Some(OutboundEvent::AskHuman {
+            question: question.clone(),
+        }),
+        AppEvent::HumanResponseSent => Some(OutboundEvent::HumanResponseSent),
+        AppEvent::RoundComplete {
+            round,
+            turns_in_round,
+        } => Some(OutboundEvent::RoundComplete {
+            round: *round,
+            turns_in_round: *turns_in_round,
+        }),
+        AppEvent::DisplayReady {
+            display_id,
+            vnc_port,
+        } => Some(OutboundEvent::DisplayReady {
+            display_id: *display_id,
+            vnc_port: *vnc_port,
+        }),
+        AppEvent::ContextManagement { turn } => Some(OutboundEvent::ContextManagement {
+            turn: *turn,
+        }),
+        AppEvent::BudgetWarning { pct, remaining } => Some(OutboundEvent::BudgetWarning {
+            pct: *pct,
+            remaining: *remaining,
+        }),
+        AppEvent::BudgetExhausted { remaining } => Some(OutboundEvent::BudgetExhausted {
+            remaining: *remaining,
+        }),
+        AppEvent::SafetyCapReached => Some(OutboundEvent::SafetyCapReached),
+        AppEvent::LoopError(msg) => Some(OutboundEvent::LoopError {
+            message: msg.clone(),
+        }),
+        AppEvent::SubAgentResult { formatted } => Some(OutboundEvent::SubAgentResult {
+            summary: formatted.clone(),
+        }),
+        AppEvent::OrchestratorProgress { status, .. } => {
+            Some(OutboundEvent::OrchestratorProgress {
+                status: status.clone(),
+            })
+        }
+        AppEvent::UserTranscript { text, seq } => Some(OutboundEvent::UserTranscript {
+            text: text.clone(),
+            seq: *seq,
+        }),
+        // Terminal-only / internal events — not broadcast to external consumers
+        AppEvent::Key(_)
+        | AppEvent::Resize(_, _)
+        | AppEvent::Tick
+        | AppEvent::Quit
+        | AppEvent::JsonExtracted { .. }
+        | AppEvent::OrchestratorLog { .. }
+        | AppEvent::SessionDirChanged { .. }
+        | AppEvent::ControlCommand(_)
+        | AppEvent::PresenceLog { .. }
+        | AppEvent::PresenceUsageUpdate { .. }
+        | AppEvent::PresenceReady
+        | AppEvent::PresenceConnected { .. }
+        | AppEvent::PresenceDisconnected
+        | AppEvent::VoiceLog { .. }
+        | AppEvent::PresenceCheckpointReceived { .. }
+        | AppEvent::VoiceDiagnostic { .. } => None,
+    }
+}
+
+/// Spawn a task that converts AppEvents to OutboundEvents and broadcasts them.
+///
+/// This is the single point where AppEvents are converted to the external
+/// format used by the control socket, web gateway, and JSON stdout.
+pub fn spawn_outbound_broadcaster(
+    mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
+    outbound_tx: tokio::sync::broadcast::Sender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    if let Some(outbound) = app_event_to_outbound(&event) {
+                        if let Ok(json) = serde_json::to_string(&outbound) {
+                            let _ = outbound_tx.send(json);
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
 /// Spawns a tick timer that sends Tick events at a regular interval.
 pub fn spawn_tick_timer(bus: EventBus, interval_ms: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

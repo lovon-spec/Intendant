@@ -2,7 +2,7 @@ use crate::autonomy::SharedAutonomy;
 use crate::control;
 use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg};
 pub use crate::types::{LogLevel, Phase, Verbosity};
-use crate::types::OutboundEvent;
+use crate::types::{format_model_summary, truncate_str, OutboundEvent};
 use crate::{knowledge, session_log};
 use crate::tui::layout::PanelConfig;
 use chrono::Local;
@@ -1814,98 +1814,7 @@ impl App {
     }
 }
 
-/// Format a human-readable summary of a model's JSON response.
-/// Extracts command functions and their key parameters (command strings, paths, etc.)
-/// instead of showing raw JSON.
-fn format_model_summary(content: &str) -> String {
-    let parsed: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => {
-            // Not valid JSON — return the full text for multi-line rendering.
-            // The rendering layer handles showing one line (collapsed turn) vs
-            // all lines (expanded turn) with continuation indentation.
-            return content.to_string();
-        }
-    };
-
-    let commands = match parsed.get("commands").and_then(|c| c.as_array()) {
-        Some(cmds) if !cmds.is_empty() => cmds,
-        _ => {
-            if parsed
-                .get("done")
-                .and_then(|d| d.as_bool())
-                .unwrap_or(false)
-            {
-                return "done signal".to_string();
-            }
-            return "no commands".to_string();
-        }
-    };
-
-    let summaries: Vec<String> = commands
-        .iter()
-        .map(|cmd| {
-            let func = cmd.get("function").and_then(|f| f.as_str()).unwrap_or("?");
-            match func {
-                "execAsAgent" => {
-                    let command = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("?");
-                    let truncated = truncate_str(command, 120);
-                    format!("exec: {}", truncated)
-                }
-                "editFile" => {
-                    let path = cmd.get("file_path").and_then(|p| p.as_str()).unwrap_or("?");
-                    let op = cmd.get("operation").and_then(|o| o.as_str()).unwrap_or("?");
-                    format!("edit: {} ({})", path, op)
-                }
-                "inspectPath" => {
-                    let path = cmd.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                    format!("inspect: {}", path)
-                }
-                "browse" => {
-                    let url = cmd.get("url").and_then(|u| u.as_str()).unwrap_or("?");
-                    format!("browse: {}", truncate_str(url, 80))
-                }
-                "askHuman" => {
-                    let q = cmd.get("question").and_then(|q| q.as_str()).unwrap_or("?");
-                    format!("ask: {}", truncate_str(q, 100))
-                }
-                "storeMemory" => {
-                    let key = cmd
-                        .get("memory_key")
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("?");
-                    format!("store: {}", key)
-                }
-                "recallMemory" => {
-                    let q = cmd
-                        .get("memory_query")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or("?");
-                    format!("recall: {}", q)
-                }
-                "execPty" => {
-                    let command = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("?");
-                    format!("pty: {}", truncate_str(command, 120))
-                }
-                _ => func.to_string(),
-            }
-        })
-        .collect();
-
-    summaries.join(" | ")
-}
-
-fn truncate_str(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        &s[..end]
-    }
-}
+// format_model_summary and truncate_str are in crate::types
 
 #[cfg(test)]
 mod tests {
