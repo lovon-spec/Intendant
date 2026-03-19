@@ -199,6 +199,9 @@ impl McpAppState {
                 tokens_used: self.session_tokens,
                 context_window: self.context_window,
                 usage_pct: self.budget_pct,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cached_tokens: 0,
             },
             presence: self.presence_provider_name.as_ref().map(|p| {
                 crate::frontend::ModelUsageSnapshot {
@@ -207,6 +210,9 @@ impl McpAppState {
                     tokens_used: self.presence_tokens,
                     context_window: self.presence_context_window,
                     usage_pct: self.presence_usage_pct,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cached_tokens: 0,
                 }
             }),
         }

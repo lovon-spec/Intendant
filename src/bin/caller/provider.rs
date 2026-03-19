@@ -75,6 +75,9 @@ pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// Tokens served from cache (subset of prompt_tokens, cheaper pricing).
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 /// A tool call returned by the model.
@@ -254,6 +257,16 @@ struct ResponsesUsage {
     input_tokens: u64,
     output_tokens: u64,
     total_tokens: u64,
+    /// Cached input tokens (subset of input_tokens). OpenAI Responses API
+    /// returns this in `input_tokens_details.cached_tokens`.
+    #[serde(default)]
+    input_tokens_details: Option<ResponsesInputTokenDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesInputTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 pub struct OpenAIProvider {
@@ -420,10 +433,18 @@ impl ChatProvider for OpenAIProvider {
 
         let usage = resp
             .usage
-            .map(|u| TokenUsage {
-                prompt_tokens: u.input_tokens,
-                completion_tokens: u.output_tokens,
-                total_tokens: u.total_tokens,
+            .map(|u| {
+                let cached = u
+                    .input_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0);
+                TokenUsage {
+                    prompt_tokens: u.input_tokens,
+                    completion_tokens: u.output_tokens,
+                    total_tokens: u.total_tokens,
+                    cached_tokens: cached,
+                }
             })
             .unwrap_or_default();
 
@@ -705,6 +726,11 @@ impl ChatProvider for OpenAIProvider {
                                             .unwrap_or(
                                                 usage.prompt_tokens + usage.completion_tokens,
                                             );
+                                        usage.cached_tokens = u
+                                            .get("input_tokens_details")
+                                            .and_then(|d| d.get("cached_tokens"))
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
                                     }
                                 }
                             }
@@ -895,6 +921,9 @@ struct AnthropicContent {
 struct AnthropicUsage {
     input_tokens: u64,
     output_tokens: u64,
+    /// Tokens read from Anthropic prompt cache (subset of input_tokens).
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 pub struct AnthropicProvider {
@@ -1053,6 +1082,7 @@ impl ChatProvider for AnthropicProvider {
                 prompt_tokens: u.input_tokens,
                 completion_tokens: u.output_tokens,
                 total_tokens: u.input_tokens + u.output_tokens,
+                cached_tokens: u.cache_read_input_tokens,
             })
             .unwrap_or_default();
 
@@ -1244,6 +1274,10 @@ impl ChatProvider for AnthropicProvider {
                                             .and_then(|v| v.as_u64())
                                             .unwrap_or(0);
                                         usage.prompt_tokens = input;
+                                        usage.cached_tokens = u
+                                            .get("cache_read_input_tokens")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
                                     }
                                 }
                             }
@@ -1540,10 +1574,15 @@ impl ChatProvider for GeminiProvider {
                     .get("totalTokenCount")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(prompt + completion);
+                let cached = u
+                    .get("cachedContentTokenCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 TokenUsage {
                     prompt_tokens: prompt,
                     completion_tokens: completion,
                     total_tokens: total,
+                    cached_tokens: cached,
                 }
             })
             .unwrap_or_default();
@@ -1699,10 +1738,15 @@ impl ChatProvider for GeminiProvider {
                             .get("totalTokenCount")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(prompt + completion);
+                        let cached = u
+                            .get("cachedContentTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         usage = TokenUsage {
                             prompt_tokens: prompt,
                             completion_tokens: completion,
                             total_tokens: total,
+                            cached_tokens: cached,
                         };
                     }
                 }
@@ -2272,6 +2316,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
+        ..Default::default()
         };
         let json = serde_json::to_string(&usage).unwrap();
         let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();

@@ -701,6 +701,7 @@ mod tests {
             prompt_tokens: 30_000,
             completion_tokens: 15_000,
             total_tokens: 45_000,
+            ..Default::default()
         });
         assert_eq!(conv.remaining_budget(), 155_000);
     }
@@ -712,6 +713,7 @@ mod tests {
             prompt_tokens: 80,
             completion_tokens: 50,
             total_tokens: 130,
+            ..Default::default()
         });
         assert_eq!(conv.remaining_budget(), 0);
     }
@@ -729,6 +731,7 @@ mod tests {
             prompt_tokens: 50_000,
             completion_tokens: 50_000,
             total_tokens: 100_000,
+        ..Default::default()
         });
         assert!((conv.usage_fraction() - 0.5).abs() < f64::EPSILON);
     }
@@ -757,6 +760,7 @@ mod tests {
             prompt_tokens: 30_000,
             completion_tokens: 15_000,
             total_tokens: 45_000,
+            ..Default::default()
         });
         let summary = conv.budget_summary();
         assert!(summary.contains("45,000"));
@@ -986,6 +990,7 @@ mod tests {
             prompt_tokens: 91_000,
             completion_tokens: 0,
             total_tokens: 91_000,
+        ..Default::default()
         });
         let before = conv.len();
         assert!(conv.auto_compact());
@@ -1021,6 +1026,7 @@ mod tests {
             prompt_tokens: 9_500,
             completion_tokens: 0,
             total_tokens: 9_500,
+        ..Default::default()
         });
         assert!(conv.auto_compact());
         let msgs = conv.messages();
@@ -1045,6 +1051,7 @@ mod tests {
             prompt_tokens: 950,
             completion_tokens: 0,
             total_tokens: 950,
+        ..Default::default()
         });
         // Only 5 messages — too few to compact
         assert!(!conv.auto_compact());
@@ -1153,6 +1160,7 @@ mod tests {
             prompt_tokens: 65_000,
             completion_tokens: 0,
             total_tokens: 65_000,
+        ..Default::default()
         });
         // Standard auto_compact (0.90 threshold) should NOT trigger
         assert!(!conv.auto_compact());
@@ -1173,6 +1181,7 @@ mod tests {
             prompt_tokens: 50_000,
             completion_tokens: 0,
             total_tokens: 50_000,
+        ..Default::default()
         });
         // 50% is below 0.60 threshold
         assert!(!conv.auto_compact_at(0.60));

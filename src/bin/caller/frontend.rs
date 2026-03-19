@@ -71,6 +71,15 @@ pub struct ModelUsageSnapshot {
     pub tokens_used: u64,
     pub context_window: u64,
     pub usage_pct: f64,
+    /// Cumulative prompt (input) tokens across the session.
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    /// Cumulative completion (output) tokens across the session.
+    #[serde(default)]
+    pub completion_tokens: u64,
+    /// Cumulative cached tokens (subset of prompt_tokens, cheaper pricing).
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 /// Combined usage snapshot for all models.
