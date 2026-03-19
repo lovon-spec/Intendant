@@ -954,9 +954,14 @@ pub fn spawn_web_gateway(
                         let state = query_ctx.as_ref()
                             .map(|ctx| ctx.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone());
                         let vd = voice_debug.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let active_id = active_presence.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .map(|a| a.connection_id.clone());
                         let debug_json = serde_json::json!({
                             "agent_state": state,
                             "voice": vd,
+                            "active_connection_id": active_id,
                         }).to_string();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
