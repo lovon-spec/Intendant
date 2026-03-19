@@ -163,6 +163,106 @@ impl Default for WebGatewayConfig {
 /// - WebSocket connections are bridged to the EventBus (inbound control
 ///   messages) and broadcast channel (outbound events), mirroring the
 ///   Unix control socket in `control.rs`.
+/// Convert session.jsonl entries into OutboundEvent-compatible JSON objects
+/// for replaying to late-connecting browsers.
+fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ts = obj.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let level = obj.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+        let event_type = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let turn = obj.get("turn").and_then(|v| v.as_u64());
+
+        // Skip internal/debug entries at Normal verbosity — the browser
+        // handles verbosity filtering, but we skip truly internal events
+        // to keep the replay payload small.
+        match event_type {
+            "messages_input" | "session_start" => continue,
+            _ => {}
+        }
+
+        // Map session log events to a simplified replay entry format.
+        // The browser will render these like regular log entries.
+        let (source, content, log_level) = match event_type {
+            "turn_start" => ("system", format!("Turn {} started", turn.unwrap_or(0)), "info"),
+            "model_response" => {
+                let tokens = obj.get("data")
+                    .and_then(|d| d.get("tokens"))
+                    .and_then(|t| t.get("total"))
+                    .and_then(|v| v.as_u64());
+                ("worker", format!("Model response{}", tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default()), "model")
+            }
+            "approval" => {
+                let decision = obj.get("data")
+                    .and_then(|d| d.get("decision"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let preview = obj.get("data")
+                    .and_then(|d| d.get("preview"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(message);
+                match decision {
+                    "waiting" => ("worker", format!("Approval required: {}", preview), "warn"),
+                    "approved" => ("system", format!("Approved: {}", preview), "info"),
+                    "denied" | "denied-no-approver" => ("system", format!("Denied: {}", preview), "warn"),
+                    _ => ("system", message.to_string(), "info"),
+                }
+            }
+            "agent_input" => ("agent", message.to_string(), "detail"),
+            "agent_output" => {
+                // Extract stdout_tail from agent output if available
+                let stdout = obj.get("data")
+                    .and_then(|d| d.get("stdout_tail"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(message);
+                let trimmed = stdout.trim();
+                if trimmed.is_empty() { continue; }
+                ("agent", trimmed.to_string(), "agent")
+            }
+            "info" => {
+                // General info entries — detect presence vs system
+                if message.starts_with("[presence]") || message.starts_with("[model]")
+                    || message.starts_with("Presence") {
+                    ("server", message.to_string(), "info")
+                } else {
+                    ("system", message.to_string(), "info")
+                }
+            }
+            "debug" => {
+                if message.starts_with("[model]") || message.starts_with("[ws]") {
+                    ("server", message.to_string(), "debug")
+                } else {
+                    ("system", message.to_string(), "debug")
+                }
+            }
+            "warn" => ("system", message.to_string(), "warn"),
+            "error" => ("system", message.to_string(), "error"),
+            "task_complete" | "round_complete" => ("worker", message.to_string(), "info"),
+            _ => {
+                if message.is_empty() { continue; }
+                ("system", message.to_string(), level)
+            }
+        };
+
+        entries.push(serde_json::json!({
+            "ts": ts,
+            "level": log_level,
+            "source": source,
+            "content": content,
+            "turn": turn,
+        }));
+    }
+    entries
+}
+
 /// Compute a short content hash for cache-busting embedded static assets.
 /// When the WASM or JS changes (i.e. a new build), the hash changes,
 /// the URL changes, and browsers fetch the new version.
@@ -319,6 +419,19 @@ pub fn spawn_web_gateway(
                     if let Ok(guard) = last_usage_json.lock() {
                         if let Some(ref usage_json) = *guard {
                             let _ = direct_tx.send(usage_json.clone());
+                        }
+                    }
+
+                    // Replay session log so late-connecting browsers see
+                    // historical events (not just real-time from now on).
+                    if let Some(ref ctx) = query_ctx {
+                        let session_jsonl = ctx.log_dir.join("session.jsonl");
+                        if let Ok(contents) = std::fs::read_to_string(&session_jsonl) {
+                            let replay = serde_json::json!({
+                                "t": "log_replay",
+                                "entries": replay_session_log(&contents),
+                            });
+                            let _ = direct_tx.send(replay.to_string());
                         }
                     }
 

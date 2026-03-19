@@ -945,11 +945,92 @@ function routeMessage(msg) {
     return;
   }
 
+  // Session log replay (historical entries on connect)
+  if (msg.t === 'log_replay') {
+    handleLogReplay(msg.entries || []);
+    return;
+  }
+
   // OutboundEvent (broadcast)
   if (msg.event) {
     handleEvent(msg);
     return;
   }
+}
+
+// ── Log Replay (historical entries on connect) ──
+function handleLogReplay(entries) {
+  const stream = document.getElementById('log-stream');
+  // Clear any stale entries from a previous connection
+  stream.innerHTML = '';
+  logEntryCount = 0;
+
+  let lastTurn = null;
+  for (const e of entries) {
+    // Turn separator when turn changes
+    if (e.turn && e.turn !== lastTurn) {
+      lastTurn = e.turn;
+      const sep = document.createElement('div');
+      sep.className = 'log-turn-sep';
+      sep.textContent = '\u2500\u2500 Turn ' + e.turn + ' \u2500\u2500';
+      stream.appendChild(sep);
+    }
+
+    const sourceMap = {
+      system: SOURCE_LABELS.system,
+      worker: SOURCE_LABELS.worker,
+      agent: SOURCE_LABELS.agent,
+      server: SOURCE_LABELS.server,
+      live: SOURCE_LABELS.live,
+      sub: SOURCE_LABELS.sub,
+      orch: SOURCE_LABELS.orch,
+    };
+
+    // Create entry with original timestamp
+    const entry = document.createElement('div');
+    entry.className = 'log-entry level-' + (e.level || 'info');
+    entry.dataset.level = e.level || 'info';
+
+    const visible = VERBOSITY_LEVELS[verbosity] || VERBOSITY_LEVELS.normal;
+    if (!visible.includes(e.level || 'info')) {
+      entry.style.display = 'none';
+    }
+
+    const icon = document.createElement('span');
+    icon.className = 'log-icon';
+    icon.textContent = LEVEL_ICONS[e.level] || '\u2022';
+    icon.title = LEVEL_TOOLTIPS[e.level] || e.level || 'info';
+
+    const ts = document.createElement('span');
+    ts.className = 'log-ts';
+    ts.textContent = (e.ts || '').substring(0, 8); // HH:MM:SS
+
+    const lvl = document.createElement('span');
+    lvl.className = 'log-level';
+    lvl.textContent = sourceMap[e.source] || e.source || SOURCE_LABELS.system;
+
+    const cnt = document.createElement('span');
+    cnt.className = 'log-content';
+    cnt.textContent = e.content || '';
+
+    entry.appendChild(icon);
+    entry.appendChild(ts);
+    entry.appendChild(lvl);
+    entry.appendChild(cnt);
+
+    // Make long entries collapsible
+    const lineCount = (e.content || '').split('\n').length;
+    if (lineCount > COLLAPSE_THRESHOLD || (e.content || '').length > 300) {
+      entry.classList.add('collapsible');
+      entry.addEventListener('click', () => entry.classList.toggle('expanded'));
+    }
+
+    stream.appendChild(entry);
+    logEntryCount++;
+  }
+
+  // Scroll to bottom
+  stream.scrollTop = stream.scrollHeight;
 }
 
 // ── State Snapshot ──
