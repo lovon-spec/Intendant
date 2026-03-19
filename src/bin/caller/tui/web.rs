@@ -186,6 +186,7 @@ impl WebTui {
         app: &mut App,
         mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
         mut cmd_rx: mpsc::UnboundedReceiver<WebTuiCommand>,
+        bus: crate::event::EventBus,
     ) -> io::Result<()> {
         loop {
             // Apply any pending verbosity override from control socket
@@ -208,10 +209,10 @@ impl WebTui {
                             // Key/Resize from EventBus (e.g. crossterm native terminal)
                             // are ignored in web mode — per-connection keys come via
                             // WebTuiCommand. But still forward to App for shared state.
-                            app.handle_event(ev);
+                            for d in app.handle_event(ev) { bus.send(d); }
                         }
                         Ok(ev) => {
-                            app.handle_event(ev);
+                            for d in app.handle_event(ev) { bus.send(d); }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

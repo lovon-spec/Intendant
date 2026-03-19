@@ -4272,11 +4272,11 @@ async fn main() -> Result<(), CallerError> {
             let mut web_tui = tui::web::WebTui::new(120, 40, broadcast_tx)
                 .map_err(|e| CallerError::Tui(format!("Failed to initialize Web TUI: {}", e)))?;
             let cmd_rx = web_tui_rx.expect("web_tui_rx must exist in --web mode");
-            let _ = web_tui.run(&mut app, event_rx, cmd_rx).await;
+            let _ = web_tui.run(&mut app, event_rx, cmd_rx, bus.clone()).await;
         } else {
             let mut terminal = tui::Tui::new()
                 .map_err(|e| CallerError::Tui(format!("Failed to initialize TUI: {}", e)))?;
-            let _ = terminal.run(&mut app, event_rx).await;
+            let _ = terminal.run(&mut app, event_rx, bus.clone()).await;
         }
 
         // Drop the App (and its follow_up_tx) so the round loop's recv()

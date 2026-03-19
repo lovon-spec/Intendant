@@ -190,6 +190,12 @@ pub enum AppEvent {
         seq: u64,
     },
 
+    /// Computed usage snapshot (emitted by TUI after accumulating tokens).
+    UsageSnapshot {
+        main: crate::frontend::ModelUsageSnapshot,
+        presence: Option<crate::frontend::ModelUsageSnapshot>,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
@@ -445,6 +451,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             prompt_tokens: *prompt_tokens,
             completion_tokens: *completion_tokens,
             cached_tokens: *cached_tokens,
+        }),
+        AppEvent::UsageSnapshot { main, presence } => Some(OutboundEvent::UsageUpdate {
+            main: main.clone(),
+            presence: presence.clone(),
         }),
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)

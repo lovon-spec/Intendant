@@ -1014,7 +1014,7 @@ function handleLogReplay(entries) {
       entry.classList.add('collapsible');
       const toggle = document.createElement('span');
       toggle.className = 'collapse-toggle';
-      toggle.innerHTML = '<span class="arrow">\u25B8</span><span class="arrow-up">\u25BE</span>';
+      toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';
       entry.appendChild(toggle);
       entry.addEventListener('click', () => entry.classList.toggle('expanded'));
     }

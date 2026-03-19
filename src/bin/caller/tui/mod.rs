@@ -58,6 +58,7 @@ impl Tui {
         &mut self,
         app: &mut App,
         mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
+        bus: crate::event::EventBus,
     ) -> io::Result<()> {
         let mut view = app::ViewState::default();
         loop {
@@ -69,14 +70,19 @@ impl Tui {
 
             match event_rx.recv().await {
                 Ok(event) => {
-                    if let AppEvent::Key(key) = &event {
+                    let derived = if let AppEvent::Key(key) = &event {
                         // Try view-only key handling first
                         if !view.handle_key(*key, app) {
                             // Fall through to shared state handling
-                            app.handle_event(event);
+                            app.handle_event(event)
+                        } else {
+                            Vec::new()
                         }
                     } else {
-                        app.handle_event(event);
+                        app.handle_event(event)
+                    };
+                    for d in derived {
+                        bus.send(d);
                     }
                     if app.should_quit {
                         break;

@@ -1298,9 +1298,13 @@ impl App {
     }
 
     /// Process an AppEvent and update state accordingly.
-    pub fn handle_event(&mut self, event: AppEvent) {
+    /// Returns derived events that the caller should send back to the EventBus
+    /// (e.g., usage snapshots computed from accumulated state).
+    pub fn handle_event(&mut self, event: AppEvent) -> Vec<AppEvent> {
         // Forward filtered events to the presence layer (non-blocking)
         self.forward_to_presence(&event);
+
+        let mut derived = Vec::new();
 
         match event {
             AppEvent::TurnStarted {
@@ -1327,6 +1331,11 @@ impl App {
                 self.session_prompt_tokens += usage.prompt_tokens;
                 self.session_completion_tokens += usage.completion_tokens;
                 self.session_cached_tokens += usage.cached_tokens;
+                // Emit usage snapshot so external consumers (web UI) get updated
+                derived.push(AppEvent::UsageSnapshot {
+                    main: self.main_usage_snapshot(),
+                    presence: self.presence_usage_snapshot(),
+                });
                 self.streaming_buffer.clear();
                 // Show human-readable command summary at Model level (visible at Normal verbosity)
                 let summary = format_model_summary(&content);
@@ -1608,6 +1617,10 @@ impl App {
                     self.presence_provider_name = Some(provider);
                     self.presence_model_name = Some(model);
                 }
+                derived.push(AppEvent::UsageSnapshot {
+                    main: self.main_usage_snapshot(),
+                    presence: self.presence_usage_snapshot(),
+                });
             }
             AppEvent::PresenceReady => {
                 // Switch to follow-up mode so the user can respond to presence,
@@ -1777,11 +1790,17 @@ impl App {
             AppEvent::Key(key) => {
                 self.handle_key(key);
             }
+            AppEvent::UsageSnapshot { .. } => {
+                // Derived event — just passes through to outbound broadcaster.
+                // App doesn't need to handle its own output.
+            }
             AppEvent::Resize(_, _) => {}
             AppEvent::Quit => {
                 self.should_quit = true;
             }
         }
+
+        derived
     }
 }
 
