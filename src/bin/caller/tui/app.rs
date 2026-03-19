@@ -1,6 +1,6 @@
 use crate::autonomy::SharedAutonomy;
 use crate::control;
-use crate::event::{AppEvent, ApprovalResponse, ControlMsg};
+use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg};
 pub use crate::types::{LogLevel, Phase, Verbosity};
 use crate::types::OutboundEvent;
 use crate::{knowledge, session_log};
@@ -8,7 +8,6 @@ use crate::tui::layout::PanelConfig;
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashSet, VecDeque};
-use tokio::sync::oneshot;
 
 const MAX_LOG_ENTRIES: usize = 10_000;
 
@@ -80,11 +79,9 @@ pub struct LogEntry {
 
 /// Pending approval waiting for user response.
 pub struct PendingApproval {
-    #[allow(dead_code)]
     pub id: u64,
     pub command_preview: String,
     pub category: String,
-    pub responder: oneshot::Sender<ApprovalResponse>,
 }
 
 /// Per-connection view state: scroll position, verbosity, inspect mode, etc.
@@ -480,6 +477,9 @@ pub struct App {
     pub autonomy: SharedAutonomy,
     pub control_tx: Option<tokio::sync::broadcast::Sender<String>>,
 
+    // Approval registry (shared with agent loop)
+    pub approval_registry: ApprovalRegistry,
+
     // Session log directory for askHuman files
     pub log_dir: std::path::PathBuf,
 
@@ -574,6 +574,7 @@ impl App {
             pending_approvals: VecDeque::new(),
             autonomy,
             control_tx: None,
+            approval_registry: ApprovalRegistry::default(),
             log_dir,
             session_tokens: 0,
             context_window: 0,
@@ -841,7 +842,7 @@ impl App {
 
         if let Some(resp) = response {
             if let Some(pending) = self.pending_approvals.pop_front() {
-                let _ = pending.responder.send(resp);
+                self.resolve_approval(pending.id, resp);
             }
             if self.pending_approvals.is_empty() {
                 self.mode = AppMode::Normal;
@@ -850,6 +851,15 @@ impl App {
             true
         } else {
             false
+        }
+    }
+
+    /// Send an approval response via the shared registry.
+    fn resolve_approval(&self, id: u64, response: ApprovalResponse) {
+        if let Ok(mut registry) = self.approval_registry.lock() {
+            if let Some(responder) = registry.remove(&id) {
+                let _ = responder.send(response);
+            }
         }
     }
 
@@ -1020,10 +1030,10 @@ impl App {
             }
             ControlMsg::Approve { id } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
-                    let pending = self.pending_approvals.remove(pos).unwrap();
+                    self.pending_approvals.remove(pos);
                     let via = self.approval_source();
                     self.log(LogLevel::Info, format!("Approved via {} (turn {})", via, id));
-                    let _ = pending.responder.send(ApprovalResponse::Approve);
+                    self.resolve_approval(id, ApprovalResponse::Approve);
                     if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
                         self.current_phase = Phase::RunningAgent;
@@ -1032,10 +1042,10 @@ impl App {
             }
             ControlMsg::Deny { id } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
-                    let pending = self.pending_approvals.remove(pos).unwrap();
+                    self.pending_approvals.remove(pos);
                     let via = self.approval_source();
                     self.log(LogLevel::Info, format!("Denied via {} (turn {})", via, id));
-                    let _ = pending.responder.send(ApprovalResponse::Deny);
+                    self.resolve_approval(id, ApprovalResponse::Deny);
                     if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
                         self.current_phase = Phase::Done;
@@ -1044,10 +1054,10 @@ impl App {
             }
             ControlMsg::Skip { id } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
-                    let pending = self.pending_approvals.remove(pos).unwrap();
+                    self.pending_approvals.remove(pos);
                     let via = self.approval_source();
                     self.log(LogLevel::Info, format!("Skipped via {} (turn {})", via, id));
-                    let _ = pending.responder.send(ApprovalResponse::Skip);
+                    self.resolve_approval(id, ApprovalResponse::Skip);
                     if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
                         self.current_phase = Phase::RunningAgent;
@@ -1056,10 +1066,10 @@ impl App {
             }
             ControlMsg::ApproveAll { id } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
-                    let pending = self.pending_approvals.remove(pos).unwrap();
+                    self.pending_approvals.remove(pos);
                     let via = self.approval_source();
                     self.log(LogLevel::Info, format!("Approve-all via {} (turn {})", via, id));
-                    let _ = pending.responder.send(ApprovalResponse::ApproveAll);
+                    self.resolve_approval(id, ApprovalResponse::ApproveAll);
                     self.set_autonomy_level("full");
                     if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
@@ -1525,7 +1535,6 @@ impl App {
                 id,
                 command_preview,
                 category,
-                responder,
             } => {
                 self.current_phase = Phase::WaitingApproval;
                 self.mode = AppMode::Approval;
@@ -1533,7 +1542,6 @@ impl App {
                     id,
                     command_preview: command_preview.clone(),
                     category: category.to_string(),
-                    responder,
                 });
                 let t = self.turn;
                 self.log_sourced(
@@ -2203,12 +2211,10 @@ mod tests {
     fn bottom_panel_height_approval_multiline() {
         let mut app = test_app();
         app.mode = AppMode::Approval;
-        let (tx, _rx) = oneshot::channel();
         app.pending_approvals.push_back(PendingApproval {
             id: 1,
             command_preview: "echo a\necho b\necho c\necho d\necho e".to_string(),
             category: "command_exec".to_string(),
-            responder: tx,
         });
         // 5 lines + 3 = 8
         assert_eq!(app.bottom_panel_height(), 8);
@@ -2218,13 +2224,11 @@ mod tests {
     fn bottom_panel_height_approval_clamped() {
         let mut app = test_app();
         app.mode = AppMode::Approval;
-        let (tx, _rx) = oneshot::channel();
         let long_cmd = (0..30).map(|i| format!("echo {}", i)).collect::<Vec<_>>().join("\n");
         app.pending_approvals.push_back(PendingApproval {
             id: 1,
             command_preview: long_cmd,
             category: "command_exec".to_string(),
-            responder: tx,
         });
         // 30 lines + 3 = 33, but clamped to 20
         assert_eq!(app.bottom_panel_height(), 20);
@@ -2302,13 +2306,13 @@ mod tests {
     #[test]
     fn approval_key_approve() {
         let mut app = test_app();
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.approval_registry.lock().unwrap().insert(1, tx);
         app.mode = AppMode::Approval;
         app.pending_approvals.push_back(PendingApproval {
             id: 1,
             command_preview: "rm -rf /tmp".to_string(),
             category: "destructive".to_string(),
-            responder: tx,
         });
 
         let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
@@ -2325,13 +2329,13 @@ mod tests {
     #[test]
     fn approval_key_deny() {
         let mut app = test_app();
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.approval_registry.lock().unwrap().insert(2, tx);
         app.mode = AppMode::Approval;
         app.pending_approvals.push_back(PendingApproval {
             id: 2,
             command_preview: "rm -rf /".to_string(),
             category: "destructive".to_string(),
-            responder: tx,
         });
 
         let key = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
@@ -2347,13 +2351,13 @@ mod tests {
     #[test]
     fn approval_key_skip() {
         let mut app = test_app();
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.approval_registry.lock().unwrap().insert(3, tx);
         app.mode = AppMode::Approval;
         app.pending_approvals.push_back(PendingApproval {
             id: 3,
             command_preview: "test".to_string(),
             category: "command_exec".to_string(),
-            responder: tx,
         });
 
         let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
@@ -2369,13 +2373,13 @@ mod tests {
     #[test]
     fn approval_key_approve_all() {
         let mut app = test_app();
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.approval_registry.lock().unwrap().insert(4, tx);
         app.mode = AppMode::Approval;
         app.pending_approvals.push_back(PendingApproval {
             id: 4,
             command_preview: "test".to_string(),
             category: "command_exec".to_string(),
-            responder: tx,
         });
 
         let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);

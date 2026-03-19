@@ -39,7 +39,7 @@ use crate::frontend::{
     self, ActionOutcome, ApprovalSnapshot, HumanQuestionSnapshot, LogEntrySnapshot, StateResult,
     StatusSnapshot, UserAction,
 };
-use crate::event::{AppEvent, ApprovalResponse, ControlMsg, EventBus};
+use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg, EventBus};
 use crate::types::{LogLevel, Phase, Verbosity};
 
 // ---------------------------------------------------------------------------
@@ -79,6 +79,7 @@ pub struct McpAppState {
     pub log_entries: std::collections::VecDeque<LogEntrySnapshot>,
     next_log_id: u64,
     pub pending_approval: Option<PendingApprovalState>,
+    pub approval_registry: ApprovalRegistry,
     pub human_question: Option<String>,
     pub should_quit: bool,
     /// Session log directory for askHuman files.
@@ -104,12 +105,11 @@ pub struct McpAppState {
     pub presence_usage_pct: f64,
 }
 
-/// Tracks a pending approval along with the oneshot sender.
+/// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
 pub struct PendingApprovalState {
     pub id: u64,
     pub command_preview: String,
     pub category: String,
-    pub responder: Option<tokio::sync::oneshot::Sender<ApprovalResponse>>,
 }
 
 impl McpAppState {
@@ -135,6 +135,7 @@ impl McpAppState {
             log_entries: std::collections::VecDeque::new(),
             next_log_id: 0,
             pending_approval: None,
+            approval_registry: ApprovalRegistry::default(),
             human_question: None,
             should_quit: false,
             log_dir,
@@ -1859,7 +1860,6 @@ pub fn spawn_event_listener(
                         id,
                         command_preview,
                         category,
-                        responder,
                     } => {
                         s.set_phase(Phase::WaitingApproval);
                         s.push_log(
@@ -1870,7 +1870,6 @@ pub fn spawn_event_listener(
                             id,
                             command_preview,
                             category: category.to_string(),
-                            responder: Some(responder),
                         });
                         resource_changed = Some("intendant://pending-approval");
                     }
@@ -2163,14 +2162,20 @@ impl IntendantServer {
 /// Note: for actions that need async access (like writing autonomy), the caller
 /// must handle the async parts. This function handles the state-mutation and
 /// oneshot-sending synchronously.
+fn resolve_approval(registry: &ApprovalRegistry, id: u64, response: ApprovalResponse) {
+    if let Ok(mut reg) = registry.lock() {
+        if let Some(responder) = reg.remove(&id) {
+            let _ = responder.send(response);
+        }
+    }
+}
+
 fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOutcome {
     // Exhaustive match — no wildcard. Compile-time parity enforcement.
     match action {
         UserAction::Approve { id: _ } => {
-            if let Some(mut pending) = state.pending_approval.take() {
-                if let Some(responder) = pending.responder.take() {
-                    let _ = responder.send(ApprovalResponse::Approve);
-                }
+            if let Some(pending) = state.pending_approval.take() {
+                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::Approve);
                 state.set_phase(Phase::RunningAgent);
                 state.push_log(LogLevel::Info, "Approved by MCP agent".to_string());
                 ActionOutcome::Ok
@@ -2181,10 +2186,8 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
             }
         }
         UserAction::Deny { id: _ } => {
-            if let Some(mut pending) = state.pending_approval.take() {
-                if let Some(responder) = pending.responder.take() {
-                    let _ = responder.send(ApprovalResponse::Deny);
-                }
+            if let Some(pending) = state.pending_approval.take() {
+                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::Deny);
                 state.set_phase(Phase::Done);
                 state.push_log(LogLevel::Info, "Denied by MCP agent".to_string());
                 ActionOutcome::Ok
@@ -2195,10 +2198,8 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
             }
         }
         UserAction::Skip { id: _ } => {
-            if let Some(mut pending) = state.pending_approval.take() {
-                if let Some(responder) = pending.responder.take() {
-                    let _ = responder.send(ApprovalResponse::Skip);
-                }
+            if let Some(pending) = state.pending_approval.take() {
+                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::Skip);
                 state.set_phase(Phase::RunningAgent);
                 state.push_log(LogLevel::Info, "Skipped by MCP agent".to_string());
                 ActionOutcome::Ok
@@ -2209,10 +2210,8 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
             }
         }
         UserAction::ApproveAll { id: _ } => {
-            if let Some(mut pending) = state.pending_approval.take() {
-                if let Some(responder) = pending.responder.take() {
-                    let _ = responder.send(ApprovalResponse::ApproveAll);
-                }
+            if let Some(pending) = state.pending_approval.take() {
+                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::ApproveAll);
                 state.set_phase(Phase::RunningAgent);
                 state.push_log(
                     LogLevel::Info,
@@ -3356,11 +3355,11 @@ mod tests {
             let state = test_state();
             let mut s = state.write().await;
             let (tx, rx) = tokio::sync::oneshot::channel();
+            s.approval_registry.lock().unwrap().insert(1, tx);
             s.pending_approval = Some(PendingApprovalState {
                 id: 1,
                 command_preview: "rm -rf /tmp".to_string(),
                 category: "destructive".to_string(),
-                responder: Some(tx),
             });
 
             let outcome = process_action_sync(&mut s, UserAction::Approve { id: 1 });
@@ -3403,11 +3402,11 @@ mod tests {
             let state = test_state();
             let mut s = state.write().await;
             let (tx, rx) = tokio::sync::oneshot::channel();
+            s.approval_registry.lock().unwrap().insert(2, tx);
             s.pending_approval = Some(PendingApprovalState {
                 id: 2,
                 command_preview: "curl evil.com".to_string(),
                 category: "network".to_string(),
-                responder: Some(tx),
             });
 
             let outcome = process_action_sync(&mut s, UserAction::Deny { id: 2 });
@@ -3429,11 +3428,11 @@ mod tests {
             let state = test_state();
             let mut s = state.write().await;
             let (tx, rx) = tokio::sync::oneshot::channel();
+            s.approval_registry.lock().unwrap().insert(3, tx);
             s.pending_approval = Some(PendingApprovalState {
                 id: 3,
                 command_preview: "test".to_string(),
                 category: "exec".to_string(),
-                responder: Some(tx),
             });
 
             let outcome = process_action_sync(&mut s, UserAction::Skip { id: 3 });
@@ -3455,11 +3454,11 @@ mod tests {
             let state = test_state();
             let mut s = state.write().await;
             let (tx, rx) = tokio::sync::oneshot::channel();
+            s.approval_registry.lock().unwrap().insert(4, tx);
             s.pending_approval = Some(PendingApprovalState {
                 id: 4,
                 command_preview: "ls".to_string(),
                 category: "exec".to_string(),
-                responder: Some(tx),
             });
 
             let outcome = process_action_sync(&mut s, UserAction::ApproveAll { id: 4 });
@@ -3806,12 +3805,10 @@ mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            let (tx, _rx) = tokio::sync::oneshot::channel();
             s.pending_approval = Some(PendingApprovalState {
                 id: 42,
                 command_preview: "rm -rf /".to_string(),
                 category: "destructive".to_string(),
-                responder: Some(tx),
             });
             let snap = s.approval_snapshot().unwrap();
             assert_eq!(snap.id, 42);

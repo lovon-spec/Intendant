@@ -9,10 +9,21 @@ use crate::provider::TokenUsage;
 use crate::types::LogLevel;
 use crossterm::event::KeyEvent;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+/// Shared registry for pending approval responders.
+///
+/// When the agent loop needs approval, it inserts a `oneshot::Sender` here
+/// keyed by approval ID, then sends an `ApprovalRequired` event (without the
+/// responder). Whichever frontend resolves the approval (TUI key press, web
+/// button, control socket command) removes the sender and calls `.send()`.
+pub type ApprovalRegistry =
+    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<ApprovalResponse>>>>;
+
 /// All events flowing through the system.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AppEvent {
     // Terminal input
     Key(KeyEvent),
@@ -91,7 +102,6 @@ pub enum AppEvent {
         id: u64,
         command_preview: String,
         category: ActionCategory,
-        responder: tokio::sync::oneshot::Sender<ApprovalResponse>,
     },
 
     // Vision display ready

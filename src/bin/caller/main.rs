@@ -826,7 +826,6 @@ fn app_event_to_json(event: &AppEvent) -> Option<(&'static str, serde_json::Valu
             id,
             command_preview,
             category,
-            ..
         } => Some((
             "approval_required",
             serde_json::json!({
@@ -1789,6 +1788,7 @@ async fn run_agent_loop(
     log_dir: &std::path::Path,
     mcp_mgr: Option<&mcp_client::McpClientManager>,
     json_approval: Option<&JsonApprovalSlot>,
+    approval_registry: &event::ApprovalRegistry,
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -2227,11 +2227,11 @@ async fn run_agent_loop(
 
                 if let Some(ref bus_ref) = bus {
                     let (tx, rx) = tokio::sync::oneshot::channel();
+                    approval_registry.lock().unwrap().insert(turn as u64, tx);
                     bus_ref.send(AppEvent::ApprovalRequired {
                         id: turn as u64,
                         command_preview: preview.clone(),
                         category: cat,
-                        responder: tx,
                     });
                     match rx.await {
                         Ok(event::ApprovalResponse::Approve) => {
@@ -2614,11 +2614,11 @@ Proceed with explicit assumptions and continue without additional questions."
 
                 if let Some(ref bus_ref) = bus {
                     let (tx, rx) = tokio::sync::oneshot::channel();
+                    approval_registry.lock().unwrap().insert(turn as u64, tx);
                     bus_ref.send(AppEvent::ApprovalRequired {
                         id: turn as u64,
                         command_preview: preview.clone(),
                         category: cat,
-                        responder: tx,
                     });
                     match rx.await {
                         Ok(event::ApprovalResponse::Approve) => {
@@ -2851,6 +2851,7 @@ async fn run_round_loop(
     mcp_mgr: Option<&mcp_client::McpClientManager>,
     mut follow_up_rx: FollowUpReceiver,
     json_approval: Option<&JsonApprovalSlot>,
+    approval_registry: &event::ApprovalRegistry,
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
     let mut cumulative_stats = LoopStats::default();
@@ -2867,6 +2868,7 @@ async fn run_round_loop(
             log_dir,
             mcp_mgr,
             json_approval,
+            approval_registry,
         )
         .await?;
 
@@ -3031,6 +3033,7 @@ All relative paths and commands execute from this directory.",
 
     let sub_agent_info = (id.clone(), role);
     let session_log_for_summary = session_log.clone();
+    let sub_agent_registry = event::ApprovalRegistry::default();
     let result = run_agent_loop(
         provider.as_ref(),
         &mut conversation,
@@ -3042,6 +3045,7 @@ All relative paths and commands execute from this directory.",
         &log_dir,
         None, // no MCP client for sub-agents
         None, // no JSON approval for sub-agents
+        &sub_agent_registry,
     )
     .await;
 
@@ -3272,6 +3276,7 @@ async fn run_with_presence(
                 None,
                 follow_up_rx,
                 None, // no JSON approval in TUI/presence mode
+                event::ApprovalRegistry::default(),
             )
             .await
         } else {
@@ -3623,6 +3628,7 @@ async fn run_direct_mode(
     mcp_mgr: Option<mcp_client::McpClientManager>,
     follow_up_rx: FollowUpReceiver,
     json_approval: Option<JsonApprovalSlot>,
+    approval_registry: event::ApprovalRegistry,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -3702,6 +3708,7 @@ async fn run_direct_mode(
         mcp_mgr.as_ref(),
         follow_up_rx,
         json_approval.as_ref(),
+        &approval_registry,
     )
     .await
 }
@@ -4153,6 +4160,7 @@ async fn main() -> Result<(), CallerError> {
                     s.follow_up_tx = Some(follow_up_tx);
                 }
 
+                let approval_registry = mcp_state.read().await.approval_registry.clone();
                 let bus_clone = bus.clone();
                 let task_for_summary = task_str.clone();
                 let session_log_summary = session_log.clone();
@@ -4180,6 +4188,7 @@ async fn main() -> Result<(), CallerError> {
                             None,
                             follow_up_rx,
                             None, // no JSON approval in MCP mode
+                            approval_registry,
                         )
                         .await
                     };
@@ -4448,6 +4457,7 @@ async fn main() -> Result<(), CallerError> {
         let session_log_clone = session_log.clone();
         let session_log_summary = session_log.clone();
         let log_dir_clone = log_dir.clone();
+        let approval_registry_clone = app.approval_registry.clone();
         let mcp_mgr = if !project.config.mcp_servers.is_empty() {
             Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
         } else {
@@ -4573,6 +4583,7 @@ async fn main() -> Result<(), CallerError> {
                         mcp_mgr,
                         follow_up_rx,
                         None, // no JSON approval in TUI mode
+                        approval_registry_clone,
                     )
                     .await
                 } else {
@@ -4786,6 +4797,7 @@ async fn main() -> Result<(), CallerError> {
                 mcp_mgr,
                 follow_up_rx,
                 json_approval_slot,
+                event::ApprovalRegistry::default(),
             )
             .await
         } else {
