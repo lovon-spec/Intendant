@@ -13,6 +13,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 
+/// Shared queue for context messages to inject into the agent conversation.
+/// Used by display takeover/release to notify the agent between turns.
+pub type ContextInjectionQueue = Arc<Mutex<Vec<String>>>;
+
 /// Shared registry for pending approval responders.
 ///
 /// When the agent loop needs approval, it inserts a `oneshot::Sender` here

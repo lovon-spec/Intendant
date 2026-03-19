@@ -483,6 +483,9 @@ pub struct App {
     // Session log directory for askHuman files
     pub log_dir: std::path::PathBuf,
 
+    // Context injection queue for display takeover messages
+    pub context_injection: crate::event::ContextInjectionQueue,
+
     // Token tracking
     pub session_tokens: u64,
     pub session_prompt_tokens: u64,
@@ -582,6 +585,7 @@ impl App {
             control_tx: None,
             approval_registry: ApprovalRegistry::default(),
             log_dir,
+            context_injection: crate::event::ContextInjectionQueue::default(),
             session_tokens: 0,
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
@@ -1627,20 +1631,31 @@ impl App {
                 self.log(LogLevel::Detail, log_msg);
             }
             AppEvent::DisplayTaken { display_id } => {
-                self.log(
-                    LogLevel::Warn,
-                    format!("User has taken manual control of display :{}", display_id),
+                let msg = format!(
+                    "User has taken manual control of display :{}. They may be interacting with the screen. Avoid mouse/keyboard automation until they release control.",
+                    display_id
                 );
+                self.log(LogLevel::Warn, msg.clone());
+                if let Ok(mut q) = self.context_injection.lock() {
+                    q.push(msg);
+                }
             }
             AppEvent::DisplayReleased { display_id, note } => {
-                let msg = format!(
-                    "User released control of display :{}{}",
-                    display_id,
-                    note.as_ref()
-                        .map(|n| format!(". Note: {}", n))
-                        .unwrap_or_default()
-                );
-                self.log(LogLevel::Info, msg);
+                let msg = if let Some(ref n) = note {
+                    format!(
+                        "User released control of display :{}. Note from user: '{}'. You may resume full automation.",
+                        display_id, n
+                    )
+                } else {
+                    format!(
+                        "User released control of display :{}. Screen state may have changed. You may resume full automation.",
+                        display_id
+                    )
+                };
+                self.log(LogLevel::Info, msg.clone());
+                if let Ok(mut q) = self.context_injection.lock() {
+                    q.push(msg);
+                }
             }
             AppEvent::SessionDirChanged { .. } => {
                 // Only relevant for MCP mode; TUI ignores this.
