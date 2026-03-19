@@ -76,6 +76,7 @@ html, body {
 .status-bar .session { color: var(--overlay1); font-size: 11px; }
 .status-bar .autonomy { font-weight: 600; }
 .status-bar .sep { color: var(--surface2); }
+.status-bar .field-label { color: var(--overlay0); font-size: 10px; margin-right: -6px; }
 .budget-bar {
   display: inline-flex;
   align-items: center;
@@ -166,14 +167,35 @@ html, body {
   display: flex;
 }
 
-/* ── Phase Banner ── */
-.phase-banner {
+/* ── Activity Toolbar ── */
+.activity-toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 6px 12px;
   background: var(--mantle);
   border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+}
+.verbosity-select {
+  margin-left: auto;
+  padding: 2px 6px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.verbosity-select:focus { outline: none; border-color: var(--blue); }
+
+/* ── Phase Banner ── */
+.phase-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
   font-size: 13px;
   flex-shrink: 0;
 }
@@ -198,17 +220,24 @@ html, body {
 }
 .log-entry {
   display: flex;
-  padding: 1px 12px;
+  padding: 2px 12px;
   line-height: 1.5;
   font-size: 13px;
 }
 .log-entry:hover { background: var(--mantle); }
+.log-entry .log-icon {
+  width: 20px;
+  flex-shrink: 0;
+  text-align: center;
+  font-size: 12px;
+  padding-top: 2px;
+}
 .log-entry .log-ts {
   color: var(--overlay1);
   width: 70px;
   flex-shrink: 0;
   font-size: 11px;
-  padding-top: 1px;
+  padding-top: 2px;
 }
 .log-entry .log-level {
   width: 52px;
@@ -216,13 +245,37 @@ html, body {
   font-weight: 600;
   font-size: 11px;
   text-transform: uppercase;
-  padding-top: 1px;
+  padding-top: 2px;
 }
 .log-entry .log-content {
   flex: 1;
   min-width: 0;
   white-space: pre-wrap;
   word-break: break-word;
+}
+/* Collapsible long entries */
+.log-entry.collapsible .log-content {
+  max-height: 1.5em;
+  overflow: hidden;
+  cursor: pointer;
+  position: relative;
+}
+.log-entry.collapsible .log-content::after {
+  content: ' ...';
+  color: var(--overlay0);
+}
+.log-entry.collapsible.expanded .log-content {
+  max-height: none;
+}
+.log-entry.collapsible.expanded .log-content::after {
+  content: '';
+}
+.log-entry .expand-hint {
+  color: var(--overlay0);
+  font-size: 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 2px 4px;
 }
 /* Log level colors */
 .log-entry.level-info .log-level { color: var(--log-info); }
@@ -557,12 +610,16 @@ html, body {
     <span class="sep">|</span>
     <span class="turn" id="sb-turn">T0</span>
     <span class="sep">|</span>
+    <span class="field-label">ctx</span>
     <div class="budget-bar">
       <div class="bar-track"><div class="bar-fill" id="sb-budget-fill"></div></div>
       <span class="budget-pct" id="sb-budget-pct">0%</span>
     </div>
     <span class="sep">|</span>
+    <span class="field-label">autonomy</span>
     <span class="autonomy" id="sb-autonomy">Medium</span>
+    <span class="sep">|</span>
+    <span class="field-label">session</span>
     <span class="session" id="sb-session"></span>
     <span class="conn-dot err" id="sb-conn"></span>
   </div>
@@ -580,9 +637,16 @@ html, body {
 
     <!-- Activity Tab -->
     <div id="tab-activity" class="tab-pane active">
-      <div class="phase-banner phase-idle" id="phase-banner">
-        <span class="spinner" id="phase-spinner"></span>
-        <span class="phase-text" id="phase-text">Idle</span>
+      <div class="activity-toolbar">
+        <div class="phase-banner phase-idle" id="phase-banner">
+          <span class="spinner" id="phase-spinner"></span>
+          <span class="phase-text" id="phase-text">Idle</span>
+        </div>
+        <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
+          <option value="normal" selected>Normal</option>
+          <option value="verbose">Verbose</option>
+          <option value="debug">Debug</option>
+        </select>
       </div>
       <div class="log-stream" id="log-stream"></div>
       <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
@@ -691,6 +755,29 @@ const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','�
 let spinnerIdx = 0;
 let spinnerInterval = null;
 
+// ── Log level symbols ──
+const LEVEL_ICONS = {
+  info:     '\u2139',  // i
+  model:    '\u2726',  // star
+  agent:    '\u25B6',  // play triangle
+  error:    '\u2716',  // x mark
+  warn:     '\u26A0',  // warning triangle
+  subagent: '\u2726',  // star
+  detail:   '\u00B7',  // middle dot
+  debug:    '\u2022',  // bullet
+  presence: '\u25C9',  // circle dot
+};
+
+// Verbosity → which log levels to show
+const VERBOSITY_LEVELS = {
+  normal:  ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'presence'],
+  verbose: ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'detail', 'presence'],
+  debug:   ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'detail', 'debug', 'presence'],
+};
+
+// Lines above which an entry is collapsible
+const COLLAPSE_THRESHOLD = 3;
+
 // ── State ──
 let ws = null;
 let connected = false;
@@ -699,6 +786,7 @@ let pendingApprovalId = null;
 let activeTab = 'activity';
 let autoScroll = true;
 let logEntryCount = 0;
+let verbosity = 'normal';
 const MAX_LOG_ENTRIES = 10000;
 
 // Usage tracking
@@ -1054,6 +1142,17 @@ function addLogEntry(level, content, turn) {
 
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + level;
+  entry.dataset.level = level;
+
+  // Visibility based on verbosity
+  const visible = VERBOSITY_LEVELS[verbosity] || VERBOSITY_LEVELS.normal;
+  if (!visible.includes(level)) {
+    entry.style.display = 'none';
+  }
+
+  const icon = document.createElement('span');
+  icon.className = 'log-icon';
+  icon.textContent = LEVEL_ICONS[level] || '\u2022';
 
   const ts = document.createElement('span');
   ts.className = 'log-ts';
@@ -1067,9 +1166,20 @@ function addLogEntry(level, content, turn) {
   cnt.className = 'log-content';
   cnt.textContent = content;
 
+  entry.appendChild(icon);
   entry.appendChild(ts);
   entry.appendChild(lvl);
   entry.appendChild(cnt);
+
+  // Make long entries collapsible
+  const lineCount = content.split('\n').length;
+  if (lineCount > COLLAPSE_THRESHOLD || content.length > 300) {
+    entry.classList.add('collapsible');
+    entry.addEventListener('click', () => {
+      entry.classList.toggle('expanded');
+    });
+  }
+
   stream.appendChild(entry);
 
   logEntryCount++;
@@ -1102,6 +1212,16 @@ function addLogEntry(level, content, turn) {
     btn.classList.remove('visible');
   });
 })();
+
+// ── Verbosity Toggle ──
+document.getElementById('verbosity-select').addEventListener('change', (e) => {
+  verbosity = e.target.value;
+  const visible = VERBOSITY_LEVELS[verbosity] || VERBOSITY_LEVELS.normal;
+  document.querySelectorAll('.log-entry').forEach(entry => {
+    const level = entry.dataset.level;
+    entry.style.display = visible.includes(level) ? '' : 'none';
+  });
+});
 
 // ── Bottom Panels ──
 function showBottomPanel(id) {
