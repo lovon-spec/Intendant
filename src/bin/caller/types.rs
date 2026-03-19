@@ -221,6 +221,12 @@ pub enum OutboundEvent {
         usage_pct: f64,
         provider: String,
         model: String,
+        #[serde(default)]
+        prompt_tokens: u64,
+        #[serde(default)]
+        completion_tokens: u64,
+        #[serde(default)]
+        cached_tokens: u64,
     },
 }
 

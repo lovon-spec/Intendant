@@ -97,6 +97,10 @@ pub struct PresenceLayer {
     /// All events and user input are silently dropped — the browser live model
     /// IS the presence and dispatches tasks directly via task_tx.
     paused: Arc<AtomicUsize>,
+    /// Cumulative prompt/completion/cached tokens across all presence turns.
+    cumulative_prompt: u64,
+    cumulative_completion: u64,
+    cumulative_cached: u64,
 }
 
 impl PresenceLayer {
@@ -128,6 +132,9 @@ impl PresenceLayer {
             turn: 0,
             last_narration_at: std::time::Instant::now() - NARRATION_DEBOUNCE,
             paused,
+            cumulative_prompt: 0,
+            cumulative_completion: 0,
+            cumulative_cached: 0,
         }
     }
 
@@ -157,12 +164,16 @@ impl PresenceLayer {
 
     /// Return current token usage stats for the presence conversation.
     pub fn usage_snapshot(&self) -> PresenceUsage {
+        let last = self.conversation.last_usage();
         PresenceUsage {
-            total_tokens: self.conversation.last_usage().map(|u| u.total_tokens).unwrap_or(0),
+            total_tokens: last.map(|u| u.total_tokens).unwrap_or(0),
             context_window: self.conversation.context_window(),
             usage_pct: self.conversation.usage_fraction() * 100.0,
             provider: self.provider.name().to_string(),
             model: self.provider.model().to_string(),
+            prompt_tokens: self.cumulative_prompt,
+            completion_tokens: self.cumulative_completion,
+            cached_tokens: self.cumulative_cached,
         }
     }
 
@@ -183,6 +194,9 @@ impl PresenceLayer {
             usage_pct: usage.usage_pct,
             provider: usage.provider,
             model: usage.model,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_tokens: usage.cached_tokens,
         });
     }
 
@@ -239,6 +253,9 @@ impl PresenceLayer {
                 Some(LogLevel::Debug),
             );
 
+            self.cumulative_prompt += response.usage.prompt_tokens;
+            self.cumulative_completion += response.usage.completion_tokens;
+            self.cumulative_cached += response.usage.cached_tokens;
             self.conversation.set_usage(response.usage.clone());
             self.conversation.auto_compact();
 

@@ -258,34 +258,24 @@ html, body {
 .log-entry.collapsible {
   cursor: pointer;
 }
-.log-entry.collapsible .log-icon {
-  color: var(--overlay0);
-}
-.log-entry.collapsible .log-icon::before {
-  content: '\25B8';  /* ▸ right-pointing triangle */
-  font-size: 10px;
-  position: absolute;
-  left: 3px;
-}
-.log-entry.collapsible.expanded .log-icon::before {
-  content: '\25BE';  /* ▾ down-pointing triangle */
-}
 .log-entry.collapsible .log-content {
   max-height: 1.5em;
   overflow: hidden;
   position: relative;
 }
-.log-entry.collapsible .log-content::after {
-  content: ' \2026';  /* ellipsis */
-  color: var(--overlay0);
-  font-style: italic;
+.log-entry.collapsible .collapse-toggle {
+  color: var(--blue);
+  font-size: 11px;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  opacity: 0.7;
 }
+.log-entry.collapsible:hover .collapse-toggle { opacity: 1; }
 .log-entry.collapsible.expanded .log-content {
   max-height: none;
 }
-.log-entry.collapsible.expanded .log-content::after {
-  content: '';
-}
+.log-entry.collapsible.expanded .collapse-toggle .arrow { display: none; }
+.log-entry.collapsible:not(.expanded) .collapse-toggle .arrow-up { display: none; }
 .log-entry .expand-hint {
   color: var(--overlay0);
   font-size: 10px;
@@ -1022,6 +1012,10 @@ function handleLogReplay(entries) {
     const lineCount = (e.content || '').split('\n').length;
     if (lineCount > COLLAPSE_THRESHOLD || (e.content || '').length > 300) {
       entry.classList.add('collapsible');
+      const toggle = document.createElement('span');
+      toggle.className = 'collapse-toggle';
+      toggle.innerHTML = '<span class="arrow">\u25B8</span><span class="arrow-up">\u25BE</span>';
+      entry.appendChild(toggle);
       entry.addEventListener('click', () => entry.classList.toggle('expanded'));
     }
 
@@ -1207,9 +1201,9 @@ function handleEvent(msg) {
         tokens_used: msg.total_tokens,
         context_window: msg.context_window,
         usage_pct: msg.usage_pct,
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        cached_tokens: 0,
+        prompt_tokens: msg.prompt_tokens || 0,
+        completion_tokens: msg.completion_tokens || 0,
+        cached_tokens: msg.cached_tokens || 0,
       };
       renderUsageTab();
       break;
@@ -1385,9 +1379,11 @@ function addLogEntry(level, content, turn, source) {
   const lineCount = content.split('\n').length;
   if (lineCount > COLLAPSE_THRESHOLD || content.length > 300) {
     entry.classList.add('collapsible');
-    entry.addEventListener('click', () => {
-      entry.classList.toggle('expanded');
-    });
+    const toggle = document.createElement('span');
+    toggle.className = 'collapse-toggle';
+    toggle.innerHTML = '<span class="arrow">\u25B8</span><span class="arrow-up">\u25BE</span>';
+    entry.appendChild(toggle);
+    entry.addEventListener('click', () => entry.classList.toggle('expanded'));
   }
 
   stream.appendChild(entry);

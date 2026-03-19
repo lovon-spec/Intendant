@@ -1940,6 +1940,7 @@ pub fn spawn_event_listener(
                         usage_pct,
                         provider,
                         model,
+                        ..
                     } => {
                         s.presence_tokens = total_tokens;
                         s.presence_context_window = context_window;

@@ -1599,6 +1599,7 @@ impl App {
                 usage_pct,
                 provider,
                 model,
+                ..
             } => {
                 self.presence_tokens = total_tokens;
                 self.presence_context_window = context_window;

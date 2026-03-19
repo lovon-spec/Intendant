@@ -99,6 +99,12 @@ pub struct PresenceUsage {
     pub usage_pct: f64,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 /// Queryable snapshot of the agent's current state.

@@ -2765,6 +2765,9 @@ async fn run_with_presence(
         usage_pct: 0.0,
         provider: presence_provider.name().to_string(),
         model: presence_provider.model().to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
     });
 
     // 2. Resolve presence system prompt (independent of sub-agent role system)

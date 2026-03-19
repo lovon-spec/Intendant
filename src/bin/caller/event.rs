@@ -130,6 +130,9 @@ pub enum AppEvent {
         usage_pct: f64,
         provider: String,
         model: String,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cached_tokens: u64,
     },
 
     /// Presence layer log message (shown in TUI log panel).
@@ -430,12 +433,18 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             usage_pct,
             provider,
             model,
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
         } => Some(OutboundEvent::PresenceUsageUpdate {
             total_tokens: *total_tokens,
             context_window: *context_window,
             usage_pct: *usage_pct,
             provider: provider.clone(),
             model: model.clone(),
+            prompt_tokens: *prompt_tokens,
+            completion_tokens: *completion_tokens,
+            cached_tokens: *cached_tokens,
         }),
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)
