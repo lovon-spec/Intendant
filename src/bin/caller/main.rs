@@ -1583,6 +1583,7 @@ async fn run_agent_loop(
     mcp_mgr: Option<&mcp_client::McpClientManager>,
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
+    context_injection: &event::ContextInjectionQueue,
     // When true, askHuman is unavailable and approvals without a json_approval
     // slot are auto-denied (headless non-JSON mode).
     headless: bool,
@@ -1608,6 +1609,14 @@ async fn run_agent_loop(
             bus.send(AppEvent::BudgetExhausted { remaining });
             exit_reason = LoopExitReason::BudgetExhausted;
             break;
+        }
+
+        // Drain context injection queue (display takeover messages, etc.)
+        if let Ok(mut q) = context_injection.lock() {
+            for msg in q.drain(..) {
+                conversation.add_user(format!("[System] {}", msg));
+                slog(&session_log, |l| l.info(&format!("Context injected: {}", msg)));
+            }
         }
 
         conversation.increment_turn();
@@ -2470,6 +2479,7 @@ async fn run_round_loop(
     mut follow_up_rx: FollowUpReceiver,
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
+    context_injection: &event::ContextInjectionQueue,
     headless: bool,
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
@@ -2488,6 +2498,7 @@ async fn run_round_loop(
             mcp_mgr,
             json_approval,
             approval_registry,
+            context_injection,
             headless,
         )
         .await?;
@@ -2663,6 +2674,7 @@ All relative paths and commands execute from this directory.",
         None, // no MCP client for sub-agents
         None, // no JSON approval for sub-agents
         &sub_agent_registry,
+        &event::ContextInjectionQueue::default(),
         true, // headless (sub-agents have no interactive UI)
     )
     .await;
@@ -2899,6 +2911,7 @@ async fn run_with_presence(
                 follow_up_rx,
                 None, // no JSON approval in TUI/presence mode
                 approval_registry.clone(),
+                event::ContextInjectionQueue::default(),
                 false, // not headless — presence has interactive UI
             )
             .await
@@ -3236,6 +3249,7 @@ async fn run_direct_mode(
     follow_up_rx: FollowUpReceiver,
     json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
+    context_injection: event::ContextInjectionQueue,
     headless: bool,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
@@ -3317,6 +3331,7 @@ async fn run_direct_mode(
         follow_up_rx,
         json_approval.as_ref(),
         &approval_registry,
+        &context_injection,
         headless,
     )
     .await
@@ -3813,6 +3828,7 @@ async fn main() -> Result<(), CallerError> {
                             follow_up_rx,
                             None, // no JSON approval in MCP mode
                             approval_registry,
+                            event::ContextInjectionQueue::default(),
                             false, // not headless — MCP has interactive approval
                         )
                         .await
@@ -4092,6 +4108,7 @@ async fn main() -> Result<(), CallerError> {
         let session_log_summary = session_log.clone();
         let log_dir_clone = log_dir.clone();
         let approval_registry_clone = app.approval_registry.clone();
+        let context_injection_clone = app.context_injection.clone();
         let mcp_mgr = if !project.config.mcp_servers.is_empty() {
             Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
         } else {
@@ -4219,6 +4236,7 @@ async fn main() -> Result<(), CallerError> {
                         follow_up_rx,
                         None, // no JSON approval in TUI mode
                         approval_registry_clone,
+                        context_injection_clone,
                         false, // not headless — TUI handles approval
                     )
                     .await
@@ -4453,6 +4471,7 @@ async fn main() -> Result<(), CallerError> {
                 follow_up_rx,
                 json_approval_slot,
                 event::ApprovalRegistry::default(),
+                event::ContextInjectionQueue::default(),
                 true, // headless mode
             )
             .await
