@@ -783,15 +783,15 @@ let spinnerInterval = null;
 
 // ── Log level symbols + tooltips ──
 const LEVEL_ICONS = {
-  info:     '\u2139',  // i
-  model:    '\u2726',  // star
-  agent:    '\u25B6',  // play triangle
-  error:    '\u2716',  // x mark
-  warn:     '\u26A0',  // warning triangle
-  subagent: '\u2726',  // star
-  detail:   '\u00B7',  // middle dot
-  debug:    '\u2022',  // bullet
-  presence: '\u25C9',  // circle dot
+  info:     '\u2139',  // ℹ
+  model:    '\u2726',  // ✦
+  agent:    '\u25B6',  // ▶
+  error:    '\u2716',  // ✖
+  warn:     '\u26A0',  // ⚠
+  subagent: '\u2726',  // ✦
+  detail:   '\u00B7',  // ·
+  debug:    '\u2022',  // •
+  presence: '\u25C9',  // ◉
 };
 const LEVEL_TOOLTIPS = {
   info:     'Info \u2014 general status update',
@@ -803,6 +803,17 @@ const LEVEL_TOOLTIPS = {
   detail:   'Detail \u2014 verbose context (enable in Verbose mode)',
   debug:    'Debug \u2014 internal diagnostics (enable in Debug mode)',
   presence: 'Presence \u2014 live model interaction',
+};
+
+// Source labels (matching TUI: Workr, Agent, Servr, Live, Sub, etc.)
+const SOURCE_LABELS = {
+  system: '\u2139',      // ℹ (system info)
+  worker: 'Workr',       // model/worker
+  agent:  'Agent',       // agent runtime
+  server: 'Servr',       // server-side presence
+  live:   'Live',        // browser-side live presence
+  sub:    'Sub',         // sub-agent
+  orch:   'Orch',        // orchestrator
 };
 
 // Verbosity → which log levels to show
@@ -959,7 +970,7 @@ function handleStateSnapshot(msg) {
     document.getElementById('approval-category').textContent =
       s.pending_approval.category ? 'Category: ' + s.pending_approval.category : '';
     showBottomPanel('approval-panel');
-    addLogEntry('warn', `Approval required: ${s.pending_approval.command_preview || ''}`);
+    addLogEntry('warn', `Approval required: ${s.pending_approval.command_preview || ''}`, undefined, SOURCE_LABELS.worker);
   }
 
   // Show follow-up panel if waiting for follow-up
@@ -973,7 +984,7 @@ function handleStateSnapshot(msg) {
 function handleEvent(msg) {
   switch (msg.event) {
     case 'turn_started':
-      addLogEntry('info', `Turn ${msg.turn} started`, msg.turn);
+      addLogEntry('info', `Turn ${msg.turn} started`, msg.turn, SOURCE_LABELS.system);
       updateBudget(msg.budget_pct);
       document.getElementById('sb-turn').textContent = 'T' + msg.turn;
       setPhase('thinking');
@@ -985,8 +996,8 @@ function handleEvent(msg) {
       break;
 
     case 'model_response':
-      addLogEntry('model', `T${msg.turn}: ${msg.summary}`);
-      if (msg.reasoning_summary) addLogEntry('detail', `Reasoning: ${msg.reasoning_summary}`);
+      addLogEntry('model', msg.summary || '(thinking...)', undefined, SOURCE_LABELS.worker);
+      if (msg.reasoning_summary) addLogEntry('detail', msg.reasoning_summary, undefined, SOURCE_LABELS.worker);
       break;
 
     case 'model_response_delta':
@@ -994,46 +1005,46 @@ function handleEvent(msg) {
       break;
 
     case 'agent_started':
-      addLogEntry('detail', `Running: ${msg.commands_preview}`);
+      addLogEntry('detail', `Running: ${msg.commands_preview}`, undefined, SOURCE_LABELS.agent);
       setPhase('running');
       break;
 
     case 'agent_output':
-      if (msg.stdout) addLogEntry('agent', formatAgentOutput(msg.stdout));
-      if (msg.stderr) addLogEntry('warn', msg.stderr);
+      if (msg.stdout) addLogEntry('agent', formatAgentOutput(msg.stdout), undefined, SOURCE_LABELS.agent);
+      if (msg.stderr) addLogEntry('warn', msg.stderr, undefined, SOURCE_LABELS.agent);
       setPhase('running');
       break;
 
     case 'auto_approved':
-      addLogEntry('info', `Auto-approved: ${msg.preview}`);
+      addLogEntry('info', `Auto-approved: ${msg.preview}`, undefined, SOURCE_LABELS.system);
       break;
 
     case 'done_signal':
-      addLogEntry('detail', `Done signal${msg.message ? ': ' + msg.message : ''}`);
+      addLogEntry('detail', `Done signal${msg.message ? ': ' + msg.message : ''}`, undefined, SOURCE_LABELS.worker);
       break;
 
     case 'context_management':
-      addLogEntry('info', `Context compacted at turn ${msg.turn}`);
+      addLogEntry('info', `Context compacted at turn ${msg.turn}`, undefined, SOURCE_LABELS.system);
       break;
 
     case 'budget_warning':
-      addLogEntry('warn', `Budget warning: ${msg.pct.toFixed(1)}% used`);
+      addLogEntry('warn', `Budget warning: ${msg.pct.toFixed(1)}% used`, undefined, SOURCE_LABELS.system);
       break;
 
     case 'budget_exhausted':
-      addLogEntry('error', `Budget exhausted (${msg.remaining} tokens remaining)`);
+      addLogEntry('error', `Budget exhausted (${msg.remaining} tokens remaining)`, undefined, SOURCE_LABELS.system);
       break;
 
     case 'loop_error':
-      addLogEntry('error', msg.message);
+      addLogEntry('error', msg.message, undefined, SOURCE_LABELS.system);
       break;
 
     case 'sub_agent_result':
-      addLogEntry('subagent', msg.summary);
+      addLogEntry('subagent', msg.summary, undefined, SOURCE_LABELS.sub);
       break;
 
     case 'orchestrator_progress':
-      addLogEntry('info', msg.status);
+      addLogEntry('info', msg.status, undefined, SOURCE_LABELS.orch);
       break;
 
     case 'approval_required':
@@ -1042,7 +1053,7 @@ function handleEvent(msg) {
       document.getElementById('approval-category').textContent = msg.category ? 'Category: ' + msg.category : '';
       showBottomPanel('approval-panel');
       setPhase('waiting');
-      addLogEntry('warn', `Approval required: ${msg.command}`);
+      addLogEntry('warn', `Approval required: ${msg.command}`, undefined, SOURCE_LABELS.worker);
       // Badge on activity tab if not viewing it
       if (activeTab !== 'activity') {
         const badge = document.getElementById('badge-activity');
@@ -1055,7 +1066,7 @@ function handleEvent(msg) {
       document.getElementById('human-question').textContent = msg.question || '';
       showBottomPanel('human-panel');
       setPhase('waiting');
-      addLogEntry('info', `Question: ${msg.question}`);
+      addLogEntry('info', `Question: ${msg.question}`, undefined, SOURCE_LABELS.worker);
       if (activeTab !== 'activity') {
         const badge = document.getElementById('badge-activity');
         badge.textContent = '?';
@@ -1066,13 +1077,13 @@ function handleEvent(msg) {
     case 'task_complete':
       hideAllBottomPanels();
       setPhase('done');
-      addLogEntry('info', `Task complete: ${msg.reason}${msg.summary ? ' — ' + msg.summary : ''}`);
+      addLogEntry('info', `Task complete: ${msg.reason}${msg.summary ? ' \u2014 ' + msg.summary : ''}`, undefined, SOURCE_LABELS.worker);
       showBottomPanel('followup-panel');
       break;
 
     case 'round_complete':
       setPhase('idle');
-      addLogEntry('info', `Round ${msg.round} complete (${msg.turns_in_round} turns)`);
+      addLogEntry('info', `Round ${msg.round} complete (${msg.turns_in_round} turns)`, undefined, SOURCE_LABELS.system);
       showBottomPanel('followup-panel');
       break;
 
@@ -1087,81 +1098,29 @@ function handleEvent(msg) {
       usageData.presence = msg.presence || null;
       if (usageData.main) {
         updateBudget(usageData.main.usage_pct);
-        addLogEntry('detail', `tokens: ${usageData.main.tokens_used.toLocaleString()} / ${usageData.main.context_window.toLocaleString()} (${usageData.main.usage_pct.toFixed(1)}%)`);
+        addLogEntry('detail', `tokens: ${usageData.main.tokens_used.toLocaleString()} / ${usageData.main.context_window.toLocaleString()} (${usageData.main.usage_pct.toFixed(1)}%)`, undefined, SOURCE_LABELS.system);
       }
       renderUsageTab();
       break;
 
     case 'display_ready':
-      addLogEntry('info', `Display :${msg.display_id} ready${msg.vnc_port ? ' (VNC port ' + msg.vnc_port + ')' : ''}`);
+      addLogEntry('info', `Display :${msg.display_id} ready${msg.vnc_port ? ' (VNC port ' + msg.vnc_port + ')' : ''}`, undefined, SOURCE_LABELS.system);
       break;
 
     case 'command_result':
-      addLogEntry(msg.ok ? 'detail' : 'error', `[${msg.action}] ${msg.message}`);
+      addLogEntry(msg.ok ? 'detail' : 'error', `[${msg.action}] ${msg.message}`, undefined, SOURCE_LABELS.system);
       break;
 
     case 'user_transcript':
-      addLogEntry('presence', `[voice] ${msg.text}`);
-      break;
-
-    case 'model_response_delta':
-      // Streaming text delta — could be used for live display
-      break;
-
-    case 'model_response':
-      addLogEntry('model', `T${msg.turn}: ${msg.summary}`);
-      if (msg.reasoning_summary) addLogEntry('detail', `Reasoning: ${msg.reasoning_summary}`);
-      break;
-
-    case 'agent_started':
-      addLogEntry('detail', `Running (T${msg.turn}): ${msg.commands_preview}`);
-      setPhase('running');
-      break;
-
-    case 'done_signal':
-      if (msg.message) addLogEntry('info', msg.message);
-      setPhase('done');
-      break;
-
-    case 'auto_approved':
-      addLogEntry('detail', `Auto-approved: ${msg.preview}`);
-      break;
-
-    case 'context_management':
-      addLogEntry('detail', `Context compacted (turn ${msg.turn})`);
-      break;
-
-    case 'budget_warning':
-      addLogEntry('warn', `Budget warning: ${msg.pct.toFixed(0)}% used (${msg.remaining.toLocaleString()} remaining)`);
-      updateBudget(msg.pct);
-      break;
-
-    case 'budget_exhausted':
-      addLogEntry('error', `Budget exhausted (${msg.remaining.toLocaleString()} remaining)`);
-      updateBudget(100);
-      setPhase('done');
-      break;
-
-    case 'loop_error':
-      addLogEntry('error', msg.message);
-      setPhase('done');
-      break;
-
-    case 'sub_agent_result':
-      addLogEntry('subagent', msg.summary);
-      break;
-
-    case 'orchestrator_progress':
-      addLogEntry('subagent', msg.status);
-      setPhase('orchestrating');
+      addLogEntry('presence', msg.text, undefined, SOURCE_LABELS.live);
       break;
 
     case 'human_response_sent':
-      addLogEntry('detail', 'Human response sent');
+      addLogEntry('detail', 'Human response sent', undefined, SOURCE_LABELS.system);
       break;
 
     case 'safety_cap_reached':
-      addLogEntry('error', 'Safety cap reached');
+      addLogEntry('error', 'Safety cap reached', undefined, SOURCE_LABELS.system);
       setPhase('done');
       break;
 
@@ -1274,7 +1233,7 @@ function stopSpinner() {
 }
 
 // ── Log Stream ──
-function addLogEntry(level, content, turn) {
+function addLogEntry(level, content, turn, source) {
   const stream = document.getElementById('log-stream');
 
   // Turn separator
@@ -1304,9 +1263,11 @@ function addLogEntry(level, content, turn) {
   ts.className = 'log-ts';
   ts.textContent = new Date().toLocaleTimeString('en-US', { hour12: false });
 
+  // Source label (matches TUI: Workr, Agent, Servr, etc.)
+  const sourceLabel = source || SOURCE_LABELS.system;
   const lvl = document.createElement('span');
   lvl.className = 'log-level';
-  lvl.textContent = level;
+  lvl.textContent = sourceLabel;
 
   const cnt = document.createElement('span');
   cnt.className = 'log-content';
