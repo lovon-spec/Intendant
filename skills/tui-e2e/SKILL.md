@@ -20,16 +20,10 @@ Always start `x11vnc` so the human can follow along via VNC on port 5950.
 Both Xvfb and x11vnc MUST be started before launching xterm.
 
 ```bash
-# 1. Kill stale processes from prior runs
-# IMPORTANT: Run each pkill as a SEPARATE Bash tool call and verify with pgrep.
-# Chaining pkill with ; can fail silently (exit codes abort the chain).
-pkill -f 'Xvfb :50' 2>/dev/null; echo "done"
-# then separately:
-pkill -f 'x11vnc.*:50' 2>/dev/null; echo "done"
-# then separately:
-pkill -f 'intendant.*control-socket' 2>/dev/null; echo "done"
-# then verify:
-pgrep -c intendant 2>/dev/null || echo "0 intendant"
+# 1. Kill stale processes from prior runs (use -9 for firefox — it ignores SIGTERM)
+pkill -f 'Xvfb :50' 2>/dev/null
+pkill -f 'x11vnc.*:50' 2>/dev/null
+pkill -f 'intendant.*control-socket' 2>/dev/null
 sleep 0.5
 
 # 2. Start Xvfb + x11vnc (MANDATORY — human needs VNC to observe)
@@ -164,8 +158,7 @@ This is **not needed for assertions** — use the control socket instead.
 ## Cleanup
 
 ```bash
-# Run each separately and verify:
-pkill -f 'intendant.*control-socket' 2>/dev/null; echo "done"
-pkill -f 'Xvfb :50' 2>/dev/null; echo "done"
-pkill -f 'x11vnc.*:50' 2>/dev/null; echo "done"
+pkill -f 'intendant.*control-socket' 2>/dev/null
+pkill -f 'Xvfb :50' 2>/dev/null
+pkill -f 'x11vnc.*:50' 2>/dev/null
 ```

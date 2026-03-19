@@ -73,29 +73,13 @@ PulseAudio must be running (`pactl info` should succeed).
 
 ### 1. Clean up stale processes
 
-**IMPORTANT**: Kill each process in a SEPARATE Bash tool call and verify it's dead
-before proceeding. Chaining `pkill` commands with `;` or `&&` can fail silently —
-the exit code from one kill can abort the chain, leaving processes alive. Old Firefox
-processes are especially problematic: they hold the Gemini API key in localStorage
-and will auto-connect voice, stealing the active slot from your test browser.
+Use `-9` for Firefox (it ignores SIGTERM). Run each kill separately, verify with pgrep.
 
 ```bash
-# Run each kill + verify as a separate Bash call:
-pkill -f 'Xvfb :50' 2>/dev/null; echo "done"
-```
-```bash
-pkill -f 'x11vnc.*:50' 2>/dev/null; echo "done"
-```
-```bash
-pkill -f firefox 2>/dev/null; echo "done"
-```
-```bash
-pkill -f intendant 2>/dev/null; echo "done"
-```
-```bash
-# VERIFY all dead before proceeding
-pgrep -c firefox 2>/dev/null || echo "0 firefox"
-pgrep -c intendant 2>/dev/null || echo "0 intendant"
+pkill -f 'Xvfb :50' 2>/dev/null
+pkill -f 'x11vnc.*:50' 2>/dev/null
+pkill -9 -f firefox 2>/dev/null
+pkill -f intendant 2>/dev/null
 sleep 0.5
 ```
 
