@@ -313,9 +313,16 @@ impl ViewState {
         if self.show_inspect {
             return self.handle_inspect_key(key, app);
         }
-        // In shared-mode states (Approval, AskHuman, FollowUp), let App handle keys
+        // In shared-mode states, approval and follow-up keys go to App,
+        // but scroll/expand/verbosity keys are still handled here so the
+        // user can browse logs while an approval is pending.
         match app.mode {
-            AppMode::Approval | AppMode::AskHuman | AppMode::FollowUp => false,
+            AppMode::Approval => {
+                // Let scroll/view keys work during approval
+                self.handle_normal_view_key(key, app)
+                // If not consumed, falls through to App::handle_approval_key
+            }
+            AppMode::AskHuman | AppMode::FollowUp => false,
             AppMode::Normal | AppMode::Help | AppMode::Inspect => {
                 self.handle_normal_view_key(key, app)
             }
@@ -1758,9 +1765,9 @@ impl App {
                         log.user_transcript(text, seq);
                     }
                 }
-                // Log at Info level with Presence source (shows "Voice" label)
-                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
-                self.log_sourced(LogLevel::Info, format!("[You] {}", text), LogSource::Live, vt);
+                // Log at Info level — no turn grouping so user speech is never
+                // collapsed inside a voice model response.
+                self.log_sourced(LogLevel::Info, format!("[You] {}", text), LogSource::Live, None);
                 // Broadcast as outbound event
                 self.broadcast_control(OutboundEvent::UserTranscript {
                     text: text.clone(),
