@@ -462,7 +462,17 @@ pub fn spawn_web_gateway(
     }
 
     let web_html = Arc::new(web_html);
-    let app_html = Arc::new(APP_HTML.to_string());
+    let app_html = Arc::new(
+        APP_HTML
+            .replace(
+                "/wasm-web/presence_web.js",
+                &format!("/wasm-web/presence_web.js?v={}", v),
+            )
+            .replace(
+                "/wasm-web/presence_web_bg.wasm",
+                &format!("/wasm-web/presence_web_bg.wasm?v={}", v),
+            ),
+    );
 
     tokio::spawn(async move {
         let addr = format!("0.0.0.0:{}", port);

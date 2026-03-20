@@ -814,122 +814,403 @@ html, body {
 <!-- xterm.js (loaded lazily for Terminal tab) -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.css" id="xterm-css" disabled>
 
-<script>
+<script type="module">
 'use strict';
 
-// ── Pricing table (USD per token) ──
-// cached = price for tokens served from prompt cache (subset of input)
-const PRICING = {
-  // OpenAI (cached = 50% of input unless noted)
-  'gpt-5.4':          { input: 2.5e-6, cached: 1.25e-6, output: 15.0e-6 },
-  'gpt-5.4-mini':     { input: 0.5e-6, cached: 0.25e-6, output: 3.0e-6 },
-  'gpt-5.4-nano':     { input: 0.15e-6, cached: 0.075e-6, output: 0.6e-6 },
-  'gpt-5.2-codex':    { input: 1.75e-6, cached: 0.175e-6, output: 7.0e-6 },
-  'gpt-5':            { input: 1.25e-6, cached: 0.625e-6, output: 10.0e-6 },
-  'gpt-5-mini':       { input: 0.25e-6, cached: 0.125e-6, output: 2.0e-6 },
-  'gpt-4.1':          { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
-  'gpt-4.1-mini':     { input: 0.4e-6, cached: 0.2e-6, output: 1.6e-6 },
-  'gpt-4.1-nano':     { input: 0.1e-6, cached: 0.05e-6, output: 0.4e-6 },
-  'o3':               { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 },
-  'o3-pro':           { input: 150.0e-6, cached: 75.0e-6, output: 600.0e-6 },
-  'o4-mini':          { input: 1.1e-6, cached: 0.55e-6, output: 4.4e-6 },
-  // Anthropic (cached = 10% of input)
-  'claude-opus-4-6':              { input: 5.0e-6, cached: 0.5e-6, output: 25.0e-6 },
-  'claude-sonnet-4-6':            { input: 3.0e-6, cached: 0.3e-6, output: 15.0e-6 },
-  'claude-sonnet-4-5-20250929':   { input: 3.0e-6, cached: 0.3e-6, output: 15.0e-6 },
-  'claude-opus-4-5-20250929':     { input: 15.0e-6, cached: 1.5e-6, output: 75.0e-6 },
-  'claude-haiku-4-5':             { input: 0.25e-6, cached: 0.025e-6, output: 1.25e-6 },
-  // Gemini (cached = ~10% of input)
-  'gemini-2.5-pro':       { input: 1.25e-6, cached: 0.125e-6, output: 10.0e-6 },
-  'gemini-2.5-flash':     { input: 0.3e-6, cached: 0.03e-6, output: 2.5e-6 },
-  'gemini-2.5-flash-lite': { input: 0.1e-6, cached: 0.01e-6, output: 0.4e-6 },
-  'gemini-2.0-flash':     { input: 0.1e-6, cached: 0.01e-6, output: 0.4e-6 },
-};
+import init, { AppWeb } from '/wasm-web/presence_web.js';
 
-// ── Spinner ──
-const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
-let spinnerIdx = 0;
-let spinnerInterval = null;
-
-// ── Log level symbols + tooltips ──
+// ── Constants (rendering only — all logic in WASM) ──
+const SPINNER_FRAMES = ['\u280b','\u2819','\u2839','\u2838','\u283c','\u2834','\u2826','\u2827','\u2807','\u280f'];
 const LEVEL_ICONS = {
-  info:     '\u2139',  // ℹ
-  model:    '\u2726',  // ✦
-  agent:    '\u25B6',  // ▶
-  error:    '\u2716',  // ✖
-  warn:     '\u26A0',  // ⚠
-  subagent: '\u2726',  // ✦
-  detail:   '\u00B7',  // ·
-  debug:    '\u2022',  // •
-  presence: '\u25C9',  // ◉
+  info: '\u2139', model: '\u2726', agent: '\u25B6', error: '\u2716', warn: '\u26A0',
+  subagent: '\u2726', detail: '\u00B7', debug: '\u2022', presence: '\u25C9',
 };
 const LEVEL_TOOLTIPS = {
-  info:     'Info \u2014 general status update',
-  model:    'Model \u2014 LLM response or action',
-  agent:    'Agent \u2014 command execution output',
-  error:    'Error \u2014 something went wrong',
-  warn:     'Warning \u2014 needs attention',
-  subagent: 'Sub-agent \u2014 delegated worker output',
-  detail:   'Detail \u2014 verbose context (enable in Verbose mode)',
-  debug:    'Debug \u2014 internal diagnostics (enable in Debug mode)',
-  presence: 'Presence \u2014 live model interaction',
+  info: 'Info', model: 'Model', agent: 'Agent', error: 'Error', warn: 'Warning',
+  subagent: 'Sub-agent', detail: 'Detail', debug: 'Debug', presence: 'Presence',
 };
 
-// Source labels (matching TUI: Workr, Agent, Servr, Live, Sub, etc.)
-const SOURCE_LABELS = {
-  system: '\u2139',      // ℹ (system info)
-  worker: 'Workr',       // model/worker
-  agent:  'Agent',       // agent runtime
-  server: 'Servr',       // server-side presence
-  live:   'Live',        // browser-side live presence
-  sub:    'Sub',         // sub-agent
-  orch:   'Orch',        // orchestrator
-};
-
-// Verbosity → which log levels to show
-const VERBOSITY_LEVELS = {
-  normal:  ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'presence'],
-  verbose: ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'detail', 'presence'],
-  debug:   ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'detail', 'debug', 'presence'],
-};
-
-// Lines above which an entry is collapsible
-const COLLAPSE_THRESHOLD = 3;
-
-// ── State ──
-let ws = null;
-let connected = false;
-let currentPhase = 'idle';
-let pendingApprovalId = null;
+// ── Minimal JS state (rendering only) ──
+let app = null;
 let activeTab = 'activity';
 let autoScroll = true;
 let logEntryCount = 0;
-let verbosity = 'normal';
-const MAX_LOG_ENTRIES = 10000;
-
-// Usage tracking
-let usageData = { main: null, presence: null };
-let tokenHistory = []; // [{turn, tokens}]
-let lastTotalTokens = 0;
+let currentPhase = 'idle';
+let spinnerIdx = 0;
+let spinnerInterval = null;
 
 // Terminal (lazy)
 let term = null;
 let fitAddon = null;
 let termInitialized = false;
-let termBuffer = []; // buffer term data before init
+let termBuffer = [];
 
 // Displays
-const displaySlots = new Map(); // displayId → DisplaySlot
+const displaySlots = new Map();
 let noVNCLoaded = false;
 let noVNCLoadCallbacks = [];
 
+// ── WASM Init ──
+async function main() {
+  await init();
+  app = new AppWeb();
+
+  // Intercept all server messages for AppState routing
+  app.set_on_raw_message((msg) => {
+    const cmds = app.handle_server_message(msg);
+    if (cmds) processCommands(cmds);
+  });
+
+  // Connection state indicator
+  app.set_on_server_state((connected) => {
+    document.getElementById('sb-conn').className = connected ? 'conn-dot ok' : 'conn-dot err';
+  });
+
+  // Connect to server
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = proto + '//' + location.host;
+
+  // Store app globally for reconnect
+  window.__presenceWeb = app;
+  app.connect_server(wsUrl);
+
+  // Fetch config for initial provider/model
+  try {
+    const cfg = await fetch('/config').then(r => r.json());
+    if (cfg.provider) document.getElementById('sb-provider').textContent = cfg.provider;
+    if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
+  } catch {}
+}
+
+// ── UiCommand Processor ──
+function processCommands(cmds) {
+  if (!Array.isArray(cmds)) return;
+  for (const c of cmds) {
+    switch (c.cmd) {
+      case 'add_log_entry': renderLogEntry(c); break;
+      case 'clear_logs': clearLogs(); break;
+      case 'add_turn_separator': renderTurnSeparator(c.turn); break;
+      case 'update_status_bar': updateStatusBar(c); break;
+      case 'set_phase': setPhase(c.phase); break;
+      case 'show_approval': showApproval(c.id, c.command, c.category); break;
+      case 'hide_approval': hidePanel('approval-panel'); break;
+      case 'show_human_input': showHumanInput(c.question); break;
+      case 'hide_human_input': hidePanel('human-panel'); break;
+      case 'show_follow_up': showPanel('followup-panel'); break;
+      case 'hide_follow_up': hidePanel('followup-panel'); break;
+      case 'hide_all_panels': hideAllPanels(); break;
+      case 'update_usage': renderUsageTab(c); break;
+      case 'add_display': addDisplaySlot(c.display_id, c.vnc_port); break;
+      case 'show_badge': showBadge(c.tab, c.text); break;
+      case 'hide_badge': hideBadge(c.tab); break;
+      case 'term_data': handleTermData(c.base64); break;
+      case 'set_connected':
+        document.getElementById('sb-conn').className = c.connected ? 'conn-dot ok' : 'conn-dot err';
+        break;
+    }
+  }
+}
+
+// ── DOM Helpers ──
+
+function clearLogs() {
+  document.getElementById('log-stream').innerHTML = '';
+  logEntryCount = 0;
+}
+
+function renderTurnSeparator(turn) {
+  const stream = document.getElementById('log-stream');
+  const sep = document.createElement('div');
+  sep.className = 'log-turn-sep';
+  sep.textContent = '\u2500\u2500 Turn ' + turn + ' \u2500\u2500';
+  stream.appendChild(sep);
+}
+
+function renderLogEntry(c) {
+  const stream = document.getElementById('log-stream');
+  const entry = document.createElement('div');
+  entry.className = 'log-entry level-' + c.level;
+  entry.dataset.level = c.level;
+
+  const icon = document.createElement('span');
+  icon.className = 'log-icon';
+  icon.textContent = LEVEL_ICONS[c.level] || '\u2022';
+  icon.title = LEVEL_TOOLTIPS[c.level] || c.level;
+
+  const ts = document.createElement('span');
+  ts.className = 'log-ts';
+  ts.textContent = (c.ts || '').substring(0, 8);
+
+  const lvl = document.createElement('span');
+  lvl.className = 'log-level';
+  lvl.textContent = c.source || '\u2139';
+
+  const cnt = document.createElement('span');
+  cnt.className = 'log-content';
+  cnt.textContent = c.content || '';
+
+  entry.appendChild(icon);
+  entry.appendChild(ts);
+  entry.appendChild(lvl);
+  entry.appendChild(cnt);
+
+  if (c.collapsible) {
+    entry.classList.add('collapsible');
+    const toggle = document.createElement('span');
+    toggle.className = 'collapse-toggle';
+    toggle.innerHTML = '<span class="arrow">\u25B8</span><span class="arrow-up">\u25BE</span>';
+    entry.appendChild(toggle);
+    entry.addEventListener('click', () => entry.classList.toggle('expanded'));
+  }
+
+  stream.appendChild(entry);
+  logEntryCount++;
+
+  // Cap entries in DOM
+  if (logEntryCount > 10000) {
+    const first = stream.querySelector('.log-entry, .log-turn-sep');
+    if (first) { stream.removeChild(first); logEntryCount--; }
+  }
+
+  if (autoScroll) stream.scrollTop = stream.scrollHeight;
+}
+
+function updateStatusBar(d) {
+  if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
+  if (d.model) document.getElementById('sb-model').textContent = d.model;
+  if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
+  if (d.budget_pct !== undefined && d.budget_pct !== null) {
+    const fill = document.getElementById('sb-budget-fill');
+    const label = document.getElementById('sb-budget-pct');
+    const pct = d.budget_pct;
+    fill.style.width = Math.min(pct, 100) + '%';
+    const color = pct < 50 ? '#a6e3a1' : pct < 85 ? '#f9e2af' : '#f38ba8';
+    fill.style.background = color;
+    label.textContent = pct.toFixed(1) + '%';
+    label.style.color = color;
+  }
+  if (d.autonomy) {
+    const el = document.getElementById('sb-autonomy');
+    el.textContent = d.autonomy;
+    const colors = { Low: '#f38ba8', Medium: '#f9e2af', High: '#94e2d5', Full: '#a6e3a1' };
+    el.style.color = colors[d.autonomy] || '#f9e2af';
+  }
+  if (d.session_id) {
+    document.getElementById('sb-session').textContent = d.session_id.substring(0, 8);
+  }
+}
+
+function setPhase(phase) {
+  currentPhase = phase;
+  const banner = document.getElementById('phase-banner');
+  const text = document.getElementById('phase-text');
+  banner.className = 'phase-banner';
+  const np = phase.replace('waiting_', 'waiting').replace('running_', 'running');
+  const labels = {
+    idle: 'Idle', thinking: 'Thinking...', running: 'Running Agent', runningagent: 'Running Agent',
+    waiting: 'Waiting for Input', waitingapproval: 'Waiting for Approval',
+    waitinghuman: 'Waiting for Response', waitingfollowup: 'Waiting for Follow-up',
+    orchestrating: 'Orchestrating', done: 'Done',
+  };
+  const cat = np.startsWith('waiting') ? 'waiting' : np.startsWith('running') ? 'running' :
+    np === 'orchestrating' ? 'thinking' : np;
+  banner.classList.add('phase-' + cat);
+  text.textContent = labels[np] || labels[phase] || phase;
+
+  if (phase === 'idle' || phase === 'done') {
+    if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
+    document.getElementById('phase-spinner').textContent = phase === 'done' ? '\u2713' : '';
+  } else if (!spinnerInterval) {
+    const el = document.getElementById('phase-spinner');
+    spinnerInterval = setInterval(() => {
+      spinnerIdx = (spinnerIdx + 1) % SPINNER_FRAMES.length;
+      el.textContent = SPINNER_FRAMES[spinnerIdx];
+    }, 80);
+  }
+}
+
+function showApproval(id, command, category) {
+  hideAllPanels();
+  document.getElementById('approval-command').textContent = command;
+  document.getElementById('approval-category').textContent = category ? 'Category: ' + category : '';
+  document.getElementById('approval-panel').classList.add('visible');
+}
+
+function showHumanInput(question) {
+  hideAllPanels();
+  document.getElementById('human-question').textContent = question;
+  document.getElementById('human-panel').classList.add('visible');
+}
+
+function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.add('visible'); }
+function hidePanel(id) { document.getElementById(id).classList.remove('visible'); }
+function hideAllPanels() { document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible')); }
+
+function showBadge(tab, text) {
+  const badge = document.getElementById('badge-' + tab);
+  if (badge) { badge.textContent = text; badge.classList.add('visible'); }
+}
+function hideBadge(tab) {
+  const badge = document.getElementById('badge-' + tab);
+  if (badge) { badge.classList.remove('visible'); badge.textContent = ''; }
+}
+
+// ── Usage Tab Rendering ──
+function renderUsageTab(c) {
+  const cardsEl = document.getElementById('usage-cards');
+  const emptyEl = document.getElementById('usage-empty');
+  const costEl = document.getElementById('cost-section');
+  const historyEl = document.getElementById('token-history');
+
+  if (!c.main_json) {
+    emptyEl.style.display = 'flex';
+    cardsEl.style.display = 'none';
+    costEl.style.display = 'none';
+    historyEl.style.display = 'none';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  cardsEl.style.display = 'flex';
+  cardsEl.innerHTML = '';
+
+  const mainData = JSON.parse(c.main_json);
+  cardsEl.appendChild(renderUsageCard('Main Model', mainData));
+
+  if (c.presence_json) {
+    const presenceData = JSON.parse(c.presence_json);
+    cardsEl.appendChild(renderUsageCard('Presence Model', presenceData));
+  }
+
+  // Cost
+  if (c.cost_json) {
+    const cost = JSON.parse(c.cost_json);
+    costEl.style.display = 'block';
+    const grid = document.getElementById('cost-grid');
+    grid.innerHTML = '';
+    for (const cl of cost.lines) {
+      grid.innerHTML += `<span class="label">${cl.label}</span><span class="value">$${cl.cost.toFixed(4)}</span>`;
+      grid.innerHTML += `<span class="label" style="padding-left:12px;font-size:11px">Input</span><span class="value" style="font-size:11px;font-weight:normal">$${cl.input_cost.toFixed(4)}</span>`;
+      grid.innerHTML += `<span class="label" style="padding-left:12px;font-size:11px">Output</span><span class="value" style="font-size:11px;font-weight:normal">$${cl.output_cost.toFixed(4)}</span>`;
+    }
+    if (cost.lines.length > 1) {
+      grid.innerHTML += `<span class="label" style="font-weight:600;color:var(--text)">Total</span><span class="value">$${cost.total.toFixed(4)}</span>`;
+    }
+  } else {
+    costEl.style.display = 'none';
+  }
+
+  // History
+  if (c.history_json) {
+    const history = JSON.parse(c.history_json);
+    historyEl.style.display = 'block';
+    const chart = document.getElementById('history-chart');
+    const maxTokens = Math.max(...history.map(h => h.tokens), 1);
+    chart.innerHTML = '';
+    for (const h of history) {
+      const bar = document.createElement('div');
+      bar.className = 'history-bar';
+      bar.style.height = Math.max((h.tokens / maxTokens) * 100, 2) + '%';
+      bar.title = `Turn ${h.turn}: ${h.tokens.toLocaleString()} tokens`;
+      chart.appendChild(bar);
+    }
+  } else {
+    historyEl.style.display = 'none';
+  }
+}
+
+function renderUsageCard(label, data) {
+  const card = document.createElement('div');
+  card.className = 'usage-card';
+  const color = data.usage_pct < 50 ? '#a6e3a1' : data.usage_pct < 85 ? '#f9e2af' : '#f38ba8';
+  const prompt = data.prompt_tokens || 0;
+  const completion = data.completion_tokens || 0;
+  const cached = data.cached_tokens || 0;
+  const uncachedInput = prompt - cached;
+  card.innerHTML = `
+    <div class="card-title">${label}</div>
+    <div class="card-model"><span class="provider">${data.provider}</span> / <span class="model-name">${data.model}</span></div>
+    <div class="token-bar">
+      <div class="bar-label">
+        <span class="tokens">${data.tokens_used.toLocaleString()} / ${data.context_window.toLocaleString()}</span>
+        <span class="pct" style="color:${color}">${data.usage_pct.toFixed(1)}%</span>
+      </div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(data.usage_pct, 100)}%;background:${color}"></div></div>
+    </div>
+    <div class="token-breakdown">
+      <span class="label">Input tokens</span><span class="value">${prompt.toLocaleString()}</span>
+      <span class="label" style="padding-left:12px">Cached</span>
+      <span class="value" style="color:var(--green)">${cached.toLocaleString()}${prompt > 0 ? ' (' + (cached / prompt * 100).toFixed(0) + '%)' : ''}</span>
+      <span class="label" style="padding-left:12px">Uncached</span><span class="value">${uncachedInput.toLocaleString()}</span>
+      <span class="label">Output tokens</span><span class="value">${completion.toLocaleString()}</span>
+      <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Remaining</span>
+      <span class="value" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${(data.context_window - data.tokens_used).toLocaleString()}</span>
+    </div>`;
+  return card;
+}
+
+// ── Terminal Tab (lazy xterm.js) ──
+function handleTermData(base64data) {
+  if (term) {
+    const bytes = Uint8Array.from(atob(base64data), c => c.charCodeAt(0));
+    term.write(bytes);
+  } else {
+    termBuffer.push(base64data);
+  }
+}
+
+function initTerminal() {
+  if (termInitialized) return;
+  termInitialized = true;
+  document.getElementById('xterm-css').removeAttribute('disabled');
+  const script = document.createElement('script');
+  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
+  script.onload = () => {
+    const fitScript = document.createElement('script');
+    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
+    fitScript.onload = () => {
+      term = new Terminal({
+        theme: {
+          background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
+          selectionBackground: '#45475a',
+          black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
+          blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
+          brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
+          brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
+          brightCyan: '#94e2d5', brightWhite: '#a6adc8',
+        },
+        fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
+        fontSize: 13, allowProposedApi: true,
+      });
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+      term.onData(data => {
+        for (const ch of data) app.send_key(ch, false, false, false);
+      });
+      for (const b64 of termBuffer) {
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        term.write(bytes);
+      }
+      termBuffer = [];
+      new ResizeObserver(() => {
+        if (fitAddon && activeTab === 'terminal') fitAddon.fit();
+      }).observe(document.getElementById('terminal-container'));
+      term.onResize(({ cols, rows }) => app.send_resize(cols, rows));
+    };
+    document.head.appendChild(fitScript);
+  };
+  document.head.appendChild(script);
+}
+
+// ── Displays (noVNC — stays JS, manages VNC WebSocket + canvas) ──
 function loadNoVNC(cb) {
   if (noVNCLoaded) { cb(); return; }
   noVNCLoadCallbacks.push(cb);
-  if (noVNCLoadCallbacks.length > 1) return; // already loading
+  if (noVNCLoadCallbacks.length > 1) return;
   const script = document.createElement('script');
   script.type = 'module';
-  // Create a shim that imports RFB and exposes it globally
   script.textContent = `
     import RFB from 'https://cdn.jsdelivr.net/gh/novnc/noVNC@v1.6.0/core/rfb.js';
     window.__noVNC_RFB = RFB;
@@ -950,8 +1231,6 @@ class DisplaySlot {
     this.rfb = null;
     this.interactive = false;
     this.connected = false;
-
-    // Build DOM
     this.el = document.createElement('div');
     this.el.className = 'display-slot';
     this.el.innerHTML = `
@@ -962,122 +1241,68 @@ class DisplaySlot {
         <button class="take-control-btn" id="ds-take-${displayId}">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none">Release</button>
       </div>
-      <div class="display-canvas" id="display-canvas-${displayId}"></div>
-    `;
-
+      <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
     this.noteInput = this.el.querySelector(`#ds-note-${displayId}`);
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
     this.releaseBtn = this.el.querySelector(`#ds-release-${displayId}`);
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
-
     this.takeBtn.addEventListener('click', () => this.takeControl());
     this.releaseBtn.addEventListener('click', () => this.releaseControl());
   }
-
-  connectPassive() {
-    loadNoVNC(() => this._connectVNC());
-  }
-
+  connectPassive() { loadNoVNC(() => this._connectVNC()); }
   _connectVNC() {
     const RFB = window.__noVNC_RFB;
     if (!RFB) return;
-
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${location.host}/vnc?port=${this.vncPort}`;
-
     try {
-      this.rfb = new RFB(this.canvasEl, wsUrl);
-      this.rfb.viewOnly = true;
-      this.rfb.scaleViewport = true;
-      this.rfb.resizeSession = false;
-      this.rfb.background = '#1e1e2e';
-
+      this.rfb = new RFB(this.canvasEl, `${proto}//${location.host}/vnc?port=${this.vncPort}`);
+      this.rfb.viewOnly = true; this.rfb.scaleViewport = true;
+      this.rfb.resizeSession = false; this.rfb.background = '#1e1e2e';
       this.rfb.addEventListener('connect', () => {
-        this.connected = true;
-        this.statusEl.textContent = 'Connected (view-only)';
+        this.connected = true; this.statusEl.textContent = 'Connected (view-only)';
         this.statusEl.className = 'display-status connected';
       });
-
       this.rfb.addEventListener('disconnect', (e) => {
         this.connected = false;
         this.statusEl.textContent = e.detail.clean ? 'Disconnected' : 'Connection lost';
         this.statusEl.className = 'display-status error';
-        // Auto-reconnect after 3s if not clean disconnect
-        if (!e.detail.clean) {
-          setTimeout(() => {
-            if (!this.connected) this._connectVNC();
-          }, 3000);
-        }
+        if (!e.detail.clean) setTimeout(() => { if (!this.connected) this._connectVNC(); }, 3000);
       });
-
       this.rfb.addEventListener('securityfailure', () => {
-        this.statusEl.textContent = 'Security error';
-        this.statusEl.className = 'display-status error';
+        this.statusEl.textContent = 'Security error'; this.statusEl.className = 'display-status error';
       });
-    } catch (err) {
-      this.statusEl.textContent = 'Failed to connect';
-      this.statusEl.className = 'display-status error';
-    }
+    } catch { this.statusEl.textContent = 'Failed'; this.statusEl.className = 'display-status error'; }
   }
-
   takeControl() {
     if (!this.rfb) return;
-    this.interactive = true;
-    this.rfb.viewOnly = false;
-    this.rfb.focus();
-    this.takeBtn.style.display = 'none';
-    this.releaseBtn.style.display = '';
-    this.noteInput.style.display = '';
-    this.statusEl.textContent = 'Interactive';
+    this.interactive = true; this.rfb.viewOnly = false; this.rfb.focus();
+    this.takeBtn.style.display = 'none'; this.releaseBtn.style.display = '';
+    this.noteInput.style.display = ''; this.statusEl.textContent = 'Interactive';
     this.statusEl.className = 'display-status connected';
-    // Notify server
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ action: 'take_display', display_id: this.displayId }));
-    }
+    if (app) app.take_display(this.displayId);
   }
-
   releaseControl() {
     if (!this.rfb) return;
-    this.interactive = false;
-    this.rfb.viewOnly = true;
+    this.interactive = false; this.rfb.viewOnly = true;
     const note = this.noteInput.value.trim() || undefined;
-    this.noteInput.value = '';
-    this.noteInput.style.display = 'none';
-    this.takeBtn.style.display = '';
-    this.releaseBtn.style.display = 'none';
+    this.noteInput.value = ''; this.noteInput.style.display = 'none';
+    this.takeBtn.style.display = ''; this.releaseBtn.style.display = 'none';
     this.statusEl.textContent = this.connected ? 'Connected (view-only)' : 'Disconnected';
-    // Notify server
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const msg = { action: 'release_display', display_id: this.displayId };
-      if (note) msg.note = note;
-      ws.send(JSON.stringify(msg));
-    }
+    if (app) app.release_display(this.displayId, note);
   }
-
-  disconnect() {
-    if (this.rfb) {
-      this.rfb.disconnect();
-      this.rfb = null;
-    }
-    this.connected = false;
-  }
+  disconnect() { if (this.rfb) { this.rfb.disconnect(); this.rfb = null; } this.connected = false; }
 }
 
 function addDisplaySlot(displayId, vncPort) {
-  if (displaySlots.has(displayId)) return; // already exists
-  if (!vncPort) return; // no VNC port, can't stream
-
+  if (displaySlots.has(displayId) || !vncPort) return;
   const slot = new DisplaySlot(displayId, vncPort);
   displaySlots.set(displayId, slot);
-
   const container = document.getElementById('displays-container');
   const placeholder = document.getElementById('displays-placeholder');
   if (placeholder) placeholder.style.display = 'none';
   container.classList.add('has-displays');
   container.appendChild(slot.el);
-
-  // Auto-connect if displays tab is active, otherwise connect when switched
   slot.connectPassive();
 }
 
@@ -1090,997 +1315,79 @@ function switchTab(tabId) {
   activeTab = tabId;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tabId));
-
-  if (tabId === 'terminal' && !termInitialized) {
-    initTerminal();
-  }
-  if (tabId === 'terminal' && term) {
-    requestAnimationFrame(() => fitAddon && fitAddon.fit());
-  }
-  // Clear activity badge when switching to activity
-  if (tabId === 'activity') {
-    const badge = document.getElementById('badge-activity');
-    badge.classList.remove('visible');
-    badge.textContent = '';
-  }
-  // Trigger noVNC rescale when switching to displays tab
-  // (noVNC checks container size which is 0 when tab is hidden)
+  if (app) processCommands(app.set_active_tab(tabId));
+  if (tabId === 'terminal' && !termInitialized) initTerminal();
+  if (tabId === 'terminal' && term) requestAnimationFrame(() => fitAddon && fitAddon.fit());
   if (tabId === 'displays') {
     requestAnimationFrame(() => {
-      for (const slot of displaySlots.values()) {
-        if (slot.rfb) {
-          slot.rfb.scaleViewport = true;
-        }
-      }
+      for (const slot of displaySlots.values()) { if (slot.rfb) slot.rfb.scaleViewport = true; }
     });
   }
 }
 
-// ── Keyboard shortcuts ──
+// ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {
-  // Don't intercept when typing in input fields
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
-
-  if (activeTab === 'activity' && pendingApprovalId !== null) {
-    if (e.key === 'y') { sendApproval('approve'); e.preventDefault(); }
-    else if (e.key === 's') { sendApproval('skip'); e.preventDefault(); }
-    else if (e.key === 'a') { sendApproval('approve_all'); e.preventDefault(); }
-    else if (e.key === 'n') { sendApproval('deny'); e.preventDefault(); }
+  if (activeTab === 'activity' && app && app.pending_approval_id() !== null) {
+    if (e.key === 'y') { processCommands(app.send_approval('approve')); e.preventDefault(); }
+    else if (e.key === 's') { processCommands(app.send_approval('skip')); e.preventDefault(); }
+    else if (e.key === 'a') { processCommands(app.send_approval('approve_all')); e.preventDefault(); }
+    else if (e.key === 'n') { processCommands(app.send_approval('deny')); e.preventDefault(); }
   }
 });
 
-// ── WebSocket ──
-function getWsUrl() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return proto + '//' + location.host;
-}
+// ── Approval / Input / Follow-up actions (from HTML onclick) ──
+window.sendApproval = function(action) {
+  if (app) processCommands(app.send_approval(action));
+};
+window.sendHumanResponse = function() {
+  const input = document.getElementById('human-input');
+  const text = input.value.trim();
+  if (!text || !app) return;
+  processCommands(app.send_human_response(text));
+  input.value = '';
+};
+window.sendFollowUp = function() {
+  const input = document.getElementById('followup-input');
+  const text = input.value.trim();
+  if (!text || !app) return;
+  processCommands(app.send_follow_up(text));
+  input.value = '';
+};
 
-function connectWs() {
-  ws = new WebSocket(getWsUrl());
-
-  ws.onopen = () => {
-    connected = true;
-    document.getElementById('sb-conn').className = 'conn-dot ok';
-    // state_snapshot arrives automatically on connect (bootstrap).
-    // Usage data arrives via usage_update events during agent runs.
-    // Do NOT send ControlMsg here — it pollutes the event log.
-  };
-
-  ws.onclose = () => {
-    connected = false;
-    document.getElementById('sb-conn').className = 'conn-dot err';
-    // Reconnect after 2s
-    setTimeout(connectWs, 2000);
-  };
-
-  ws.onerror = () => {
-    connected = false;
-    document.getElementById('sb-conn').className = 'conn-dot err';
-  };
-
-  ws.onmessage = (evt) => {
-    if (typeof evt.data !== 'string') return;
-    try {
-      const msg = JSON.parse(evt.data);
-      routeMessage(msg);
-    } catch (e) {
-      // ignore non-JSON
+// Enter to submit
+document.querySelectorAll('#human-input, #followup-input').forEach(ta => {
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (ta.id === 'human-input') window.sendHumanResponse();
+      else window.sendFollowUp();
     }
-  };
-}
-
-function sendJson(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
-  }
-}
-
-// ── Message Router ──
-function routeMessage(msg) {
-  // TUI ANSI frames → terminal
-  if (msg.t === 'term') {
-    handleTermData(msg.d);
-    return;
-  }
-
-  // Bootstrap state snapshot
-  if (msg.t === 'state_snapshot') {
-    handleStateSnapshot(msg);
-    return;
-  }
-
-  // Session log replay (historical entries on connect)
-  if (msg.t === 'log_replay') {
-    handleLogReplay(msg.entries || []);
-    return;
-  }
-
-  // OutboundEvent (broadcast)
-  if (msg.event) {
-    handleEvent(msg);
-    return;
-  }
-}
-
-// ── Log Replay (historical entries on connect) ──
-function handleLogReplay(entries) {
-  const stream = document.getElementById('log-stream');
-  // Clear any stale entries from a previous connection
-  stream.innerHTML = '';
-  logEntryCount = 0;
-
-  // Extract status bar info from replay entries
-  for (const e of entries) {
-    const c = e.content || '';
-    if (c.startsWith('Autonomy: ')) updateStatusBar({ autonomy: c.substring(10) });
-    else if (c.startsWith('Provider: ')) document.getElementById('sb-provider').textContent = c.substring(10);
-    else if (c.startsWith('Model: ')) document.getElementById('sb-model').textContent = c.substring(7);
-    if (e.turn) document.getElementById('sb-turn').textContent = 'T' + e.turn;
-  }
-
-  let lastTurn = null;
-  for (const e of entries) {
-    // Turn separator when turn changes
-    if (e.turn && e.turn !== lastTurn) {
-      lastTurn = e.turn;
-      const sep = document.createElement('div');
-      sep.className = 'log-turn-sep';
-      sep.textContent = '\u2500\u2500 Turn ' + e.turn + ' \u2500\u2500';
-      stream.appendChild(sep);
-    }
-
-    const sourceMap = {
-      system: SOURCE_LABELS.system,
-      worker: SOURCE_LABELS.worker,
-      agent: SOURCE_LABELS.agent,
-      server: SOURCE_LABELS.server,
-      live: SOURCE_LABELS.live,
-      sub: SOURCE_LABELS.sub,
-      orch: SOURCE_LABELS.orch,
-    };
-
-    // Create entry with original timestamp
-    const entry = document.createElement('div');
-    entry.className = 'log-entry level-' + (e.level || 'info');
-    entry.dataset.level = e.level || 'info';
-
-    const visible = VERBOSITY_LEVELS[verbosity] || VERBOSITY_LEVELS.normal;
-    if (!visible.includes(e.level || 'info')) {
-      entry.style.display = 'none';
-    }
-
-    const icon = document.createElement('span');
-    icon.className = 'log-icon';
-    icon.textContent = LEVEL_ICONS[e.level] || '\u2022';
-    icon.title = LEVEL_TOOLTIPS[e.level] || e.level || 'info';
-
-    const ts = document.createElement('span');
-    ts.className = 'log-ts';
-    ts.textContent = (e.ts || '').substring(0, 8); // HH:MM:SS
-
-    const lvl = document.createElement('span');
-    lvl.className = 'log-level';
-    lvl.textContent = sourceMap[e.source] || e.source || SOURCE_LABELS.system;
-
-    const cnt = document.createElement('span');
-    cnt.className = 'log-content';
-    cnt.textContent = e.content || '';
-
-    entry.appendChild(icon);
-    entry.appendChild(ts);
-    entry.appendChild(lvl);
-    entry.appendChild(cnt);
-
-    // Make long entries collapsible
-    const lineCount = (e.content || '').split('\n').length;
-    if (lineCount > COLLAPSE_THRESHOLD || (e.content || '').length > 300) {
-      entry.classList.add('collapsible');
-      const toggle = document.createElement('span');
-      toggle.className = 'collapse-toggle';
-      toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';
-      entry.appendChild(toggle);
-      entry.addEventListener('click', () => entry.classList.toggle('expanded'));
-    }
-
-    stream.appendChild(entry);
-    logEntryCount++;
-  }
-
-  // Scroll to bottom
-  stream.scrollTop = stream.scrollHeight;
-}
-
-// ── State Snapshot ──
-function handleStateSnapshot(msg) {
-  const s = msg.state;
-  if (!s) return;
-  updateStatusBar({
-    turn: s.turn || 0,
-    budget_pct: s.budget_pct || 0,
-    phase: s.phase || 'idle',
   });
-  // Populate provider/model from config
-  if (msg.config) {
-    if (msg.config.provider) document.getElementById('sb-provider').textContent = msg.config.provider;
-    if (msg.config.model) document.getElementById('sb-model').textContent = msg.config.model;
-  }
-  // Populate session ID
-  if (msg.session_id) {
-    document.getElementById('sb-session').textContent = msg.session_id.substring(0, 8);
-  }
-  if (s.phase) setPhase(s.phase);
-
-  // Restore pending approval from snapshot
-  if (s.pending_approval && s.pending_approval.id) {
-    pendingApprovalId = s.pending_approval.id;
-    document.getElementById('approval-command').textContent = s.pending_approval.command_preview || '';
-    document.getElementById('approval-category').textContent =
-      s.pending_approval.category ? 'Category: ' + s.pending_approval.category : '';
-    showBottomPanel('approval-panel');
-    addLogEntry('warn', `Approval required: ${s.pending_approval.command_preview || ''}`, undefined, SOURCE_LABELS.worker);
-  }
-
-  // Show follow-up panel if waiting for follow-up
-  const np = (s.phase || '').replace(/_/g, '');
-  if (np === 'waitingfollowup' || np === 'idle' || np === 'done') {
-    showBottomPanel('followup-panel');
-  }
-}
-
-// ── Event Handler ──
-function handleEvent(msg) {
-  switch (msg.event) {
-    case 'turn_started':
-      addLogEntry('info', `Turn ${msg.turn} started`, msg.turn, SOURCE_LABELS.system);
-      updateBudget(msg.budget_pct);
-      document.getElementById('sb-turn').textContent = 'T' + msg.turn;
-      setPhase('thinking');
-      // Track token delta for history
-      if (usageData.main && msg.turn > 1) {
-        tokenHistory.push({ turn: msg.turn - 1, tokens: usageData.main.tokens_used - lastTotalTokens });
-        lastTotalTokens = usageData.main.tokens_used;
-      }
-      break;
-
-    case 'model_response':
-      addLogEntry('model', msg.summary || '(thinking...)', undefined, SOURCE_LABELS.worker);
-      if (msg.reasoning_summary) addLogEntry('detail', msg.reasoning_summary, undefined, SOURCE_LABELS.worker);
-      break;
-
-    case 'model_response_delta':
-      // Streaming text — could accumulate for real-time display
-      break;
-
-    case 'agent_started': {
-      const preview = msg.commands_preview || '';
-      // If running on a display, show link to Displays tab
-      const hasDisplay = displaySlots.size > 0;
-      if (hasDisplay) {
-        addLogEntryWithDisplayLink('detail', `Running on display`, Array.from(displaySlots.keys())[0], SOURCE_LABELS.agent);
-      }
-      addLogEntry('detail', `Running: ${preview}`, undefined, SOURCE_LABELS.agent);
-      setPhase('running');
-      break;
-    }
-
-    case 'agent_output':
-      if (msg.stdout) addLogEntry('agent', formatAgentOutput(msg.stdout), undefined, SOURCE_LABELS.agent);
-      if (msg.stderr) addLogEntry('warn', msg.stderr, undefined, SOURCE_LABELS.agent);
-      setPhase('running');
-      break;
-
-    case 'auto_approved':
-      addLogEntry('info', `Auto-approved: ${msg.preview}`, undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'done_signal':
-      addLogEntry('detail', `Done signal${msg.message ? ': ' + msg.message : ''}`, undefined, SOURCE_LABELS.worker);
-      break;
-
-    case 'context_management':
-      addLogEntry('info', `Context compacted at turn ${msg.turn}`, undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'budget_warning':
-      addLogEntry('warn', `Budget warning: ${msg.pct.toFixed(1)}% used`, undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'budget_exhausted':
-      addLogEntry('error', `Budget exhausted (${msg.remaining} tokens remaining)`, undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'loop_error':
-      addLogEntry('error', msg.message, undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'sub_agent_result':
-      addLogEntry('subagent', msg.summary, undefined, SOURCE_LABELS.sub);
-      break;
-
-    case 'orchestrator_progress':
-      addLogEntry('info', msg.status, undefined, SOURCE_LABELS.orch);
-      break;
-
-    case 'approval_required':
-      pendingApprovalId = msg.id;
-      document.getElementById('approval-command').textContent = msg.command || '';
-      document.getElementById('approval-category').textContent = msg.category ? 'Category: ' + msg.category : '';
-      showBottomPanel('approval-panel');
-      setPhase('waiting');
-      addLogEntry('warn', `Approval required: ${msg.command}`, undefined, SOURCE_LABELS.worker);
-      // Badge on activity tab if not viewing it
-      if (activeTab !== 'activity') {
-        const badge = document.getElementById('badge-activity');
-        badge.textContent = '!';
-        badge.classList.add('visible');
-      }
-      break;
-
-    case 'ask_human':
-      document.getElementById('human-question').textContent = msg.question || '';
-      showBottomPanel('human-panel');
-      setPhase('waiting');
-      addLogEntry('info', `Question: ${msg.question}`, undefined, SOURCE_LABELS.worker);
-      if (activeTab !== 'activity') {
-        const badge = document.getElementById('badge-activity');
-        badge.textContent = '?';
-        badge.classList.add('visible');
-      }
-      break;
-
-    case 'task_complete':
-      hideAllBottomPanels();
-      setPhase('done');
-      addLogEntry('info', `Task complete: ${msg.reason}${msg.summary ? ' \u2014 ' + msg.summary : ''}`, undefined, SOURCE_LABELS.worker);
-      showBottomPanel('followup-panel');
-      break;
-
-    case 'round_complete':
-      setPhase('idle');
-      addLogEntry('info', `Round ${msg.round} complete (${msg.turns_in_round} turns)`, undefined, SOURCE_LABELS.system);
-      showBottomPanel('followup-panel');
-      break;
-
-    case 'status':
-      updateStatusBar(msg);
-      if (msg.phase) setPhase(msg.phase);
-      break;
-
-    case 'usage':
-    case 'usage_update':
-      usageData.main = msg.main || null;
-      usageData.presence = msg.presence || null;
-      if (usageData.main) {
-        updateBudget(usageData.main.usage_pct);
-        addLogEntry('detail', `tokens: ${usageData.main.tokens_used.toLocaleString()} / ${usageData.main.context_window.toLocaleString()} (${usageData.main.usage_pct.toFixed(1)}%)`, undefined, SOURCE_LABELS.system);
-      }
-      renderUsageTab();
-      break;
-
-    case 'display_ready':
-      addLogEntryWithDisplayLink('info', `Display :${msg.display_id} ready`, msg.display_id, SOURCE_LABELS.system);
-      if (msg.vnc_port) addDisplaySlot(msg.display_id, msg.vnc_port);
-      break;
-
-    case 'display_taken':
-      addLogEntry('warn', `User took control of display :${msg.display_id}`, undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'display_released':
-      addLogEntry('info', `User released control of display :${msg.display_id}${msg.note ? '. Note: ' + msg.note : ''}`, undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'command_result':
-      addLogEntry(msg.ok ? 'detail' : 'error', `[${msg.action}] ${msg.message}`, undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'presence_log': {
-      // Respect the level from the presence layer (debug/detail/info)
-      const presenceLevel = msg.level || 'info';
-      addLogEntry(presenceLevel, msg.message, undefined, SOURCE_LABELS.server);
-      break;
-    }
-
-    case 'presence_usage_update':
-      // Update presence usage data for the Usage tab
-      usageData.presence = {
-        provider: msg.provider,
-        model: msg.model,
-        tokens_used: msg.total_tokens,
-        context_window: msg.context_window,
-        usage_pct: msg.usage_pct,
-        prompt_tokens: msg.prompt_tokens || 0,
-        completion_tokens: msg.completion_tokens || 0,
-        cached_tokens: msg.cached_tokens || 0,
-      };
-      renderUsageTab();
-      break;
-
-    case 'user_transcript':
-      addLogEntry('presence', msg.text, undefined, SOURCE_LABELS.live);
-      break;
-
-    case 'human_response_sent':
-      addLogEntry('detail', 'Human response sent', undefined, SOURCE_LABELS.system);
-      break;
-
-    case 'safety_cap_reached':
-      addLogEntry('error', 'Safety cap reached', undefined, SOURCE_LABELS.system);
-      setPhase('done');
-      break;
-
-    default:
-      // Unknown events logged at debug level
-      addLogEntry('debug', `[${msg.event}] ${JSON.stringify(msg)}`);
-  }
-}
-
-// ── Status Bar ──
-function updateStatusBar(data) {
-  if (data.provider) document.getElementById('sb-provider').textContent = data.provider;
-  if (data.model) document.getElementById('sb-model').textContent = data.model;
-  if (data.turn !== undefined) document.getElementById('sb-turn').textContent = 'T' + data.turn;
-  if (data.budget_pct !== undefined) updateBudget(data.budget_pct);
-  if (data.autonomy) {
-    const el = document.getElementById('sb-autonomy');
-    el.textContent = data.autonomy;
-    el.style.color = autonomyColor(data.autonomy);
-  }
-  if (data.session_id) {
-    document.getElementById('sb-session').textContent = data.session_id.substring(0, 8);
-  }
-}
-
-function updateBudget(pct) {
-  const fill = document.getElementById('sb-budget-fill');
-  const label = document.getElementById('sb-budget-pct');
-  fill.style.width = Math.min(pct, 100) + '%';
-  fill.style.background = budgetColor(pct);
-  label.textContent = pct.toFixed(1) + '%';
-  label.style.color = budgetColor(pct);
-}
-
-function budgetColor(pct) {
-  if (pct < 50) return '#a6e3a1';
-  if (pct < 85) return '#f9e2af';
-  return '#f38ba8';
-}
-
-function autonomyColor(level) {
-  switch (level) {
-    case 'Low': return '#f38ba8';
-    case 'Medium': return '#f9e2af';
-    case 'High': return '#94e2d5';
-    case 'Full': return '#a6e3a1';
-    default: return '#f9e2af';
-  }
-}
-
-// ── Phase Banner ──
-function setPhase(phase) {
-  currentPhase = phase;
-  const banner = document.getElementById('phase-banner');
-  const text = document.getElementById('phase-text');
-
-  // Remove all phase classes
-  banner.className = 'phase-banner';
-
-  // Normalize phase: Debug format has no underscores (e.g. "waitingfollowup"),
-  // AgentStateSnapshot uses underscores (e.g. "waiting_followup").
-  const normalizedPhase = phase.replace('waiting_', 'waiting')
-    .replace('running_', 'running');
-
-  const labels = {
-    idle: 'Idle',
-    thinking: 'Thinking...',
-    running: 'Running Agent',
-    runningagent: 'Running Agent',
-    waiting: 'Waiting for Input',
-    waitingapproval: 'Waiting for Approval',
-    waitinghuman: 'Waiting for Response',
-    waitingfollowup: 'Waiting for Follow-up',
-    orchestrating: 'Orchestrating',
-    done: 'Done',
-  };
-
-  const phaseCategory =
-    normalizedPhase.startsWith('waiting') ? 'waiting' :
-    normalizedPhase.startsWith('running') ? 'running' :
-    normalizedPhase === 'orchestrating' ? 'thinking' :
-    normalizedPhase;
-
-  banner.classList.add('phase-' + phaseCategory);
-  text.textContent = labels[normalizedPhase] || labels[phase] || phase;
-
-  // Start/stop spinner
-  if (phase === 'idle' || phase === 'done') {
-    stopSpinner();
-  } else {
-    startSpinner();
-  }
-}
-
-function startSpinner() {
-  if (spinnerInterval) return;
-  const el = document.getElementById('phase-spinner');
-  spinnerInterval = setInterval(() => {
-    spinnerIdx = (spinnerIdx + 1) % SPINNER_FRAMES.length;
-    el.textContent = SPINNER_FRAMES[spinnerIdx];
-  }, 80);
-}
-
-function stopSpinner() {
-  if (spinnerInterval) {
-    clearInterval(spinnerInterval);
-    spinnerInterval = null;
-  }
-  document.getElementById('phase-spinner').textContent = currentPhase === 'done' ? '✓' : '';
-}
-
-// ── Log Stream ──
-function addLogEntry(level, content, turn, source) {
-  const stream = document.getElementById('log-stream');
-
-  // Turn separator
-  if (turn !== undefined) {
-    const sep = document.createElement('div');
-    sep.className = 'log-turn-sep';
-    sep.textContent = '── Turn ' + turn + ' ──';
-    stream.appendChild(sep);
-  }
-
-  const entry = document.createElement('div');
-  entry.className = 'log-entry level-' + level;
-  entry.dataset.level = level;
-
-  // Visibility based on verbosity
-  const visible = VERBOSITY_LEVELS[verbosity] || VERBOSITY_LEVELS.normal;
-  if (!visible.includes(level)) {
-    entry.style.display = 'none';
-  }
-
-  const icon = document.createElement('span');
-  icon.className = 'log-icon';
-  icon.textContent = LEVEL_ICONS[level] || '\u2022';
-  icon.title = LEVEL_TOOLTIPS[level] || level;
-
-  const ts = document.createElement('span');
-  ts.className = 'log-ts';
-  ts.textContent = new Date().toLocaleTimeString('en-US', { hour12: false });
-
-  // Source label (matches TUI: Workr, Agent, Servr, etc.)
-  const sourceLabel = source || SOURCE_LABELS.system;
-  const lvl = document.createElement('span');
-  lvl.className = 'log-level';
-  lvl.textContent = sourceLabel;
-
-  const cnt = document.createElement('span');
-  cnt.className = 'log-content';
-  cnt.textContent = content;
-
-  entry.appendChild(icon);
-  entry.appendChild(ts);
-  entry.appendChild(lvl);
-  entry.appendChild(cnt);
-
-  // Make long entries collapsible
-  const lineCount = content.split('\n').length;
-  if (lineCount > COLLAPSE_THRESHOLD || content.length > 300) {
-    entry.classList.add('collapsible');
-    const toggle = document.createElement('span');
-    toggle.className = 'collapse-toggle';
-    toggle.innerHTML = '<span class="arrow">\u25B8</span><span class="arrow-up">\u25BE</span>';
-    entry.appendChild(toggle);
-    entry.addEventListener('click', () => entry.classList.toggle('expanded'));
-  }
-
-  stream.appendChild(entry);
-
-  logEntryCount++;
-  // Cap entries
-  if (logEntryCount > MAX_LOG_ENTRIES) {
-    const first = stream.querySelector('.log-entry, .log-turn-sep');
-    if (first) { stream.removeChild(first); logEntryCount--; }
-  }
-
-  // Auto-scroll
-  if (autoScroll) {
-    stream.scrollTop = stream.scrollHeight;
-  }
-}
-
-// Add a log entry with a clickable link to the Displays tab
-function addLogEntryWithDisplayLink(level, text, displayId, source) {
-  const stream = document.getElementById('log-stream');
-
-  const entry = document.createElement('div');
-  entry.className = 'log-entry level-' + level;
-  entry.dataset.level = level;
-
-  const visible = VERBOSITY_LEVELS[verbosity] || VERBOSITY_LEVELS.normal;
-  if (!visible.includes(level)) entry.style.display = 'none';
-
-  const icon = document.createElement('span');
-  icon.className = 'log-icon';
-  icon.textContent = LEVEL_ICONS[level] || '\u2022';
-  icon.title = LEVEL_TOOLTIPS[level] || level;
-
-  const ts = document.createElement('span');
-  ts.className = 'log-ts';
-  ts.textContent = new Date().toLocaleTimeString('en-US', { hour12: false });
-
-  const lvl = document.createElement('span');
-  lvl.className = 'log-level';
-  lvl.textContent = source || SOURCE_LABELS.system;
-
-  const cnt = document.createElement('span');
-  cnt.className = 'log-content';
-  cnt.textContent = text + ' ';
-
-  const link = document.createElement('a');
-  link.textContent = `:${displayId} \u2192 Displays`;
-  link.href = '#';
-  link.style.cssText = 'color:var(--blue);text-decoration:underline;cursor:pointer;font-size:12px';
-  link.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); switchTab('displays'); });
-  cnt.appendChild(link);
-
-  entry.appendChild(icon);
-  entry.appendChild(ts);
-  entry.appendChild(lvl);
-  entry.appendChild(cnt);
-  stream.appendChild(entry);
-
-  logEntryCount++;
-  if (autoScroll) stream.scrollTop = stream.scrollHeight;
-}
+});
+
+// Verbosity toggle
+document.getElementById('verbosity-select').addEventListener('change', (e) => {
+  if (app) processCommands(app.set_verbosity(e.target.value));
+});
 
 // Auto-scroll detection
 (function() {
   const stream = document.getElementById('log-stream');
   const btn = document.getElementById('scroll-bottom');
-
   stream.addEventListener('scroll', () => {
     const atBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 30;
     autoScroll = atBottom;
     btn.classList.toggle('visible', !atBottom);
   });
-
   btn.addEventListener('click', () => {
     stream.scrollTop = stream.scrollHeight;
-    autoScroll = true;
-    btn.classList.remove('visible');
+    autoScroll = true; btn.classList.remove('visible');
   });
 })();
 
-// ── Verbosity Toggle ──
-document.getElementById('verbosity-select').addEventListener('change', (e) => {
-  verbosity = e.target.value;
-  const visible = VERBOSITY_LEVELS[verbosity] || VERBOSITY_LEVELS.normal;
-  document.querySelectorAll('.log-entry').forEach(entry => {
-    const level = entry.dataset.level;
-    entry.style.display = visible.includes(level) ? '' : 'none';
-  });
-});
-
-// ── Bottom Panels ──
-function showBottomPanel(id) {
-  hideAllBottomPanels();
-  document.getElementById(id).classList.add('visible');
-}
-
-function hideAllBottomPanels() {
-  document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible'));
-}
-
-function sendApproval(action) {
-  if (pendingApprovalId === null) return;
-  sendJson({ action: action, id: pendingApprovalId });
-  pendingApprovalId = null;
-  hideAllBottomPanels();
-  setPhase('running');
-  addLogEntry('info', `Action: ${action}`);
-}
-
-function sendHumanResponse() {
-  const input = document.getElementById('human-input');
-  const text = input.value.trim();
-  if (!text) return;
-  sendJson({ action: 'input', text: text });
-  input.value = '';
-  hideAllBottomPanels();
-  setPhase('thinking');
-  addLogEntry('info', `Response: ${text}`);
-}
-
-function sendFollowUp() {
-  const input = document.getElementById('followup-input');
-  const text = input.value.trim();
-  if (!text) return;
-  sendJson({ action: 'follow_up', text: text });
-  input.value = '';
-  hideAllBottomPanels();
-  setPhase('thinking');
-  addLogEntry('info', `Follow-up: ${text}`);
-}
-
-// Enter to submit in textareas
-document.querySelectorAll('#human-input, #followup-input').forEach(ta => {
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      if (ta.id === 'human-input') sendHumanResponse();
-      else sendFollowUp();
-    }
-  });
-});
-
-// ── Usage Tab ──
-function renderUsageTab() {
-  const cardsEl = document.getElementById('usage-cards');
-  const emptyEl = document.getElementById('usage-empty');
-  const costEl = document.getElementById('cost-section');
-  const historyEl = document.getElementById('token-history');
-
-  if (!usageData.main) {
-    emptyEl.style.display = 'flex';
-    cardsEl.style.display = 'none';
-    costEl.style.display = 'none';
-    historyEl.style.display = 'none';
-    return;
-  }
-
-  emptyEl.style.display = 'none';
-  cardsEl.style.display = 'flex';
-  cardsEl.innerHTML = '';
-
-  // Render cards
-  const models = [
-    { label: 'Main Model', data: usageData.main },
-  ];
-  if (usageData.presence) {
-    models.push({ label: 'Presence Model', data: usageData.presence });
-  }
-
-  let totalCost = 0;
-  const costLines = [];
-
-  for (const m of models) {
-    const card = renderUsageCard(m.label, m.data);
-    cardsEl.appendChild(card);
-
-    // Estimate cost using per-type pricing
-    const pricing = findPricing(m.data.model);
-    if (pricing) {
-      const prompt = m.data.prompt_tokens || 0;
-      const completion = m.data.completion_tokens || 0;
-      const cached = m.data.cached_tokens || 0;
-      const uncachedInput = prompt - cached;
-      const inputCost = uncachedInput * pricing.input + cached * (pricing.cached || pricing.input);
-      const outputCost = completion * pricing.output;
-      const cost = inputCost + outputCost;
-      totalCost += cost;
-      costLines.push({ label: m.label, cost, inputCost, outputCost, model: m.data.model });
-    }
-  }
-
-  // Cost section
-  if (costLines.length > 0) {
-    costEl.style.display = 'block';
-    const grid = document.getElementById('cost-grid');
-    grid.innerHTML = '';
-    for (const cl of costLines) {
-      grid.innerHTML += `<span class="label">${cl.label}</span><span class="value">$${cl.cost.toFixed(4)}</span>`;
-      if (cl.inputCost !== undefined) {
-        grid.innerHTML += `<span class="label" style="padding-left:12px;font-size:11px">Input</span><span class="value" style="font-size:11px;font-weight:normal">$${cl.inputCost.toFixed(4)}</span>`;
-        grid.innerHTML += `<span class="label" style="padding-left:12px;font-size:11px">Output</span><span class="value" style="font-size:11px;font-weight:normal">$${cl.outputCost.toFixed(4)}</span>`;
-      }
-    }
-    if (costLines.length > 1) {
-      grid.innerHTML += `<span class="label" style="font-weight:600;color:var(--text)">Total</span><span class="value">$${totalCost.toFixed(4)}</span>`;
-    }
-  } else {
-    costEl.style.display = 'none';
-  }
-
-  // Token history chart
-  if (tokenHistory.length > 0) {
-    historyEl.style.display = 'block';
-    const chart = document.getElementById('history-chart');
-    const maxTokens = Math.max(...tokenHistory.map(h => h.tokens), 1);
-    chart.innerHTML = '';
-    for (const h of tokenHistory) {
-      const bar = document.createElement('div');
-      bar.className = 'history-bar';
-      bar.style.height = Math.max((h.tokens / maxTokens) * 100, 2) + '%';
-      bar.title = `Turn ${h.turn}: ${h.tokens.toLocaleString()} tokens`;
-      chart.appendChild(bar);
-    }
-  } else {
-    historyEl.style.display = 'none';
-  }
-}
-
-function renderUsageCard(label, data) {
-  const card = document.createElement('div');
-  card.className = 'usage-card';
-
-  const color = budgetColor(data.usage_pct);
-  const prompt = data.prompt_tokens || 0;
-  const completion = data.completion_tokens || 0;
-  const cached = data.cached_tokens || 0;
-  const uncachedInput = prompt - cached;
-
-  card.innerHTML = `
-    <div class="card-title">${label}</div>
-    <div class="card-model">
-      <span class="provider">${data.provider}</span> /
-      <span class="model-name">${data.model}</span>
-    </div>
-    <div class="token-bar">
-      <div class="bar-label">
-        <span class="tokens">${data.tokens_used.toLocaleString()} / ${data.context_window.toLocaleString()}</span>
-        <span class="pct" style="color:${color}">${data.usage_pct.toFixed(1)}%</span>
-      </div>
-      <div class="bar-track">
-        <div class="bar-fill" style="width:${Math.min(data.usage_pct, 100)}%;background:${color}"></div>
-      </div>
-    </div>
-    <div class="token-breakdown">
-      <span class="label">Input tokens</span>
-      <span class="value">${prompt.toLocaleString()}</span>
-      <span class="label" style="padding-left:12px">Cached</span>
-      <span class="value" style="color:var(--green)">${cached.toLocaleString()}${prompt > 0 ? ' (' + (cached / prompt * 100).toFixed(0) + '%)' : ''}</span>
-      <span class="label" style="padding-left:12px">Uncached</span>
-      <span class="value">${uncachedInput.toLocaleString()}</span>
-      <span class="label">Output tokens</span>
-      <span class="value">${completion.toLocaleString()}</span>
-      <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Remaining</span>
-      <span class="value" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${(data.context_window - data.tokens_used).toLocaleString()}</span>
-    </div>
-  `;
-  return card;
-}
-
-function findPricing(model) {
-  // Try exact match first, then prefix match
-  if (PRICING[model]) return PRICING[model];
-  for (const key of Object.keys(PRICING)) {
-    if (model.startsWith(key) || model.includes(key)) return PRICING[key];
-  }
-  return null;
-}
-
-// ── Terminal Tab (lazy xterm.js) ──
-function handleTermData(base64data) {
-  if (term) {
-    const bytes = Uint8Array.from(atob(base64data), c => c.charCodeAt(0));
-    term.write(bytes);
-  } else {
-    termBuffer.push(base64data);
-  }
-}
-
-function initTerminal() {
-  if (termInitialized) return;
-  termInitialized = true;
-
-  // Enable CSS
-  document.getElementById('xterm-css').removeAttribute('disabled');
-
-  // Load xterm.js
-  const script = document.createElement('script');
-  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
-  script.onload = () => {
-    const fitScript = document.createElement('script');
-    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
-    fitScript.onload = () => {
-      term = new Terminal({
-        theme: {
-          background: '#1e1e2e',
-          foreground: '#cdd6f4',
-          cursor: '#f5e0dc',
-          cursorAccent: '#1e1e2e',
-          selectionBackground: '#45475a',
-          black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
-          blue: '#89b4fa', magenta: '#cba6f7', cyan: '#94e2d5', white: '#bac2de',
-          brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
-          brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
-          brightCyan: '#94e2d5', brightWhite: '#a6adc8',
-        },
-        fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
-        fontSize: 13,
-        allowProposedApi: true,
-      });
-      fitAddon = new FitAddon.FitAddon();
-      term.loadAddon(fitAddon);
-      term.open(document.getElementById('terminal-container'));
-      fitAddon.fit();
-
-      // Send key events
-      term.onData(data => {
-        // Convert to key event format the server expects
-        for (const ch of data) {
-          sendJson({ t: 'key', key: ch });
-        }
-      });
-
-      // Replay buffered data
-      for (const b64 of termBuffer) {
-        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        term.write(bytes);
-      }
-      termBuffer = [];
-
-      // Resize handling
-      new ResizeObserver(() => {
-        if (fitAddon && activeTab === 'terminal') fitAddon.fit();
-      }).observe(document.getElementById('terminal-container'));
-
-      term.onResize(({ cols, rows }) => {
-        sendJson({ t: 'resize', cols, rows });
-      });
-    };
-    document.head.appendChild(fitScript);
-  };
-  document.head.appendChild(script);
-}
-
-// ── Agent Output Formatting ──
-// The runtime emits JSON lines. Each line is either a status update or a result.
-// We parse and display a human-readable summary.
-function formatAgentOutput(raw) {
-  const lines = raw.trim().split('\n');
-  const parts = [];
-  for (const line of lines) {
-    try {
-      const obj = JSON.parse(line);
-      if (obj.type === 'result' && obj.data) {
-        // data is a JSON-encoded string with the actual result
-        let data;
-        try { data = typeof obj.data === 'string' ? JSON.parse(obj.data) : obj.data; } catch { data = obj.data; }
-        if (data.stdout_tail) {
-          const out = data.stdout_tail.trim();
-          if (out) parts.push(out);
-        }
-        if (data.stderr_tail) {
-          const err = data.stderr_tail.trim();
-          if (err) parts.push('[stderr] ' + err);
-        }
-        if (data.content) {
-          parts.push(data.content);
-        }
-        if (data.exists !== undefined) {
-          parts.push('exists: ' + data.exists);
-        }
-        if (data.exit_code !== undefined && data.exit_code !== 0) {
-          parts.push('exit code: ' + data.exit_code);
-        }
-        // If we couldn't extract anything useful, show the data as-is
-        if (parts.length === 0 && typeof data === 'object') {
-          parts.push(JSON.stringify(data, null, 2));
-        }
-      } else if (obj.type === 'status') {
-        // Skip status lines (running/completed) — not useful to display
-      } else {
-        // Unknown type, show raw
-        parts.push(line);
-      }
-    } catch {
-      // Not JSON, show as-is
-      parts.push(line);
-    }
-  }
-  return parts.length > 0 ? parts.join('\n') : raw;
-}
-
-// ── Init ──
-// Fetch config for provider/model info
-fetch('/config').then(r => r.json()).then(cfg => {
-  if (cfg.provider) document.getElementById('sb-provider').textContent = cfg.provider;
-  if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
-}).catch(() => {});
-
-connectWs();
+// ── Start ──
+main();
 </script>
 </body>
 </html>
