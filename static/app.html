@@ -1910,7 +1910,7 @@ function addDisplayThumb(displayId) {
   const thumb = document.createElement('div');
   thumb.className = 'activity-display-thumb';
   thumb.innerHTML = `<span class="thumb-label">:${displayId}</span>`;
-  thumb.addEventListener('click', () => toggleDisplayStrip(), true);
+  thumb.addEventListener('click', (e) => { e.stopPropagation(); toggleDisplayStrip(); }, true);
 
   displayThumbs.set(displayId, thumb);
   row.appendChild(thumb);
