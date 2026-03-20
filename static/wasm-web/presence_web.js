@@ -1,6 +1,405 @@
 /* @ts-self-types="./presence_web.d.ts" */
 
 /**
+ * App dashboard backed by WASM.
+ *
+ * - All event routing, state, and cost calculation in Rust (`AppState`)
+ * - Voice/server connection delegated to `PresenceWeb`
+ * - JS only processes `UiCommand[]` for DOM updates
+ */
+export class AppWeb {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        AppWebFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_appweb_free(ptr, 0);
+    }
+    /**
+     * Connect to the intendant web gateway WebSocket.
+     * Sets up raw_message interception for AppState routing.
+     * @param {string} url
+     */
+    connect_server(url) {
+        const ptr0 = passStringToWasm0(url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.appweb_connect_server(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {string} provider
+     * @param {string} token
+     * @param {string | null} [model]
+     * @param {number | null} [input_sample_rate]
+     */
+    connect_voice(provider, token, model, input_sample_rate) {
+        const ptr0 = passStringToWasm0(provider, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        var ptr2 = isLikeNone(model) ? 0 : passStringToWasm0(model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len2 = WASM_VECTOR_LEN;
+        wasm.appweb_connect_voice(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, isLikeNone(input_sample_rate) ? 0x100000001 : (input_sample_rate) >>> 0);
+    }
+    disconnect_voice() {
+        wasm.appweb_disconnect_voice(this.__wbg_ptr);
+    }
+    /**
+     * @returns {string}
+     */
+    get_prompt() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.appweb_get_prompt(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {any}
+     */
+    get_state() {
+        const ret = wasm.appweb_get_state(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {any}
+     */
+    get_tools() {
+        const ret = wasm.appweb_get_tools(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @param {any} evt
+     * @returns {boolean}
+     */
+    handle_server_event(evt) {
+        const ret = wasm.appweb_handle_server_event(this.__wbg_ptr, evt);
+        return ret !== 0;
+    }
+    /**
+     * Route a raw server message through AppState. Returns `UiCommand[]` as JSON.
+     * @param {any} msg
+     * @returns {any}
+     */
+    handle_server_message(msg) {
+        const ret = wasm.appweb_handle_server_message(this.__wbg_ptr, msg);
+        return ret;
+    }
+    /**
+     * @param {any} call
+     * @returns {any}
+     */
+    handle_voice_tool_call(call) {
+        const ret = wasm.appweb_handle_voice_tool_call(this.__wbg_ptr, call);
+        return ret;
+    }
+    /**
+     * @returns {boolean}
+     */
+    has_pending_approval() {
+        const ret = wasm.appweb_has_pending_approval(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @returns {boolean}
+     */
+    inject_pending_approval_if_any() {
+        const ret = wasm.appweb_inject_pending_approval_if_any(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    constructor() {
+        const ret = wasm.appweb_new();
+        this.__wbg_ptr = ret >>> 0;
+        AppWebFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Get pending approval ID (for keyboard shortcut routing).
+     * @returns {any}
+     */
+    pending_approval_id() {
+        const ret = wasm.appweb_pending_approval_id(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {string}
+     */
+    phase() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.appweb_phase(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @param {string} url
+     */
+    reconnect_server(url) {
+        const ptr0 = passStringToWasm0(url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.appweb_reconnect_server(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Release control of a display.
+     * @param {bigint} display_id
+     * @param {string | null} [note]
+     */
+    release_display(display_id, note) {
+        var ptr0 = isLikeNone(note) ? 0 : passStringToWasm0(note, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.appweb_release_display(this.__wbg_ptr, display_id, ptr0, len0);
+    }
+    /**
+     * Approve/skip/deny/approve_all a pending action.
+     * Returns `UiCommand[]` for UI updates. Sends the action to the server.
+     * @param {string} action
+     * @returns {any}
+     */
+    send_approval(action) {
+        const ptr0 = passStringToWasm0(action, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.appweb_send_approval(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * @param {string} base64_pcm
+     */
+    send_audio(base64_pcm) {
+        const ptr0 = passStringToWasm0(base64_pcm, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.appweb_send_audio(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Send a follow-up message.
+     * @param {string} text
+     * @returns {any}
+     */
+    send_follow_up(text) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.appweb_send_follow_up(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Send a human response (askHuman).
+     * @param {string} text
+     * @returns {any}
+     */
+    send_human_response(text) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.appweb_send_human_response(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    send_make_active() {
+        wasm.appweb_send_make_active(this.__wbg_ptr);
+    }
+    /**
+     * @param {string} summary
+     */
+    send_presence_checkpoint(summary) {
+        const ptr0 = passStringToWasm0(summary, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.appweb_send_presence_checkpoint(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {string} text
+     */
+    send_text(text) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.appweb_send_text(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {string} base64_pcm
+     */
+    send_user_audio(base64_pcm) {
+        const ptr0 = passStringToWasm0(base64_pcm, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.appweb_send_user_audio(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {string} kind
+     * @param {string} detail
+     */
+    send_voice_diagnostic(kind, detail) {
+        const ptr0 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(detail, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.appweb_send_voice_diagnostic(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+    }
+    /**
+     * @param {string} text
+     * @param {string | null} [tool_context]
+     */
+    send_voice_log(text, tool_context) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        var ptr1 = isLikeNone(tool_context) ? 0 : passStringToWasm0(tool_context, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len1 = WASM_VECTOR_LEN;
+        wasm.appweb_send_voice_log(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+    }
+    /**
+     * @param {any} call
+     * @param {any} result
+     */
+    send_voice_tool_response(call, result) {
+        wasm.appweb_send_voice_tool_response(this.__wbg_ptr, call, result);
+    }
+    /**
+     * Notify which tab is active (for badge logic).
+     * @param {string} tab
+     * @returns {any}
+     */
+    set_active_tab(tab) {
+        const ptr0 = passStringToWasm0(tab, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.appweb_set_active_tab(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_active_granted(f) {
+        wasm.appweb_set_on_active_granted(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_diagnostic(f) {
+        wasm.appweb_set_on_diagnostic(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_error(f) {
+        wasm.appweb_set_on_error(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_force_disconnect(f) {
+        wasm.appweb_set_on_force_disconnect(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_inject_voice_text(f) {
+        wasm.appweb_set_on_inject_voice_text(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_raw_message(f) {
+        wasm.appweb_set_on_raw_message(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_server_event(f) {
+        wasm.appweb_set_on_server_event(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_server_state(f) {
+        wasm.appweb_set_on_server_state(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_session_changed(f) {
+        wasm.appweb_set_on_session_changed(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_state_snapshot(f) {
+        wasm.appweb_set_on_state_snapshot(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_term(f) {
+        wasm.appweb_set_on_term(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_voice_audio(f) {
+        wasm.appweb_set_on_voice_audio(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_voice_interrupted(f) {
+        wasm.appweb_set_on_voice_interrupted(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_voice_ready(f) {
+        wasm.appweb_set_on_voice_ready(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_voice_text(f) {
+        wasm.appweb_set_on_voice_text(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_voice_tool_call(f) {
+        wasm.appweb_set_on_voice_tool_call(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_voice_transcript(f) {
+        wasm.appweb_set_on_voice_transcript(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {boolean} passive
+     */
+    set_passive_mode(passive) {
+        wasm.appweb_set_passive_mode(this.__wbg_ptr, passive);
+    }
+    /**
+     * Change log verbosity and return commands to re-filter.
+     * @param {string} level
+     * @returns {any}
+     */
+    set_verbosity(level) {
+        const ptr0 = passStringToWasm0(level, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.appweb_set_verbosity(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Take control of a display.
+     * @param {bigint} display_id
+     */
+    take_display(display_id) {
+        wasm.appweb_take_display(this.__wbg_ptr, display_id);
+    }
+}
+if (Symbol.dispose) AppWeb.prototype[Symbol.dispose] = AppWeb.prototype.free;
+
+/**
  * Main entry point for the browser presence layer.
  *
  * Manages server connection, voice model, and presence state.
@@ -292,6 +691,12 @@ export class PresenceWeb {
      */
     set_on_inject_voice_text(f) {
         wasm.presenceweb_set_on_inject_voice_text(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_raw_message(f) {
+        wasm.presenceweb_set_on_raw_message(this.__wbg_ptr, f);
     }
     /**
      * @param {Function} f
@@ -650,6 +1055,18 @@ function __wbg_get_imports() {
             const ret = Object.entries(arg0);
             return ret;
         },
+        __wbg_getHours_e02e88722301c418: function(arg0) {
+            const ret = arg0.getHours();
+            return ret;
+        },
+        __wbg_getMinutes_eb73ceeb8231f6f4: function(arg0) {
+            const ret = arg0.getMinutes();
+            return ret;
+        },
+        __wbg_getSeconds_d5269a98a03bab5e: function(arg0) {
+            const ret = arg0.getSeconds();
+            return ret;
+        },
         __wbg_get_9b94d73e6221f75c: function(arg0, arg1) {
             const ret = arg0[arg1 >>> 0];
             return ret;
@@ -726,6 +1143,10 @@ function __wbg_get_imports() {
             const ret = new WebSocket(getStringFromWasm0(arg0, arg1));
             return ret;
         }, arguments); },
+        __wbg_new_0_73afc35eb544e539: function() {
+            const ret = new Date();
+            return ret;
+        },
         __wbg_new_361308b2356cecd0: function() {
             const ret = new Object();
             return ret;
@@ -832,17 +1253,17 @@ function __wbg_get_imports() {
             console.warn(arg0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 101, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 104, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 110, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 113, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 101, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 104, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 110, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 113, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 101, function: Function { arguments: [], shim_idx: 102, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 110, function: Function { arguments: [], shim_idx: 111, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83c8c2db16b120ac, wasm_bindgen__convert__closures_____invoke__ha067de4be952b5b6);
             return ret;
         },
@@ -892,6 +1313,9 @@ function wasm_bindgen__convert__closures_____invoke__h02c82abf5f4209d1(arg0, arg
 
 
 const __wbindgen_enum_BinaryType = ["blob", "arraybuffer"];
+const AppWebFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_appweb_free(ptr >>> 0, 1));
 const PresenceWebFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_presenceweb_free(ptr >>> 0, 1));
