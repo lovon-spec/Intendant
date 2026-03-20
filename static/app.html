@@ -671,6 +671,101 @@ html, body {
   font-size: 14px;
 }
 
+/* ── Voice Overlay ── */
+.voice-overlay {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  z-index: 100;
+}
+.mic-btn {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  border: 2px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 20px;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mic-btn:hover { border-color: var(--blue); background: var(--surface1); }
+.mic-btn.active { border-color: var(--red); background: var(--red); color: var(--crust); }
+.mic-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.voice-status {
+  padding: 4px 10px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--subtext0);
+  max-width: 200px;
+  text-align: right;
+}
+.voice-status.error { color: var(--red); border-color: var(--red); }
+.voice-status.connected { color: var(--green); }
+.make-active-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--peach);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--peach);
+  font-size: 11px;
+  cursor: pointer;
+}
+.make-active-btn:hover { background: var(--peach); color: var(--crust); }
+.voice-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  background: var(--surface2);
+}
+.voice-dot.ok { background: var(--green); }
+.voice-dot.err { background: var(--red); }
+
+/* ── Dialogs ── */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+.dialog-overlay.hidden { display: none; }
+.dialog {
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 8px;
+  padding: 24px;
+  width: 380px;
+  max-width: 90vw;
+}
+.dialog h2 { font-size: 16px; margin-bottom: 12px; color: var(--text); }
+.dialog label { display: block; font-size: 12px; color: var(--overlay1); margin-bottom: 4px; }
+.dialog input[type="password"], .dialog input[type="text"] {
+  width: 100%; padding: 8px 10px; background: var(--surface0);
+  border: 1px solid var(--surface1); border-radius: 4px;
+  color: var(--text); font-family: inherit; font-size: 13px;
+}
+.dialog input:focus { outline: none; border-color: var(--blue); }
+.dialog .btn-row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+.dialog .btn-primary {
+  padding: 6px 16px; background: var(--blue); border: none; border-radius: 4px;
+  color: var(--crust); font-family: inherit; font-weight: 600; cursor: pointer;
+}
+.dialog .btn-secondary {
+  padding: 6px 16px; background: var(--surface0); border: 1px solid var(--surface1);
+  border-radius: 4px; color: var(--text); font-family: inherit; cursor: pointer;
+}
+
 /* ── Mobile ── */
 @media (max-width: 600px) {
   .status-bar { font-size: 11px; gap: 8px; padding: 4px 8px; }
@@ -682,6 +777,7 @@ html, body {
   .usage-card { min-width: unset; }
   .usage-cards { flex-direction: column; }
   .budget-bar .bar-track { width: 40px; }
+  .mic-btn { width: 40px; height: 40px; font-size: 16px; }
 }
 </style>
 </head>
@@ -708,6 +804,8 @@ html, body {
     <span class="field-label">session</span>
     <span class="session" id="sb-session"></span>
     <span class="conn-dot err" id="sb-conn"></span>
+    <span class="voice-dot" id="sb-voice" title="Voice model"></span>
+    <span style="font-size:11px;color:var(--overlay0)" id="sb-voice-label"></span>
   </div>
 
   <!-- Tab Bar -->
@@ -811,6 +909,44 @@ html, body {
   </div>
 </div>
 
+<!-- Voice Overlay -->
+<div class="voice-overlay">
+  <div class="voice-status hidden" id="voiceStatus"></div>
+  <button class="make-active-btn hidden" id="makeActiveBtn">Make Active</button>
+  <button class="mic-btn" id="micBtn" title="Toggle voice">&#127908;</button>
+</div>
+
+<!-- Voice Settings Dialog -->
+<div class="dialog-overlay hidden" id="settingsDialog">
+  <div class="dialog">
+    <h2>Voice Settings</h2>
+    <label for="apiKeyInput" id="apiKeyLabel">API Key</label>
+    <input type="password" id="apiKeyInput" placeholder="Enter API key for voice...">
+    <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;cursor:pointer;">
+      <input type="checkbox" id="passiveModeCheckbox">
+      Always passive (observe only)
+    </label>
+    <div class="btn-row">
+      <button class="btn-secondary" id="settingsCancel">Cancel</button>
+      <button class="btn-primary" id="settingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- First-run Voice Dialog -->
+<div class="dialog-overlay hidden" id="firstRunDialog">
+  <div class="dialog">
+    <h2>Voice Setup</h2>
+    <p style="font-size:13px;color:var(--subtext0);margin-bottom:12px">Enter an API key to enable voice interaction with tool support.</p>
+    <label for="firstRunKeyInput" id="firstRunKeyLabel">API Key</label>
+    <input type="password" id="firstRunKeyInput" placeholder="Enter API key for voice...">
+    <div class="btn-row">
+      <button class="btn-secondary" id="firstRunSkip">Skip</button>
+      <button class="btn-primary" id="firstRunSave">Connect Voice</button>
+    </div>
+  </div>
+</div>
+
 <!-- xterm.js (loaded lazily for Terminal tab) -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.css" id="xterm-css" disabled>
 
@@ -850,6 +986,186 @@ const displaySlots = new Map();
 let noVNCLoaded = false;
 let noVNCLoadCallbacks = [];
 
+// Voice / Live mode
+let gatewayConfig = null;
+let micActive = false;
+let modelConnected = false;
+let audioCtx = null;
+let mediaStream = null;
+let workletNode = null;
+let workletReady = false;
+let isActiveBrowser = true;
+let storedConversationCtx = null;
+let voiceConnecting = false;
+let audioDropLogCount = 0;
+const audioQueue = [];
+let isPlaying = false;
+
+// ── Audio Helpers ──
+function downsample(buffer, fromRate, toRate) {
+  if (fromRate === toRate) return buffer;
+  const ratio = fromRate / toRate;
+  const len = Math.round(buffer.length / ratio);
+  const result = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const srcIdx = i * ratio;
+    const lo = Math.floor(srcIdx);
+    const hi = Math.min(lo + 1, buffer.length - 1);
+    const frac = srcIdx - lo;
+    result[i] = buffer[lo] * (1 - frac) + buffer[hi] * frac;
+  }
+  return result;
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function getStorageKey() {
+  const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+  return provider === 'openai' ? 'openai_api_key' : 'gemini_api_key';
+}
+
+// ── Voice Status UI ──
+function showVoiceStatus(msg, isError) {
+  const el = document.getElementById('voiceStatus');
+  el.textContent = msg;
+  el.className = 'voice-status' + (isError ? ' error' : '');
+  el.classList.remove('hidden');
+}
+function hideVoiceStatus() {
+  document.getElementById('voiceStatus').classList.add('hidden');
+}
+
+function updateActivePassiveUI() {
+  const micBtn = document.getElementById('micBtn');
+  const makeActiveBtn = document.getElementById('makeActiveBtn');
+  micBtn.disabled = !isActiveBrowser;
+  makeActiveBtn.classList.toggle('hidden', isActiveBrowser);
+  if (!isActiveBrowser) {
+    document.getElementById('sb-voice-label').textContent = 'Passive';
+  }
+}
+
+// ── Audio Playback ──
+function playAudioChunk(b64data) {
+  if (!audioCtx) return;
+  const outRate = gatewayConfig ? gatewayConfig.output_sample_rate : 24000;
+  const binary = atob(b64data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const pcm16 = new Int16Array(bytes.buffer);
+  const float32 = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
+  const nativeRate = audioCtx.sampleRate;
+  const resampled = (outRate !== nativeRate) ? downsample(float32, outRate, nativeRate) : float32;
+  const buffer = audioCtx.createBuffer(1, resampled.length, nativeRate);
+  buffer.copyToChannel(resampled, 0);
+  audioQueue.push(buffer);
+  if (!isPlaying) playNext();
+}
+
+function playNext() {
+  if (audioQueue.length === 0) { isPlaying = false; return; }
+  isPlaying = true;
+  const buffer = audioQueue.shift();
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(audioCtx.destination);
+  src.onended = playNext;
+  src.start();
+}
+
+// ── Mic Control ──
+async function startMic() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showVoiceStatus('Mic requires HTTPS or localhost', true);
+    return;
+  }
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  if (!workletReady) {
+    try {
+      await audioCtx.audioWorklet.addModule('/audio-processor.js');
+      workletReady = true;
+    } catch (e) {
+      showVoiceStatus(`AudioWorklet failed: ${e.message}`, true);
+      return;
+    }
+  }
+  if (!mediaStream) {
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true } });
+    } catch (e) {
+      showVoiceStatus(`Mic denied: ${e.message}`, true);
+      return;
+    }
+  }
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+  const targetSR = gatewayConfig ? gatewayConfig.input_sample_rate : 16000;
+  const nativeSR = audioCtx.sampleRate;
+  workletNode = new AudioWorkletNode(audioCtx, 'audio-capture-processor', { processorOptions: { bufferSize: 4096 } });
+  workletNode.port.onmessage = (e) => {
+    if (e.data.type !== 'audio') return;
+    if (!micActive || !modelConnected || !app) { audioDropLogCount++; return; }
+    audioDropLogCount = 0;
+    const resampled = downsample(e.data.data, nativeSR, targetSR);
+    const pcm16 = new Int16Array(resampled.length);
+    for (let i = 0; i < resampled.length; i++)
+      pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
+    app.send_audio(arrayBufferToBase64(pcm16.buffer));
+    if (gatewayConfig && gatewayConfig.transcription_enabled) {
+      app.send_user_audio(arrayBufferToBase64(pcm16.buffer));
+    }
+  };
+  source.connect(workletNode);
+  workletNode.connect(audioCtx.destination);
+  showVoiceStatus('Mic active \u2014 speak now');
+}
+
+function stopMic() {
+  if (workletNode) {
+    workletNode.port.postMessage({ type: 'mute' });
+    workletNode.disconnect();
+    workletNode = null;
+  }
+  hideVoiceStatus();
+}
+
+// ── Voice Connection ──
+function connectVoice() {
+  if (!app || voiceConnecting || !isActiveBrowser) return;
+  const apiKey = localStorage.getItem(getStorageKey());
+  if (!apiKey) { showFirstRunDialog(); return; }
+  voiceConnecting = true;
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+  const model = (gatewayConfig && gatewayConfig.model) || null;
+  const inputRate = (gatewayConfig && gatewayConfig.input_sample_rate) || null;
+  showVoiceStatus('Connecting...');
+  app.connect_voice(provider, apiKey, model, inputRate);
+  voiceConnecting = false;
+}
+
+// ── Dialogs ──
+function showFirstRunDialog() {
+  const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+  document.getElementById('firstRunKeyLabel').textContent = provider.charAt(0).toUpperCase() + provider.slice(1) + ' API Key';
+  document.getElementById('firstRunDialog').classList.remove('hidden');
+}
+
+function showSettingsDialog() {
+  const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+  document.getElementById('apiKeyLabel').textContent = provider.charAt(0).toUpperCase() + provider.slice(1) + ' API Key';
+  document.getElementById('apiKeyInput').value = localStorage.getItem(getStorageKey()) || '';
+  document.getElementById('passiveModeCheckbox').checked = localStorage.getItem('passive_mode') === 'true';
+  document.getElementById('settingsDialog').classList.remove('hidden');
+}
+
 // ── WASM Init ──
 async function main() {
   await init();
@@ -866,6 +1182,111 @@ async function main() {
     document.getElementById('sb-conn').className = connected ? 'conn-dot ok' : 'conn-dot err';
   });
 
+  // ── Voice Callbacks ──
+  app.set_on_voice_ready(() => {
+    modelConnected = true;
+    document.getElementById('sb-voice').className = 'voice-dot ok';
+    const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+    document.getElementById('sb-voice-label').textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
+    showVoiceStatus('Voice ready');
+    setTimeout(hideVoiceStatus, 3000);
+    if (storedConversationCtx) {
+      app.send_text('[System: conversation so far]\n' + storedConversationCtx);
+      storedConversationCtx = null;
+    }
+    app.inject_pending_approval_if_any();
+    try { app.send_voice_diagnostic('connected', provider + ' voice model ready'); } catch(_) {}
+  });
+
+  app.set_on_voice_audio((b64) => playAudioChunk(b64));
+
+  app.set_on_voice_text((text) => {
+    app.send_voice_log(text, undefined);
+  });
+
+  app.set_on_voice_transcript((text) => {
+    app.send_voice_log(text, 'transcript');
+  });
+
+  app.set_on_voice_tool_call((call) => {
+    app.handle_voice_tool_call(call);
+  });
+
+  app.set_on_voice_interrupted(() => {
+    try { app.send_voice_diagnostic('interrupted', 'voice model interrupted by user'); } catch(_) {}
+  });
+
+  app.set_on_error((msg) => {
+    if (!msg.startsWith('Server')) {
+      modelConnected = false;
+      document.getElementById('sb-voice').className = 'voice-dot err';
+    }
+    showVoiceStatus(msg, true);
+    try { app.send_voice_diagnostic('error', msg); } catch(_) {}
+  });
+
+  app.set_on_diagnostic((kind, detail) => {
+    try { app.send_voice_diagnostic(kind, detail); } catch(_) {}
+  });
+
+  app.set_on_session_changed(() => {
+    if (modelConnected) {
+      app.disconnect_voice();
+      modelConnected = false;
+      document.getElementById('sb-voice').className = 'voice-dot err';
+      connectVoice();
+    }
+  });
+
+  app.set_on_inject_voice_text((text) => {
+    app.send_text(text);
+  });
+
+  app.set_on_state_snapshot((msg) => {
+    if (msg && msg.is_active !== undefined) {
+      isActiveBrowser = msg.is_active;
+      updateActivePassiveUI();
+    }
+    if (msg && msg.conversation_context) storedConversationCtx = msg.conversation_context;
+    if (modelConnected) app.inject_pending_approval_if_any();
+  });
+
+  app.set_on_server_event((evt) => {
+    if (modelConnected) app.handle_server_event(evt);
+  });
+
+  app.set_on_force_disconnect((reason) => {
+    if (modelConnected) {
+      app.disconnect_voice();
+      modelConnected = false;
+      micActive = false;
+      document.getElementById('micBtn').classList.remove('active');
+      stopMic();
+    }
+    isActiveBrowser = false;
+    document.getElementById('sb-voice').className = 'voice-dot';
+    document.getElementById('sb-voice-label').textContent = 'Passive';
+    updateActivePassiveUI();
+    showVoiceStatus('Voice handed to another browser');
+    setTimeout(hideVoiceStatus, 5000);
+  });
+
+  app.set_on_active_granted((handoverContext, conversationContext) => {
+    isActiveBrowser = true;
+    document.getElementById('makeActiveBtn').disabled = false;
+    updateActivePassiveUI();
+    if (conversationContext) storedConversationCtx = conversationContext;
+    connectVoice();
+    if (handoverContext) {
+      const waitForVoice = () => {
+        if (modelConnected) {
+          app.send_text('[System: handover context] ' + handoverContext + '. Full history available via recall_memory.');
+        } else { setTimeout(waitForVoice, 200); }
+      };
+      setTimeout(waitForVoice, 500);
+    }
+  });
+
   // Connect to server
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = proto + '//' + location.host;
@@ -874,12 +1295,79 @@ async function main() {
   window.__presenceWeb = app;
   app.connect_server(wsUrl);
 
-  // Fetch config for initial provider/model
+  // Fetch config for initial provider/model + voice setup
   try {
     const cfg = await fetch('/config').then(r => r.json());
+    gatewayConfig = cfg;
     if (cfg.provider) document.getElementById('sb-provider').textContent = cfg.provider;
     if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
   } catch {}
+
+  // Passive mode from localStorage
+  if (localStorage.getItem('passive_mode') === 'true') {
+    isActiveBrowser = false;
+    app.set_passive_mode(true);
+    updateActivePassiveUI();
+  }
+
+  // ── Mic Button ──
+  document.getElementById('micBtn').addEventListener('click', async () => {
+    if (!isActiveBrowser) return;
+    if (!modelConnected) {
+      const apiKey = localStorage.getItem(getStorageKey());
+      if (!apiKey) { showFirstRunDialog(); return; }
+      connectVoice();
+    }
+    micActive = !micActive;
+    document.getElementById('micBtn').classList.toggle('active', micActive);
+    if (micActive) await startMic(); else stopMic();
+  });
+
+  // Long-press mic button opens settings
+  let micLongPress = null;
+  document.getElementById('micBtn').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    showSettingsDialog();
+  });
+
+  // Make Active button
+  document.getElementById('makeActiveBtn').addEventListener('click', () => {
+    if (app && !isActiveBrowser) {
+      app.send_make_active();
+      document.getElementById('makeActiveBtn').disabled = true;
+      showVoiceStatus('Requesting active...');
+    }
+  });
+
+  // ── Dialog Handlers ──
+  document.getElementById('firstRunSave').addEventListener('click', () => {
+    const key = document.getElementById('firstRunKeyInput').value.trim();
+    if (key) {
+      localStorage.setItem(getStorageKey(), key);
+      document.getElementById('firstRunDialog').classList.add('hidden');
+      connectVoice();
+    }
+  });
+  document.getElementById('firstRunSkip').addEventListener('click', () => {
+    document.getElementById('firstRunDialog').classList.add('hidden');
+  });
+  document.getElementById('settingsSave').addEventListener('click', () => {
+    const key = document.getElementById('apiKeyInput').value.trim();
+    if (key) localStorage.setItem(getStorageKey(), key);
+    const passive = document.getElementById('passiveModeCheckbox').checked;
+    localStorage.setItem('passive_mode', passive);
+    app.set_passive_mode(passive);
+    if (passive) { isActiveBrowser = false; updateActivePassiveUI(); }
+    document.getElementById('settingsDialog').classList.add('hidden');
+  });
+  document.getElementById('settingsCancel').addEventListener('click', () => {
+    document.getElementById('settingsDialog').classList.add('hidden');
+  });
+
+  // Clean up on unload
+  window.addEventListener('beforeunload', () => {
+    if (modelConnected && app) app.disconnect_voice();
+  });
 }
 
 // ── UiCommand Processor ──
