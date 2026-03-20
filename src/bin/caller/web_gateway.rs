@@ -181,25 +181,42 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
         let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
         let turn = obj.get("turn").and_then(|v| v.as_u64());
 
-        // Skip internal/debug entries at Normal verbosity — the browser
-        // handles verbosity filtering, but we skip truly internal events
-        // to keep the replay payload small.
+        // Skip truly internal events that have no display value.
         match event_type {
-            "messages_input" | "session_start" => continue,
+            "messages_input" | "session_start" | "json_extracted" => continue,
             _ => {}
         }
 
-        // Map session log events to a simplified replay entry format.
-        // The browser will render these like regular log entries.
+        // Map every session log event type to (source, content, log_level).
         let (source, content, log_level) = match event_type {
+            // ── Turn lifecycle ──
             "turn_start" => ("system", format!("Turn {} started", turn.unwrap_or(0)), "info"),
+
+            // ── Model response ──
             "model_response" => {
                 let tokens = obj.get("data")
                     .and_then(|d| d.get("tokens"))
                     .and_then(|t| t.get("total"))
                     .and_then(|v| v.as_u64());
-                ("worker", format!("Model response{}", tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default()), "model")
+                let summary = if message.is_empty() {
+                    format!("Model response{}", tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
+                } else {
+                    format!("{}{}", message, tokens.map(|t| format!(" ({} tokens)", t)).unwrap_or_default())
+                };
+                ("worker", summary, "model")
             }
+
+            // ── Reasoning ──
+            "reasoning" => {
+                let summary = obj.get("data")
+                    .and_then(|d| d.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(message);
+                if summary.is_empty() { continue; }
+                ("worker", format!("Reasoning: {}", summary), "detail")
+            }
+
+            // ── Approval lifecycle ──
             "approval" => {
                 let decision = obj.get("data")
                     .and_then(|d| d.get("decision"))
@@ -213,13 +230,17 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
                     "waiting" => ("worker", format!("Approval required: {}", preview), "warn"),
                     "approved" => ("system", format!("Approved: {}", preview), "info"),
                     "denied" | "denied-no-approver" => ("system", format!("Denied: {}", preview), "warn"),
+                    "skipped" => ("system", format!("Skipped: {}", preview), "info"),
                     _ => ("system", message.to_string(), "info"),
                 }
             }
-            "agent_input" => ("agent", message.to_string(), "detail"),
+
+            // ── Agent I/O ──
+            "agent_input" => {
+                ("agent", format!("Commands: {}", message), "detail")
+            }
             "agent_output" => {
-                // The message field contains raw runtime JSON lines.
-                // Parse each line to extract stdout_tail for display.
+                // Parse runtime JSON to extract stdout_tail for display.
                 let mut parts = Vec::new();
                 for json_line in message.lines() {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_line) {
@@ -232,6 +253,18 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
                                             parts.push(trimmed.to_string());
                                         }
                                     }
+                                    if let Some(stderr) = data.get("stderr_tail").and_then(|v| v.as_str()) {
+                                        let trimmed = stderr.trim();
+                                        if !trimmed.is_empty() {
+                                            parts.push(format!("[stderr] {}", trimmed));
+                                        }
+                                    }
+                                    // Show non-zero exit codes
+                                    if let Some(code) = data.get("exit_code").and_then(|v| v.as_i64()) {
+                                        if code != 0 {
+                                            parts.push(format!("exit code: {}", code));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -240,25 +273,105 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
                 if parts.is_empty() { continue; }
                 ("agent", parts.join("\n"), "agent")
             }
+
+            // ── Voice / presence lifecycle ──
+            "voice_log" => {
+                let text = obj.get("data")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(message);
+                if text.is_empty() { continue; }
+                ("live", text.to_string(), "presence")
+            }
+            "user_transcript" => {
+                let text = obj.get("data")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(message);
+                if text.is_empty() { continue; }
+                ("live", format!("[You] {}", text), "info")
+            }
+            "presence_connected" => {
+                let provider = obj.get("data")
+                    .and_then(|d| d.get("provider"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                ("live", format!("Live connected ({})", provider), "info")
+            }
+            "presence_disconnected" => {
+                ("live", "Live disconnected".to_string(), "detail")
+            }
+            "presence_checkpoint" => {
+                let summary = obj.get("data")
+                    .and_then(|d| d.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                ("live", format!("Checkpoint: {}", summary), "debug")
+            }
+
+            // ── Tool dispatch ──
+            "tool_request" => {
+                let tool = obj.get("data")
+                    .and_then(|d| d.get("tool"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                ("live", format!("Tool request: {}", tool), "debug")
+            }
+            "tool_response" => {
+                let tool = obj.get("data")
+                    .and_then(|d| d.get("tool"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                ("live", format!("Tool response: {}", tool), "debug")
+            }
+
+            // ── Task lifecycle ──
+            "task_complete" | "round_complete" => {
+                ("worker", message.to_string(), "info")
+            }
+            "session_end" | "summary" => {
+                if message.is_empty() { continue; }
+                ("system", message.to_string(), "info")
+            }
+            "interrupted" => {
+                ("system", "Session interrupted".to_string(), "warn")
+            }
+
+            // ── General log levels ──
             "info" => {
-                // General info entries — detect presence vs system
-                if message.starts_with("[presence]") || message.starts_with("[model]")
-                    || message.starts_with("Presence") {
-                    ("server", message.to_string(), "info")
+                // Detect presence vs system from message prefix
+                let source = if message.starts_with("[presence]")
+                    || message.starts_with("[model]")
+                    || message.starts_with("Presence")
+                {
+                    "server"
                 } else {
-                    ("system", message.to_string(), "info")
-                }
+                    "system"
+                };
+                // Detect detail-level presence internals
+                let lvl = if message.starts_with("[model] Thinking")
+                    || message.starts_with("[model] Tool call:")
+                {
+                    "detail"
+                } else {
+                    "info"
+                };
+                (source, message.to_string(), lvl)
             }
             "debug" => {
-                if message.starts_with("[model]") || message.starts_with("[ws]") {
-                    ("server", message.to_string(), "debug")
+                let source = if message.starts_with("[model]")
+                    || message.starts_with("[ws]")
+                {
+                    "server"
                 } else {
-                    ("system", message.to_string(), "debug")
-                }
+                    "system"
+                };
+                (source, message.to_string(), "debug")
             }
             "warn" => ("system", message.to_string(), "warn"),
             "error" => ("system", message.to_string(), "error"),
-            "task_complete" | "round_complete" => ("worker", message.to_string(), "info"),
+
+            // ── Catch-all ──
             _ => {
                 if message.is_empty() { continue; }
                 ("system", message.to_string(), level)

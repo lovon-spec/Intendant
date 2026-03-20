@@ -73,14 +73,21 @@ PulseAudio must be running (`pactl info` should succeed).
 
 ### 1. Clean up stale processes
 
-Use `-9` for Firefox (it ignores SIGTERM). Run each kill separately, verify with pgrep.
+Use `pgrep -x` (exact process name) instead of `pkill -f` (full command-line match).
+`pkill -f intendant` will match the bash shell itself if the cwd contains "intendant",
+killing the shell with exit code 144. Always verify kills with `pgrep` after.
+
+Use `-9` for Firefox (it ignores SIGTERM). Firefox may be named `firefox` or
+`firefox-esr` depending on the system — kill both.
 
 ```bash
-pkill -f 'Xvfb :50' 2>/dev/null
-pkill -f 'x11vnc.*:50' 2>/dev/null
-pkill -9 -f firefox 2>/dev/null
-pkill -f intendant 2>/dev/null
+for p in $(pgrep -x Xvfb 2>/dev/null); do kill "$p" 2>/dev/null; done
+for p in $(pgrep -x x11vnc 2>/dev/null); do kill "$p" 2>/dev/null; done
+for p in $(pgrep -x firefox -x firefox-esr 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+for p in $(pgrep -x intendant 2>/dev/null); do kill "$p" 2>/dev/null; done
 sleep 0.5
+# Verify all dead
+pgrep -x 'Xvfb|x11vnc|firefox|firefox-esr|intendant' && echo "WARN: stale processes remain" || echo "All clean"
 ```
 
 ### 2. Create PulseAudio virtual microphone
@@ -490,11 +497,11 @@ pactl info  # verify
 
 ```bash
 # Remove virtual mic
-pactl unload-module $(pactl list short modules | grep 'sink_name=virtual_mic' | awk '{print $1}') 2>/dev/null
+pactl list short modules | grep 'sink_name=virtual_mic' | awk '{print $1}' | xargs -r -I{} pactl unload-module {} 2>/dev/null
 
-# Kill processes
-pkill -f 'intendant.*web' 2>/dev/null
-pkill -f firefox 2>/dev/null
-pkill -f 'Xvfb :50' 2>/dev/null
-pkill -f 'x11vnc.*:50' 2>/dev/null
+# Kill processes (use pgrep -x to avoid matching the shell itself)
+for p in $(pgrep -x intendant 2>/dev/null); do kill "$p" 2>/dev/null; done
+for p in $(pgrep -x firefox -x firefox-esr 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+for p in $(pgrep -x Xvfb 2>/dev/null); do kill "$p" 2>/dev/null; done
+for p in $(pgrep -x x11vnc 2>/dev/null); do kill "$p" 2>/dev/null; done
 ```
