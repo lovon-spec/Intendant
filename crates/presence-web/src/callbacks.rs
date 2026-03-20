@@ -43,6 +43,8 @@ pub struct Callbacks {
     pub on_force_disconnect: RefCell<Option<Function>>,
     /// Server confirms this browser is now the active voice owner.
     pub on_active_granted: RefCell<Option<Function>>,
+    /// Raw server message (fired before internal routing, for AppWeb interception).
+    pub on_raw_message: RefCell<Option<Function>>,
 }
 
 impl Callbacks {
@@ -147,6 +149,12 @@ impl Callbacks {
                 &JsValue::from_str(handover_context),
                 &JsValue::from_str(conversation_context),
             );
+        }
+    }
+
+    pub fn invoke_raw_message(&self, msg: &JsValue) {
+        if let Some(ref f) = *self.on_raw_message.borrow() {
+            let _ = f.call1(&JsValue::NULL, msg);
         }
     }
 }

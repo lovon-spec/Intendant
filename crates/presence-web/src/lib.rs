@@ -11,6 +11,9 @@ mod callbacks;
 mod gemini;
 mod openai;
 mod server;
+pub mod app_state;
+#[cfg(target_arch = "wasm32")]
+mod app_web;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -158,6 +161,11 @@ impl PresenceWeb {
         *self.callbacks.on_active_granted.borrow_mut() = Some(f);
     }
 
+    #[wasm_bindgen]
+    pub fn set_on_raw_message(&self, f: Function) {
+        *self.callbacks.on_raw_message.borrow_mut() = Some(f);
+    }
+
     // --- Server connection ---
 
     #[wasm_bindgen]
@@ -172,6 +180,9 @@ impl PresenceWeb {
             let presence = presence;
             let last_session_id: RefCell<Option<String>> = RefCell::new(None);
             Box::new(move |msg: serde_json::Value| {
+                // Fire raw message callback (for AppWeb interception)
+                cb.invoke_raw_message(&to_js(&msg));
+
                 // Route by message type
                 let t = msg.get("t").and_then(|v| v.as_str());
 
