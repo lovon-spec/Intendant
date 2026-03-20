@@ -661,6 +661,91 @@ html, body {
   height: 100% !important;
 }
 
+/* ── Activity Display Strip ── */
+.activity-display-strip {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--surface0);
+  background: var(--mantle);
+  overflow: hidden;
+}
+.activity-display-header {
+  display: flex;
+  align-items: center;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--overlay1);
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.activity-display-header:hover {
+  background: var(--surface0);
+}
+.strip-toggle-btn {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--overlay1);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+.strip-toggle-btn:hover { color: var(--text); background: var(--surface0); }
+.activity-display-row {
+  display: flex;
+  gap: 4px;
+  padding: 0 12px 6px;
+  overflow-x: auto;
+  height: 120px;
+  flex-shrink: 0;
+}
+.activity-display-strip.expanded .activity-display-row {
+  flex: 1;
+  height: auto;
+  padding-bottom: 0;
+  min-height: 0;
+}
+.activity-display-thumb {
+  flex: 1;
+  min-width: 160px;
+  max-width: 320px;
+  background: #000;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  position: relative;
+  border: 1px solid var(--surface0);
+  transition: border-color 0.15s;
+}
+.activity-display-thumb:hover { border-color: var(--blue); }
+.activity-display-strip.expanded .activity-display-thumb { max-width: none; cursor: default; }
+.activity-display-thumb > .display-canvas {
+  position: absolute;
+  inset: 0;
+}
+.thumb-label {
+  position: absolute;
+  top: 4px; left: 6px;
+  font-size: 10px;
+  color: var(--blue);
+  background: rgba(17,17,27,0.75);
+  padding: 1px 5px;
+  border-radius: 3px;
+  z-index: 1;
+  pointer-events: none;
+  font-family: monospace;
+}
+.activity-split-handle {
+  height: 5px;
+  background: var(--surface0);
+  cursor: row-resize;
+  flex-shrink: 0;
+}
+.activity-split-handle:hover, .activity-split-handle.dragging { background: var(--blue); }
+.activity-split-handle.hidden { display: none; }
+
 /* ── Usage empty state ── */
 .empty-state {
   display: flex;
@@ -835,6 +920,17 @@ html, body {
           <option value="debug">Debug</option>
         </select>
       </div>
+
+      <!-- Display Strip (shown when displays are active) -->
+      <div class="activity-display-strip hidden" id="activity-display-strip">
+        <div class="activity-display-header">
+          <span>Displays (<span id="strip-count">0</span>)</span>
+          <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
+        </div>
+        <div class="activity-display-row" id="activity-display-row"></div>
+      </div>
+      <div class="activity-split-handle hidden" id="activity-split-handle"></div>
+
       <div class="log-stream" id="log-stream"></div>
       <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
 
@@ -987,6 +1083,11 @@ let termBuffer = [];
 // Displays
 const displaySlots = new Map();
 let noVNCLoaded = false;
+
+// Activity display strip
+const displayThumbs = new Map();
+let stripExpanded = false;
+let stripHeight = 280;
 let noVNCLoadCallbacks = [];
 
 // Voice / Live mode
@@ -1795,6 +1896,87 @@ function addDisplaySlot(displayId, vncPort) {
   container.classList.add('has-displays');
   container.appendChild(slot.el);
   slot.connectPassive();
+  addDisplayThumb(displayId);
+}
+
+// ── Activity Display Strip ──
+function addDisplayThumb(displayId) {
+  if (displayThumbs.has(displayId)) return;
+  const strip = document.getElementById('activity-display-strip');
+  const row = document.getElementById('activity-display-row');
+  strip.classList.remove('hidden');
+  document.getElementById('strip-count').textContent = displayThumbs.size + 1;
+
+  const thumb = document.createElement('div');
+  thumb.className = 'activity-display-thumb';
+  thumb.innerHTML = `<span class="thumb-label">:${displayId}</span>`;
+  thumb.addEventListener('click', (e) => { if (!e.target.closest('.display-canvas')) toggleDisplayStrip(); });
+
+  displayThumbs.set(displayId, thumb);
+  row.appendChild(thumb);
+
+  // If on the activity tab, move the canvas here immediately
+  if (activeTab === 'activity') {
+    const slot = displaySlots.get(displayId);
+    if (slot) moveCanvasToThumb(slot);
+  }
+}
+
+function moveCanvasToThumb(slot) {
+  const thumb = displayThumbs.get(slot.displayId);
+  if (!thumb || !slot.canvasEl) return;
+  // Auto-release control when moving to view-only strip
+  if (slot.interactive) {
+    slot.interactive = false;
+    if (slot.rfb) slot.rfb.viewOnly = true;
+    slot.takeBtn.style.display = '';
+    slot.releaseBtn.style.display = 'none';
+    slot.noteInput.style.display = 'none';
+    slot.noteInput.value = '';
+    slot.statusEl.textContent = slot.connected ? 'Connected (view-only)' : 'Disconnected';
+  }
+  thumb.appendChild(slot.canvasEl);
+  requestAnimationFrame(() => { if (slot.rfb) slot.rfb.scaleViewport = true; });
+}
+
+function moveCanvasToSlot(slot) {
+  if (!slot.canvasEl) return;
+  slot.el.appendChild(slot.canvasEl);
+  requestAnimationFrame(() => { if (slot.rfb) slot.rfb.scaleViewport = true; });
+}
+
+function relocateDisplays(tabId) {
+  for (const slot of displaySlots.values()) {
+    if (tabId === 'activity') moveCanvasToThumb(slot);
+    else if (tabId === 'displays') moveCanvasToSlot(slot);
+  }
+}
+
+function toggleDisplayStrip() {
+  const strip = document.getElementById('activity-display-strip');
+  const handle = document.getElementById('activity-split-handle');
+  const toggle = document.getElementById('strip-toggle');
+  stripExpanded = !stripExpanded;
+
+  if (stripExpanded) {
+    strip.classList.add('expanded');
+    strip.style.height = stripHeight + 'px';
+    handle.classList.remove('hidden');
+    toggle.innerHTML = '&#x25B4;';
+    toggle.title = 'Collapse displays';
+  } else {
+    strip.classList.remove('expanded');
+    strip.style.height = '';
+    handle.classList.add('hidden');
+    toggle.innerHTML = '&#x25BE;';
+    toggle.title = 'Expand displays';
+  }
+
+  requestAnimationFrame(() => {
+    for (const slot of displaySlots.values()) {
+      if (slot.rfb) slot.rfb.scaleViewport = true;
+    }
+  });
 }
 
 // ── Tab Switching ──
@@ -1809,10 +1991,8 @@ function switchTab(tabId) {
   if (app) processCommands(app.set_active_tab(tabId));
   if (tabId === 'terminal' && !termInitialized) initTerminal();
   if (tabId === 'terminal' && term) requestAnimationFrame(() => fitAddon && fitAddon.fit());
-  if (tabId === 'displays') {
-    requestAnimationFrame(() => {
-      for (const slot of displaySlots.values()) { if (slot.rfb) slot.rfb.scaleViewport = true; }
-    });
+  if (tabId === 'activity' || tabId === 'displays') {
+    relocateDisplays(tabId);
   }
 }
 
@@ -1874,6 +2054,51 @@ document.getElementById('verbosity-select').addEventListener('change', (e) => {
   btn.addEventListener('click', () => {
     stream.scrollTop = stream.scrollHeight;
     autoScroll = true; btn.classList.remove('visible');
+  });
+})();
+
+// Toggle display strip — header click or button click
+document.getElementById('activity-display-strip').querySelector('.activity-display-header')
+  .addEventListener('click', toggleDisplayStrip);
+
+// Drag handle for display strip resize
+(function() {
+  const handle = document.getElementById('activity-split-handle');
+  const strip = document.getElementById('activity-display-strip');
+  let dragging = false;
+  let startY = 0;
+  let startH = 0;
+
+  handle.addEventListener('mousedown', (e) => {
+    if (!stripExpanded) return;
+    dragging = true;
+    startY = e.clientY;
+    startH = strip.offsetHeight;
+    handle.classList.add('dragging');
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const delta = e.clientY - startY;
+    const newH = Math.max(100, Math.min(startH + delta, window.innerHeight * 0.7));
+    strip.style.height = newH + 'px';
+    stripHeight = newH;
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    requestAnimationFrame(() => {
+      for (const slot of displaySlots.values()) {
+        if (slot.rfb) slot.rfb.scaleViewport = true;
+      }
+    });
   });
 })();
 
