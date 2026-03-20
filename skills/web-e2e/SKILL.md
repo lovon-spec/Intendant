@@ -1,31 +1,28 @@
 ---
 name: web-e2e
 description: >
-  E2E test the --web live mode. Launches Xvfb, runs intendant --web as a
-  background process, opens Firefox on the web TUI, and asserts via /debug
+  E2E test the --web app UI. Launches Xvfb, runs intendant --web as a
+  background process, opens Firefox on /app, and asserts via /debug
   endpoint and WebSocket JSON. Human monitors via VNC on port 5950.
 compatibility: Requires Xvfb, Firefox, x11vnc, xdotool, curl
 allowed-tools: Bash Read
 disable-model-invocation: true
 ---
 
-# Test --web Live Mode E2E
+# Test --web App UI E2E
 
-## Key Differences from TUI E2E
+## Key Concepts
 
 - **No xterm needed**: `--web` uses `WebTui` (buffer-backed ratatui backend).
   Intendant runs as a plain background process, not inside a terminal emulator.
-- **Firefox is the UI**: Open Firefox on the Xvfb display pointing to
-  `http://localhost:8765`. The browser renders the TUI via xterm.js and
-  provides voice model controls.
-- **Voice model connects from browser**: Two auth modes for Gemini Live:
-  1. **API key in localStorage** (preferred) — supports tool calling via
-     `BidiGenerateContent`. Set `gemini_api_key` in localStorage.
-  2. **Ephemeral tokens** (fallback) — server mints tokens via `POST /session`,
-     uses `BidiGenerateContentConstrained`. No tool calling support.
-  The browser checks localStorage first; falls back to `/session` if no key.
-- **Control is via browser**: No `--control-socket` or socat needed. The
-  browser IS the control interface (approval buttons, voice commands, etc.)
+- **Firefox renders `/app`**: The tabbed web UI with Activity, Usage, Terminal,
+  Displays tabs. All logic runs in WASM (presence-web), JS is a thin rendering layer.
+- **Live mode available**: `/app` has a mic button for connecting Gemini Live or
+  OpenAI Realtime. Set API key in localStorage first.
+- **Approval via browser**: Approval buttons in the Activity tab, or keyboard
+  shortcuts (y/s/a/n). No `--control-socket` or socat needed.
+- **Display streaming**: The Displays tab shows live VNC via noVNC. Agent's
+  display :99 is streamed in real-time.
 
 ## Launch
 
@@ -56,8 +53,10 @@ cd /home/user/projects/intendant && source .env && \
 sleep 3
 cat /tmp/intendant-web-stderr.log  # Should show "Web TUI: http://0.0.0.0:8765"
 
-# 5. Launch Firefox on display :50 pointing to the web TUI
-DISPLAY=:50 nohup firefox --new-window http://localhost:8765 > /dev/null 2>&1 &
+# 5. Launch Firefox on display :50 pointing to /app
+rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock 2>/dev/null
+DISPLAY=:50 nohup firefox --new-window http://localhost:8765/app > /dev/null 2>&1 &
+sleep 8
 ```
 
 ## Asserting on State (primary method — no screenshots)
@@ -111,7 +110,20 @@ done
 echo "Final phase: $PHASE"
 ```
 
-### Check voice connection
+### Approve via WebSocket (programmatic, no browser interaction)
+```bash
+python3 -c "
+import asyncio, json, websockets
+async def approve():
+    async with websockets.connect('ws://localhost:8765') as ws:
+        await asyncio.wait_for(ws.recv(), timeout=3)  # bootstrap
+        await ws.send(json.dumps({'action': 'approve', 'id': 1}))
+        print('Approved')
+asyncio.run(approve())
+"
+```
+
+### Check voice/live connection
 ```bash
 curl -s http://localhost:8765/debug | python3 -c "
 import sys, json
@@ -132,15 +144,15 @@ curl -s http://localhost:8765/config
 curl -s -X POST http://localhost:8765/session
 ```
 
-## Simulating Voice Input
+## Simulating Live Input
 
-Since there's no real microphone on a headless display, simulate voice input
-by sending text directly to the live model via the Firefox debugger or
-`pw.send_text()` from the browser console.
+Since there's no real microphone on a headless display, simulate live input
+by sending text directly via the Firefox debugger.
 
 **Via Firefox debugger** (if `--start-debugger-server 6000` is active):
 ```bash
-python3 scripts/ff-eval.py "pw.send_text('Hello, what is happening?')"
+# The WASM instance in /app is exposed as window.app (AppWeb)
+python3 scripts/ff-eval.py "app.send_text('Hello, what is happening?')"
 ```
 
 **Setting API key in localStorage** (required for tool calling):
@@ -150,30 +162,34 @@ source .env && python3 scripts/ff-eval.py "localStorage.setItem('gemini_api_key'
 python3 scripts/ff-eval.py "location.reload(); 'reloading'"
 ```
 
-**Via xdotool** (open DevTools F12 → Console tab → type):
+**Clicking the mic button**:
 ```bash
-DISPLAY=:50 xdotool key F12
-sleep 2
-DISPLAY=:50 xdotool mousemove 400 658 click 1
-sleep 0.3
-DISPLAY=:50 xdotool type --clearmodifiers 'pw.send_text("Hello, what are you working on?")'
-DISPLAY=:50 xdotool key Return
+python3 scripts/ff-eval.py "document.querySelector('.mic-btn')?.click(); 'clicked'"
+sleep 3
 ```
 
-Then verify with `curl -s http://localhost:8765/debug` to see voice logs.
+## Approval via Browser UI
 
-## Keyboard Input via xdotool
-
-Click inside the xterm.js terminal first to give it focus, then send keys:
+The `/app` Activity tab has approval buttons (Approve/Skip/Approve All/Deny).
+You can also use keyboard shortcuts when the page has focus:
 
 ```bash
-DISPLAY=:50 xdotool mousemove 500 300 click 1
-sleep 0.2
-DISPLAY=:50 xdotool key y   # approve
+# Press 'y' to approve (the page must have focus)
+DISPLAY=:50 xdotool key y
 ```
 
 **Gotcha**: If the follow-up text input panel is active, keyboard shortcuts
 go into the text input. Press Escape first to dismiss it.
+
+## Displays Tab
+
+When the agent runs commands that trigger Xvfb (display :99), the Displays tab
+shows a live VNC stream via noVNC. Features:
+
+- **View-only** by default — watch what the agent does
+- **Take Control** button — switch to interactive mode (mouse/keyboard forwarded)
+- **Release** button — return to view-only, optional note for the agent
+- Auto-connects when `display_ready` event arrives
 
 ## Screenshot (optional — for human VNC verification only)
 
@@ -185,36 +201,26 @@ This is **not needed for assertions** — use `/debug` instead.
 
 ## Known Gotchas
 
-- **Two Gemini endpoints, different capabilities**:
-  | | `BidiGenerateContent` | `BidiGenerateContentConstrained` |
-  |---|---|---|
-  | Auth | API key (`?key=`) | Ephemeral token (`?access_token=`) |
-  | Frames | Text | Binary (ArrayBuffer) |
-  | Tool calling | Yes | No (model narrates but never emits `toolCall`) |
-  | Setup message | Full (model + generation_config + tools) | Minimal (tools + system_instruction only) |
-- **Binary frame handling**: WASM must set `ws.set_binary_type(BinaryType::Arraybuffer)`
-  before connecting. Default `Blob` type silently drops binary messages.
-- **`serde_wasm_bindgen` Map vs Object**: Version 0.6+ serializes `serde_json::Value`
-  maps as ES6 `Map`, not plain `Object`. This breaks `Object.keys()` and property access.
-  Use `Serializer::new().serialize_maps_as_objects(true)` for any value passed to JS callbacks.
-- **`response_modalities` must be `["AUDIO"]` only**: Adding `"TEXT"` causes
-  WebSocket close code 1007 ("Invalid argument") on the constrained endpoint.
-  Note: `["AUDIO"]` mode still sends BOTH audio AND text parts — the model
-  outputs text alongside audio. The restriction is about what you request, not
-  what the model produces.
 - **WASM cache**: Content-hash versioning (`?v=<hash>`) on WASM/JS URLs means
   browsers automatically fetch new assets after rebuilds. No manual cache
   clearing needed.
 - **WASM rebuild**: From `crates/presence-web/`:
   `wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web`
   Then `cargo build --release -p intendant` (use `-p intendant` to skip WASM-only crate).
-- **Gemini REST token endpoint**: `POST /v1alpha/auth_tokens` (snake_case, NOT
-  camelCase `authTokens`). Body uses flat fields, NOT wrapped in `"config"`.
-  Use `bidi_generate_content_setup` to bake model+config into the token.
 - **AudioContext warning** on headless displays is expected and harmless.
 - **Follow-up panel** captures keystrokes — Escape first before sending shortcuts.
 - **Firefox profile lock**: If Firefox won't start, remove lock files:
   `rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock`
+- **Late-connect**: If you reload the browser mid-session, the Activity tab
+  replays the full session log. Usage tab gets cached data. Displays tab
+  auto-reconnects to VNC.
+- **Two Gemini endpoints, different capabilities**:
+  | | `BidiGenerateContent` | `BidiGenerateContentConstrained` |
+  |---|---|---|
+  | Auth | API key (`?key=`) | Ephemeral token (`?access_token=`) |
+  | Frames | Text | Binary (ArrayBuffer) |
+  | Tool calling | Yes | No |
+  | Setup message | Full (model + config + tools) | Minimal (tools + system_instruction only) |
 
 **For browser-side JS debugging** (only needed for WASM/JS errors):
 
@@ -229,10 +235,7 @@ user_pref("devtools.debugger.prompt-connection", false);
 user_pref("devtools.debugger.force-local", false);
 EOF
 ```
-Then launch Firefox with `--start-debugger-server 6000` and use `scripts/ff-eval.py`
-(a zero-dependency raw socket script) for JS evaluation — no pip packages needed.
-If `scripts/ff-eval.py` doesn't exist, create it from the project's prior test artifacts
-or write a fresh one using the Firefox remote debug protocol (`length:json` framing).
+Then launch Firefox with `--start-debugger-server 6000` and use `scripts/ff-eval.py`.
 
 ## Cleanup
 
