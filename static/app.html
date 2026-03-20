@@ -1209,6 +1209,15 @@ function handleLogReplay(entries) {
   stream.innerHTML = '';
   logEntryCount = 0;
 
+  // Extract status bar info from replay entries
+  for (const e of entries) {
+    const c = e.content || '';
+    if (c.startsWith('Autonomy: ')) updateStatusBar({ autonomy: c.substring(10) });
+    else if (c.startsWith('Provider: ')) document.getElementById('sb-provider').textContent = c.substring(10);
+    else if (c.startsWith('Model: ')) document.getElementById('sb-model').textContent = c.substring(7);
+    if (e.turn) document.getElementById('sb-turn').textContent = 'T' + e.turn;
+  }
+
   let lastTurn = null;
   for (const e of entries) {
     // Turn separator when turn changes
@@ -1290,6 +1299,15 @@ function handleStateSnapshot(msg) {
     budget_pct: s.budget_pct || 0,
     phase: s.phase || 'idle',
   });
+  // Populate provider/model from config
+  if (msg.config) {
+    if (msg.config.provider) document.getElementById('sb-provider').textContent = msg.config.provider;
+    if (msg.config.model) document.getElementById('sb-model').textContent = msg.config.model;
+  }
+  // Populate session ID
+  if (msg.session_id) {
+    document.getElementById('sb-session').textContent = msg.session_id.substring(0, 8);
+  }
   if (s.phase) setPhase(s.phase);
 
   // Restore pending approval from snapshot

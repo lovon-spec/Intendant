@@ -237,7 +237,7 @@ impl PresenceLayer {
                 } else {
                     format!("Thinking (tool round {})...", round + 1)
                 },
-                None,
+                Some(crate::types::LogLevel::Detail),
             );
 
             let messages = self.conversation.messages().to_vec();
@@ -268,7 +268,7 @@ impl PresenceLayer {
 
             // Has tool calls — process them
             let tool_names: Vec<&str> = response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-            self.plog(format!("Tool call: {}", tool_names.join(", ")), None);
+            self.plog(format!("Tool call: {}", tool_names.join(", ")), Some(crate::types::LogLevel::Detail));
 
             if !response.content.is_empty() {
                 self.plog(format!("Model text: {}", response.content), Some(LogLevel::Agent));
@@ -720,6 +720,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::VoiceDiagnostic { .. }
         | AppEvent::UserTranscript { .. }
         | AppEvent::UsageSnapshot { .. }
+        | AppEvent::StatusUpdate { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Key(_)
         | AppEvent::Resize(_, _)

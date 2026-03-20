@@ -209,6 +209,15 @@ pub enum AppEvent {
         presence: Option<crate::frontend::ModelUsageSnapshot>,
     },
 
+    /// Proactive status broadcast (emitted on turn start, phase change, etc.)
+    StatusUpdate {
+        turn: usize,
+        phase: String,
+        autonomy: String,
+        session_id: String,
+        task: String,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
@@ -485,6 +494,19 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::UsageSnapshot { main, presence } => Some(OutboundEvent::UsageUpdate {
             main: main.clone(),
             presence: presence.clone(),
+        }),
+        AppEvent::StatusUpdate {
+            turn,
+            phase,
+            autonomy,
+            session_id,
+            task,
+        } => Some(OutboundEvent::Status {
+            turn: *turn,
+            phase: phase.clone(),
+            autonomy: autonomy.clone(),
+            session_id: session_id.clone(),
+            task: task.clone(),
         }),
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)

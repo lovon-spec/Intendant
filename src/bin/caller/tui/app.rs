@@ -1350,6 +1350,14 @@ impl App {
                     LogSource::Agent,
                     Some(turn),
                 );
+                // Proactive status broadcast so web UI stays in sync
+                derived.push(AppEvent::StatusUpdate {
+                    turn,
+                    phase: format!("{:?}", self.current_phase).to_lowercase(),
+                    autonomy: self.autonomy_display.clone(),
+                    session_id: self.session_id.clone(),
+                    task: self.task_description.clone(),
+                });
             }
             AppEvent::ModelResponse {
                 turn,
@@ -1853,8 +1861,8 @@ impl App {
             AppEvent::Key(key) => {
                 self.handle_key(key);
             }
-            AppEvent::UsageSnapshot { .. } => {
-                // Derived event — just passes through to outbound broadcaster.
+            AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } => {
+                // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }
             AppEvent::Resize(_, _) => {}

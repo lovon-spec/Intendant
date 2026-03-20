@@ -412,12 +412,15 @@ pub fn spawn_web_gateway(
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).
     let last_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache the latest status event (has autonomy, session_id, task).
+    let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest VNC port from display_ready events for the /vnc proxy.
     let last_vnc_port: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
     // Cache the last display_ready JSON for late-connecting browsers.
     let last_display_ready_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
         let usage_cache = last_usage_json.clone();
+        let status_cache = last_status_json.clone();
         let vnc_cache = last_vnc_port.clone();
         let display_cache = last_display_ready_json.clone();
         let mut usage_rx = broadcast_tx.subscribe();
@@ -442,6 +445,11 @@ pub fn spawn_web_gateway(
                             || line.contains("\"event\":\"usage\"")
                         {
                             if let Ok(mut guard) = usage_cache.lock() {
+                                *guard = Some(line.clone());
+                            }
+                        }
+                        if line.contains("\"event\":\"status\"") {
+                            if let Ok(mut guard) = status_cache.lock() {
                                 *guard = Some(line);
                             }
                         }
@@ -484,6 +492,7 @@ pub fn spawn_web_gateway(
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let last_usage_json = last_usage_json.clone();
+            let last_status_json = last_status_json.clone();
             let last_vnc_port = last_vnc_port.clone();
             let last_display_ready_json = last_display_ready_json.clone();
             let web_tui_tx = web_tui_tx.clone();
@@ -550,15 +559,25 @@ pub fn spawn_web_gateway(
                         });
                     }
 
-                    // Send bootstrap state snapshot on connect (with connection_id)
+                    // Send bootstrap state snapshot on connect (with connection_id).
+                    // Include config (provider/model) since AgentStateSnapshot
+                    // doesn't carry those.
                     if let Some(ref ctx) = query_ctx {
                         let state = ctx.agent_state.lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
+                        let config: serde_json::Value = serde_json::from_str(&config_json)
+                            .unwrap_or_default();
+                        // Extract session_id from log_dir path name
+                        let session_id = ctx.log_dir.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
                         let bootstrap = serde_json::json!({
                             "t": "state_snapshot",
                             "state": state,
                             "connection_id": connection_id,
+                            "config": config,
+                            "session_id": session_id,
                         });
                         let _ = direct_tx.send(bootstrap.to_string());
                     }
@@ -568,6 +587,13 @@ pub fn spawn_web_gateway(
                     if let Ok(guard) = last_usage_json.lock() {
                         if let Some(ref usage_json) = *guard {
                             let _ = direct_tx.send(usage_json.clone());
+                        }
+                    }
+
+                    // Send cached status (autonomy, session_id, task).
+                    if let Ok(guard) = last_status_json.lock() {
+                        if let Some(ref status_json) = *guard {
+                            let _ = direct_tx.send(status_json.clone());
                         }
                     }
 
