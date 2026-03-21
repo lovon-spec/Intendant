@@ -166,6 +166,11 @@ impl PresenceWeb {
         *self.callbacks.on_raw_message.borrow_mut() = Some(f);
     }
 
+    #[wasm_bindgen]
+    pub fn set_on_voice_usage(&self, f: Function) {
+        *self.callbacks.on_voice_usage.borrow_mut() = Some(f);
+    }
+
     // --- Server connection ---
 
     #[wasm_bindgen]

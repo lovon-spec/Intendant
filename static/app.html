@@ -1320,6 +1320,26 @@ async function main() {
     try { app.send_voice_diagnostic('interrupted', 'voice model interrupted by user'); } catch(_) {}
   });
 
+  app.set_on_voice_usage((usage) => {
+    // usage is the raw Gemini usageMetadata object:
+    // { promptTokenCount, responseTokenCount, cachedContentTokenCount, totalTokenCount, thoughtsTokenCount }
+    if (usage && typeof processCommands === 'function') {
+      const prompt = usage.promptTokenCount || 0;
+      const response = usage.responseTokenCount || 0;
+      const cached = usage.cachedContentTokenCount || 0;
+      const total = usage.totalTokenCount || 0;
+      const thoughts = usage.thoughtsTokenCount || 0;
+      processCommands([{
+        type: 'update_voice_usage',
+        prompt_tokens: prompt,
+        completion_tokens: response,
+        cached_tokens: cached,
+        total_tokens: total,
+        thoughts_tokens: thoughts,
+      }]);
+    }
+  });
+
   app.set_on_error((msg) => {
     if (!msg.startsWith('Server')) {
       modelConnected = false;
@@ -1492,6 +1512,7 @@ function processCommands(cmds) {
       case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage': renderUsageTab(c); break;
+      case 'update_voice_usage': updateVoiceUsage(c); break;
       case 'add_display': addDisplaySlot(c.display_id, c.vnc_port); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;
@@ -1647,6 +1668,31 @@ function hideBadge(tab) {
   if (badge) { badge.classList.remove('visible'); badge.textContent = ''; }
 }
 
+// ── Live Model Usage Tracking ──
+let voiceUsageData = null; // Accumulated from on_voice_usage callback
+
+function updateVoiceUsage(c) {
+  voiceUsageData = {
+    prompt_tokens: c.prompt_tokens || 0,
+    completion_tokens: c.completion_tokens || 0,
+    cached_tokens: c.cached_tokens || 0,
+    total_tokens: c.total_tokens || 0,
+    thoughts_tokens: c.thoughts_tokens || 0,
+  };
+  // If we have a rendered live model card, update it
+  const liveCard = document.getElementById('live-usage-card');
+  if (liveCard) {
+    liveCard.querySelector('.live-prompt').textContent = voiceUsageData.prompt_tokens.toLocaleString();
+    liveCard.querySelector('.live-response').textContent = voiceUsageData.completion_tokens.toLocaleString();
+    liveCard.querySelector('.live-cached').textContent = voiceUsageData.cached_tokens.toLocaleString();
+    liveCard.querySelector('.live-total').textContent = voiceUsageData.total_tokens.toLocaleString();
+    if (voiceUsageData.thoughts_tokens > 0) {
+      liveCard.querySelector('.live-thoughts').textContent = voiceUsageData.thoughts_tokens.toLocaleString();
+      liveCard.querySelector('.live-thoughts-row').style.display = '';
+    }
+  }
+}
+
 // ── Usage Tab Rendering ──
 function renderUsageTab(c) {
   const cardsEl = document.getElementById('usage-cards');
@@ -1672,6 +1718,32 @@ function renderUsageTab(c) {
   if (c.presence_json) {
     const presenceData = JSON.parse(c.presence_json);
     cardsEl.appendChild(renderUsageCard('Presence Model', presenceData));
+  }
+
+  // Live model usage card (from Gemini Live / OpenAI Realtime usageMetadata)
+  if (voiceUsageData && voiceUsageData.total_tokens > 0) {
+    const liveCard = document.createElement('div');
+    liveCard.className = 'usage-card';
+    liveCard.id = 'live-usage-card';
+    liveCard.innerHTML = `
+      <div class="card-title">Live Model</div>
+      <div class="card-model">
+        <span class="provider" style="color:var(--green)">Session tokens</span>
+      </div>
+      <div class="token-breakdown">
+        <span class="label">Input tokens</span>
+        <span class="value live-prompt">${voiceUsageData.prompt_tokens.toLocaleString()}</span>
+        <span class="label" style="padding-left:12px">Cached</span>
+        <span class="value live-cached" style="color:var(--green)">${voiceUsageData.cached_tokens.toLocaleString()}</span>
+        <span class="label">Output tokens</span>
+        <span class="value live-response">${voiceUsageData.completion_tokens.toLocaleString()}</span>
+        <span class="label live-thoughts-row" ${voiceUsageData.thoughts_tokens > 0 ? '' : 'style="display:none"'}>Thinking tokens</span>
+        <span class="value live-thoughts live-thoughts-row" ${voiceUsageData.thoughts_tokens > 0 ? '' : 'style="display:none"'}>${voiceUsageData.thoughts_tokens.toLocaleString()}</span>
+        <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Total</span>
+        <span class="value live-total" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${voiceUsageData.total_tokens.toLocaleString()}</span>
+      </div>
+    `;
+    cardsEl.appendChild(liveCard);
   }
 
   // Cost

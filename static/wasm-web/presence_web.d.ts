@@ -82,6 +82,7 @@ export class AppWeb {
     set_on_voice_text(f: Function): void;
     set_on_voice_tool_call(f: Function): void;
     set_on_voice_transcript(f: Function): void;
+    set_on_voice_usage(f: Function): void;
     set_passive_mode(passive: boolean): void;
     /**
      * Change log verbosity and return commands to re-filter.
@@ -188,6 +189,7 @@ export class PresenceWeb {
     set_on_voice_text(f: Function): void;
     set_on_voice_tool_call(f: Function): void;
     set_on_voice_transcript(f: Function): void;
+    set_on_voice_usage(f: Function): void;
     /**
      * Set passive mode — this browser will never request active status.
      * Use for observer/follow-along mode.
@@ -312,6 +314,7 @@ export interface InitOutput {
     readonly presenceweb_set_on_voice_text: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_tool_call: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_transcript: (a: number, b: any) => void;
+    readonly presenceweb_set_on_voice_usage: (a: number, b: any) => void;
     readonly presenceweb_set_passive_mode: (a: number, b: number) => void;
     readonly presenceweb_set_state: (a: number, b: any) => void;
     readonly presenceweb_update_from_event: (a: number, b: any) => any;
@@ -361,6 +364,7 @@ export interface InitOutput {
     readonly appweb_set_on_voice_text: (a: number, b: any) => void;
     readonly appweb_set_on_voice_tool_call: (a: number, b: any) => void;
     readonly appweb_set_on_voice_transcript: (a: number, b: any) => void;
+    readonly appweb_set_on_voice_usage: (a: number, b: any) => void;
     readonly appweb_set_passive_mode: (a: number, b: number) => void;
     readonly appweb_set_verbosity: (a: number, b: number, c: number) => any;
     readonly appweb_take_display: (a: number, b: bigint) => void;

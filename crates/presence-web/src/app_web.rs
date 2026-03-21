@@ -265,6 +265,8 @@ impl AppWeb {
     #[wasm_bindgen]
     pub fn set_on_voice_interrupted(&self, f: Function) { self.inner.set_on_voice_interrupted(f); }
     #[wasm_bindgen]
+    pub fn set_on_voice_usage(&self, f: Function) { self.inner.set_on_voice_usage(f); }
+    #[wasm_bindgen]
     pub fn set_on_error(&self, f: Function) { self.inner.set_on_error(f); }
     #[wasm_bindgen]
     pub fn set_on_diagnostic(&self, f: Function) { self.inner.set_on_diagnostic(f); }

@@ -252,6 +252,11 @@ impl GeminiProvider {
         turn_tool_calls: &Cell<u32>,
         turn_has_speech: &Cell<bool>,
     ) {
+        // usageMetadata can appear alongside any server message
+        if let Some(usage) = msg.get("usageMetadata") {
+            callbacks.invoke_voice_usage(&to_js_object(usage));
+        }
+
         // setupComplete
         if msg.get("setupComplete").is_some() {
             callbacks.invoke_diagnostic("gemini_msg", "setupComplete");

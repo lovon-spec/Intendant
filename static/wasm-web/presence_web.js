@@ -373,6 +373,12 @@ export class AppWeb {
         wasm.appweb_set_on_voice_transcript(this.__wbg_ptr, f);
     }
     /**
+     * @param {Function} f
+     */
+    set_on_voice_usage(f) {
+        wasm.appweb_set_on_voice_usage(this.__wbg_ptr, f);
+    }
+    /**
      * @param {boolean} passive
      */
     set_passive_mode(passive) {
@@ -763,6 +769,12 @@ export class PresenceWeb {
      */
     set_on_voice_transcript(f) {
         wasm.presenceweb_set_on_voice_transcript(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_voice_usage(f) {
+        wasm.presenceweb_set_on_voice_usage(this.__wbg_ptr, f);
     }
     /**
      * Set passive mode — this browser will never request active status.

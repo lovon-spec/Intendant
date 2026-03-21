@@ -45,6 +45,8 @@ pub struct Callbacks {
     pub on_active_granted: RefCell<Option<Function>>,
     /// Raw server message (fired before internal routing, for AppWeb interception).
     pub on_raw_message: RefCell<Option<Function>>,
+    /// Live model token usage update (prompt, response, cached, total tokens).
+    pub on_voice_usage: RefCell<Option<Function>>,
 }
 
 impl Callbacks {
@@ -155,6 +157,13 @@ impl Callbacks {
     pub fn invoke_raw_message(&self, msg: &JsValue) {
         if let Some(ref f) = *self.on_raw_message.borrow() {
             let _ = f.call1(&JsValue::NULL, msg);
+        }
+    }
+
+    /// Invoke with a JsValue containing the full usage metadata object.
+    pub fn invoke_voice_usage(&self, usage: &JsValue) {
+        if let Some(ref f) = *self.on_voice_usage.borrow() {
+            let _ = f.call1(&JsValue::NULL, usage);
         }
     }
 }
