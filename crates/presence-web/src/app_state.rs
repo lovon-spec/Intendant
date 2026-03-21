@@ -828,6 +828,14 @@ impl AppState {
                 self.phase = "done".to_string();
             }
 
+            "log_entry" => {
+                let level = msg["level"].as_str().unwrap_or("info");
+                let source = msg["source"].as_str().unwrap_or("system");
+                let content = msg["content"].as_str().unwrap_or("");
+                let turn = msg["turn"].as_u64();
+                cmds.extend(self.add_log(level, content, turn, source));
+            }
+
             _ => {
                 // Unknown events at debug level
                 let text = format!("[{}] {}", event, serde_json::to_string(msg).unwrap_or_default());
