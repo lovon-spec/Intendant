@@ -1778,8 +1778,8 @@ function initTerminal() {
       term.loadAddon(fitAddon);
       term.open(document.getElementById('terminal-container'));
       fitAddon.fit();
-      term.onData(data => {
-        for (const ch of data) app.send_key(ch, false, false, false);
+      term.onKey(({ domEvent }) => {
+        app.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
       });
       for (const b64 of termBuffer) {
         const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
