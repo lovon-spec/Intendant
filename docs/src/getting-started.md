@@ -8,7 +8,7 @@ cargo build --release
 
 Two binaries are produced:
 - `./target/release/intendant-runtime` — the command runtime
-- `./target/release/intendant` — the AI CLI/TUI
+- `./target/release/intendant` — the AI CLI/TUI/Web
 
 ### Installing
 
@@ -16,7 +16,19 @@ Two binaries are produced:
 cargo install --path .
 ```
 
-Both binaries are installed to `~/.cargo/bin/`. The `intendant` binary embeds default system prompts at compile time, so it works immediately from any directory without needing the source tree.
+Both binaries are installed to `~/.cargo/bin/`. The `intendant` binary embeds default system prompts and web assets (HTML, WASM) at compile time, so it works immediately from any directory without needing the source tree.
+
+### Building the WASM crate
+
+If you modify `crates/presence-web/`, rebuild the WASM module:
+
+```bash
+# From crates/presence-web/
+wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
+
+# Then rebuild intendant to re-embed the WASM
+cargo build --release -p intendant
+```
 
 ## Setup
 
@@ -83,10 +95,10 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 # Force single-agent mode (skip orchestrator)
 ./target/release/intendant --direct "simple task"
 
-# Web TUI (remote terminal + optional voice, default port 8765)
+# Web dashboard (Activity + Usage + Terminal + Displays, default port 8765)
 ./target/release/intendant --web
 
-# Web TUI on custom port
+# Web dashboard on custom port
 ./target/release/intendant --web 9000
 
 # Enable filesystem sandboxing (Landlock, Linux 5.13+)

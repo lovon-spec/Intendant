@@ -45,18 +45,36 @@ Disable with `--no-presence` flag or `[presence] enabled = false` in `intendant.
 
 ## Browser-Side Live Presence
 
-When `--web` is used and a browser connects a live model (Gemini Live / OpenAI Realtime), the browser sends a `live_connected` message over WebSocket. This pauses server-side presence — `PresenceLayer::handle_event()` returns `Ok(None)` while paused. The browser's live model takes over as the conversational front-end, using the same 9 tools via the WebSocket tool request/response protocol.
+When `--web` is used and a browser connects a live model (Gemini Live / OpenAI Realtime), the browser sends a `presence_connect` message over WebSocket. The server pauses `PresenceLayer` and sends a `presence_welcome` message with the current state, missed events, and conversation context. The browser's live model takes over as the conversational front-end, using the same 9 tools via the WebSocket tool request/response protocol.
 
-When the browser's live model disconnects (page close, error), a `live_disconnected` message is sent and server-side presence resumes automatically.
+When the browser's live model disconnects (page close, error), a `presence_disconnect` message is sent and server-side presence resumes automatically.
 
 ### Configuration
 
 ```toml
 [presence]
-audio_model = "gemini-2.5-flash-live"  # model for browser-side live presence (optional)
+live_provider = "gemini"                                    # provider for browser-side live presence
+live_model = "gemini-2.5-flash-native-audio-preview-12-2025"  # model for browser-side live presence
 ```
 
 Voice requires an API key (Gemini or OpenAI), stored in browser localStorage. The key is used browser-side only — it is never sent to the Intendant server.
+
+### Active/Passive Multi-Browser
+
+Only one browser connection can be "active" (controlling the voice model) at a time. Other connections are passive observers:
+
+- **Active browser**: Pauses server-side presence, receives tool responses, controls the voice session
+- **Passive browsers**: Receive TUI frames and events but don't affect server-side presence
+- **Handover**: A passive browser can request active status via `{"t":"make_active"}`, which force-disconnects the previous active browser and sends an `active_granted` message with handover context
+
+### Session Continuity
+
+The presence session protocol maintains voice context across reconnects:
+
+1. The server maintains a `PresenceSession` with an event window and checkpoint state
+2. Browsers send periodic `presence_checkpoint` messages with a conversation summary and `last_event_seq`
+3. On reconnect, the `presence_welcome` includes events since `last_event_seq` and the last checkpoint summary
+4. Conversation context from recent voice transcripts is also included for smooth resumption
 
 ## Presence Tools
 
@@ -102,25 +120,41 @@ Not all agent events are worth narrating. The presence layer classifies events a
 
 The presence layer enforces mutual exclusion between server-side and browser-side presence:
 
-1. Browser connects live model → sends `{"t":"live_connected"}`
-2. Web gateway emits `AppEvent::LiveConnected` → sets shared `AtomicBool` pause flag
-3. Server-side `PresenceLayer::handle_event()` returns `Ok(None)` while paused
-4. Browser live model handles all presence duties (narration, tool calls, user interaction)
-5. Browser disconnects → sends `{"t":"live_disconnected"}`
-6. Web gateway emits `AppEvent::LiveDisconnected` → clears pause flag
-7. Server-side presence resumes
+1. Browser connects live model → sends `{"t":"presence_connect"}`
+2. Web gateway emits `AppEvent::PresenceConnected` → pauses server-side presence
+3. Server sends `{"t":"presence_welcome"}` with state, event replay, and conversation context
+4. Server-side `PresenceLayer::handle_event()` returns `Ok(None)` while paused
+5. Browser live model handles all presence duties (narration, tool calls, user interaction)
+6. Browser disconnects → sends `{"t":"presence_disconnect"}`
+7. Web gateway emits `AppEvent::PresenceDisconnected` → resumes server-side presence
+
+Legacy `live_connected`/`live_disconnected` messages are still accepted for backward compatibility.
 
 ## presence-core Crate
 
 The `crates/presence-core/` workspace crate contains the WASM-compatible core logic:
 
-- **Types**: `PresenceConfig`, `TaskEnvelope`, `PresenceEvent`, `AgentStateSnapshot`, constants
+- **Types**: `PresenceConfig`, `TaskEnvelope`, `PresenceEvent`, `AgentStateSnapshot`, `PresenceSession`, `PresenceCheckpoint`, `PresenceConnect`, `PresenceWelcome`, constants
 - **Dispatch**: `PresenceAction` enum, `dispatch_tool_call()` — pure logic dispatch
 - **Tools**: 9 presence tool definitions (provider-agnostic `ToolDefinition` format)
 - **Format**: `format_event()`, `truncate()` (unicode-safe)
 - **Prompt**: `DEFAULT_PRESENCE_PROMPT` via `include_str!`
+- **WASM**: `WasmPresence` object, `get_presence_tools()`, `get_presence_prompt()` — browser-side presence logic
 
-Minimal dependencies (serde + serde_json only, no tokio/reqwest). Compiles to both native and `wasm32-unknown-unknown`. The main crate re-exports its types and converts `ToolDefinition` to the provider-specific format.
+Minimal dependencies (serde + serde_json + wasm-bindgen, no tokio/reqwest). Compiles to both native and `wasm32-unknown-unknown`. The main crate re-exports its types and converts `ToolDefinition` to the provider-specific format.
+
+## presence-web Crate
+
+The `crates/presence-web/` crate provides the browser-side WASM layer:
+
+- **app_state.rs** — Pure-Rust app state for the web dashboard. All event routing, log filtering, usage tracking, and cost calculation. Methods return `Vec<UiCommand>` which the thin JS layer applies to the DOM. Includes a per-model pricing table covering OpenAI, Anthropic, and Gemini models.
+- **app_web.rs** — Browser-side app dashboard entry point. WASM↔DOM bridge, tab management, WebSocket event dispatch.
+- **server.rs** — WebSocket connection to the Intendant server, message routing.
+- **gemini.rs** — Gemini Live API integration (BidiGenerateContent), dual-mode auth (API key + ephemeral token).
+- **openai.rs** — OpenAI Realtime API integration.
+- **callbacks.rs** — JS callback management for voice/tool events.
+
+Build: `wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web` from `crates/presence-web/`.
 
 ## Tool Dispatch Flow
 

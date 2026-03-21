@@ -1,27 +1,29 @@
 # Intendant
 
-A Rust runtime for autonomous AI agents with process lifecycle management. Intendant executes commands on behalf of AI agents, tracks process state in memory, and persists structured session logs. It supports OpenAI, Anthropic, and Gemini APIs with native tool calling, streaming, a ratatui TUI, configurable autonomy and approval gates, MCP server/client, multi-agent orchestration, a conversational presence layer, browser-based voice interaction, and session resume.
+A Rust runtime for autonomous AI agents with process lifecycle management. Intendant executes commands on behalf of AI agents, tracks process state in memory, and persists structured session logs. It supports OpenAI, Anthropic, and Gemini APIs with native tool calling, streaming, a ratatui TUI, a web dashboard with live voice interaction, configurable autonomy and approval gates, MCP server/client, multi-agent orchestration, a conversational presence layer, and session resume.
 
 ## Architecture
 
 ```
-                          ┌─────────────────────────────┐
-                          │     intendant (caller)      │
-                          │                             │
-  TUI / MCP / Web   ◄─────┤ presence ── agent loop ── ┐ │
-                          │     │           │         │ │
-                          │     │     ┌─────┴─────┐   │ │
-                          │     │     │sub-agents │   │ │
-                          │     │     └───────────┘   │ │
-                          └─────┼─────────────────────┼─┘
-                                │                     │
-                                v                     v
-                          Model APIs           intendant-runtime
-                     (OpenAI/Anthropic/        (sequential command
-                      Gemini + streaming)       execution, stdin/stdout)
+                          ┌────────────────────────────────────┐
+                          │        intendant (caller)          │
+                          │                                    │
+  Web Dashboard ◄─────────┤  presence ─── agent loop ───┐     │
+  TUI / MCP     ◄─────────┤     │            │          │     │
+                          │     │      ┌─────┴──────┐   │     │
+                          │     │      │ sub-agents  │   │     │
+                          │     │      └────────────┘   │     │
+                          └─────┼────────────────────────┼─────┘
+                                │                        │
+                                v                        v
+                          Model APIs              intendant-runtime
+                     (OpenAI/Anthropic/           (sequential command
+                      Gemini + streaming)          execution, stdin/stdout)
 ```
 
-**Presence layer** mediates between the user and agent loop — handles conversation, dispatches tasks, narrates events. Runs as server-side text or browser-side voice (Gemini Live / OpenAI Realtime), with mutual exclusion.
+**Web dashboard** (`--web`) serves a 4-tab app at `/` with activity log, usage tracking with cost estimates, embedded terminal, and remote display viewing via noVNC. Optional live voice interaction via Gemini Live or OpenAI Realtime.
+
+**Presence layer** mediates between the user and agent loop — handles conversation, dispatches tasks, narrates events. Runs as server-side text or browser-side voice, with mutual exclusion and session continuity across reconnects.
 
 Three execution modes: *direct* (single agent), *user* (orchestrator + sub-agents), *sub-agent* (scoped child task).
 
@@ -46,11 +48,11 @@ echo 'OPENAI_API_KEY=sk-...' > .env
 # Choose provider/model
 ./target/release/intendant --provider anthropic --model claude-sonnet-4-5-20250929 "Fix the tests"
 
+# Web dashboard (Activity + Usage + Terminal + Displays, default port 8765)
+./target/release/intendant --web
+
 # Run as MCP server
 ./target/release/intendant --mcp "Deploy the application"
-
-# Web gateway (remote TUI + optional voice from browser)
-./target/release/intendant --web
 
 # JSONL structured output
 ./target/release/intendant --json "echo hello"
@@ -65,6 +67,19 @@ echo 'OPENAI_API_KEY=sk-...' > .env
 ./target/release/intendant --sandbox "run tests"
 ```
 
+## Web Dashboard
+
+The `--web` flag starts a web server (default port 8765) serving a modern dashboard at `/`:
+
+- **Activity** — Live event log from agent loop, presence, and voice model with color-coded entries and turn separators
+- **Usage** — Token consumption for main and presence models with cost estimates (built-in pricing for OpenAI, Anthropic, Gemini)
+- **Terminal** — Embedded xterm.js connected to the server-side ratatui TUI
+- **Displays** — noVNC viewers for each Xvfb display created by the agent
+
+Optional **live voice** via Gemini Live or OpenAI Realtime — the browser connects directly to the model's realtime API with presence tools for approving actions, submitting tasks, and querying status by voice.
+
+Late-connecting browsers receive the full session log replay and cached state, so you can open the dashboard at any point and see everything that's happened.
+
 ## Testing
 
 ```bash
@@ -74,7 +89,7 @@ cargo test -- --list      # List all test names
 
 ## Documentation
 
-**[Read the full documentation](https://lovon-spec.github.io/intendant/)** — covers architecture, configuration, runtime protocol, TUI & autonomy, multi-agent orchestration, the presence layer, MCP server, integrations, and session logging.
+**[Read the full documentation](https://lovon-spec.github.io/intendant/)** — covers architecture, configuration, runtime protocol, TUI & autonomy, multi-agent orchestration, the presence layer, web gateway, MCP server, integrations, and session logging.
 
 Or build locally with [mdBook](https://rust-lang.github.io/mdBook/):
 

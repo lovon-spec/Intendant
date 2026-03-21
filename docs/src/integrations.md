@@ -61,9 +61,9 @@ echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
 
 ## Web Gateway
 
-The `--web` flag starts a WebSocket server that serves a remote TUI (xterm.js) and optionally enables browser-side live model interaction (voice/text) via the Gemini Live API or OpenAI Realtime API. `--web` implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically.
+The `--web` flag starts a web server that serves the app dashboard and bridges WebSocket connections to the EventBus. `--web` implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically.
 
-See [TUI & Autonomy — Web TUI](./tui.md#web-tui) for setup instructions and [Presence Layer](./presence.md) for details on the mutual exclusion between server-side and browser-side presence.
+See [Web Dashboard](./web-dashboard.md) for the full dashboard documentation and [Presence Layer](./presence.md) for details on the presence session protocol and mutual exclusion.
 
 ### How It Works
 
@@ -72,10 +72,12 @@ Browser ──WebSocket──> Intendant web gateway (port 8765)
   │                              │
   │  Terminal I/O (ANSI)         │  Events (broadcast to all clients)
   │  Key/resize input            │  Tool responses (per-connection direct channel)
-  │  Tool requests               │  State snapshot (on connect)
-  │  live_connected/disconnected │
+  │  Tool requests               │  State snapshot + log replay (on connect)
+  │  presence_connect/disconnect │  Presence welcome (on voice connect)
+  │  Voice logs/checkpoints      │  Per-connection TUI frames
+  │  Audio for transcription     │
   v                              v
-xterm.js terminal           EventBus + AgentStateSnapshot
+App dashboard (WASM)        EventBus + AgentStateSnapshot
   +                              │
 Optional: browser-side           │  Dual outbound channels:
 live model (Gemini/OpenAI)       │  - broadcast::Receiver (events)
@@ -85,11 +87,13 @@ live model (Gemini/OpenAI)       │  - broadcast::Receiver (events)
 Intendant agent loop
 ```
 
-The web gateway has two layers:
+The web gateway has three layers:
 
-1. **Remote TUI** — The TUI renders to a buffer-backed ratatui backend (`WebTui`). ANSI output is broadcast to all connected WebSocket clients as base64-encoded `{"t":"term","d":"..."}` messages. Key presses and terminal resizes from the browser are sent back and injected into the TUI event loop.
+1. **App dashboard** — The primary web interface at `/` with 4 tabs (Activity, Usage, Terminal, Displays). State management is handled by `presence-web` WASM. Events are broadcast and late-connecting browsers get a full log replay.
 
-2. **Presence bridge** (optional) — When a browser connects a live model (Gemini Live / OpenAI Realtime), the model uses 9 presence tools that map to `tool_request` WebSocket messages. The gateway handles these server-side and returns `tool_response` messages on a per-connection direct channel.
+2. **Per-connection TUI rendering** — Each WebSocket connection gets its own `WebTui` instance with independent terminal dimensions. ANSI output is sent per-connection via the direct channel, not broadcast.
+
+3. **Presence bridge** (optional) — When a browser connects a live model (Gemini Live / OpenAI Realtime), the model uses 9 presence tools that map to `tool_request` WebSocket messages. The gateway handles these server-side and returns `tool_response` messages on the per-connection direct channel.
 
 ### WebSocket Protocol
 
@@ -97,20 +101,34 @@ The web gateway has two layers:
 
 | Message | Description |
 |---------|-------------|
-| `{"t":"key","key":"..."}` | Keyboard input (crossterm key format) |
-| `{"t":"resize","cols":N,"rows":N}` | Terminal resize |
-| `{"t":"live_connected"}` | Browser live model connected — pauses server-side presence |
-| `{"t":"live_disconnected"}` | Browser live model disconnected — resumes server-side presence |
-| `{"t":"tool_request","id":"...","tool":"...","args":{}}` | Presence tool call from browser live model |
+| `{"t":"key","key":"..."}` | Keyboard input (routed to per-connection WebTui) |
+| `{"t":"resize","cols":N,"rows":N}` | Terminal resize (per-connection) |
+| `{"t":"presence_connect",...}` | Presence session protocol — replaces server-side presence |
+| `{"t":"presence_disconnect"}` | Disconnect presence — resumes server-side presence |
+| `{"t":"make_active"}` | Request active voice ownership (handover) |
+| `{"t":"voice_log","text":"...","seq":N}` | Voice transcript from browser presence model |
+| `{"t":"presence_checkpoint","summary":"...","last_event_seq":N}` | Context checkpoint |
+| `{"t":"voice_diagnostic","kind":"...","detail":"..."}` | Browser voice diagnostics |
+| `{"t":"user_audio","data":"<base64>"}` | PCM16 audio for server-side transcription |
+| `{"t":"tool_request","id":"...","tool":"...","args":{}}` | Presence tool call |
+| `{"t":"async_query","id":"...","tool":"...","args":{}}` | Async query (result as text, not tool response) |
+| `{"action":"..."}` | ControlMsg (same as Unix control socket) |
+| `{"t":"live_connected"}` / `{"t":"live_disconnected"}` | Legacy (still accepted) |
 
 #### Outbound Messages (server → browser)
 
 | Message | Description |
 |---------|-------------|
-| `{"t":"term","d":"<base64>"}` | TUI ANSI output (broadcast) |
-| `{"t":"state_snapshot","state":{...}}` | Full `AgentStateSnapshot` on connect (bootstrap) |
-| `{"t":"event","event":{...}}` | Agent event from EventBus (broadcast) |
-| `{"t":"tool_response","id":"...","result":"..."}` | Response to a tool_request (direct, per-connection) |
+| `{"t":"term","d":"<base64>"}` | Per-connection TUI ANSI output |
+| `{"t":"state_snapshot","state":{...},"connection_id":"...","config":{...},"session_id":"..."}` | Bootstrap on connect |
+| `{"t":"log_replay","entries":[...]}` | Historical session events for late-connecting browsers |
+| `{"t":"presence_welcome","session_id":"...","state":{...},"events":[...],"is_active":bool,"conversation_context":"..."}` | Presence session welcome |
+| `{"t":"active_granted","is_active":true,"handover_context":"...","conversation_context":"..."}` | Active ownership granted |
+| `{"t":"force_disconnect_voice","reason":"handover"}` | Sent to old active on handover |
+| `{"t":"presence_checkpoint_ack","seq":N}` | Checkpoint acknowledgement |
+| `{"t":"tool_response","id":"...","result":"..."}` | Response to a tool_request |
+| `{"t":"async_query_result","id":"...","tool":"...","result":"..."}` | Response to async_query |
+| `{"event":"..."}` | OutboundEvent broadcast (status, agent_output, approval_required, etc.) |
 
 #### Tool Request/Response Protocol
 
@@ -126,65 +144,38 @@ The browser live model calls presence tools via tagged request/response messages
 
 **Action tools** (`submit_task`, `approve_action`, `deny_action`, `skip_action`, `respond_to_question`, `set_autonomy`) are dispatched via the EventBus — the same path as TUI key presses and control socket commands.
 
-**Query tools** (`check_status`, `query_detail`, `recall_memory`) are handled synchronously server-side via `presence::handle_tool_query()`, which reads from the shared `AgentStateSnapshot`, project files, and knowledge store.
+**Query tools** (`check_status`, `query_detail`, `recall_memory`) are handled asynchronously server-side via `presence::handle_tool_query()`, which reads from the shared `AgentStateSnapshot`, project files, and knowledge store.
 
 #### State Bootstrap
 
-On WebSocket connect, if a `WebQueryCtx` is available (presence layer active), the server sends a `state_snapshot` message containing the full `AgentStateSnapshot`. This lets the browser reconstruct agent state without replaying the event history:
+On WebSocket connect, the server sends multiple bootstrap messages:
 
-```json
-{
-  "t": "state_snapshot",
-  "state": {
-    "phase": "thinking",
-    "turn": 3,
-    "budget_pct": 8.5,
-    "autonomy": "medium",
-    "last_command": "cargo test",
-    "pending_approval": null,
-    "pending_question": null
-  }
-}
-```
+1. **`state_snapshot`** — Full `AgentStateSnapshot` with `connection_id`, config, and `session_id`
+2. **Cached `usage_update`** — Latest token usage data
+3. **Cached `status`** — Latest status (autonomy, session_id, task)
+4. **Cached `display_ready`** — Latest display info for VNC slots
+5. **`log_replay`** — Historical session events parsed from `session.jsonl`
 
-Subsequent state changes arrive as incremental `event` messages.
-
-### Mutual Exclusion
-
-Only one presence model runs at a time — server-side text or browser-side live:
-
-1. Browser connects live model → sends `{"t":"live_connected"}`
-2. Web gateway emits `AppEvent::LiveConnected` → sets shared `AtomicBool` pause flag
-3. Server-side `PresenceLayer::handle_event()` returns `Ok(None)` while paused
-4. Browser live model handles all presence duties (narration, tool calls, user interaction)
-5. Browser disconnects → sends `{"t":"live_disconnected"}`
-6. Web gateway emits `AppEvent::LiveDisconnected` → clears pause flag
-7. Server-side presence resumes
-
-### Running
-
-```bash
-# Start idle, waiting for tasks via web UI (default port 8765)
-./target/release/intendant --web
-
-# Custom port
-./target/release/intendant --web 9000
-```
-
-Open `http://<host>:8765/` on your phone or browser. The xterm.js terminal shows the full TUI remotely. To enable voice, enter your API key on first visit (Gemini or OpenAI; stored in browser localStorage, never sent to Intendant).
+This ensures late-connecting browsers see the complete state immediately.
 
 ### HTTP Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /` | Serves `static/live.html` (xterm.js terminal + optional voice overlay) |
-| `GET /config` | Returns configured live model provider/model as JSON |
-| `GET /ws` | WebSocket upgrade endpoint |
+| `GET /` | App dashboard (4-tab UI: Activity, Usage, Terminal, Displays) |
+| `GET /live` | Legacy xterm.js terminal + voice overlay |
+| `GET /config` | Live model configuration JSON |
+| `GET /debug` | Debug JSON (agent state, voice connection, active browser) |
+| `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime |
+| `GET /wasm-web/*` | WASM and JS glue (content-hash cache-busted) |
+| `GET /audio-processor.js` | AudioWorklet processor for microphone capture |
+| `WS /` | Main WebSocket (events, terminal I/O, presence protocol) |
+| `WS /vnc` | WebSocket-to-TCP VNC proxy for noVNC display viewing |
 
 ### Requirements
 
 - **Microphone access requires a secure context**: Use `localhost` (via SSH tunnel: `ssh -L 8765:localhost:8765 host`), or set browser flags for insecure origins.
-- **API key for voice**: Gemini (free tier from Google AI Studio) or OpenAI. The key is used browser-side only. Voice is optional — the remote TUI works without it.
+- **API key for voice**: Gemini or OpenAI. The key is used browser-side only. Voice is optional — the dashboard works without it.
 
 ### Supported Tools (Browser Live Model)
 

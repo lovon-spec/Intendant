@@ -47,6 +47,17 @@
 | `a` | Auto-approve all remaining |
 | `n` | Deny and stop |
 
+### Markdown Rendering
+
+Model responses containing markdown are rendered with syntax highlighting in the log panel:
+- **Headers** (`#` through `####`) in blue
+- **Bold** (`**text**`) with bright styling
+- **Italic** (`*text*`) in lavender
+- **Inline code** (`` `code` ``) in green
+- **Fenced code blocks** (` ``` `) in green
+- **List items** (`- ` and `* `) with yellow bullets
+- **Horizontal rules** (`---`) as dim lines
+
 ### Streaming Display
 
 When a model is generating a response, text deltas are forwarded to the TUI in real-time via `AppEvent::ModelResponseDelta` and accumulated in a streaming buffer. The buffer is cleared when the full response arrives. This gives immediate feedback during long model responses.
@@ -94,11 +105,9 @@ Commands are classified into categories by inspecting the command JSON:
 
 Shell commands are further classified by inspecting the command string for destructive patterns, network tools, and file writes (redirects, `tee`, `mv`, `cp`). The `sudo` prefix is detected as Destructive and the actual command after `sudo` is also classified.
 
-## Web TUI
+## Web Dashboard
 
-The `--web` flag serves the TUI remotely via WebSocket using xterm.js. The full ratatui interface is rendered server-side into an ANSI buffer and streamed to connected browsers.
-
-### Running
+The `--web` flag starts a web server that serves a modern 4-tab dashboard at `/` with Activity, Usage, Terminal, and Displays tabs. The Terminal tab provides the same ratatui interface as the native TUI via xterm.js, while the other tabs add event logging, cost tracking, and remote display viewing.
 
 ```bash
 # Default port 8765
@@ -108,19 +117,8 @@ The `--web` flag serves the TUI remotely via WebSocket using xterm.js. The full 
 ./target/release/intendant --web 9000
 ```
 
-Open `http://<host>:8765/` in a browser. The terminal renders the same layout as the native TUI — status bar, log panel, action panel, approval/input panels. Key presses and terminal resizes in the browser are sent back to the server.
+The `--web` flag implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically. Open `http://<host>:8765/` in a browser.
 
-The `--web` flag implies `--mcp`, so no initial task is required — the agent starts idle and accepts tasks dynamically via the web UI or programmatically.
+The dashboard also supports optional live voice interaction via Gemini Live or OpenAI Realtime, with active/passive multi-browser support and session continuity across reconnects.
 
-### Voice Overlay
-
-The web TUI includes an optional voice overlay for browser-side live model interaction (Gemini Live / OpenAI Realtime). When activated:
-
-- The browser connects directly to the model's realtime API for low-latency voice I/O
-- The live model receives agent events and narrates progress in first person
-- Tool calls from the live model are routed through the WebSocket protocol to the server
-- Server-side presence is automatically paused (mutual exclusion)
-
-Voice requires an API key (Gemini or OpenAI), stored in browser localStorage. The remote TUI works without voice enabled.
-
-See [Integrations — Web Gateway](./integrations.md#web-gateway) for the full WebSocket protocol documentation and [Presence Layer](./presence.md) for details on presence mutual exclusion.
+See [Web Dashboard](./web-dashboard.md) for full documentation and [Integrations — Web Gateway](./integrations.md#web-gateway) for the WebSocket protocol.

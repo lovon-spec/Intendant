@@ -18,7 +18,8 @@
 | `--no-presence` | Disable the presence layer (direct agent interaction) |
 | `--continue` / `-c` | Resume most recent session for this project |
 | `--resume <id>` / `-r <id>` | Resume specific session by ID or prefix |
-| `--web [PORT]` | Start web gateway for remote TUI + optional voice/text interaction (default port 8765) |
+| `--web [PORT]` | Start web dashboard with Activity/Usage/Terminal/Displays tabs + optional voice (default port 8765) |
+| `--transcription` | Enable server-side audio transcription (Whisper API) |
 
 The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
 
@@ -87,8 +88,16 @@ destructive = "ask"           # ask before destructive commands (default)
 enabled = true                # enable the conversational presence layer (default: true)
 provider = "gemini"           # provider for the presence model (optional, falls back to PROVIDER)
 model = "gemini-2.5-flash"    # model for the presence layer (optional)
-audio_model = "gemini-2.5-flash-live"  # model for browser-side live presence (optional)
+live_provider = "gemini"      # provider for browser-side live presence (optional)
+live_model = "gemini-2.5-flash-native-audio-preview-12-2025"  # model for browser-side live presence (optional)
 context_window = 32768        # context window for the presence conversation (default: 32768)
+
+[transcription]
+enabled = false               # enable server-side audio transcription (default: false)
+provider = "openai"           # transcription provider (default: "openai")
+model = "whisper-1"           # transcription model (default: "whisper-1")
+language = "en"               # ISO-639-1 language hint (optional, auto-detect if omitted)
+# endpoint = "http://..."     # custom endpoint for self-hosted whisper.cpp
 
 [sandbox]
 enabled = false               # enable Landlock filesystem sandboxing (default: false)
@@ -108,6 +117,39 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 [mcp_servers.env]
 GITHUB_TOKEN = "ghp_..."
 ```
+
+## Skills
+
+Skills are named instruction sets stored as `SKILL.md` files with YAML frontmatter. They are discovered from two directories (project-scoped first):
+
+1. `<project_root>/.intendant/skills/<name>/SKILL.md`
+2. `~/.intendant/skills/<name>/SKILL.md`
+
+Example `SKILL.md`:
+
+```yaml
+---
+name: deploy
+description: Deploy the application to production
+autonomy: high
+disable-auto-invocation: true
+---
+
+## Steps
+
+1. Run tests
+2. Build release binary
+3. Deploy to server
+```
+
+Frontmatter fields:
+- `name` — skill identifier (required)
+- `description` — shown in skill catalog (required)
+- `autonomy` — override session autonomy level when active (optional)
+- `disable-auto-invocation` — if `true`, only user can trigger this skill (optional, default `false`)
+- `sandbox` — override session sandbox setting (optional)
+
+Project skills take precedence over personal skills with the same name. Available skills are formatted into a catalog and injected into the agent's conversation.
 
 When sandboxing is enabled (via `--sandbox` or `[sandbox].enabled = true`), runtime command execution is restricted to read-only filesystem access plus writes to project root, `/tmp`, session log directory, `~/.intendant`, and `extra_write_paths`. On kernels without Landlock support, sandboxing is silently skipped.
 

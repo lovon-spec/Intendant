@@ -12,7 +12,7 @@ stdin (JSON) --> intendant-runtime --> executes commands sequentially (blocking)
                   |
                   +--> stdout (result lines with exit code, stdout/stderr tail)
 
-intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
+intendant (3 modes) --> detects project root (git) --> loads memory/knowledge/skills
   |
   +--> User Mode:       spawns orchestrator subprocess, monitors progress (no API calls)
   +--> Sub-Agent Mode:  scoped task, writes results/progress, isolated context
@@ -22,14 +22,18 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge
   +--> Native tool calling (OpenAI/Anthropic/Gemini) with text extraction fallback
   +--> Streaming output:  SSE-based token streaming for all 3 providers
   +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
+  +--> Web dashboard:   4-tab app (Activity/Usage/Terminal/Displays) with WASM-driven state
+  +--> Live voice:      Gemini Live / OpenAI Realtime via browser, active/passive multi-browser
   +--> MCP Server:      --mcp flag, stdio transport, full parity with TUI (tools + resources)
   +--> MCP Client:      connects to external MCP servers (configured in intendant.toml)
   +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
+  +--> Skills system:   SKILL.md-based instruction sets with YAML frontmatter
+  +--> Transcription:   server-side Whisper API for browser audio transcription
   +--> Landlock sandbox: filesystem restrictions on agent runtime (Linux)
   +--> Prompt caching:  Anthropic cache_control, OpenAI/Gemini implicit caching
   +--> Auto-compaction: triggers at 90% context usage, preserves system+tail messages
   +--> Control socket:  /tmp/intendant-<pid>.sock (JSON-line protocol)
-  +--> Web gateway:     WebSocket server for remote TUI + browser-side voice (Gemini Live / OpenAI Realtime)
+  +--> VNC proxy:       WebSocket-to-TCP bridge for noVNC display viewing
   +--> Token budget tracking (context-window-aware loop termination)
   +--> Session resume:  --continue (most recent) or --resume <id> (specific session)
   +--> Git worktree isolation for implementation agents

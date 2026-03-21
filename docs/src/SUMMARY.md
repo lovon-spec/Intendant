@@ -5,6 +5,7 @@
 - [Configuration](./configuration.md)
 - [Runtime Protocol](./runtime-protocol.md)
 - [TUI & Autonomy](./tui.md)
+- [Web Dashboard](./web-dashboard.md)
 - [Multi-Agent Orchestration](./multi-agent.md)
 - [Presence Layer](./presence.md)
 - [MCP Server](./mcp-server.md)
