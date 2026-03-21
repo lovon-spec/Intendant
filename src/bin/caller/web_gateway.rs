@@ -1440,10 +1440,11 @@ pub fn spawn_web_gateway(
                             ("application/javascript", AUDIO_PROCESSOR_JS.to_string(), "no-cache")
                         } else if request_line.contains("/config") {
                             ("application/json", config_json.clone(), "no-cache")
-                        } else if request_line.contains("/app") {
-                            ("text/html; charset=utf-8", app_html.to_string(), "no-cache")
-                        } else {
+                        } else if request_line.contains("/live") {
                             ("text/html; charset=utf-8", web_html.to_string(), "no-cache")
+                        } else {
+                            // Default: serve app.html (also matches /app for backward compat)
+                            ("text/html; charset=utf-8", app_html.to_string(), "no-cache")
                         };
 
                         let response = format!(
