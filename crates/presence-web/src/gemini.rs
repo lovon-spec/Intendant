@@ -375,17 +375,31 @@ impl GeminiProvider {
         }
     }
 
-    /// Send a video frame to Gemini Live as a media_chunk (image/jpeg).
-    /// The frame_id is included as a text annotation so the model can reference it.
+    /// Send a video frame to Gemini Live with its frame ID annotation.
+    ///
+    /// Uses `client_content` with `turn_complete: false` to deliver both the
+    /// image and its ID label atomically without interrupting the model's
+    /// current response. This avoids a race condition where a separate
+    /// `turn_complete: true` annotation could cancel an in-progress tool call.
     pub fn send_frame(&self, base64_jpeg: &str, frame_id: &str) {
         if let Some(ref ws) = self.ws {
-            // Send the image as a media chunk (same mechanism as audio)
             let msg = serde_json::json!({
-                "realtime_input": {
-                    "media_chunks": [{
-                        "mime_type": "image/jpeg",
-                        "data": base64_jpeg
-                    }]
+                "client_content": {
+                    "turns": [{
+                        "role": "user",
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/jpeg",
+                                    "data": base64_jpeg
+                                }
+                            },
+                            {
+                                "text": format!("[frame:{}]", frame_id)
+                            }
+                        ]
+                    }],
+                    "turn_complete": false
                 }
             });
             let _ = ws.send_with_str(&msg.to_string());
