@@ -138,7 +138,7 @@ add_pf_conf_anchor() {
     # Already present?
     if grep -q "$PF_ANCHOR" "$PF_CONF" 2>/dev/null; then
         info "pfctl anchor already in $PF_CONF"
-        return
+        return 1   # no full reload needed
     fi
 
     # Backup original (once)
@@ -185,13 +185,21 @@ remove_pf_conf_anchor() {
 
 setup_port_forwarding() {
     write_pf_anchor
-    add_pf_conf_anchor
+
+    local need_full_reload=false
+    add_pf_conf_anchor && need_full_reload=true
 
     info "enabling IP forwarding..."
     sysctl -w net.inet.ip.forwarding=1 >/dev/null
 
     info "loading pfctl rules..."
-    pfctl -f "$PF_CONF" 2>/dev/null
+    if $need_full_reload; then
+        # First time: anchor was just added to pf.conf, need full reload to register it
+        pfctl -f "$PF_CONF" 2>/dev/null
+    else
+        # Subsequent runs: just reload our anchor rules without disrupting NAT state
+        pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null
+    fi
     pfctl -e 2>/dev/null || true   # may already be enabled
     info "pfctl active — forwarding $LAN_IFACE:{$HTTPS_PORT,$CERT_PORT} → $VM_IP"
 }
@@ -395,7 +403,7 @@ run_recert() {
         info "updating port forwarding to $VM_IP..."
         write_pf_anchor
         sysctl -w net.inet.ip.forwarding=1 >/dev/null
-        pfctl -f "$PF_CONF" 2>/dev/null
+        pfctl -a "$PF_ANCHOR" -f "$PF_ANCHOR_FILE" 2>/dev/null
         pfctl -e 2>/dev/null || true
         info "pfctl rules reloaded"
     fi
