@@ -406,6 +406,27 @@ impl SessionLog {
         });
     }
 
+    /// Log a voice/presence diagnostic (errors, disconnects, routine events).
+    pub fn voice_diagnostic(&mut self, kind: &str, detail: &str) {
+        let level = match kind {
+            "error" | "gemini_close" => "warn",
+            _ => "debug",
+        };
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "voice_diagnostic".to_string(),
+            level: Some(level.to_string()),
+            message: Some(format!("[voice:{}] {}", kind, detail)),
+            data: Some(serde_json::json!({
+                "kind": kind,
+                "detail": detail,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a tool request received from the browser presence model.
     pub fn tool_request(&mut self, tool: &str, args: &serde_json::Value) {
         self.emit(LogEvent {

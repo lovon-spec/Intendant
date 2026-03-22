@@ -40,7 +40,7 @@ sleep 0.5
 # 2. Start Xvfb + x11vnc (MANDATORY — human needs VNC to observe)
 nohup Xvfb :50 -screen 0 1280x720x24 > /dev/null 2>&1 &
 sleep 0.5
-nohup x11vnc -display :50 -rfbport 5950 -nopw -forever -quiet > /dev/null 2>&1 &
+nohup x11vnc -display :50 -rfbport 5950 -passwd intendant -forever -quiet > /dev/null 2>&1 &
 sleep 0.5
 
 # 3. Launch intendant --web as background process (no xterm needed)

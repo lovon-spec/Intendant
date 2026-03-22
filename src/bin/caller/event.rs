@@ -13,9 +13,24 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 
+/// A context injection item: text with optional images.
+#[derive(Clone)]
+pub struct ContextInjection {
+    pub text: String,
+    pub images: Vec<crate::conversation::ImageData>,
+}
+
+impl ContextInjection {
+    /// Create a text-only injection (no images).
+    pub fn text(msg: String) -> Self {
+        Self { text: msg, images: vec![] }
+    }
+}
+
 /// Shared queue for context messages to inject into the agent conversation.
-/// Used by display takeover/release to notify the agent between turns.
-pub type ContextInjectionQueue = Arc<Mutex<Vec<String>>>;
+/// Used by display takeover/release to notify the agent between turns,
+/// and by presence to inject mid-task interjections.
+pub type ContextInjectionQueue = Arc<Mutex<Vec<ContextInjection>>>;
 
 /// Shared registry for pending approval responders.
 ///

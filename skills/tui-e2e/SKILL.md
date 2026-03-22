@@ -29,7 +29,7 @@ sleep 0.5
 # 2. Start Xvfb + x11vnc (MANDATORY — human needs VNC to observe)
 Xvfb :50 -screen 0 1280x720x24 &
 sleep 0.5
-x11vnc -display :50 -rfbport 5950 -nopw -forever -quiet &
+x11vnc -display :50 -rfbport 5950 -passwd intendant -forever -quiet &
 sleep 0.5
 
 # 3. Launch intendant in xterm on display :50

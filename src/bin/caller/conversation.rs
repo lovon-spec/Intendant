@@ -89,6 +89,15 @@ impl Conversation {
         });
     }
 
+    pub fn add_user_with_images(&mut self, content: String, images: Vec<ImageData>) {
+        self.messages.push(Message {
+            role: "user".to_string(),
+            content,
+            images: if images.is_empty() { None } else { Some(images) },
+            ..Default::default()
+        });
+    }
+
     #[allow(dead_code)]
     pub fn add_user_with_layer(&mut self, content: String, layer: MessageLayer) {
         self.messages.push(Message {

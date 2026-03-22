@@ -1613,11 +1613,18 @@ async fn run_agent_loop(
             break;
         }
 
-        // Drain context injection queue (display takeover messages, etc.)
+        // Drain context injection queue (display takeover messages, presence interjections, etc.)
         if let Ok(mut q) = context_injection.lock() {
-            for msg in q.drain(..) {
-                conversation.add_user(format!("[System] {}", msg));
-                slog(&session_log, |l| l.info(&format!("Context injected: {}", msg)));
+            for inj in q.drain(..) {
+                if inj.images.is_empty() {
+                    conversation.add_user(format!("[System] {}", inj.text));
+                } else {
+                    conversation.add_user_with_images(
+                        format!("[System] {}", inj.text),
+                        inj.images,
+                    );
+                }
+                slog(&session_log, |l| l.info(&format!("Context injected: {}", inj.text)));
             }
         }
 
@@ -2535,7 +2542,7 @@ async fn run_round_loop(
     session_log: SharedSessionLog,
     log_dir: &std::path::Path,
     mcp_mgr: Option<&mcp_client::McpClientManager>,
-    mut follow_up_rx: FollowUpReceiver,
+    follow_up_rx: &mut FollowUpReceiver,
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
     context_injection: &event::ContextInjectionQueue,
@@ -2822,11 +2829,13 @@ async fn run_with_presence(
     response_tx: tokio::sync::mpsc::Sender<String>,
     presence_event_rx: tokio::sync::mpsc::Receiver<presence::PresenceEvent>,
     agent_state: Arc<Mutex<presence::AgentStateSnapshot>>,
-    force_direct: bool,
+    _force_direct: bool,
     presence_paused: Arc<std::sync::atomic::AtomicUsize>,
     task_tx: tokio::sync::mpsc::Sender<presence::TaskEnvelope>,
     mut task_rx: tokio::sync::mpsc::Receiver<presence::TaskEnvelope>,
     approval_registry: event::ApprovalRegistry,
+    frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+    context_injection: event::ContextInjectionQueue,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
     let presence_provider = provider::select_presence_provider(
@@ -2925,69 +2934,123 @@ async fn run_with_presence(
         presence.run(user_rx, response_tx).await;
     });
 
-    // 8. Main loop: dispatch task envelopes from presence to agent loops.
+    // 8. Persistent server conversation across all presence tasks.
+    //    First task initializes the conversation; subsequent tasks inject new
+    //    user messages into the same conversation. This preserves the server
+    //    model's context across the entire presence session.
     let mut cumulative_stats = LoopStats::default();
     let project_root = project.root.clone();
+
+    // Conversation, provider, project — created on first task, reused thereafter.
+    let mut persistent_conv: Option<Conversation> = None;
+    let mut persistent_provider: Option<Box<dyn provider::ChatProvider>> = None;
+    let mut persistent_project: Option<Project> = None;
 
     while let Some(envelope) = task_rx.recv().await {
         slog(&session_log, |l| {
             l.info(&format!("Presence dispatched task: {}", envelope.task));
         });
 
-        let task_provider = match provider::select_provider() {
-            Ok(p) => p,
-            Err(e) => {
-                bus.send(AppEvent::PresenceLog {
-                    message: format!("Provider error: {}", e),
-                    level: Some(types::LogLevel::Error),
-                    turn: None,
-                });
-                continue;
-            }
-        };
-        let task_project = match Project::from_root(project_root.clone()) {
-            Ok(p) => p,
-            Err(e) => {
-                bus.send(AppEvent::PresenceLog {
-                    message: format!("Project error: {}", e),
-                    level: Some(types::LogLevel::Error),
-                    turn: None,
-                });
-                continue;
-            }
-        };
+        // Resolve frame context_hints → images
+        let frame_images = resolve_frame_hints(
+            &envelope.context_hints, &frame_registry
+        ).await;
 
-        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-        drop(follow_up_tx); // single-round for delegated tasks
+        if persistent_conv.is_none() {
+            // ── First task: full initialization ──
+            let task_provider = match provider::select_provider() {
+                Ok(p) => p,
+                Err(e) => {
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("Provider error: {}", e),
+                        level: Some(types::LogLevel::Error),
+                        turn: None,
+                    });
+                    continue;
+                }
+            };
+            let proj = match Project::from_root(project_root.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("Project error: {}", e),
+                        level: Some(types::LogLevel::Error),
+                        turn: None,
+                    });
+                    continue;
+                }
+            };
 
-        let result = if force_direct || envelope.force_direct || is_simple_task(&envelope.task) {
-            run_direct_mode(
-                task_provider,
-                envelope.task,
-                task_project,
-                bus.clone(),
-                autonomy.clone(),
-                session_log.clone(),
-                log_dir.clone(),
-                None,
-                follow_up_rx,
-                None, // no JSON approval in TUI/presence mode
-                approval_registry.clone(),
-                event::ContextInjectionQueue::default(),
-                false, // not headless — presence has interactive UI
-            )
-            .await
+            slog(&session_log, |l| {
+                l.info(&format!(
+                    "Mode: direct (provider: {}, context: {})",
+                    task_provider.name(), task_provider.context_window()
+                ));
+            });
+
+            let role = sub_agent::SubAgentRole::Custom("direct".to_string());
+            let system_prompt = if task_provider.use_tools() {
+                prompts::resolve_system_prompt_for_tools(&role, Some(&proj.root))?
+            } else {
+                prompts::resolve_system_prompt(&role, Some(&proj.root))?
+            };
+
+            let mut conv = Conversation::new(system_prompt, task_provider.context_window());
+            setup_fresh_conversation_no_task(&mut conv, &proj);
+
+            // Frame directory awareness
+            let frames_dir = log_dir.join("frames");
+            conv.add_user(format!(
+                "[System] Video frames from the user's camera are stored at: {}\n\
+                 Each frame is a JPEG named by frame ID (e.g., cam0-f00001.jpg).\n\
+                 When you receive frame references, you can read them from this path.",
+                frames_dir.display()
+            ));
+            conv.add_assistant("Understood.".to_string());
+
+            // Add task with optional frame images
+            if frame_images.is_empty() {
+                conv.add_user(envelope.task);
+            } else {
+                conv.add_user_with_images(envelope.task, frame_images);
+            }
+
+            persistent_project = Some(proj);
+            persistent_provider = Some(task_provider);
+            persistent_conv = Some(conv);
         } else {
-            run_user_mode(
-                task_provider,
-                envelope.task,
-                task_project,
-                bus.clone(),
-                autonomy.clone(),
-                session_log.clone(),
-            )
-            .await
-        };
+            // ── Subsequent task: inject into existing conversation ──
+            let conv = persistent_conv.as_mut().unwrap();
+            if frame_images.is_empty() {
+                conv.add_user(format!("[New Task] {}", envelope.task));
+            } else {
+                conv.add_user_with_images(
+                    format!("[New Task] {}", envelope.task),
+                    frame_images,
+                );
+            }
+        }
+
+        // Run one round (agent loop until done/budget/error)
+        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+        drop(follow_up_tx); // single-round per task dispatch
+
+        let result = run_round_loop(
+            persistent_provider.as_ref().unwrap().as_ref(),
+            persistent_conv.as_mut().unwrap(),
+            persistent_project.as_ref().unwrap(),
+            None, // not sub-agent
+            &bus,
+            autonomy.clone(),
+            session_log.clone(),
+            &log_dir,
+            None, // no MCP
+            &mut follow_up_rx,
+            None, // no JSON approval
+            &approval_registry,
+            &context_injection, // shared with presence
+            false, // not headless
+        ).await;
 
         match result {
             Ok(stats) => {
@@ -2998,6 +3061,7 @@ async fn run_with_presence(
                 cumulative_stats.usage.total_tokens += stats.usage.total_tokens;
             }
             Err(e) => {
+                // Log error but DON'T discard conversation — it persists
                 bus.send(AppEvent::PresenceLog {
                     message: format!("Task error: {}", e),
                     level: Some(types::LogLevel::Error),
@@ -3308,7 +3372,7 @@ async fn run_direct_mode(
     session_log: SharedSessionLog,
     log_dir: PathBuf,
     mcp_mgr: Option<mcp_client::McpClientManager>,
-    follow_up_rx: FollowUpReceiver,
+    mut follow_up_rx: FollowUpReceiver,
     json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
     context_injection: event::ContextInjectionQueue,
@@ -3390,7 +3454,7 @@ async fn run_direct_mode(
         session_log,
         &log_dir,
         mcp_mgr.as_ref(),
-        follow_up_rx,
+        &mut follow_up_rx,
         json_approval.as_ref(),
         &approval_registry,
         &context_injection,
@@ -3399,8 +3463,9 @@ async fn run_direct_mode(
     .await
 }
 
-/// Set up a fresh conversation with project context, memory, and task.
-fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) {
+/// Set up a fresh conversation with project context, memory, and skills (without a task).
+/// Used by both `setup_fresh_conversation` and the persistent presence conversation.
+fn setup_fresh_conversation_no_task(conv: &mut Conversation, project: &Project) {
     // Inject project root so the model knows which directory to work in
     conv.add_user(format!(
         "Working directory: {}\nThis is the project you should examine and modify. \
@@ -3438,9 +3503,40 @@ All relative paths and commands execute from this directory.",
         conv.add_user(catalog);
         conv.add_assistant("Acknowledged. I see the available skills.".to_string());
     }
+}
 
-    // Add the task
+/// Set up a fresh conversation with project context, memory, skills, and task.
+fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) {
+    setup_fresh_conversation_no_task(conv, project);
     conv.add_user(task.to_string());
+}
+
+/// Resolve `frames:` context hints into HQ images from the frame registry.
+async fn resolve_frame_hints(
+    hints: &[String],
+    registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+) -> Vec<conversation::ImageData> {
+    let mut images = Vec::new();
+    for hint in hints {
+        if let Some(frame_list) = hint.strip_prefix("frames:") {
+            let reg = registry.read().await;
+            for fid in frame_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                match reg.read_hq(fid) {
+                    Ok(data) => {
+                        use base64::Engine;
+                        images.push(conversation::ImageData {
+                            media_type: "image/jpeg".to_string(),
+                            data: base64::engine::general_purpose::STANDARD.encode(&data),
+                        });
+                    }
+                    Err(_) => {
+                        // Frame not found — skip silently
+                    }
+                }
+            }
+        }
+    }
+    images
 }
 
 fn is_simple_task(task: &str) -> bool {
@@ -3765,6 +3861,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 None, // MCP mode: no WebTui
                 Some(frame_registry.clone()),
+                Some(session_log.clone()),
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -4168,6 +4265,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 web_tui_tx.clone(),
                 Some(frame_registry.clone()),
+                Some(session_log.clone()),
             );
             app.log(
                 types::LogLevel::Info,
@@ -4249,6 +4347,8 @@ async fn main() -> Result<(), CallerError> {
                     task_tx,
                     task_rx,
                     approval_registry_clone,
+                    frame_registry.clone(),
+                    context_injection_clone,
                 )
                 .await;
 
@@ -4444,6 +4544,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 None, // Headless mode: no WebTui
                 Some(frame_registry.clone()),
+                Some(session_log.clone()),
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",

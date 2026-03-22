@@ -1683,7 +1683,7 @@ impl App {
                 );
                 self.log(LogLevel::Warn, msg.clone());
                 if let Ok(mut q) = self.context_injection.lock() {
-                    q.push(msg);
+                    q.push(crate::event::ContextInjection::text(msg));
                 }
             }
             AppEvent::DisplayReleased { display_id, note } => {
@@ -1700,7 +1700,7 @@ impl App {
                 };
                 self.log(LogLevel::Info, msg.clone());
                 if let Ok(mut q) = self.context_injection.lock() {
-                    q.push(msg);
+                    q.push(crate::event::ContextInjection::text(msg));
                 }
             }
             AppEvent::SessionDirChanged { .. } => {
@@ -1768,15 +1768,6 @@ impl App {
                 if let Some(ref model) = live_model {
                     self.presence_model_name = Some(model.clone());
                 }
-                // Persist to session log
-                if let Some(ref sl) = self.session_log {
-                    if let Ok(mut log) = sl.lock() {
-                        log.presence_connected(
-                            live_provider.as_deref(),
-                            live_model.as_deref(),
-                        );
-                    }
-                }
             }
             AppEvent::PresenceDisconnected => {
                 self.flush_voice_transcript();
@@ -1796,21 +1787,8 @@ impl App {
                 } else {
                     self.log_sourced(LogLevel::Detail, "Browser presence disconnected".to_string(), LogSource::Live, vt);
                 }
-                // Persist to session log
-                if let Some(ref sl) = self.session_log {
-                    if let Ok(mut log) = sl.lock() {
-                        log.presence_disconnected();
-                    }
-                }
             }
-            AppEvent::VoiceLog { ref text, seq, ref tool_context } => {
-                // Always persist individual fragments to session log on disk.
-                if let Some(ref sl) = self.session_log {
-                    if let Ok(mut log) = sl.lock() {
-                        log.voice_log(text, seq, tool_context.as_deref());
-                    }
-                }
-
+            AppEvent::VoiceLog { ref text, ref tool_context, .. } => {
                 let ctx = tool_context.as_deref().unwrap_or("");
                 match ctx {
                     "transcript" => {
@@ -1853,12 +1831,6 @@ impl App {
                     LogSource::Live,
                     None,
                 );
-                // Persist to session log
-                if let Some(ref sl) = self.session_log {
-                    if let Ok(mut log) = sl.lock() {
-                        log.presence_checkpoint(summary, last_event_seq);
-                    }
-                }
             }
             AppEvent::VoiceDiagnostic { ref kind, ref detail } => {
                 let msg = format!("[voice:{}] {}", kind, detail);
@@ -1870,13 +1842,7 @@ impl App {
                 let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
                 self.log_sourced(lvl, msg, LogSource::Live, vt);
             }
-            AppEvent::UserTranscript { ref text, seq } => {
-                // Persist to session log
-                if let Some(ref sl) = self.session_log {
-                    if let Ok(mut log) = sl.lock() {
-                        log.user_transcript(text, seq);
-                    }
-                }
+            AppEvent::UserTranscript { ref text, .. } => {
                 // Log at Info level — no turn grouping so user speech is never
                 // collapsed inside a voice model response.
                 self.log_sourced(LogLevel::Info, format!("[You] {}", text), LogSource::Live, None);

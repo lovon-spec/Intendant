@@ -843,6 +843,26 @@ fn build_openai_request_parts(
                     return items;
                 }
             }
+            // User messages with images: multipart content
+            if m.role == "user" {
+                if let Some(ref images) = m.images {
+                    let mut content_parts = vec![serde_json::json!({
+                        "type": "input_text",
+                        "text": m.content,
+                    })];
+                    for img in images {
+                        content_parts.push(serde_json::json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", img.media_type, img.data),
+                        }));
+                    }
+                    items.push(serde_json::json!({
+                        "role": "user",
+                        "content": content_parts,
+                    }));
+                    return items;
+                }
+            }
             items.push(openai_message_item(&m.role, &m.content));
             items
         })
@@ -1381,9 +1401,32 @@ fn build_anthropic_messages(messages: &[Message]) -> (serde_json::Value, Vec<Ant
             }
         }
         if m.role == "user" || m.role == "assistant" {
+            let content = if m.role == "user" {
+                if let Some(ref images) = m.images {
+                    let mut parts = vec![serde_json::json!({
+                        "type": "text",
+                        "text": m.content,
+                    })];
+                    for img in images {
+                        parts.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data,
+                            }
+                        }));
+                    }
+                    serde_json::Value::Array(parts)
+                } else {
+                    serde_json::Value::String(m.content.clone())
+                }
+            } else {
+                serde_json::Value::String(m.content.clone())
+            };
             api_messages.push(AnthropicMessage {
                 role: m.role.clone(),
-                content: serde_json::Value::String(m.content.clone()),
+                content,
             });
         }
     }
@@ -1832,6 +1875,24 @@ fn build_gemini_request_parts(
                         "functionCall": {
                             "name": tc.name,
                             "args": args,
+                        }
+                    }));
+                }
+                contents.push(serde_json::json!({
+                    "role": role,
+                    "parts": parts,
+                }));
+                continue;
+            }
+        }
+        if m.role == "user" {
+            if let Some(ref images) = m.images {
+                let mut parts = vec![serde_json::json!({"text": m.content})];
+                for img in images {
+                    parts.push(serde_json::json!({
+                        "inlineData": {
+                            "mimeType": img.media_type,
+                            "data": img.data,
                         }
                     }));
                 }

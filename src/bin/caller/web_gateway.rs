@@ -503,6 +503,7 @@ pub fn spawn_web_gateway(
     transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
     web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
     frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
+    session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -618,6 +619,7 @@ pub fn spawn_web_gateway(
             let last_display_ready_json = last_display_ready_json.clone();
             let web_tui_tx = web_tui_tx.clone();
             let frame_registry = frame_registry.clone();
+            let session_log = session_log.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -769,6 +771,7 @@ pub fn spawn_web_gateway(
                     let connection_id_inbound = connection_id.clone();
                     let web_tui_tx_inbound = web_tui_tx.clone();
                     let frame_registry_inbound = frame_registry.clone();
+                    let session_log_inbound = session_log.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -913,6 +916,11 @@ pub fn spawn_web_gateway(
                                             // Only emit PresenceConnected for the active browser
                                             // (passive browsers don't pause server-side presence)
                                             if becomes_active {
+                                                if let Some(ref sl) = session_log_inbound {
+                                                    if let Ok(mut l) = sl.lock() {
+                                                        l.presence_connected(Some(&msg_provider), Some(&msg_model));
+                                                    }
+                                                }
                                                 bus_inbound.send(AppEvent::PresenceConnected {
                                                     server_session_id,
                                                     last_event_seq,
@@ -939,6 +947,11 @@ pub fn spawn_web_gateway(
                                                     *slot = None;
                                                 }
                                                 is_active = false;
+                                                if let Some(ref sl) = session_log_inbound {
+                                                    if let Ok(mut l) = sl.lock() {
+                                                        l.presence_disconnected();
+                                                    }
+                                                }
                                                 bus_inbound.send(AppEvent::PresenceDisconnected);
                                             }
                                         }
@@ -992,6 +1005,11 @@ pub fn spawn_web_gateway(
                                             let _ = direct_tx_inbound.send(granted_msg.to_string());
 
                                             // Emit PresenceConnected for the new active browser
+                                            if let Some(ref sl) = session_log_inbound {
+                                                if let Ok(mut l) = sl.lock() {
+                                                    l.presence_connected(Some(&live_provider), Some(&live_model));
+                                                }
+                                            }
                                             bus_inbound.send(AppEvent::PresenceConnected {
                                                 server_session_id: None,
                                                 last_event_seq: 0,
@@ -1009,6 +1027,11 @@ pub fn spawn_web_gateway(
                                                 let mut vd = voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner());
                                                 vd.voice_log_count += 1;
                                                 vd.last_voice_log = text.clone();
+                                            }
+                                            if let Some(ref sl) = session_log_inbound {
+                                                if let Ok(mut l) = sl.lock() {
+                                                    l.voice_log(&text, seq, tool_context.as_deref());
+                                                }
                                             }
                                             bus_inbound.send(AppEvent::VoiceLog {
                                                 text,
@@ -1051,6 +1074,11 @@ pub fn spawn_web_gateway(
                                                 }
                                             }
 
+                                            if let Some(ref sl) = session_log_inbound {
+                                                if let Ok(mut l) = sl.lock() {
+                                                    l.presence_checkpoint(&summary, last_event_seq);
+                                                }
+                                            }
                                             bus_inbound.send(AppEvent::PresenceCheckpointReceived {
                                                 summary,
                                                 last_event_seq,
@@ -1059,6 +1087,11 @@ pub fn spawn_web_gateway(
                                         Some("voice_diagnostic") => {
                                             let kind = json["kind"].as_str().unwrap_or("unknown").to_string();
                                             let detail = json["detail"].as_str().unwrap_or("").to_string();
+                                            if let Some(ref sl) = session_log_inbound {
+                                                if let Ok(mut l) = sl.lock() {
+                                                    l.voice_diagnostic(&kind, &detail);
+                                                }
+                                            }
                                             bus_inbound.send(AppEvent::VoiceDiagnostic {
                                                 kind,
                                                 detail,
@@ -1102,11 +1135,17 @@ pub fn spawn_web_gateway(
                                                             let seq = audio_seq;
                                                             let t = transcriber.clone();
                                                             let bus_tx = bus_inbound.clone();
+                                                            let session_log_tx = session_log_inbound.clone();
                                                             tokio::spawn(async move {
                                                                 match t.transcribe(&wav).await {
                                                                     Ok(segment) => {
                                                                         let text = segment.text.trim().to_string();
                                                                         if !text.is_empty() {
+                                                                            if let Some(ref sl) = session_log_tx {
+                                                                                if let Ok(mut l) = sl.lock() {
+                                                                                    l.user_transcript(&text, seq);
+                                                                                }
+                                                                            }
                                                                             bus_tx.send(AppEvent::UserTranscript { text, seq });
                                                                         }
                                                                     }
@@ -1637,7 +1676,7 @@ mod tests {
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None, None, None, None);
 
         // Give it a moment to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1657,7 +1696,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -1701,7 +1740,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -1752,7 +1791,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -1795,7 +1834,7 @@ mod tests {
             output_sample_rate: 24000,
             transcription_enabled: false,
         };
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -1833,7 +1872,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1889,7 +1928,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1944,7 +1983,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1998,7 +2037,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2062,7 +2101,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2137,7 +2176,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2187,7 +2226,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2241,7 +2280,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -2277,7 +2316,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -2315,7 +2354,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2371,7 +2410,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2441,7 +2480,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2539,7 +2578,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
