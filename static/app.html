@@ -1419,7 +1419,7 @@ function showSettingsDialog() {
 
 // ── WASM Init ──
 async function main() {
-  await init();
+  await init('/wasm-web/presence_web_bg.wasm');
   app = new PresenceWeb();
 
   // Intercept all server messages for AppState routing
