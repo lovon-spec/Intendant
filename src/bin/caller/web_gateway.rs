@@ -620,6 +620,7 @@ pub fn spawn_web_gateway(
             let last_vnc_port = last_vnc_port.clone();
             let last_display_ready_json = last_display_ready_json.clone();
             let web_tui_tx = web_tui_tx.clone();
+            let frame_registry = frame_registry.clone();
 
             tokio::spawn(async move {
                 // Peek at the first bytes to detect WebSocket upgrade.
@@ -1678,7 +1679,7 @@ mod tests {
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, None, None, None, None);
 
         // Give it a moment to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1698,7 +1699,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -1742,7 +1743,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -1793,7 +1794,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -1836,7 +1837,7 @@ mod tests {
             output_sample_rate: 24000,
             transcription_enabled: false,
         };
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -1874,7 +1875,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1930,7 +1931,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -1986,7 +1987,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2041,7 +2042,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2095,7 +2096,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2159,7 +2160,7 @@ mod tests {
         });
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, query_ctx, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2234,7 +2235,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2284,7 +2285,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2338,7 +2339,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -2374,7 +2375,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -2412,7 +2413,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2468,7 +2469,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2538,7 +2539,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2636,7 +2637,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

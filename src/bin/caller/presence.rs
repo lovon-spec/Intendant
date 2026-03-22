@@ -1136,7 +1136,7 @@ mod tests {
     #[test]
     fn presence_tools_count_and_names() {
         let tools = presence_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"submit_task"));
@@ -1148,6 +1148,8 @@ mod tests {
         assert!(names.contains(&"skip_action"));
         assert!(names.contains(&"respond_to_question"));
         assert!(names.contains(&"set_autonomy"));
+        assert!(names.contains(&"inspect_frame"));
+        assert!(names.contains(&"inspect_frames"));
     }
 
     #[test]
