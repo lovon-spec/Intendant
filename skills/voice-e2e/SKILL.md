@@ -51,7 +51,7 @@ Firefox getUserMedia({audio: true})
 AudioWorklet (audio-processor.js)
     |
     v
-WASM (presence-web AppWeb) -- resample to 16kHz/24kHz, PCM16, base64
+WASM (presence-web PresenceWeb) -- resample to 16kHz/24kHz, PCM16, base64
     |
     v
 WebSocket to live model (Gemini Live / OpenAI Realtime)

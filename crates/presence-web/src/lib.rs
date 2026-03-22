@@ -12,8 +12,6 @@ mod gemini;
 mod openai;
 mod server;
 pub mod app_state;
-#[cfg(target_arch = "wasm32")]
-mod app_web;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -63,6 +61,7 @@ pub struct PresenceWeb {
     pending_tool_requests:
         Rc<RefCell<std::collections::HashMap<String, js_sys::Function>>>,
     tool_request_counter: RefCell<u32>,
+    dashboard: RefCell<app_state::AppState>,
 }
 
 #[wasm_bindgen]
@@ -93,6 +92,7 @@ impl PresenceWeb {
             active_provider: RefCell::new(String::new()),
             pending_tool_requests: pending,
             tool_request_counter: RefCell::new(0),
+            dashboard: RefCell::new(app_state::AppState::new()),
         }
     }
 
@@ -202,7 +202,7 @@ impl PresenceWeb {
             let presence = presence;
             let last_session_id: RefCell<Option<String>> = RefCell::new(None);
             Box::new(move |msg: serde_json::Value| {
-                // Fire raw message callback (for AppWeb interception)
+                // Fire raw message callback (for dashboard interception)
                 cb.invoke_raw_message(&to_js(&msg));
 
                 // Route by message type
@@ -386,7 +386,7 @@ impl PresenceWeb {
             srv.set_active_voice(provider, actual_model);
             srv.set_voice_live(true);
         }
-        self.server.borrow().send_live_connected();
+        self.server.borrow().send_presence_connect();
     }
 
     #[wasm_bindgen]
@@ -400,7 +400,7 @@ impl PresenceWeb {
         *self.active_provider.borrow_mut() = String::new();
 
         // Notify server and clear voice state
-        self.server.borrow().send_live_disconnected();
+        self.server.borrow().send_presence_disconnect();
         let mut srv = self.server.borrow_mut();
         srv.set_voice_live(false);
         srv.set_active_voice("", "");
@@ -792,5 +792,93 @@ impl PresenceWeb {
         } else {
             false
         }
+    }
+
+    // --- Dashboard state (log/usage/approval UI) ---
+
+    /// Route a raw server message through the dashboard state machine.
+    /// Returns `UiCommand[]` as a JS array for the rendering layer.
+    #[wasm_bindgen]
+    pub fn handle_server_message(&self, msg: JsValue) -> JsValue {
+        let Ok(val) = serde_wasm_bindgen::from_value::<serde_json::Value>(msg) else {
+            return JsValue::NULL;
+        };
+        let cmds = self.dashboard.borrow_mut().handle_message(&val);
+        to_js(&cmds)
+    }
+
+    /// Change log verbosity and return commands to re-filter.
+    #[wasm_bindgen]
+    pub fn set_verbosity(&self, level: &str) -> JsValue {
+        let cmds = self.dashboard.borrow_mut().set_verbosity(level);
+        to_js(&cmds)
+    }
+
+    /// Notify which tab is active (for badge logic).
+    #[wasm_bindgen]
+    pub fn set_active_tab(&self, tab: &str) -> JsValue {
+        let cmds = self.dashboard.borrow_mut().set_active_tab(tab);
+        to_js(&cmds)
+    }
+
+    /// Approve/skip/deny/approve_all a pending action.
+    /// Returns `UiCommand[]` for UI updates. Sends the action to the server.
+    #[wasm_bindgen]
+    pub fn send_approval(&self, action: &str) -> JsValue {
+        let result = self.dashboard.borrow_mut().approve_action(action);
+        match result {
+            Some((id, cmds)) => {
+                let msg = serde_json::json!({"action": action, "id": id});
+                self.server.borrow().send_json(&msg);
+                to_js(&cmds)
+            }
+            None => JsValue::NULL,
+        }
+    }
+
+    /// Send a human response (askHuman).
+    #[wasm_bindgen]
+    pub fn send_human_response(&self, text: &str) -> JsValue {
+        let cmds = self.dashboard.borrow_mut().human_response(text);
+        let msg = serde_json::json!({"action": "input", "text": text});
+        self.server.borrow().send_json(&msg);
+        to_js(&cmds)
+    }
+
+    /// Send a follow-up message.
+    #[wasm_bindgen]
+    pub fn send_follow_up(&self, text: &str) -> JsValue {
+        let cmds = self.dashboard.borrow_mut().follow_up(text);
+        let msg = serde_json::json!({"action": "follow_up", "text": text});
+        self.server.borrow().send_json(&msg);
+        to_js(&cmds)
+    }
+
+    /// Get pending approval ID (for keyboard shortcut routing).
+    #[wasm_bindgen]
+    pub fn pending_approval_id(&self) -> JsValue {
+        match self.dashboard.borrow().pending_approval_id() {
+            Some(id) => JsValue::from_f64(id as f64),
+            None => JsValue::NULL,
+        }
+    }
+
+    /// Take control of a display.
+    #[wasm_bindgen]
+    pub fn take_display(&self, display_id: u64) {
+        let msg = serde_json::json!({"action": "take_display", "display_id": display_id});
+        self.server.borrow().send_json(&msg);
+    }
+
+    /// Release control of a display.
+    #[wasm_bindgen]
+    pub fn release_display(&self, display_id: u64, note: Option<String>) {
+        let mut msg = serde_json::json!({"action": "release_display", "display_id": display_id});
+        if let Some(n) = note {
+            if !n.is_empty() {
+                msg["note"] = serde_json::Value::String(n);
+            }
+        }
+        self.server.borrow().send_json(&msg);
     }
 }

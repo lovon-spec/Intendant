@@ -1107,7 +1107,7 @@ html, body {
 <script type="module">
 'use strict';
 
-import init, { AppWeb } from '/wasm-web/presence_web.js';
+import init, { PresenceWeb } from '/wasm-web/presence_web.js';
 
 // ── Constants (rendering only — all logic in WASM) ──
 const SPINNER_FRAMES = ['\u280b','\u2819','\u2839','\u2838','\u283c','\u2834','\u2826','\u2827','\u2807','\u280f'];
@@ -1420,7 +1420,7 @@ function showSettingsDialog() {
 // ── WASM Init ──
 async function main() {
   await init();
-  app = new AppWeb();
+  app = new PresenceWeb();
 
   // Intercept all server messages for AppState routing
   app.set_on_raw_message((msg) => {

@@ -57,7 +57,6 @@ crates/
 └── presence-web/        # Browser WASM: app dashboard state, Gemini Live, OpenAI Realtime, WebSocket transport
 static/
 ├── app.html             # 4-tab web dashboard (Activity, Usage, Terminal, Displays)
-├── live.html            # Legacy xterm.js + voice overlay
 ├── audio-processor.js   # AudioWorklet for mic capture (PCM16)
 └── wasm-web/            # Compiled WASM + JS glue
 SysPrompt*.md            # System prompts (direct, tools, user, orchestrator, research, implementation, presence)
@@ -216,7 +215,7 @@ Conversational interface between user and agent system. Only one active at a tim
 
 ### Web Gateway
 
-`--web` (default 8765). HTTP: `/` (app.html), `/live` (live.html), `/config`, `/debug`, `POST /session` (ephemeral tokens), `/wasm-web/*`, `/audio-processor.js`. WebSocket: `/` or `/ws` (events + terminal + presence), `/vnc` (VNC proxy).
+`--web` (default 8765). HTTP: `/` (app.html), `/config`, `/debug`, `POST /session` (ephemeral tokens), `/wasm-web/*`, `/audio-processor.js`. WebSocket: `/` or `/ws` (events + terminal + presence), `/vnc` (VNC proxy).
 
 Per-connection `WebTui` instances with independent terminal dimensions. Caches latest `usage_update`, `status`, `display_ready` for late-connecting browsers.
 
