@@ -604,6 +604,18 @@ pub fn build_conversation_context(log_dir: &std::path::Path, max_turns: usize) -
     Some(lines.join("\n"))
 }
 
+/// Result of a tool query, containing text and optional images.
+pub struct ToolQueryResult {
+    pub text: String,
+    pub images: Vec<crate::conversation::ImageData>,
+}
+
+impl ToolQueryResult {
+    pub fn text(s: String) -> Self {
+        Self { text: s, images: vec![] }
+    }
+}
+
 /// Handle a tool query by name. Used by both the server-side PresenceLayer and
 /// the WebSocket gateway for browser-side live model tool requests.
 ///
@@ -618,26 +630,26 @@ pub async fn handle_tool_query(
     args: &Value,
     frame_registry: Option<&Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
     context_injection: Option<&crate::event::ContextInjectionQueue>,
-) -> Option<String> {
+) -> Option<ToolQueryResult> {
     match tool_name {
         "check_status" => {
             let state = agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let action = dispatch_tool_call("check_status", args, &state);
             match action {
-                PresenceAction::TextResult(text) => Some(text),
+                PresenceAction::TextResult(text) => Some(ToolQueryResult::text(text)),
                 _ => None,
             }
         }
         "query_detail" => {
-            Some(query_detail(agent_state, project_root, log_dir, args).await)
+            Some(ToolQueryResult::text(query_detail(agent_state, project_root, log_dir, args).await))
         }
         "recall_memory" => {
-            Some(recall_memory(knowledge_path, log_dir, args))
+            Some(ToolQueryResult::text(recall_memory(knowledge_path, log_dir, args)))
         }
         "send_message" => {
             let msg = args["message"].as_str().unwrap_or("").to_string();
             if msg.is_empty() {
-                return Some("Error: message is required".to_string());
+                return Some(ToolQueryResult::text("Error: message is required".to_string()));
             }
             // Resolve optional frame_ids to HQ images
             let mut images = Vec::new();
@@ -665,7 +677,7 @@ pub async fn handle_tool_query(
                     });
                 }
             }
-            Some(format!("Message injected: {}", msg))
+            Some(ToolQueryResult::text(format!("Message injected: {}", msg)))
         }
         "inspect_frame" => {
             let reg = frame_registry?;
@@ -676,17 +688,27 @@ pub async fn handle_tool_query(
                 None => reg.latest(None)?.to_string(),
             };
             if let Some(meta) = reg.get(&fid) {
-                // Return metadata text. The HQ image will be injected separately
-                // (as a media chunk in the live model or as an image part in the agent conversation).
-                Some(format!(
-                    "Frame {} | stream={} | ts={} | hq_resolution={} | HQ image attached below.",
-                    meta.frame_id,
-                    meta.stream,
-                    meta.timestamp,
-                    meta.hq_resolution.as_deref().unwrap_or("unknown"),
-                ))
+                // Read HQ image and return alongside metadata
+                let mut images = Vec::new();
+                if let Ok(data) = reg.read_hq(&fid) {
+                    use base64::Engine;
+                    images.push(crate::conversation::ImageData {
+                        media_type: "image/jpeg".to_string(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&data),
+                    });
+                }
+                Some(ToolQueryResult {
+                    text: format!(
+                        "Frame {} | stream={} | ts={} | hq_resolution={}",
+                        meta.frame_id,
+                        meta.stream,
+                        meta.timestamp,
+                        meta.hq_resolution.as_deref().unwrap_or("unknown"),
+                    ),
+                    images,
+                })
             } else {
-                Some(format!("Frame {} not found in registry.", fid))
+                Some(ToolQueryResult::text(format!("Frame {} not found in registry.", fid)))
             }
         }
         "inspect_frames" => {
@@ -703,7 +725,7 @@ pub async fn handle_tool_query(
             };
 
             let frames = reg.query(stream_filter, count);
-            Some(crate::frames::FrameRegistry::format_frame_list(&frames))
+            Some(ToolQueryResult::text(crate::frames::FrameRegistry::format_frame_list(&frames)))
         }
         _ => None,
     }

@@ -1208,13 +1208,15 @@ pub fn spawn_web_gateway(
                                                 .unwrap_or_default();
                                             let action = presence::dispatch_tool_call(&tool, &args, &state);
 
-                                            let result = if let Some((ctrl, msg)) = presence::action_to_control_msg(&action) {
+                                            let query_result = if let Some((ctrl, msg)) = presence::action_to_control_msg(&action) {
                                                 // Action tools: dispatch via EventBus
                                                 bus_inbound.send(AppEvent::ControlCommand(ctrl));
-                                                msg
+                                                presence::ToolQueryResult::text(msg)
                                             } else {
                                                 match action {
-                                                    presence::PresenceAction::TextResult(text) => text,
+                                                    presence::PresenceAction::TextResult(text) => {
+                                                        presence::ToolQueryResult::text(text)
+                                                    }
                                                     presence::PresenceAction::NeedsIO { tool_name, args: io_args } => {
                                                         if let Some(ref ctx) = query_ctx_inbound {
                                                             if let Some(result) = presence::handle_tool_query(
@@ -1229,10 +1231,10 @@ pub fn spawn_web_gateway(
                                                             ).await {
                                                                 result
                                                             } else {
-                                                                format!("Unknown tool: {}", tool)
+                                                                presence::ToolQueryResult::text(format!("Unknown tool: {}", tool))
                                                             }
                                                         } else {
-                                                            "Presence query context not available".to_string()
+                                                            presence::ToolQueryResult::text("Presence query context not available".to_string())
                                                         }
                                                     }
                                                     _ => unreachable!(),
@@ -1240,10 +1242,10 @@ pub fn spawn_web_gateway(
                                             };
 
                                             // Log the tool response at Debug level
-                                            let result_preview = if result.len() > 200 {
-                                                format!("{}...", &result[..200])
+                                            let result_preview = if query_result.text.len() > 200 {
+                                                format!("{}...", &query_result.text[..200])
                                             } else {
-                                                result.clone()
+                                                query_result.text.clone()
                                             };
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!("[tool_response] {} → {}", tool, result_preview),
@@ -1251,11 +1253,20 @@ pub fn spawn_web_gateway(
                                                 turn: None,
                                             });
 
-                                            let response = serde_json::json!({
+                                            let mut response = serde_json::json!({
                                                 "t": "tool_response",
                                                 "id": req_id,
-                                                "result": result,
+                                                "result": query_result.text,
                                             });
+                                            if !query_result.images.is_empty() {
+                                                let img_array: Vec<serde_json::Value> = query_result.images.iter().map(|img| {
+                                                    serde_json::json!({
+                                                        "mime_type": img.media_type,
+                                                        "data": img.data,
+                                                    })
+                                                }).collect();
+                                                response["images"] = serde_json::Value::Array(img_array);
+                                            }
                                             let _ = direct_tx_inbound.send(response.to_string());
                                         }
                                         Some("async_query") => {
@@ -1273,7 +1284,7 @@ pub fn spawn_web_gateway(
                                                 turn: None,
                                             });
 
-                                            let result = if let Some(ref ctx) = query_ctx_inbound {
+                                            let query_result = if let Some(ref ctx) = query_ctx_inbound {
                                                 if let Some(result) = presence::handle_tool_query(
                                                     &ctx.agent_state,
                                                     &ctx.project_root,
@@ -1286,16 +1297,16 @@ pub fn spawn_web_gateway(
                                                 ).await {
                                                     result
                                                 } else {
-                                                    format!("Unknown query tool: {}", tool)
+                                                    presence::ToolQueryResult::text(format!("Unknown query tool: {}", tool))
                                                 }
                                             } else {
-                                                "Presence query context not available".to_string()
+                                                presence::ToolQueryResult::text("Presence query context not available".to_string())
                                             };
 
-                                            let result_preview = if result.len() > 200 {
-                                                format!("{}...", &result[..200])
+                                            let result_preview = if query_result.text.len() > 200 {
+                                                format!("{}...", &query_result.text[..200])
                                             } else {
-                                                result.clone()
+                                                query_result.text.clone()
                                             };
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!("[async_query_result] {} → {}", tool, result_preview),
@@ -1303,12 +1314,21 @@ pub fn spawn_web_gateway(
                                                 turn: None,
                                             });
 
-                                            let response = serde_json::json!({
+                                            let mut response = serde_json::json!({
                                                 "t": "async_query_result",
                                                 "id": req_id,
                                                 "tool": tool,
-                                                "result": result,
+                                                "result": query_result.text,
                                             });
+                                            if !query_result.images.is_empty() {
+                                                let img_array: Vec<serde_json::Value> = query_result.images.iter().map(|img| {
+                                                    serde_json::json!({
+                                                        "mime_type": img.media_type,
+                                                        "data": img.data,
+                                                    })
+                                                }).collect();
+                                                response["images"] = serde_json::Value::Array(img_array);
+                                            }
                                             let _ = direct_tx_inbound.send(response.to_string());
                                         }
                                         _ => {

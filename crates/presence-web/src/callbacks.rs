@@ -37,6 +37,9 @@ pub struct Callbacks {
     pub on_diagnostic: RefCell<Option<Function>>,
     /// Inject system text into the active voice model (for async query results).
     pub on_inject_voice_text: RefCell<Option<Function>>,
+    /// Inject an image into the active voice model (for inspect_frame results).
+    /// Called with (base64_data: string, label: string).
+    pub on_inject_voice_image: RefCell<Option<Function>>,
     /// Server session changed (binary restarted). Voice model should reconnect.
     pub on_session_changed: RefCell<Option<Function>>,
     /// Server tells this browser to disconnect its voice model (handover to another browser).
@@ -129,6 +132,16 @@ impl Callbacks {
     pub fn invoke_inject_voice_text(&self, text: &str) {
         if let Some(ref f) = *self.on_inject_voice_text.borrow() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
+        }
+    }
+
+    pub fn invoke_inject_voice_image(&self, base64_data: &str, label: &str) {
+        if let Some(ref f) = *self.on_inject_voice_image.borrow() {
+            let _ = f.call2(
+                &JsValue::NULL,
+                &JsValue::from_str(base64_data),
+                &JsValue::from_str(label),
+            );
         }
     }
 

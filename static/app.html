@@ -1506,6 +1506,10 @@ async function main() {
     app.send_text(text);
   });
 
+  app.set_on_inject_voice_image((base64Data, label) => {
+    app.send_frame(base64Data, label);
+  });
+
   app.set_on_state_snapshot((msg) => {
     if (msg && msg.is_active !== undefined) {
       isActiveBrowser = msg.is_active;

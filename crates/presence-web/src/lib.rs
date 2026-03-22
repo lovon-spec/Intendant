@@ -154,6 +154,11 @@ impl PresenceWeb {
     }
 
     #[wasm_bindgen]
+    pub fn set_on_inject_voice_image(&self, f: Function) {
+        *self.callbacks.on_inject_voice_image.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
     pub fn set_on_session_changed(&self, f: Function) {
         *self.callbacks.on_session_changed.borrow_mut() = Some(f);
     }
@@ -278,7 +283,7 @@ impl PresenceWeb {
                         }
                     }
                     Some("async_query_result") => {
-                        // Async query result from server — inject into voice model as system text
+                        // Async query result from server — inject into voice model
                         let tool = msg["tool"].as_str().unwrap_or("query");
                         let result_text = msg["result"].as_str().unwrap_or("");
                         let truncated = if result_text.len() > 2000 {
@@ -286,6 +291,19 @@ impl PresenceWeb {
                         } else {
                             result_text.to_string()
                         };
+
+                        // If images are included (e.g. from inspect_frame), inject them
+                        // into the voice model via send_frame (uses client_content with
+                        // turn_complete: false, so it won't interrupt).
+                        if let Some(images) = msg["images"].as_array() {
+                            for (i, img) in images.iter().enumerate() {
+                                if let Some(data) = img["data"].as_str() {
+                                    let label = format!("{}_{}", tool, i);
+                                    cb.invoke_inject_voice_image(data, &label);
+                                }
+                            }
+                        }
+
                         let text = format!("[System: {} result] {}", tool, truncated);
                         cb.invoke_inject_voice_text(&text);
                     }
