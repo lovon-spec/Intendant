@@ -59,6 +59,34 @@ impl AppWeb {
         to_js(&cmds)
     }
 
+    // ── Live usage ────────────────────────────────────────────────
+
+    /// Handle live model usage from Gemini Live / OpenAI Realtime.
+    /// Updates AppState, sends to server, returns `UiCommand[]`.
+    #[wasm_bindgen]
+    pub fn handle_live_usage(&self, usage: JsValue) -> JsValue {
+        let Ok(val) = serde_wasm_bindgen::from_value::<serde_json::Value>(usage) else {
+            return JsValue::NULL;
+        };
+        let provider = self.inner.active_voice_provider();
+        let model = self.inner.active_voice_model();
+        let input_tokens = val["input_tokens"].as_u64().unwrap_or(0);
+        let output_tokens = val["output_tokens"].as_u64().unwrap_or(0);
+        let cached_tokens = val["cached_tokens"].as_u64().unwrap_or(0);
+        let total_tokens = val["total_tokens"].as_u64().unwrap_or(0);
+        let thinking_tokens = val["thinking_tokens"].as_u64().unwrap_or(0);
+
+        // Update WASM state for immediate rendering
+        let cmds = self.state.borrow_mut().update_live_usage(
+            &provider, &model,
+            input_tokens, output_tokens, cached_tokens, total_tokens, thinking_tokens,
+        );
+        // Notify server for caching/broadcast to other connections
+        self.inner.send_live_usage(input_tokens, output_tokens, cached_tokens, total_tokens, thinking_tokens);
+
+        to_js(&cmds)
+    }
+
     // ── Verbosity ──────────────────────────────────────────────────
 
     /// Change log verbosity and return commands to re-filter.

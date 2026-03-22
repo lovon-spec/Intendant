@@ -84,6 +84,11 @@ impl ServerConnection {
         *self.active_model.borrow_mut() = model.to_string();
     }
 
+    /// Get the active voice model name.
+    pub fn active_model(&self) -> String {
+        self.active_model.borrow().clone()
+    }
+
     /// Set passive mode — this browser will never request active status.
     pub fn set_passive_mode(&mut self, passive: bool) {
         *self.passive_mode.borrow_mut() = passive;
@@ -334,6 +339,22 @@ impl ServerConnection {
             "t": "voice_diagnostic",
             "kind": kind,
             "detail": detail,
+        });
+        self.send_json(&msg);
+    }
+
+    /// Send live model (Gemini Live / OpenAI Realtime) usage to the server.
+    /// Provider/model are taken from the active voice config set during connect.
+    pub fn send_live_usage(&self, input: u64, output: u64, cached: u64, total: u64, thinking: u64) {
+        let msg = serde_json::json!({
+            "t": "live_usage_update",
+            "provider": *self.active_provider.borrow(),
+            "model": *self.active_model.borrow(),
+            "input_tokens": input,
+            "output_tokens": output,
+            "cached_tokens": cached,
+            "total_tokens": total,
+            "thinking_tokens": thinking,
         });
         self.send_json(&msg);
     }

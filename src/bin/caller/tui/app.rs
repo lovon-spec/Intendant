@@ -1899,7 +1899,7 @@ impl App {
             AppEvent::Key(key) => {
                 self.handle_key(key);
             }
-            AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } => {
+            AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }

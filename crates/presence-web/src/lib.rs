@@ -602,6 +602,21 @@ impl PresenceWeb {
         self.server.borrow().send_voice_diagnostic(kind, detail);
     }
 
+    /// Send live model usage to the server for tracking/broadcast.
+    pub fn send_live_usage(&self, input: u64, output: u64, cached: u64, total: u64, thinking: u64) {
+        self.server.borrow().send_live_usage(input, output, cached, total, thinking);
+    }
+
+    /// Get the active voice provider name (e.g. "gemini", "openai", or "").
+    pub fn active_voice_provider(&self) -> String {
+        self.active_provider.borrow().clone()
+    }
+
+    /// Get the active voice model name from the server connection.
+    pub fn active_voice_model(&self) -> String {
+        self.server.borrow().active_model()
+    }
+
     // --- High-level handlers (consolidate JS logic into WASM) ---
 
     /// Handle a voice model tool call end-to-end.

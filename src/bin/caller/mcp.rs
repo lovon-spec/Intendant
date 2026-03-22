@@ -2028,6 +2028,9 @@ pub fn spawn_event_listener(
                     AppEvent::UserTranscript { ref text, seq } => {
                         s.push_log(LogLevel::Info, format!("[transcript #{}] {}", seq, text));
                     }
+                    AppEvent::LiveUsageUpdate { .. } => {
+                        // Broadcast-only — handled by outbound event converter.
+                    }
                 }
             }
 

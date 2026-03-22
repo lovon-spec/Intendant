@@ -236,6 +236,15 @@ pub enum OutboundEvent {
         #[serde(default)]
         cached_tokens: u64,
     },
+    LiveUsageUpdate {
+        provider: String,
+        model: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        total_tokens: u64,
+        thinking_tokens: u64,
+    },
     /// App-originated log entry broadcast to external consumers.
     LogEntry {
         level: String,

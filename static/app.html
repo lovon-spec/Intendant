@@ -1469,17 +1469,11 @@ async function main() {
   });
 
   app.set_on_live_usage((usage) => {
-    // usage is a normalized LiveUsage object (provider-agnostic):
-    // { input_tokens, output_tokens, cached_tokens, total_tokens, thinking_tokens }
-    if (usage && typeof processCommands === 'function') {
-      processCommands([{
-        type: 'update_live_usage',
-        input_tokens: usage.input_tokens || 0,
-        output_tokens: usage.output_tokens || 0,
-        cached_tokens: usage.cached_tokens || 0,
-        total_tokens: usage.total_tokens || 0,
-        thinking_tokens: usage.thinking_tokens || 0,
-      }]);
+    // Route live usage through WASM AppState for proper rendering + cost calculation,
+    // and send to server for caching/broadcast.
+    if (usage && typeof app.handle_live_usage === 'function') {
+      const cmds = app.handle_live_usage(usage);
+      if (cmds) processCommands(cmds);
     }
   });
 
@@ -1672,7 +1666,6 @@ function processCommands(cmds) {
       case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage': renderUsageTab(c); break;
-      case 'update_live_usage': updateLiveUsage(c); break;
       case 'add_display': addDisplaySlot(c.display_id, c.vnc_port); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;
@@ -1828,31 +1821,6 @@ function hideBadge(tab) {
   if (badge) { badge.classList.remove('visible'); badge.textContent = ''; }
 }
 
-// ── Live Model Usage Tracking ──
-let liveUsageData = null; // Accumulated from on_live_usage callback
-
-function updateLiveUsage(c) {
-  liveUsageData = {
-    input_tokens: c.input_tokens || 0,
-    output_tokens: c.output_tokens || 0,
-    cached_tokens: c.cached_tokens || 0,
-    total_tokens: c.total_tokens || 0,
-    thinking_tokens: c.thinking_tokens || 0,
-  };
-  // If we have a rendered live model card, update it
-  const liveCard = document.getElementById('live-usage-card');
-  if (liveCard) {
-    liveCard.querySelector('.live-input').textContent = liveUsageData.input_tokens.toLocaleString();
-    liveCard.querySelector('.live-output').textContent = liveUsageData.output_tokens.toLocaleString();
-    liveCard.querySelector('.live-cached').textContent = liveUsageData.cached_tokens.toLocaleString();
-    liveCard.querySelector('.live-total').textContent = liveUsageData.total_tokens.toLocaleString();
-    if (liveUsageData.thinking_tokens > 0) {
-      liveCard.querySelector('.live-thinking').textContent = liveUsageData.thinking_tokens.toLocaleString();
-      liveCard.querySelector('.live-thinking-row').style.display = '';
-    }
-  }
-}
-
 // ── Usage Tab Rendering ──
 function renderUsageTab(c) {
   const cardsEl = document.getElementById('usage-cards');
@@ -1880,30 +1848,35 @@ function renderUsageTab(c) {
     cardsEl.appendChild(renderUsageCard('Presence Model', presenceData));
   }
 
-  // Live model usage card (from Gemini Live / OpenAI Realtime usageMetadata)
-  if (liveUsageData && liveUsageData.total_tokens > 0) {
-    const liveCard = document.createElement('div');
-    liveCard.className = 'usage-card';
-    liveCard.id = 'live-usage-card';
-    liveCard.innerHTML = `
-      <div class="card-title">Live Model</div>
-      <div class="card-model">
-        <span class="provider" style="color:var(--green)">Session tokens</span>
-      </div>
-      <div class="token-breakdown">
-        <span class="label">Input tokens</span>
-        <span class="value live-input">${liveUsageData.input_tokens.toLocaleString()}</span>
-        <span class="label" style="padding-left:12px">Cached</span>
-        <span class="value live-cached" style="color:var(--green)">${liveUsageData.cached_tokens.toLocaleString()}</span>
-        <span class="label">Output tokens</span>
-        <span class="value live-output">${liveUsageData.output_tokens.toLocaleString()}</span>
-        <span class="label live-thinking-row" ${liveUsageData.thinking_tokens > 0 ? '' : 'style="display:none"'}>Thinking tokens</span>
-        <span class="value live-thinking live-thinking-row" ${liveUsageData.thinking_tokens > 0 ? '' : 'style="display:none"'}>${liveUsageData.thinking_tokens.toLocaleString()}</span>
-        <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Total</span>
-        <span class="value live-total" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${liveUsageData.total_tokens.toLocaleString()}</span>
-      </div>
-    `;
-    cardsEl.appendChild(liveCard);
+  // Live model usage card (from Gemini Live / OpenAI Realtime via WASM AppState)
+  if (c.live_json) {
+    const ld = JSON.parse(c.live_json);
+    if (ld.total_tokens > 0) {
+      const liveCard = document.createElement('div');
+      liveCard.className = 'usage-card';
+      liveCard.id = 'live-usage-card';
+      const providerLabel = ld.provider ? ld.provider.charAt(0).toUpperCase() + ld.provider.slice(1) : 'Live';
+      const modelLabel = ld.model || 'unknown';
+      liveCard.innerHTML = `
+        <div class="card-title">Live Model</div>
+        <div class="card-model">
+          <span class="provider" style="color:var(--green)">${providerLabel}</span>
+          <span class="model">${modelLabel}</span>
+        </div>
+        <div class="token-breakdown">
+          <span class="label">Input tokens</span>
+          <span class="value">${ld.input_tokens.toLocaleString()}</span>
+          <span class="label" style="padding-left:12px">Cached</span>
+          <span class="value" style="color:var(--green)">${ld.cached_tokens.toLocaleString()}</span>
+          <span class="label">Output tokens</span>
+          <span class="value">${ld.output_tokens.toLocaleString()}</span>
+          ${ld.thinking_tokens > 0 ? `<span class="label">Thinking tokens</span><span class="value">${ld.thinking_tokens.toLocaleString()}</span>` : ''}
+          <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Total</span>
+          <span class="value" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${ld.total_tokens.toLocaleString()}</span>
+        </div>
+      `;
+      cardsEl.appendChild(liveCard);
+    }
   }
 
   // Cost

@@ -148,6 +148,17 @@ pub enum AppEvent {
         cached_tokens: u64,
     },
 
+    // Live model (Gemini Live / OpenAI Realtime) usage update from browser
+    LiveUsageUpdate {
+        provider: String,
+        model: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        total_tokens: u64,
+        thinking_tokens: u64,
+    },
+
     /// Presence layer log message (shown in TUI log panel).
     /// `level` controls visibility: None defaults to Info.
     PresenceLog {
@@ -505,6 +516,23 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             prompt_tokens: *prompt_tokens,
             completion_tokens: *completion_tokens,
             cached_tokens: *cached_tokens,
+        }),
+        AppEvent::LiveUsageUpdate {
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            total_tokens,
+            thinking_tokens,
+        } => Some(OutboundEvent::LiveUsageUpdate {
+            provider: provider.clone(),
+            model: model.clone(),
+            input_tokens: *input_tokens,
+            output_tokens: *output_tokens,
+            cached_tokens: *cached_tokens,
+            total_tokens: *total_tokens,
+            thinking_tokens: *thinking_tokens,
         }),
         AppEvent::UsageSnapshot { main, presence } => Some(OutboundEvent::UsageUpdate {
             main: main.clone(),
@@ -1138,6 +1166,24 @@ mod tests {
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"auto_approved\""));
+    }
+
+    #[test]
+    fn outbound_live_usage_update() {
+        let event = AppEvent::LiveUsageUpdate {
+            provider: "gemini".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_tokens: 200,
+            total_tokens: 1700,
+            thinking_tokens: 0,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"live_usage_update\""));
+        assert!(json.contains("\"input_tokens\":1000"));
+        assert!(json.contains("\"provider\":\"gemini\""));
     }
 
     #[test]

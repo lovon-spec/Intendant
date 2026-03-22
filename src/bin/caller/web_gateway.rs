@@ -526,6 +526,8 @@ pub fn spawn_web_gateway(
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).
     let last_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache the latest live_usage_update JSON for late-connecting browsers.
+    let last_live_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest status event (has autonomy, session_id, task).
     let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest VNC port from display_ready events for the /vnc proxy.
@@ -534,6 +536,7 @@ pub fn spawn_web_gateway(
     let last_display_ready_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
         let usage_cache = last_usage_json.clone();
+        let live_usage_cache = last_live_usage_json.clone();
         let status_cache = last_status_json.clone();
         let vnc_cache = last_vnc_port.clone();
         let display_cache = last_display_ready_json.clone();
@@ -559,6 +562,11 @@ pub fn spawn_web_gateway(
                             || line.contains("\"event\":\"usage\"")
                         {
                             if let Ok(mut guard) = usage_cache.lock() {
+                                *guard = Some(line.clone());
+                            }
+                        }
+                        if line.contains("\"event\":\"live_usage_update\"") {
+                            if let Ok(mut guard) = live_usage_cache.lock() {
                                 *guard = Some(line.clone());
                             }
                         }
@@ -616,6 +624,7 @@ pub fn spawn_web_gateway(
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let last_usage_json = last_usage_json.clone();
+            let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
             let last_vnc_port = last_vnc_port.clone();
             let last_display_ready_json = last_display_ready_json.clone();
@@ -712,6 +721,13 @@ pub fn spawn_web_gateway(
                     if let Ok(guard) = last_usage_json.lock() {
                         if let Some(ref usage_json) = *guard {
                             let _ = direct_tx.send(usage_json.clone());
+                        }
+                    }
+
+                    // Send cached live usage data.
+                    if let Ok(guard) = last_live_usage_json.lock() {
+                        if let Some(ref live_json) = *guard {
+                            let _ = direct_tx.send(live_json.clone());
                         }
                     }
 
@@ -1059,6 +1075,17 @@ pub fn spawn_web_gateway(
                                                 text,
                                                 seq,
                                                 tool_context,
+                                            });
+                                        }
+                                        Some("live_usage_update") => {
+                                            bus_inbound.send(AppEvent::LiveUsageUpdate {
+                                                provider: json["provider"].as_str().unwrap_or("").to_string(),
+                                                model: json["model"].as_str().unwrap_or("").to_string(),
+                                                input_tokens: json["input_tokens"].as_u64().unwrap_or(0),
+                                                output_tokens: json["output_tokens"].as_u64().unwrap_or(0),
+                                                cached_tokens: json["cached_tokens"].as_u64().unwrap_or(0),
+                                                total_tokens: json["total_tokens"].as_u64().unwrap_or(0),
+                                                thinking_tokens: json["thinking_tokens"].as_u64().unwrap_or(0),
                                             });
                                         }
                                         Some("presence_checkpoint") => {

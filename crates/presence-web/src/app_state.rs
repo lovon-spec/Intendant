@@ -60,6 +60,7 @@ pub enum UiCommand {
     UpdateUsage {
         main_json: Option<String>,
         presence_json: Option<String>,
+        live_json: Option<String>,
         cost_json: Option<String>,
         history_json: Option<String>,
     },
@@ -194,6 +195,22 @@ pub struct CostLine {
     pub output_cost: f64,
 }
 
+// ── Live usage snapshot ───────────────────────────────────────────
+
+/// Usage snapshot for live models (Gemini Live / OpenAI Realtime).
+/// Separate from `UsageSnapshot` because live models report thinking_tokens
+/// and don't have a context window concept.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LiveUsageSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub total_tokens: u64,
+    pub thinking_tokens: u64,
+}
+
 // ── Token history entry ────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +282,7 @@ pub struct AppState {
     // Usage
     main_usage: Option<UsageSnapshot>,
     presence_usage: Option<UsageSnapshot>,
+    live_usage: Option<LiveUsageSnapshot>,
     token_history: Vec<TokenHistoryEntry>,
     last_total_tokens: u64,
 
@@ -290,6 +308,7 @@ impl AppState {
             verbosity: "normal".to_string(),
             main_usage: None,
             presence_usage: None,
+            live_usage: None,
             token_history: Vec::new(),
             last_total_tokens: 0,
             active_tab: "activity".to_string(),
@@ -813,6 +832,19 @@ impl AppState {
                 cmds.push(self.build_usage_command());
             }
 
+            "live_usage_update" => {
+                self.live_usage = Some(LiveUsageSnapshot {
+                    provider: msg["provider"].as_str().unwrap_or("").to_string(),
+                    model: msg["model"].as_str().unwrap_or("").to_string(),
+                    input_tokens: msg["input_tokens"].as_u64().unwrap_or(0),
+                    output_tokens: msg["output_tokens"].as_u64().unwrap_or(0),
+                    cached_tokens: msg["cached_tokens"].as_u64().unwrap_or(0),
+                    total_tokens: msg["total_tokens"].as_u64().unwrap_or(0),
+                    thinking_tokens: msg["thinking_tokens"].as_u64().unwrap_or(0),
+                });
+                cmds.push(self.build_usage_command());
+            }
+
             "user_transcript" => {
                 let text = msg["text"].as_str().unwrap_or("");
                 cmds.extend(self.add_log("presence", &format!("[You] {}", text), None, "live"));
@@ -888,11 +920,36 @@ impl AppState {
         cmds
     }
 
+    /// Update live model usage and return commands to re-render the Usage tab.
+    pub fn update_live_usage(
+        &mut self,
+        provider: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        total_tokens: u64,
+        thinking_tokens: u64,
+    ) -> Vec<UiCommand> {
+        self.live_usage = Some(LiveUsageSnapshot {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            total_tokens,
+            thinking_tokens,
+        });
+        vec![self.build_usage_command()]
+    }
+
     /// Build an UpdateUsage command from current state.
     fn build_usage_command(&self) -> UiCommand {
         let main_json = self.main_usage.as_ref()
             .and_then(|u| serde_json::to_string(u).ok());
         let presence_json = self.presence_usage.as_ref()
+            .and_then(|u| serde_json::to_string(u).ok());
+        let live_json = self.live_usage.as_ref()
             .and_then(|u| serde_json::to_string(u).ok());
 
         // Cost calculation
@@ -924,6 +981,19 @@ impl AppState {
                     });
                 }
             }
+            if let Some(ref u) = self.live_usage {
+                if let Some(pricing) = find_pricing(&u.model) {
+                    let cost = calculate_cost(u.input_tokens, u.output_tokens, u.cached_tokens, &pricing);
+                    summary.total += cost.total;
+                    summary.lines.push(CostLine {
+                        label: "Live Model".into(),
+                        model: u.model.clone(),
+                        cost: cost.total,
+                        input_cost: cost.input_cost,
+                        output_cost: cost.output_cost,
+                    });
+                }
+            }
             if summary.lines.is_empty() { None } else { serde_json::to_string(&summary).ok() }
         };
 
@@ -933,7 +1003,7 @@ impl AppState {
             serde_json::to_string(&self.token_history).ok()
         };
 
-        UiCommand::UpdateUsage { main_json, presence_json, cost_json, history_json }
+        UiCommand::UpdateUsage { main_json, presence_json, live_json, cost_json, history_json }
     }
 
     /// Process an approval action. Returns commands to send to server + update UI.
@@ -1450,6 +1520,64 @@ mod tests {
         let cmds = s.handle_message(&msg);
         assert!(s.presence_usage.is_some());
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::UpdateUsage { .. })));
+    }
+
+    #[test]
+    fn live_usage_update_via_handle_message() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "live_usage_update",
+            "provider": "gemini", "model": "gemini-2.5-flash",
+            "input_tokens": 1000, "output_tokens": 500,
+            "cached_tokens": 200, "total_tokens": 1500,
+            "thinking_tokens": 0
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(s.live_usage.is_some());
+        let lu = s.live_usage.as_ref().unwrap();
+        assert_eq!(lu.input_tokens, 1000);
+        assert_eq!(lu.output_tokens, 500);
+        assert_eq!(lu.provider, "gemini");
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::UpdateUsage { live_json, .. } if live_json.is_some())));
+    }
+
+    #[test]
+    fn update_live_usage_returns_commands() {
+        let mut s = AppState::new();
+        let cmds = s.update_live_usage("gemini", "gemini-2.5-flash", 100, 50, 10, 150, 0);
+        assert!(s.live_usage.is_some());
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::UpdateUsage { live_json, .. } if live_json.is_some())));
+    }
+
+    #[test]
+    fn live_usage_included_in_cost() {
+        let mut s = AppState::new();
+        // Set main usage with a known-priced model
+        let main_msg = json!({
+            "event": "usage_update",
+            "main": {
+                "provider": "openai", "model": "gpt-5",
+                "tokens_used": 5000, "context_window": 128000,
+                "usage_pct": 3.9, "prompt_tokens": 4000,
+                "completion_tokens": 1000, "cached_tokens": 0
+            }
+        });
+        s.handle_message(&main_msg);
+
+        // Set live usage with a known-priced model
+        s.update_live_usage("gemini", "gemini-2.0-flash", 1000, 500, 0, 1500, 0);
+
+        let cmd = s.build_usage_command();
+        if let UiCommand::UpdateUsage { cost_json, live_json, .. } = cmd {
+            assert!(live_json.is_some());
+            assert!(cost_json.is_some());
+            let cost: CostSummary = serde_json::from_str(&cost_json.unwrap()).unwrap();
+            // Should have both main and live cost lines
+            assert_eq!(cost.lines.len(), 2);
+            assert!(cost.lines.iter().any(|l| l.label == "Live Model"));
+        } else {
+            panic!("Expected UpdateUsage");
+        }
     }
 
     #[test]
