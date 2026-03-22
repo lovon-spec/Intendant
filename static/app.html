@@ -1351,9 +1351,8 @@ async function startVideo() {
     const liveJpeg = canvas.toDataURL('image/jpeg', 0.8);
     const liveB64 = liveJpeg.split(',')[1];
 
-    // Send live-res frame to voice model + frame ID annotation
+    // Send live-res frame to voice model (frame ID annotation is bundled in)
     app.send_frame(liveB64, frameId);
-    app.send_frame_context(frameId);
 
     // Send HQ frame (full resolution) to server for archival
     canvas.width = vw;
