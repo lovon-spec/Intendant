@@ -292,16 +292,6 @@ impl ServerConnection {
         self.send_json(&serde_json::json!({"t": "presence_disconnect"}));
     }
 
-    /// Send live_connected notification (legacy, kept for backward compatibility).
-    pub fn send_live_connected(&self) {
-        self.send_presence_connect();
-    }
-
-    /// Send live_disconnected notification (legacy, kept for backward compatibility).
-    pub fn send_live_disconnected(&self) {
-        self.send_presence_disconnect();
-    }
-
     /// Send a voice transcript log entry.
     pub fn send_voice_log(&mut self, text: &str, tool_context: Option<&str>) {
         self.voice_log_seq += 1;

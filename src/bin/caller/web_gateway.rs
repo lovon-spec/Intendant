@@ -106,7 +106,6 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
     }
 }
 
-const WEB_HTML: &str = include_str!("../../../static/live.html");
 const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
@@ -509,15 +508,6 @@ pub fn spawn_web_gateway(
 
     // Inject content-hash version into WASM/JS URLs for cache-busting.
     let v = asset_version_hash();
-    let web_html = WEB_HTML
-        .replace(
-            "/wasm-web/presence_web.js",
-            &format!("/wasm-web/presence_web.js?v={}", v),
-        )
-        .replace(
-            "/wasm-web/presence_web_bg.wasm",
-            &format!("/wasm-web/presence_web_bg.wasm?v={}", v),
-        );
     let session_provider = config.provider.clone();
     let session_model = config.model.clone();
     let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
@@ -583,7 +573,6 @@ pub fn spawn_web_gateway(
         });
     }
 
-    let web_html = Arc::new(web_html);
     let app_html = Arc::new(
         APP_HTML
             .replace(
@@ -619,7 +608,6 @@ pub fn spawn_web_gateway(
             let voice_debug = voice_debug.clone();
             let session_provider = session_provider.clone();
             let session_model = session_model.clone();
-            let web_html = web_html.clone();
             let app_html = app_html.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
@@ -833,55 +821,6 @@ pub fn spawn_web_gateway(
                                                 });
                                             } else if is_active {
                                                 bus_inbound.send(AppEvent::Resize(cols, rows));
-                                            }
-                                        }
-                                        // Legacy: keep accepting live_connected/live_disconnected
-                                        // for older clients, mapping to the new protocol
-                                        Some("live_connected") => {
-                                            is_presence_connected = true;
-                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = true;
-                                            let msg_provider = json.get("provider")
-                                                .and_then(|v| v.as_str())
-                                                .filter(|s| !s.is_empty())
-                                                .map(String::from)
-                                                .unwrap_or_else(|| live_provider.clone());
-                                            let msg_model = json.get("model")
-                                                .and_then(|v| v.as_str())
-                                                .filter(|s| !s.is_empty())
-                                                .map(String::from)
-                                                .unwrap_or_else(|| live_model.clone());
-                                            // Legacy clients always become active (first-connect wins)
-                                            let becomes_active = {
-                                                let slot = active_presence_inbound.lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                slot.is_none()
-                                            };
-                                            if becomes_active {
-                                                *active_presence_inbound.lock()
-                                                    .unwrap_or_else(|e| e.into_inner()) = Some(ActivePresence {
-                                                    connection_id: connection_id_inbound.clone(),
-                                                    direct_tx: direct_tx_inbound.clone(),
-                                                });
-                                                is_active = true;
-                                                bus_inbound.send(AppEvent::PresenceConnected {
-                                                    server_session_id: None,
-                                                    last_event_seq: 0,
-                                                    live_provider: Some(msg_provider),
-                                                    live_model: Some(msg_model),
-                                                });
-                                            }
-                                        }
-                                        Some("live_disconnected") => {
-                                            is_presence_connected = false;
-                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = false;
-                                            if is_active {
-                                                let mut slot = active_presence_inbound.lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                if slot.as_ref().map(|a| a.connection_id == connection_id_inbound).unwrap_or(false) {
-                                                    *slot = None;
-                                                }
-                                                is_active = false;
-                                                bus_inbound.send(AppEvent::PresenceDisconnected);
                                             }
                                         }
                                         Some("presence_connect") => {
@@ -1536,8 +1475,6 @@ pub fn spawn_web_gateway(
                             ("application/javascript", AUDIO_PROCESSOR_JS.to_string(), "no-cache")
                         } else if request_line.contains("/config") {
                             ("application/json", config_json.clone(), "no-cache")
-                        } else if request_line.contains("/live") {
-                            ("text/html; charset=utf-8", web_html.to_string(), "no-cache")
                         } else {
                             // Default: serve app.html (also matches /app for backward compat)
                             ("text/html; charset=utf-8", app_html.to_string(), "no-cache")
@@ -1637,12 +1574,6 @@ mod tests {
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
-    }
-
-    #[test]
-    fn test_live_html_embedded() {
-        assert!(!WEB_HTML.is_empty());
-        assert!(WEB_HTML.contains("<!DOCTYPE html>"));
     }
 
     #[test]
@@ -1931,62 +1862,6 @@ mod tests {
 
         // Send presence_disconnect
         ws.send(Message::Text(r#"{"t":"presence_disconnect"}"#.into()))
-            .await
-            .unwrap();
-
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
-
-        assert!(matches!(event, AppEvent::PresenceDisconnected));
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_legacy_live_connected_maps_to_presence() {
-        let bus = EventBus::new();
-        let mut rx = bus.subscribe();
-        let (broadcast_tx, _) = broadcast::channel::<String>(16);
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None);
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let url = format!("ws://127.0.0.1:{}", port);
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-
-        // Legacy live_connected should map to PresenceConnected
-        ws.send(Message::Text(r#"{"t":"live_connected"}"#.into()))
-            .await
-            .unwrap();
-
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
-
-        match event {
-            AppEvent::PresenceConnected { server_session_id, last_event_seq, .. } => {
-                assert!(server_session_id.is_none());
-                assert_eq!(last_event_seq, 0);
-            }
-            _ => panic!("expected PresenceConnected"),
-        }
-
-        // Legacy live_disconnected
-        ws.send(Message::Text(r#"{"t":"live_disconnected"}"#.into()))
             .await
             .unwrap();
 

@@ -151,7 +151,7 @@ by sending text directly via the Firefox debugger.
 
 **Via Firefox debugger** (if `--start-debugger-server 6000` is active):
 ```bash
-# The WASM instance in /app is exposed as window.app (AppWeb)
+# The WASM instance in /app is exposed as window.app (PresenceWeb)
 python3 scripts/ff-eval.py "app.send_text('Hello, what is happening?')"
 ```
 

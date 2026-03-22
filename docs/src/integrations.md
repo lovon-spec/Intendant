@@ -163,7 +163,6 @@ This ensures late-connecting browsers see the complete state immediately.
 | Endpoint | Description |
 |----------|-------------|
 | `GET /` | App dashboard (4-tab UI: Activity, Usage, Terminal, Displays) |
-| `GET /live` | Legacy xterm.js terminal + voice overlay |
 | `GET /config` | Live model configuration JSON |
 | `GET /debug` | Debug JSON (agent state, voice connection, active browser) |
 | `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime |

@@ -43,7 +43,7 @@ pub struct Callbacks {
     pub on_force_disconnect: RefCell<Option<Function>>,
     /// Server confirms this browser is now the active voice owner.
     pub on_active_granted: RefCell<Option<Function>>,
-    /// Raw server message (fired before internal routing, for AppWeb interception).
+    /// Raw server message (fired before internal routing, for dashboard interception).
     pub on_raw_message: RefCell<Option<Function>>,
     /// Live model token usage update (provider-agnostic normalized struct).
     pub on_live_usage: RefCell<Option<Function>>,
