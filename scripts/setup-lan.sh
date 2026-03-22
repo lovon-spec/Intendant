@@ -44,6 +44,7 @@ parse_args() {
             --backend)  BACKEND="$2"; shift 2 ;;
             --tunnel)   TUNNEL_TARGET="$2"; shift 2 ;;
             --port)     HTTPS_PORT="$2"; shift 2 ;;
+            --lan-ip)   LAN_IP="$2"; shift 2 ;;
             --recert)   ACTION="recert"; shift ;;
             --force)    FORCE=true; shift ;;
             --remove)   ACTION="remove"; shift ;;
@@ -54,6 +55,10 @@ parse_args() {
 }
 
 detect_lan_ip() {
+    if [[ -n "$LAN_IP" ]]; then
+        info "LAN IP: $LAN_IP (override)"
+        return
+    fi
     LAN_IP=$(hostname -I | awk '{print $1}')
     [[ -n "$LAN_IP" ]] || die "could not detect LAN IP"
     info "LAN IP: $LAN_IP"

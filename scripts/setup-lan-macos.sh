@@ -353,7 +353,9 @@ run_wizard() {
     copy_to_guest
 
     info "running setup on VM..."
-    run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME --port $HTTPS_PORT"
+    local guest_args="--port $HTTPS_PORT"
+    [[ "$NET_MODE" == "shared" ]] && guest_args="$guest_args --lan-ip $LAN_IP"
+    run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $guest_args"
 
     save_config
     info "config saved to $CONFIG_FILE"
@@ -386,6 +388,7 @@ run_recert() {
 
     local recert_args="--recert"
     $FORCE && recert_args="$recert_args --force"
+    [[ "$NET_MODE" == "shared" ]] && recert_args="$recert_args --lan-ip $LAN_IP"
 
     info "regenerating server cert on VM..."
     run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $recert_args"
