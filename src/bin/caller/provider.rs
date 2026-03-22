@@ -1992,7 +1992,7 @@ fn resolve_reasoning(model: &str) -> Option<ReasoningConfig> {
                 Some(v)
             }
         })
-        .unwrap_or_else(|| "low".to_string());
+        .unwrap_or_else(|| "xhigh".to_string());
     let summary = env::var("REASONING_SUMMARY")
         .ok()
         .and_then(|s| {
@@ -2073,13 +2073,13 @@ pub fn select_provider() -> Result<Box<dyn ChatProvider>, CallerError> {
             Ok(Box::new(AnthropicProvider::new(ant, model, ctx, max_out)))
         }
         (Some(oai), Some(_ant), Some("openai")) | (Some(oai), Some(_ant), None) => {
-            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.2-codex".to_string());
+            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.4".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(OpenAIProvider::new(oai, model, ctx, max_out)))
         }
         (Some(oai), None, _) => {
-            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.2-codex".to_string());
+            let model = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.4".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(OpenAIProvider::new(oai, model, ctx, max_out)))
@@ -2782,7 +2782,7 @@ mod tests {
 
     #[test]
     fn supports_reasoning_models() {
-        assert!(supports_reasoning("gpt-5.2-codex"));
+        assert!(supports_reasoning("gpt-5.4"));
         assert!(supports_reasoning("gpt-5"));
         assert!(supports_reasoning("o3-mini"));
         assert!(supports_reasoning("o4-mini"));

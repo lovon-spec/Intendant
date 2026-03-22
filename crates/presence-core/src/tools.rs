@@ -169,13 +169,18 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
         // ── Interjection tool ──
         ToolDefinition {
             name: "send_message".to_string(),
-            description: "Send a message to the running worker agent as a mid-task interjection. The message will be injected into the agent's conversation at the start of its next turn. Use this for corrections, additional context, or redirections — NOT for new tasks (use submit_task for those).".to_string(),
+            description: "Send a message to the running worker agent as a mid-task interjection. The message will be injected into the agent's conversation at the start of its next turn. Use this for corrections, additional context, or redirections — NOT for new tasks (use submit_task for those). Optionally attach video frame references.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
                         "description": "The message to inject into the agent's conversation."
+                    },
+                    "frame_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional frame IDs to attach as HQ images (e.g. ['cam0-f00014', 'cam0-f00018'])."
                     }
                 },
                 "required": ["message"]

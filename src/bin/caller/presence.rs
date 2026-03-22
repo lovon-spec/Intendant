@@ -639,11 +639,30 @@ pub async fn handle_tool_query(
             if msg.is_empty() {
                 return Some("Error: message is required".to_string());
             }
+            // Resolve optional frame_ids to HQ images
+            let mut images = Vec::new();
+            if let Some(fids) = args["frame_ids"].as_array() {
+                if let Some(reg) = frame_registry {
+                    let reg = reg.read().await;
+                    for fid_val in fids {
+                        if let Some(fid) = fid_val.as_str() {
+                            if let Ok(data) = reg.read_hq(fid) {
+                                use base64::Engine;
+                                images.push(crate::conversation::ImageData {
+                                    media_type: "image/jpeg".to_string(),
+                                    data: base64::engine::general_purpose::STANDARD.encode(&data),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(q) = context_injection {
                 if let Ok(mut q) = q.lock() {
-                    q.push(crate::event::ContextInjection::text(
-                        format!("[Presence] {}", msg),
-                    ));
+                    q.push(crate::event::ContextInjection {
+                        text: format!("[Presence] {}", msg),
+                        images,
+                    });
                 }
             }
             Some(format!("Message injected: {}", msg))

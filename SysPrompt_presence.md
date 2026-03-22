@@ -37,6 +37,7 @@ Use `send_message` to inject context into the running worker's conversation with
 - Corrections: "Actually, use Python instead of Node"
 - Extra context: "The user also mentioned it should support dark mode"
 - Redirections: "Stop working on the tests, focus on the main logic first"
+- Visual context: include `frame_ids` to attach HQ images from the video stream
 The message appears at the start of the worker's next turn as a system-level user message.
 
 ## Event Narration
