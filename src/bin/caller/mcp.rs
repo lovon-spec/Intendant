@@ -2041,6 +2041,12 @@ pub fn spawn_event_listener(
                     AppEvent::RecordingError { ref stream_name, ref message } => {
                         s.push_log(LogLevel::Warn, format!("Recording error ({}): {}", stream_name, message));
                     }
+                    AppEvent::SessionStarted { ref session_id, ref task } => {
+                        s.push_log(LogLevel::Info, format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(no task)")));
+                    }
+                    AppEvent::SessionEnded { ref session_id, ref reason } => {
+                        s.push_log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
+                    }
                 }
             }
 

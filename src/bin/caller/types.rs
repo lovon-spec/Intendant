@@ -126,6 +126,15 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+    SessionStarted {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+    },
+    SessionEnded {
+        session_id: String,
+        reason: String,
+    },
     RoundComplete {
         round: usize,
         turns_in_round: usize,

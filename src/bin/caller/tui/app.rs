@@ -1880,6 +1880,12 @@ impl App {
             AppEvent::RecordingError { ref stream_name, ref message } => {
                 self.log(LogLevel::Warn, format!("Recording error ({}): {}", stream_name, message));
             }
+            AppEvent::SessionStarted { ref session_id, ref task } => {
+                self.log(LogLevel::Info, format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(idle)")));
+            }
+            AppEvent::SessionEnded { ref session_id, ref reason } => {
+                self.log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
+            }
         }
 
         // Drain log entries emitted during this handle_event call

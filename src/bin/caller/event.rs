@@ -100,6 +100,14 @@ pub enum AppEvent {
         reason: String,
         summary: Option<String>,
     },
+    SessionStarted {
+        session_id: String,
+        task: Option<String>,
+    },
+    SessionEnded {
+        session_id: String,
+        reason: String,
+    },
     BudgetWarning {
         pct: f64,
         remaining: u64,
@@ -457,6 +465,18 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             reason: reason.clone(),
             summary: summary.clone(),
         }),
+        AppEvent::SessionStarted { session_id, task } => {
+            Some(OutboundEvent::SessionStarted {
+                session_id: session_id.clone(),
+                task: task.clone(),
+            })
+        }
+        AppEvent::SessionEnded { session_id, reason } => {
+            Some(OutboundEvent::SessionEnded {
+                session_id: session_id.clone(),
+                reason: reason.clone(),
+            })
+        }
         AppEvent::ApprovalRequired {
             id,
             command_preview,
