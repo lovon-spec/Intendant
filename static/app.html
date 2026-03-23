@@ -2398,12 +2398,17 @@ function loadSessions() {
 function renderSessionsAggregate(sessions, el) {
   const totalSessions = sessions.length;
   const totalTokens = sessions.reduce((sum, s) => sum + (s.total_tokens || 0), 0);
+  const totalInput = sessions.reduce((sum, s) => sum + (s.prompt_tokens || 0), 0);
+  const totalOutput = sessions.reduce((sum, s) => sum + (s.completion_tokens || 0), 0);
+  const activeSessions = sessions.filter(s => s.status === 'running' || s.status === 'in_progress').length;
 
   el.innerHTML = '';
 
   const cards = [
-    { label: 'Total Sessions', value: totalSessions.toLocaleString() },
+    { label: 'Sessions', value: totalSessions.toLocaleString() + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
     { label: 'Total Tokens', value: totalTokens.toLocaleString() },
+    { label: 'Input', value: totalInput.toLocaleString() },
+    { label: 'Output', value: totalOutput.toLocaleString() },
   ];
 
   for (const c of cards) {

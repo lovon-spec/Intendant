@@ -46,6 +46,7 @@ export const presenceweb_set_on_active_granted: (a: number, b: any) => void;
 export const presenceweb_set_on_diagnostic: (a: number, b: any) => void;
 export const presenceweb_set_on_error: (a: number, b: any) => void;
 export const presenceweb_set_on_force_disconnect: (a: number, b: any) => void;
+export const presenceweb_set_on_inject_voice_image: (a: number, b: any) => void;
 export const presenceweb_set_on_inject_voice_text: (a: number, b: any) => void;
 export const presenceweb_set_on_live_usage: (a: number, b: any) => void;
 export const presenceweb_set_on_raw_message: (a: number, b: any) => void;

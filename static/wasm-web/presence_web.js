@@ -458,6 +458,12 @@ export class PresenceWeb {
     /**
      * @param {Function} f
      */
+    set_on_inject_voice_image(f) {
+        wasm.presenceweb_set_on_inject_voice_image(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
     set_on_inject_voice_text(f) {
         wasm.presenceweb_set_on_inject_voice_text(this.__wbg_ptr, f);
     }

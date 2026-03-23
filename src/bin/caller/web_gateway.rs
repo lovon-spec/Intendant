@@ -531,6 +531,8 @@ fn list_sessions() -> String {
         let mut status = "in_progress".to_string();
         let mut turns: u64 = 0;
         let mut total_tokens: u64 = 0;
+        let mut prompt_tokens: u64 = 0;
+        let mut completion_tokens: u64 = 0;
         let mut role: Option<String> = None;
 
         if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
@@ -584,13 +586,21 @@ fn list_sessions() -> String {
                         }
                     }
                     "model_response" => {
-                        if let Some(tokens) = obj
-                            .get("data")
-                            .and_then(|d| d.get("tokens"))
-                            .and_then(|t| t.get("total"))
-                            .and_then(|v| v.as_u64())
-                        {
-                            total_tokens += tokens;
+                        if let Some(tok) = obj.get("data").and_then(|d| d.get("tokens")) {
+                            if let Some(t) = tok.get("total").and_then(|v| v.as_u64()) {
+                                total_tokens += t;
+                            }
+                            if let Some(p) = tok.get("prompt").and_then(|v| v.as_u64())
+                                .or_else(|| tok.get("completion").and_then(|v| v.as_u64()).map(|c| {
+                                    // If only completion is available, derive prompt from total - completion
+                                    total_tokens.saturating_sub(c)
+                                }))
+                            {
+                                prompt_tokens += p;
+                            }
+                            if let Some(c) = tok.get("completion").and_then(|v| v.as_u64()) {
+                                completion_tokens += c;
+                            }
                         }
                     }
                     "task_complete" | "session_end" | "round_complete" => {
@@ -634,6 +644,8 @@ fn list_sessions() -> String {
             "turns": turns,
             "status": status,
             "total_tokens": total_tokens,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
             "role": role,
         }));
     }
