@@ -321,6 +321,22 @@ impl RecordingRegistry {
         })
     }
 
+    /// Get the session directory path (for serving segment files).
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+
+    /// Read the manifest.json for a stream, if it exists.
+    pub fn manifest(&self, stream_name: &str) -> Option<serde_json::Value> {
+        let manifest_path = self
+            .session_dir
+            .join("recordings")
+            .join(stream_name)
+            .join("manifest.json");
+        let content = std::fs::read_to_string(manifest_path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
     /// Get all recorded streams (including stopped ones that have segments on disk).
     pub fn all_streams(&self) -> Vec<String> {
         let recordings_dir = self.session_dir.join("recordings");

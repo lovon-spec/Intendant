@@ -746,6 +746,148 @@ html, body {
 .activity-split-handle:hover, .activity-split-handle.dragging { background: var(--blue); }
 .activity-split-handle.hidden { display: none; }
 
+/* ── Recording Replay ── */
+.recording-section {
+  flex-shrink: 0;
+  border-top: 1px solid var(--surface0);
+  background: var(--base);
+  display: flex;
+  flex-direction: column;
+}
+.recording-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  font-size: 13px;
+  color: var(--subtext1);
+  font-weight: 600;
+}
+.recording-header select {
+  padding: 2px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+  font-family: monospace;
+}
+.recording-player-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 200px;
+  max-height: 60vh;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.recording-player-wrap video {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+}
+.recording-player-wrap .recording-overlay {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+}
+.recording-timeline {
+  position: relative;
+  height: 28px;
+  background: var(--mantle);
+  cursor: pointer;
+  flex-shrink: 0;
+  border-top: 1px solid var(--surface0);
+  border-bottom: 1px solid var(--surface0);
+}
+.timeline-bar {
+  position: absolute;
+  top: 0; left: 0;
+  height: 100%;
+  background: var(--surface0);
+  width: 100%;
+}
+.timeline-progress {
+  position: absolute;
+  top: 0; left: 0;
+  height: 100%;
+  background: var(--blue);
+  opacity: 0.25;
+  width: 0;
+  pointer-events: none;
+}
+.timeline-cursor {
+  position: absolute;
+  top: 0;
+  width: 2px;
+  height: 100%;
+  background: var(--blue);
+  pointer-events: none;
+  left: 0;
+  z-index: 2;
+}
+.timeline-segment-mark {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--surface1);
+  opacity: 0.6;
+  pointer-events: none;
+}
+.timeline-event-mark {
+  position: absolute;
+  top: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--peach);
+  transform: translateX(-3px);
+  pointer-events: none;
+  z-index: 1;
+}
+.recording-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 12px;
+  background: var(--mantle);
+  flex-shrink: 0;
+}
+.recording-controls button {
+  padding: 4px 12px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+  min-width: 36px;
+}
+.recording-controls button:hover { background: var(--blue); color: var(--base); border-color: var(--blue); }
+.recording-controls .rec-time {
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--subtext0);
+}
+.recording-controls select {
+  padding: 2px 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+}
+.recording-controls .rec-status {
+  font-size: 11px;
+  color: var(--green);
+  margin-left: auto;
+}
+
 /* ── Usage empty state ── */
 .empty-state {
   display: flex;
@@ -1047,6 +1189,32 @@ html, body {
           <div style="font-size:12px;margin-top:8px;color:var(--surface2)">Displays will appear when the agent launches a GUI</div>
         </div>
       </div>
+      <div class="recording-section hidden" id="recording-section">
+        <div class="recording-header">
+          <span>Recordings</span>
+          <select id="recording-stream-select"></select>
+          <span class="rec-status" id="rec-status"></span>
+        </div>
+        <div class="recording-player-wrap" id="recording-player-wrap">
+          <video id="recording-video" preload="auto"></video>
+          <canvas class="recording-overlay" id="recording-overlay"></canvas>
+        </div>
+        <div class="recording-timeline" id="recording-timeline">
+          <div class="timeline-bar" id="timeline-bar"></div>
+          <div class="timeline-progress" id="timeline-progress"></div>
+          <div class="timeline-cursor" id="timeline-cursor"></div>
+        </div>
+        <div class="recording-controls">
+          <button id="rec-play-btn" title="Play/Pause">&#x25B6;</button>
+          <span class="rec-time" id="rec-time">0:00 / 0:00</span>
+          <select id="rec-speed" title="Playback speed">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+          </select>
+        </div>
+      </div>
     </div>
 
   </div>
@@ -1144,6 +1312,11 @@ const displayThumbs = new Map();
 let stripExpanded = false;
 let stripHeight = 280;
 let noVNCLoadCallbacks = [];
+
+// Recording replay
+const recordingStreams = new Map(); // stream_name -> {segments, totalDuration, manifest}
+let activeRecordingStream = null;
+let recPlayer = null;
 
 // Voice / Live mode
 let gatewayConfig = null;
@@ -1570,6 +1743,9 @@ async function main() {
     if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
   } catch {}
 
+  // Check for existing recordings (late-connecting browser)
+  checkExistingRecordings();
+
   // Passive mode from localStorage
   if (localStorage.getItem('passive_mode') === 'true') {
     isActiveBrowser = false;
@@ -1667,6 +1843,9 @@ function processCommands(cmds) {
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage': renderUsageTab(c); break;
       case 'add_display': addDisplaySlot(c.display_id, c.vnc_port); break;
+      case 'add_recording': addRecordingStream(c.stream_name); break;
+      case 'remove_recording': removeRecordingStream(c.stream_name); break;
+      case 'recording_error': /* logged via add_log_entry */ break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;
       case 'term_data': handleTermData(c.base64); break;
@@ -2182,6 +2361,261 @@ function toggleDisplayStrip() {
       if (slot.rfb) slot.rfb.scaleViewport = true;
     }
   });
+}
+
+// ── Recording Replay ──
+
+class RecordingPlayer {
+  constructor(videoEl, timelineEl, cursorEl, progressEl, timeLabel, playBtn) {
+    this.video = videoEl;
+    this.timelineEl = timelineEl;
+    this.cursorEl = cursorEl;
+    this.progressEl = progressEl;
+    this.timeLabel = timeLabel;
+    this.playBtn = playBtn;
+    this.segments = [];
+    this.totalDuration = 0;
+    this.currentSegIdx = -1;
+    this.playing = false;
+    this.rafId = null;
+    this.streamName = null;
+
+    this.video.addEventListener('ended', () => this._onSegmentEnd());
+    this.video.addEventListener('timeupdate', () => this._updateDisplay());
+
+    this.timelineEl.addEventListener('click', (e) => {
+      const rect = this.timelineEl.getBoundingClientRect();
+      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      this.seekToGlobal(pct * this.totalDuration);
+    });
+
+    playBtn.addEventListener('click', () => this.togglePlayback());
+  }
+
+  async load(streamName) {
+    this.streamName = streamName;
+    try {
+      const resp = await fetch(`/recordings/${streamName}/segments`);
+      this.segments = await resp.json();
+    } catch { this.segments = []; }
+    this.totalDuration = this.segments.length > 0
+      ? this.segments[this.segments.length - 1].end_secs
+      : 0;
+    this._renderSegmentMarks();
+    this._updateDisplay();
+    if (this.segments.length > 0) {
+      this._loadSegment(0, 0);
+    }
+  }
+
+  async refresh() {
+    if (!this.streamName) return;
+    const oldLen = this.segments.length;
+    try {
+      const resp = await fetch(`/recordings/${this.streamName}/segments`);
+      this.segments = await resp.json();
+    } catch { return; }
+    const newTotal = this.segments.length > 0
+      ? this.segments[this.segments.length - 1].end_secs
+      : 0;
+    if (newTotal !== this.totalDuration) {
+      this.totalDuration = newTotal;
+      this._renderSegmentMarks();
+    }
+  }
+
+  togglePlayback() {
+    if (this.playing) this.pause(); else this.play();
+  }
+
+  play() {
+    if (this.totalDuration === 0) return;
+    if (this.currentSegIdx < 0) this._loadSegment(0, 0);
+    this.video.play().catch(() => {});
+    this.playing = true;
+    this.playBtn.textContent = '\u23F8';
+    this._startAnimLoop();
+  }
+
+  pause() {
+    this.video.pause();
+    this.playing = false;
+    this.playBtn.textContent = '\u25B6';
+    this._stopAnimLoop();
+  }
+
+  seekToGlobal(secs) {
+    secs = Math.max(0, Math.min(secs, this.totalDuration));
+    const idx = this._findSegmentIndex(secs);
+    if (idx < 0) return;
+    const seg = this.segments[idx];
+    const offset = secs - seg.start_secs;
+    if (idx !== this.currentSegIdx) {
+      this._loadSegment(idx, offset);
+      if (this.playing) this.video.play().catch(() => {});
+    } else {
+      this.video.currentTime = offset;
+    }
+    this._updateDisplay();
+  }
+
+  setSpeed(rate) {
+    this.video.playbackRate = rate;
+  }
+
+  globalTime() {
+    if (this.currentSegIdx < 0 || this.currentSegIdx >= this.segments.length) return 0;
+    return this.segments[this.currentSegIdx].start_secs + this.video.currentTime;
+  }
+
+  _findSegmentIndex(secs) {
+    for (let i = 0; i < this.segments.length; i++) {
+      if (secs >= this.segments[i].start_secs && secs < this.segments[i].end_secs) return i;
+    }
+    return this.segments.length > 0 ? this.segments.length - 1 : -1;
+  }
+
+  _loadSegment(idx, offsetSecs) {
+    if (idx < 0 || idx >= this.segments.length) return;
+    this.currentSegIdx = idx;
+    const seg = this.segments[idx];
+    this.video.src = `/recordings/${this.streamName}/${seg.filename}`;
+    this.video.currentTime = offsetSecs || 0;
+  }
+
+  _onSegmentEnd() {
+    if (this.currentSegIdx + 1 < this.segments.length) {
+      this._loadSegment(this.currentSegIdx + 1, 0);
+      if (this.playing) this.video.play().catch(() => {});
+    } else {
+      this.pause();
+    }
+  }
+
+  _updateDisplay() {
+    const current = this.globalTime();
+    const total = this.totalDuration;
+    this.timeLabel.textContent = `${fmtTime(current)} / ${fmtTime(total)}`;
+    if (total > 0) {
+      const pct = (current / total) * 100;
+      this.cursorEl.style.left = pct + '%';
+      this.progressEl.style.width = pct + '%';
+    }
+  }
+
+  _renderSegmentMarks() {
+    // Remove old marks
+    this.timelineEl.querySelectorAll('.timeline-segment-mark').forEach(el => el.remove());
+    if (this.totalDuration === 0) return;
+    // Add segment boundary markers (skip first)
+    for (let i = 1; i < this.segments.length; i++) {
+      const pct = (this.segments[i].start_secs / this.totalDuration) * 100;
+      const mark = document.createElement('div');
+      mark.className = 'timeline-segment-mark';
+      mark.style.left = pct + '%';
+      this.timelineEl.appendChild(mark);
+    }
+  }
+
+  _startAnimLoop() {
+    if (this.rafId) return;
+    const tick = () => {
+      this._updateDisplay();
+      this.rafId = requestAnimationFrame(tick);
+    };
+    this.rafId = requestAnimationFrame(tick);
+  }
+
+  _stopAnimLoop() {
+    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+  }
+
+  destroy() {
+    this._stopAnimLoop();
+    this.video.pause();
+    this.video.removeAttribute('src');
+    this.video.load();
+  }
+}
+
+function fmtTime(secs) {
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function addRecordingStream(streamName) {
+  if (recordingStreams.has(streamName)) return;
+  recordingStreams.set(streamName, { active: true });
+
+  const section = document.getElementById('recording-section');
+  section.classList.remove('hidden');
+
+  const select = document.getElementById('recording-stream-select');
+  const opt = document.createElement('option');
+  opt.value = streamName;
+  opt.textContent = streamName;
+  select.appendChild(opt);
+
+  document.getElementById('rec-status').textContent = 'Recording';
+
+  // If this is the first stream, auto-select it
+  if (!activeRecordingStream) {
+    select.value = streamName;
+    switchRecordingStream(streamName);
+  }
+}
+
+function removeRecordingStream(streamName) {
+  const info = recordingStreams.get(streamName);
+  if (info) info.active = false;
+  document.getElementById('rec-status').textContent = '';
+  // Don't remove from UI — user can still replay stopped recordings
+}
+
+function switchRecordingStream(streamName) {
+  activeRecordingStream = streamName;
+  if (recPlayer) recPlayer.destroy();
+
+  recPlayer = new RecordingPlayer(
+    document.getElementById('recording-video'),
+    document.getElementById('recording-timeline'),
+    document.getElementById('timeline-cursor'),
+    document.getElementById('timeline-progress'),
+    document.getElementById('rec-time'),
+    document.getElementById('rec-play-btn')
+  );
+
+  const speedSelect = document.getElementById('rec-speed');
+  speedSelect.value = '1';
+  speedSelect.onchange = () => recPlayer.setSpeed(parseFloat(speedSelect.value));
+
+  recPlayer.load(streamName);
+
+  // Periodically refresh segment list for active recordings
+  if (recPlayer._refreshInterval) clearInterval(recPlayer._refreshInterval);
+  recPlayer._refreshInterval = setInterval(() => {
+    const info = recordingStreams.get(streamName);
+    if (info && info.active) recPlayer.refresh();
+  }, 5000);
+}
+
+// Wire up stream selector
+document.getElementById('recording-stream-select').addEventListener('change', (e) => {
+  if (e.target.value) switchRecordingStream(e.target.value);
+});
+
+// Also check for existing recordings on page load (late-connecting browser)
+async function checkExistingRecordings() {
+  try {
+    const resp = await fetch('/recordings');
+    const streams = await resp.json();
+    for (const s of streams) {
+      if (s.stream_name && !recordingStreams.has(s.stream_name)) {
+        addRecordingStream(s.stream_name);
+      }
+    }
+  } catch { /* no recordings available */ }
 }
 
 // ── Tab Switching ──

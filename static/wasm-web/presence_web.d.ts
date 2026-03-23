@@ -148,6 +148,7 @@ export class PresenceWeb {
     set_on_diagnostic(f: Function): void;
     set_on_error(f: Function): void;
     set_on_force_disconnect(f: Function): void;
+    set_on_inject_voice_image(f: Function): void;
     set_on_inject_voice_text(f: Function): void;
     set_on_live_usage(f: Function): void;
     set_on_raw_message(f: Function): void;
@@ -295,6 +296,7 @@ export interface InitOutput {
     readonly presenceweb_set_on_diagnostic: (a: number, b: any) => void;
     readonly presenceweb_set_on_error: (a: number, b: any) => void;
     readonly presenceweb_set_on_force_disconnect: (a: number, b: any) => void;
+    readonly presenceweb_set_on_inject_voice_image: (a: number, b: any) => void;
     readonly presenceweb_set_on_inject_voice_text: (a: number, b: any) => void;
     readonly presenceweb_set_on_live_usage: (a: number, b: any) => void;
     readonly presenceweb_set_on_raw_message: (a: number, b: any) => void;

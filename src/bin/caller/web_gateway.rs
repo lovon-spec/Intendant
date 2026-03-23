@@ -1527,6 +1527,163 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/recordings/") {
+                        // Serve recording data: segment files and metadata.
+                        use tokio::io::AsyncWriteExt;
+                        let path_part = request_line
+                            .split("/recordings/")
+                            .nth(1)
+                            .and_then(|s| s.split_whitespace().next())
+                            .unwrap_or("");
+                        let parts: Vec<&str> = path_part.split('/').collect();
+
+                        if let Some(ref rec_reg) = recording_registry {
+                            let reg = rec_reg.read().await;
+
+                            if parts.len() == 2 && parts[1] == "segments" {
+                                // GET /recordings/{stream}/segments
+                                let stream_name = parts[0];
+                                let segments = reg.segments(stream_name);
+                                let json: Vec<serde_json::Value> = segments.iter().map(|s| {
+                                    serde_json::json!({
+                                        "filename": s.filename,
+                                        "start_secs": s.start_secs,
+                                        "end_secs": s.end_secs,
+                                    })
+                                }).collect();
+                                let body = serde_json::to_string(&json).unwrap_or("[]".to_string());
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(), body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else if parts.len() == 2 {
+                                // GET /recordings/{stream}/{filename} — serve MP4 segment
+                                let stream_name = parts[0];
+                                let filename = parts[1];
+                                // Validate filename to prevent path traversal
+                                let valid = filename.starts_with("seg_")
+                                    && filename.ends_with(".mp4")
+                                    && filename.len() < 30
+                                    && !filename.contains("..");
+                                if valid {
+                                    let seg_path = reg.session_dir()
+                                        .join("recordings")
+                                        .join(stream_name)
+                                        .join(filename);
+                                    match tokio::fs::read(&seg_path).await {
+                                        Ok(data) => {
+                                            let header = format!(
+                                                "HTTP/1.1 200 OK\r\n\
+                                                 Content-Type: video/mp4\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Cache-Control: public, max-age=3600\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n",
+                                                data.len()
+                                            );
+                                            let _ = stream.write_all(header.as_bytes()).await;
+                                            let _ = stream.write_all(&data).await;
+                                        }
+                                        Err(_) => {
+                                            let body = "Segment not found";
+                                            let response = format!(
+                                                "HTTP/1.1 404 Not Found\r\n\
+                                                 Content-Type: text/plain\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n\
+                                                 {}",
+                                                body.len(), body
+                                            );
+                                            let _ = stream.write_all(response.as_bytes()).await;
+                                        }
+                                    }
+                                } else {
+                                    let body = "Invalid filename";
+                                    let response = format!(
+                                        "HTTP/1.1 400 Bad Request\r\n\
+                                         Content-Type: text/plain\r\n\
+                                         Content-Length: {}\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {}",
+                                        body.len(), body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                }
+                            } else {
+                                let body = "Not found";
+                                let response = format!(
+                                    "HTTP/1.1 404 Not Found\r\n\
+                                     Content-Type: text/plain\r\n\
+                                     Content-Length: {}\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(), body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                        } else {
+                            let body = "Recording not available";
+                            let response = format!(
+                                "HTTP/1.1 404 Not Found\r\n\
+                                 Content-Type: text/plain\r\n\
+                                 Content-Length: {}\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {}",
+                                body.len(), body
+                            );
+                            use tokio::io::AsyncWriteExt;
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        }
+                    } else if request_line.contains("/recordings") {
+                        // GET /recordings — list all streams with manifest + segments
+                        use tokio::io::AsyncWriteExt;
+                        let body = if let Some(ref rec_reg) = recording_registry {
+                            let reg = rec_reg.read().await;
+                            let streams = reg.all_streams();
+                            let entries: Vec<serde_json::Value> = streams.iter().map(|name| {
+                                let manifest = reg.manifest(name).unwrap_or(serde_json::json!({}));
+                                let segments = reg.segments(name);
+                                let total_duration = segments.last()
+                                    .map(|s| s.end_secs)
+                                    .unwrap_or(0.0);
+                                let seg_json: Vec<serde_json::Value> = segments.iter().map(|s| {
+                                    serde_json::json!({
+                                        "filename": s.filename,
+                                        "start_secs": s.start_secs,
+                                        "end_secs": s.end_secs,
+                                    })
+                                }).collect();
+                                let mut entry = manifest;
+                                entry["segments"] = serde_json::Value::Array(seg_json);
+                                entry["total_duration_secs"] = serde_json::json!(total_duration);
+                                entry
+                            }).collect();
+                            serde_json::to_string(&entries).unwrap_or("[]".to_string())
+                        } else {
+                            "[]".to_string()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/debug") {
                         // Debug endpoint: returns agent state + voice connection info
                         let state = query_ctx.as_ref()

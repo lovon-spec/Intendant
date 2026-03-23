@@ -68,6 +68,16 @@ pub enum UiCommand {
         display_id: u64,
         vnc_port: u64,
     },
+    AddRecording {
+        stream_name: String,
+    },
+    RemoveRecording {
+        stream_name: String,
+    },
+    RecordingError {
+        stream_name: String,
+        message: String,
+    },
     ShowBadge {
         tab: String,
         text: String,
@@ -291,6 +301,9 @@ pub struct AppState {
 
     // Displays
     known_displays: Vec<(u64, u64)>, // (display_id, vnc_port)
+
+    // Recordings
+    known_recordings: Vec<String>,
 }
 
 impl AppState {
@@ -313,6 +326,7 @@ impl AppState {
             last_total_tokens: 0,
             active_tab: "activity".to_string(),
             known_displays: Vec::new(),
+            known_recordings: Vec::new(),
         }
     }
 
@@ -801,6 +815,29 @@ impl AppState {
                     format!("User released control of display :{}. Note: {}", id, note)
                 };
                 cmds.extend(self.add_log("info", &text, None, "system"));
+            }
+
+            "recording_started" => {
+                let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
+                cmds.extend(self.add_log("info", &format!("Recording started: {}", stream), None, "system"));
+                if !self.known_recordings.contains(&stream) {
+                    self.known_recordings.push(stream.clone());
+                }
+                cmds.push(UiCommand::AddRecording { stream_name: stream });
+            }
+
+            "recording_stopped" => {
+                let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
+                cmds.extend(self.add_log("info", &format!("Recording stopped: {}", stream), None, "system"));
+                self.known_recordings.retain(|s| s != &stream);
+                cmds.push(UiCommand::RemoveRecording { stream_name: stream });
+            }
+
+            "recording_error" => {
+                let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
+                let message = msg["message"].as_str().unwrap_or("").to_string();
+                cmds.extend(self.add_log("warn", &format!("Recording error ({}): {}", stream, message), None, "system"));
+                cmds.push(UiCommand::RecordingError { stream_name: stream, message });
             }
 
             "command_result" => {
