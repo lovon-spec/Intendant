@@ -1436,6 +1436,7 @@ html, body {
     <button class="tab-btn" data-tab="terminal">Terminal</button>
     <button class="tab-btn" data-tab="displays">Displays</button>
     <button class="tab-btn" data-tab="sessions">Sessions</button>
+    <button class="tab-btn" data-tab="debug">Debug</button>
   </nav>
 
   <!-- Tab Content -->
@@ -1624,6 +1625,23 @@ html, body {
             <span class="session-detail-title" id="session-detail-title"></span>
           </div>
           <div class="session-detail-logs" id="session-detail-logs"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Debug Tab -->
+    <div id="tab-debug" class="tab-pane">
+      <div style="padding:20px">
+        <h3 style="margin:0 0 12px;color:var(--text);font-size:16px">Observer Display</h3>
+        <p style="color:var(--subtext0);font-size:13px;margin:0 0 12px" id="debug-status">Not active</p>
+        <div style="display:flex;gap:8px;margin-bottom:16px">
+          <button id="debug-setup-btn" style="padding:8px 16px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);cursor:pointer;font-size:13px" onclick="toggleDebugScreen()">Set up debug screen</button>
+          <button id="debug-record-btn" style="padding:8px 16px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);cursor:pointer;font-size:13px" onclick="toggleDebugRecording()" disabled>Start recording</button>
+        </div>
+        <div id="debug-info" class="hidden" style="padding:8px 12px;background:var(--mantle);border-radius:4px;font-size:12px;color:var(--subtext1);margin-bottom:8px">
+          <p style="margin:4px 0">Display: <code style="color:var(--blue)">:<span id="debug-display-id"></span></code></p>
+          <p style="margin:4px 0">VNC: <code style="color:var(--blue)">localhost:<span id="debug-vnc-port"></span></code></p>
+          <p style="margin:4px 0;color:var(--overlay0)">Connect: <code>vncviewer localhost:<span id="debug-vnc-port2"></span></code></p>
         </div>
       </div>
     </div>
@@ -2207,10 +2225,12 @@ async function main() {
   // Check for existing recordings (late-connecting browser)
   checkExistingRecordings();
 
-  // Passive mode from localStorage
-  if (localStorage.getItem('passive_mode') === 'true') {
+  // Passive mode from localStorage or ?passive=1 URL param
+  const urlPassive = new URLSearchParams(window.location.search).get('passive') === '1';
+  if (urlPassive || localStorage.getItem('passive_mode') === 'true') {
     isActiveBrowser = false;
     app.set_passive_mode(true);
+    if (urlPassive) localStorage.setItem('passive_mode', 'true');
     updateActivePassiveUI();
   }
 
@@ -2329,6 +2349,8 @@ function processCommands(cmds) {
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started': onSessionStarted(c.session_id, c.task); break;
       case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
+      case 'debug_screen_ready': onDebugScreenReady(c.display_id, c.vnc_port); break;
+      case 'debug_screen_torn_down': onDebugScreenTornDown(); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;
       case 'term_data': handleTermData(c.base64); break;
@@ -3591,6 +3613,49 @@ function startNewSession() {
   if (app) {
     app.send_server_action({ action: 'start_task', text: task });
   }
+}
+
+// ── Debug Screen ──
+let debugScreenActive = false;
+let debugRecording = false;
+
+function toggleDebugScreen() {
+  if (debugScreenActive) {
+    if (app) app.send_server_action({ action: 'teardown_debug_screen' });
+  } else {
+    if (app) app.send_server_action({ action: 'setup_debug_screen' });
+  }
+}
+
+function toggleDebugRecording() {
+  if (debugRecording) {
+    if (app) app.send_server_action({ action: 'stop_debug_recording' });
+  } else {
+    if (app) app.send_server_action({ action: 'start_debug_recording' });
+  }
+}
+
+function onDebugScreenReady(displayId, vncPort) {
+  debugScreenActive = true;
+  document.getElementById('debug-status').textContent = 'Active';
+  document.getElementById('debug-status').style.color = 'var(--green)';
+  document.getElementById('debug-setup-btn').textContent = 'Tear down';
+  document.getElementById('debug-record-btn').disabled = false;
+  document.getElementById('debug-info').classList.remove('hidden');
+  document.getElementById('debug-display-id').textContent = displayId;
+  document.getElementById('debug-vnc-port').textContent = vncPort;
+  document.getElementById('debug-vnc-port2').textContent = vncPort;
+}
+
+function onDebugScreenTornDown() {
+  debugScreenActive = false;
+  debugRecording = false;
+  document.getElementById('debug-status').textContent = 'Not active';
+  document.getElementById('debug-status').style.color = '';
+  document.getElementById('debug-setup-btn').textContent = 'Set up debug screen';
+  document.getElementById('debug-record-btn').disabled = true;
+  document.getElementById('debug-record-btn').textContent = 'Start recording';
+  document.getElementById('debug-info').classList.add('hidden');
 }
 
 // ── Sessions Tab ──

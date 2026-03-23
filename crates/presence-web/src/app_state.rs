@@ -87,6 +87,11 @@ pub enum UiCommand {
         session_id: String,
         reason: String,
     },
+    DebugScreenReady {
+        display_id: u64,
+        vnc_port: u64,
+    },
+    DebugScreenTornDown,
     ShowBadge {
         tab: String,
         text: String,
@@ -861,6 +866,19 @@ impl AppState {
                 let reason = msg["reason"].as_str().unwrap_or("").to_string();
                 cmds.extend(self.add_log("info", &format!("Session ended: {} — {}", session_id, reason), None, "system"));
                 cmds.push(UiCommand::SessionEnded { session_id, reason });
+            }
+
+            "debug_screen_ready" => {
+                let display_id = msg["display_id"].as_u64().unwrap_or(0);
+                let vnc_port = msg["vnc_port"].as_u64().unwrap_or(0);
+                cmds.extend(self.add_log("info", &format!("Debug screen ready on :{}, VNC port {}", display_id, vnc_port), None, "system"));
+                cmds.push(UiCommand::DebugScreenReady { display_id, vnc_port });
+            }
+
+            "debug_screen_torn_down" => {
+                let display_id = msg["display_id"].as_u64().unwrap_or(0);
+                cmds.extend(self.add_log("info", &format!("Debug screen :{} torn down", display_id), None, "system"));
+                cmds.push(UiCommand::DebugScreenTornDown);
             }
 
             "command_result" => {
