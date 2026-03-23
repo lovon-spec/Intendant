@@ -1162,6 +1162,27 @@ html, body {
   font-weight: 600;
 }
 .ann-submit-btn:hover { opacity: 0.85; }
+.ann-save-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--blue);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--blue);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ann-save-btn:hover { background: var(--blue); color: var(--base); }
+.ann-result {
+  font-size: 11px;
+  color: var(--subtext0);
+  cursor: pointer;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ann-result:hover { color: var(--blue); }
 .ann-close {
   width: 28px; height: 28px;
   border: 1px solid var(--surface1);
@@ -1532,9 +1553,11 @@ html, body {
             <button class="ann-act" id="ann-clear" title="Clear">&#10005;</button>
           </div>
           <div class="ann-submit">
-            <input class="ann-note" id="ann-note" placeholder="Note for agent..." />
-            <button class="ann-submit-btn" id="ann-submit-btn" title="Send annotation to agent">Send</button>
+            <input class="ann-note" id="ann-note" placeholder="Note..." />
+            <button class="ann-save-btn" id="ann-save-btn" title="Save annotation to disk">Save</button>
+            <button class="ann-submit-btn" id="ann-submit-btn" title="Save and send to agent">Send</button>
           </div>
+          <span class="ann-result" id="ann-result"></span>
           <button class="ann-close" id="ann-close" title="Exit annotation (Esc)">&times;</button>
         </div>
         <div class="recording-timeline" id="recording-timeline">
@@ -1956,6 +1979,14 @@ async function main() {
 
   // Intercept all server messages for AppState routing
   app.set_on_raw_message((msg) => {
+    // Handle annotation responses before WASM
+    try {
+      const d = JSON.parse(msg);
+      if (d.t === 'annotation_saved' && d.path) {
+        showAnnotationResult(d.path);
+        return;
+      }
+    } catch(_) {}
     const cmds = app.handle_server_message(msg);
     if (cmds) processCommands(cmds);
   });
@@ -3263,34 +3294,46 @@ function exitAnnotationMode() {
   document.getElementById('annotation-toolbar').classList.add('hidden');
 }
 
-async function submitAnnotation() {
+async function submitAnnotation(inject) {
   if (!annotationCanvas || !annotationCanvas.hasAnnotations()) return;
   const note = document.getElementById('ann-note').value.trim();
   const blob = await annotationCanvas.composite();
   if (!blob) return;
 
-  // Convert blob to base64
-  const reader = new FileReader();
-  reader.onload = () => {
-    const b64 = reader.result.split(',')[1]; // strip data:image/jpeg;base64,
-    annotationCounter++;
-    const frameId = `ann-${activeRecordingStream || 'recording'}-${annotationCounter}`;
-    const msg = JSON.stringify({
-      t: 'annotation_submit',
-      frame_id: frameId,
-      stream: activeRecordingStream || 'annotation',
-      data: b64,
-      note: note,
-    });
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
-    }
-    // Clear and exit
-    document.getElementById('ann-note').value = '';
-    annotationCanvas.clear();
-    exitAnnotationMode();
+  const b64 = await new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.readAsDataURL(blob);
+  });
+
+  annotationCounter++;
+  const frameId = `ann-${activeRecordingStream || 'recording'}-${annotationCounter}`;
+  const payload = {
+    t: 'annotation_submit',
+    frame_id: frameId,
+    stream: activeRecordingStream || 'annotation',
+    data: b64,
+    note: note,
+    inject: !!inject,
   };
-  reader.readAsDataURL(blob);
+  if (app) {
+    app.send_server_action(payload);
+  }
+  document.getElementById('ann-note').value = '';
+  annotationCanvas.clear();
+  exitAnnotationMode();
+}
+
+function showAnnotationResult(path) {
+  const el = document.getElementById('ann-result');
+  el.textContent = path;
+  el.title = 'Click to copy: ' + path;
+  el.onclick = () => {
+    navigator.clipboard.writeText(path).then(() => {
+      el.textContent = 'Copied!';
+      setTimeout(() => { el.textContent = path; }, 1500);
+    });
+  };
 }
 
 // Wire up annotation toolbar
@@ -3317,13 +3360,14 @@ document.getElementById('annotation-toolbar').addEventListener('click', (e) => {
 document.getElementById('ann-undo').addEventListener('click', () => annotationCanvas && annotationCanvas.undo());
 document.getElementById('ann-redo').addEventListener('click', () => annotationCanvas && annotationCanvas.redo());
 document.getElementById('ann-clear').addEventListener('click', () => annotationCanvas && annotationCanvas.clear());
-document.getElementById('ann-submit-btn').addEventListener('click', submitAnnotation);
+document.getElementById('ann-save-btn').addEventListener('click', () => submitAnnotation(false));
+document.getElementById('ann-submit-btn').addEventListener('click', () => submitAnnotation(true));
 document.getElementById('ann-close').addEventListener('click', exitAnnotationMode);
 document.getElementById('rec-annotate-btn').addEventListener('click', enterAnnotationMode);
 
-// Submit on Enter in note field
+// Submit on Enter in note field (Send by default)
 document.getElementById('ann-note').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); submitAnnotation(); }
+  if (e.key === 'Enter') { e.preventDefault(); submitAnnotation(true); }
   e.stopPropagation(); // Don't let key events bubble to global handlers
 });
 
