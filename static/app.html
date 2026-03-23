@@ -108,6 +108,29 @@ html, body {
 .conn-dot.ok { background: var(--green); }
 .conn-dot.err { background: var(--red); }
 
+/* ── Active/Passive Badge ── */
+.active-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  transition: all 0.15s;
+  border: 1px solid transparent;
+}
+.active-badge.is-active {
+  color: var(--green);
+  border-color: var(--green);
+}
+.active-badge.is-passive {
+  color: var(--peach);
+  border-color: var(--peach);
+}
+.active-badge:hover {
+  background: var(--surface1);
+}
+
 /* ── Tab Bar ── */
 .tab-bar {
   display: flex;
@@ -1382,6 +1405,7 @@ html, body {
     <span class="conn-dot err" id="sb-conn"></span>
     <span class="voice-dot" id="sb-voice" title="Voice model"></span>
     <span style="font-size:11px;color:var(--overlay0)" id="sb-voice-label"></span>
+    <span class="active-badge is-active" id="sb-active-badge" title="Click to toggle passive mode">Active</span>
   </div>
 
   <!-- Tab Bar -->
@@ -1741,14 +1765,42 @@ function hideVoiceStatus() {
   document.getElementById('voiceStatus').classList.add('hidden');
 }
 
+function requestMakeActive() {
+  if (!app || isActiveBrowser) return;
+  // Clear passive mode so we can become active
+  localStorage.setItem('passive_mode', 'false');
+  app.set_passive_mode(false);
+  const sent = app.send_make_active();
+  try {
+    app.send_voice_diagnostic(
+      'make_active_request_client',
+      sent ? 'request sent to server' : 'request NOT sent (server socket not open)',
+    );
+  } catch(_) {}
+  if (sent) {
+    document.getElementById('makeActiveBtn').disabled = true;
+    showVoiceStatus('Requesting active...');
+  } else {
+    showVoiceStatus('Takeover request failed', true);
+  }
+}
+
 function updateActivePassiveUI() {
   const micBtn = document.getElementById('micBtn');
   const makeActiveBtn = document.getElementById('makeActiveBtn');
   const videoBtn = document.getElementById('videoBtn');
+  const badge = document.getElementById('sb-active-badge');
   micBtn.disabled = !isActiveBrowser;
   videoBtn.disabled = !isActiveBrowser || !modelConnected;
   makeActiveBtn.classList.toggle('hidden', isActiveBrowser);
-  if (!isActiveBrowser) {
+  if (isActiveBrowser) {
+    badge.textContent = 'Active';
+    badge.className = 'active-badge is-active';
+    badge.title = 'Click to enable passive (observe only) mode';
+  } else {
+    badge.textContent = 'Passive';
+    badge.className = 'active-badge is-passive';
+    badge.title = 'Click to request active mode';
     document.getElementById('sb-voice-label').textContent = 'Passive';
     if (videoActive) stopVideo();
   }
@@ -2083,14 +2135,21 @@ async function main() {
     document.getElementById('makeActiveBtn').disabled = false;
     updateActivePassiveUI();
     if (conversationContext) storedConversationCtx = conversationContext;
-    connectVoice();
-    if (handoverContext) {
-      const waitForVoice = () => {
-        if (modelConnected) {
-          app.send_text('[System: handover context] ' + handoverContext + '. Full history available via recall_memory.');
-        } else { setTimeout(waitForVoice, 200); }
-      };
-      setTimeout(waitForVoice, 500);
+    showVoiceStatus('Active');
+    setTimeout(hideVoiceStatus, 3000);
+    // Only auto-connect voice if an API key is already stored —
+    // handover should succeed even without voice (display-only mode).
+    const apiKey = localStorage.getItem(getStorageKey());
+    if (apiKey) {
+      connectVoice();
+      if (handoverContext) {
+        const waitForVoice = () => {
+          if (modelConnected) {
+            app.send_text('[System: handover context] ' + handoverContext + '. Full history available via recall_memory.');
+          } else { setTimeout(waitForVoice, 200); }
+        };
+        setTimeout(waitForVoice, 500);
+      }
     }
   });
 
@@ -2153,20 +2212,30 @@ async function main() {
 
   // Make Active button
   document.getElementById('makeActiveBtn').addEventListener('click', () => {
-    if (app && !isActiveBrowser) {
-      const sent = app.send_make_active();
-      try {
-        app.send_voice_diagnostic(
-          'make_active_request_client',
-          sent ? 'request sent to server' : 'request NOT sent (server socket not open)',
-        );
-      } catch(_) {}
-      if (sent) {
-        document.getElementById('makeActiveBtn').disabled = true;
-        showVoiceStatus('Requesting active...');
-      } else {
-        showVoiceStatus('Takeover request failed', true);
+    requestMakeActive();
+  });
+
+  // Active/Passive badge in status bar — click to toggle
+  document.getElementById('sb-active-badge').addEventListener('click', () => {
+    if (isActiveBrowser) {
+      // Switch to passive: enable passive mode and disconnect voice
+      localStorage.setItem('passive_mode', 'true');
+      app.set_passive_mode(true);
+      if (modelConnected) {
+        if (videoActive) stopVideo();
+        app.disconnect_voice();
+        modelConnected = false;
+        micActive = false;
+        document.getElementById('micBtn').classList.remove('active');
+        document.getElementById('videoBtn').disabled = true;
+        stopMic();
       }
+      isActiveBrowser = false;
+      document.getElementById('sb-voice').className = 'voice-dot';
+      updateActivePassiveUI();
+    } else {
+      // Request active — same as Make Active button
+      requestMakeActive();
     }
   });
 

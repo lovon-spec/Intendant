@@ -1091,11 +1091,18 @@ pub fn spawn_web_gateway(
                                             } else {
                                                 let slot = active_presence_inbound.lock()
                                                     .unwrap_or_else(|e| e.into_inner());
+                                                // Empty slot → first connect wins.
+                                                // Slot occupied by THIS connection → already active
+                                                // (happens when active browser reconnects voice after handover).
                                                 slot.is_none()
+                                                    || slot.as_ref()
+                                                        .map(|a| a.connection_id == connection_id_inbound)
+                                                        .unwrap_or(false)
                                             };
 
+                                            let was_already_active = is_active;
                                             if becomes_active {
-                                                // First-connect wins: grant active status
+                                                // First-connect wins (or re-confirm already-active)
                                                 *active_presence_inbound.lock()
                                                     .unwrap_or_else(|e| e.into_inner()) = Some(ActivePresence {
                                                     connection_id: connection_id_inbound.clone(),
@@ -1147,8 +1154,10 @@ pub fn spawn_web_gateway(
                                             }
 
                                             // Only emit PresenceConnected for the active browser
-                                            // (passive browsers don't pause server-side presence)
-                                            if becomes_active {
+                                            // (passive browsers don't pause server-side presence).
+                                            // Skip if already active (e.g. voice reconnect after make_active
+                                            // handover — PresenceConnected was already emitted by make_active).
+                                            if becomes_active && !was_already_active {
                                                 if let Some(ref sl) = session_log_inbound {
                                                     if let Ok(mut l) = sl.lock() {
                                                         l.presence_connected(Some(&msg_provider), Some(&msg_model));
@@ -3209,6 +3218,77 @@ mod tests {
             }
         }
         assert!(found_welcome, "new browser should be active after old one dropped");
+
+        handle.abort();
+    }
+
+    /// An already-active browser re-sending presence_connect (e.g. after voice reconnect)
+    /// should receive is_active: true and NOT emit a duplicate PresenceConnected.
+    #[tokio::test]
+    async fn test_active_browser_resend_presence_connect() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = WebGatewayConfig::default();
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, None, None, None, None, None, None);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (mut ws_tx, mut ws_rx) = ws.split();
+
+        // First presence_connect — becomes active
+        ws_tx.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+            .await
+            .unwrap();
+
+        // Drain PresenceConnected from first connect
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await.expect("timeout").expect("closed");
+        assert!(matches!(event, AppEvent::PresenceConnected { .. }));
+
+        // Drain welcome + bootstrap messages
+        for _ in 0..5 {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_millis(200), ws_rx.next()).await;
+        }
+
+        // Re-send presence_connect (simulates voice reconnect after handover)
+        ws_tx.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+            .await
+            .unwrap();
+
+        // Should receive welcome with is_active: true (still active)
+        let mut found_welcome = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if json["t"] == "presence_welcome" {
+                            assert_eq!(json["is_active"], true,
+                                "already-active browser should still be active on re-connect");
+                            found_welcome = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(found_welcome, "should receive presence_welcome");
+
+        // Should NOT get a duplicate PresenceConnected on the bus
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            rx.recv(),
+        )
+        .await;
+        assert!(result.is_err(), "should not emit duplicate PresenceConnected for already-active browser");
 
         handle.abort();
     }
