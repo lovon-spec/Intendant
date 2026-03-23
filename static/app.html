@@ -2712,23 +2712,58 @@ function closeSessionDetail() {
   document.querySelector('.sessions-header').style.display = '';
   document.getElementById('session-detail').style.display = 'none';
 }
+window.closeSessionDetail = closeSessionDetail;
+window.loadSessions = loadSessions;
+
+let detailVerbosity = 'normal';
 
 function renderSessionDetailLogs(entries, el) {
   el.innerHTML = '';
+
+  // Verbosity toggle
+  const toolbar = document.createElement('div');
+  toolbar.style.cssText = 'display:flex;justify-content:flex-end;padding:4px 0;';
+  const select = document.createElement('select');
+  select.className = 'verbosity-select';
+  select.innerHTML = '<option value="normal">Normal</option><option value="verbose">Verbose</option><option value="debug">Debug</option>';
+  select.value = detailVerbosity;
+  select.addEventListener('change', () => {
+    detailVerbosity = select.value;
+    renderSessionDetailEntries(entries, logsContainer);
+  });
+  toolbar.appendChild(select);
+  el.appendChild(toolbar);
+
+  const logsContainer = document.createElement('div');
+  logsContainer.style.cssText = 'flex:1;overflow-y:auto;';
+  el.appendChild(logsContainer);
+
+  renderSessionDetailEntries(entries, logsContainer);
+}
+
+function renderSessionDetailEntries(entries, el) {
+  el.innerHTML = '';
   let lastTurn = null;
 
-  // Level colors matching the Activity tab
   const levelColors = {
     model: 'var(--blue)', agent: 'var(--teal)', error: 'var(--red)',
     warn: 'var(--yellow)', subagent: 'var(--mauve)', presence: 'var(--green)',
-    detail: 'var(--log-detail)', debug: 'var(--overlay1)',
+    detail: '#a2a8be', debug: 'var(--overlay1)',
   };
   const sourceLabels = {
     system: '\u2139', worker: 'Workr', agent: 'Agent',
     server: 'Servr', live: 'Live', sub: 'Sub', orch: 'Orch',
   };
+  const normalLevels = ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'presence'];
+  const verboseLevels = [...normalLevels, 'detail'];
+  const debugLevels = [...verboseLevels, 'debug'];
+  const visibleLevels = detailVerbosity === 'debug' ? debugLevels :
+                        detailVerbosity === 'verbose' ? verboseLevels : normalLevels;
 
   for (const e of entries) {
+    const level = e.level || 'info';
+    if (!visibleLevels.includes(level)) continue;
+
     if (e.turn && e.turn !== lastTurn) {
       lastTurn = e.turn;
       const sep = document.createElement('div');
@@ -2747,21 +2782,41 @@ function renderSessionDetailLogs(entries, el) {
     const lvl = document.createElement('span');
     lvl.className = 'log-level';
     lvl.textContent = sourceLabels[e.source] || e.source || '\u2139';
-    lvl.style.color = levelColors[e.level] || 'var(--text)';
+    lvl.style.color = levelColors[level] || 'var(--text)';
 
     const cnt = document.createElement('span');
     cnt.className = 'log-content';
     cnt.textContent = e.content || '';
-    if (levelColors[e.level]) cnt.style.color = levelColors[e.level];
+    if (levelColors[level]) cnt.style.color = levelColors[level];
 
     entry.appendChild(ts);
     entry.appendChild(lvl);
     entry.appendChild(cnt);
+
+    // Collapsible for long entries
+    const content = e.content || '';
+    if (content.split('\n').length > 3 || content.length > 300) {
+      cnt.style.maxHeight = '1.5em';
+      cnt.style.overflow = 'hidden';
+      cnt.style.cursor = 'pointer';
+      const toggle = document.createElement('span');
+      toggle.className = 'collapse-toggle';
+      toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up" style="display:none">\u25BE less</span>';
+      toggle.style.cssText = 'color:var(--blue);font-size:11px;flex-shrink:0;padding:2px 6px;cursor:pointer;';
+      entry.appendChild(toggle);
+      entry.addEventListener('click', () => {
+        const expanded = cnt.style.maxHeight === 'none';
+        cnt.style.maxHeight = expanded ? '1.5em' : 'none';
+        toggle.querySelector('.arrow').style.display = expanded ? '' : 'none';
+        toggle.querySelector('.arrow-up').style.display = expanded ? 'none' : '';
+      });
+    }
+
     el.appendChild(entry);
   }
 
-  if (entries.length === 0) {
-    el.innerHTML = '<div class="empty-state">No log entries</div>';
+  if (el.children.length === 0) {
+    el.innerHTML = '<div class="empty-state">No log entries at this verbosity</div>';
   }
 }
 
