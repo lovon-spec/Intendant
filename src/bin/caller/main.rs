@@ -3961,17 +3961,22 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
             );
+            let shared_session = Arc::new(tokio::sync::RwLock::new(
+                web_gateway::ActiveSessionState {
+                    query_ctx: None,
+                    frame_registry: Some(frame_registry.clone()),
+                    session_log: Some(session_log.clone()),
+                    recording_registry: Some(recording_registry.clone()),
+                },
+            ));
             let handle = web_gateway::spawn_web_gateway(
                 flags.web_port,
                 bus.clone(),
                 broadcast_tx,
                 config,
-                None, // MCP mode: no presence query context
+                shared_session,
                 transcriber,
                 None, // MCP mode: no WebTui
-                Some(frame_registry.clone()),
-                Some(session_log.clone()),
-                Some(recording_registry.clone()),
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -4371,17 +4376,22 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
             );
+            let shared_session = Arc::new(tokio::sync::RwLock::new(
+                web_gateway::ActiveSessionState {
+                    query_ctx,
+                    frame_registry: Some(frame_registry.clone()),
+                    session_log: Some(session_log.clone()),
+                    recording_registry: Some(recording_registry.clone()),
+                },
+            ));
             let handle = web_gateway::spawn_web_gateway(
                 flags.web_port,
                 bus.clone(),
                 broadcast_tx,
                 config,
-                query_ctx,
+                shared_session,
                 transcriber,
                 web_tui_tx.clone(),
-                Some(frame_registry.clone()),
-                Some(session_log.clone()),
-                Some(recording_registry.clone()),
             );
             app.log(
                 types::LogLevel::Info,
@@ -4667,17 +4677,22 @@ async fn main() -> Result<(), CallerError> {
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
             );
+            let shared_session = Arc::new(tokio::sync::RwLock::new(
+                web_gateway::ActiveSessionState {
+                    query_ctx: None,
+                    frame_registry: Some(frame_registry.clone()),
+                    session_log: Some(session_log.clone()),
+                    recording_registry: Some(recording_registry.clone()),
+                },
+            ));
             let _web_handle = web_gateway::spawn_web_gateway(
                 flags.web_port,
                 bus.clone(),
                 outbound_tx.clone(),
                 config,
-                None, // Headless mode: no presence query context
+                shared_session.clone(),
                 transcriber,
                 None, // Headless mode: no WebTui
-                Some(frame_registry.clone()),
-                Some(session_log.clone()),
-                Some(recording_registry.clone()),
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
