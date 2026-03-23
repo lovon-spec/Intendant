@@ -2921,6 +2921,28 @@ function fmtTime(secs) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
+function _getOrCreateOptgroup(select, label) {
+  for (const child of select.children) {
+    if (child.tagName === 'OPTGROUP' && child.label === label) return child;
+  }
+  const group = document.createElement('optgroup');
+  group.label = label;
+  select.appendChild(group);
+  return group;
+}
+
+function _streamGroup(name) {
+  if (name.startsWith('display_')) return 'Displays';
+  if (name.startsWith('cam')) return 'Cameras';
+  return 'Other';
+}
+
+function _streamLabel(name) {
+  // display_99 → :99, cam0 → cam0
+  if (name.startsWith('display_')) return ':' + name.slice(8);
+  return name;
+}
+
 function addRecordingStream(streamName) {
   if (recordingStreams.has(streamName)) return;
   recordingStreams.set(streamName, { active: true });
@@ -2929,10 +2951,11 @@ function addRecordingStream(streamName) {
   section.classList.remove('hidden');
 
   const select = document.getElementById('recording-stream-select');
+  const group = _getOrCreateOptgroup(select, _streamGroup(streamName));
   const opt = document.createElement('option');
   opt.value = streamName;
-  opt.textContent = streamName;
-  select.appendChild(opt);
+  opt.textContent = _streamLabel(streamName);
+  group.appendChild(opt);
 
   document.getElementById('rec-status').textContent = 'Recording';
 
