@@ -4592,6 +4592,7 @@ async fn main() -> Result<(), CallerError> {
 
         // Drop the App (and its follow_up_tx) so the round loop's recv()
         // returns None and exits gracefully, allowing write_summary to run.
+        let session_id = app.session_id.clone();
         drop(app);
 
         // Give the agent task a moment to finish writing the session summary.
@@ -4599,6 +4600,17 @@ async fn main() -> Result<(), CallerError> {
         match tokio::time::timeout(std::time::Duration::from_secs(5), &mut loop_handle).await {
             Ok(_) => {} // task finished naturally
             Err(_) => loop_handle.abort(), // timed out — force stop
+        }
+
+        if flags.web && !session_id.is_empty() {
+            bus.send(AppEvent::SessionEnded {
+                session_id,
+                reason: "completed".to_string(),
+            });
+            // Daemon mode: keep web gateway alive after TUI quits.
+            eprintln!("TUI exited. Web gateway still running on port {}. Press Ctrl+C to exit.", flags.web_port);
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("Shutting down.");
         }
 
         control::cleanup();
@@ -4758,12 +4770,23 @@ async fn main() -> Result<(), CallerError> {
             drop(follow_up_tx); // single-round: recv() returns None immediately
         }
 
+        let session_id = log_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        bus.send(AppEvent::SessionStarted {
+            session_id: session_id.clone(),
+            task: Some(task.clone()),
+        });
+
         let result = if flags.direct || is_simple_task(&task) {
             run_direct_mode(
                 provider,
                 task.clone(),
                 project,
-                bus,
+                bus.clone(),
                 autonomy,
                 session_log.clone(),
                 log_dir,
@@ -4786,15 +4809,39 @@ async fn main() -> Result<(), CallerError> {
             )
             .await
         };
-        match &result {
-            Ok(stats) => slog(&session_log, |l| {
-                l.write_summary_with_rounds(&task, "completed", stats.turns, Some(stats.rounds))
-            }),
-            Err(e) => slog(&session_log, |l| {
-                l.write_summary(&task, &format!("error: {}", e), 0)
-            }),
+
+        let reason = match &result {
+            Ok(stats) => {
+                slog(&session_log, |l| {
+                    l.write_summary_with_rounds(&task, "completed", stats.turns, Some(stats.rounds))
+                });
+                "completed".to_string()
+            }
+            Err(e) => {
+                slog(&session_log, |l| {
+                    l.write_summary(&task, &format!("error: {}", e), 0)
+                });
+                format!("error: {}", e)
+            }
+        };
+
+        bus.send(AppEvent::SessionEnded {
+            session_id,
+            reason: reason.clone(),
+        });
+
+        if flags.web {
+            // Daemon mode: keep web gateway alive after session ends.
+            // Wait indefinitely — the web gateway continues serving recordings,
+            // sessions, and annotations. Process exits on SIGINT/SIGTERM.
+            eprintln!("Session ended ({}). Web gateway still running on port {}. Press Ctrl+C to exit.", reason, flags.web_port);
+            // Hold the EventBus and broadcast channel alive by parking.
+            // The web gateway task continues accepting connections.
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("Shutting down.");
+        } else {
+            result?;
         }
-        result?;
     }
 
     Ok(())
