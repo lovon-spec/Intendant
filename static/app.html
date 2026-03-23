@@ -2507,6 +2507,7 @@ function renderSessionsAggregate(sessions, el) {
   const totalTokens = sessions.reduce((sum, s) => sum + (s.total_tokens || 0), 0);
   const totalInput = sessions.reduce((sum, s) => sum + (s.prompt_tokens || 0), 0);
   const totalOutput = sessions.reduce((sum, s) => sum + (s.completion_tokens || 0), 0);
+  const totalCached = sessions.reduce((sum, s) => sum + (s.cached_tokens || 0), 0);
   const activeSessions = sessions.filter(s => s.status === 'running' || s.status === 'in_progress').length;
 
   el.innerHTML = '';
@@ -2515,6 +2516,7 @@ function renderSessionsAggregate(sessions, el) {
     { label: 'Sessions', value: totalSessions.toLocaleString() + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
     { label: 'Total Tokens', value: totalTokens.toLocaleString() },
     { label: 'Input', value: totalInput.toLocaleString() },
+    { label: 'Cached', value: totalCached.toLocaleString() },
     { label: 'Output', value: totalOutput.toLocaleString() },
   ];
 
@@ -2645,16 +2647,22 @@ function renderSessionsList(sessions, el) {
     }
 
     if (s.total_tokens > 0) {
-      const tok = document.createElement('span');
-      const tokLabel = document.createElement('span');
-      tokLabel.className = 'label';
-      tokLabel.textContent = 'tokens';
-      const tokVal = document.createElement('span');
-      tokVal.className = 'value';
-      tokVal.textContent = s.total_tokens.toLocaleString();
-      tok.appendChild(tokLabel);
-      tok.appendChild(tokVal);
-      meta.appendChild(tok);
+      const addTokField = (label, value, color) => {
+        const span = document.createElement('span');
+        const l = document.createElement('span');
+        l.className = 'label';
+        l.textContent = label;
+        const v = document.createElement('span');
+        v.className = 'value';
+        v.textContent = value.toLocaleString();
+        if (color) v.style.color = color;
+        span.appendChild(l);
+        span.appendChild(v);
+        meta.appendChild(span);
+      };
+      addTokField('in', s.prompt_tokens || 0);
+      if (s.cached_tokens > 0) addTokField('cached', s.cached_tokens, 'var(--green)');
+      addTokField('out', s.completion_tokens || 0);
     }
 
     if (s.estimated_cost > 0) {
