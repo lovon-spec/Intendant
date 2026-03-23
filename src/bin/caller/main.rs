@@ -717,21 +717,40 @@ fn query_display_resolution(display_id: u32) -> (u32, u32) {
     (1280, 720)
 }
 
-/// Emit synthetic DisplayReady events for --record-display displays.
-/// The recording listener will pick these up and start ffmpeg on each.
-fn emit_record_display_events(displays: &[u32], bus: &EventBus) {
+/// Start recording external displays (--record-display) directly on the registry.
+/// Also emits DisplayReady so the web UI shows the display slot.
+async fn start_external_display_recordings(
+    displays: &[u32],
+    registry: &std::sync::Arc<tokio::sync::RwLock<recording::RecordingRegistry>>,
+    bus: &EventBus,
+) {
     for &id in displays {
         let (width, height) = query_display_resolution(id);
         eprintln!(
             "Recording external display :{} ({}x{})",
             id, width, height
         );
-        bus.send(AppEvent::DisplayReady {
-            display_id: id,
-            vnc_port: None,
-            width,
-            height,
-        });
+        let mut reg = registry.write().await;
+        if !reg.is_enabled() {
+            eprintln!("Recording not enabled in config — skipping :{}",id);
+            continue;
+        }
+        if !recording::is_ffmpeg_available() {
+            eprintln!("ffmpeg not available — skipping :{}", id);
+            continue;
+        }
+        match reg.start_external_display(id, width, height).await {
+            Ok(stream_name) => {
+                bus.send(AppEvent::DisplayReady {
+                    display_id: id,
+                    vnc_port: None,
+                    width,
+                    height,
+                });
+                bus.send(AppEvent::RecordingStarted { stream_name });
+            }
+            Err(e) => eprintln!("Failed to start recording for :{}: {}", id, e),
+        }
     }
 }
 
@@ -3886,7 +3905,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
-        emit_record_display_events(&flags.record_displays, &bus);
+        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let mcp_control_tx = if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             slog(&session_log, |l| {
@@ -4194,7 +4213,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
-        emit_record_display_events(&flags.record_displays, &bus);
+        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
 
         // TUI is created later — just before run() — so that web mode
         // (--web) can use WebTui instead of the real terminal backend.
@@ -4592,7 +4611,7 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
-        emit_record_display_events(&flags.record_displays, &bus);
+        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
 
         // Outbound broadcast channel — shared by web gateway and JSON stdout subscriber
         let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);

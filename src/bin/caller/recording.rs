@@ -220,6 +220,8 @@ pub struct SeekResult {
 /// Registry tracking active recordings and providing segment queries.
 pub struct RecordingRegistry {
     recordings: HashMap<String, RecordingGuard>,
+    /// Streams started via --record-display (external, persist across tasks).
+    external_streams: std::collections::HashSet<String>,
     session_dir: PathBuf,
     config: RecordingConfig,
 }
@@ -228,6 +230,7 @@ impl RecordingRegistry {
     pub fn new(session_dir: &Path, config: RecordingConfig) -> Self {
         Self {
             recordings: HashMap::new(),
+            external_streams: std::collections::HashSet::new(),
             session_dir: session_dir.to_path_buf(),
             config,
         }
@@ -253,6 +256,19 @@ impl RecordingRegistry {
             start_display_recording(display_id, width, height, &self.config, &self.session_dir)
                 .await?;
         self.recordings.insert(stream_name.clone(), guard);
+        Ok(stream_name)
+    }
+
+    /// Start recording an external display (--record-display).
+    /// External streams persist across task completions.
+    pub async fn start_external_display(
+        &mut self,
+        display_id: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<String, String> {
+        let stream_name = self.start_display(display_id, width, height).await?;
+        self.external_streams.insert(stream_name.clone());
         Ok(stream_name)
     }
 
@@ -292,6 +308,21 @@ impl RecordingRegistry {
     /// Stop all recordings.
     pub fn stop_all(&mut self) {
         self.recordings.clear();
+    }
+
+    /// Stop only agent-managed recordings, keeping external (--record-display) streams alive.
+    /// Returns the names of streams that were stopped.
+    pub fn stop_agent_streams(&mut self) -> Vec<String> {
+        let to_stop: Vec<String> = self
+            .recordings
+            .keys()
+            .filter(|name| !self.external_streams.contains(*name))
+            .cloned()
+            .collect();
+        for name in &to_stop {
+            self.recordings.remove(name);
+        }
+        to_stop
     }
 
     /// List active recording stream names.
@@ -428,8 +459,19 @@ pub fn spawn_recording_listener(
                         }
                     }
                 }
-                Ok(AppEvent::TaskComplete { .. }) | Err(_) => {
-                    // Stop all recordings on task completion or channel close
+                Ok(AppEvent::TaskComplete { .. }) => {
+                    // Stop agent-managed recordings, keep external (--record-display) alive
+                    let mut reg = registry.write().await;
+                    let stopped = reg.stop_agent_streams();
+                    for stream in &stopped {
+                        bus.send(AppEvent::RecordingStopped {
+                            stream_name: stream.clone(),
+                        });
+                    }
+                    // Don't break — keep listening for new tasks (--continue)
+                }
+                Err(_) => {
+                    // Channel closed — stop everything including external
                     let mut reg = registry.write().await;
                     let streams = reg.active_streams();
                     for stream in &streams {
