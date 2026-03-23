@@ -1487,6 +1487,56 @@ pub fn spawn_web_gateway(
                                                 }
                                             }
                                         }
+                                        Some("annotation_submit") => {
+                                            // User drew annotations on a frame and submitted it with a note.
+                                            let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                                            let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
+                                            let note = json["note"].as_str().unwrap_or("").to_string();
+                                            if let Some(data_b64) = json["data"].as_str() {
+                                                use base64::Engine;
+                                                if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                    // Register in frame registry
+                                                    if let Some(ref registry) = frame_registry_inbound {
+                                                        let meta = presence_core::FrameMeta {
+                                                            frame_id: frame_id.clone(),
+                                                            stream: stream.clone(),
+                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            sent_to_live: false,
+                                                            live_resolution: None,
+                                                            hq_resolution: None,
+                                                        };
+                                                        let mut reg = registry.write().await;
+                                                        if let Err(e) = reg.register(meta, &jpeg_bytes) {
+                                                            eprintln!("annotation frame registry write failed: {}", e);
+                                                        }
+                                                    }
+                                                    // Inject into agent conversation with the annotated image
+                                                    if let Some(ref ctx) = query_ctx_inbound {
+                                                        if let Some(ref ciq) = ctx.context_injection {
+                                                            if let Ok(mut q) = ciq.lock() {
+                                                                let label = if note.is_empty() {
+                                                                    "[User Annotation] User highlighted something on the screen.".to_string()
+                                                                } else {
+                                                                    format!("[User Annotation] {}", note)
+                                                                };
+                                                                q.push(crate::event::ContextInjection {
+                                                                    text: label,
+                                                                    images: vec![crate::conversation::ImageData {
+                                                                        media_type: "image/jpeg".to_string(),
+                                                                        data: data_b64.to_string(),
+                                                                    }],
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                    bus_inbound.send(AppEvent::PresenceLog {
+                                                        message: format!("[annotation] {} on {}", frame_id, stream),
+                                                        level: Some(LogLevel::Info),
+                                                        turn: None,
+                                                    });
+                                                }
+                                            }
+                                        }
                                         Some("tool_request") => {
                                             let req_id = json["id"].as_str().unwrap_or("").to_string();
                                             let tool = json["tool"].as_str().unwrap_or("").to_string();

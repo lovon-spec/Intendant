@@ -1062,6 +1062,127 @@ html, body {
   margin-left: auto;
 }
 
+/* ── Annotation Toolbar ── */
+.annotation-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  background: var(--mantle);
+  border-top: 1px solid var(--surface0);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.annotation-toolbar.hidden { display: none; }
+.ann-tools, .ann-colors, .ann-thickness, .ann-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.ann-btn {
+  width: 32px; height: 32px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.ann-btn:hover { border-color: var(--blue); }
+.ann-btn.active { background: var(--blue); color: var(--base); border-color: var(--blue); }
+.ann-color {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.ann-color.active { border-color: var(--text); }
+.ann-color:hover { border-color: var(--overlay1); }
+.ann-thick {
+  width: 28px; height: 28px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.ann-thick:hover { border-color: var(--blue); }
+.ann-thick.active { background: var(--blue); color: var(--base); border-color: var(--blue); }
+.ann-act {
+  width: 28px; height: 28px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.ann-act:hover { background: var(--blue); color: var(--base); border-color: var(--blue); }
+.ann-submit {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.ann-note {
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  width: 180px;
+}
+.ann-note::placeholder { color: var(--overlay0); }
+.ann-note:focus { border-color: var(--blue); outline: none; }
+.ann-submit-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  background: var(--green);
+  color: var(--base);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ann-submit-btn:hover { opacity: 0.85; }
+.ann-close {
+  width: 28px; height: 28px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  cursor: pointer;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.ann-close:hover { background: var(--red); color: var(--base); border-color: var(--red); }
+.recording-overlay.annotation-active {
+  pointer-events: auto;
+  touch-action: none;
+  cursor: crosshair;
+  z-index: 5;
+}
+
 /* ── Usage empty state ── */
 .empty-state {
   display: flex;
@@ -1229,6 +1350,10 @@ html, body {
   .video-btn { width: 40px; height: 40px; font-size: 16px; }
   .video-preview { width: 120px; height: 90px; }
   .video-preview-wrap { bottom: 70px; right: 8px; }
+  .annotation-toolbar { gap: 6px; padding: 4px 8px; }
+  .ann-btn, .ann-thick, .ann-act, .ann-close { width: 44px; height: 44px; font-size: 18px; }
+  .ann-color { width: 28px; height: 28px; }
+  .ann-note { width: 120px; }
 }
 </style>
 </head>
@@ -1381,6 +1506,37 @@ html, body {
           <video id="recording-video" preload="auto"></video>
           <canvas class="recording-overlay" id="recording-overlay"></canvas>
         </div>
+        <div class="annotation-toolbar hidden" id="annotation-toolbar">
+          <div class="ann-tools">
+            <button class="ann-btn active" data-tool="freehand" title="Pen (freehand)">&#9998;</button>
+            <button class="ann-btn" data-tool="rect" title="Rectangle">&#9633;</button>
+            <button class="ann-btn" data-tool="circle" title="Circle">&#9675;</button>
+            <button class="ann-btn" data-tool="arrow" title="Arrow">&#8599;</button>
+            <button class="ann-btn" data-tool="text" title="Text">T</button>
+          </div>
+          <div class="ann-colors">
+            <button class="ann-color active" data-color="#f38ba8" style="background:#f38ba8" title="Red"></button>
+            <button class="ann-color" data-color="#f9e2af" style="background:#f9e2af" title="Yellow"></button>
+            <button class="ann-color" data-color="#a6e3a1" style="background:#a6e3a1" title="Green"></button>
+            <button class="ann-color" data-color="#89b4fa" style="background:#89b4fa" title="Blue"></button>
+            <button class="ann-color" data-color="#cdd6f4" style="background:#cdd6f4" title="White"></button>
+          </div>
+          <div class="ann-thickness">
+            <button class="ann-thick" data-thick="2" title="Thin">&#8212;</button>
+            <button class="ann-thick active" data-thick="4" title="Medium">&#9473;</button>
+            <button class="ann-thick" data-thick="8" title="Thick">&#9608;</button>
+          </div>
+          <div class="ann-actions">
+            <button class="ann-act" id="ann-undo" title="Undo (Ctrl+Z)">&#8630;</button>
+            <button class="ann-act" id="ann-redo" title="Redo (Ctrl+Shift+Z)">&#8631;</button>
+            <button class="ann-act" id="ann-clear" title="Clear">&#10005;</button>
+          </div>
+          <div class="ann-submit">
+            <input class="ann-note" id="ann-note" placeholder="Note for agent..." />
+            <button class="ann-submit-btn" id="ann-submit-btn" title="Send annotation to agent">Send</button>
+          </div>
+          <button class="ann-close" id="ann-close" title="Exit annotation (Esc)">&times;</button>
+        </div>
         <div class="recording-timeline" id="recording-timeline">
           <div class="timeline-bar" id="timeline-bar"></div>
           <div class="timeline-progress" id="timeline-progress"></div>
@@ -1395,6 +1551,7 @@ html, body {
             <option value="2">2x</option>
             <option value="4">4x</option>
           </select>
+          <button id="rec-annotate-btn" title="Annotate frame (A)">&#9998; Annotate</button>
         </div>
       </div>
     </div>
@@ -2837,6 +2994,343 @@ async function checkExistingRecordings() {
     }
   } catch { /* no recordings available */ }
 }
+
+// ── Annotation Drawing ──
+class AnnotationCanvas {
+  constructor(overlayCanvas, sourceElement) {
+    this.canvas = overlayCanvas;
+    this.ctx = overlayCanvas.getContext('2d');
+    this.source = sourceElement;
+    this.shapes = [];
+    this.undoStack = [];
+    this.currentShape = null;
+    this.tool = 'freehand';
+    this.color = '#f38ba8';
+    this.thickness = 4;
+    this.active = false;
+    this._onDown = (e) => this._pointerDown(e);
+    this._onMove = (e) => this._pointerMove(e);
+    this._onUp = (e) => this._pointerUp(e);
+  }
+
+  activate() {
+    // Size canvas buffer to source resolution
+    const src = this.source;
+    const w = src.videoWidth || src.width;
+    const h = src.videoHeight || src.height;
+    if (w && h) {
+      this.canvas.width = w;
+      this.canvas.height = h;
+    }
+    // Align overlay to the actual rendered video area (handle letterboxing)
+    this._alignToSource();
+    this.canvas.classList.add('annotation-active');
+    this.canvas.addEventListener('pointerdown', this._onDown);
+    this.canvas.addEventListener('pointermove', this._onMove);
+    this.canvas.addEventListener('pointerup', this._onUp);
+    this.active = true;
+    this.render();
+  }
+
+  deactivate() {
+    this.canvas.classList.remove('annotation-active');
+    this.canvas.removeEventListener('pointerdown', this._onDown);
+    this.canvas.removeEventListener('pointermove', this._onMove);
+    this.canvas.removeEventListener('pointerup', this._onUp);
+    this.active = false;
+    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    // Reset overlay to cover full parent
+    this.canvas.style.position = '';
+    this.canvas.style.left = '';
+    this.canvas.style.top = '';
+    this.canvas.style.width = '';
+    this.canvas.style.height = '';
+  }
+
+  _alignToSource() {
+    // Position overlay exactly over the rendered video content within the wrapper
+    const src = this.source;
+    const wrap = this.canvas.parentElement;
+    if (!wrap) return;
+    const wrapRect = wrap.getBoundingClientRect();
+    const srcRect = src.getBoundingClientRect();
+    this.canvas.style.position = 'absolute';
+    this.canvas.style.left = (srcRect.left - wrapRect.left) + 'px';
+    this.canvas.style.top = (srcRect.top - wrapRect.top) + 'px';
+    this.canvas.style.width = srcRect.width + 'px';
+    this.canvas.style.height = srcRect.height + 'px';
+  }
+
+  _canvasCoords(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    return [
+      (e.clientX - rect.left) / rect.width * this.canvas.width,
+      (e.clientY - rect.top) / rect.height * this.canvas.height
+    ];
+  }
+
+  _pointerDown(e) {
+    e.preventDefault();
+    this.canvas.setPointerCapture(e.pointerId);
+    const [x, y] = this._canvasCoords(e);
+    if (this.tool === 'text') {
+      const text = prompt('Annotation text:');
+      if (text) {
+        this.shapes.push({ type: 'text', x, y, text, color: this.color, size: this.thickness * 5 });
+        this.undoStack = [];
+        this.render();
+      }
+      return;
+    }
+    if (this.tool === 'freehand') {
+      this.currentShape = { type: 'freehand', points: [[x, y]], color: this.color, thickness: this.thickness };
+    } else if (this.tool === 'rect') {
+      this.currentShape = { type: 'rect', x, y, w: 0, h: 0, color: this.color, thickness: this.thickness };
+    } else if (this.tool === 'circle') {
+      this.currentShape = { type: 'circle', cx: x, cy: y, r: 0, color: this.color, thickness: this.thickness };
+    } else if (this.tool === 'arrow') {
+      this.currentShape = { type: 'arrow', x1: x, y1: y, x2: x, y2: y, color: this.color, thickness: this.thickness };
+    }
+  }
+
+  _pointerMove(e) {
+    if (!this.currentShape) return;
+    const [x, y] = this._canvasCoords(e);
+    const s = this.currentShape;
+    if (s.type === 'freehand') {
+      s.points.push([x, y]);
+    } else if (s.type === 'rect') {
+      s.w = x - s.x;
+      s.h = y - s.y;
+    } else if (s.type === 'circle') {
+      s.r = Math.hypot(x - s.cx, y - s.cy);
+    } else if (s.type === 'arrow') {
+      s.x2 = x;
+      s.y2 = y;
+    }
+    this.render();
+    this._drawShape(this.ctx, s);
+  }
+
+  _pointerUp(e) {
+    if (!this.currentShape) return;
+    this.shapes.push(this.currentShape);
+    this.currentShape = null;
+    this.undoStack = [];
+    this.render();
+  }
+
+  setTool(type) { this.tool = type; }
+  setColor(color) { this.color = color; }
+  setThickness(px) { this.thickness = px; }
+
+  undo() {
+    if (this.shapes.length === 0) return;
+    this.undoStack.push(this.shapes.pop());
+    this.render();
+  }
+
+  redo() {
+    if (this.undoStack.length === 0) return;
+    this.shapes.push(this.undoStack.pop());
+    this.render();
+  }
+
+  clear() {
+    this.shapes = [];
+    this.undoStack = [];
+    this.currentShape = null;
+    this.render();
+  }
+
+  hasAnnotations() { return this.shapes.length > 0; }
+
+  render() {
+    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    for (const s of this.shapes) this._drawShape(this.ctx, s);
+  }
+
+  _drawShape(ctx, s) {
+    ctx.save();
+    ctx.strokeStyle = s.color || this.color;
+    ctx.fillStyle = s.color || this.color;
+    ctx.lineWidth = s.thickness || this.thickness;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    if (s.type === 'freehand' && s.points.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(s.points[0][0], s.points[0][1]);
+      for (let i = 1; i < s.points.length; i++) ctx.lineTo(s.points[i][0], s.points[i][1]);
+      ctx.stroke();
+    } else if (s.type === 'rect') {
+      ctx.strokeRect(s.x, s.y, s.w, s.h);
+    } else if (s.type === 'circle') {
+      ctx.beginPath();
+      ctx.arc(s.cx, s.cy, s.r, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (s.type === 'arrow') {
+      ctx.beginPath();
+      ctx.moveTo(s.x1, s.y1);
+      ctx.lineTo(s.x2, s.y2);
+      ctx.stroke();
+      // Arrowhead
+      const angle = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
+      const headLen = Math.max(12, (s.thickness || 4) * 3);
+      ctx.beginPath();
+      ctx.moveTo(s.x2, s.y2);
+      ctx.lineTo(s.x2 - headLen * Math.cos(angle - 0.4), s.y2 - headLen * Math.sin(angle - 0.4));
+      ctx.lineTo(s.x2 - headLen * Math.cos(angle + 0.4), s.y2 - headLen * Math.sin(angle + 0.4));
+      ctx.closePath();
+      ctx.fill();
+    } else if (s.type === 'text') {
+      ctx.font = `${s.size || 20}px sans-serif`;
+      ctx.fillText(s.text, s.x, s.y);
+    }
+    ctx.restore();
+  }
+
+  /** Composite source frame + annotations into a JPEG blob. */
+  composite() {
+    return new Promise((resolve) => {
+      const w = this.canvas.width;
+      const h = this.canvas.height;
+      const offscreen = document.createElement('canvas');
+      offscreen.width = w;
+      offscreen.height = h;
+      const octx = offscreen.getContext('2d');
+      // Draw source (video or canvas)
+      octx.drawImage(this.source, 0, 0, w, h);
+      // Draw all annotations on top
+      for (const s of this.shapes) this._drawShape(octx, s);
+      offscreen.toBlob((blob) => resolve(blob), 'image/jpeg', 0.92);
+    });
+  }
+}
+
+// ── Annotation state and integration ──
+let annotationCanvas = null;
+let annotationMode = false;
+let annotationCounter = 0;
+
+function enterAnnotationMode() {
+  if (annotationMode) return;
+  const video = document.getElementById('recording-video');
+  const overlay = document.getElementById('recording-overlay');
+  if (!video || !overlay) return;
+
+  // Pause video if playing
+  if (recPlayer && recPlayer.playing) recPlayer.pause();
+
+  // Wait for video to have dimensions
+  if (!video.videoWidth) return;
+
+  annotationCanvas = new AnnotationCanvas(overlay, video);
+  annotationCanvas.activate();
+  annotationMode = true;
+  document.getElementById('annotation-toolbar').classList.remove('hidden');
+}
+
+function exitAnnotationMode() {
+  if (!annotationMode) return;
+  if (annotationCanvas) {
+    annotationCanvas.deactivate();
+    annotationCanvas = null;
+  }
+  annotationMode = false;
+  document.getElementById('annotation-toolbar').classList.add('hidden');
+}
+
+async function submitAnnotation() {
+  if (!annotationCanvas || !annotationCanvas.hasAnnotations()) return;
+  const note = document.getElementById('ann-note').value.trim();
+  const blob = await annotationCanvas.composite();
+  if (!blob) return;
+
+  // Convert blob to base64
+  const reader = new FileReader();
+  reader.onload = () => {
+    const b64 = reader.result.split(',')[1]; // strip data:image/jpeg;base64,
+    annotationCounter++;
+    const frameId = `ann-${activeRecordingStream || 'recording'}-${annotationCounter}`;
+    const msg = JSON.stringify({
+      t: 'annotation_submit',
+      frame_id: frameId,
+      stream: activeRecordingStream || 'annotation',
+      data: b64,
+      note: note,
+    });
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+    // Clear and exit
+    document.getElementById('ann-note').value = '';
+    annotationCanvas.clear();
+    exitAnnotationMode();
+  };
+  reader.readAsDataURL(blob);
+}
+
+// Wire up annotation toolbar
+document.getElementById('annotation-toolbar').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-tool]');
+  if (btn && annotationCanvas) {
+    annotationCanvas.setTool(btn.dataset.tool);
+    document.querySelectorAll('.ann-btn').forEach(b => b.classList.toggle('active', b === btn));
+    return;
+  }
+  const colorBtn = e.target.closest('[data-color]');
+  if (colorBtn && annotationCanvas) {
+    annotationCanvas.setColor(colorBtn.dataset.color);
+    document.querySelectorAll('.ann-color').forEach(b => b.classList.toggle('active', b === colorBtn));
+    return;
+  }
+  const thickBtn = e.target.closest('[data-thick]');
+  if (thickBtn && annotationCanvas) {
+    annotationCanvas.setThickness(parseInt(thickBtn.dataset.thick));
+    document.querySelectorAll('.ann-thick').forEach(b => b.classList.toggle('active', b === thickBtn));
+    return;
+  }
+});
+document.getElementById('ann-undo').addEventListener('click', () => annotationCanvas && annotationCanvas.undo());
+document.getElementById('ann-redo').addEventListener('click', () => annotationCanvas && annotationCanvas.redo());
+document.getElementById('ann-clear').addEventListener('click', () => annotationCanvas && annotationCanvas.clear());
+document.getElementById('ann-submit-btn').addEventListener('click', submitAnnotation);
+document.getElementById('ann-close').addEventListener('click', exitAnnotationMode);
+document.getElementById('rec-annotate-btn').addEventListener('click', enterAnnotationMode);
+
+// Submit on Enter in note field
+document.getElementById('ann-note').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); submitAnnotation(); }
+  e.stopPropagation(); // Don't let key events bubble to global handlers
+});
+
+// Keyboard shortcuts for annotation
+document.addEventListener('keydown', (e) => {
+  // Don't fire in input fields (except our handled ann-note)
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.key === 'a' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    // Toggle annotation mode when recording section is visible
+    const section = document.getElementById('recording-section');
+    if (section && !section.classList.contains('hidden')) {
+      if (annotationMode) exitAnnotationMode();
+      else enterAnnotationMode();
+    }
+    return;
+  }
+  if (e.key === 'Escape' && annotationMode) {
+    exitAnnotationMode();
+    return;
+  }
+  if (annotationMode && annotationCanvas) {
+    if (e.key === 'z' && (e.ctrlKey || e.metaKey) && e.shiftKey) {
+      e.preventDefault();
+      annotationCanvas.redo();
+    } else if (e.key === 'z' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      annotationCanvas.undo();
+    }
+  }
+});
 
 // ── Tab Switching ──
 document.querySelectorAll('.tab-btn').forEach(btn => {
