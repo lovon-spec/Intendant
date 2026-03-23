@@ -2,6 +2,7 @@ mod agent_runner;
 mod autonomy;
 mod control;
 mod conversation;
+mod debug;
 mod error;
 mod event;
 mod frames;
@@ -3906,6 +3907,16 @@ async fn main() -> Result<(), CallerError> {
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
+        let _debug_handler = if flags.web {
+            Some(debug::spawn_debug_screen_handler(
+                bus.subscribe(),
+                project.config.recording.clone(),
+                flags.web_port,
+                bus.clone(),
+            ))
+        } else {
+            None
+        };
         let mcp_control_tx = if flags.control_socket {
             let (_control_handle, control_tx) = control::spawn_control_server(bus.clone());
             slog(&session_log, |l| {
@@ -4214,6 +4225,16 @@ async fn main() -> Result<(), CallerError> {
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
+        let _debug_handler = if flags.web {
+            Some(debug::spawn_debug_screen_handler(
+                bus.subscribe(),
+                project.config.recording.clone(),
+                flags.web_port,
+                bus.clone(),
+            ))
+        } else {
+            None
+        };
 
         // TUI is created later — just before run() — so that web mode
         // (--web) can use WebTui instead of the real terminal backend.
@@ -4624,6 +4645,16 @@ async fn main() -> Result<(), CallerError> {
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
+        let _debug_handler = if flags.web {
+            Some(debug::spawn_debug_screen_handler(
+                bus.subscribe(),
+                project.config.recording.clone(),
+                flags.web_port,
+                bus.clone(),
+            ))
+        } else {
+            None
+        };
 
         // Outbound broadcast channel — shared by web gateway and JSON stdout subscriber
         let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
