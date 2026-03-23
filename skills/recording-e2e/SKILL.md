@@ -137,7 +137,7 @@ cat /tmp/intendant-rec-stderr.log
 
 ```bash
 rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock 2>/dev/null
-DISPLAY=:50 nohup firefox --new-window http://localhost:8765/app > /dev/null 2>&1 &
+DISPLAY=:50 nohup firefox -P default --new-window http://localhost:8765/app > /dev/null 2>&1 &
 sleep 8
 ```
 
@@ -342,7 +342,7 @@ Then relaunch Firefox with debugger:
 for p in $(pgrep -x firefox -x firefox-esr 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
 sleep 1
 rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock 2>/dev/null
-DISPLAY=:50 nohup firefox --start-debugger-server 6000 \
+DISPLAY=:50 nohup firefox -P default --start-debugger-server 6000 \
   --new-window http://localhost:8765/app > /dev/null 2>&1 &
 sleep 8
 ```

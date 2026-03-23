@@ -165,10 +165,12 @@ user_pref("devtools.debugger.force-local", false);
 EOF
 ```
 
-Launch (pointing to `/app`):
+Launch (pointing to `/app`). Use `-P default` so Firefox uses the profile where
+we set debugger prefs and mic permissions — without it, it may pick a different
+profile and the debugger server won't bind:
 ```bash
 rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock 2>/dev/null
-DISPLAY=:50 nohup firefox --start-debugger-server 6000 \
+DISPLAY=:50 nohup firefox -P default --start-debugger-server 6000 \
   --new-window http://localhost:8765/app > /dev/null 2>&1 &
 sleep 5
 ```

@@ -55,7 +55,7 @@ cat /tmp/intendant-web-stderr.log  # Should show "Web TUI: http://0.0.0.0:8765"
 
 # 5. Launch Firefox on display :50 pointing to /app
 rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock 2>/dev/null
-DISPLAY=:50 nohup firefox --new-window http://localhost:8765/app > /dev/null 2>&1 &
+DISPLAY=:50 nohup firefox -P default --new-window http://localhost:8765/app > /dev/null 2>&1 &
 sleep 8
 ```
 
