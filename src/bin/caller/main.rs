@@ -16,7 +16,6 @@ mod mcp_client;
 mod presence;
 mod project;
 mod audio_routing;
-mod pulse_audio;
 mod quarantine;
 mod recording;
 mod prompts;
