@@ -20,7 +20,7 @@ set -euo pipefail
 CERT_DIR="/etc/intendant-lan"
 NGINX_SITE="intendant-lan"
 TUNNEL_SERVICE="intendant-tunnel"
-BACKEND="localhost:8765"
+BACKEND="127.0.0.1:8765"
 HTTPS_PORT=8443
 CERT_SERVE_PORT=9999
 TUNNEL_TARGET=""
@@ -224,6 +224,15 @@ server {
         # Keep WebSocket alive (24h)
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
+
+        # Custom error page when intendant isn't running
+        proxy_intercept_errors on;
+        error_page 502 =502 @intendant_down;
+    }
+
+    location @intendant_down {
+        default_type text/html;
+        return 502 '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Intendant</title><style>body{background:#1e1e2e;color:#cdd6f4;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{text-align:center}.status{font-size:1.5em;margin-bottom:.5em;color:#f9e2af}p{color:#a6adc8}</style></head><body><div><div class="status">Waiting for intendant</div><p>The agent is not running yet. Start it with:<br><code style="color:#89b4fa">intendant --web</code></p><script>setTimeout(()=>location.reload(),3000)</script></div></body></html>';
     }
 }
 NGINX
@@ -239,7 +248,7 @@ setup_tunnel() {
     [[ -z "$TUNNEL_TARGET" ]] && return
 
     # With nginx handling external access, tunnel only needs localhost
-    BACKEND="localhost:8765"
+    BACKEND="127.0.0.1:8765"
 
     info "setting up SSH tunnel to $TUNNEL_TARGET..."
 
