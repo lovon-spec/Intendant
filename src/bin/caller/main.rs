@@ -1686,6 +1686,7 @@ async fn run_agent_loop(
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
+    let mut cu_action_counter = 0u64;
     let mut loop_stats = LoopStats::default();
     let mut seen_sub_agent_results: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -1815,7 +1816,8 @@ async fn run_agent_loop(
 
         // Store assistant message — with or without tool calls
         let has_tool_calls = !response.tool_calls.is_empty();
-        if has_tool_calls {
+        let has_cu_calls = !response.cu_calls.is_empty();
+        if has_tool_calls || has_cu_calls {
             let refs: Vec<conversation::ToolCallRef> = response
                 .tool_calls
                 .iter()
@@ -2277,6 +2279,28 @@ async fn run_agent_loop(
                 }
                 conversation.add_tool_result(call_id, tool_name, &text);
             }
+
+            // Process CU calls alongside function tool calls
+            if has_cu_calls {
+                execute_cu_calls(
+                    &response.cu_calls,
+                    conversation,
+                    provider.cu_display(),
+                    log_dir,
+                    &mut cu_action_counter,
+                    &session_log,
+                ).await;
+            }
+        } else if has_cu_calls {
+            // CU-only turn (no function tool calls)
+            execute_cu_calls(
+                &response.cu_calls,
+                conversation,
+                provider.cu_display(),
+                log_dir,
+                &mut cu_action_counter,
+                &session_log,
+            ).await;
         } else {
             // --- Legacy text extraction path ---
 
@@ -3717,6 +3741,66 @@ async fn resolve_frame_ids(
         }
     }
     images
+}
+
+/// Execute native computer-use tool calls via the xdotool executor
+/// and add results (with screenshots) to the conversation.
+#[allow(clippy::too_many_arguments)]
+async fn execute_cu_calls(
+    cu_calls: &[computer_use::CuToolCall],
+    conversation: &mut conversation::Conversation,
+    cu_display: Option<(u32, u32)>,
+    log_dir: &std::path::Path,
+    counter: &mut u64,
+    session_log: &SharedSessionLog,
+) {
+    let display_id = cu_display
+        .map(|_| {
+            // Use the display from DISPLAY env or default to 99
+            std::env::var("DISPLAY")
+                .ok()
+                .and_then(|d| d.trim_start_matches(':').parse().ok())
+                .unwrap_or(99)
+        })
+        .unwrap_or(99);
+
+    for cu_call in cu_calls {
+        slog(session_log, |l| {
+            l.info(&format!(
+                "CU: executing {} action(s) for call {}",
+                cu_call.actions.len(),
+                cu_call.call_id
+            ))
+        });
+
+        let results = computer_use::execute_actions(
+            &cu_call.actions,
+            display_id,
+            log_dir,
+            counter,
+        ).await;
+
+        // Find the last screenshot from results
+        let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
+        let output = if results.iter().all(|r| r.success) {
+            "Actions executed successfully.".to_string()
+        } else {
+            let errors: Vec<&str> = results.iter()
+                .filter_map(|r| r.error.as_deref())
+                .collect();
+            format!("Some actions failed: {}", errors.join("; "))
+        };
+
+        if let Some(screenshot) = last_screenshot {
+            let images = vec![conversation::ImageData {
+                media_type: "image/png".to_string(),
+                data: screenshot.base64_png.clone(),
+            }];
+            conversation.add_cu_result(&cu_call.call_id, &output, images);
+        } else {
+            conversation.add_cu_result(&cu_call.call_id, &output, vec![]);
+        }
+    }
 }
 
 fn is_simple_task(task: &str) -> bool {

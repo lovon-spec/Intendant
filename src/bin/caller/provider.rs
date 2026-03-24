@@ -2670,9 +2670,13 @@ pub fn select_cu_provider(
                 CallerError::Config("CU provider=gemini but no GEMINI_API_KEY found.".into())
             })?;
             let model = model_str.unwrap_or_else(|| "gemini-2.5-flash".to_string());
+            let display = crate::vision::display_config_for_provider("gemini");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            Ok(Box::new(GeminiProvider::new(key, model, ctx, max_out)))
+            let mut p = GeminiProvider::new(key, model, ctx, max_out);
+            p.cu_enabled = true;
+            p.cu_display = Some((display.width, display.height));
+            Ok(Box::new(p))
         }
         Some("anthropic") => {
             let key = anthropic_key.ok_or_else(|| {
@@ -2682,18 +2686,26 @@ pub fn select_cu_provider(
             })?;
             let model =
                 model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+            let display = crate::vision::display_config_for_provider("anthropic");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            Ok(Box::new(AnthropicProvider::new(key, model, ctx, max_out)))
+            let mut p = AnthropicProvider::new(key, model, ctx, max_out);
+            p.cu_enabled = true;
+            p.cu_display = Some((display.width, display.height));
+            Ok(Box::new(p))
         }
         Some("openai") => {
             let key = openai_key.ok_or_else(|| {
                 CallerError::Config("CU provider=openai but no OPENAI_API_KEY found.".into())
             })?;
             let model = model_str.unwrap_or_else(|| "gpt-5.2-codex".to_string());
+            let display = crate::vision::display_config_for_provider("openai");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            Ok(Box::new(OpenAIProvider::new(key, model, ctx, max_out)))
+            let mut p = OpenAIProvider::new(key, model, ctx, max_out);
+            p.cu_enabled = true;
+            p.cu_display = Some((display.width, display.height));
+            Ok(Box::new(p))
         }
         Some(other) => Err(CallerError::Config(format!(
             "Unknown CU provider: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
