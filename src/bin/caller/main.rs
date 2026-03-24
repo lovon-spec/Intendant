@@ -5001,7 +5001,8 @@ async fn main() -> Result<(), CallerError> {
                     }
                     event = event_rx.recv() => {
                         match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate })) => {
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids })) => {
+                                let _ = &reference_frame_ids; // TODO: route to CU path when non-empty
                                 eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
                                 // Create fresh session resources
                                 let new_log_dir = session_log::SessionLog::resolve_path(None);
@@ -5316,7 +5317,8 @@ async fn main() -> Result<(), CallerError> {
                     }
                     event = event_rx.recv() => {
                         match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate })) => {
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids })) => {
+                                let _ = &reference_frame_ids; // TODO: route to CU path when non-empty
                                 eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
 
                                 // Create fresh session resources

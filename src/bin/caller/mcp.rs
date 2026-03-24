@@ -1514,7 +1514,7 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_LOOP_URI)
         }
-        ControlMsg::StartTask { task, orchestrate } => {
+        ControlMsg::StartTask { task, orchestrate, .. } => {
             match start_task_with_state(state, bus, task, "voice", orchestrate).await {
                 Ok(()) => {
                     emit_control_result(control_tx, "start_task", true, "ok".to_string(), None);
@@ -1618,6 +1618,7 @@ async fn handle_control_command_mcp(
                     bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
                         task: task_text,
                         orchestrate: Some(false),
+                        reference_frame_ids: vec![],
                     }));
                     emit_control_result(control_tx, "invoke_skill", true, format!("Skill '{}' dispatched", skill_name), None);
                 }
@@ -2141,6 +2142,11 @@ pub struct StartTaskParams {
     /// automatically: complex tasks use orchestration, simple tasks use direct.
     #[serde(default)]
     pub orchestrate: Option<bool>,
+    /// Frame IDs the user was looking at when they made this request.
+    /// When present, routes to the ephemeral CU task runner with a fast
+    /// CU-capable model instead of the regular agent loop.
+    #[serde(default)]
+    pub reference_frame_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2549,6 +2555,16 @@ impl IntendantServer {
         description = "Start a new task for the Intendant agent to execute. The agent will begin working on the task immediately. Only one task can run at a time — check get_status to see if a task is already running."
     )]
     async fn start_task(&self, Parameters(params): Parameters<StartTaskParams>) -> String {
+        // If reference_frame_ids are present, dispatch as a CU task via ControlMsg
+        // so the main loop can route it to the ephemeral CU runner.
+        if !params.reference_frame_ids.is_empty() {
+            self.bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                task: params.task,
+                orchestrate: params.orchestrate,
+                reference_frame_ids: params.reference_frame_ids,
+            }));
+            return "ok (CU task dispatched)".to_string();
+        }
         match self
             .start_task_internal(params.task, "MCP", params.orchestrate)
             .await
