@@ -2061,6 +2061,7 @@ impl ChatProvider for GeminiProvider {
         let mut text_parts = Vec::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut cu_calls: Vec<super::computer_use::CuToolCall> = Vec::new();
+        let mut raw_model_parts: Vec<serde_json::Value> = Vec::new();
         let mut usage = TokenUsage::default();
         let mut line_buf = String::new();
 
@@ -2092,18 +2093,14 @@ impl ChatProvider for GeminiProvider {
                         .and_then(|p| p.as_array())
                     {
                         for part in parts {
-                            // Debug: log all part keys for CU diagnosis
-                            let part_keys: Vec<&str> = part.as_object()
-                                .map(|o| o.keys().map(|k| k.as_str()).collect())
-                                .unwrap_or_default();
-                            eprintln!("[gemini-stream] part keys: {:?}", part_keys);
+                            // Capture raw parts for verbatim echo-back (preserves thoughtSignature)
+                            raw_model_parts.push(part.clone());
 
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 text_parts.push(text.to_string());
                                 on_event(StreamEvent::Delta(text.to_string()));
                             }
                             if let Some(fc) = part.get("functionCall") {
-                                eprintln!("[gemini-stream] functionCall detected: {}", fc);
                                 let name = fc
                                     .get("name")
                                     .and_then(|n| n.as_str())
@@ -2166,6 +2163,12 @@ impl ChatProvider for GeminiProvider {
 
         let content = text_parts.join("");
         let _ = (contents, system_text); // consumed above
+        // Store raw parts for echo-back (preserves thoughtSignature for Gemini CU)
+        let raw_output = if !raw_model_parts.is_empty() {
+            Some(raw_model_parts)
+        } else {
+            None
+        };
         let response = ChatResponse {
             content,
             usage,
@@ -2173,7 +2176,7 @@ impl ChatProvider for GeminiProvider {
             reasoning_content: None,
             tool_calls,
             cu_calls,
-            raw_output: None,
+            raw_output,
         };
         on_event(StreamEvent::Complete(response.clone()));
         Ok(response)
@@ -2264,6 +2267,14 @@ fn build_gemini_request_parts(
         }
         if m.role == "assistant" {
             if let Some(ref tcs) = m.tool_calls {
+                // Use raw_output if available (preserves thoughtSignature for Gemini CU)
+                if let Some(ref raw) = m.raw_output {
+                    contents.push(serde_json::json!({
+                        "role": role,
+                        "parts": raw,
+                    }));
+                    continue;
+                }
                 let mut parts = Vec::new();
                 if !m.content.is_empty() {
                     parts.push(serde_json::json!({"text": m.content}));
