@@ -3923,8 +3923,22 @@ async fn run_cu_task(
     // Add the task
     conv.add_user(task.to_string());
 
+    // Log initial conversation state
+    slog(session_log, |l| {
+        l.info(&format!(
+            "CU task starting: {} messages, provider={}, model={}, cu_enabled={}, cu_display={:?}",
+            conv.messages().len(),
+            provider.name(),
+            provider.model(),
+            provider.cu_enabled(),
+            provider.cu_display(),
+        ))
+    });
+
     for turn in 1..=CU_TASK_MAX_TURNS {
         stats.turns = turn;
+
+        slog(session_log, |l| l.info(&format!("CU turn {} starting", turn)));
 
         let response = provider.chat_stream(
             conv.messages(),
@@ -3940,6 +3954,46 @@ async fn run_cu_task(
         ).await?;
 
         conv.set_usage(response.usage.clone());
+
+        // Log full turn details
+        slog(session_log, |l| {
+            l.info(&format!(
+                "CU turn {} response: content_len={}, cu_calls={}, tool_calls={}, usage={{prompt={}, completion={}, total={}}}",
+                turn,
+                response.content.len(),
+                response.cu_calls.len(),
+                response.tool_calls.len(),
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+                response.usage.total_tokens,
+            ))
+        });
+        if !response.content.is_empty() {
+            slog(session_log, |l| {
+                l.info(&format!(
+                    "CU turn {} text: {}",
+                    turn,
+                    &response.content[..response.content.len().min(500)]
+                ))
+            });
+        }
+        for (i, cu) in response.cu_calls.iter().enumerate() {
+            slog(session_log, |l| {
+                l.info(&format!(
+                    "CU turn {} call[{}]: id={}, actions={:?}",
+                    turn, i, cu.call_id,
+                    cu.actions.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>()
+                ))
+            });
+        }
+        for tc in &response.tool_calls {
+            slog(session_log, |l| {
+                l.info(&format!(
+                    "CU turn {} unexpected function call: {}({})",
+                    turn, tc.name, &tc.arguments[..tc.arguments.len().min(200)]
+                ))
+            });
+        }
 
         // Check for task completion
         let content_lower = response.content.to_lowercase();
@@ -4009,6 +4063,14 @@ async fn run_cu_task(
         }
 
         // No CU calls and not done — model may be thinking or confused
+        if response.cu_calls.is_empty() && response.tool_calls.is_empty() && !is_done {
+            slog(session_log, |l| {
+                l.warn(&format!(
+                    "CU turn {}: no actions returned (text-only response)",
+                    turn
+                ))
+            });
+        }
         if turn >= CU_TASK_MAX_TURNS {
             slog(session_log, |l| l.warn("CU task hit max turns"));
         }
