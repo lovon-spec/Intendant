@@ -2061,6 +2061,16 @@ pub fn spawn_event_listener(
                     AppEvent::DebugScreenTornDown { display_id } => {
                         s.push_log(LogLevel::Info, format!("Debug screen :{} torn down", display_id));
                     }
+                    AppEvent::LiveAudioStarted { id, provider } => {
+                        s.push_log(LogLevel::Info, format!("Live audio '{}' started ({})", id, provider));
+                    }
+                    AppEvent::LiveAudioProgress { id, state, elapsed_secs, .. } => {
+                        s.push_log(LogLevel::Detail, format!("Live audio '{}': {} ({:.0}s)", id, state, elapsed_secs));
+                    }
+                    AppEvent::LiveAudioCompleted { id, status, quarantine_count } => {
+                        let q_note = if quarantine_count > 0 { format!(" ({} quarantined)", quarantine_count) } else { String::new() };
+                        s.push_log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
+                    }
                 }
             }
 

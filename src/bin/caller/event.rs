@@ -252,6 +252,23 @@ pub enum AppEvent {
         detail: String,
     },
 
+    // Live audio sub-agent lifecycle
+    LiveAudioStarted {
+        id: String,
+        provider: String,
+    },
+    LiveAudioProgress {
+        id: String,
+        state: String,
+        elapsed_secs: f64,
+        transcript_preview: String,
+    },
+    LiveAudioCompleted {
+        id: String,
+        status: String,
+        quarantine_count: usize,
+    },
+
     /// Server-side transcription of user speech (from Whisper API).
     UserTranscript {
         text: String,
@@ -664,7 +681,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         | AppEvent::PresenceDisconnected
         | AppEvent::VoiceLog { .. }
         | AppEvent::PresenceCheckpointReceived { .. }
-        | AppEvent::VoiceDiagnostic { .. } => None,
+        | AppEvent::VoiceDiagnostic { .. }
+        | AppEvent::LiveAudioStarted { .. }
+        | AppEvent::LiveAudioProgress { .. }
+        | AppEvent::LiveAudioCompleted { .. } => None,
     }
 }
 

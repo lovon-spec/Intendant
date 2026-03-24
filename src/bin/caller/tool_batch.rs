@@ -22,6 +22,9 @@ pub struct ToolBatchResult {
     /// Skill invocations extracted from invoke_skill tool calls.
     /// Vec of (call_id, skill_name, arguments).
     pub skill_invocations: Vec<(String, String, String)>,
+    /// Live audio spawn requests extracted from spawn_live_audio tool calls.
+    /// Vec of (call_id, session_id, full_args_json).
+    pub live_audio_spawns: Vec<(String, String, serde_json::Value)>,
 }
 
 /// Assemble an AgentInput batch from individual tool calls.
@@ -36,6 +39,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
     let mut mcp_calls = Vec::new();
     let mut precomputed_results = Vec::new();
     let mut skill_invocations = Vec::new();
+    let mut live_audio_spawns = Vec::new();
 
     for tc in tool_calls {
         call_id_names.push((tc.call_id.clone(), tc.name.clone()));
@@ -59,6 +63,16 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
                         .unwrap_or("")
                         .to_string();
                     skill_invocations.push((tc.call_id.clone(), skill_name, arguments));
+                }
+            }
+            "spawn_live_audio" => {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    let session_id = args
+                        .get("id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    live_audio_spawns.push((tc.call_id.clone(), session_id, args));
                 }
             }
             "signal_done" => {
@@ -123,6 +137,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
         mcp_calls,
         precomputed_results,
         skill_invocations,
+        live_audio_spawns,
     }
 }
 
@@ -191,7 +206,7 @@ pub fn map_results_to_tool_responses(
             }
         }
 
-        if tool_name == "manage_context" || tool_name == "signal_done" || tool_name == "invoke_skill" {
+        if tool_name == "manage_context" || tool_name == "signal_done" || tool_name == "invoke_skill" || tool_name == "spawn_live_audio" {
             results.push((call_id.clone(), tool_name.clone(), "OK".to_string()));
             continue;
         }

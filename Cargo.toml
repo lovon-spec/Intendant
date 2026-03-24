@@ -38,7 +38,7 @@ dirs = "6"
 rmcp = { version = "0.16", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 base64 = "0.22"
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 presence-core = { path = "crates/presence-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

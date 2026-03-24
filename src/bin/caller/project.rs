@@ -67,6 +67,8 @@ pub struct ProjectConfig {
     pub transcription: crate::transcription::TranscriptionConfig,
     #[serde(default)]
     pub recording: RecordingConfig,
+    #[serde(default)]
+    pub live_audio: LiveAudioConfig,
 }
 
 /// Recording configuration in intendant.toml.
@@ -113,6 +115,40 @@ impl RecordingConfig {
             "low" => 35,
             "high" => 20,
             _ => 28, // medium
+        }
+    }
+}
+
+/// Live audio sub-agent configuration in intendant.toml.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveAudioConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_live_timeout")]
+    pub default_timeout_secs: u64,
+    #[serde(default)]
+    pub gemini_model: Option<String>,
+    #[serde(default)]
+    pub openai_model: Option<String>,
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: u32,
+}
+
+fn default_live_timeout() -> u64 {
+    300
+}
+fn default_sample_rate() -> u32 {
+    24000
+}
+
+impl Default for LiveAudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_timeout_secs: default_live_timeout(),
+            gemini_model: None,
+            openai_model: None,
+            sample_rate: default_sample_rate(),
         }
     }
 }

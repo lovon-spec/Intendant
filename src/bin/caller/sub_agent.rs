@@ -9,6 +9,7 @@ pub enum SubAgentRole {
     Implementation,
     Testing,
     Orchestrator,
+    LiveAudio,
     Custom(String),
 }
 
@@ -19,6 +20,7 @@ impl SubAgentRole {
             SubAgentRole::Implementation => "implementation",
             SubAgentRole::Testing => "testing",
             SubAgentRole::Orchestrator => "orchestrator",
+            SubAgentRole::LiveAudio => "live_audio",
             SubAgentRole::Custom(s) => s,
         }
     }
@@ -29,6 +31,7 @@ impl SubAgentRole {
             "implementation" => SubAgentRole::Implementation,
             "testing" => SubAgentRole::Testing,
             "orchestrator" => SubAgentRole::Orchestrator,
+            "live_audio" => SubAgentRole::LiveAudio,
             other => SubAgentRole::Custom(other.to_string()),
         }
     }

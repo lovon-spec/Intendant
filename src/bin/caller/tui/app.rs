@@ -1897,6 +1897,28 @@ impl App {
             AppEvent::DebugScreenTornDown { display_id } => {
                 self.log(LogLevel::Info, format!("Debug screen :{} torn down", display_id));
             }
+            AppEvent::LiveAudioStarted { id, provider } => {
+                self.log(LogLevel::Info, format!("Live audio session '{}' started ({})", id, provider));
+            }
+            AppEvent::LiveAudioProgress { id, state, elapsed_secs, transcript_preview } => {
+                self.log(LogLevel::Detail, format!(
+                    "Live audio '{}': {} ({:.0}s) - {}",
+                    id, state, elapsed_secs,
+                    if transcript_preview.len() > 80 {
+                        format!("...{}", &transcript_preview[transcript_preview.len()-80..])
+                    } else {
+                        transcript_preview.clone()
+                    }
+                ));
+            }
+            AppEvent::LiveAudioCompleted { id, status, quarantine_count } => {
+                let q_note = if quarantine_count > 0 {
+                    format!(" ({} quarantined)", quarantine_count)
+                } else {
+                    String::new()
+                };
+                self.log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
+            }
         }
 
         // Drain log entries emitted during this handle_event call

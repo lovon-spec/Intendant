@@ -74,6 +74,8 @@ pub enum ActionCategory {
     NetworkRequest,
     Destructive,
     HumanInput,
+    /// Spawning an untrusted live audio sub-agent.
+    LiveAudioSpawn,
 }
 
 impl ActionCategory {
@@ -89,6 +91,7 @@ impl ActionCategory {
             Self::FileDelete => 4,
             Self::Destructive => 5,
             Self::HumanInput => 6,
+            Self::LiveAudioSpawn => 7,
         }
     }
 }
@@ -103,6 +106,7 @@ impl fmt::Display for ActionCategory {
             Self::NetworkRequest => write!(f, "network"),
             Self::Destructive => write!(f, "destructive"),
             Self::HumanInput => write!(f, "human_input"),
+            Self::LiveAudioSpawn => write!(f, "live_audio_spawn"),
         }
     }
 }
@@ -166,6 +170,7 @@ impl ApprovalConfig {
             ActionCategory::NetworkRequest => self.network,
             ActionCategory::Destructive => self.destructive,
             ActionCategory::HumanInput => ApprovalRule::Ask, // always ask
+            ActionCategory::LiveAudioSpawn => ApprovalRule::Ask, // always ask
         }
     }
 }
@@ -194,8 +199,10 @@ impl AutonomyState {
     /// Determine whether approval is needed for a given action category.
     /// Returns true if the user must be prompted.
     pub fn needs_approval(&self, category: ActionCategory) -> bool {
-        // HumanInput always requires human regardless of autonomy level
-        if category == ActionCategory::HumanInput {
+        // HumanInput and LiveAudioSpawn always require human regardless of autonomy level
+        if category == ActionCategory::HumanInput
+            || category == ActionCategory::LiveAudioSpawn
+        {
             return true;
         }
 

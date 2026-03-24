@@ -368,6 +368,48 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         }),
     });
 
+    // 13. spawn_live_audio (caller-handled, untrusted live audio sub-agent)
+    tools.push(ToolDefinition {
+        name: "spawn_live_audio".to_string(),
+        description: "Spawn an untrusted live audio sub-agent to conduct a voice conversation through an app on the virtual display. Connects to a live audio model (Gemini Live or OpenAI Realtime) and routes audio through PulseAudio virtual devices. The sub-agent has zero tools and zero file access. Returns structured data matching the response_schema, or quarantine references for unexpected content.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Unique identifier for this live audio session."
+                },
+                "provider": {
+                    "type": "string",
+                    "enum": ["gemini", "openai"],
+                    "description": "Live audio model provider."
+                },
+                "playbook": {
+                    "type": "string",
+                    "description": "System prompt with goal, talking points, and decision tree for the conversation."
+                },
+                "response_schema": {
+                    "type": "object",
+                    "description": "Schema defining the structured response the live model must produce. Contains 'fields' array where each field has 'name', 'field_type' (string/integer/boolean/array with constraints), 'required', and 'description'."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Hard timeout in seconds. Default: 300 (5 minutes)."
+                },
+                "voice": {
+                    "type": "string",
+                    "description": "Voice name (e.g., 'Aoede' for Gemini, 'alloy' for OpenAI)."
+                },
+                "display_id": {
+                    "type": "integer",
+                    "description": "X11 display number where the target app is running."
+                }
+            },
+            "required": ["id", "provider", "playbook", "response_schema"],
+            "additionalProperties": false
+        }),
+    });
+
     // Append any extra tools registered at runtime (MCP servers, etc.)
     if let Ok(extra) = EXTRA_TOOLS.lock() {
         tools.extend(extra.iter().cloned());
@@ -397,9 +439,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_tools_has_12_definitions() {
+    fn all_tools_has_13_definitions() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -470,7 +512,7 @@ mod tests {
 
     #[test]
     fn caller_tools_have_no_nonce() {
-        let caller_tools = ["manage_context", "signal_done", "invoke_skill"];
+        let caller_tools = ["manage_context", "signal_done", "invoke_skill", "spawn_live_audio"];
         let tools = all_tools();
         for name in &caller_tools {
             let tool = tools.iter().find(|t| t.name == *name).unwrap();
@@ -541,19 +583,19 @@ mod tests {
         let tools = all_tools();
 
         let oai_tools: Vec<Value> = tools.iter().map(|t| t.to_openai()).collect();
-        assert_eq!(oai_tools.len(), 12);
+        assert_eq!(oai_tools.len(), 13);
         for t in &oai_tools {
             assert_eq!(t["type"].as_str(), Some("function"));
         }
 
         let ant_tools: Vec<Value> = tools.iter().map(|t| t.to_anthropic()).collect();
-        assert_eq!(ant_tools.len(), 12);
+        assert_eq!(ant_tools.len(), 13);
         for t in &ant_tools {
             assert!(t["input_schema"].is_object());
         }
 
         let gem_tools: Vec<Value> = tools.iter().map(|t| t.to_gemini()).collect();
-        assert_eq!(gem_tools.len(), 12);
+        assert_eq!(gem_tools.len(), 13);
         for t in &gem_tools {
             assert!(t["parameters"].is_object());
         }
