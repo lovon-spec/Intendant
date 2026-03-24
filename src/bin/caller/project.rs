@@ -45,6 +45,19 @@ pub struct McpServerConfig {
     pub env: std::collections::HashMap<String, String>,
 }
 
+/// Computer use configuration: provider/model overrides for tasks that involve
+/// visual grounding (reference frames). Configured via `[computer_use]` in
+/// intendant.toml or `CU_PROVIDER`/`CU_MODEL` env vars.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ComputerUseConfig {
+    /// Provider name (e.g. "anthropic", "gemini").
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model name (e.g. "claude-haiku-4-5-20251001", "gemini-2.5-flash").
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct ProjectConfig {
     #[serde(default)]
@@ -67,6 +80,8 @@ pub struct ProjectConfig {
     pub transcription: crate::transcription::TranscriptionConfig,
     #[serde(default)]
     pub recording: RecordingConfig,
+    #[serde(default)]
+    pub computer_use: ComputerUseConfig,
 }
 
 /// Recording configuration in intendant.toml.

@@ -3056,24 +3056,33 @@ async fn run_with_presence(
             &envelope.reference_frame_ids, &frame_registry
         ).await;
 
+        let has_reference_frames = !reference_images.is_empty();
+
         if persistent_conv.is_none() {
             // ── First task: full initialization ──
-            let task_provider = match provider::select_provider() {
+            let proj = match Project::from_root(project_root.clone()) {
                 Ok(p) => p,
                 Err(e) => {
                     bus.send(AppEvent::PresenceLog {
-                        message: format!("Provider error: {}", e),
+                        message: format!("Project error: {}", e),
                         level: Some(types::LogLevel::Error),
                         turn: None,
                     });
                     continue;
                 }
             };
-            let proj = match Project::from_root(project_root.clone()) {
+
+            // Use CU-capable provider when reference frames are present
+            let task_provider = if has_reference_frames {
+                provider::select_cu_provider(&proj.config.computer_use)
+            } else {
+                provider::select_provider()
+            };
+            let task_provider = match task_provider {
                 Ok(p) => p,
                 Err(e) => {
                     bus.send(AppEvent::PresenceLog {
-                        message: format!("Project error: {}", e),
+                        message: format!("Provider error: {}", e),
                         level: Some(types::LogLevel::Error),
                         turn: None,
                     });
@@ -3108,7 +3117,7 @@ async fn run_with_presence(
             ));
             conv.add_assistant("Understood.".to_string());
 
-            // Inject reference frames: what the user was looking at when they spoke
+            // Inject reference frames + CU guidance when visual grounding is needed
             if !reference_images.is_empty() {
                 conv.add_user_with_images(
                     "[Reference] The user was looking at the following screen when they \
@@ -3118,6 +3127,24 @@ async fn run_with_presence(
                     reference_images,
                 );
                 conv.add_assistant("Understood — I'll use these reference frames to understand the user's intent and capture a fresh screenshot for the current state.".to_string());
+
+                // CU workflow guidance — only injected when reference frames indicate
+                // this is a visual/desktop interaction task
+                conv.add_user(
+                    "[Computer Use Guide] This task involves interacting with the desktop GUI. Follow this workflow:\n\
+                     1. Compare the reference frame (what the user saw) with a fresh capture_screen (current state)\n\
+                     2. Identify the target element the user is referring to\n\
+                     3. Use exec_command with xdotool to interact: \
+                        xdotool mousemove X Y click 1 (click), \
+                        xdotool type 'text' (type), \
+                        xdotool key Return (keypress), \
+                        xdotool mousemove X Y click 4/5 (scroll up/down)\n\
+                     4. capture_screen again to verify the action succeeded\n\
+                     5. Repeat until the task is complete\n\n\
+                     If the target element has moved or scrolled off screen since the reference frame, \
+                     scroll or navigate to find it before interacting.".to_string(),
+                );
+                conv.add_assistant("Understood.".to_string());
             }
 
             // Add task with optional frame images

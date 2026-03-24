@@ -2180,6 +2180,76 @@ pub fn select_provider_with_overrides(
     }
 }
 
+/// Select a provider for computer-use tasks (tasks with reference frames).
+///
+/// Priority: explicit config > CU_PROVIDER/CU_MODEL env > default select_provider.
+pub fn select_cu_provider(
+    cu_config: &crate::project::ComputerUseConfig,
+) -> Result<Box<dyn ChatProvider>, CallerError> {
+    let provider_str = cu_config
+        .provider
+        .as_deref()
+        .map(String::from)
+        .or_else(|| env::var("CU_PROVIDER").ok())
+        .or_else(|| env::var("PROVIDER").ok());
+    let model_str = cu_config
+        .model
+        .as_deref()
+        .map(String::from)
+        .or_else(|| env::var("CU_MODEL").ok());
+
+    let openai_key = env::var("OPENAI_API_KEY")
+        .or_else(|_| env::var("OPENAI"))
+        .ok();
+    let anthropic_key = env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| env::var("ANTHROPIC"))
+        .ok();
+    let gemini_key = env::var("GEMINI_API_KEY")
+        .or_else(|_| env::var("GEMINI"))
+        .ok();
+
+    match provider_str.as_deref() {
+        Some("gemini") => {
+            let key = gemini_key.ok_or_else(|| {
+                CallerError::Config("CU provider=gemini but no GEMINI_API_KEY found.".into())
+            })?;
+            let model = model_str.unwrap_or_else(|| "gemini-2.5-flash".to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(GeminiProvider::new(key, model, ctx, max_out)))
+        }
+        Some("anthropic") => {
+            let key = anthropic_key.ok_or_else(|| {
+                CallerError::Config(
+                    "CU provider=anthropic but no ANTHROPIC_API_KEY found.".into(),
+                )
+            })?;
+            let model =
+                model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(AnthropicProvider::new(key, model, ctx, max_out)))
+        }
+        Some("openai") => {
+            let key = openai_key.ok_or_else(|| {
+                CallerError::Config("CU provider=openai but no OPENAI_API_KEY found.".into())
+            })?;
+            let model = model_str.unwrap_or_else(|| "gpt-5.2-codex".to_string());
+            let ctx = resolve_context_window(&model);
+            let max_out = resolve_max_output_tokens(&model);
+            Ok(Box::new(OpenAIProvider::new(key, model, ctx, max_out)))
+        }
+        Some(other) => Err(CallerError::Config(format!(
+            "Unknown CU provider: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
+            other
+        ))),
+        None => {
+            // No CU-specific override — fall back to the standard provider
+            select_provider()
+        }
+    }
+}
+
 /// Select a provider for the presence layer (text mode).
 ///
 /// Priority: explicit config > PRESENCE_PROVIDER/PRESENCE_MODEL env > auto-detect.
