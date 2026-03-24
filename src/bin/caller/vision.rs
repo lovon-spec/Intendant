@@ -141,6 +141,21 @@ impl Drop for XvfbGuard {
     }
 }
 
+/// Detect if a VNC server is already running for the given display.
+/// Checks the standard VNC port (5900 + display_id).
+pub fn detect_vnc_port(display_id: u32) -> Option<u32> {
+    let port = 5900 + display_id;
+    // Quick check: try to connect to the port
+    use std::net::TcpStream;
+    match TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().ok()?,
+        std::time::Duration::from_millis(100),
+    ) {
+        Ok(_) => Some(port),
+        Err(_) => None,
+    }
+}
+
 /// Best-effort launch of x11vnc on the given display.
 /// Returns `Some(Child)` on success, `None` if x11vnc is not installed or fails to start.
 async fn launch_vnc(display_arg: &str, port: u32) -> Option<Child> {

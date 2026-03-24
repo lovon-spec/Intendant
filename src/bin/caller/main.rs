@@ -654,10 +654,31 @@ async fn maybe_auto_launch_xvfb(
     if xvfb_guard.is_some() {
         return;
     }
-    if vision::is_display_accessible() {
+    if !has_capture_screen_command(json_str) && !has_exec_command(json_str) {
         return;
     }
-    if !has_capture_screen_command(json_str) && !has_exec_command(json_str) {
+    // If a display is already accessible (e.g. DISPLAY was set before launch),
+    // emit DisplayReady so the web UI knows about it, but skip Xvfb launch.
+    if vision::is_display_accessible() {
+        let display_id = std::env::var("DISPLAY")
+            .ok()
+            .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
+            .unwrap_or(99);
+        let (width, height) = query_display_resolution(display_id);
+        // Check if x11vnc is already running on this display
+        let vnc_port = vision::detect_vnc_port(display_id);
+        slog(session_log, |l| {
+            l.info(&format!(
+                "Using existing display :{} ({}x{}, vnc={:?})",
+                display_id, width, height, vnc_port
+            ))
+        });
+        bus.send(AppEvent::DisplayReady {
+            display_id,
+            vnc_port,
+            width,
+            height,
+        });
         return;
     }
     let config = vision::display_config_for_provider(provider_name);
