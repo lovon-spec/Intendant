@@ -3217,6 +3217,7 @@ async fn run_with_presence(
             force_direct: true,
             context_hints: vec![],
             reference_frame_ids: vec![],
+            display_target: None,
         };
         let _ = fallback_task_tx.send(envelope).await;
     }
@@ -4014,6 +4015,28 @@ async fn try_cu_first(
         &proj.config.computer_use,
         None, // auto-resolve display target
     ).await)
+}
+
+/// Parse a display target string from the presence model into a `DisplayTarget`.
+///
+/// Accepts "user_session" for the user's display, or ":<N>" / "<N>" for virtual.
+fn parse_display_target_str(s: &str) -> computer_use::DisplayTarget {
+    match s.trim() {
+        "user_session" | "user" | ":0" | "0" => computer_use::DisplayTarget::UserSession,
+        other => {
+            let num_str = other.trim_start_matches(':');
+            if let Ok(id) = num_str.parse::<u32>() {
+                if id == 0 {
+                    computer_use::DisplayTarget::UserSession
+                } else {
+                    computer_use::DisplayTarget::Virtual { id }
+                }
+            } else {
+                // Unrecognized — fall back to auto-resolve
+                resolve_cu_display_target()
+            }
+        }
+    }
 }
 
 /// Resolve the display target for CU actions.
@@ -5377,7 +5400,7 @@ async fn main() -> Result<(), CallerError> {
                     }
                     event = event_rx.recv() => {
                         match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids })) => {
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids, display_target })) => {
                                 eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
                                 // Create fresh session resources
                                 let new_log_dir = session_log::SessionLog::resolve_path(None);
@@ -5406,9 +5429,11 @@ async fn main() -> Result<(), CallerError> {
                                         let session_log_cu = new_session_log.clone();
                                         let cu_config = new_project.config.computer_use.clone();
                                         tokio::spawn(async move {
+                                            let cu_target = display_target.as_deref()
+                                                .map(parse_display_target_str);
                                             match run_cu_task(
                                                 cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, None,
+                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
                                             ).await {
                                                 Ok(CuTaskResult::Completed(stats)) => {
                                                     bus_cu.send(AppEvent::PresenceLog {
@@ -5744,7 +5769,7 @@ async fn main() -> Result<(), CallerError> {
                     }
                     event = event_rx.recv() => {
                         match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids })) => {
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids, display_target })) => {
                                 eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
 
                                 // Create fresh session resources
@@ -5780,9 +5805,11 @@ async fn main() -> Result<(), CallerError> {
                                         let session_log_cu = new_session_log.clone();
                                         let cu_config = new_project.config.computer_use.clone();
                                         tokio::spawn(async move {
+                                            let cu_target = display_target.as_deref()
+                                                .map(parse_display_target_str);
                                             match run_cu_task(
                                                 cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, None,
+                                                &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
                                             ).await {
                                                 Ok(CuTaskResult::Completed(stats)) => {
                                                     bus_cu.send(AppEvent::PresenceLog {

@@ -1167,7 +1167,7 @@ impl App {
                     );
                 }
             }
-            ControlMsg::StartTask { task, orchestrate, reference_frame_ids } => {
+            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target } => {
                 // StartTask is an explicit command — bypass server-side presence
                 // and dispatch directly to the worker task channel. This avoids
                 // the server-side presence re-processing decisions the browser
@@ -1184,6 +1184,7 @@ impl App {
                             force_direct: orchestrate == Some(false),
                             context_hints: vec![],
                             reference_frame_ids,
+                            display_target,
                         };
                         tx.try_send(envelope).is_ok()
                     } else if let Some(ref tx) = self.follow_up_tx {
@@ -1403,6 +1404,7 @@ impl App {
                             task: task_text,
                             orchestrate: Some(false),
                             reference_frame_ids: vec![],
+                            display_target: None,
                         });
                     }
                     Err(e) => {

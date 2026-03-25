@@ -40,6 +40,10 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Frame IDs the user was looking at when they made this request. Include these so the agent knows what the user was referring to, even if the screen has since changed."
+                    },
+                    "display_target": {
+                        "type": "string",
+                        "description": "Which display to target for CU actions. Use 'user_session' for the user's real screen, or a virtual display like ':99'. Omit to auto-resolve."
                     }
                 },
                 "required": ["task"]

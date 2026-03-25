@@ -104,11 +104,16 @@ fn handle_submit_task(args: &Value) -> PresenceAction {
         })
         .unwrap_or_default();
 
+    let display_target = args["display_target"]
+        .as_str()
+        .map(String::from);
+
     PresenceAction::SubmitTask(TaskEnvelope {
         task,
         force_direct,
         context_hints,
         reference_frame_ids,
+        display_target,
     })
 }
 
@@ -388,6 +393,7 @@ mod tests {
                 force_direct: false,
                 context_hints: vec![],
                 reference_frame_ids: vec![],
+                display_target: None,
             })),
             "Task submitted: fix bug"
         );

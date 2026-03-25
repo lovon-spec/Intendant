@@ -34,6 +34,7 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                     task: envelope.task.clone(),
                     orchestrate,
                     reference_frame_ids: envelope.reference_frame_ids.clone(),
+                    display_target: envelope.display_target.clone(),
                 },
                 confirmation,
             ))
@@ -827,6 +828,21 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 message: "Safety cap reached (500 turns)".to_string(),
             })
         }
+        // Display state events — pushed to presence for display-aware routing
+        AppEvent::DisplayReady {
+            display_id,
+            width,
+            height,
+            ..
+        } => Some(PresenceEvent::DisplayReady {
+            display_id: *display_id,
+            width: *width,
+            height: *height,
+            is_user_session: *display_id == 0,
+        }),
+        AppEvent::UserDisplayGranted => Some(PresenceEvent::UserDisplayGranted),
+        AppEvent::UserDisplayRevoked { .. } => Some(PresenceEvent::UserDisplayRevoked),
+
         // Pull-only events — not pushed to presence
         AppEvent::AgentOutput { .. }
         | AppEvent::ModelResponseDelta { .. }
@@ -839,11 +855,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SubAgentResult { .. }
         | AppEvent::HumanResponseSent
         | AppEvent::TurnStarted { .. }
-        | AppEvent::DisplayReady { .. }
         | AppEvent::DisplayTaken { .. }
         | AppEvent::DisplayReleased { .. }
-        | AppEvent::UserDisplayGranted
-        | AppEvent::UserDisplayRevoked { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceLog { .. }
@@ -1082,6 +1095,7 @@ mod tests {
             force_direct: true,
             context_hints: vec!["check src/main.rs".to_string()],
             reference_frame_ids: vec!["cam0-f00005".to_string()],
+            display_target: Some("user_session".to_string()),
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: TaskEnvelope = serde_json::from_str(&json).unwrap();

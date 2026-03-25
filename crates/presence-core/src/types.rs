@@ -77,6 +77,11 @@ pub struct TaskEnvelope {
     /// Used to give the CU agent temporal context about what the user was referring to.
     #[serde(default)]
     pub reference_frame_ids: Vec<String>,
+    /// Explicit display target for CU actions. When set, the CU pipeline
+    /// targets this display instead of auto-resolving from env.
+    /// Use "user_session" for the user's real display, or ":99" etc. for virtual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_target: Option<String>,
 }
 
 /// Filtered events pushed to the presence layer from the agent loop.
@@ -94,6 +99,17 @@ pub enum PresenceEvent {
     BudgetWarning { pct: f64, remaining: u64 },
     RoundComplete { round: usize, turns_in_round: usize },
     Error { message: String },
+    /// A display became available.
+    DisplayReady {
+        display_id: u32,
+        width: u32,
+        height: u32,
+        is_user_session: bool,
+    },
+    /// User granted agent access to their session display.
+    UserDisplayGranted,
+    /// User revoked agent access to their session display.
+    UserDisplayRevoked,
 }
 
 /// Token usage snapshot from the presence layer.
@@ -437,6 +453,7 @@ mod tests {
             force_direct: true,
             context_hints: vec!["src/main.rs".to_string()],
             reference_frame_ids: vec!["display:99-f00012".to_string()],
+            display_target: Some("user_session".to_string()),
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let back: TaskEnvelope = serde_json::from_str(&json).unwrap();
@@ -444,6 +461,7 @@ mod tests {
         assert!(back.force_direct);
         assert_eq!(back.context_hints.len(), 1);
         assert_eq!(back.reference_frame_ids.len(), 1);
+        assert_eq!(back.display_target.as_deref(), Some("user_session"));
     }
 
     #[test]

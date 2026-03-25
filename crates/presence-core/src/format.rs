@@ -37,6 +37,30 @@ pub fn format_event(event: &PresenceEvent) -> String {
             turns_in_round,
         } => format!("Round {} complete ({} turns)", round, turns_in_round),
         PresenceEvent::Error { message } => format!("Error: {}", message),
+        PresenceEvent::DisplayReady {
+            display_id,
+            width,
+            height,
+            is_user_session,
+        } => {
+            if *is_user_session {
+                format!(
+                    "Display available: user_session ({}x{}) — the user's real screen",
+                    width, height
+                )
+            } else {
+                format!(
+                    "Display available: :{} ({}x{}) — virtual display",
+                    display_id, width, height
+                )
+            }
+        }
+        PresenceEvent::UserDisplayGranted => {
+            "User display access GRANTED — you can now target 'user_session' in submit_task display_target".to_string()
+        }
+        PresenceEvent::UserDisplayRevoked => {
+            "User display access REVOKED — do not target 'user_session', use virtual displays only".to_string()
+        }
     }
 }
 
