@@ -4,6 +4,7 @@ mod computer_use;
 mod control;
 mod conversation;
 mod debug;
+mod display_capture;
 mod error;
 mod event;
 mod frames;
@@ -4671,6 +4672,9 @@ async fn main() -> Result<(), CallerError> {
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
         );
+        let _display_capture = display_capture::spawn_user_display_capture(
+            bus.clone(), frame_registry.clone(),
+        );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
             Some(debug::spawn_debug_screen_handler(
@@ -5000,6 +5004,9 @@ async fn main() -> Result<(), CallerError> {
         );
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
+        );
+        let _display_capture = display_capture::spawn_user_display_capture(
+            bus.clone(), frame_registry.clone(),
         );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
@@ -5542,6 +5549,9 @@ async fn main() -> Result<(), CallerError> {
         let bus = EventBus::new();
         let _recording_listener = recording::spawn_recording_listener(
             bus.subscribe(), recording_registry.clone(), bus.clone(),
+        );
+        let _display_capture = display_capture::spawn_user_display_capture(
+            bus.clone(), frame_registry.clone(),
         );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if flags.web {
