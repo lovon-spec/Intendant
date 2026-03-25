@@ -2888,6 +2888,15 @@ class DisplaySlot {
         this.statusEl.className = 'display-status error';
         if (!e.detail.clean) setTimeout(() => { if (!this.connected) this._connectVNC(); }, 3000);
       });
+      this.rfb.addEventListener('credentialsrequired', () => {
+        const pw = prompt('VNC password required for display :' + this.displayId);
+        if (pw) {
+          this.rfb.sendCredentials({ password: pw });
+        } else {
+          this.statusEl.textContent = 'Auth cancelled';
+          this.statusEl.className = 'display-status error';
+        }
+      });
       this.rfb.addEventListener('securityfailure', () => {
         this.statusEl.textContent = 'Security error'; this.statusEl.className = 'display-status error';
       });
