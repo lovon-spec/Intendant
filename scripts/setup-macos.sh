@@ -5,7 +5,7 @@
 # Usage:
 #   ./setup-macos.sh             # Install all dependencies and build
 #   ./setup-macos.sh --check     # Check what's installed without changing anything
-#   ./setup-macos.sh --minimal   # Skip audio/voice deps (BlackHole, sox, etc.)
+#   ./setup-macos.sh --all       # Also install audio routing deps (BlackHole, sox, etc.)
 #
 set -euo pipefail
 
@@ -16,15 +16,15 @@ ok()   { echo "   ✓ $1"; }
 miss() { echo "   ✗ $1 — $2"; }
 
 ACTION="install"
-MINIMAL=false
+INCLUDE_AUDIO_ROUTING=false
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --check)   ACTION="check"; shift ;;
-            --minimal) MINIMAL=true; shift ;;
+            --check) ACTION="check"; shift ;;
+            --all)   INCLUDE_AUDIO_ROUTING=true; shift ;;
             -h|--help) sed -n '3,9p' "$0" | sed 's/^# \?//'; exit 0 ;;
-            *)         die "unknown option: $1" ;;
+            *)       die "unknown option: $1" ;;
         esac
     done
 }
@@ -103,12 +103,13 @@ check_computer_use() {
     $all_ok
 }
 
-# Audio deps: needed for voice/live audio features
+# Audio routing deps: only needed for spawn_live_audio (voice calls through
+# third-party apps like WhatsApp). Browser-based voice works without these.
 check_audio() {
     local all_ok=true
 
     echo ""
-    echo "Audio/voice dependencies:"
+    echo "Audio routing dependencies (optional — for voice calls through apps):"
 
     if has_cmd SwitchAudioSource; then
         ok "SwitchAudioSource"
@@ -264,10 +265,10 @@ run_check() {
     check_core       && core_ok=true  || core_ok=false
     check_computer_use && cu_ok=true  || cu_ok=false
 
-    if ! $MINIMAL; then
+    if $INCLUDE_AUDIO_ROUTING; then
         check_audio    && audio_ok=true || audio_ok=false
-        check_recording && rec_ok=true  || rec_ok=false
     fi
+    check_recording && rec_ok=true  || rec_ok=false
 
     check_wasm
 
@@ -280,17 +281,20 @@ run_check() {
         echo "  Core + computer-use: missing dependencies"
     fi
 
-    if ! $MINIMAL; then
+    if ${rec_ok:-false}; then
+        echo "  Recording: ready"
+    else
+        echo "  Recording: missing dependencies"
+    fi
+
+    if $INCLUDE_AUDIO_ROUTING; then
         if ${audio_ok:-false}; then
-            echo "  Audio/voice: ready"
+            echo "  Audio routing: ready"
         else
-            echo "  Audio/voice: missing dependencies"
+            echo "  Audio routing: missing dependencies"
         fi
-        if ${rec_ok:-false}; then
-            echo "  Recording: ready"
-        else
-            echo "  Recording: missing dependencies"
-        fi
+    else
+        echo "  Audio routing: skipped (use --all to include)"
     fi
 
     echo ""
@@ -310,15 +314,12 @@ run_install() {
     # Phase 2: Homebrew packages
     info "installing Homebrew packages..."
     brew_install cliclick
+    brew_install ffmpeg
 
-    if ! $MINIMAL; then
+    # Phase 3: Audio routing (optional — only for voice calls through apps)
+    if $INCLUDE_AUDIO_ROUTING; then
         brew_install switchaudio-osx
         brew_install sox
-        brew_install ffmpeg
-    fi
-
-    # Phase 3: BlackHole (interactive — needs user approval for kernel extension)
-    if ! $MINIMAL; then
         install_blackhole
     fi
 
@@ -336,9 +337,10 @@ run_install() {
     echo "    ./target/release/intendant \"your task\""
     echo ""
 
-    if $MINIMAL; then
-        echo "  Audio/voice features were skipped (--minimal)."
-        echo "  Re-run without --minimal to install them later."
+    if ! $INCLUDE_AUDIO_ROUTING; then
+        echo "  Audio routing (voice calls through apps) was skipped."
+        echo "  Browser-based voice works without it."
+        echo "  Run with --all to install audio routing deps later."
         echo ""
     fi
 }

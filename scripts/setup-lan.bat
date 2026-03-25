@@ -1,20 +1,18 @@
-#Requires -RunAsAdministrator
-<#
-.SYNOPSIS
-    Intendant LAN Access Setup for Windows hosts with a Linux guest.
-
-.DESCRIPTION
-    Interactive setup that configures port forwarding from the Windows host
-    to a Linux guest (WSL2 or VM) running intendant, then runs setup-lan.sh
-    inside the guest to configure nginx with mTLS.
-
-    Run without parameters for the interactive wizard.
-    Use -Remove, -Recert, or -Force for maintenance operations.
-
-.EXAMPLE
-    .\setup-lan.ps1              # Interactive setup wizard
-    .\setup-lan.ps1 -Remove      # Uninstall everything
-    .\setup-lan.ps1 -Recert      # Regenerate server cert (IP changed)
+<# : setup-lan.bat -- Double-click to run Intendant LAN Access Setup
+@echo off
+setlocal
+cd /d "%~dp0"
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Requesting administrator privileges...
+    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    exit /b
+)
+copy "%~f0" "%TEMP%\setup-lan.ps1" >nul
+powershell -ExecutionPolicy Bypass -NoProfile -File "%TEMP%\setup-lan.ps1" %*
+del "%TEMP%\setup-lan.ps1" >nul 2>&1
+pause
+exit /b
 #>
 
 param(
@@ -26,11 +24,13 @@ param(
 $ErrorActionPreference = "Stop"
 $FwRuleName = "Intendant LAN Access"
 
-# State — populated by wizard or loaded from config
+# State -- populated by wizard or loaded from config
 $script:Mode = ""
 $script:GuestIp = ""
 $script:VmUser = ""
 $script:VmAddress = ""
+$script:SshHost = ""
+$script:SshPort = 22
 $script:Port = 8443
 $script:CertPort = 9999
 $script:ConfigPath = Join-Path $env:USERPROFILE ".intendant-lan.json"
@@ -62,13 +62,15 @@ function Ask-Choice($prompt, $options) {
     }
 }
 
-# ── Config persistence ──
+# -- Config persistence --
 
 function Save-Config {
     @{
         Mode      = $script:Mode
         VmAddress = $script:VmAddress
         VmUser    = $script:VmUser
+        SshHost   = $script:SshHost
+        SshPort   = $script:SshPort
         Port      = $script:Port
     } | ConvertTo-Json | Set-Content $script:ConfigPath
 }
@@ -79,17 +81,19 @@ function Load-Config {
         $script:Mode      = $cfg.Mode
         $script:VmAddress = $cfg.VmAddress
         $script:VmUser    = $cfg.VmUser
+        $script:SshHost   = if ($cfg.SshHost) { $cfg.SshHost } else { $cfg.VmAddress }
+        $script:SshPort   = if ($cfg.SshPort) { $cfg.SshPort } else { 22 }
         $script:Port      = $cfg.Port
         return $true
     }
     return $false
 }
 
-# ── Network helpers ──
+# -- Network helpers --
 
 function Get-WslIp {
     $ip = wsl hostname -I 2>$null
-    if (-not $ip) { Die "could not get WSL IP — is WSL running? Start it with: wsl" }
+    if (-not $ip) { Die "could not get WSL IP -- is WSL running? Start it with: wsl" }
     return ($ip.Trim() -split '\s+')[0]
 }
 
@@ -110,7 +114,7 @@ function Resolve-GuestIp {
     }
 }
 
-# ── Port forwarding & firewall ──
+# -- Port forwarding & firewall --
 
 function Add-PortForwarding {
     $ports = @($script:Port, $script:CertPort)
@@ -148,13 +152,21 @@ function Remove-FirewallRule {
     Info "firewall rule removed"
 }
 
-# ── Guest communication ──
+# -- Guest communication --
+
+function Get-SshArgs {
+    $args = @()
+    if ($script:SshPort -ne 22) { $args += @("-p", $script:SshPort) }
+    $args += "$($script:VmUser)@$($script:SshHost)"
+    return $args
+}
 
 function Invoke-GuestCommand($cmd) {
     if ($script:Mode -eq "wsl") {
         wsl bash -c $cmd
     } else {
-        ssh "$($script:VmUser)@$($script:VmAddress)" $cmd
+        $sshArgs = Get-SshArgs
+        ssh @sshArgs $cmd
     }
 }
 
@@ -169,27 +181,30 @@ function Copy-ScriptToGuest {
         wsl cp $wslPath /tmp/setup-lan.sh
         wsl chmod +x /tmp/setup-lan.sh
     } else {
-        scp $scriptPath "$($script:VmUser)@$($script:VmAddress):/tmp/setup-lan.sh"
-        ssh "$($script:VmUser)@$($script:VmAddress)" "chmod +x /tmp/setup-lan.sh"
+        $scpPort = if ($script:SshPort -ne 22) { @("-P", $script:SshPort) } else { @() }
+        scp @scpPort $scriptPath "$($script:VmUser)@$($script:SshHost):/tmp/setup-lan.sh"
+        $sshArgs = Get-SshArgs
+        ssh @sshArgs "chmod +x /tmp/setup-lan.sh"
     }
 }
 
 function Test-GuestSsh {
     try {
-        ssh -o BatchMode=yes -o ConnectTimeout=5 "$($script:VmUser)@$($script:VmAddress)" "echo ok" 2>$null | Out-Null
+        $portArgs = if ($script:SshPort -ne 22) { @("-p", $script:SshPort) } else { @() }
+        ssh -o BatchMode=yes -o ConnectTimeout=5 @portArgs "$($script:VmUser)@$($script:SshHost)" "echo ok" 2>$null | Out-Null
         return $true
     } catch {
         return $false
     }
 }
 
-# ── Interactive wizard ──
+# -- Interactive wizard --
 
 function Run-Wizard {
     Write-Host ""
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host "  Intendant LAN Access Setup" -ForegroundColor Cyan
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
 
     # Step 1: Guest type
     $guestChoice = Ask-Choice "Where is intendant running?" @(
@@ -211,21 +226,80 @@ function Run-Wizard {
         Info "detected WSL IP: $($script:GuestIp)"
     } else {
         $script:Mode = "vm"
+        $isVirtualBoxNat = $false
 
-        Write-Host ""
-        $script:VmAddress = Ask "Guest IP address"
-        if (-not $script:VmAddress) { Die "IP address is required" }
+        # VirtualBox NAT needs special handling
+        if ($guestChoice -eq 2) {
+            Write-Host ""
+            Write-Host "  How to check:" -ForegroundColor Yellow
+            Write-Host "    Open VirtualBox > select your VM > Settings > Network."
+            Write-Host "    'Attached to' shows your network mode."
+            Write-Host ""
+            $netChoice = Ask-Choice "What network mode is the VM using?" @(
+                "NAT (default -- you haven't changed network settings)"
+                "Bridged Adapter (the VM has its own IP on your network)"
+                "Not sure"
+            )
+            if ($netChoice -eq 2) {
+                Write-Host ""
+                Write-Host "  If you never changed the VirtualBox network settings," -ForegroundColor Yellow
+                Write-Host "  it's almost certainly NAT. Choosing NAT for you." -ForegroundColor Yellow
+                $netChoice = 0
+            }
+            $isVirtualBoxNat = ($netChoice -eq 0)
+        }
+
+        if ($isVirtualBoxNat) {
+            Write-Host ""
+            Info "VirtualBox NAT mode: connections go through port forwarding"
+            Write-Host ""
+            Write-Host "  Before continuing, set up port forwarding in VirtualBox:" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "    1. Open VirtualBox > select your VM > Settings > Network"
+            Write-Host "    2. Expand 'Advanced' > click 'Port Forwarding'"
+            Write-Host "    3. Add these rules (click the + icon):"
+            Write-Host ""
+            Write-Host "       Name      Host IP      Host Port   Guest Port" -ForegroundColor Cyan
+            Write-Host "       SSH       127.0.0.1    2222        22"
+            Write-Host "       HTTPS     127.0.0.1    8443        8443"
+            Write-Host "       Cert      127.0.0.1    9999        9999"
+            Write-Host ""
+            Write-Host "    4. Click OK, then OK again to save."
+            Write-Host ""
+
+            $ready = Ask "Press Enter when done (or 'q' to quit)" ""
+            if ($ready -eq "q") { exit 0 }
+
+            $script:SshHost = "127.0.0.1"
+            $sshPortInput = Ask "SSH host port from step 3 above" "2222"
+            $script:SshPort = [int]$sshPortInput
+            $script:VmAddress = "127.0.0.1"
+            $script:GuestIp = "127.0.0.1"
+        } else {
+            Write-Host ""
+            $script:VmAddress = Ask "Guest IP address"
+            if (-not $script:VmAddress) { Die "IP address is required" }
+            $script:SshHost = $script:VmAddress
+            $script:SshPort = 22
+            $script:GuestIp = $script:VmAddress
+        }
 
         $script:VmUser = Ask "SSH username on the guest" $env:USERNAME
 
-        Info "testing SSH connection to $($script:VmUser)@$($script:VmAddress)..."
+        $sshDisplay = if ($script:SshPort -ne 22) { "$($script:SshHost):$($script:SshPort)" } else { $script:SshHost }
+        Info "testing SSH connection to $($script:VmUser)@$sshDisplay..."
         if (-not (Test-GuestSsh)) {
             Warn "could not connect via SSH"
             Write-Host ""
             Write-Host "  Make sure:" -ForegroundColor Yellow
             Write-Host "    - The VM is running"
             Write-Host "    - SSH server is installed: sudo apt install openssh-server"
-            Write-Host "    - You can SSH manually: ssh $($script:VmUser)@$($script:VmAddress)"
+            if ($isVirtualBoxNat) {
+                Write-Host "    - VirtualBox port forwarding is configured (see above)"
+                Write-Host "    - You can SSH manually: ssh -p $($script:SshPort) $($script:VmUser)@$($script:SshHost)"
+            } else {
+                Write-Host "    - You can SSH manually: ssh $($script:VmUser)@$($script:SshHost)"
+            }
             Write-Host ""
             $retry = Ask "Try again after fixing? (y/n)" "y"
             if ($retry -eq "y") {
@@ -235,8 +309,6 @@ function Run-Wizard {
             }
         }
         Info "SSH connection OK"
-
-        $script:GuestIp = $script:VmAddress
     }
 
     # Step 2: Port
@@ -249,12 +321,15 @@ function Run-Wizard {
 
     # Step 4: Confirm
     Write-Host ""
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host "  Setup Summary" -ForegroundColor Cyan
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Guest type:    $($script:Mode)"
     Write-Host "  Guest address: $($script:GuestIp)"
+    if ($script:SshPort -ne 22) {
+        Write-Host "  SSH via:       $($script:SshHost):$($script:SshPort)"
+    }
     Write-Host "  Host LAN IP:   $hostIp"
     Write-Host "  HTTPS port:    $($script:Port)"
     Write-Host "  Phone URL:     https://${hostIp}:$($script:Port)"
@@ -266,7 +341,7 @@ function Run-Wizard {
     # Step 5: Execute
     Write-Host ""
 
-    # Set up port forwarding FIRST — setup-lan.sh will start a temporary
+    # Set up port forwarding FIRST -- setup-lan.sh will start a temporary
     # HTTP server for cert download, which needs to be reachable from the phone
     Info "setting up Windows port forwarding..."
     Add-PortForwarding
@@ -286,12 +361,12 @@ function Run-Wizard {
     if ($script:Mode -eq "wsl") {
         Write-Host ""
         Warn "WSL2's IP changes on every restart. After rebooting, run:"
-        Warn "  .\setup-lan.ps1 -Recert"
+        Warn "  .\setup-lan.bat -Recert"
         Write-Host ""
         $autoTask = Ask "Create a scheduled task to do this automatically at login? (y/n)" "y"
         if ($autoTask -eq "y") {
             $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-                -Argument "-WindowStyle Hidden -File `"$PSCommandPath`" -Recert"
+                -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Recert"
             $trigger = New-ScheduledTaskTrigger -AtLogOn
             Register-ScheduledTask -TaskName "IntendantLAN" -Action $action `
                 -Trigger $trigger -RunLevel Highest -Force | Out-Null
@@ -300,19 +375,19 @@ function Run-Wizard {
     }
 
     Write-Host ""
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "========================================================" -ForegroundColor Green
     Write-Host "  Setup complete!" -ForegroundColor Green
-    Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "========================================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "  Phone connects to: https://${hostIp}:$($script:Port)"
     Write-Host ""
 }
 
-# ── Maintenance commands ──
+# -- Maintenance commands --
 
 function Run-Remove {
     if (-not (Load-Config)) {
-        Warn "no saved config found — using defaults"
+        Warn "no saved config found -- using defaults"
         $script:Port = 8443
     }
 
@@ -339,7 +414,7 @@ function Run-Remove {
 
 function Run-Recert {
     if (-not (Load-Config)) {
-        Die "no saved config found — run the setup wizard first"
+        Die "no saved config found -- run the setup wizard first"
     }
 
     Resolve-GuestIp
@@ -358,10 +433,10 @@ function Run-Recert {
 
     $hostIp = Get-HostLanIp
     Write-Host ""
-    Info "done — phone connects to: https://${hostIp}:$($script:Port)"
+    Info "done -- phone connects to: https://${hostIp}:$($script:Port)"
 }
 
-# ── Main ──
+# -- Main --
 
 if ($Remove) {
     Run-Remove
