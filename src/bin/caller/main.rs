@@ -4093,6 +4093,33 @@ async fn activate_user_display(bus: &EventBus) {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    if vnc_port.is_none() {
+        // Try to enable macOS Screen Sharing (VNC on port 5900).
+        // Requires passwordless sudo (common in dev environments).
+        let status = tokio::process::Command::new("sudo")
+            .args([
+                "launchctl", "load", "-w",
+                "/System/Library/LaunchDaemons/com.apple.screensharing.plist",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if status.map(|s| s.success()).unwrap_or(false) {
+            // Brief wait for the VNC server to bind
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            vnc_port = vision::detect_vnc_port(display_id);
+        }
+        if vnc_port.is_none() {
+            eprintln!(
+                "[user_display] macOS Screen Sharing not available on port 5900. \
+                 Enable it in System Settings > General > Sharing > Screen Sharing \
+                 for remote VNC access to the user display."
+            );
+        }
+    }
+
     bus.send(AppEvent::DisplayReady {
         display_id,
         vnc_port,
