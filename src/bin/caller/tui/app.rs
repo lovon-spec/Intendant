@@ -1383,6 +1383,8 @@ impl App {
                 std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
                 self.log(LogLevel::Warn, "User display access granted".to_string());
                 self.broadcast_control(OutboundEvent::UserDisplayGranted);
+                // Emit to EventBus so spawn_user_display_listener activates VNC + recording
+                self.pending_derived.push(AppEvent::UserDisplayGranted);
             }
             ControlMsg::RevokeUserDisplay { note } => {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1402,7 +1404,8 @@ impl App {
                         .unwrap_or_default()
                 );
                 self.log(LogLevel::Warn, msg);
-                self.broadcast_control(OutboundEvent::UserDisplayRevoked { note });
+                self.broadcast_control(OutboundEvent::UserDisplayRevoked { note: note.clone() });
+                self.pending_derived.push(AppEvent::UserDisplayRevoked { note });
             }
             ControlMsg::InvokeSkill {
                 skill_name,
