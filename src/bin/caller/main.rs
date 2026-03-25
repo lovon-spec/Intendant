@@ -13,6 +13,7 @@ mod live_audio;
 mod live_audio_types;
 mod mcp;
 mod mcp_client;
+mod platform;
 mod presence;
 mod project;
 mod audio_routing;

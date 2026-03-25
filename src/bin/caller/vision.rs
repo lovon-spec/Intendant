@@ -18,7 +18,7 @@ pub(crate) fn read_lock_pid(lock_path: &str) -> Option<u32> {
 /// Check if a lock file is stale (the PID inside is no longer running).
 pub(crate) fn is_lock_stale(lock_path: &str) -> bool {
     match read_lock_pid(lock_path) {
-        Some(pid) => !std::path::Path::new(&format!("/proc/{}", pid)).exists(),
+        Some(pid) => !super::platform::process_alive(pid),
         None => false, // can't read/parse → assume not stale
     }
 }
@@ -30,13 +30,10 @@ pub(crate) fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
         Some(p) => p,
         None => return false,
     };
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    let cmdline = match std::fs::read(&cmdline_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
+    let cmdline_str = match super::platform::process_cmdline(pid) {
+        Some(s) => s,
+        None => return false,
     };
-    // /proc/pid/cmdline is NUL-separated; replace NULs with spaces for easy matching
-    let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
     let expected = format!("Xvfb :{}", display_id);
     cmdline_str.starts_with(&expected)
 }

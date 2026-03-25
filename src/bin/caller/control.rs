@@ -1,7 +1,7 @@
 use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::types::OutboundEvent;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -32,7 +32,7 @@ pub fn spawn_control_server(
                 return;
             }
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
@@ -40,11 +40,11 @@ pub fn spawn_control_server(
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(unix)]
                     {
-                        let current_uid = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
-                        if let (Some(uid), Ok(cred)) = (current_uid, stream.peer_cred()) {
-                            if cred.uid() != uid {
+                        let current_uid = super::platform::current_uid();
+                        if let Ok(cred) = stream.peer_cred() {
+                            if cred.uid() != current_uid {
                                 continue;
                             }
                         }

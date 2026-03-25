@@ -546,12 +546,6 @@ fn read_trimmed(path: &std::path::Path) -> Option<String> {
     }
 }
 
-fn pid_is_alive(pid: u32) -> bool {
-    std::path::PathBuf::from("/proc")
-        .join(pid.to_string())
-        .exists()
-}
-
 fn parse_pid_file(path: &std::path::Path) -> Option<u32> {
     read_trimmed(path)?.parse::<u32>().ok()
 }
@@ -634,7 +628,7 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
 
     let lock_dir = loop_dir.join("active.lock");
     let lock_owner_pid = parse_pid_file(&lock_dir.join("pid"));
-    let lock_owner_alive = lock_owner_pid.map(pid_is_alive).unwrap_or(false);
+    let lock_owner_alive = lock_owner_pid.map(super::platform::process_alive).unwrap_or(false);
 
     let mut active_wrappers = Vec::new();
     let mut active_codex = Vec::new();
@@ -645,7 +639,7 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
             .unwrap_or("")
             .to_string();
         if let Some(pid) = parse_pid_file(&run.join("wrapper.pid")) {
-            if pid_is_alive(pid) {
+            if super::platform::process_alive(pid) {
                 active_wrappers.push(serde_json::json!({
                     "run_id": run_id,
                     "pid": pid
@@ -653,7 +647,7 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
             }
         }
         if let Some(pid) = parse_pid_file(&run.join("codex.pid")) {
-            if pid_is_alive(pid) {
+            if super::platform::process_alive(pid) {
                 active_codex.push(serde_json::json!({
                     "run_id": run_id,
                     "pid": pid
