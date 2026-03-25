@@ -4095,27 +4095,34 @@ async fn activate_user_display(bus: &EventBus) {
 
     #[cfg(target_os = "macos")]
     if vnc_port.is_none() {
-        // Try to enable macOS Screen Sharing (VNC on port 5900).
-        // Requires passwordless sudo (common in dev environments).
-        let status = tokio::process::Command::new("sudo")
-            .args([
-                "launchctl", "load", "-w",
-                "/System/Library/LaunchDaemons/com.apple.screensharing.plist",
-            ])
+        // Open System Settings to the Screen Sharing pane so the user can
+        // enable it with one click. Once VNC is up on port 5900, the web
+        // dashboard can connect and any further security prompts can be
+        // resolved through the VNC viewer.
+        eprintln!(
+            "[user_display] Screen Sharing not detected on port 5900. \
+             Opening System Settings — please enable Screen Sharing."
+        );
+        let _ = tokio::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.Sharing-Settings.extension")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .await;
-        if status.map(|s| s.success()).unwrap_or(false) {
-            // Brief wait for the VNC server to bind
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            vnc_port = vision::detect_vnc_port(display_id);
+
+        // Poll for VNC to come up (user needs to click the toggle)
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if let Some(port) = vision::detect_vnc_port(display_id) {
+                vnc_port = Some(port);
+                eprintln!("[user_display] Screen Sharing detected on port {}", port);
+                break;
+            }
         }
         if vnc_port.is_none() {
             eprintln!(
-                "[user_display] macOS Screen Sharing not available on port 5900. \
-                 Enable it in System Settings > General > Sharing > Screen Sharing \
-                 for remote VNC access to the user display."
+                "[user_display] Screen Sharing still not detected after 30s. \
+                 Continuing without VNC — browser streaming still works."
             );
         }
     }
