@@ -211,6 +211,69 @@ impl Conversation {
         });
     }
 
+    /// Resolve any dangling tool calls at the end of the conversation.
+    ///
+    /// When the agent loop exits early (denial, error, budget exhaustion), it may
+    /// leave an assistant message with `tool_calls` but no corresponding `tool`
+    /// result messages.  APIs (especially OpenAI) reject conversations in this
+    /// state.  This method walks backward from the tail, collects every tool-call
+    /// ID that lacks a result, and appends a synthetic result for each one.
+    ///
+    /// Returns the number of synthetic results added.
+    pub fn resolve_dangling_tool_calls(&mut self) -> usize {
+        // Collect tool-call IDs that already have results.
+        let answered: std::collections::HashSet<&str> = self
+            .messages
+            .iter()
+            .filter_map(|m| {
+                if m.role == "tool" {
+                    m.tool_call_id.as_deref()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Walk backward to find the most recent assistant message with tool_calls.
+        // (There should be at most one trailing batch of unanswered calls.)
+        let mut to_resolve: Vec<(String, String)> = Vec::new();
+        for msg in self.messages.iter().rev() {
+            if msg.role == "assistant" {
+                if let Some(ref calls) = msg.tool_calls {
+                    for tc in calls {
+                        let key = if tc.call_id.is_empty() {
+                            &tc.id
+                        } else {
+                            &tc.call_id
+                        };
+                        if !answered.contains(key.as_str()) {
+                            to_resolve.push((key.clone(), tc.name.clone()));
+                        }
+                    }
+                }
+                // Only check the most recent assistant message with tool calls.
+                if !to_resolve.is_empty() {
+                    break;
+                }
+            }
+            // Stop scanning once we hit a user message — anything before that
+            // belongs to a prior turn that was properly closed.
+            if msg.role == "user" {
+                break;
+            }
+        }
+
+        let count = to_resolve.len();
+        for (call_id, name) in to_resolve {
+            self.add_tool_result(
+                &call_id,
+                &name,
+                "[interrupted] Task was interrupted before this tool call could execute.",
+            );
+        }
+        count
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -1226,5 +1289,107 @@ mod tests {
         });
         // 50% is below 0.60 threshold
         assert!(!conv.auto_compact_at(0.60));
+    }
+
+    #[test]
+    fn resolve_dangling_tool_calls_adds_synthetic_results() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("do something".to_string());
+        conv.add_assistant_tool_calls(
+            "I'll run two commands.".to_string(),
+            vec![
+                ToolCallRef {
+                    id: "fc_1".to_string(),
+                    call_id: "call_1".to_string(),
+                    name: "exec_command".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                ToolCallRef {
+                    id: "fc_2".to_string(),
+                    call_id: "call_2".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ],
+            None,
+        );
+        // No tool results added — simulates early exit from agent loop
+
+        let resolved = conv.resolve_dangling_tool_calls();
+        assert_eq!(resolved, 2);
+
+        // Both should now have synthetic results
+        let messages = conv.messages();
+        let tool_msgs: Vec<_> = messages.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("call_2"));
+        assert!(tool_msgs[0].content.contains("interrupted"));
+    }
+
+    #[test]
+    fn resolve_dangling_tool_calls_partial() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("do something".to_string());
+        conv.add_assistant_tool_calls(
+            "Running.".to_string(),
+            vec![
+                ToolCallRef {
+                    id: "fc_1".to_string(),
+                    call_id: "call_1".to_string(),
+                    name: "exec_command".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                ToolCallRef {
+                    id: "fc_2".to_string(),
+                    call_id: "call_2".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ],
+            None,
+        );
+        // Only one tool result was added before early exit
+        conv.add_tool_result("call_1", "exec_command", "ok");
+
+        let resolved = conv.resolve_dangling_tool_calls();
+        assert_eq!(resolved, 1);
+
+        let tool_msgs: Vec<_> = conv.messages().iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool_msgs[0].content, "ok");
+        assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("call_2"));
+        assert!(tool_msgs[1].content.contains("interrupted"));
+    }
+
+    #[test]
+    fn resolve_dangling_tool_calls_noop_when_complete() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("do something".to_string());
+        conv.add_assistant_tool_calls(
+            "Running.".to_string(),
+            vec![ToolCallRef {
+                id: "fc_1".to_string(),
+                call_id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            None,
+        );
+        conv.add_tool_result("call_1", "exec_command", "done");
+
+        let resolved = conv.resolve_dangling_tool_calls();
+        assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn resolve_dangling_tool_calls_noop_on_text_only() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("hello".to_string());
+        conv.add_assistant("hi there".to_string());
+
+        let resolved = conv.resolve_dangling_tool_calls();
+        assert_eq!(resolved, 0);
     }
 }

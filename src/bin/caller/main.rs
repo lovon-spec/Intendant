@@ -3333,6 +3333,21 @@ async fn run_with_presence(
             // ── Subsequent task: inject into existing conversation ──
             let conv = persistent_conv.as_mut().unwrap();
 
+            // If the previous round exited with dangling tool calls (e.g. the
+            // agent loop returned due to denial, error, or budget exhaustion
+            // after the assistant message was recorded but before tool results
+            // were added), resolve them now.  Without this, the API will reject
+            // the conversation with "No tool output found for function call …".
+            let resolved = conv.resolve_dangling_tool_calls();
+            if resolved > 0 {
+                slog(&session_log, |l| {
+                    l.info(&format!(
+                        "Resolved {} dangling tool call(s) from previous round",
+                        resolved
+                    ))
+                });
+            }
+
             if frame_images.is_empty() {
                 conv.add_user(format!("[New Task] {}", task_text));
             } else {
