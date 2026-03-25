@@ -4,8 +4,8 @@
 //! - Model audio output → virtual mic → app reads as mic input
 //! - App audio output → virtual speaker → captured and sent to model
 //!
-//! On Linux, uses PulseAudio null sinks. macOS support (CoreAudio + virtual
-//! audio driver) is planned but not yet implemented.
+//! On Linux, uses PulseAudio null sinks. On macOS, uses BlackHole virtual
+//! audio driver with SwitchAudioSource for device management.
 
 use crate::error::CallerError;
 use std::process::Stdio;
@@ -400,28 +400,51 @@ async fn move_stream(
     Ok(())
 }
 
-// ─── macOS stub (CoreAudio) ─────────────────────────────────────────────────
+// ─── macOS backend (BlackHole + SwitchAudioSource) ──────────────────────────
+//
+// Requires:
+// - BlackHole 2ch AND BlackHole 16ch: https://github.com/ExistentialAudio/BlackHole
+// - SwitchAudioSource: brew install switchaudio-osx
+// - sox (with CoreAudio support): brew install sox
+//
+// BlackHole 2ch = virtual mic (model output → app mic input)
+// BlackHole 16ch = virtual speaker (app audio output → model capture)
 
 #[cfg(target_os = "macos")]
 struct PlatformBridge {
+    /// BlackHole device used as virtual mic (model plays here, apps read as mic).
     mic_device_name: String,
+    /// BlackHole device used as virtual speaker (apps play here, model captures).
     speaker_device_name: String,
 }
 
 #[cfg(target_os = "macos")]
 impl PlatformBridge {
     async fn is_available() -> bool {
-        // TODO: Check for BlackHole or similar virtual audio driver
-        false
+        has_switchaudio().await && find_blackhole_devices().await.is_some()
     }
 
     async fn create(_session_id: &str) -> Result<Self, CallerError> {
-        Err(CallerError::Agent(
-            "macOS virtual audio routing is not yet implemented. \
-             Install BlackHole (https://github.com/ExistentialAudio/BlackHole) \
-             and check back later."
-                .to_string(),
-        ))
+        if !has_switchaudio().await {
+            return Err(CallerError::Agent(
+                "SwitchAudioSource is required for audio routing on macOS. \
+                 Install with: brew install switchaudio-osx"
+                    .into(),
+            ));
+        }
+        let (mic, speaker) = find_blackhole_devices().await.ok_or_else(|| {
+            CallerError::Agent(
+                "BlackHole virtual audio driver not found. Two instances are required \
+                 for bidirectional audio: BlackHole 2ch (virtual mic) and \
+                 BlackHole 16ch (app capture). Install from: \
+                 https://github.com/ExistentialAudio/BlackHole"
+                    .into(),
+            )
+        })?;
+        Ok(Self {
+            mic_device_name: mic,
+            speaker_device_name: speaker,
+        })
     }
 
     fn model_output_device(&self) -> &str {
@@ -433,54 +456,164 @@ impl PlatformBridge {
     }
 
     fn capture_command(&self, sample_rate: u32) -> (&'static str, Vec<String>) {
-        // TODO: Use sox or ffmpeg with CoreAudio input
-        ("sox", vec![
-            "-t".into(), "coreaudio".into(),
-            self.speaker_device_name.clone(),
-            "-t".into(), "raw".into(),
-            "-r".into(), sample_rate.to_string(),
-            "-e".into(), "signed-integer".into(),
-            "-b".into(), "16".into(),
-            "-c".into(), "1".into(),
-            "-".into(),
-        ])
+        (
+            "sox",
+            vec![
+                "-t".into(), "coreaudio".into(),
+                self.speaker_device_name.clone(),
+                "-t".into(), "raw".into(),
+                "-r".into(), sample_rate.to_string(),
+                "-e".into(), "signed-integer".into(),
+                "-b".into(), "16".into(),
+                "-c".into(), "1".into(),
+                "-".into(),
+            ],
+        )
     }
 
     fn playback_command(&self, sample_rate: u32) -> (&'static str, Vec<String>) {
-        // TODO: Use sox or ffmpeg with CoreAudio output
-        ("sox", vec![
-            "-t".into(), "raw".into(),
-            "-r".into(), sample_rate.to_string(),
-            "-e".into(), "signed-integer".into(),
-            "-b".into(), "16".into(),
-            "-c".into(), "1".into(),
-            "-".into(),
-            "-t".into(), "coreaudio".into(),
-            self.mic_device_name.clone(),
-        ])
+        (
+            "sox",
+            vec![
+                "-t".into(), "raw".into(),
+                "-r".into(), sample_rate.to_string(),
+                "-e".into(), "signed-integer".into(),
+                "-b".into(), "16".into(),
+                "-c".into(), "1".into(),
+                "-".into(),
+                "-t".into(), "coreaudio".into(),
+                self.mic_device_name.clone(),
+            ],
+        )
     }
 
     async fn get_defaults(&self) -> Result<(String, String), CallerError> {
-        Err(CallerError::Agent("macOS get_defaults not yet implemented".into()))
+        let source = switchaudio_get_current("input").await?;
+        let sink = switchaudio_get_current("output").await?;
+        Ok((source, sink))
     }
 
     async fn set_as_default(&self) -> Result<(), CallerError> {
-        Err(CallerError::Agent("macOS set_as_default not yet implemented".into()))
+        // Default input = mic device (apps record model output from here)
+        switchaudio_set(&self.mic_device_name, "input").await?;
+        // Default output = speaker device (apps play audio here for model to capture)
+        switchaudio_set(&self.speaker_device_name, "output").await?;
+        Ok(())
     }
 
-    fn set_default_source(&self, _name: &str) {}
-    fn set_default_sink(&self, _name: &str) {}
+    fn set_default_source(&self, name: &str) {
+        let _ = std::process::Command::new("SwitchAudioSource")
+            .args(["-s", name, "-t", "input"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    fn set_default_sink(&self, name: &str) {
+        let _ = std::process::Command::new("SwitchAudioSource")
+            .args(["-s", name, "-t", "output"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 
     async fn route_app(&self, _app_name: &str) -> Result<(), CallerError> {
-        Err(CallerError::Agent("macOS per-app routing not yet implemented".into()))
+        Err(CallerError::Agent(
+            "Per-app audio routing is not supported on macOS. \
+             Use set_as_default to route all audio through the bridge."
+                .into(),
+        ))
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for PlatformBridge {
     fn drop(&mut self) {
-        // TODO: Clean up CoreAudio virtual devices
+        // BlackHole devices are system-level (kernel extension), no cleanup needed.
+        // Default device restoration is handled by AudioBridge::drop.
     }
+}
+
+// ─── macOS helpers ──────────────────────────────────────────────────────────
+
+/// Check if SwitchAudioSource CLI is installed.
+#[cfg(target_os = "macos")]
+async fn has_switchaudio() -> bool {
+    tokio::process::Command::new("SwitchAudioSource")
+        .args(["-a", "-t", "output"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Find BlackHole 2ch and 16ch devices. Returns (mic_device, speaker_device).
+#[cfg(target_os = "macos")]
+async fn find_blackhole_devices() -> Option<(String, String)> {
+    // List all output devices — BlackHole appears as both input and output
+    let output = tokio::process::Command::new("SwitchAudioSource")
+        .args(["-a", "-t", "output"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+
+    let devices = String::from_utf8_lossy(&output.stdout);
+    let has_2ch = devices.lines().any(|l| l.trim() == "BlackHole 2ch");
+    let has_16ch = devices.lines().any(|l| l.trim() == "BlackHole 16ch");
+
+    if has_2ch && has_16ch {
+        // 2ch = virtual mic (model → app), 16ch = virtual speaker (app → model)
+        Some(("BlackHole 2ch".into(), "BlackHole 16ch".into()))
+    } else {
+        None
+    }
+}
+
+/// Get the current default device for a given type ("input" or "output").
+#[cfg(target_os = "macos")]
+async fn switchaudio_get_current(device_type: &str) -> Result<String, CallerError> {
+    let output = tokio::process::Command::new("SwitchAudioSource")
+        .args(["-c", "-t", device_type])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| CallerError::Agent(format!("SwitchAudioSource failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CallerError::Agent(format!(
+            "SwitchAudioSource -c -t {} failed: {}",
+            device_type, stderr
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Set the default device for a given type ("input" or "output").
+#[cfg(target_os = "macos")]
+async fn switchaudio_set(device_name: &str, device_type: &str) -> Result<(), CallerError> {
+    let output = tokio::process::Command::new("SwitchAudioSource")
+        .args(["-s", device_name, "-t", device_type])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| CallerError::Agent(format!("SwitchAudioSource failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CallerError::Agent(format!(
+            "SwitchAudioSource -s '{}' -t {} failed: {}",
+            device_name, device_type, stderr
+        )));
+    }
+    Ok(())
 }
 
 // ─── Fallback for other platforms ───────────────────────────────────────────
@@ -612,5 +745,43 @@ Source Output #7
         let (cmd, args) = bridge.playback_command(24000);
         assert_eq!(cmd, "pacat");
         assert!(args.iter().any(|a| a.contains("intendant_mic_test")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_command_uses_sox_coreaudio() {
+        let bridge = PlatformBridge {
+            mic_device_name: "BlackHole 2ch".into(),
+            speaker_device_name: "BlackHole 16ch".into(),
+        };
+        let (cmd, args) = bridge.capture_command(24000);
+        assert_eq!(cmd, "sox");
+        assert!(args.contains(&"coreaudio".into()));
+        assert!(args.contains(&"BlackHole 16ch".into()));
+        assert!(args.contains(&"24000".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn playback_command_uses_sox_coreaudio() {
+        let bridge = PlatformBridge {
+            mic_device_name: "BlackHole 2ch".into(),
+            speaker_device_name: "BlackHole 16ch".into(),
+        };
+        let (cmd, args) = bridge.playback_command(24000);
+        assert_eq!(cmd, "sox");
+        assert!(args.contains(&"coreaudio".into()));
+        assert!(args.contains(&"BlackHole 2ch".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn model_output_is_mic_device() {
+        let bridge = PlatformBridge {
+            mic_device_name: "BlackHole 2ch".into(),
+            speaker_device_name: "BlackHole 16ch".into(),
+        };
+        assert_eq!(bridge.model_output_device(), "BlackHole 2ch");
+        assert_eq!(bridge.app_capture_device(), "BlackHole 16ch");
     }
 }
