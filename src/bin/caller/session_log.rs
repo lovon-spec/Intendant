@@ -427,6 +427,475 @@ impl SessionLog {
         });
     }
 
+    // ---- Event-bus-driven logging methods ----
+    // These are called by spawn_session_log_writer() for events that flow
+    // through the AppEvent bus but were not previously persisted to disk.
+
+    /// Log a done signal from the agent.
+    pub fn done_signal(&mut self, message: Option<&str>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            event: "done_signal".to_string(),
+            level: Some("info".to_string()),
+            message: Some(message.unwrap_or("Agent signalled done").to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log task completion.
+    pub fn task_complete(&mut self, reason: &str, summary: Option<&str>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "task_complete".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Task complete: {}", reason)),
+            data: Some(serde_json::json!({
+                "reason": reason,
+                "summary": summary,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a new session starting (MCP multi-task).
+    pub fn session_started(&mut self, session_id: &str, task: Option<&str>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_started".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Session started: {}", session_id)),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "task": task,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a session ending (MCP multi-task).
+    pub fn session_ended(&mut self, session_id: &str, reason: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_ended".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Session ended: {} ({})", session_id, reason)),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "reason": reason,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log agent execution starting.
+    pub fn agent_started(&mut self, turn: usize, commands_preview: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: Some(turn),
+            event: "agent_started".to_string(),
+            level: Some("info".to_string()),
+            message: Some(commands_preview.to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log an auto-approved command.
+    pub fn auto_approved(&mut self, preview: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            event: "auto_approved".to_string(),
+            level: Some("info".to_string()),
+            message: Some(preview.to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a human question (askHuman).
+    pub fn human_question(&mut self, question: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            event: "human_question".to_string(),
+            level: Some("info".to_string()),
+            message: Some(question.to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log that a human response was sent.
+    pub fn human_response_sent(&mut self) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            event: "human_response_sent".to_string(),
+            level: Some("info".to_string()),
+            message: Some("Human response sent".to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log round completion (orchestrator mode).
+    pub fn round_complete(&mut self, round: usize, turns_in_round: usize) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "round_complete".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Round {} complete ({} turns)", round, turns_in_round)),
+            data: Some(serde_json::json!({
+                "round": round,
+                "turns_in_round": turns_in_round,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log display ready.
+    pub fn display_ready(
+        &mut self,
+        display_id: u32,
+        vnc_port: Option<u32>,
+        width: u32,
+        height: u32,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "display_ready".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Display :{} ready ({}x{}, vnc={:?})",
+                display_id, width, height, vnc_port
+            )),
+            data: Some(serde_json::json!({
+                "display_id": display_id,
+                "vnc_port": vnc_port,
+                "width": width,
+                "height": height,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log display takeover.
+    pub fn display_taken(&mut self, display_id: u32) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "display_taken".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Display :{} taken over", display_id)),
+            data: Some(serde_json::json!({ "display_id": display_id })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log display released.
+    pub fn display_released(&mut self, display_id: u32, note: Option<&str>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "display_released".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Display :{} released{}",
+                display_id,
+                note.map(|n| format!(": {}", n)).unwrap_or_default()
+            )),
+            data: Some(serde_json::json!({
+                "display_id": display_id,
+                "note": note,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log debug screen ready.
+    pub fn debug_screen_ready(&mut self, display_id: u32, vnc_port: u32) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "debug_screen_ready".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Debug screen :{} ready (vnc port {})",
+                display_id, vnc_port
+            )),
+            data: Some(serde_json::json!({
+                "display_id": display_id,
+                "vnc_port": vnc_port,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log debug screen torn down.
+    pub fn debug_screen_torn_down(&mut self, display_id: u32) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "debug_screen_torn_down".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Debug screen :{} torn down", display_id)),
+            data: Some(serde_json::json!({ "display_id": display_id })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log safety cap reached.
+    pub fn safety_cap_reached(&mut self) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            event: "safety_cap_reached".to_string(),
+            level: Some("warn".to_string()),
+            message: Some("Safety cap reached".to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log recording started.
+    pub fn recording_started(&mut self, stream_name: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "recording_started".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Recording started: {}", stream_name)),
+            data: Some(serde_json::json!({ "stream_name": stream_name })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log recording stopped.
+    pub fn recording_stopped(&mut self, stream_name: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "recording_stopped".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Recording stopped: {}", stream_name)),
+            data: Some(serde_json::json!({ "stream_name": stream_name })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log recording error.
+    pub fn recording_error(&mut self, stream_name: &str, message: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "recording_error".to_string(),
+            level: Some("warn".to_string()),
+            message: Some(format!("Recording error ({}): {}", stream_name, message)),
+            data: Some(serde_json::json!({
+                "stream_name": stream_name,
+                "error": message,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log sub-agent result.
+    pub fn sub_agent_result(&mut self, summary: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            event: "sub_agent_result".to_string(),
+            level: Some("info".to_string()),
+            message: Some(summary.to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log orchestrator progress.
+    pub fn orchestrator_progress(&mut self, status: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "orchestrator_progress".to_string(),
+            level: Some("info".to_string()),
+            message: Some(status.to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log presence layer log message.
+    pub fn presence_log(&mut self, message: &str, level: Option<&str>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "presence_log".to_string(),
+            level: Some(level.unwrap_or("info").to_string()),
+            message: Some(message.to_string()),
+            data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log presence layer usage update.
+    pub fn presence_usage_update(
+        &mut self,
+        provider: &str,
+        model: &str,
+        total_tokens: u64,
+        context_window: u64,
+        usage_pct: f64,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "presence_usage_update".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!(
+                "Presence usage: {:.0}% ({} tokens, {}:{})",
+                usage_pct * 100.0,
+                total_tokens,
+                provider,
+                model
+            )),
+            data: Some(serde_json::json!({
+                "provider": provider,
+                "model": model,
+                "total_tokens": total_tokens,
+                "context_window": context_window,
+                "usage_pct": usage_pct,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log live model (Gemini Live / OpenAI Realtime) usage update.
+    pub fn live_usage_update(
+        &mut self,
+        provider: &str,
+        model: &str,
+        total_tokens: u64,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "live_usage_update".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!(
+                "Live usage: {} tokens ({}:{})",
+                total_tokens, provider, model
+            )),
+            data: Some(serde_json::json!({
+                "provider": provider,
+                "model": model,
+                "total_tokens": total_tokens,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log live audio sub-agent started.
+    pub fn live_audio_started(&mut self, id: &str, provider: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "live_audio_started".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Live audio started: {} ({})", id, provider)),
+            data: Some(serde_json::json!({
+                "id": id,
+                "provider": provider,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log live audio sub-agent progress.
+    pub fn live_audio_progress(
+        &mut self,
+        id: &str,
+        state: &str,
+        elapsed_secs: f64,
+        transcript_preview: &str,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "live_audio_progress".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!(
+                "Live audio {}: {} ({:.1}s) {}",
+                id, state, elapsed_secs, transcript_preview
+            )),
+            data: Some(serde_json::json!({
+                "id": id,
+                "state": state,
+                "elapsed_secs": elapsed_secs,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log live audio sub-agent completed.
+    pub fn live_audio_completed(
+        &mut self,
+        id: &str,
+        status: &str,
+        quarantine_count: usize,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "live_audio_completed".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Live audio completed: {} ({}, {} quarantined)",
+                id, status, quarantine_count
+            )),
+            data: Some(serde_json::json!({
+                "id": id,
+                "status": status,
+                "quarantine_count": quarantine_count,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a tool request received from the browser presence model.
     pub fn tool_request(&mut self, tool: &str, args: &serde_json::Value) {
         self.emit(LogEvent {
