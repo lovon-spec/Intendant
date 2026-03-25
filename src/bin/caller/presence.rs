@@ -828,23 +828,15 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 message: "Safety cap reached (500 turns)".to_string(),
             })
         }
-        // Display state events — pushed to presence for display-aware routing
-        AppEvent::DisplayReady {
-            display_id,
-            width,
-            height,
-            ..
-        } => Some(PresenceEvent::DisplayReady {
-            display_id: *display_id,
-            width: *width,
-            height: *height,
-            is_user_session: *display_id == 0,
-        }),
-        AppEvent::UserDisplayGranted => Some(PresenceEvent::UserDisplayGranted),
-        AppEvent::UserDisplayRevoked { .. } => Some(PresenceEvent::UserDisplayRevoked),
+        // Display lifecycle events — not pushed to presence (avoids unnecessary
+        // inference calls). Display state is available via check_status when the
+        // model needs it for routing decisions.
+        AppEvent::DisplayReady { .. }
+        | AppEvent::UserDisplayGranted
+        | AppEvent::UserDisplayRevoked { .. }
 
         // Pull-only events — not pushed to presence
-        AppEvent::AgentOutput { .. }
+        | AppEvent::AgentOutput { .. }
         | AppEvent::ModelResponseDelta { .. }
         | AppEvent::JsonExtracted { .. }
         | AppEvent::DoneSignal { .. }
@@ -1042,6 +1034,26 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
         }
         AppEvent::LoopError(msg) => {
             s.phase = format!("error: {}", msg);
+        }
+        AppEvent::DisplayReady {
+            display_id, width, height, ..
+        } => {
+            let prefix = if *display_id == 0 {
+                "user_session".to_string()
+            } else {
+                format!(":{}", display_id)
+            };
+            let label = if *display_id == 0 {
+                format!("user_session ({}x{})", width, height)
+            } else {
+                format!(":{} ({}x{}, virtual)", display_id, width, height)
+            };
+            if !s.available_displays.iter().any(|d| d.starts_with(&prefix)) {
+                s.available_displays.push(label);
+            }
+        }
+        AppEvent::UserDisplayRevoked { .. } => {
+            s.available_displays.retain(|d| !d.starts_with("user_session"));
         }
         _ => {}
     }

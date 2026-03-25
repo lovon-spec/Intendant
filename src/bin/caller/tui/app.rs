@@ -1777,22 +1777,15 @@ impl App {
                 }
             }
             AppEvent::UserDisplayGranted => {
-                let msg = "User display permission granted. Display is being activated — wait for DisplayReady before interacting.".to_string();
-                self.log(LogLevel::Warn, msg.clone());
-                if let Ok(mut q) = self.context_injection.lock() {
-                    q.push(crate::event::ContextInjection::text(msg));
-                }
+                self.log(LogLevel::Warn, "User display access granted".to_string());
             }
             AppEvent::UserDisplayRevoked { ref note } => {
                 let msg = if let Some(n) = note {
-                    format!("Your access to the user's session display has been revoked. Note: '{}'. Resume virtual display work only.", n)
+                    format!("User display access revoked: {}", n)
                 } else {
-                    "Your access to the user's session display has been revoked. Resume virtual display work only.".to_string()
+                    "User display access revoked".to_string()
                 };
-                self.log(LogLevel::Warn, msg.clone());
-                if let Ok(mut q) = self.context_injection.lock() {
-                    q.push(crate::event::ContextInjection::text(msg));
-                }
+                self.log(LogLevel::Warn, msg);
             }
             AppEvent::SessionDirChanged { .. } => {
                 // Only relevant for MCP mode; TUI ignores this.

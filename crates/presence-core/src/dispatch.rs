@@ -140,6 +140,9 @@ fn handle_check_status(state: &AgentStateSnapshot) -> String {
     if state.last_task_result.is_some() {
         parts.push("Task result: available (use query_detail scope 'task_result' for details)".to_string());
     }
+    if !state.available_displays.is_empty() {
+        parts.push(format!("Displays: {}", state.available_displays.join(", ")));
+    }
     parts.join("\n")
 }
 

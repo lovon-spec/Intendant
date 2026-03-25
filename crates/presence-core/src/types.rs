@@ -144,6 +144,11 @@ pub struct AgentStateSnapshot {
     /// Full result text from the last completed task (available via `query_detail` scope `task_result`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_task_result: Option<String>,
+    /// Available displays for CU targeting.
+    /// Each entry is a human-readable string like ":99 (1024x768, virtual)" or
+    /// "user_session (1920x1080, granted)".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_displays: Vec<String>,
 }
 
 /// Serializable snapshot of a pending approval for the live model bootstrap.
