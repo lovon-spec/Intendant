@@ -18,8 +18,7 @@ pub enum DisplayBackend {
     /// Wayland: ydotool + grim. Requires /dev/uinput access. (not yet implemented)
     #[allow(dead_code)]
     Wayland,
-    /// macOS: cliclick + screencapture. Requires accessibility permissions. (not yet implemented)
-    #[allow(dead_code)]
+    /// macOS: cliclick + screencapture. Requires accessibility permissions.
     MacOS,
 }
 
@@ -108,6 +107,16 @@ impl MouseButton {
             MouseButton::Left => "1",
             MouseButton::Right => "3",
             MouseButton::Middle => "2",
+        }
+    }
+
+    /// cliclick action prefix for this button.
+    fn cliclick_prefix(self) -> &'static str {
+        match self {
+            MouseButton::Left => "c",
+            MouseButton::Right => "rc",
+            // cliclick has no middle-click; use triple-click as closest approximation
+            MouseButton::Middle => "tc",
         }
     }
 }
@@ -208,21 +217,15 @@ pub async fn execute_actions(
                 error: Some("Wayland backend not yet implemented".to_string()),
             }];
         }
-        DisplayBackend::MacOS => {
-            return vec![CuActionResult {
-                success: false,
-                screenshot: None,
-                error: Some("macOS backend not yet implemented".to_string()),
-            }];
-        }
-        DisplayBackend::X11 => {} // handled below
+        DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
     }
     let display = format!(":{}", display_id);
     let mut results = Vec::with_capacity(actions.len());
     let mut last_screenshot: Option<ScreenshotData> = None;
 
     for action in actions {
-        let result = execute_single(action, &display, screenshot_dir, action_counter).await;
+        let result =
+            execute_single(action, &display, backend, screenshot_dir, action_counter).await;
         if let Some(ref s) = result.screenshot {
             last_screenshot = Some(s.clone());
         }
@@ -230,9 +233,11 @@ pub async fn execute_actions(
     }
 
     // If the last action was not a Screenshot, auto-capture one.
-    let needs_auto_screenshot = actions.last().map_or(false, |a| !matches!(a, CuAction::Screenshot));
+    let needs_auto_screenshot = actions
+        .last()
+        .is_some_and(|a| !matches!(a, CuAction::Screenshot));
     if needs_auto_screenshot {
-        let auto = take_screenshot(&display, screenshot_dir, action_counter).await;
+        let auto = take_screenshot(&display, backend, screenshot_dir, action_counter).await;
         match auto {
             Ok(s) => {
                 last_screenshot = Some(s.clone());
@@ -263,60 +268,100 @@ pub async fn execute_actions(
     results
 }
 
-/// Execute a single CU action.
+/// Execute a single CU action, dispatching to the appropriate backend.
 async fn execute_single(
     action: &CuAction,
     display: &str,
+    backend: DisplayBackend,
     screenshot_dir: &Path,
     counter: &mut u64,
 ) -> CuActionResult {
     match action {
-        CuAction::Click { x, y, button } => {
-            run_xdotool(display, &[
-                "mousemove", "--sync", &x.to_string(), &y.to_string(),
-                "click", button.xdotool_button(),
-            ]).await
-        }
-        CuAction::DoubleClick { x, y, button } => {
-            run_xdotool(display, &[
-                "mousemove", "--sync", &x.to_string(), &y.to_string(),
-                "click", "--repeat", "2", "--delay", "50", button.xdotool_button(),
-            ]).await
-        }
-        CuAction::Type { text } => {
-            run_xdotool(display, &["type", "--clearmodifiers", text]).await
-        }
-        CuAction::Key { key } => {
-            run_xdotool(display, &["key", "--clearmodifiers", key]).await
-        }
-        CuAction::Scroll { x, y, direction, amount } => {
-            let mut result = run_xdotool(display, &[
-                "mousemove", "--sync", &x.to_string(), &y.to_string(),
-            ]).await;
-            if result.success {
-                let btn = direction.xdotool_button();
-                let amt = (*amount).max(1);
-                result = run_xdotool(display, &[
-                    "click", "--repeat", &amt.to_string(), "--delay", "20", btn,
-                ]).await;
+        CuAction::Click { x, y, button } => match backend {
+            DisplayBackend::MacOS => {
+                run_cliclick(&[&format!("{}:{},{}", button.cliclick_prefix(), x, y)]).await
             }
-            result
-        }
-        CuAction::MoveMouse { x, y } => {
-            run_xdotool(display, &[
-                "mousemove", "--sync", &x.to_string(), &y.to_string(),
-            ]).await
-        }
-        CuAction::Drag { start_x, start_y, end_x, end_y } => {
-            run_xdotool(display, &[
-                "mousemove", "--sync", &start_x.to_string(), &start_y.to_string(),
-                "mousedown", "1",
-                "mousemove", "--sync", &end_x.to_string(), &end_y.to_string(),
-                "mouseup", "1",
-            ]).await
-        }
+            _ => {
+                run_xdotool(display, &[
+                    "mousemove", "--sync", &x.to_string(), &y.to_string(),
+                    "click", button.xdotool_button(),
+                ]).await
+            }
+        },
+        CuAction::DoubleClick { x, y, .. } => match backend {
+            DisplayBackend::MacOS => {
+                run_cliclick(&[&format!("dc:{},{}", x, y)]).await
+            }
+            _ => {
+                run_xdotool(display, &[
+                    "mousemove", "--sync", &x.to_string(), &y.to_string(),
+                    "click", "--repeat", "2", "--delay", "50",
+                    MouseButton::Left.xdotool_button(),
+                ]).await
+            }
+        },
+        CuAction::Type { text } => match backend {
+            DisplayBackend::MacOS => {
+                run_cliclick(&[&format!("t:{}", text)]).await
+            }
+            _ => {
+                run_xdotool(display, &["type", "--clearmodifiers", text]).await
+            }
+        },
+        CuAction::Key { key } => match backend {
+            DisplayBackend::MacOS => {
+                execute_macos_key(key).await
+            }
+            _ => {
+                run_xdotool(display, &["key", "--clearmodifiers", key]).await
+            }
+        },
+        CuAction::Scroll { x, y, direction, amount } => match backend {
+            DisplayBackend::MacOS => {
+                execute_macos_scroll(*x, *y, *direction, *amount).await
+            }
+            _ => {
+                let mut result = run_xdotool(display, &[
+                    "mousemove", "--sync", &x.to_string(), &y.to_string(),
+                ]).await;
+                if result.success {
+                    let btn = direction.xdotool_button();
+                    let amt = (*amount).max(1);
+                    result = run_xdotool(display, &[
+                        "click", "--repeat", &amt.to_string(), "--delay", "20", btn,
+                    ]).await;
+                }
+                result
+            }
+        },
+        CuAction::MoveMouse { x, y } => match backend {
+            DisplayBackend::MacOS => {
+                run_cliclick(&[&format!("m:{},{}", x, y)]).await
+            }
+            _ => {
+                run_xdotool(display, &[
+                    "mousemove", "--sync", &x.to_string(), &y.to_string(),
+                ]).await
+            }
+        },
+        CuAction::Drag { start_x, start_y, end_x, end_y } => match backend {
+            DisplayBackend::MacOS => {
+                run_cliclick(&[
+                    &format!("dd:{},{}", start_x, start_y),
+                    &format!("du:{},{}", end_x, end_y),
+                ]).await
+            }
+            _ => {
+                run_xdotool(display, &[
+                    "mousemove", "--sync", &start_x.to_string(), &start_y.to_string(),
+                    "mousedown", "1",
+                    "mousemove", "--sync", &end_x.to_string(), &end_y.to_string(),
+                    "mouseup", "1",
+                ]).await
+            }
+        },
         CuAction::Screenshot => {
-            match take_screenshot(display, screenshot_dir, counter).await {
+            match take_screenshot(display, backend, screenshot_dir, counter).await {
                 Ok(s) => CuActionResult {
                     success: true,
                     screenshot: Some(s),
@@ -339,6 +384,8 @@ async fn execute_single(
         }
     }
 }
+
+// ── X11 backend (xdotool) ───────────────────────────────────────────────────
 
 /// Run an xdotool command on the given display.
 async fn run_xdotool(display: &str, args: &[&str]) -> CuActionResult {
@@ -367,24 +414,212 @@ async fn run_xdotool(display: &str, args: &[&str]) -> CuActionResult {
     }
 }
 
-/// Capture a screenshot via ImageMagick `import`.
+// ── macOS backend (cliclick + osascript) ─────────────────────────────────────
+
+/// Run a cliclick command with the given action arguments.
+async fn run_cliclick(args: &[&str]) -> CuActionResult {
+    let output = Command::new("cliclick")
+        .args(args)
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => CuActionResult {
+            success: true,
+            screenshot: None,
+            error: None,
+        },
+        Ok(o) => CuActionResult {
+            success: false,
+            screenshot: None,
+            error: Some(String::from_utf8_lossy(&o.stderr).to_string()),
+        },
+        Err(e) => CuActionResult {
+            success: false,
+            screenshot: None,
+            error: Some(format!("cliclick exec error (is cliclick installed?): {}", e)),
+        },
+    }
+}
+
+/// Translate an xdotool-style key name to cliclick key press syntax.
+///
+/// Handles single keys and modifier combos (e.g. "ctrl+c" → "kd:ctrl kp:c ku:ctrl").
+fn translate_key_for_cliclick(key: &str) -> Vec<String> {
+    // Check for modifier combo (e.g. "ctrl+c", "super+shift+a")
+    if key.contains('+') {
+        let parts: Vec<&str> = key.split('+').collect();
+        if parts.len() >= 2 {
+            let modifiers: Vec<&str> = parts[..parts.len() - 1].to_vec();
+            let base_key = parts[parts.len() - 1];
+            let mut args = Vec::new();
+            // Press modifiers down
+            for m in &modifiers {
+                args.push(format!("kd:{}", translate_single_key(m)));
+            }
+            // Press the base key
+            args.push(format!("kp:{}", translate_single_key(base_key)));
+            // Release modifiers in reverse
+            for m in modifiers.iter().rev() {
+                args.push(format!("ku:{}", translate_single_key(m)));
+            }
+            return args;
+        }
+    }
+    vec![format!("kp:{}", translate_single_key(key))]
+}
+
+/// Map a single key name from xdotool convention to cliclick convention.
+fn translate_single_key(key: &str) -> &str {
+    match key.to_lowercase().as_str() {
+        "return" | "enter" | "kp_enter" => "return",
+        "tab" => "tab",
+        "escape" | "esc" => "esc",
+        "space" => "space",
+        "backspace" => "delete",
+        "delete" => "fwd-delete",
+        "up" => "arrow-up",
+        "down" => "arrow-down",
+        "left" => "arrow-left",
+        "right" => "arrow-right",
+        "home" => "home",
+        "end" => "end",
+        "prior" | "page_up" | "pageup" => "page-up",
+        "next" | "page_down" | "pagedown" => "page-down",
+        "ctrl" | "control" | "control_l" | "control_r" => "ctrl",
+        "alt" | "alt_l" | "alt_r" => "alt",
+        "shift" | "shift_l" | "shift_r" => "shift",
+        "super" | "super_l" | "super_r" | "meta" => "cmd",
+        "f1" => "f1",
+        "f2" => "f2",
+        "f3" => "f3",
+        "f4" => "f4",
+        "f5" => "f5",
+        "f6" => "f6",
+        "f7" => "f7",
+        "f8" => "f8",
+        "f9" => "f9",
+        "f10" => "f10",
+        "f11" => "f11",
+        "f12" => "f12",
+        // cliclick accepts single characters directly
+        _ => {
+            // Can't return a computed value from a match arm that borrows,
+            // so for unrecognized keys, return the input as-is via leak-free path.
+            // The caller already owns the key string.
+            key
+        }
+    }
+}
+
+/// Execute a key press on macOS via cliclick.
+async fn execute_macos_key(key: &str) -> CuActionResult {
+    let args = translate_key_for_cliclick(key);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_cliclick(&arg_refs).await
+}
+
+/// Execute a scroll action on macOS.
+///
+/// Moves the mouse to (x, y) via cliclick, then uses osascript to post
+/// scroll wheel events via CGEvent.
+async fn execute_macos_scroll(
+    x: i32,
+    y: i32,
+    direction: ScrollDirection,
+    amount: i32,
+) -> CuActionResult {
+    // Move mouse to target position first
+    let move_result = run_cliclick(&[&format!("m:{},{}", x, y)]).await;
+    if !move_result.success {
+        return move_result;
+    }
+
+    let amt = amount.max(1);
+    // CGEvent scroll: positive = up/left, negative = down/right
+    let (dy, dx) = match direction {
+        ScrollDirection::Up => (amt, 0),
+        ScrollDirection::Down => (-amt, 0),
+        ScrollDirection::Left => (0, amt),
+        ScrollDirection::Right => (0, -amt),
+    };
+
+    // Use osascript + ObjC bridge to post a CGEvent scroll wheel event
+    let script = format!(
+        concat!(
+            "use framework \"ApplicationServices\"\n",
+            "set e to current application's CGEventCreateScrollWheelEvent(",
+            "missing value, 0, 2, {}, {})\n",
+            "current application's CGEventPost(0, e)"
+        ),
+        dy, dx
+    );
+
+    let output = Command::new("osascript")
+        .args(["-l", "AppleScript", "-e", &script])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => CuActionResult {
+            success: true,
+            screenshot: None,
+            error: None,
+        },
+        Ok(o) => CuActionResult {
+            success: false,
+            screenshot: None,
+            error: Some(String::from_utf8_lossy(&o.stderr).to_string()),
+        },
+        Err(e) => CuActionResult {
+            success: false,
+            screenshot: None,
+            error: Some(format!("osascript exec error: {}", e)),
+        },
+    }
+}
+
+// ── Screenshot capture ──────────────────────────────────────────────────────
+
+/// Capture a screenshot using the appropriate backend tool.
+///
+/// X11: ImageMagick `import -window root -display :N`.
+/// macOS: `screencapture -x` (captures primary display, silent).
 async fn take_screenshot(
     display: &str,
+    backend: DisplayBackend,
     screenshot_dir: &Path,
     counter: &mut u64,
 ) -> Result<ScreenshotData, String> {
     *counter += 1;
     let path = screenshot_dir.join(format!("cu_screenshot_{}.png", counter));
 
-    let output = Command::new("import")
-        .args(["-window", "root", "-display", display, &path.to_string_lossy()])
-        .output()
-        .await
-        .map_err(|e| format!("import exec error: {}", e))?;
+    let output = match backend {
+        DisplayBackend::MacOS => {
+            Command::new("screencapture")
+                .args(["-x", &path.to_string_lossy()])
+                .output()
+                .await
+                .map_err(|e| format!("screencapture exec error: {}", e))?
+        }
+        _ => {
+            Command::new("import")
+                .args(["-window", "root", "-display", display, &path.to_string_lossy()])
+                .output()
+                .await
+                .map_err(|e| format!("import exec error: {}", e))?
+        }
+    };
 
     if !output.status.success() {
+        let tool = if backend == DisplayBackend::MacOS {
+            "screencapture"
+        } else {
+            "import"
+        };
         return Err(format!(
-            "import failed: {}",
+            "{} failed: {}",
+            tool,
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -440,6 +675,13 @@ mod tests {
     }
 
     #[test]
+    fn mouse_button_cliclick() {
+        assert_eq!(MouseButton::Left.cliclick_prefix(), "c");
+        assert_eq!(MouseButton::Right.cliclick_prefix(), "rc");
+        assert_eq!(MouseButton::Middle.cliclick_prefix(), "tc");
+    }
+
+    #[test]
     fn scroll_direction_xdotool() {
         assert_eq!(ScrollDirection::Up.xdotool_button(), "4");
         assert_eq!(ScrollDirection::Down.xdotool_button(), "5");
@@ -476,5 +718,33 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn translate_simple_keys() {
+        assert_eq!(translate_single_key("Return"), "return");
+        assert_eq!(translate_single_key("Tab"), "tab");
+        assert_eq!(translate_single_key("Escape"), "esc");
+        assert_eq!(translate_single_key("BackSpace"), "delete");
+        assert_eq!(translate_single_key("Up"), "arrow-up");
+        assert_eq!(translate_single_key("Down"), "arrow-down");
+        assert_eq!(translate_single_key("super"), "cmd");
+        assert_eq!(translate_single_key("control"), "ctrl");
+    }
+
+    #[test]
+    fn translate_modifier_combo() {
+        let args = translate_key_for_cliclick("ctrl+c");
+        assert_eq!(args, vec!["kd:ctrl", "kp:c", "ku:ctrl"]);
+
+        let args = translate_key_for_cliclick("super+shift+a");
+        assert_eq!(args, vec!["kd:cmd", "kd:shift", "kp:a", "ku:shift", "ku:cmd"]);
+    }
+
+    #[test]
+    fn translate_single_key_passthrough() {
+        // Unrecognized keys pass through as-is
+        assert_eq!(translate_single_key("a"), "a");
+        assert_eq!(translate_single_key("z"), "z");
     }
 }

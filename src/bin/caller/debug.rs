@@ -30,6 +30,8 @@ impl Drop for DebugScreen {
 }
 
 /// Find a free display in the 50-59 range for debug use.
+/// On non-Linux platforms the X lock file helpers are stubs, so this
+/// returns the first display in range immediately.
 pub fn find_free_debug_display() -> u32 {
     for id in DEBUG_DISPLAY_MIN..=DEBUG_DISPLAY_MAX {
         let lock = format!("/tmp/.X{}-lock", id);
@@ -55,6 +57,14 @@ pub fn daemon_recordings_dir() -> PathBuf {
 }
 
 /// Set up a debug screen: Xvfb + x11vnc + passive Firefox.
+/// Only available on Linux (requires X11).
+#[cfg(not(target_os = "linux"))]
+pub async fn setup_debug_screen(_web_port: u16) -> Result<DebugScreen, String> {
+    Err("Debug screen requires X11 (Linux only)".into())
+}
+
+/// Set up a debug screen: Xvfb + x11vnc + passive Firefox.
+#[cfg(target_os = "linux")]
 pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
     let display_id = find_free_debug_display();
     let config = vision::DisplayConfig {

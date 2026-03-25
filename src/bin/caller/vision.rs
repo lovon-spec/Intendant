@@ -2,20 +2,24 @@ use super::error::CallerError;
 use std::process::Stdio;
 use tokio::process::Child;
 
-/// Per-provider display resolution for Xvfb.
+/// Per-provider display resolution for Xvfb (Linux) or native display (macOS).
 pub struct DisplayConfig {
     pub display_id: u32,
     pub width: u32,
     pub height: u32,
 }
 
+// ── X11 lock file helpers (Linux only) ──────────────────────────────────────
+
 /// Read the PID from an X lock file. Returns `None` if the file can't be read or parsed.
+#[cfg(target_os = "linux")]
 pub(crate) fn read_lock_pid(lock_path: &str) -> Option<u32> {
     let contents = std::fs::read_to_string(lock_path).ok()?;
     contents.trim().parse().ok()
 }
 
 /// Check if a lock file is stale (the PID inside is no longer running).
+#[cfg(target_os = "linux")]
 pub(crate) fn is_lock_stale(lock_path: &str) -> bool {
     match read_lock_pid(lock_path) {
         Some(pid) => !super::platform::process_alive(pid),
@@ -25,6 +29,7 @@ pub(crate) fn is_lock_stale(lock_path: &str) -> bool {
 
 /// Check whether the process owning a lock file is an Xvfb instance for the given display.
 /// Returns true if the process cmdline starts with "Xvfb :<id>".
+#[cfg(target_os = "linux")]
 pub(crate) fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
     let pid = match read_lock_pid(lock_path) {
         Some(p) => p,
@@ -39,6 +44,7 @@ pub(crate) fn is_our_xvfb(lock_path: &str, display_id: u32) -> bool {
 }
 
 /// Kill the process that owns a lock file (if alive) and clean up.
+#[cfg(target_os = "linux")]
 pub(crate) fn kill_and_reclaim(lock_path: &str, display_id: u32) {
     if let Some(pid) = read_lock_pid(lock_path) {
         // Send SIGKILL via the kill command — the process is an orphaned Xvfb we're reclaiming
@@ -54,12 +60,25 @@ pub(crate) fn kill_and_reclaim(lock_path: &str, display_id: u32) {
 }
 
 /// Remove a stale X lock file and its socket.
+#[cfg(target_os = "linux")]
 pub(crate) fn remove_stale_lock(id: u32) {
     let lock = format!("/tmp/.X{}-lock", id);
     let socket = format!("/tmp/.X11-unix/X{}", id);
     let _ = std::fs::remove_file(&lock);
     let _ = std::fs::remove_file(&socket);
 }
+
+// Non-Linux stubs — these are called from debug.rs and XvfbGuard::Drop.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn is_lock_stale(_lock_path: &str) -> bool { false }
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool { false }
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn kill_and_reclaim(_lock_path: &str, _display_id: u32) {}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn remove_stale_lock(_id: u32) {}
+
+// ── Display config ──────────────────────────────────────────────────────────
 
 /// Returns the optimal display resolution for the given provider name.
 ///
@@ -80,7 +99,10 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
     }
 }
 
+// ── Display allocation ──────────────────────────────────────────────────────
+
 /// Preferred display number. Keeps VNC port predictable at 5999.
+#[cfg(target_os = "linux")]
 const PREFERRED_DISPLAY: u32 = 99;
 
 /// Find a free X display number, preferring :99 for a predictable VNC port.
@@ -91,6 +113,7 @@ const PREFERRED_DISPLAY: u32 = 99;
 /// 3. Lock file with live Xvfb process for this display → kill and reclaim it
 ///    (it's an orphan from a previous intendant session)
 /// 4. Lock file with some other live process → skip to next display
+#[cfg(target_os = "linux")]
 fn find_free_display() -> u32 {
     for id in PREFERRED_DISPLAY..200 {
         let lock = format!("/tmp/.X{}-lock", id);
@@ -110,6 +133,14 @@ fn find_free_display() -> u32 {
     }
     199 // fallback
 }
+
+/// On non-Linux platforms, return 0 as a sentinel for the native display.
+#[cfg(not(target_os = "linux"))]
+fn find_free_display() -> u32 {
+    0
+}
+
+// ── Xvfb guard ──────────────────────────────────────────────────────────────
 
 /// Guard that kills the Xvfb (and optional x11vnc) process when dropped.
 /// Cleans up the lock file and socket after killing.
@@ -138,6 +169,8 @@ impl Drop for XvfbGuard {
     }
 }
 
+// ── VNC detection ───────────────────────────────────────────────────────────
+
 /// Detect if a VNC server is already running for the given display.
 /// Checks the standard VNC port (5900 + display_id).
 pub fn detect_vnc_port(display_id: u32) -> Option<u32> {
@@ -153,8 +186,11 @@ pub fn detect_vnc_port(display_id: u32) -> Option<u32> {
     }
 }
 
+// ── Display launch (Linux / X11) ────────────────────────────────────────────
+
 /// Best-effort launch of x11vnc on the given display.
 /// Returns `Some(Child)` on success, `None` if x11vnc is not installed or fails to start.
+#[cfg(target_os = "linux")]
 async fn launch_vnc(display_arg: &str, port: u32) -> Option<Child> {
     let child = tokio::process::Command::new("x11vnc")
         .args([
@@ -184,6 +220,7 @@ async fn launch_vnc(display_arg: &str, port: u32) -> Option<Child> {
 
 /// Launch Xvfb on the given display with the given resolution.
 /// Returns a guard that kills the process on drop.
+#[cfg(target_os = "linux")]
 pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
     let display_arg = format!(":{}", config.display_id);
     let screen_arg = format!("{}x{}x24", config.width, config.height);
@@ -233,8 +270,25 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     })
 }
 
+/// Virtual display launch is not available on non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+pub async fn launch_display(_config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
+    Err(CallerError::Config(
+        "Virtual display launch is only available on Linux".into(),
+    ))
+}
+
+// ── Display accessibility ───────────────────────────────────────────────────
+
+/// On macOS, the native display is always accessible.
+#[cfg(target_os = "macos")]
+pub fn is_display_accessible() -> bool {
+    true
+}
+
 /// Check whether the current DISPLAY environment variable points to an accessible X server.
 /// Returns `false` if DISPLAY is unset or `xdpyinfo` fails to connect.
+#[cfg(not(target_os = "macos"))]
 pub fn is_display_accessible() -> bool {
     let display = match std::env::var("DISPLAY") {
         Ok(d) if !d.is_empty() => d,
@@ -248,6 +302,8 @@ pub fn is_display_accessible() -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -281,6 +337,7 @@ mod tests {
         assert_eq!(config.height, 768);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn find_free_display_avoids_existing() {
         // Should return a display number >= 99
@@ -296,11 +353,13 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn is_lock_stale_nonexistent_file() {
         assert!(!is_lock_stale("/tmp/.X_nonexistent_test-lock"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stale_lock_detection_and_cleanup() {
         // Create a lock file with a definitely-dead PID
@@ -326,6 +385,7 @@ mod tests {
         assert_eq!(5900 + 99, 5999);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn launch_vnc_missing_binary() {
         // x11vnc may or may not be installed; if not, launch_vnc returns None gracefully
@@ -336,11 +396,13 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_lock_pid_nonexistent() {
         assert_eq!(read_lock_pid("/tmp/.X_nonexistent_test-lock"), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_lock_pid_valid() {
         let lock = "/tmp/.X197-test-lock";
@@ -349,6 +411,7 @@ mod tests {
         let _ = std::fs::remove_file(lock);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn is_our_xvfb_dead_pid() {
         // Lock with dead PID — is_our_xvfb should return false (can't read cmdline)
@@ -358,11 +421,13 @@ mod tests {
         let _ = std::fs::remove_file(lock);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn preferred_display_is_99() {
         assert_eq!(PREFERRED_DISPLAY, 99);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn find_free_display_prefers_99() {
         // When :99 is free, find_free_display should return 99
@@ -374,6 +439,7 @@ mod tests {
         assert!(find_free_display() >= 99);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn is_display_accessible_no_display_set() {
         // Temporarily unset DISPLAY to test the "no display" path.

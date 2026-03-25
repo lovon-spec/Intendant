@@ -98,6 +98,14 @@ impl Agent {
     }
 
     /// Scan `/tmp/.X*-lock` for active X display numbers.
+    /// On macOS there are no X displays; returns an empty list.
+    #[cfg(target_os = "macos")]
+    fn discover_displays() -> Vec<i32> {
+        vec![]
+    }
+
+    /// Scan `/tmp/.X*-lock` for active X display numbers.
+    #[cfg(not(target_os = "macos"))]
     fn discover_displays() -> Vec<i32> {
         let mut displays = Vec::new();
         if let Ok(entries) = fs::read_dir("/tmp") {
@@ -117,7 +125,14 @@ impl Agent {
         displays
     }
 
+    /// On macOS, xauth is not needed — the native display has no X authentication.
+    #[cfg(target_os = "macos")]
+    fn setup_merged_xauthority(_displays: &[i32], _log_dir: &Path) -> Option<PathBuf> {
+        None
+    }
+
     /// Merge xauth cookies from all discovered displays into a session-scoped file.
+    #[cfg(not(target_os = "macos"))]
     fn setup_merged_xauthority(displays: &[i32], log_dir: &Path) -> Option<PathBuf> {
         if displays.is_empty() {
             return None;
@@ -212,9 +227,13 @@ impl Agent {
     }
 
     /// Return the display number to use when no explicit display is given and
-    /// the DISPLAY env var is not set/parseable.  Prefers discovered displays
-    /// >0, falling back to 1.
+    /// the DISPLAY env var is not set/parseable.  On macOS returns 0 (native
+    /// display sentinel).  On Linux, prefers discovered displays >0, falling
+    /// back to 1.
     fn default_display(&self) -> i32 {
+        if cfg!(target_os = "macos") {
+            return 0;
+        }
         // Prefer the DISPLAY env var (set by the caller when Xvfb is auto-launched)
         if let Ok(d) = std::env::var("DISPLAY") {
             if let Ok(n) = d.trim_start_matches(':').parse::<i32>() {
@@ -355,27 +374,40 @@ impl Agent {
     }
 
     async fn capture_screen(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
-        let display = cmd.display.unwrap_or_else(|| {
-            std::env::var("DISPLAY")
-                .ok()
-                .and_then(|d| d.trim_start_matches(':').parse().ok())
-                .unwrap_or_else(|| self.default_display())
-        });
         let screenshot_path = self.log_dir.join(format!("screenshot_{}.png", cmd.nonce));
 
-        // Use import command from ImageMagick
-        let mut cmd_builder = Command::new("import");
-        cmd_builder.args([
-            "-window",
-            "root",
-            "-display",
-            &format!(":{}", display),
-            &screenshot_path.to_string_lossy(),
-        ]);
-        if let Some(ref xauth) = self.session_xauthority {
-            cmd_builder.env("XAUTHORITY", xauth);
-        }
-        let status = cmd_builder.status().await?;
+        // macOS: use native screencapture
+        #[cfg(target_os = "macos")]
+        let status = {
+            Command::new("screencapture")
+                .args(["-x", &screenshot_path.to_string_lossy()])
+                .status()
+                .await?
+        };
+
+        // Linux / other: use ImageMagick import with X11 display
+        #[cfg(not(target_os = "macos"))]
+        let status = {
+            let display = cmd.display.unwrap_or_else(|| {
+                std::env::var("DISPLAY")
+                    .ok()
+                    .and_then(|d| d.trim_start_matches(':').parse().ok())
+                    .unwrap_or_else(|| self.default_display())
+            });
+            let mut cmd_builder = Command::new("import");
+            cmd_builder.args([
+                "-window",
+                "root",
+                "-display",
+                &format!(":{}", display),
+                &screenshot_path.to_string_lossy(),
+            ]);
+            if let Some(ref xauth) = self.session_xauthority {
+                cmd_builder.env("XAUTHORITY", xauth);
+            }
+            cmd_builder.status().await?
+        };
+
         let exit_code = status.code().unwrap_or(-1);
         let process_status = if status.success() {
             ProcessStatus::Completed

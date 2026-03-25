@@ -69,6 +69,20 @@ pub fn is_ffmpeg_available() -> bool {
 }
 
 /// Start recording an X11 display via ffmpeg x11grab.
+/// Only available on Linux — macOS would need `-f avfoundation`.
+#[cfg(not(target_os = "linux"))]
+pub async fn start_display_recording(
+    _display_id: u32,
+    _width: u32,
+    _height: u32,
+    _config: &RecordingConfig,
+    _session_dir: &Path,
+) -> Result<RecordingGuard, String> {
+    Err("Display recording via x11grab is only available on Linux".into())
+}
+
+/// Start recording an X11 display via ffmpeg x11grab.
+#[cfg(target_os = "linux")]
 pub async fn start_display_recording(
     display_id: u32,
     width: u32,

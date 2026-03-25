@@ -658,13 +658,16 @@ async fn maybe_auto_launch_xvfb(
     if !has_capture_screen_command(json_str) && !has_exec_command(json_str) {
         return;
     }
-    // If a display is already accessible (e.g. DISPLAY was set before launch),
-    // emit DisplayReady so the web UI knows about it, but skip Xvfb launch.
+    // If a display is already accessible (e.g. DISPLAY was set before launch,
+    // or on macOS where the native display is always available), emit
+    // DisplayReady so the web UI knows about it, but skip Xvfb launch.
     if vision::is_display_accessible() {
+        // On macOS DISPLAY is typically unset; use 0 as sentinel for native display.
+        let default_display = if cfg!(target_os = "macos") { 0 } else { 99 };
         let display_id = std::env::var("DISPLAY")
             .ok()
             .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
-            .unwrap_or(99);
+            .unwrap_or(default_display);
         let (width, height) = query_display_resolution(display_id);
         // Check if x11vnc is already running on this display
         let vnc_port = vision::detect_vnc_port(display_id);
@@ -719,8 +722,34 @@ async fn maybe_auto_launch_xvfb(
     }
 }
 
+/// Query the resolution of the native display via system_profiler.
+/// Returns (width, height) or a default of (1920, 1080) if detection fails.
+#[cfg(target_os = "macos")]
+fn query_display_resolution(_display_id: u32) -> (u32, u32) {
+    if let Ok(out) = std::process::Command::new("system_profiler")
+        .arg("SPDisplaysDataType")
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Parse "Resolution: 2560 x 1600 Retina" or similar
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Resolution:") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    if let (Ok(w), Ok(h)) = (parts[1].parse(), parts[3].parse()) {
+                        return (w, h);
+                    }
+                }
+            }
+        }
+    }
+    (1920, 1080)
+}
+
 /// Query the resolution of an existing X11 display via xdpyinfo.
 /// Returns (width, height) or a default of (1280, 720) if detection fails.
+#[cfg(not(target_os = "macos"))]
 fn query_display_resolution(display_id: u32) -> (u32, u32) {
     let output = std::process::Command::new("xdpyinfo")
         .arg("-display")
