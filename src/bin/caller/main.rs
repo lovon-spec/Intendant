@@ -691,10 +691,14 @@ async fn maybe_auto_launch_xvfb(
     } else {
         "execAsAgent (display needed)"
     };
+    let virtual_id = match config.target {
+        computer_use::DisplayTarget::Virtual { id } => id,
+        _ => return,
+    };
     slog(session_log, |l| {
         l.info(&format!(
             "Auto-launching Xvfb :{} at {}x{} for {}",
-            config.display_id, config.width, config.height, trigger
+            virtual_id, config.width, config.height, trigger
         ))
     });
     match vision::launch_display(&config).await {
@@ -705,7 +709,7 @@ async fn maybe_auto_launch_xvfb(
                     l.info(&format!("VNC server available at vnc://localhost:{}", port))
                 });
             }
-            let display_id = config.display_id;
+            let display_id = virtual_id;
             bus.send(AppEvent::DisplayReady {
                 display_id,
                 vnc_port,
@@ -2303,6 +2307,15 @@ async fn run_agent_loop(
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
                             bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
+                            // Session-grant: first DisplayControl approval unlocks the session
+                            if cat == autonomy::ActionCategory::DisplayControl {
+                                let mut state = autonomy.write().await;
+                                if !state.user_display_granted {
+                                    state.user_display_granted = true;
+                                    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                                    bus.send(AppEvent::UserDisplayGranted);
+                                }
+                            }
                         }
                         Ok(event::ApprovalResponse::ApproveAll) => {
                             slog(&session_log, |l| {
@@ -2311,6 +2324,14 @@ async fn run_agent_loop(
                             bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve_all".to_string() });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
+                            // Session-grant: DisplayControl approval also unlocks user display
+                            if cat == autonomy::ActionCategory::DisplayControl
+                                && !state.user_display_granted
+                            {
+                                state.user_display_granted = true;
+                                std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                                bus.send(AppEvent::UserDisplayGranted);
+                            }
                         }
                         Ok(event::ApprovalResponse::Skip) => {
                             slog(&session_log, |l| {
@@ -2647,6 +2668,15 @@ Proceed with explicit assumptions and continue without additional questions."
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
                             bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
+                            // Session-grant: first DisplayControl approval unlocks the session
+                            if cat == autonomy::ActionCategory::DisplayControl {
+                                let mut state = autonomy.write().await;
+                                if !state.user_display_granted {
+                                    state.user_display_granted = true;
+                                    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                                    bus.send(AppEvent::UserDisplayGranted);
+                                }
+                            }
                         }
                         Ok(event::ApprovalResponse::ApproveAll) => {
                             slog(&session_log, |l| {
@@ -2655,6 +2685,14 @@ Proceed with explicit assumptions and continue without additional questions."
                             bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve_all".to_string() });
                             let mut state = autonomy.write().await;
                             state.level = AutonomyLevel::Full;
+                            // Session-grant: DisplayControl approval also unlocks user display
+                            if cat == autonomy::ActionCategory::DisplayControl
+                                && !state.user_display_granted
+                            {
+                                state.user_display_granted = true;
+                                std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                                bus.send(AppEvent::UserDisplayGranted);
+                            }
                         }
                         Ok(event::ApprovalResponse::Skip) => {
                             slog(&session_log, |l| {
@@ -4037,10 +4075,13 @@ async fn run_cu_task(
     let mut cu_counter = 0u64;
     let backend = computer_use::DisplayBackend::from_config(&cu_config.backend);
 
-    let display_id = std::env::var("DISPLAY")
-        .ok()
-        .and_then(|d| d.trim_start_matches(':').parse().ok())
-        .unwrap_or(99);
+    let display_target = {
+        let id: u32 = std::env::var("DISPLAY")
+            .ok()
+            .and_then(|d| d.trim_start_matches(':').parse().ok())
+            .unwrap_or(99);
+        computer_use::DisplayTarget::Virtual { id }
+    };
 
     // CU-first system prompt: handle display tasks or escalate
     let system_prompt = "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
@@ -4207,7 +4248,7 @@ async fn run_cu_task(
 
                 let results = computer_use::execute_actions(
                     &cu_call.actions,
-                    display_id,
+                    display_target,
                     backend,
                     log_dir,
                     &mut cu_counter,
@@ -4264,15 +4305,17 @@ async fn execute_cu_calls(
     counter: &mut u64,
     session_log: &SharedSessionLog,
 ) {
-    let display_id = cu_display
-        .map(|_| {
-            // Use the display from DISPLAY env or default to 99
-            std::env::var("DISPLAY")
-                .ok()
-                .and_then(|d| d.trim_start_matches(':').parse().ok())
-                .unwrap_or(99)
-        })
-        .unwrap_or(99);
+    let display_target = {
+        let id: u32 = cu_display
+            .map(|_| {
+                std::env::var("DISPLAY")
+                    .ok()
+                    .and_then(|d| d.trim_start_matches(':').parse().ok())
+                    .unwrap_or(99)
+            })
+            .unwrap_or(99);
+        computer_use::DisplayTarget::Virtual { id }
+    };
 
     for cu_call in cu_calls {
         slog(session_log, |l| {
@@ -4286,7 +4329,7 @@ async fn execute_cu_calls(
         let backend = computer_use::DisplayBackend::detect();
         let results = computer_use::execute_actions(
             &cu_call.actions,
-            display_id,
+            display_target,
             backend,
             log_dir,
             counter,

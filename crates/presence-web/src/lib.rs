@@ -940,4 +940,18 @@ impl PresenceWeb {
         }
         self.server.borrow().send_json(&msg);
     }
+
+    /// Grant agent access to the user's session display.
+    #[wasm_bindgen]
+    pub fn grant_user_display(&self) {
+        let msg = serde_json::json!({"action": "grant_user_display"});
+        self.server.borrow().send_json(&msg);
+    }
+
+    /// Revoke agent access to the user's session display.
+    #[wasm_bindgen]
+    pub fn revoke_user_display(&self) {
+        let msg = serde_json::json!({"action": "revoke_user_display"});
+        self.server.borrow().send_json(&msg);
+    }
 }

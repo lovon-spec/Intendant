@@ -842,6 +842,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::DisplayReady { .. }
         | AppEvent::DisplayTaken { .. }
         | AppEvent::DisplayReleased { .. }
+        | AppEvent::UserDisplayGranted
+        | AppEvent::UserDisplayRevoked { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceLog { .. }

@@ -33,6 +33,10 @@ export class PresenceWeb {
      */
     get_tools(): any;
     /**
+     * Grant agent access to the user's session display.
+     */
+    grant_user_display(): void;
+    /**
      * Handle live model usage from Gemini Live / OpenAI Realtime.
      * Updates dashboard state, sends to server, returns `UiCommand[]`.
      */
@@ -75,6 +79,10 @@ export class PresenceWeb {
      * Release control of a display.
      */
     release_display(display_id: bigint, note?: string | null): void;
+    /**
+     * Revoke agent access to the user's session display.
+     */
+    revoke_user_display(): void;
     /**
      * Approve/skip/deny/approve_all a pending action.
      * Returns `UiCommand[]` for UI updates. Sends the action to the server.
@@ -261,6 +269,7 @@ export interface InitOutput {
     readonly presenceweb_get_prompt: (a: number) => [number, number];
     readonly presenceweb_get_state: (a: number) => any;
     readonly presenceweb_get_tools: (a: number) => any;
+    readonly presenceweb_grant_user_display: (a: number) => void;
     readonly presenceweb_handle_live_usage: (a: number, b: any) => any;
     readonly presenceweb_handle_server_event: (a: number, b: any) => number;
     readonly presenceweb_handle_server_message: (a: number, b: any) => any;
@@ -272,6 +281,7 @@ export interface InitOutput {
     readonly presenceweb_phase: (a: number) => [number, number];
     readonly presenceweb_reconnect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_release_display: (a: number, b: bigint, c: number, d: number) => void;
+    readonly presenceweb_revoke_user_display: (a: number) => void;
     readonly presenceweb_send_approval: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_audio: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_follow_up: (a: number, b: number, c: number) => any;

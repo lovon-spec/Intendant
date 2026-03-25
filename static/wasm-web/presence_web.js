@@ -119,6 +119,12 @@ export class PresenceWeb {
         return ret;
     }
     /**
+     * Grant agent access to the user's session display.
+     */
+    grant_user_display() {
+        wasm.presenceweb_grant_user_display(this.__wbg_ptr);
+    }
+    /**
      * Handle live model usage from Gemini Live / OpenAI Realtime.
      * Updates dashboard state, sends to server, returns `UiCommand[]`.
      * @param {any} usage
@@ -226,6 +232,12 @@ export class PresenceWeb {
         var ptr0 = isLikeNone(note) ? 0 : passStringToWasm0(note, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         var len0 = WASM_VECTOR_LEN;
         wasm.presenceweb_release_display(this.__wbg_ptr, display_id, ptr0, len0);
+    }
+    /**
+     * Revoke agent access to the user's session display.
+     */
+    revoke_user_display() {
+        wasm.presenceweb_revoke_user_display(this.__wbg_ptr);
     }
     /**
      * Approve/skip/deny/approve_all a pending action.

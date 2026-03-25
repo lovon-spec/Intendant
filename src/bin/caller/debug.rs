@@ -68,7 +68,7 @@ pub async fn setup_debug_screen(_web_port: u16) -> Result<DebugScreen, String> {
 pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
     let display_id = find_free_debug_display();
     let config = vision::DisplayConfig {
-        display_id,
+        target: super::computer_use::DisplayTarget::Virtual { id: display_id },
         width: 1280,
         height: 720,
     };

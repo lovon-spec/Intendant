@@ -76,6 +76,8 @@ pub enum ActionCategory {
     HumanInput,
     /// Spawning an untrusted live audio sub-agent.
     LiveAudioSpawn,
+    /// Accessing the user's session display (screenshot, mouse, keyboard).
+    DisplayControl,
 }
 
 impl ActionCategory {
@@ -92,6 +94,7 @@ impl ActionCategory {
             Self::Destructive => 5,
             Self::HumanInput => 6,
             Self::LiveAudioSpawn => 7,
+            Self::DisplayControl => 8,
         }
     }
 }
@@ -107,6 +110,7 @@ impl fmt::Display for ActionCategory {
             Self::Destructive => write!(f, "destructive"),
             Self::HumanInput => write!(f, "human_input"),
             Self::LiveAudioSpawn => write!(f, "live_audio_spawn"),
+            Self::DisplayControl => write!(f, "display_control"),
         }
     }
 }
@@ -141,6 +145,8 @@ pub struct ApprovalConfig {
     pub network: ApprovalRule,
     #[serde(default)]
     pub destructive: ApprovalRule,
+    #[serde(default)]
+    pub display_control: ApprovalRule,
 }
 
 fn default_auto() -> ApprovalRule {
@@ -156,6 +162,7 @@ impl Default for ApprovalConfig {
             command_exec: ApprovalRule::Auto,
             network: ApprovalRule::Auto,
             destructive: ApprovalRule::Ask,
+            display_control: ApprovalRule::Ask,
         }
     }
 }
@@ -171,6 +178,7 @@ impl ApprovalConfig {
             ActionCategory::Destructive => self.destructive,
             ActionCategory::HumanInput => ApprovalRule::Ask, // always ask
             ActionCategory::LiveAudioSpawn => ApprovalRule::Ask, // always ask
+            ActionCategory::DisplayControl => self.display_control,
         }
     }
 }
@@ -180,6 +188,9 @@ impl ApprovalConfig {
 pub struct AutonomyState {
     pub level: AutonomyLevel,
     pub rules: ApprovalConfig,
+    /// Session-level grant for the user's session display.
+    /// Once true, `DisplayControl` actions skip the approval prompt.
+    pub user_display_granted: bool,
 }
 
 impl Default for AutonomyState {
@@ -187,13 +198,18 @@ impl Default for AutonomyState {
         Self {
             level: AutonomyLevel::Medium,
             rules: ApprovalConfig::default(),
+            user_display_granted: false,
         }
     }
 }
 
 impl AutonomyState {
     pub fn new(level: AutonomyLevel, rules: ApprovalConfig) -> Self {
-        Self { level, rules }
+        Self {
+            level,
+            rules,
+            user_display_granted: false,
+        }
     }
 
     /// Determine whether approval is needed for a given action category.
@@ -204,6 +220,11 @@ impl AutonomyState {
             || category == ActionCategory::LiveAudioSpawn
         {
             return true;
+        }
+
+        // DisplayControl: always ask on first use, then session-grant takes over
+        if category == ActionCategory::DisplayControl {
+            return !self.user_display_granted;
         }
 
         // Full autonomy auto-approves everything except HumanInput
@@ -257,15 +278,30 @@ pub fn shared_autonomy(state: AutonomyState) -> SharedAutonomy {
 pub fn classify_command(cmd: &serde_json::Value) -> Vec<ActionCategory> {
     let function = cmd.get("function").and_then(|f| f.as_str()).unwrap_or("");
 
+    let targets_user_display = cmd
+        .get("display")
+        .and_then(|d| d.as_i64())
+        .map_or(false, |id| id <= 0);
+
     match function {
         "inspectPath" | "recallMemory" => vec![ActionCategory::FileRead],
         "writeFile" | "editFile" | "storeMemory" => vec![ActionCategory::FileWrite],
-        "captureScreen" => vec![ActionCategory::FileRead],
+        "captureScreen" => {
+            let mut cats = vec![ActionCategory::FileRead];
+            if targets_user_display {
+                cats.push(ActionCategory::DisplayControl);
+            }
+            cats
+        }
         "askHuman" => vec![ActionCategory::HumanInput],
         "browse" => vec![ActionCategory::NetworkRequest],
         "execAsAgent" | "execPty" => {
             let command_str = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("");
-            classify_shell_command(command_str)
+            let mut cats = classify_shell_command(command_str);
+            if targets_user_display {
+                cats.push(ActionCategory::DisplayControl);
+            }
+            cats
         }
         _ => vec![ActionCategory::CommandExec],
     }
@@ -722,5 +758,115 @@ destructive = "deny"
     #[test]
     fn human_input_highest_severity() {
         assert!(ActionCategory::HumanInput.severity() > ActionCategory::Destructive.severity());
+    }
+
+    #[test]
+    fn display_control_highest_severity() {
+        assert!(
+            ActionCategory::DisplayControl.severity()
+                > ActionCategory::LiveAudioSpawn.severity()
+        );
+    }
+
+    #[test]
+    fn display_control_category_display() {
+        assert_eq!(ActionCategory::DisplayControl.to_string(), "display_control");
+    }
+
+    #[test]
+    fn display_control_default_rule_is_ask() {
+        let config = ApprovalConfig::default();
+        assert_eq!(config.display_control, ApprovalRule::Ask);
+        assert_eq!(
+            config.rule_for(ActionCategory::DisplayControl),
+            ApprovalRule::Ask
+        );
+    }
+
+    #[test]
+    fn display_control_needs_approval_when_not_granted() {
+        // DisplayControl always needs approval until granted, at every autonomy level
+        for level in [
+            AutonomyLevel::Low,
+            AutonomyLevel::Medium,
+            AutonomyLevel::High,
+            AutonomyLevel::Full,
+        ] {
+            let state = AutonomyState::new(level, ApprovalConfig::default());
+            assert!(
+                state.needs_approval(ActionCategory::DisplayControl),
+                "DisplayControl should need approval at {:?} when not granted",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn display_control_skips_approval_when_granted() {
+        // Once granted, no approval needed at any level
+        for level in [
+            AutonomyLevel::Low,
+            AutonomyLevel::Medium,
+            AutonomyLevel::High,
+            AutonomyLevel::Full,
+        ] {
+            let mut state = AutonomyState::new(level, ApprovalConfig::default());
+            state.user_display_granted = true;
+            assert!(
+                !state.needs_approval(ActionCategory::DisplayControl),
+                "DisplayControl should NOT need approval at {:?} when granted",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn classify_capture_screen_user_display() {
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "captureScreen",
+            "nonce": 1,
+            "display": 0
+        });
+        let cats = classify_command(&cmd);
+        assert!(cats.contains(&ActionCategory::DisplayControl));
+        assert!(cats.contains(&ActionCategory::FileRead));
+    }
+
+    #[test]
+    fn classify_capture_screen_virtual_display() {
+        // display: 99 should NOT trigger DisplayControl
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "captureScreen",
+            "nonce": 1,
+            "display": 99
+        });
+        let cats = classify_command(&cmd);
+        assert!(!cats.contains(&ActionCategory::DisplayControl));
+        assert!(cats.contains(&ActionCategory::FileRead));
+    }
+
+    #[test]
+    fn classify_exec_user_display() {
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "xdotool key Return",
+            "display": 0
+        });
+        let cats = classify_command(&cmd);
+        assert!(cats.contains(&ActionCategory::DisplayControl));
+        assert!(cats.contains(&ActionCategory::CommandExec));
+    }
+
+    #[test]
+    fn classify_exec_no_display_no_control() {
+        // No display field → no DisplayControl
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "echo hello"
+        });
+        let cats = classify_command(&cmd);
+        assert!(!cats.contains(&ActionCategory::DisplayControl));
     }
 }

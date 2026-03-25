@@ -840,6 +840,18 @@ impl App {
                         self.cycle_autonomy_down();
                         true
                     }
+                    KeyCode::Char('d') => {
+                        // Toggle user display access
+                        let granted = self.autonomy.blocking_read().user_display_granted;
+                        if granted {
+                            self.handle_control_command(ControlMsg::RevokeUserDisplay {
+                                note: None,
+                            });
+                        } else {
+                            self.handle_control_command(ControlMsg::GrantUserDisplay);
+                        }
+                        true
+                    }
                     _ => false,
                 }
             }
@@ -1355,6 +1367,30 @@ impl App {
                     note,
                 });
             }
+            ControlMsg::GrantUserDisplay => {
+                {
+                    let mut state = self.autonomy.blocking_write();
+                    state.user_display_granted = true;
+                }
+                std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                self.log(LogLevel::Warn, "User display access granted".to_string());
+                self.broadcast_control(OutboundEvent::UserDisplayGranted);
+            }
+            ControlMsg::RevokeUserDisplay { note } => {
+                {
+                    let mut state = self.autonomy.blocking_write();
+                    state.user_display_granted = false;
+                }
+                std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+                let msg = format!(
+                    "User display access revoked{}",
+                    note.as_ref()
+                        .map(|n| format!(". Note: {}", n))
+                        .unwrap_or_default()
+                );
+                self.log(LogLevel::Warn, msg);
+                self.broadcast_control(OutboundEvent::UserDisplayRevoked { note });
+            }
             ControlMsg::InvokeSkill {
                 skill_name,
                 arguments,
@@ -1719,6 +1755,24 @@ impl App {
                     )
                 };
                 self.log(LogLevel::Info, msg.clone());
+                if let Ok(mut q) = self.context_injection.lock() {
+                    q.push(crate::event::ContextInjection::text(msg));
+                }
+            }
+            AppEvent::UserDisplayGranted => {
+                let msg = "You now have access to the user's session display. This is their real screen — be careful with mouse/keyboard automation.".to_string();
+                self.log(LogLevel::Warn, msg.clone());
+                if let Ok(mut q) = self.context_injection.lock() {
+                    q.push(crate::event::ContextInjection::text(msg));
+                }
+            }
+            AppEvent::UserDisplayRevoked { ref note } => {
+                let msg = if let Some(n) = note {
+                    format!("Your access to the user's session display has been revoked. Note: '{}'. Resume virtual display work only.", n)
+                } else {
+                    "Your access to the user's session display has been revoked. Resume virtual display work only.".to_string()
+                };
+                self.log(LogLevel::Warn, msg.clone());
                 if let Ok(mut q) = self.context_injection.lock() {
                     q.push(crate::event::ContextInjection::text(msg));
                 }

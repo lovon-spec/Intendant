@@ -1473,6 +1473,9 @@ html, body {
     <span class="field-label">autonomy</span>
     <span class="autonomy" id="sb-autonomy">Medium</span>
     <span class="sep">|</span>
+    <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Toggle agent access to your display">display</span>
+    <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay()" title="Toggle agent access to your display">off</span>
+    <span class="sep">|</span>
     <span class="field-label">session</span>
     <span class="session" id="sb-session"></span>
     <span class="conn-dot err" id="sb-conn"></span>
@@ -2169,6 +2172,12 @@ async function main() {
       if (d.t === 'annotation_saved' && d.path) {
         showAnnotationResult(d.path);
         return;
+      }
+      // Track user display grant/revoke events
+      if (d.event === 'user_display_granted') {
+        setUserDisplayState(true);
+      } else if (d.event === 'user_display_revoked') {
+        setUserDisplayState(false);
       }
     } catch(_) {}
     const cmds = app.handle_server_message(msg);
@@ -4279,6 +4288,7 @@ function renderSessionDetailEntries(entries, el) {
 // ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+  if (e.key === 'd') { toggleUserDisplay(); e.preventDefault(); return; }
   if (activeTab === 'activity' && app && app.pending_approval_id() !== null) {
     if (e.key === 'y') { processCommands(app.send_approval('approve')); e.preventDefault(); }
     else if (e.key === 's') { processCommands(app.send_approval('skip')); e.preventDefault(); }
@@ -4305,6 +4315,30 @@ window.sendFollowUp = function() {
   processCommands(app.send_follow_up(text));
   input.value = '';
 };
+
+// ── User display access toggle ──
+let userDisplayGranted = false;
+window.toggleUserDisplay = function() {
+  if (!app) return;
+  if (userDisplayGranted) {
+    app.revoke_user_display();
+    setUserDisplayState(false);
+  } else {
+    app.grant_user_display();
+    setUserDisplayState(true);
+  }
+};
+function setUserDisplayState(granted) {
+  userDisplayGranted = granted;
+  const el = document.getElementById('sb-display-access');
+  if (granted) {
+    el.textContent = 'on';
+    el.style.color = '#a6e3a1'; // green
+  } else {
+    el.textContent = 'off';
+    el.style.color = '#f38ba8'; // red
+  }
+}
 
 // Enter to submit
 document.querySelectorAll('#human-input, #followup-input').forEach(ta => {

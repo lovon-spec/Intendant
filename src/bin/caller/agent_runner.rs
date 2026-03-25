@@ -93,6 +93,18 @@ async fn run_agent_inner(
         }
     }
 
+    // Pass through user display grant if set by the caller
+    if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
+        cmd.env("INTENDANT_USER_DISPLAY_GRANTED", "1");
+    }
+
+    // Also preserve the original user display for UserSession resolution
+    if std::env::var("INTENDANT_USER_DISPLAY").is_ok() {
+        if let Ok(val) = std::env::var("INTENDANT_USER_DISPLAY") {
+            cmd.env("INTENDANT_USER_DISPLAY", val);
+        }
+    }
+
     let mut child = cmd.spawn().map_err(|e| {
         CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
     })?;

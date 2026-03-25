@@ -765,6 +765,7 @@ pub fn render_help_overlay(f: &mut Frame, area: Rect) {
         ("PgUp/PgDn", "Scroll log (page)"),
         ("Home/End", "Jump to start/end"),
         ("+/-", "Cycle autonomy level"),
+        ("d", "Toggle user display access"),
         ("?", "Toggle this help"),
         ("y/Enter", "Approve pending action"),
         ("s", "Skip pending action"),

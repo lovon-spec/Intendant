@@ -1615,6 +1615,32 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "release_display", true, format!("Released control of :{}", display_id), None);
             Some(RESOURCE_LOGS_URI)
         }
+        ControlMsg::GrantUserDisplay => {
+            {
+                let s = state.read().await;
+                let autonomy = s.autonomy.clone();
+                drop(s);
+                let mut a = autonomy.write().await;
+                a.user_display_granted = true;
+            }
+            std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+            bus.send(AppEvent::UserDisplayGranted);
+            emit_control_result(control_tx, "grant_user_display", true, "User display access granted".to_string(), None);
+            Some(RESOURCE_LOGS_URI)
+        }
+        ControlMsg::RevokeUserDisplay { note } => {
+            {
+                let s = state.read().await;
+                let autonomy = s.autonomy.clone();
+                drop(s);
+                let mut a = autonomy.write().await;
+                a.user_display_granted = false;
+            }
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            bus.send(AppEvent::UserDisplayRevoked { note: note.clone() });
+            emit_control_result(control_tx, "revoke_user_display", true, "User display access revoked".to_string(), None);
+            Some(RESOURCE_LOGS_URI)
+        }
         ControlMsg::InvokeSkill { skill_name, arguments } => {
             // In MCP mode, convert skill invocation to a StartTask
             let discovered = crate::skills::discover_skills(None);
@@ -1958,6 +1984,22 @@ pub fn spawn_event_listener(
                         let msg = format!(
                             "User released control of display :{}{}",
                             display_id,
+                            note.as_ref()
+                                .map(|n| format!(". Note: {}", n))
+                                .unwrap_or_default()
+                        );
+                        s.push_log(LogLevel::Info, msg);
+                        resource_changed = Some("intendant://logs");
+                    }
+
+                    AppEvent::UserDisplayGranted => {
+                        s.push_log(LogLevel::Warn, "User display access granted".to_string());
+                        resource_changed = Some("intendant://logs");
+                    }
+
+                    AppEvent::UserDisplayRevoked { ref note } => {
+                        let msg = format!(
+                            "User display access revoked{}",
                             note.as_ref()
                                 .map(|n| format!(". Note: {}", n))
                                 .unwrap_or_default()

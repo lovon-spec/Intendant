@@ -45,6 +45,86 @@ impl DisplayBackend {
     }
 }
 
+// ── Display target ──────────────────────────────────────────────────────────
+
+/// Cross-platform display target. Replaces raw display numbers with a
+/// platform-agnostic enum that distinguishes between agent-managed virtual
+/// displays and the user's active session display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DisplayTarget {
+    /// A virtual display managed by intendant (Xvfb on Linux, :99+).
+    Virtual { id: u32 },
+    /// The user's active session display (:0 on Linux X11, primary display
+    /// on macOS). Requires explicit grant via the autonomy system.
+    UserSession,
+}
+
+impl DisplayTarget {
+    /// Return the DISPLAY environment variable string for this target.
+    ///
+    /// - `Virtual { id: 99 }` → `":99"`
+    /// - `UserSession` → queries the login session DISPLAY, falls back to `":0"`
+    pub fn display_env_string(&self) -> String {
+        match self {
+            DisplayTarget::Virtual { id } => format!(":{}", id),
+            DisplayTarget::UserSession => {
+                if cfg!(target_os = "macos") {
+                    // macOS doesn't use DISPLAY for the primary display
+                    String::new()
+                } else {
+                    // On Linux, try to find the login session's DISPLAY.
+                    // The caller may have overridden DISPLAY for Xvfb, so we
+                    // check INTENDANT_USER_DISPLAY first, then fall back to :0.
+                    std::env::var("INTENDANT_USER_DISPLAY")
+                        .unwrap_or_else(|_| ":0".to_string())
+                }
+            }
+        }
+    }
+
+    /// Return the stream name used in frame/recording registries.
+    pub fn stream_name(&self) -> String {
+        match self {
+            DisplayTarget::Virtual { id } => format!("display_{}", id),
+            DisplayTarget::UserSession => "display_user_session".to_string(),
+        }
+    }
+
+    /// Whether this target refers to the user's session display.
+    pub fn is_user_session(&self) -> bool {
+        matches!(self, DisplayTarget::UserSession)
+    }
+
+    /// Convert a raw display ID to a `DisplayTarget`.
+    /// `0` maps to `UserSession`, positive values to `Virtual`.
+    pub fn from_display_id(id: i32) -> Self {
+        if id <= 0 {
+            DisplayTarget::UserSession
+        } else {
+            DisplayTarget::Virtual { id: id as u32 }
+        }
+    }
+
+    /// Bridge for `Command.display: Option<i32>` (the JSON wire format).
+    /// Returns the explicit target if provided, otherwise the given default.
+    pub fn from_command_display(display: Option<i32>, default: Self) -> Self {
+        match display {
+            Some(id) => Self::from_display_id(id),
+            None => default,
+        }
+    }
+}
+
+impl std::fmt::Display for DisplayTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DisplayTarget::Virtual { id } => write!(f, ":{}", id),
+            DisplayTarget::UserSession => write!(f, "user_session"),
+        }
+    }
+}
+
 // ── Action types ─────────────────────────────────────────────────────────────
 
 /// A single computer-use action, normalized across all providers.
@@ -204,7 +284,7 @@ pub fn normalized_to_pixels(
 /// result).
 pub async fn execute_actions(
     actions: &[CuAction],
-    display_id: u32,
+    target: DisplayTarget,
     backend: DisplayBackend,
     screenshot_dir: &Path,
     action_counter: &mut u64,
@@ -219,7 +299,7 @@ pub async fn execute_actions(
         }
         DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
     }
-    let display = format!(":{}", display_id);
+    let display = target.display_env_string();
     let mut results = Vec::with_capacity(actions.len());
     let mut last_screenshot: Option<ScreenshotData> = None;
 
@@ -746,5 +826,84 @@ mod tests {
         // Unrecognized keys pass through as-is
         assert_eq!(translate_single_key("a"), "a");
         assert_eq!(translate_single_key("z"), "z");
+    }
+
+    #[test]
+    fn display_target_virtual_env_string() {
+        let target = DisplayTarget::Virtual { id: 99 };
+        assert_eq!(target.display_env_string(), ":99");
+    }
+
+    #[test]
+    fn display_target_stream_names() {
+        assert_eq!(
+            DisplayTarget::Virtual { id: 99 }.stream_name(),
+            "display_99"
+        );
+        assert_eq!(
+            DisplayTarget::UserSession.stream_name(),
+            "display_user_session"
+        );
+    }
+
+    #[test]
+    fn display_target_is_user_session() {
+        assert!(!DisplayTarget::Virtual { id: 99 }.is_user_session());
+        assert!(DisplayTarget::UserSession.is_user_session());
+    }
+
+    #[test]
+    fn display_target_from_display_id() {
+        assert_eq!(
+            DisplayTarget::from_display_id(99),
+            DisplayTarget::Virtual { id: 99 }
+        );
+        assert_eq!(
+            DisplayTarget::from_display_id(0),
+            DisplayTarget::UserSession
+        );
+        assert_eq!(
+            DisplayTarget::from_display_id(-1),
+            DisplayTarget::UserSession
+        );
+    }
+
+    #[test]
+    fn display_target_from_command_display() {
+        let default = DisplayTarget::Virtual { id: 99 };
+        assert_eq!(
+            DisplayTarget::from_command_display(None, default),
+            DisplayTarget::Virtual { id: 99 }
+        );
+        assert_eq!(
+            DisplayTarget::from_command_display(Some(0), default),
+            DisplayTarget::UserSession
+        );
+        assert_eq!(
+            DisplayTarget::from_command_display(Some(50), default),
+            DisplayTarget::Virtual { id: 50 }
+        );
+    }
+
+    #[test]
+    fn display_target_serde_roundtrip() {
+        let virtual_target = DisplayTarget::Virtual { id: 42 };
+        let json = serde_json::to_string(&virtual_target).unwrap();
+        let back: DisplayTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, virtual_target);
+
+        let session_target = DisplayTarget::UserSession;
+        let json = serde_json::to_string(&session_target).unwrap();
+        let back: DisplayTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, session_target);
+    }
+
+    #[test]
+    fn display_target_display_fmt() {
+        assert_eq!(format!("{}", DisplayTarget::Virtual { id: 99 }), ":99");
+        assert_eq!(
+            format!("{}", DisplayTarget::UserSession),
+            "user_session"
+        );
     }
 }

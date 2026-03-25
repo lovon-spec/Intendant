@@ -78,7 +78,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
         tools.push(ToolDefinition {
             name: "exec_command".to_string(),
-            description: "Execute a Bash command and wait for completion. Returns exit code, stdout tail (last 10KB), and stderr tail directly. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id]. For daemons, background in bash (`cmd &`) — the shell exits and the tool returns while the daemon keeps running. Optional fields (omit unless needed): `display` (integer) — X11 display number for GUI commands; `wait_for_port` (integer) — TCP port to wait for before executing.".to_string(),
+            description: "Execute a Bash command and wait for completion. Returns exit code, stdout tail (last 10KB), and stderr tail directly. DISPLAY and XAUTHORITY are set automatically. Reference a previous command's PID with $NONCE[id]. For daemons, background in bash (`cmd &`) — the shell exits and the tool returns while the daemon keeps running. Optional fields (omit unless needed): `display` (integer) — X11 display number for GUI commands, use 0 for the user's session display (requires approval); `wait_for_port` (integer) — TCP port to wait for before executing.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,
@@ -99,7 +99,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 
         tools.push(ToolDefinition {
             name: "capture_screen".to_string(),
-            description: "Capture a screenshot of an X11 display. The screenshot image is sent back to you for visual inspection. Screenshots are also saved to the log directory. The runtime auto-discovers active displays, skipping :0. Chain after UI interactions to verify success. Optional: `display` (integer) — X11 display number, omit to auto-discover.".to_string(),
+            description: "Capture a screenshot of an X11 display. The screenshot image is sent back to you for visual inspection. Screenshots are also saved to the log directory. The runtime auto-discovers active virtual displays by default. Use `display: 0` for the user's session display (requires one-time approval). Chain after UI interactions to verify success. Optional: `display` (integer) — display number, 0 for user session (requires approval), omit for auto-discover.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": props,

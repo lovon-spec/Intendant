@@ -11,6 +11,7 @@ export const presenceweb_dispatch_tool: (a: number, b: number, c: number, d: any
 export const presenceweb_get_prompt: (a: number) => [number, number];
 export const presenceweb_get_state: (a: number) => any;
 export const presenceweb_get_tools: (a: number) => any;
+export const presenceweb_grant_user_display: (a: number) => void;
 export const presenceweb_handle_live_usage: (a: number, b: any) => any;
 export const presenceweb_handle_server_event: (a: number, b: any) => number;
 export const presenceweb_handle_server_message: (a: number, b: any) => any;
@@ -22,6 +23,7 @@ export const presenceweb_pending_approval_id: (a: number) => any;
 export const presenceweb_phase: (a: number) => [number, number];
 export const presenceweb_reconnect_server: (a: number, b: number, c: number) => void;
 export const presenceweb_release_display: (a: number, b: bigint, c: number, d: number) => void;
+export const presenceweb_revoke_user_display: (a: number) => void;
 export const presenceweb_send_approval: (a: number, b: number, c: number) => any;
 export const presenceweb_send_audio: (a: number, b: number, c: number) => void;
 export const presenceweb_send_follow_up: (a: number, b: number, c: number) => any;

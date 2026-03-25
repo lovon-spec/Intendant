@@ -159,6 +159,12 @@ pub enum AppEvent {
         note: Option<String>,
     },
 
+    // User session display grant/revoke
+    UserDisplayGranted,
+    UserDisplayRevoked {
+        note: Option<String>,
+    },
+
     // Recording lifecycle
     RecordingStarted {
         stream_name: String,
@@ -404,6 +410,11 @@ pub enum ControlMsg {
         #[serde(default)]
         note: Option<String>,
     },
+    GrantUserDisplay,
+    RevokeUserDisplay {
+        #[serde(default)]
+        note: Option<String>,
+    },
     QueryDetail {
         scope: String,
         #[serde(default)]
@@ -570,6 +581,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 note: note.clone(),
             })
         }
+        AppEvent::UserDisplayGranted => Some(OutboundEvent::UserDisplayGranted),
+        AppEvent::UserDisplayRevoked { note } => Some(OutboundEvent::UserDisplayRevoked {
+            note: note.clone(),
+        }),
         AppEvent::ContextManagement { turn } => Some(OutboundEvent::ContextManagement {
             turn: *turn,
         }),
@@ -815,6 +830,17 @@ fn write_event_to_session_log(
         }
         AppEvent::DisplayReleased { display_id, note } => {
             log.display_released(*display_id, note.as_deref());
+        }
+        AppEvent::UserDisplayGranted => {
+            log.info("User display access granted");
+        }
+        AppEvent::UserDisplayRevoked { note } => {
+            let msg = if let Some(n) = note {
+                format!("User display access revoked: {}", n)
+            } else {
+                "User display access revoked".to_string()
+            };
+            log.info(&msg);
         }
         AppEvent::DebugScreenReady { display_id, vnc_port } => {
             log.debug_screen_ready(*display_id, *vnc_port);
@@ -1165,6 +1191,10 @@ mod tests {
                 display_id: 99,
                 note: Some("done testing".to_string()),
             },
+            ControlMsg::GrantUserDisplay,
+            ControlMsg::RevokeUserDisplay {
+                note: Some("done with user display".to_string()),
+            },
             ControlMsg::InvokeSkill {
                 skill_name: "deploy".to_string(),
                 arguments: Some("staging".to_string()),
@@ -1346,6 +1376,37 @@ mod tests {
                 assert!(arguments.is_none());
             }
             _ => panic!("expected InvokeSkill"),
+        }
+    }
+
+    #[test]
+    fn control_msg_grant_user_display_deserialize() {
+        let json = r#"{"action":"grant_user_display"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ControlMsg::GrantUserDisplay));
+    }
+
+    #[test]
+    fn control_msg_revoke_user_display_deserialize() {
+        let json = r#"{"action":"revoke_user_display","note":"testing done"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::RevokeUserDisplay { note } => {
+                assert_eq!(note.as_deref(), Some("testing done"));
+            }
+            _ => panic!("expected RevokeUserDisplay"),
+        }
+    }
+
+    #[test]
+    fn control_msg_revoke_user_display_no_note() {
+        let json = r#"{"action":"revoke_user_display"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::RevokeUserDisplay { note } => {
+                assert!(note.is_none());
+            }
+            _ => panic!("expected RevokeUserDisplay"),
         }
     }
 

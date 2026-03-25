@@ -160,6 +160,11 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    UserDisplayGranted,
+    UserDisplayRevoked {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     RecordingStarted {
         stream_name: String,
     },

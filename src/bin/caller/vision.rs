@@ -2,9 +2,11 @@ use super::error::CallerError;
 use std::process::Stdio;
 use tokio::process::Child;
 
+use super::computer_use::DisplayTarget;
+
 /// Per-provider display resolution for Xvfb (Linux) or native display (macOS).
 pub struct DisplayConfig {
-    pub display_id: u32,
+    pub target: DisplayTarget,
     pub width: u32,
     pub height: u32,
 }
@@ -93,7 +95,7 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
         _ => (1024, 768),           // safe default
     };
     DisplayConfig {
-        display_id: find_free_display(),
+        target: DisplayTarget::Virtual { id: find_free_display() },
         width,
         height,
     }
@@ -219,10 +221,19 @@ async fn launch_vnc(display_arg: &str, port: u32) -> Option<Child> {
 }
 
 /// Launch Xvfb on the given display with the given resolution.
+/// The config's target must be `DisplayTarget::Virtual`; panics otherwise.
 /// Returns a guard that kills the process on drop.
 #[cfg(target_os = "linux")]
 pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerError> {
-    let display_arg = format!(":{}", config.display_id);
+    let display_id = match config.target {
+        DisplayTarget::Virtual { id } => id,
+        DisplayTarget::UserSession => {
+            return Err(CallerError::Config(
+                "Cannot launch Xvfb for the user session display".to_string(),
+            ))
+        }
+    };
+    let display_arg = format!(":{}", display_id);
     let screen_arg = format!("{}x{}x24", config.width, config.height);
 
     let child = tokio::process::Command::new("Xvfb")
@@ -254,17 +265,25 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
         )));
     }
 
+    // Preserve the user's original DISPLAY before overriding with virtual display.
+    // This is used by DisplayTarget::UserSession to resolve the user's actual display.
+    if std::env::var("INTENDANT_USER_DISPLAY").is_err() {
+        if let Ok(original) = std::env::var("DISPLAY") {
+            std::env::set_var("INTENDANT_USER_DISPLAY", &original);
+        }
+    }
+
     // Set DISPLAY env var so the runtime subprocess inherits it
     std::env::set_var("DISPLAY", &display_arg);
 
     // Best-effort: launch x11vnc so users can watch the display via VNC
-    let vnc_port_num = 5900 + config.display_id;
+    let vnc_port_num = 5900 + display_id;
     let vnc_child = launch_vnc(&display_arg, vnc_port_num).await;
     let has_vnc = vnc_child.is_some();
 
     Ok(XvfbGuard {
         child,
-        display_id: config.display_id,
+        display_id,
         vnc_child,
         vnc_port: if has_vnc { Some(vnc_port_num) } else { None },
     })
@@ -380,7 +399,8 @@ mod tests {
     fn vnc_port_tracks_display_id() {
         // VNC port should always be 5900 + display_id
         let config = display_config_for_provider("openai");
-        assert_eq!(5900 + config.display_id, 5900 + config.display_id);
+        // Target should be a Virtual display
+        assert!(matches!(config.target, DisplayTarget::Virtual { .. }));
         // With display :99, VNC port is 5999
         assert_eq!(5900 + 99, 5999);
     }
