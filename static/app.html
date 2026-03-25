@@ -1265,8 +1265,17 @@ html, body {
   z-index: 100;
   cursor: grab;
   user-select: none;
+  -webkit-user-drag: none;
 }
 .voice-overlay.dragging { cursor: grabbing; }
+.voice-overlay.dragging * { pointer-events: none; }
+.voice-drag-handle {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  cursor: grab;
+}
+.voice-drag-handle:active { cursor: grabbing; }
 .mic-btn {
   width: 48px; height: 48px;
   border-radius: 50%;
@@ -1282,7 +1291,7 @@ html, body {
 }
 .mic-btn:hover { border-color: var(--blue); background: var(--surface1); }
 .mic-btn.active { border-color: var(--red); background: var(--red); color: var(--crust); }
-.mic-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.mic-btn:disabled, .mic-btn.is-disabled { opacity: 0.3; cursor: grab; }
 .video-btn {
   width: 48px; height: 48px;
   border-radius: 50%;
@@ -1298,7 +1307,7 @@ html, body {
 }
 .video-btn:hover { border-color: var(--sapphire); background: var(--surface1); }
 .video-btn.active { border-color: var(--sapphire); background: var(--sapphire); color: var(--crust); }
-.video-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.video-btn:disabled, .video-btn.is-disabled { opacity: 0.3; cursor: grab; }
 .video-preview-wrap {
   position: fixed;
   bottom: 80px;
@@ -1676,39 +1685,67 @@ html, body {
 </div>
 
 <!-- Voice Overlay -->
-<div class="voice-overlay" id="voiceOverlay">
+<div class="voice-overlay" id="voiceOverlay" draggable="false">
+  <div class="voice-drag-handle" id="voiceDragHandle"></div>
   <div class="voice-status hidden" id="voiceStatus"></div>
   <button class="make-active-btn hidden" id="makeActiveBtn">Make Active</button>
-  <button class="video-btn" id="videoBtn" title="Toggle video" disabled>&#128249;</button>
+  <button class="video-btn is-disabled" id="videoBtn" title="Toggle video">&#128249;</button>
   <button class="mic-btn" id="micBtn" title="Toggle voice">&#127908;</button>
 </div>
 <script>
 (function() {
   const el = document.getElementById('voiceOverlay');
-  let dragging = false, startX, startY, startLeft, startBottom;
-  el.addEventListener('mousedown', (e) => {
-    if (e.target.tagName === 'BUTTON') return;
-    dragging = true;
-    el.classList.add('dragging');
+  const handle = document.getElementById('voiceDragHandle');
+  let pointerDown = false, moved = false, startX, startY, startLeft, startBottom;
+  const DRAG_THRESHOLD = 8;
+  function onDown(e) {
+    const pt = e.touches ? e.touches[0] : e;
+    pointerDown = true; moved = false;
     const rect = el.getBoundingClientRect();
-    startX = e.clientX; startY = e.clientY;
+    startX = pt.clientX; startY = pt.clientY;
     startLeft = rect.left;
     startBottom = window.innerHeight - rect.bottom;
-    el.style.right = 'auto';
-    el.style.left = startLeft + 'px';
-    el.style.bottom = startBottom + 'px';
     e.preventDefault();
-  });
-  document.addEventListener('mousemove', (e) => {
-    if (!dragging) return;
-    el.style.left = (startLeft + e.clientX - startX) + 'px';
-    el.style.bottom = (startBottom - (e.clientY - startY)) + 'px';
-  });
-  document.addEventListener('mouseup', () => {
-    if (!dragging) return;
-    dragging = false;
+  }
+  function onMove(e) {
+    if (!pointerDown) return;
+    const pt = e.touches ? e.touches[0] : e;
+    const dx = pt.clientX - startX, dy = pt.clientY - startY;
+    if (!moved && Math.abs(dx) + Math.abs(dy) < DRAG_THRESHOLD) return;
+    if (!moved) {
+      moved = true;
+      el.classList.add('dragging');
+      el.style.right = 'auto';
+      el.style.left = startLeft + 'px';
+      el.style.bottom = startBottom + 'px';
+    }
+    el.style.left = (startLeft + dx) + 'px';
+    el.style.bottom = (startBottom - dy) + 'px';
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (!pointerDown) return;
+    pointerDown = false;
     el.classList.remove('dragging');
-  });
+    if (!moved) {
+      // Was a tap/click — find the button underneath and click it
+      const pt = e.changedTouches ? e.changedTouches[0] : e;
+      handle.style.pointerEvents = 'none';
+      const target = document.elementFromPoint(pt.clientX, pt.clientY);
+      handle.style.pointerEvents = '';
+      if (target && target.tagName === 'BUTTON' && !target.disabled && !target.classList.contains('is-disabled')) {
+        target.click();
+      }
+    }
+    moved = false;
+  }
+  handle.addEventListener('dragstart', (e) => e.preventDefault());
+  handle.addEventListener('mousedown', onDown);
+  handle.addEventListener('touchstart', onDown, {passive: false});
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('touchmove', onMove, {passive: false});
+  document.addEventListener('mouseup', onUp);
+  document.addEventListener('touchend', onUp);
 })();
 </script>
 
@@ -1880,8 +1917,8 @@ function updateActivePassiveUI() {
   const makeActiveBtn = document.getElementById('makeActiveBtn');
   const videoBtn = document.getElementById('videoBtn');
   const badge = document.getElementById('sb-active-badge');
-  micBtn.disabled = !isActiveBrowser;
-  videoBtn.disabled = !isActiveBrowser || !modelConnected;
+  micBtn.classList.toggle('is-disabled', !isActiveBrowser);
+  videoBtn.classList.toggle('is-disabled', !isActiveBrowser || !modelConnected);
   makeActiveBtn.classList.toggle('hidden', isActiveBrowser);
   if (isActiveBrowser) {
     badge.textContent = 'Active';
@@ -2119,7 +2156,7 @@ async function main() {
   app.set_on_voice_ready(() => {
     modelConnected = true;
     document.getElementById('sb-voice').className = 'voice-dot ok';
-    document.getElementById('videoBtn').disabled = false;
+    document.getElementById('videoBtn').classList.remove('is-disabled');
     const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
     document.getElementById('sb-voice-label').textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
     showVoiceStatus('Voice ready');
@@ -2161,7 +2198,7 @@ async function main() {
       modelConnected = false;
       document.getElementById('sb-voice').className = 'voice-dot err';
       if (videoActive) stopVideo();
-      document.getElementById('videoBtn').disabled = true;
+      document.getElementById('videoBtn').classList.add('is-disabled');
     }
     showVoiceStatus(msg, true);
     try { app.send_voice_diagnostic('error', msg); } catch(_) {}
@@ -2177,7 +2214,7 @@ async function main() {
       app.disconnect_voice();
       modelConnected = false;
       document.getElementById('sb-voice').className = 'voice-dot err';
-      document.getElementById('videoBtn').disabled = true;
+      document.getElementById('videoBtn').classList.add('is-disabled');
       connectVoice();
     }
   });
@@ -2211,7 +2248,7 @@ async function main() {
       modelConnected = false;
       micActive = false;
       document.getElementById('micBtn').classList.remove('active');
-      document.getElementById('videoBtn').disabled = true;
+      document.getElementById('videoBtn').classList.add('is-disabled');
       stopMic();
     }
     isActiveBrowser = false;
@@ -2327,7 +2364,7 @@ async function main() {
         modelConnected = false;
         micActive = false;
         document.getElementById('micBtn').classList.remove('active');
-        document.getElementById('videoBtn').disabled = true;
+        document.getElementById('videoBtn').classList.add('is-disabled');
         stopMic();
       }
       isActiveBrowser = false;
