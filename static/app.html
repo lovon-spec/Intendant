@@ -891,6 +891,63 @@ html, body {
   position: relative;
   background: #000;
 }
+.vnc-auth-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(17, 17, 27, 0.85);
+  z-index: 10;
+}
+.vnc-auth-box {
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 280px;
+}
+.vnc-auth-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+.vnc-auth-label {
+  font-size: 12px;
+  color: var(--overlay0);
+}
+.vnc-auth-input {
+  padding: 6px 10px;
+  border: 1px solid var(--surface2);
+  border-radius: 4px;
+  background: var(--base);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+.vnc-auth-input:focus { border-color: var(--blue); }
+.vnc-auth-submit {
+  padding: 5px 16px;
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  background: var(--green);
+  color: var(--base);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.vnc-auth-cancel {
+  padding: 5px 16px;
+  border: 1px solid var(--surface2);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--overlay0);
+  font-size: 12px;
+  cursor: pointer;
+}
 .display-canvas canvas {
   position: absolute;
   top: 0; left: 0;
@@ -2858,16 +2915,52 @@ class DisplaySlot {
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
       </div>
-      <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
+      <div class="display-canvas" id="display-canvas-${displayId}">
+        <div class="vnc-auth-overlay" id="ds-auth-${displayId}" style="display:none">
+          <div class="vnc-auth-box">
+            <div class="vnc-auth-title">VNC Password Required</div>
+            <div class="vnc-auth-label">Display :${displayId} requires authentication</div>
+            <input type="password" class="vnc-auth-input" id="ds-auth-pw-${displayId}" placeholder="VNC password" autocomplete="off">
+            <div style="display:flex;gap:8px;justify-content:flex-end">
+              <button class="vnc-auth-cancel" id="ds-auth-cancel-${displayId}">Cancel</button>
+              <button class="vnc-auth-submit" id="ds-auth-ok-${displayId}">Connect</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
     this.noteInput = this.el.querySelector(`#ds-note-${displayId}`);
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
     this.releaseBtn = this.el.querySelector(`#ds-release-${displayId}`);
     this.streamBtn = this.el.querySelector(`#ds-stream-${displayId}`);
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
+    this.authOverlay = this.el.querySelector(`#ds-auth-${displayId}`);
+    this.authInput = this.el.querySelector(`#ds-auth-pw-${displayId}`);
     this.takeBtn.addEventListener('click', () => this.takeControl());
     this.releaseBtn.addEventListener('click', () => this.releaseControl());
     this.streamBtn.addEventListener('click', () => this.toggleStreaming());
+    this.el.querySelector(`#ds-auth-ok-${displayId}`).addEventListener('click', () => this._submitAuth());
+    this.el.querySelector(`#ds-auth-cancel-${displayId}`).addEventListener('click', () => this._cancelAuth());
+    this.authInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this._submitAuth(); });
+  }
+  _showAuth() {
+    this.authOverlay.style.display = 'flex';
+    this.authInput.value = '';
+    this.statusEl.textContent = 'Password required';
+    this.statusEl.className = 'display-status';
+    setTimeout(() => this.authInput.focus(), 50);
+  }
+  _submitAuth() {
+    const pw = this.authInput.value;
+    this.authOverlay.style.display = 'none';
+    if (pw && this.rfb) {
+      this.rfb.sendCredentials({ password: pw });
+    }
+  }
+  _cancelAuth() {
+    this.authOverlay.style.display = 'none';
+    this.statusEl.textContent = 'Auth cancelled';
+    this.statusEl.className = 'display-status error';
   }
   connectPassive() { loadNoVNC(() => this._connectVNC()); }
   _connectVNC() {
@@ -2888,15 +2981,7 @@ class DisplaySlot {
         this.statusEl.className = 'display-status error';
         if (!e.detail.clean) setTimeout(() => { if (!this.connected) this._connectVNC(); }, 3000);
       });
-      this.rfb.addEventListener('credentialsrequired', () => {
-        const pw = prompt('VNC password required for display :' + this.displayId);
-        if (pw) {
-          this.rfb.sendCredentials({ password: pw });
-        } else {
-          this.statusEl.textContent = 'Auth cancelled';
-          this.statusEl.className = 'display-status error';
-        }
-      });
+      this.rfb.addEventListener('credentialsrequired', () => this._showAuth());
       this.rfb.addEventListener('securityfailure', () => {
         this.statusEl.textContent = 'Security error'; this.statusEl.className = 'display-status error';
       });
