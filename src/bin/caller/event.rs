@@ -717,6 +717,156 @@ pub fn spawn_outbound_broadcaster(
     })
 }
 
+/// Spawn a task that persists AppEvents to the session log on disk.
+///
+/// This is the single point where events flowing through the bus are written
+/// to `session.jsonl`. Events that are already logged inline by the agent loop
+/// (turn_start, model_response, agent_input/output, approval decisions, etc.)
+/// are skipped here to avoid duplication — only events that would otherwise be
+/// lost are handled.
+///
+/// Counterpart to `spawn_outbound_broadcaster` which handles the WebSocket/
+/// control-socket broadcast path.
+pub fn spawn_session_log_writer(
+    mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
+    session_log: crate::SharedSessionLog,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => write_event_to_session_log(&session_log, &event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Write a single AppEvent to the session log if it isn't already logged
+/// inline by the agent loop.
+fn write_event_to_session_log(
+    session_log: &crate::SharedSessionLog,
+    event: &AppEvent,
+) {
+    let Ok(mut log) = session_log.lock() else {
+        return;
+    };
+
+    match event {
+        // ---- Events NOT logged inline — this writer is their only path to disk ----
+
+        // Agent lifecycle
+        AppEvent::AgentStarted { turn, commands_preview } => {
+            log.agent_started(*turn, commands_preview);
+        }
+        AppEvent::DoneSignal { message } => {
+            log.done_signal(message.as_deref());
+        }
+        AppEvent::TaskComplete { reason, summary } => {
+            log.task_complete(reason, summary.as_deref());
+        }
+        AppEvent::SessionStarted { session_id, task } => {
+            log.session_started(session_id, task.as_deref());
+        }
+        AppEvent::SessionEnded { session_id, reason } => {
+            log.session_ended(session_id, reason);
+        }
+        AppEvent::SafetyCapReached => {
+            log.safety_cap_reached();
+        }
+        AppEvent::SubAgentResult { formatted } => {
+            log.sub_agent_result(formatted);
+        }
+        AppEvent::OrchestratorProgress { status, .. } => {
+            log.orchestrator_progress(status);
+        }
+        AppEvent::RoundComplete { round, turns_in_round } => {
+            log.round_complete(*round, *turns_in_round);
+        }
+
+        // Approval / human interaction
+        AppEvent::AutoApproved { preview } => {
+            log.auto_approved(preview);
+        }
+        AppEvent::HumanQuestionDetected { question } => {
+            log.human_question(question);
+        }
+        AppEvent::HumanResponseSent => {
+            log.human_response_sent();
+        }
+
+        // Display / vision
+        AppEvent::DisplayReady { display_id, vnc_port, width, height } => {
+            log.display_ready(*display_id, *vnc_port, *width, *height);
+        }
+        AppEvent::DisplayTaken { display_id } => {
+            log.display_taken(*display_id);
+        }
+        AppEvent::DisplayReleased { display_id, note } => {
+            log.display_released(*display_id, note.as_deref());
+        }
+        AppEvent::DebugScreenReady { display_id, vnc_port } => {
+            log.debug_screen_ready(*display_id, *vnc_port);
+        }
+        AppEvent::DebugScreenTornDown { display_id } => {
+            log.debug_screen_torn_down(*display_id);
+        }
+
+        // Recording
+        AppEvent::RecordingStarted { stream_name } => {
+            log.recording_started(stream_name);
+        }
+        AppEvent::RecordingStopped { stream_name } => {
+            log.recording_stopped(stream_name);
+        }
+        AppEvent::RecordingError { stream_name, message } => {
+            log.recording_error(stream_name, message);
+        }
+
+        // Presence / voice
+        AppEvent::PresenceLog { message, level, .. } => {
+            let level_str = level.as_ref().map(|l| {
+                crate::frontend::log_level_to_str(l)
+            });
+            log.presence_log(message, level_str);
+        }
+        AppEvent::PresenceUsageUpdate {
+            provider, model, total_tokens, context_window, usage_pct, ..
+        } => {
+            log.presence_usage_update(provider, model, *total_tokens, *context_window, *usage_pct);
+        }
+        AppEvent::LiveUsageUpdate {
+            provider, model, total_tokens, ..
+        } => {
+            log.live_usage_update(provider, model, *total_tokens);
+        }
+
+        // Live audio sub-agent lifecycle
+        AppEvent::LiveAudioStarted { id, provider } => {
+            log.live_audio_started(id, provider);
+        }
+        AppEvent::LiveAudioProgress { id, state, elapsed_secs, transcript_preview } => {
+            log.live_audio_progress(id, state, *elapsed_secs, transcript_preview);
+        }
+        AppEvent::LiveAudioCompleted { id, status, quarantine_count, .. } => {
+            log.live_audio_completed(id, status, *quarantine_count);
+        }
+
+        // ---- Events already logged inline by the agent loop or web_gateway ----
+        // turn_start, model_response, agent_input/output, approval decisions,
+        // json_extracted, reasoning, budget warnings, loop errors, context
+        // management, voice_log, voice_diagnostic, presence_connected/disconnected,
+        // presence_checkpoint, user_transcript — all have slog() calls at their
+        // point of origin.
+        //
+        // ---- Terminal-only / internal / high-frequency events ----
+        // Key, Resize, Tick, Quit, ControlCommand, SessionDirChanged,
+        // ModelResponseDelta (too chatty), StatusUpdate (every tick),
+        // UsageSnapshot (periodic, mainly for UI), LogEntry (meta/circular).
+        _ => {}
+    }
+}
+
 /// Spawns a tick timer that sends Tick events at a regular interval.
 pub fn spawn_tick_timer(bus: EventBus, interval_ms: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

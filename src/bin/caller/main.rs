@@ -4497,6 +4497,12 @@ async fn main() -> Result<(), CallerError> {
             outbound_tx.clone(),
         );
 
+        // Wire session log writer: persists bus events that aren't logged inline.
+        let _session_log_writer = event::spawn_session_log_writer(
+            bus.subscribe(),
+            session_log.clone(),
+        );
+
         // Web gateway (WebSocket)
         let _web_handle = if flags.web {
             let broadcast_tx = outbound_tx.clone();
@@ -4845,6 +4851,12 @@ async fn main() -> Result<(), CallerError> {
         } else {
             None
         };
+
+        // Wire session log writer: persists bus events that aren't logged inline.
+        let _session_log_writer = event::spawn_session_log_writer(
+            bus.subscribe(),
+            session_log.clone(),
+        );
 
         if let Some(ref t) = task {
             app.log(types::LogLevel::Info, format!("Task: {}", t));
@@ -5321,6 +5333,12 @@ async fn main() -> Result<(), CallerError> {
         let _outbound_broadcaster = event::spawn_outbound_broadcaster(
             bus.subscribe(),
             outbound_tx.clone(),
+        );
+
+        // Wire session log writer: persists bus events that aren't logged inline.
+        let _session_log_writer = event::spawn_session_log_writer(
+            bus.subscribe(),
+            session_log.clone(),
         );
 
         // JSON stdout subscriber: prints OutboundEvents as JSONL to stdout
