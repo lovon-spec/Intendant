@@ -56,7 +56,9 @@ pub fn format_event(event: &PresenceEvent) -> String {
             }
         }
         PresenceEvent::UserDisplayGranted => {
-            "User display access GRANTED — you can now target 'user_session' in submit_task display_target".to_string()
+            "User display permission granted — waiting for display to become available. \
+             Do NOT act on the display until you see a 'Display available: user_session' event."
+                .to_string()
         }
         PresenceEvent::UserDisplayRevoked => {
             "User display access REVOKED — do not target 'user_session', use virtual displays only".to_string()

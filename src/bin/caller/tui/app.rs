@@ -1777,7 +1777,7 @@ impl App {
                 }
             }
             AppEvent::UserDisplayGranted => {
-                let msg = "You now have access to the user's session display. This is their real screen — be careful with mouse/keyboard automation.".to_string();
+                let msg = "User display permission granted. Display is being activated — wait for DisplayReady before interacting.".to_string();
                 self.log(LogLevel::Warn, msg.clone());
                 if let Ok(mut q) = self.context_injection.lock() {
                     q.push(crate::event::ContextInjection::text(msg));
