@@ -2726,6 +2726,9 @@ pub fn select_cu_provider(
         .or_else(|_| env::var("GEMINI"))
         .ok();
 
+    // CU providers get native CU tools + escalation function tool
+    let escalate_tools = vec![crate::tools::escalate_to_agent_tool()];
+
     match provider_str.as_deref() {
         Some("gemini") => {
             let key = gemini_key.ok_or_else(|| {
@@ -2735,8 +2738,7 @@ pub fn select_cu_provider(
             let display = crate::vision::display_config_for_provider("gemini");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            // Use new_plain() — CU tasks only use native CU tools, not function tools
-            let mut p = GeminiProvider::new_plain(key, model, ctx, max_out);
+            let mut p = GeminiProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
             p.cu_enabled = true;
             p.cu_display = Some((display.width, display.height));
             Ok(Box::new(p))
@@ -2752,8 +2754,7 @@ pub fn select_cu_provider(
             let display = crate::vision::display_config_for_provider("anthropic");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            // Use new_plain() — CU tasks only use native CU tools, not function tools
-            let mut p = AnthropicProvider::new_plain(key, model, ctx, max_out);
+            let mut p = AnthropicProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
             p.cu_enabled = true;
             p.cu_display = Some((display.width, display.height));
             Ok(Box::new(p))
@@ -2766,8 +2767,7 @@ pub fn select_cu_provider(
             let display = crate::vision::display_config_for_provider("openai");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            // Use new_plain() — CU tasks only use native CU tools, not function tools
-            let mut p = OpenAIProvider::new_plain(key, model, ctx, max_out);
+            let mut p = OpenAIProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
             p.cu_enabled = true;
             p.cu_display = Some((display.width, display.height));
             Ok(Box::new(p))

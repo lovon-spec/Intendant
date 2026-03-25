@@ -3205,103 +3205,57 @@ async fn run_with_presence(
             &envelope.context_hints, &frame_registry
         ).await;
 
-        // Resolve reference frames (what the user was looking at when they spoke)
-        slog(&session_log, |l| {
-            l.info(&format!(
-                "Reference frame IDs from envelope: {:?} (count={})",
-                envelope.reference_frame_ids, envelope.reference_frame_ids.len()
-            ))
-        });
-        let reference_images = resolve_frame_ids(
-            &envelope.reference_frame_ids, &frame_registry
-        ).await;
-        slog(&session_log, |l| {
-            l.info(&format!(
-                "Resolved reference images: {} (from {} frame IDs)",
-                reference_images.len(), envelope.reference_frame_ids.len()
-            ))
-        });
-        if reference_images.is_empty() && !envelope.reference_frame_ids.is_empty() {
-            // Frame IDs were provided but couldn't be resolved — log registry state
-            let reg = frame_registry.read().await;
-            let latest = reg.latest(None);
-            let total = reg.query(None, 5);
-            slog(&session_log, |l| {
-                l.warn(&format!(
-                    "Frame resolution failed! Registry latest={:?}, recent_frames={:?}",
-                    latest,
-                    total.iter().map(|f| &f.frame_id).collect::<Vec<_>>()
-                ))
-            });
-        }
+        // ── CU-first routing: all tasks go to fast CU model first ──
+        let mut task_for_agent: Option<String> = None;
 
-        let has_reference_frames = !reference_images.is_empty();
+        if !envelope.force_direct {
+            // Auto-attach latest display frame(s) if none were explicitly provided
+            let mut reference_images = resolve_frame_ids(
+                &envelope.reference_frame_ids, &frame_registry
+            ).await;
+            if reference_images.is_empty() {
+                reference_images = auto_attach_display_frames(&frame_registry).await;
+            }
 
-        // ── Ephemeral CU task: lightweight, short-lived, no project context ──
-        if has_reference_frames {
-            let proj = match Project::from_root(project_root.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    bus.send(AppEvent::PresenceLog {
-                        message: format!("Project error: {}", e),
-                        level: Some(types::LogLevel::Error),
-                        turn: None,
-                    });
-                    continue;
-                }
-            };
-            let cu_provider = match provider::select_cu_provider(&proj.config.computer_use) {
-                Ok(p) => p,
-                Err(e) => {
-                    bus.send(AppEvent::PresenceLog {
-                        message: format!("CU provider error: {}", e),
-                        level: Some(types::LogLevel::Error),
-                        turn: None,
-                    });
-                    continue;
-                }
-            };
-
-            slog(&session_log, |l| {
-                l.info(&format!(
-                    "CU task: {} (provider: {}, model: {})",
-                    envelope.task, cu_provider.name(), cu_provider.model()
-                ))
-            });
-            bus.send(AppEvent::PresenceLog {
-                message: format!("Starting CU task: {}", envelope.task),
-                level: None,
-                turn: None,
-            });
-
-            match run_cu_task(
-                cu_provider.as_ref(),
-                &envelope.task,
-                reference_images,
-                frame_images,
-                &session_log,
-                &log_dir,
-                &bus,
-                &proj.config.computer_use,
+            match try_cu_first(
+                &project_root, &reference_images, &frame_images,
+                &envelope.task, &session_log, &log_dir, &bus,
             ).await {
-                Ok(stats) => {
+                Some(Ok(CuTaskResult::Completed(stats))) => {
                     cumulative_stats.turns += stats.turns;
                     bus.send(AppEvent::PresenceLog {
                         message: format!("CU task complete ({} turns)", stats.turns),
-                        level: None,
-                        turn: None,
+                        level: None, turn: None,
                     });
+                    continue; // done
                 }
-                Err(e) => {
-                    bus.send(AppEvent::PresenceLog {
-                        message: format!("CU task error: {}", e),
-                        level: Some(types::LogLevel::Error),
-                        turn: None,
+                Some(Ok(CuTaskResult::Escalate { task })) => {
+                    slog(&session_log, |l| {
+                        l.info(&format!("CU escalated to agent: {}", &task[..task.len().min(80)]))
                     });
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("Escalating to agent: {}", &task[..task.len().min(80)]),
+                        level: None, turn: None,
+                    });
+                    task_for_agent = Some(task);
+                }
+                Some(Err(e)) => {
+                    slog(&session_log, |l| {
+                        l.warn(&format!("CU error, escalating: {}", e))
+                    });
+                    task_for_agent = Some(envelope.task.clone());
+                }
+                None => {
+                    // No CU available (no display, no provider) — go to agent directly
+                    task_for_agent = Some(envelope.task.clone());
                 }
             }
-            continue;
+        } else {
+            task_for_agent = Some(envelope.task.clone());
         }
+
+        // ── Regular agent path (for escalated or non-CU tasks) ──
+        let task_text = task_for_agent.unwrap_or_else(|| envelope.task.clone());
 
         if persistent_conv.is_none() {
             // ── First task: full initialization ──
@@ -3360,9 +3314,9 @@ async fn run_with_presence(
 
             // Add task with optional frame images
             if frame_images.is_empty() {
-                conv.add_user(envelope.task);
+                conv.add_user(task_text.clone());
             } else {
-                conv.add_user_with_images(envelope.task, frame_images);
+                conv.add_user_with_images(task_text.clone(), frame_images);
             }
 
             persistent_project = Some(proj);
@@ -3373,10 +3327,10 @@ async fn run_with_presence(
             let conv = persistent_conv.as_mut().unwrap();
 
             if frame_images.is_empty() {
-                conv.add_user(format!("[New Task] {}", envelope.task));
+                conv.add_user(format!("[New Task] {}", task_text));
             } else {
                 conv.add_user_with_images(
-                    format!("[New Task] {}", envelope.task),
+                    format!("[New Task] {}", task_text),
                     frame_images,
                 );
             }
@@ -3917,8 +3871,84 @@ async fn resolve_frame_ids(
     images
 }
 
+/// Auto-attach the latest display frame(s) from the frame registry.
+async fn auto_attach_display_frames(
+    registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+) -> Vec<conversation::ImageData> {
+    let reg = registry.read().await;
+    let mut images = Vec::new();
+    for stream in reg.active_streams() {
+        if stream.starts_with("display_") {
+            if let Some(frame_id) = reg.latest(Some(&stream)) {
+                if let Ok(data) = reg.read_hq(frame_id) {
+                    use base64::Engine;
+                    images.push(conversation::ImageData {
+                        media_type: "image/jpeg".to_string(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&data),
+                    });
+                }
+            }
+        }
+    }
+    images
+}
+
+/// Try the CU-first path: send task to the fast CU model.
+/// Returns None if CU is not available (no display, no provider).
+#[allow(clippy::too_many_arguments)]
+async fn try_cu_first(
+    project_root: &std::path::Path,
+    reference_images: &[conversation::ImageData],
+    frame_images: &[conversation::ImageData],
+    task: &str,
+    session_log: &SharedSessionLog,
+    log_dir: &std::path::Path,
+    bus: &event::EventBus,
+) -> Option<Result<CuTaskResult, CallerError>> {
+    if reference_images.is_empty() {
+        return None;
+    }
+
+    let proj = Project::from_root(project_root.to_path_buf()).ok()?;
+    let cu_provider = match provider::select_cu_provider(&proj.config.computer_use) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+
+    slog(session_log, |l| {
+        l.info(&format!(
+            "CU-first: {} (provider: {}, model: {})",
+            &task[..task.len().min(80)], cu_provider.name(), cu_provider.model()
+        ))
+    });
+    bus.send(event::AppEvent::PresenceLog {
+        message: format!("Trying CU: {}", &task[..task.len().min(80)]),
+        level: None,
+        turn: None,
+    });
+
+    Some(run_cu_task(
+        cu_provider.as_ref(),
+        task,
+        reference_images.to_vec(),
+        frame_images.to_vec(),
+        session_log,
+        log_dir,
+        bus,
+        &proj.config.computer_use,
+    ).await)
+}
+
 /// Maximum turns for an ephemeral CU task before giving up.
 const CU_TASK_MAX_TURNS: usize = 20;
+
+/// Result of an ephemeral CU task.
+enum CuTaskResult {
+    /// Task completed by the CU agent.
+    Completed(LoopStats),
+    /// CU agent determined this isn't a display task; escalate to the full agent.
+    Escalate { task: String },
+}
 
 /// Run an ephemeral computer-use task with minimal context.
 ///
@@ -3934,7 +3964,7 @@ async fn run_cu_task(
     log_dir: &std::path::Path,
     bus: &event::EventBus,
     cu_config: &project::ComputerUseConfig,
-) -> Result<LoopStats, CallerError> {
+) -> Result<CuTaskResult, CallerError> {
     let mut stats = LoopStats::default();
     let mut cu_counter = 0u64;
     let backend = computer_use::DisplayBackend::from_config(&cu_config.backend);
@@ -3944,23 +3974,29 @@ async fn run_cu_task(
         .and_then(|d| d.trim_start_matches(':').parse().ok())
         .unwrap_or(99);
 
-    // Minimal system prompt for CU tasks
-    let system_prompt = "You are a computer use agent. You interact with a desktop GUI \
-        using native computer use tools. You can see the screen via screenshots and \
-        perform actions like clicking, typing, scrolling, and dragging.\n\n\
-        CRITICAL RULES:\n\
-        - You are given ONE specific task. Perform ONLY that task and nothing else.\n\
-        - Once the task is complete, STOP. Respond with just the word DONE and a one-sentence summary.\n\
-        - Do NOT take additional actions after the task is finished.\n\
-        - Do NOT open browsers, navigate to websites, or perform any action not explicitly requested.\n\
-        - Do NOT \"explore\" or do anything beyond the exact scope of the task.\n\n\
-        Workflow:\n\
-        1. Take a screenshot to see the current screen state\n\
-        2. Identify the target elements\n\
-        3. Perform the required actions\n\
-        4. Take a verification screenshot to confirm success\n\
-        5. Respond with DONE and a brief summary — no further actions\n\n\
-        Be precise with coordinates. Act efficiently.".to_string();
+    // CU-first system prompt: handle display tasks or escalate
+    let system_prompt = "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
+        ROUTING:\n\
+        - If the task involves the display (clicking, typing, scrolling, pressing buttons, \
+          opening apps, interacting with GUI elements), handle it with your computer use tools.\n\
+        - If the task is NOT about the display (coding, file editing, research, shell commands, \
+          git, debugging, questions), call escalate_to_agent with the task description.\n\
+        - If no display screenshot is provided below, call escalate_to_agent immediately.\n\n\
+        WHEN HANDLING DISPLAY TASKS:\n\
+        1. Examine the screenshot to identify target elements\n\
+        2. Perform the required actions\n\
+        3. Take a verification screenshot\n\
+        4. Respond with DONE and a one-sentence summary\n\n\
+        RULES:\n\
+        - Perform ONLY the requested task, nothing else.\n\
+        - Once done, STOP. Do not take additional actions.\n\
+        - Be precise with coordinates. Act efficiently.".to_string();
+
+    // No display frames at all → escalate immediately without API call
+    if reference_images.is_empty() && context_images.is_empty() {
+        slog(session_log, |l| l.info("CU: no display frames available, escalating"));
+        return Ok(CuTaskResult::Escalate { task: task.to_string() });
+    }
 
     let mut conv = Conversation::new(system_prompt, provider.context_window());
 
@@ -4048,10 +4084,18 @@ async fn run_cu_task(
                 ))
             });
         }
+        // Check for escalation before processing anything else
+        if let Some(esc_call) = response.tool_calls.iter().find(|tc| tc.name == "escalate_to_agent") {
+            let args: serde_json::Value = serde_json::from_str(&esc_call.arguments).unwrap_or_default();
+            let escalated_task = args["task"].as_str().unwrap_or(task).to_string();
+            slog(session_log, |l| l.info(&format!("CU escalating to agent: {}", escalated_task)));
+            return Ok(CuTaskResult::Escalate { task: escalated_task });
+        }
+
         for tc in &response.tool_calls {
             slog(session_log, |l| {
                 l.info(&format!(
-                    "CU turn {} unexpected function call: {}({})",
+                    "CU turn {} function call: {}({})",
                     turn, tc.name, &tc.arguments[..tc.arguments.len().min(200)]
                 ))
             });
@@ -4138,7 +4182,7 @@ async fn run_cu_task(
         }
     }
 
-    Ok(stats)
+    Ok(CuTaskResult::Completed(stats))
 }
 
 /// Execute native computer-use tool calls via the xdotool executor
@@ -5258,9 +5302,15 @@ async fn main() -> Result<(), CallerError> {
                                                 cu_provider.as_ref(), &new_task, reference_images, vec![],
                                                 &session_log_cu, &new_log_dir, &bus_cu, &cu_config,
                                             ).await {
-                                                Ok(stats) => {
+                                                Ok(CuTaskResult::Completed(stats)) => {
                                                     bus_cu.send(AppEvent::PresenceLog {
                                                         message: format!("CU task complete ({} turns)", stats.turns),
+                                                        level: None, turn: None,
+                                                    });
+                                                }
+                                                Ok(CuTaskResult::Escalate { task }) => {
+                                                    bus_cu.send(AppEvent::PresenceLog {
+                                                        message: format!("CU escalated (not a display task): {}", &task[..task.len().min(80)]),
                                                         level: None, turn: None,
                                                     });
                                                 }
@@ -5619,9 +5669,15 @@ async fn main() -> Result<(), CallerError> {
                                                 cu_provider.as_ref(), &new_task, reference_images, vec![],
                                                 &session_log_cu, &new_log_dir, &bus_cu, &cu_config,
                                             ).await {
-                                                Ok(stats) => {
+                                                Ok(CuTaskResult::Completed(stats)) => {
                                                     bus_cu.send(AppEvent::PresenceLog {
                                                         message: format!("CU task complete ({} turns)", stats.turns),
+                                                        level: None, turn: None,
+                                                    });
+                                                }
+                                                Ok(CuTaskResult::Escalate { task }) => {
+                                                    bus_cu.send(AppEvent::PresenceLog {
+                                                        message: format!("CU escalated (not a display task): {}", &task[..task.len().min(80)]),
                                                         level: None, turn: None,
                                                     });
                                                 }

@@ -426,6 +426,27 @@ pub fn register_extra_tools(new_tools: Vec<ToolDefinition>) {
     }
 }
 
+/// Tool for CU model to escalate non-display tasks to the full coding agent.
+pub fn escalate_to_agent_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "escalate_to_agent".to_string(),
+        description: "Hand this task off to the full coding agent. Call this when the task \
+            does NOT involve interacting with the display (clicking, typing, scrolling). \
+            Tasks to escalate: coding, file editing, research, shell commands, git, debugging."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task description to forward to the coding agent."
+                }
+            },
+            "required": ["task"]
+        }),
+    }
+}
+
 /// Clear all extra registered tools.
 #[allow(dead_code)]
 pub fn clear_extra_tools() {
