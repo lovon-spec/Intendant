@@ -2982,7 +2982,7 @@ class DisplaySlot {
       this.rfb.viewOnly = true; this.rfb.scaleViewport = true;
       this.rfb.resizeSession = false; this.rfb.background = '#1e1e2e';
       this.rfb.showDotCursor = true; // Fallback cursor when VNC server doesn't send one
-      this.rfb.qualityLevel = 5; // Reduce encoding quality to improve responsiveness
+      this.rfb.compressionLevel = 9; // Maximum compression to reduce data over the proxy
       this.rfb.addEventListener('connect', () => {
         this.connected = true;
         // Show framebuffer resolution from the RFB connection
