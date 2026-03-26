@@ -53,7 +53,20 @@ impl Drop for RecordingGuard {
     fn drop(&mut self) {
         // Drop stdin first so ffmpeg sees EOF and can finalize
         self.stdin.take();
-        let _ = self.child.start_kill();
+        // Send SIGINT for graceful shutdown — ffmpeg finalizes the MP4 moov atom.
+        // SIGKILL would produce corrupt files (missing moov atom).
+        #[cfg(unix)]
+        {
+            if let Some(id) = self.child.id() {
+                unsafe { libc::kill(id as i32, libc::SIGINT); }
+                // Give ffmpeg a moment to finalize
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.start_kill();
+        }
     }
 }
 
