@@ -35,7 +35,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binPath)
-        process.arguments = ["--web", "--web-port", "\(port)"]
+        process.arguments = ["--web"]
 
         // Inherit environment + ensure Homebrew PATH
         var env = ProcessInfo.processInfo.environment
