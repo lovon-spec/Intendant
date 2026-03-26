@@ -1,11 +1,11 @@
 #!/bin/bash
-# Build intendant as a macOS .app bundle.
+# Build intendant as a native macOS desktop app.
 #
-# The .app wrapper gives intendant a proper bundle ID so macOS TCC
-# (Transparency, Consent, and Control) can manage permissions:
-#   - Screen Recording (ffmpeg avfoundation, screencapture)
-#   - Accessibility (cliclick for computer use)
-#   - Screen Sharing (VNC)
+# Creates Intendant.app with a Swift wrapper that:
+#   1. Launches intendant --web as a child process
+#   2. Opens a native window with WKWebView loading the dashboard
+#   3. Gets proper TCC permissions (Screen Recording, Accessibility)
+#   4. Child processes (ffmpeg, screencapture, cliclick) inherit permissions
 #
 # Usage:
 #   ./scripts/bundle-macos.sh          # Release build
@@ -34,18 +34,23 @@ RESOURCES="$CONTENTS/Resources"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
 
-# Copy binaries
-cp "$BINARY" "$MACOS/intendant"
+# Compile Swift wrapper
+echo "Compiling macOS app wrapper..."
+swiftc -O -o "$MACOS/Intendant" macos-app/main.swift \
+    -framework Cocoa -framework WebKit
+
+# Copy Rust binaries
+cp "$BINARY" "$MACOS/intendant-bin"
 cp "$RUNTIME" "$MACOS/intendant-runtime"
 
-# Info.plist with TCC usage descriptions
+# Info.plist
 cat > "$CONTENTS/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>intendant</string>
+    <string>Intendant</string>
     <key>CFBundleIdentifier</key>
     <string>com.intendant.app</string>
     <key>CFBundleName</key>
@@ -62,8 +67,6 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>LSUIElement</key>
-    <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Intendant records your screen for display capture, computer use, and session replay.</string>
     <key>NSAppleEventsUsageDescription</key>
@@ -72,23 +75,9 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
-# Wrapper script that forwards args and sets up PATH
-mv "$MACOS/intendant" "$MACOS/intendant-bin"
-cat > "$MACOS/intendant" << 'WRAPPER'
-#!/bin/bash
-# Ensure Homebrew tools are in PATH
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/intendant-bin" "$@"
-WRAPPER
-chmod +x "$MACOS/intendant"
-
 echo "✅ Built: $APP"
 echo ""
-echo "Run from terminal:"
-echo "  open target/Intendant.app --args --web"
+echo "Launch:"
+echo "  open target/Intendant.app"
 echo ""
-echo "Or launch directly:"
-echo "  target/Intendant.app/Contents/MacOS/intendant --web"
-echo ""
-echo "On first run, macOS will prompt for Screen Recording permission."
+echo "On first screen capture, macOS will prompt for Screen Recording permission."
