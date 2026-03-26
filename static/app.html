@@ -3354,16 +3354,12 @@ class RecordingPlayer {
     if (idx < 0 || idx >= this.segments.length) return;
     this.currentSegIdx = idx;
     const seg = this.segments[idx];
-    const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
+    // Use server-side HLS playlist for .ts segments (Safari/WKWebView
+    // requires HTTP-served m3u8, not blob URLs)
     if (seg.filename.endsWith('.ts')) {
-      // Safari doesn't play raw .ts — wrap in a minimal HLS playlist
-      const duration = seg.end_secs - seg.start_secs;
-      const m3u8 = `#EXTM3U\n#EXT-X-TARGETDURATION:${Math.ceil(duration)}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:${duration.toFixed(3)},\n${url}\n#EXT-X-ENDLIST`;
-      if (this._blobUrl) URL.revokeObjectURL(this._blobUrl);
-      this._blobUrl = URL.createObjectURL(new Blob([m3u8], { type: 'application/vnd.apple.mpegurl' }));
-      this.video.src = this._blobUrl;
+      this.video.src = `${this.baseUrl}/${this.streamName}/playlist.m3u8`;
     } else {
-      this.video.src = url;
+      this.video.src = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
     }
     this.video.currentTime = offsetSecs || 0;
   }

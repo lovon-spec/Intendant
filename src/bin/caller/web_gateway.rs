@@ -2005,8 +2005,39 @@ pub fn spawn_web_gateway(
                                     body.len(), body
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
+                            } else if parts.len() == 2 && parts[1] == "playlist.m3u8" {
+                                // GET /recordings/{stream}/playlist.m3u8 — HLS playlist
+                                let stream_name = parts[0];
+                                let mut segments = reg.segments(stream_name);
+                                if segments.is_empty() {
+                                    let daemon_dir = crate::debug::daemon_recordings_dir();
+                                    let stream_dir = daemon_dir.join(stream_name);
+                                    segments = crate::recording::parse_segment_csv_pub(
+                                        &stream_dir.join("segments.csv"),
+                                        &stream_dir,
+                                    );
+                                }
+                                let mut m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n");
+                                let max_dur = segments.iter().map(|s| s.end_secs - s.start_secs).fold(0.0f64, f64::max);
+                                m3u8.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", max_dur.ceil() as u64));
+                                for s in &segments {
+                                    let dur = s.end_secs - s.start_secs;
+                                    m3u8.push_str(&format!("#EXTINF:{:.3},\n{}\n", dur, s.filename));
+                                }
+                                m3u8.push_str("#EXT-X-ENDLIST\n");
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/vnd.apple.mpegurl\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    m3u8.len(), m3u8
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
                             } else if parts.len() == 2 {
-                                // GET /recordings/{stream}/{filename} — serve MP4 segment
+                                // GET /recordings/{stream}/{filename} — serve segment file
                                 let stream_name = parts[0];
                                 let filename = parts[1];
                                 // Validate filename to prevent path traversal
