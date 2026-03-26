@@ -727,17 +727,31 @@ async fn maybe_auto_launch_xvfb(
 }
 
 /// Query the resolution of the native display via system_profiler.
-/// Returns (width, height) or a default of (1920, 1080) if detection fails.
+/// Returns the logical (point) resolution, not device pixels.
+/// Uses CoreGraphics via swift, which returns logical resolution directly
+/// (e.g. 1339x837 on a Retina display, not the 2x device pixel size).
+/// Falls back to system_profiler, then a default.
 #[cfg(target_os = "macos")]
 fn query_display_resolution(_display_id: u32) -> (u32, u32) {
+    // Primary method: CoreGraphics (works in VMs where system_profiler is empty)
+    if let Ok(out) = std::process::Command::new("swift")
+        .args(["-e", "import CoreGraphics; let d = CGMainDisplayID(); print(\"\\(CGDisplayPixelsWide(d))x\\(CGDisplayPixelsHigh(d))\")"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let parts: Vec<&str> = text.split('x').collect();
+        if parts.len() == 2 {
+            if let (Ok(w), Ok(h)) = (parts[0].parse(), parts[1].parse()) {
+                return (w, h);
+            }
+        }
+    }
+    // Fallback: system_profiler (may be empty in VMs)
     if let Ok(out) = std::process::Command::new("system_profiler")
         .arg("SPDisplaysDataType")
         .output()
     {
         let text = String::from_utf8_lossy(&out.stdout);
-        // Parse "Resolution: 2560 x 1600 Retina" or "Resolution: 1920 x 1080"
-        // When "Retina" is present, the values are device pixels — halve to get
-        // logical resolution (which is what CU tools and mouse coordinates use).
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("Resolution:") {
