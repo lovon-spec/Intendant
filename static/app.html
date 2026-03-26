@@ -2991,20 +2991,9 @@ class DisplaySlot {
         const res = w > 0 ? ` ${w}x${h}` : '';
         this.statusEl.textContent = `Connected (view-only)${res}`;
         this.statusEl.className = 'display-status connected';
-        // Retina VNC fix: macOS Screen Sharing advertises a framebuffer at
-        // device-pixel resolution (2x) but processes mouse events at logical
-        // (1x) coordinates. Only applied to the user session display (id 0)
-        // when the framebuffer is exactly 2x the resolution reported in the
-        // DisplayReady event (stored in _displayReadyWidth by addDisplaySlot).
-        if (this._displayReadyWidth > 0 && w > 0) {
-          const scale = Math.round(w / this._displayReadyWidth);
-          if (scale >= 2 && this.rfb.sendPointerEvent) {
-            const origSend = this.rfb.sendPointerEvent.bind(this.rfb);
-            this.rfb.sendPointerEvent = function(x, y, mask) {
-              origSend(Math.round(x / scale), Math.round(y / scale), mask);
-            };
-          }
-        }
+        // Note: no Retina coordinate correction needed here. noVNC with
+        // scaleViewport maps mouse events to framebuffer coordinates, and
+        // macOS Screen Sharing accepts device-pixel coordinates directly.
       });
       this.rfb.addEventListener('disconnect', (e) => {
         this.connected = false;
