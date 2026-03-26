@@ -2991,6 +2991,7 @@ class DisplaySlot {
         const res = w > 0 ? ` ${w}x${h}` : '';
         this.statusEl.textContent = `Connected (view-only)${res}`;
         this.statusEl.className = 'display-status connected';
+        console.log(`[VNC connect] fb=${w}x${h} displayReady=${this._displayReadyWidth}x${this._displayReadyHeight}`);
         // Retina VNC fix: macOS Screen Sharing advertises a framebuffer at
         // device-pixel resolution (2x) but processes mouse events at logical
         // (1x) coordinates. Only applied to the user session display (id 0)
@@ -3094,6 +3095,7 @@ class DisplaySlot {
 }
 
 function addDisplaySlot(displayId, vncPort, width, height) {
+  console.log(`[addDisplaySlot] id=${displayId} vnc=${vncPort} width=${width} height=${height}`);
   if (displaySlots.has(displayId) || !vncPort) return;
   const slot = new DisplaySlot(displayId, vncPort, width, height);
   displaySlots.set(displayId, slot);
