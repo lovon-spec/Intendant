@@ -1104,6 +1104,7 @@ html, body {
   max-height: 60vh;
   background: #000;
   display: flex;
+  overflow: hidden;
   align-items: center;
   justify-content: center;
 }
@@ -3835,10 +3836,18 @@ function enterAnnotationMode() {
   annotationCanvas.activate();
   annotationMode = true;
   document.getElementById('annotation-toolbar').classList.remove('hidden');
+
+  // Re-align canvas when the player wrap resizes (split handle drag)
+  if (window._annResizeObserver) window._annResizeObserver.disconnect();
+  window._annResizeObserver = new ResizeObserver(() => {
+    if (annotationCanvas && annotationMode) annotationCanvas._alignToSource();
+  });
+  window._annResizeObserver.observe(document.getElementById('recording-player-wrap'));
 }
 
 function exitAnnotationMode() {
   if (!annotationMode) return;
+  if (window._annResizeObserver) { window._annResizeObserver.disconnect(); window._annResizeObserver = null; }
   if (annotationCanvas) {
     annotationCanvas.deactivate();
     annotationCanvas = null;
