@@ -1109,6 +1109,61 @@ html, body {
   width: 100%; height: 100%;
   pointer-events: none;
 }
+.recording-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--mantle);
+  border-top: 1px solid var(--surface0);
+}
+.rec-play-btn {
+  background: none;
+  border: 1px solid var(--surface2);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.recording-timeline {
+  flex: 1;
+  height: 6px;
+  background: var(--surface0);
+  border-radius: 3px;
+  position: relative;
+  cursor: pointer;
+}
+.timeline-progress {
+  height: 100%;
+  background: var(--blue);
+  border-radius: 3px;
+  width: 0%;
+}
+.timeline-cursor {
+  position: absolute;
+  top: -3px;
+  width: 12px;
+  height: 12px;
+  background: var(--text);
+  border-radius: 50%;
+  left: 0%;
+  transform: translateX(-50%);
+}
+.rec-time {
+  font-size: 11px;
+  color: var(--overlay0);
+  font-family: monospace;
+  min-width: 80px;
+}
+.rec-speed {
+  padding: 2px 4px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 11px;
+}
 .recording-timeline {
   position: relative;
   height: 28px;
@@ -1689,6 +1744,20 @@ html, body {
         <div class="recording-player-wrap" id="recording-player-wrap">
           <video id="recording-video" preload="auto"></video>
           <canvas class="recording-overlay" id="recording-overlay"></canvas>
+        </div>
+        <div class="recording-controls">
+          <button class="rec-play-btn" id="rec-play-btn" title="Play/Pause">&#x25B6;</button>
+          <div class="recording-timeline" id="recording-timeline">
+            <div class="timeline-progress" id="timeline-progress"></div>
+            <div class="timeline-cursor" id="timeline-cursor"></div>
+          </div>
+          <span class="rec-time" id="rec-time">0:00</span>
+          <select class="rec-speed" id="rec-speed">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+          </select>
         </div>
         <div class="annotation-toolbar hidden" id="annotation-toolbar">
           <div class="ann-tools">
@@ -3349,7 +3418,17 @@ class RecordingPlayer {
     if (idx < 0 || idx >= this.segments.length) return;
     this.currentSegIdx = idx;
     const seg = this.segments[idx];
-    this.video.src = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
+    const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
+    if (seg.filename.endsWith('.ts')) {
+      // Safari doesn't play raw .ts — wrap in a minimal HLS playlist
+      const duration = seg.end_secs - seg.start_secs;
+      const m3u8 = `#EXTM3U\n#EXT-X-TARGETDURATION:${Math.ceil(duration)}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:${duration.toFixed(3)},\n${url}\n#EXT-X-ENDLIST`;
+      if (this._blobUrl) URL.revokeObjectURL(this._blobUrl);
+      this._blobUrl = URL.createObjectURL(new Blob([m3u8], { type: 'application/vnd.apple.mpegurl' }));
+      this.video.src = this._blobUrl;
+    } else {
+      this.video.src = url;
+    }
     this.video.currentTime = offsetSecs || 0;
   }
 
