@@ -174,7 +174,7 @@ pub async fn start_display_recording(
                 .map(std::process::Stdio::from)
                 .unwrap_or_else(|_| std::process::Stdio::null())
         })
-        .kill_on_drop(false); // We send SIGINT in Drop for clean shutdown
+        .kill_on_drop(true); // Fallback — ensures no zombie ffmpeg processes
 
     let child = cmd
         .spawn()
