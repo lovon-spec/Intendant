@@ -59,8 +59,13 @@ impl Drop for RecordingGuard {
         {
             if let Some(id) = self.child.id() {
                 unsafe { libc::kill(id as i32, libc::SIGINT); }
-                // Give ffmpeg a moment to finalize
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Wait for ffmpeg to exit (up to 3 seconds)
+                for _ in 0..30 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    // Check if process exited
+                    let ret = unsafe { libc::waitpid(id as i32, std::ptr::null_mut(), libc::WNOHANG) };
+                    if ret != 0 { break; }
+                }
             }
         }
         #[cfg(not(unix))]
@@ -169,7 +174,7 @@ pub async fn start_display_recording(
                 .map(std::process::Stdio::from)
                 .unwrap_or_else(|_| std::process::Stdio::null())
         })
-        .kill_on_drop(true);
+        .kill_on_drop(false); // We send SIGINT in Drop for clean shutdown
 
     let child = cmd
         .spawn()
