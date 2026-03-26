@@ -1752,6 +1752,12 @@ async fn run_agent_loop(
         std::collections::HashSet::new();
     let mut exit_reason = LoopExitReason::TaskComplete;
 
+    // Discard stale context injections from before this task started
+    // (e.g. display take/release events that happened while idle).
+    if let Ok(mut q) = context_injection.lock() {
+        q.clear();
+    }
+
     for turn in 1..=SAFETY_CAP {
         // Check budget before sending
         if conversation.remaining_budget() <= MIN_BUDGET_TOKENS {
