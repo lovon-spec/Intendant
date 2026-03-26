@@ -2531,7 +2531,7 @@ function processCommands(cmds) {
       case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage': renderUsageTab(c); break;
-      case 'add_display': addDisplaySlot(c.display_id, c.vnc_port); break;
+      case 'add_display': addDisplaySlot(c.display_id, c.vnc_port, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
@@ -2894,9 +2894,11 @@ function loadNoVNC(cb) {
 }
 
 class DisplaySlot {
-  constructor(displayId, vncPort) {
+  constructor(displayId, vncPort, width, height) {
     this.displayId = displayId;
     this.vncPort = vncPort;
+    this._displayReadyWidth = width || 0;
+    this._displayReadyHeight = height || 0;
     this.rfb = null;
     this.interactive = false;
     this.connected = false;
@@ -2987,27 +2989,18 @@ class DisplaySlot {
         const res = w > 0 ? ` ${w}x${h}` : '';
         this.statusEl.textContent = `Connected (view-only)${res}`;
         this.statusEl.className = 'display-status connected';
-        // Detect Retina mismatch: macOS Screen Sharing advertises 2x pixels
-        // but processes mouse events at 1x logical coordinates. Patch the
-        // noVNC pointer handler to halve coordinates when this is detected.
-        if (w > 0 && this.rfb._target) {
-          const canvas = this.rfb._target;
-          const cssW = canvas.clientWidth;
-          // If FB is ~2x the CSS display size, the VNC server is Retina
-          const ratio = w / cssW;
-          if (ratio > 1.8) {
-            this._retinaScale = Math.round(ratio);
-            const origSendPointer = this.rfb._handlePointerEvent?.bind(this.rfb)
-              || this.rfb.sendPointerEvent?.bind(this.rfb);
-            if (this.rfb._handlePointerEvent) {
-              // noVNC internal: pointer events pass through _handlePointerEvent
-              // which eventually calls sendPointerEvent(x, y, mask)
-              const origSend = this.rfb.sendPointerEvent.bind(this.rfb);
-              const scale = this._retinaScale;
-              this.rfb.sendPointerEvent = function(x, y, mask) {
-                origSend(Math.round(x / scale), Math.round(y / scale), mask);
-              };
-            }
+        // Retina VNC fix: macOS Screen Sharing advertises a framebuffer at
+        // device-pixel resolution (2x) but processes mouse events at logical
+        // (1x) coordinates. Only applied to the user session display (id 0)
+        // when the framebuffer is exactly 2x the resolution reported in the
+        // DisplayReady event (stored in _displayReadyWidth by addDisplaySlot).
+        if (this._displayReadyWidth > 0 && w > 0) {
+          const scale = Math.round(w / this._displayReadyWidth);
+          if (scale >= 2 && this.rfb.sendPointerEvent) {
+            const origSend = this.rfb.sendPointerEvent.bind(this.rfb);
+            this.rfb.sendPointerEvent = function(x, y, mask) {
+              origSend(Math.round(x / scale), Math.round(y / scale), mask);
+            };
           }
         }
       });
@@ -3092,9 +3085,9 @@ class DisplaySlot {
   }
 }
 
-function addDisplaySlot(displayId, vncPort) {
+function addDisplaySlot(displayId, vncPort, width, height) {
   if (displaySlots.has(displayId) || !vncPort) return;
-  const slot = new DisplaySlot(displayId, vncPort);
+  const slot = new DisplaySlot(displayId, vncPort, width, height);
   displaySlots.set(displayId, slot);
   const container = document.getElementById('displays-container');
   const placeholder = document.getElementById('displays-placeholder');

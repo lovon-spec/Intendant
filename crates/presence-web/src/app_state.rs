@@ -67,6 +67,10 @@ pub enum UiCommand {
     AddDisplay {
         display_id: u64,
         vnc_port: u64,
+        #[serde(default)]
+        width: u64,
+        #[serde(default)]
+        height: u64,
     },
     AddRecording {
         stream_name: String,
@@ -806,12 +810,14 @@ impl AppState {
             "display_ready" => {
                 let display_id = msg["display_id"].as_u64().unwrap_or(0);
                 let vnc_port = msg["vnc_port"].as_u64().unwrap_or(0);
+                let width = msg["width"].as_u64().unwrap_or(0);
+                let height = msg["height"].as_u64().unwrap_or(0);
                 cmds.extend(self.add_log("info", &format!("Display :{} ready", display_id), None, "system"));
                 if vnc_port > 0 {
                     if !self.known_displays.iter().any(|&(id, _)| id == display_id) {
                         self.known_displays.push((display_id, vnc_port));
                     }
-                    cmds.push(UiCommand::AddDisplay { display_id, vnc_port });
+                    cmds.push(UiCommand::AddDisplay { display_id, vnc_port, width, height });
                 }
             }
 
@@ -1413,7 +1419,7 @@ mod tests {
         let msg = json!({"event": "display_ready", "display_id": 99, "vnc_port": 5999});
         let cmds = s.handle_message(&msg);
         assert_eq!(s.known_displays.len(), 1);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::AddDisplay { display_id: 99, vnc_port: 5999 })));
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::AddDisplay { display_id: 99, vnc_port: 5999, .. })));
     }
 
     #[test]
