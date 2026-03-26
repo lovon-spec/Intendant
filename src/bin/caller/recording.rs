@@ -137,6 +137,7 @@ pub async fn start_display_recording(
             "-framerate".into(), fps_arg.clone(),
             "-capture_cursor".into(), "1".into(),
             "-use_wallclock_as_timestamps".into(), "1".into(),
+            "-fflags".into(), "+genpts".into(),
             "-i".into(), format!("{}:none", display_id),
         ]);
     } else {
