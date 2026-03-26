@@ -2980,7 +2980,12 @@ class DisplaySlot {
       this.rfb.viewOnly = true; this.rfb.scaleViewport = true;
       this.rfb.resizeSession = false; this.rfb.background = '#1e1e2e';
       this.rfb.addEventListener('connect', () => {
-        this.connected = true; this.statusEl.textContent = 'Connected (view-only)';
+        this.connected = true;
+        // Show framebuffer resolution from the RFB connection
+        const w = this.rfb._fbWidth || 0;
+        const h = this.rfb._fbHeight || 0;
+        const res = w > 0 ? ` ${w}x${h}` : '';
+        this.statusEl.textContent = `Connected (view-only)${res}`;
         this.statusEl.className = 'display-status connected';
       });
       this.rfb.addEventListener('disconnect', (e) => {
@@ -2999,7 +3004,9 @@ class DisplaySlot {
     if (!this.rfb) return;
     this.interactive = true; this.rfb.viewOnly = false; this.rfb.focus();
     this.takeBtn.style.display = 'none'; this.releaseBtn.style.display = '';
-    this.noteInput.style.display = ''; this.statusEl.textContent = 'Interactive';
+    this.noteInput.style.display = '';
+    const w = this.rfb._fbWidth || 0, h = this.rfb._fbHeight || 0;
+    this.statusEl.textContent = w > 0 ? `Interactive ${w}x${h}` : 'Interactive';
     this.statusEl.className = 'display-status connected';
     if (app) app.take_display(this.displayId);
   }
