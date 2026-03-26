@@ -1060,12 +1060,21 @@ html, body {
 .activity-split-handle:hover, .activity-split-handle.dragging { background: var(--blue); }
 .activity-split-handle.hidden { display: none; }
 
+.displays-split-handle {
+  height: 5px;
+  background: var(--surface0);
+  cursor: row-resize;
+  flex-shrink: 0;
+}
+.displays-split-handle:hover, .displays-split-handle.dragging { background: var(--blue); }
+
 /* ── Recording Replay ── */
 .recording-section {
   flex-shrink: 0;
   border-top: 1px solid var(--surface0);
   background: var(--base);
   display: flex;
+  overflow: hidden;
   flex-direction: column;
 }
 .recording-header {
@@ -1680,6 +1689,7 @@ html, body {
           <div style="font-size:12px;margin-top:8px;color:var(--surface2)">Displays will appear when the agent launches a GUI</div>
         </div>
       </div>
+      <div class="displays-split-handle" id="displays-split-handle" style="display:none"></div>
       <div class="recording-section hidden" id="recording-section">
         <div class="recording-header">
           <span>Recordings</span>
@@ -3453,6 +3463,7 @@ function addRecordingStream(streamName) {
 
   const section = document.getElementById('recording-section');
   section.classList.remove('hidden');
+  document.getElementById('displays-split-handle').style.display = '';
 
   const select = document.getElementById('recording-stream-select');
   const group = _getOrCreateOptgroup(select, _streamGroup(streamName));
@@ -3505,6 +3516,35 @@ function switchRecordingStream(streamName) {
     const info = recordingStreams.get(streamName);
     if (info && info.active) recPlayer.refresh();
   }, 5000);
+}
+
+// ── Displays split handle (drag to resize VNC vs Recording) ──
+{
+  const handle = document.getElementById('displays-split-handle');
+  const tab = document.getElementById('tab-displays');
+  const displays = document.getElementById('displays-container');
+  const recording = document.getElementById('recording-section');
+  let dragging = false;
+  handle.addEventListener('mousedown', (e) => {
+    dragging = true;
+    handle.classList.add('dragging');
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const tabRect = tab.getBoundingClientRect();
+    const y = e.clientY - tabRect.top;
+    const total = tabRect.height;
+    const minPx = 100;
+    const topH = Math.max(minPx, Math.min(total - minPx, y));
+    displays.style.flex = 'none';
+    displays.style.height = topH + 'px';
+    recording.style.flex = '1';
+    recording.style.minHeight = '0';
+  });
+  document.addEventListener('mouseup', () => {
+    if (dragging) { dragging = false; handle.classList.remove('dragging'); }
+  });
 }
 
 // Wire up stream selector
