@@ -2987,6 +2987,29 @@ class DisplaySlot {
         const res = w > 0 ? ` ${w}x${h}` : '';
         this.statusEl.textContent = `Connected (view-only)${res}`;
         this.statusEl.className = 'display-status connected';
+        // Detect Retina mismatch: macOS Screen Sharing advertises 2x pixels
+        // but processes mouse events at 1x logical coordinates. Patch the
+        // noVNC pointer handler to halve coordinates when this is detected.
+        if (w > 0 && this.rfb._target) {
+          const canvas = this.rfb._target;
+          const cssW = canvas.clientWidth;
+          // If FB is ~2x the CSS display size, the VNC server is Retina
+          const ratio = w / cssW;
+          if (ratio > 1.8) {
+            this._retinaScale = Math.round(ratio);
+            const origSendPointer = this.rfb._handlePointerEvent?.bind(this.rfb)
+              || this.rfb.sendPointerEvent?.bind(this.rfb);
+            if (this.rfb._handlePointerEvent) {
+              // noVNC internal: pointer events pass through _handlePointerEvent
+              // which eventually calls sendPointerEvent(x, y, mask)
+              const origSend = this.rfb.sendPointerEvent.bind(this.rfb);
+              const scale = this._retinaScale;
+              this.rfb.sendPointerEvent = function(x, y, mask) {
+                origSend(Math.round(x / scale), Math.round(y / scale), mask);
+              };
+            }
+          }
+        }
       });
       this.rfb.addEventListener('disconnect', (e) => {
         this.connected = false;
