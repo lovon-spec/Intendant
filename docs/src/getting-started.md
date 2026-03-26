@@ -21,9 +21,10 @@ Both binaries are installed to `~/.cargo/bin/`. The `intendant` binary embeds de
 ### Prerequisites
 
 - **Rust** toolchain (stable)
-- **wasm-pack** — `cargo install wasm-pack`
+- **wasm-pack** — `cargo install wasm-pack` (auto-rebuilds WASM on source changes)
+- **ffmpeg** — required for display recording (`brew install ffmpeg` / `apt install ffmpeg`)
 - **macOS**: `./scripts/setup-macos.sh` installs all platform dependencies
-- **Linux**: `sudo apt install imagemagick xdotool xvfb x11vnc ffmpeg` (all optional)
+- **Linux**: `sudo apt install imagemagick xdotool xvfb x11vnc ffmpeg`
 
 ### WASM auto-rebuild
 

@@ -303,6 +303,7 @@ supported platforms — never panic or silently do nothing.
 - **API keys**: `.env` with `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`. Optional: `PROVIDER`, `MODEL_NAME`, `USE_NATIVE_TOOLS`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`
 - **captureScreen**: ImageMagick `import` + DISPLAY (Linux), `screencapture` (macOS)
 - **Computer use**: xdotool (Linux), cliclick (macOS)
+- **Recording**: ffmpeg (`brew install ffmpeg` / `apt install ffmpeg`)
 - **WASM build**: `wasm-pack` (`cargo install wasm-pack`)
 - **macOS setup**: `./scripts/setup-macos.sh` installs all dependencies
 

@@ -31,8 +31,9 @@ Three execution modes: *direct* (single agent), *user* (orchestrator + sub-agent
 
 - **Rust** toolchain (stable)
 - **wasm-pack** — `cargo install wasm-pack` (auto-rebuilds WASM when presence-web source changes)
-- **macOS**: `./scripts/setup-macos.sh` installs all dependencies (cliclick, ffmpeg, BlackHole, etc.)
-- **Linux**: ImageMagick (`import`), xdotool, Xvfb, x11vnc, ffmpeg (all optional, degrade gracefully)
+- **ffmpeg** — required for display recording (`brew install ffmpeg` / `apt install ffmpeg`)
+- **macOS**: `./scripts/setup-macos.sh` installs all dependencies (cliclick, ffmpeg, wasm-pack, etc.)
+- **Linux**: ImageMagick (`import`), xdotool, Xvfb, x11vnc, ffmpeg — `sudo apt install imagemagick xdotool xvfb x11vnc ffmpeg`
 
 ## Quick Start
 
