@@ -346,6 +346,16 @@ impl RecordingRegistry {
         self.recordings.remove(stream_name);
     }
 
+    /// Delete a recording's files from disk. Stops it first if still active.
+    pub fn delete(&mut self, stream_name: &str) {
+        self.recordings.remove(stream_name);
+        self.external_streams.remove(stream_name);
+        let dir = self.session_dir.join("recordings").join(stream_name);
+        if dir.is_dir() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// Stop all recordings.
     pub fn stop_all(&mut self) {
         self.recordings.clear();
@@ -503,6 +513,53 @@ pub fn spawn_recording_listener(
                             });
                         }
                     }
+                }
+                Ok(AppEvent::ControlCommand(
+                    crate::event::ControlMsg::StartRecording { stream_name },
+                )) => {
+                    let mut reg = registry.write().await;
+                    if reg.is_recording(&stream_name) {
+                        continue;
+                    }
+                    if !is_ffmpeg_available() {
+                        bus.send(AppEvent::RecordingError {
+                            stream_name,
+                            message: "ffmpeg not installed".to_string(),
+                        });
+                        continue;
+                    }
+                    // Parse display_id from stream name "display_N"
+                    if let Some(id_str) = stream_name.strip_prefix("display_") {
+                        if let Ok(id) = id_str.parse::<u32>() {
+                            let (w, h) = (1920, 1080); // fallback; real resolution comes from DisplayReady
+                            match reg.start_display(id, w, h).await {
+                                Ok(name) => bus.send(AppEvent::RecordingStarted { stream_name: name }),
+                                Err(e) => bus.send(AppEvent::RecordingError { stream_name, message: e }),
+                            }
+                        }
+                    }
+                }
+                Ok(AppEvent::ControlCommand(
+                    crate::event::ControlMsg::StopRecording { stream_name },
+                )) => {
+                    let mut reg = registry.write().await;
+                    if reg.is_recording(&stream_name) {
+                        reg.stop(&stream_name);
+                        bus.send(AppEvent::RecordingStopped { stream_name });
+                    }
+                }
+                Ok(AppEvent::ControlCommand(
+                    crate::event::ControlMsg::DeleteRecording { stream_name },
+                )) => {
+                    let mut reg = registry.write().await;
+                    let was_recording = reg.is_recording(&stream_name);
+                    reg.delete(&stream_name);
+                    if was_recording {
+                        bus.send(AppEvent::RecordingStopped {
+                            stream_name: stream_name.clone(),
+                        });
+                    }
+                    bus.send(AppEvent::RecordingDeleted { stream_name });
                 }
                 Ok(AppEvent::TaskComplete { .. }) => {
                     // Stop agent-managed recordings, keep external (--record-display) alive

@@ -176,6 +176,9 @@ pub enum AppEvent {
         stream_name: String,
         message: String,
     },
+    RecordingDeleted {
+        stream_name: String,
+    },
 
     // Session directory changed (MCP per-task isolation)
     SessionDirChanged {
@@ -441,6 +444,15 @@ pub enum ControlMsg {
     TeardownDebugScreen,
     StartDebugRecording,
     StopDebugRecording,
+    StartRecording {
+        stream_name: String,
+    },
+    StopRecording {
+        stream_name: String,
+    },
+    DeleteRecording {
+        stream_name: String,
+    },
 }
 
 /// The event bus sender. Cloneable for use in multiple tasks.
@@ -690,6 +702,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::RecordingStopped { stream_name } => Some(OutboundEvent::RecordingStopped {
             stream_name: stream_name.clone(),
         }),
+        AppEvent::RecordingDeleted { stream_name } => Some(OutboundEvent::RecordingDeleted {
+            stream_name: stream_name.clone(),
+        }),
         AppEvent::RecordingError {
             stream_name,
             message,
@@ -861,6 +876,9 @@ fn write_event_to_session_log(
         }
         AppEvent::RecordingError { stream_name, message } => {
             log.recording_error(stream_name, message);
+        }
+        AppEvent::RecordingDeleted { stream_name } => {
+            log.info(&format!("Recording deleted: {}", stream_name));
         }
 
         // Presence / voice

@@ -171,6 +171,9 @@ pub enum OutboundEvent {
     RecordingStopped {
         stream_name: String,
     },
+    RecordingDeleted {
+        stream_name: String,
+    },
     RecordingError {
         stream_name: String,
         message: String,

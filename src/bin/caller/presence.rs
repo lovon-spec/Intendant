@@ -871,6 +871,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::RecordingStarted { .. }
         | AppEvent::RecordingStopped { .. }
         | AppEvent::RecordingError { .. }
+        | AppEvent::RecordingDeleted { .. }
         | AppEvent::SessionStarted { .. }
         | AppEvent::SessionEnded { .. }
         | AppEvent::DebugScreenReady { .. }

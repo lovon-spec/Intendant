@@ -862,6 +862,26 @@ html, body {
   color: var(--base);
   border-color: var(--green);
 }
+.display-toolbar .record-btn {
+  border-color: var(--red);
+  color: var(--red);
+}
+.display-toolbar .record-btn:hover,
+.display-toolbar .record-btn.active {
+  background: var(--red);
+  color: var(--base);
+  border-color: var(--red);
+}
+.display-toolbar .delete-recording-btn {
+  border-color: var(--overlay0);
+  color: var(--overlay0);
+  font-size: 11px;
+}
+.display-toolbar .delete-recording-btn:hover {
+  background: var(--red);
+  color: var(--base);
+  border-color: var(--red);
+}
 .display-toolbar .take-control-btn:hover {
   background: var(--blue);
   color: var(--base);
@@ -2242,6 +2262,17 @@ async function main() {
       } else if (d.event === 'user_display_revoked') {
         setUserDisplayState(false);
       }
+      // Track recording state on display slots
+      if (d.event === 'recording_started' && d.stream_name) {
+        const slot = [...displaySlots.values()].find(s => 'display_' + s.displayId === d.stream_name);
+        if (slot) { slot.recording = true; slot.recordBtn.innerHTML = '&#x23F9; Stop'; slot.recordBtn.classList.add('active'); slot.deleteRecBtn.style.display = 'none'; }
+      } else if (d.event === 'recording_stopped' && d.stream_name) {
+        const slot = [...displaySlots.values()].find(s => 'display_' + s.displayId === d.stream_name);
+        if (slot) { slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = ''; }
+      } else if (d.event === 'recording_deleted' && d.stream_name) {
+        const slot = [...displaySlots.values()].find(s => 'display_' + s.displayId === d.stream_name);
+        if (slot) { slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
+      }
     } catch(_) {}
     const cmds = app.handle_server_message(msg);
     if (cmds) processCommands(cmds);
@@ -2914,8 +2945,10 @@ class DisplaySlot {
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
         <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the AI model">&#x1F441; Stream</button>
+        <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">&#x23FA; Record</button>
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
+        <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">&#x1F5D1; Delete</button>
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}">
         <div class="vnc-auth-overlay" id="ds-auth-${displayId}" style="display:none">
@@ -2941,9 +2974,14 @@ class DisplaySlot {
     this.authUserInput = this.el.querySelector(`#ds-auth-user-${displayId}`);
     this.authPwInput = this.el.querySelector(`#ds-auth-pw-${displayId}`);
     this._authNeedsUsername = false;
+    this.recordBtn = this.el.querySelector(`#ds-record-${displayId}`);
+    this.deleteRecBtn = this.el.querySelector(`#ds-delete-rec-${displayId}`);
+    this.recording = false;
     this.takeBtn.addEventListener('click', () => this.takeControl());
     this.releaseBtn.addEventListener('click', () => this.releaseControl());
     this.streamBtn.addEventListener('click', () => this.toggleStreaming());
+    this.recordBtn.addEventListener('click', () => this.toggleRecording());
+    this.deleteRecBtn.addEventListener('click', () => this.deleteRecording());
     this.el.querySelector(`#ds-auth-ok-${displayId}`).addEventListener('click', () => this._submitAuth());
     this.el.querySelector(`#ds-auth-cancel-${displayId}`).addEventListener('click', () => this._cancelAuth());
     this.authPwInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this._submitAuth(); });
@@ -3068,6 +3106,31 @@ class DisplaySlot {
     if (this._streamIntervalId) { clearInterval(this._streamIntervalId); this._streamIntervalId = null; }
     this.streamBtn.classList.remove('active');
     this.streamBtn.innerHTML = '&#x1F441; Stream';
+  }
+  toggleRecording() {
+    if (!app) return;
+    const stream = 'display_' + this.displayId;
+    if (this.recording) {
+      app.send_server_action({ action: 'stop_recording', stream_name: stream });
+      this.recording = false;
+      this.recordBtn.innerHTML = '&#x23FA; Record';
+      this.recordBtn.classList.remove('active');
+      this.deleteRecBtn.style.display = '';
+    } else {
+      app.send_server_action({ action: 'start_recording', stream_name: stream });
+      this.recording = true;
+      this.recordBtn.innerHTML = '&#x23F9; Stop';
+      this.recordBtn.classList.add('active');
+      this.deleteRecBtn.style.display = 'none';
+    }
+  }
+  deleteRecording() {
+    if (!app) return;
+    const stream = 'display_' + this.displayId;
+    if (confirm('Delete recording for ' + stream + '?')) {
+      app.send_server_action({ action: 'delete_recording', stream_name: stream });
+      this.deleteRecBtn.style.display = 'none';
+    }
   }
   disconnect() {
     this.stopStreaming();

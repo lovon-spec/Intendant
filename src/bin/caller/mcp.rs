@@ -1682,6 +1682,18 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "debug_screen", true, "Dispatched".to_string(), None);
             None
         }
+        ControlMsg::StartRecording { ref stream_name } => {
+            emit_control_result(control_tx, "start_recording", true, format!("Starting {}", stream_name), None);
+            None
+        }
+        ControlMsg::StopRecording { ref stream_name } => {
+            emit_control_result(control_tx, "stop_recording", true, format!("Stopping {}", stream_name), None);
+            None
+        }
+        ControlMsg::DeleteRecording { ref stream_name } => {
+            emit_control_result(control_tx, "delete_recording", true, format!("Deleting {}", stream_name), None);
+            None
+        }
     }
 }
 
@@ -2112,6 +2124,9 @@ pub fn spawn_event_listener(
                     }
                     AppEvent::RecordingError { ref stream_name, ref message } => {
                         s.push_log(LogLevel::Warn, format!("Recording error ({}): {}", stream_name, message));
+                    }
+                    AppEvent::RecordingDeleted { ref stream_name } => {
+                        s.push_log(LogLevel::Info, format!("Recording deleted: {}", stream_name));
                     }
                     AppEvent::SessionStarted { ref session_id, ref task } => {
                         s.push_log(LogLevel::Info, format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(no task)")));
