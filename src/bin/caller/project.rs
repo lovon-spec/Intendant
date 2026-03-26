@@ -110,7 +110,7 @@ pub struct RecordingConfig {
 }
 
 fn default_framerate() -> u32 {
-    30
+    15
 }
 fn default_segment_duration() -> u32 {
     60
