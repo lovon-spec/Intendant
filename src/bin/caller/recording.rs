@@ -105,7 +105,7 @@ pub async fn start_display_recording(
     let fps_arg = config.framerate.to_string();
     let crf_arg = config.crf().to_string();
     let seg_time_arg = config.segment_duration_secs.to_string();
-    let output_pattern = segments_dir.join("seg_%05d.mp4");
+    let output_pattern = segments_dir.join("seg_%05d.ts");
     let segment_list = segments_dir.join("segments.csv");
 
     let source = if cfg!(target_os = "macos") {
@@ -161,9 +161,10 @@ pub async fn start_display_recording(
             "-crf", &crf_arg,
             "-pix_fmt", "yuv420p",
             "-force_key_frames", &keyframe_expr,
+            "-vsync", "cfr",
             "-f", "segment",
             "-segment_time", &seg_time_arg,
-            "-segment_format", "mp4",
+            "-segment_format", "mpegts",
             "-segment_list", segment_list.to_str().unwrap_or("segments.csv"),
             "-segment_list_type", "csv",
             "-reset_timestamps", "1",
@@ -205,7 +206,7 @@ pub async fn start_frame_recording(
     let fps_arg = config.framerate.to_string();
     let crf_arg = config.crf().to_string();
     let seg_time_arg = config.segment_duration_secs.to_string();
-    let output_pattern = segments_dir.join("seg_%05d.mp4");
+    let output_pattern = segments_dir.join("seg_%05d.ts");
     let segment_list = segments_dir.join("segments.csv");
 
     // Write manifest
@@ -232,9 +233,10 @@ pub async fn start_frame_recording(
             "-crf", &crf_arg,
             "-pix_fmt", "yuv420p",
             "-force_key_frames", &keyframe_expr,
+            "-vsync", "cfr",
             "-f", "segment",
             "-segment_time", &seg_time_arg,
-            "-segment_format", "mp4",
+            "-segment_format", "mpegts",
             "-segment_list", segment_list.to_str().unwrap_or("segments.csv"),
             "-segment_list_type", "csv",
             "-reset_timestamps", "1",
