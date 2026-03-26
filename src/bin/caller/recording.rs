@@ -137,7 +137,7 @@ pub async fn start_display_recording(
     if use_screencapture_feeder {
         input_args.extend([
             "-f".into(), "image2pipe".into(),
-            "-framerate".into(), fps_arg.clone(),
+            "-use_wallclock_as_timestamps".into(), "1".into(),
             "-i".into(), "pipe:0".into(),
         ]);
     } else {
