@@ -1322,6 +1322,38 @@ html, body {
   font-weight: 600;
 }
 .ann-save-btn:hover { background: var(--blue); color: var(--base); }
+.annotation-refs-panel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  background: var(--mantle);
+  border-top: 1px solid var(--surface0);
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.ann-ref-item {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--blue);
+  cursor: pointer;
+  padding: 1px 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 3px;
+  background: var(--surface0);
+}
+.ann-ref-item:hover { border-color: var(--blue); }
+.ann-copy-all-btn {
+  font-size: 10px;
+  padding: 1px 8px;
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--overlay0);
+  cursor: pointer;
+  margin-left: auto;
+}
+.ann-copy-all-btn:hover { background: var(--blue); color: var(--base); border-color: var(--blue); }
 .ann-result {
   font-size: 11px;
   color: var(--subtext0);
@@ -3843,18 +3875,70 @@ async function submitAnnotation(inject) {
   document.getElementById('ann-note').value = '';
   annotationCanvas.clear();
   exitAnnotationMode();
+
+  // Track annotation and show result
+  addAnnotationRef(frameId, inject);
 }
 
+const savedAnnotations = [];
+
+function addAnnotationRef(frameId, injected) {
+  savedAnnotations.push({ frameId, injected });
+  renderAnnotationRefs();
+}
+
+function renderAnnotationRefs() {
+  let panel = document.getElementById('annotation-refs-panel');
+  if (!panel) {
+    // Create panel below annotation toolbar
+    panel = document.createElement('div');
+    panel.id = 'annotation-refs-panel';
+    panel.className = 'annotation-refs-panel';
+    const section = document.getElementById('recording-section');
+    section.appendChild(panel);
+  }
+  panel.style.display = savedAnnotations.length > 0 ? '' : 'none';
+
+  const items = savedAnnotations.map(a => {
+    const badge = a.injected ? '<span style="color:var(--green);font-size:10px"> sent</span>' : '<span style="color:var(--overlay0);font-size:10px"> saved</span>';
+    return `<span class="ann-ref-item" title="Click to copy frame ID" onclick="copyAnnotationRef('${a.frameId}')">${a.frameId}${badge}</span>`;
+  }).join('');
+
+  panel.innerHTML = `
+    <span style="font-size:11px;color:var(--subtext1);font-weight:600">Annotations:</span>
+    ${items}
+    <button class="ann-copy-all-btn" onclick="copyAllAnnotationRefs()" title="Copy all frame IDs to clipboard">Copy all</button>
+  `;
+}
+
+window.copyAnnotationRef = function(frameId) {
+  navigator.clipboard.writeText(frameId).then(() => {
+    const el = document.querySelector(`.ann-ref-item[onclick*="${frameId}"]`);
+    if (el) { const orig = el.innerHTML; el.textContent = 'Copied!'; setTimeout(() => { el.innerHTML = orig; }, 1000); }
+  });
+};
+
+window.copyAllAnnotationRefs = function() {
+  const text = savedAnnotations.map(a => a.frameId).join(', ');
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('.ann-copy-all-btn');
+    if (btn) { btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy all'; }, 1000); }
+  });
+};
+
 function showAnnotationResult(path) {
+  // Legacy — server response with file path
   const el = document.getElementById('ann-result');
-  el.textContent = path;
-  el.title = 'Click to copy: ' + path;
-  el.onclick = () => {
-    navigator.clipboard.writeText(path).then(() => {
-      el.textContent = 'Copied!';
-      setTimeout(() => { el.textContent = path; }, 1500);
-    });
-  };
+  if (el) {
+    el.textContent = path;
+    el.title = 'Click to copy: ' + path;
+    el.onclick = () => {
+      navigator.clipboard.writeText(path).then(() => {
+        el.textContent = 'Copied!';
+        setTimeout(() => { el.textContent = path; }, 1500);
+      });
+    };
+  }
 }
 
 // Wire up annotation toolbar
