@@ -4135,6 +4135,13 @@ function fmtTime(secs) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
+function _fmtBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
 function _getOrCreateOptgroup(select, label) {
   for (const child of select.children) {
     if (child.tagName === 'OPTGROUP' && child.label === label) return child;
@@ -6045,6 +6052,31 @@ function renderSessionsList(sessions, el) {
       cost.appendChild(costLabel);
       cost.appendChild(costVal);
       meta.appendChild(cost);
+    }
+
+    // Media stats row (recordings, annotations, clips, size)
+    const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
+    if (hasMedia) {
+      const mediaMeta = document.createElement('div');
+      mediaMeta.className = 'sc-meta';
+      const addMediaField = (label, value, color) => {
+        const span = document.createElement('span');
+        const l = document.createElement('span');
+        l.className = 'label';
+        l.textContent = label;
+        const v = document.createElement('span');
+        v.className = 'value';
+        v.textContent = value;
+        if (color) v.style.color = color;
+        span.appendChild(l);
+        span.appendChild(v);
+        mediaMeta.appendChild(span);
+      };
+      if (s.recordings > 0) addMediaField('recordings', s.recordings, 'var(--blue)');
+      if (s.annotations > 0) addMediaField('annotations', s.annotations, 'var(--peach)');
+      if (s.clips > 0) addMediaField('clips', s.clips, 'var(--peach)');
+      if (s.recording_bytes > 0) addMediaField('size', _fmtBytes(s.recording_bytes), 'var(--overlay1)');
+      card.appendChild(mediaMeta);
     }
 
     card.appendChild(meta);

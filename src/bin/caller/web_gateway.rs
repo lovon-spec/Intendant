@@ -755,6 +755,53 @@ fn list_sessions() -> String {
             .and_then(|m| crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens))
             .unwrap_or(0.0);
 
+        // Recording / annotation / clip stats from disk
+        let mut recording_count: u64 = 0;
+        let mut recording_bytes: u64 = 0;
+        let mut annotation_count: u64 = 0;
+        let mut clip_count: u64 = 0;
+
+        let recordings_dir = dir.join("recordings");
+        if recordings_dir.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&recordings_dir) {
+                for re in rd.flatten() {
+                    if re.path().is_dir() {
+                        recording_count += 1;
+                        // Sum segment file sizes
+                        if let Ok(files) = std::fs::read_dir(re.path()) {
+                            for f in files.flatten() {
+                                let name = f.file_name().to_string_lossy().to_string();
+                                if name.starts_with("seg_") {
+                                    if let Ok(m) = f.metadata() {
+                                        recording_bytes += m.len();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let frames_dir = dir.join("frames");
+        if frames_dir.is_dir() {
+            if let Ok(fd) = std::fs::read_dir(&frames_dir) {
+                let mut clip_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for fe in fd.flatten() {
+                    let name = fe.file_name().to_string_lossy().to_string();
+                    if name.starts_with("ann-") && name.ends_with(".jpg") {
+                        annotation_count += 1;
+                    } else if name.starts_with("clip-") && name.ends_with(".jpg") {
+                        // Extract clip ID: clip-stream-N-fXXX.jpg → clip-stream-N
+                        if let Some(pos) = name.rfind("-f") {
+                            clip_ids.insert(name[..pos].to_string());
+                        }
+                    }
+                }
+                clip_count = clip_ids.len() as u64;
+            }
+        }
+
         sessions.push(serde_json::json!({
             "session_id": session_id,
             "created_at": created_at.unwrap_or_default(),
@@ -769,6 +816,10 @@ fn list_sessions() -> String {
             "cached_tokens": cached_tokens,
             "estimated_cost": estimated_cost,
             "role": role,
+            "recordings": recording_count,
+            "recording_bytes": recording_bytes,
+            "annotations": annotation_count,
+            "clips": clip_count,
         }));
     }
 
