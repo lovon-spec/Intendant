@@ -3378,6 +3378,9 @@ class DisplaySlot {
     if (this._authNeedsUsername) creds.username = this.authUserInput.value;
     this.authOverlay.style.display = 'none';
     if (creds.password && this.rfb) {
+      // Persist for auto-reconnect across page refreshes and browser restarts
+      localStorage.setItem(`vnc_pw_${this.displayId}`, creds.password);
+      if (this._authNeedsUsername && creds.username) localStorage.setItem(`vnc_user_${this.displayId}`, creds.username);
       this.rfb.sendCredentials(creds);
     }
   }
@@ -3415,8 +3418,22 @@ class DisplaySlot {
         this.statusEl.className = 'display-status error';
         if (!e.detail.clean) setTimeout(() => { if (!this.connected) this._connectVNC(); }, 3000);
       });
-      this.rfb.addEventListener('credentialsrequired', (e) => this._showAuth(e.detail && e.detail.types));
+      this.rfb.addEventListener('credentialsrequired', (e) => {
+        // Auto-send stored credentials from localStorage
+        const storedPw = localStorage.getItem(`vnc_pw_${this.displayId}`);
+        if (storedPw && this.rfb) {
+          const creds = { password: storedPw };
+          const storedUser = localStorage.getItem(`vnc_user_${this.displayId}`);
+          if (storedUser) creds.username = storedUser;
+          this.rfb.sendCredentials(creds);
+        } else {
+          this._showAuth(e.detail && e.detail.types);
+        }
+      });
       this.rfb.addEventListener('securityfailure', () => {
+        // Clear stored credentials so wrong passwords don't loop on auto-reconnect
+        localStorage.removeItem(`vnc_pw_${this.displayId}`);
+        localStorage.removeItem(`vnc_user_${this.displayId}`);
         this.statusEl.textContent = 'Security error'; this.statusEl.className = 'display-status error';
       });
     } catch { this.statusEl.textContent = 'Failed'; this.statusEl.className = 'display-status error'; }
