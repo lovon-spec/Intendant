@@ -4061,11 +4061,14 @@ function _streamGroup(name) {
 }
 
 function _streamLabel(name) {
-  // display_0 → :0, display_0_2 → :0 #2
+  // display_0 → :0 #1, display_0_2 → :0 #2
   if (name.startsWith('display_')) {
     const rest = name.slice(8);
     const m = rest.match(/^(\d+)_(\d+)$/);
     if (m) return ':' + m[1] + ' #' + m[2];
+    // First recording for this display — label as #1
+    const m2 = rest.match(/^(\d+)$/);
+    if (m2) return ':' + m2[1] + ' #1';
     return ':' + rest;
   }
   return name;
@@ -4106,6 +4109,10 @@ function removeRecordingStream(streamName) {
 }
 
 function switchRecordingStream(streamName) {
+  // Exit clip/annotation mode when switching streams — state is per-recording
+  if (clipMode) exitClipMode();
+  if (annotationMode) exitAnnotationMode();
+
   activeRecordingStream = streamName;
   if (recPlayer) recPlayer.destroy();
 
