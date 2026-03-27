@@ -295,6 +295,9 @@ pub struct FrameMeta {
     /// Resolution of the HQ version stored server-side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hq_resolution: Option<String>,
+    /// User-provided note (annotation description, clip note, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Summary of active video streams for the presence model.
@@ -810,6 +813,7 @@ mod tests {
             sent_to_live: true,
             live_resolution: Some("768x768".to_string()),
             hq_resolution: Some("1920x1080".to_string()),
+            note: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: FrameMeta = serde_json::from_str(&json).unwrap();

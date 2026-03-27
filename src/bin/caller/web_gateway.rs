@@ -1547,6 +1547,7 @@ pub fn spawn_web_gateway(
                                                             sent_to_live: true,
                                                             live_resolution: Some("768x768".to_string()),
                                                             hq_resolution: None,
+                                                            note: None,
                                                         };
                                                         let mut reg = registry.write().await;
                                                         if let Err(e) = reg.register(meta, &jpeg_bytes) {
@@ -1593,6 +1594,7 @@ pub fn spawn_web_gateway(
                                                             sent_to_live: false,
                                                             live_resolution: None,
                                                             hq_resolution: None,
+                                                            note: if note.is_empty() { None } else { Some(note.clone()) },
                                                         };
                                                         let mut reg = registry.write().await;
                                                         match reg.register(meta, &jpeg_bytes) {
@@ -1676,6 +1678,7 @@ pub fn spawn_web_gateway(
                                                             sent_to_live: false,
                                                             live_resolution: None,
                                                             hq_resolution: None,
+                                                            note: None,
                                                         };
                                                         let mut reg = registry.write().await;
                                                         if let Err(e) = reg.register(meta, &jpeg_bytes) {

@@ -1,6 +1,7 @@
 use presence_core::FrameMeta;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Server-side frame registry.
@@ -45,6 +46,14 @@ impl FrameRegistry {
     ) -> Result<PathBuf, std::io::Error> {
         let hq_path = self.frames_dir.join(format!("{}.jpg", &meta.frame_id));
         fs::write(&hq_path, hq_data)?;
+
+        // Append metadata to frames.jsonl manifest
+        if let Ok(json_line) = serde_json::to_string(&meta) {
+            let manifest = self.frames_dir.join("frames.jsonl");
+            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&manifest) {
+                let _ = writeln!(f, "{}", json_line);
+            }
+        }
 
         let frame_id = meta.frame_id.clone();
         let stream = meta.stream.clone();
@@ -117,10 +126,14 @@ impl FrameRegistry {
         frames
             .iter()
             .map(|f| {
-                format!(
+                let base = format!(
                     "{} | stream={} | ts={} | live={}",
                     f.frame_id, f.stream, f.timestamp, f.sent_to_live
-                )
+                );
+                match &f.note {
+                    Some(n) if !n.is_empty() => format!("{} | note={}", base, n),
+                    _ => base,
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -139,6 +152,7 @@ mod tests {
             sent_to_live: true,
             live_resolution: Some("768x768".to_string()),
             hq_resolution: Some("1920x1080".to_string()),
+            note: None,
         }
     }
 

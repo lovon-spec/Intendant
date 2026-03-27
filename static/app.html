@@ -1060,6 +1060,32 @@ html, body {
 .activity-split-handle:hover, .activity-split-handle.dragging { background: var(--blue); }
 .activity-split-handle.hidden { display: none; }
 
+.displays-collapse-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--mantle);
+  border-top: 1px solid var(--surface0);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+  padding: 1px 0;
+}
+.displays-collapse-bar.hidden { display: none; }
+.displays-collapse-bar button {
+  background: none;
+  border: none;
+  color: var(--overlay0);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 12px;
+}
+.displays-collapse-bar button:hover { color: var(--text); }
+.displays-container.collapsed {
+  height: 0 !important;
+  min-height: 0 !important;
+  flex: none !important;
+  overflow: hidden;
+}
 .displays-split-handle {
   height: 5px;
   background: var(--surface0);
@@ -2010,6 +2036,9 @@ html, body {
           <div>No displays active</div>
           <div style="font-size:12px;margin-top:8px;color:var(--surface2)">Displays will appear when the agent launches a GUI</div>
         </div>
+      </div>
+      <div class="displays-collapse-bar hidden" id="displays-collapse-bar">
+        <button id="displays-collapse-btn" title="Collapse/expand display viewer">&#x25B4; Displays</button>
       </div>
       <div class="displays-split-handle" id="displays-split-handle" style="display:none"></div>
       <div class="recording-section hidden" id="recording-section">
@@ -4141,6 +4170,7 @@ function addRecordingStream(streamName) {
   const section = document.getElementById('recording-section');
   section.classList.remove('hidden');
   document.getElementById('displays-split-handle').style.display = '';
+  document.getElementById('displays-collapse-bar').classList.remove('hidden');
 
   const select = document.getElementById('recording-stream-select');
   const group = _getOrCreateOptgroup(select, _streamGroup(streamName));
@@ -4197,6 +4227,35 @@ function switchRecordingStream(streamName) {
     const info = recordingStreams.get(streamName);
     if (info && info.active) recPlayer.refresh();
   }, 5000);
+}
+
+// ── Displays collapse toggle ──
+{
+  let displaysCollapsed = false;
+  let savedHeight = null;
+  document.getElementById('displays-collapse-btn').addEventListener('click', () => {
+    const container = document.getElementById('displays-container');
+    const handle = document.getElementById('displays-split-handle');
+    const btn = document.getElementById('displays-collapse-btn');
+    displaysCollapsed = !displaysCollapsed;
+    if (displaysCollapsed) {
+      savedHeight = container.style.height || null;
+      container.classList.add('collapsed');
+      handle.style.display = 'none';
+      btn.innerHTML = '&#x25BE; Displays';
+      btn.title = 'Expand display viewer';
+      // Give recording section full space
+      document.getElementById('recording-section').style.flex = '1';
+    } else {
+      container.classList.remove('collapsed');
+      if (savedHeight) container.style.height = savedHeight;
+      else { container.style.flex = ''; container.style.height = ''; }
+      handle.style.display = '';
+      btn.innerHTML = '&#x25B4; Displays';
+      btn.title = 'Collapse display viewer';
+      document.getElementById('recording-section').style.flex = '';
+    }
+  });
 }
 
 // ── Displays split handle (drag to resize VNC vs Recording) ──
