@@ -789,6 +789,7 @@ html, body {
 /* ── Displays Tab ── */
 .displays-container {
   flex: 1;
+  min-height: 120px;
   display: flex;
   flex-direction: column;
   color: var(--overlay0);
@@ -1096,7 +1097,8 @@ html, body {
 
 /* ── Recording Replay ── */
 .recording-section {
-  flex-shrink: 0;
+  flex: 1;
+  min-height: 0;
   border-top: 1px solid var(--surface0);
   background: var(--base);
   display: flex;
@@ -1126,7 +1128,7 @@ html, body {
 .recording-player-wrap {
   position: relative;
   flex: 1;
-  min-height: 200px;
+  min-height: 100px;
   max-height: 60vh;
   background: #000;
   display: flex;
