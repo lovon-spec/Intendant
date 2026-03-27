@@ -5248,6 +5248,19 @@ function deleteClipAnnotationLayer(layerId) {
 
 // ── Live annotation overlay during clip playback ──
 
+/** Align the overlay canvas exactly over the rendered video (handles letterboxing). */
+function _alignOverlayToVideo(overlay, video) {
+  const wrap = overlay.parentElement;
+  if (!wrap || !video.videoWidth) return;
+  const wrapRect = wrap.getBoundingClientRect();
+  const vidRect = video.getBoundingClientRect();
+  overlay.style.position = 'absolute';
+  overlay.style.left = (vidRect.left - wrapRect.left) + 'px';
+  overlay.style.top = (vidRect.top - wrapRect.top) + 'px';
+  overlay.style.width = vidRect.width + 'px';
+  overlay.style.height = vidRect.height + 'px';
+}
+
 function startClipLiveOverlay() {
   stopClipLiveOverlay();
   const overlay = document.getElementById('recording-overlay');
@@ -5260,11 +5273,13 @@ function startClipLiveOverlay() {
     // Only draw overlay when not in annotation draw mode
     if (!clipAnnotatingRange && recPlayer && clipAnnotationLayers.length > 0) {
       const currentTime = recPlayer.globalTime();
-      // Size overlay to match video
+      // Size canvas buffer to video resolution
       if (video.videoWidth && (overlay.width !== video.videoWidth || overlay.height !== video.videoHeight)) {
         overlay.width = video.videoWidth;
         overlay.height = video.videoHeight;
       }
+      // Align overlay CSS to rendered video area (handles letterboxing + resize)
+      _alignOverlayToVideo(overlay, video);
       ctx.clearRect(0, 0, overlay.width, overlay.height);
       for (const layer of clipAnnotationLayers) {
         if (currentTime >= layer.startSecs && currentTime <= layer.endSecs) {
@@ -5288,6 +5303,12 @@ function stopClipLiveOverlay() {
   if (overlay) {
     const ctx = overlay.getContext('2d');
     ctx.clearRect(0, 0, overlay.width, overlay.height);
+    // Reset overlay to full-parent coverage
+    overlay.style.position = '';
+    overlay.style.left = '';
+    overlay.style.top = '';
+    overlay.style.width = '';
+    overlay.style.height = '';
   }
 }
 
