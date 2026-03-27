@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="static/icon-128.png" width="96" alt="Intendant" />
+</p>
+
 # Intendant
 
 A Rust runtime for autonomous AI agents with process lifecycle management. Intendant executes commands on behalf of AI agents, tracks process state in memory, and persists structured session logs. It supports OpenAI, Anthropic, and Gemini APIs with native tool calling, streaming, a ratatui TUI, a web dashboard with live voice interaction, configurable autonomy and approval gates, MCP server/client, multi-agent orchestration, a conversational presence layer, and session resume.
