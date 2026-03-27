@@ -43,6 +43,11 @@ swiftc -O -o "$MACOS/Intendant" macos-app/main.swift \
 cp "$BINARY" "$MACOS/intendant-bin"
 cp "$RUNTIME" "$MACOS/intendant-runtime"
 
+# Copy app icon
+if [ -f "macos-app/AppIcon.icns" ]; then
+    cp "macos-app/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+fi
+
 # Info.plist
 cat > "$CONTENTS/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -61,6 +66,8 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>

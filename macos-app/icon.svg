@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e1e2e"/>
+      <stop offset="100%" stop-color="#11111b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#89b4fa"/>
+      <stop offset="100%" stop-color="#74c7ec"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#a68a5b"/>
+      <stop offset="50%" stop-color="#f9e2af"/>
+      <stop offset="100%" stop-color="#fff8e7"/>
+    </linearGradient>
+    <linearGradient id="archGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#585b70"/>
+      <stop offset="100%" stop-color="#313244"/>
+    </linearGradient>
+    <radialGradient id="iGlow" cx="0.5" cy="0.5" r="0.35">
+      <stop offset="0%" stop-color="#89b4fa" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#89b4fa" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bg)"/>
+  <rect x="18" y="18" width="476" height="476" rx="94" fill="none" stroke="#313244" stroke-width="1.5"/>
+
+  <!-- Subtle glow behind the I -->
+  <ellipse cx="256" cy="270" rx="120" ry="150" fill="url(#iGlow)"/>
+
+  <!-- Proscenium arch — outer -->
+  <path d="M 105 405 L 105 185 Q 105 95, 195 95 L 317 95 Q 407 95, 407 185 L 407 405"
+        fill="none" stroke="url(#archGrad)" stroke-width="5" stroke-linecap="round"/>
+
+  <!-- Arch keystone accent -->
+  <circle cx="256" cy="95" r="6" fill="#45475a"/>
+  <circle cx="256" cy="95" r="3" fill="#585b70"/>
+
+  <!-- Inner arch (subtle depth) -->
+  <path d="M 125 405 L 125 195 Q 125 115, 205 115 L 307 115 Q 387 115, 387 195 L 387 405"
+        fill="none" stroke="#45475a" stroke-width="1.5" opacity="0.4"/>
+
+  <!-- The "I" — elegant serif, centered in the arch -->
+  <!-- Top serif -->
+  <rect x="206" y="150" width="100" height="10" rx="3" fill="url(#accent)"/>
+  <!-- Stem -->
+  <rect x="241" y="150" width="30" height="230" rx="4" fill="url(#accent)"/>
+  <!-- Bottom serif -->
+  <rect x="206" y="370" width="100" height="10" rx="3" fill="url(#accent)"/>
+
+  <!-- Conductor's baton — crossing the I with authority -->
+  <line x1="185" y1="330" x2="335" y2="175" stroke="url(#gold)" stroke-width="4" stroke-linecap="round"/>
+  <!-- Baton tip highlight -->
+  <circle cx="335" cy="175" r="5" fill="#f9e2af"/>
+  <circle cx="335" cy="175" r="2.5" fill="#fff8e7" opacity="0.8"/>
+  <!-- Baton grip -->
+  <ellipse cx="185" cy="330" rx="7" ry="3.5" fill="#a68a5b" transform="rotate(-46 185 330)"/>
+
+  <!-- Orchestrated agents — three dots with connecting lines -->
+  <line x1="256" y1="380" x2="206" y2="430" stroke="#a6e3a1" stroke-width="1.2" opacity="0.25"/>
+  <line x1="256" y1="380" x2="256" y2="435" stroke="#a6e3a1" stroke-width="1.2" opacity="0.25"/>
+  <line x1="256" y1="380" x2="306" y2="430" stroke="#a6e3a1" stroke-width="1.2" opacity="0.25"/>
+  <circle cx="206" cy="432" r="6" fill="#a6e3a1" opacity="0.55"/>
+  <circle cx="256" cy="437" r="6" fill="#a6e3a1" opacity="0.55"/>
+  <circle cx="306" cy="432" r="6" fill="#a6e3a1" opacity="0.55"/>
+</svg>
