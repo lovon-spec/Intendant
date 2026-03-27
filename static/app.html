@@ -3086,7 +3086,7 @@ class DisplaySlot {
         if (!e.detail.clean) setTimeout(() => { if (!this.connected) this._connectVNC(); }, 3000);
       });
       this.rfb.addEventListener('credentialsrequired', (e) => {
-        // Auto-send stored credentials (survives page refresh via sessionStorage)
+        // Auto-send stored credentials from localStorage
         const storedPw = localStorage.getItem(`vnc_pw_${this.displayId}`);
         if (storedPw && this.rfb) {
           const creds = { password: storedPw };
