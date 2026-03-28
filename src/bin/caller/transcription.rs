@@ -6,7 +6,7 @@
 use crate::error::CallerError;
 use crate::provider::mask_api_keys;
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A single transcription result.
 #[derive(Debug, Clone)]
@@ -19,7 +19,7 @@ pub struct TranscriptSegment {
 }
 
 /// Configuration for transcription, parsed from `[transcription]` in intendant.toml.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -54,7 +54,7 @@ fn default_buffer_secs() -> f32 {
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: default_provider(),
             model: default_model(),
             endpoint: None,
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn default_transcription_config() {
         let config = TranscriptionConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "whisper-1");
         assert!(config.endpoint.is_none());

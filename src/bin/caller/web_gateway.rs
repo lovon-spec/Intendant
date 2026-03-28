@@ -845,6 +845,101 @@ fn list_sessions() -> String {
     serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Settings payload for GET/POST /api/settings.
+/// Flattened view of intendant.toml sections relevant to the web dashboard.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SettingsPayload {
+    // Computer Use
+    pub cu_provider: Option<String>,
+    pub cu_model: Option<String>,
+    pub cu_backend: String,
+    // Presence
+    pub presence_enabled: bool,
+    pub presence_provider: Option<String>,
+    pub presence_model: Option<String>,
+    pub presence_live_provider: Option<String>,
+    pub presence_live_model: Option<String>,
+    // Transcription
+    pub transcription_enabled: bool,
+    pub transcription_provider: String,
+    pub transcription_model: String,
+    pub transcription_endpoint: Option<String>,
+    pub transcription_language: Option<String>,
+    // Recording
+    pub recording_enabled: bool,
+    pub recording_framerate: u32,
+    pub recording_quality: String,
+    // Live Audio
+    pub live_audio_enabled: bool,
+    pub live_audio_timeout_secs: u64,
+    // Env var overrides (read-only, shown in UI)
+    #[serde(default)]
+    pub env_overrides: std::collections::HashMap<String, String>,
+}
+
+fn settings_payload_from_config(
+    config: &crate::project::ProjectConfig,
+) -> SettingsPayload {
+    let mut env_overrides = std::collections::HashMap::new();
+    for (key, var) in [
+        ("CU_PROVIDER", "CU_PROVIDER"),
+        ("CU_MODEL", "CU_MODEL"),
+        ("PRESENCE_PROVIDER", "PRESENCE_PROVIDER"),
+        ("PRESENCE_MODEL", "PRESENCE_MODEL"),
+        ("PROVIDER", "PROVIDER"),
+        ("MODEL_NAME", "MODEL_NAME"),
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            env_overrides.insert(key.to_string(), val);
+        }
+    }
+    SettingsPayload {
+        cu_provider: config.computer_use.provider.clone(),
+        cu_model: config.computer_use.model.clone(),
+        cu_backend: config.computer_use.backend.clone(),
+        presence_enabled: config.presence.enabled,
+        presence_provider: config.presence.provider.clone(),
+        presence_model: config.presence.model.clone(),
+        presence_live_provider: config.presence.live_provider.clone(),
+        presence_live_model: config.presence.live_model.clone(),
+        transcription_enabled: config.transcription.enabled,
+        transcription_provider: config.transcription.provider.clone(),
+        transcription_model: config.transcription.model.clone(),
+        transcription_endpoint: config.transcription.endpoint.clone(),
+        transcription_language: config.transcription.language.clone(),
+        recording_enabled: config.recording.enabled,
+        recording_framerate: config.recording.framerate,
+        recording_quality: config.recording.quality.clone(),
+        live_audio_enabled: config.live_audio.enabled,
+        live_audio_timeout_secs: config.live_audio.default_timeout_secs,
+        env_overrides,
+    }
+}
+
+fn apply_settings_payload(
+    config: &mut crate::project::ProjectConfig,
+    payload: &SettingsPayload,
+) {
+    config.computer_use.provider = payload.cu_provider.clone();
+    config.computer_use.model = payload.cu_model.clone();
+    config.computer_use.backend = payload.cu_backend.clone();
+    config.presence.enabled = payload.presence_enabled;
+    config.presence.provider = payload.presence_provider.clone();
+    config.presence.model = payload.presence_model.clone();
+    config.presence.live_provider = payload.presence_live_provider.clone();
+    config.presence.live_model = payload.presence_live_model.clone();
+    config.transcription.enabled = payload.transcription_enabled;
+    config.transcription.provider = payload.transcription_provider.clone();
+    config.transcription.model = payload.transcription_model.clone();
+    config.transcription.endpoint = payload.transcription_endpoint.clone();
+    config.transcription.language = payload.transcription_language.clone();
+    config.recording.enabled = payload.recording_enabled;
+    config.recording.framerate = payload.recording_framerate;
+    config.recording.quality = payload.recording_quality.clone();
+    config.live_audio.enabled = payload.live_audio_enabled;
+    config.live_audio.default_timeout_secs = payload.live_audio_timeout_secs;
+}
+
 pub fn spawn_web_gateway(
     port: u16,
     bus: EventBus,
@@ -854,6 +949,7 @@ pub fn spawn_web_gateway(
     transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
     web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
     task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
+    project_root: Option<std::path::PathBuf>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -969,6 +1065,7 @@ pub fn spawn_web_gateway(
             let last_display_ready_json = last_display_ready_json.clone();
             let web_tui_tx = web_tui_tx.clone();
             let task_tx = task_tx.clone();
+            let project_root = project_root.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -2130,6 +2227,67 @@ pub fn spawn_web_gateway(
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
+                    } else if request_line.starts_with("POST") && request_line.contains("/api/settings") {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = header_text
+                            .split("\r\n\r\n")
+                            .nth(1)
+                            .unwrap_or("");
+                        let result = match &project_root {
+                            Some(root) => {
+                                match serde_json::from_str::<SettingsPayload>(body_text) {
+                                    Ok(payload) => {
+                                        match crate::project::Project::from_root(root.clone()) {
+                                            Ok(mut proj) => {
+                                                apply_settings_payload(&mut proj.config, &payload);
+                                                match proj.save_config() {
+                                                    Ok(()) => serde_json::json!({"ok": true}).to_string(),
+                                                    Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+                                                }
+                                            }
+                                            Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+                                        }
+                                    }
+                                    Err(e) => serde_json::json!({"error": format!("Invalid settings: {}", e)}).to_string(),
+                                }
+                            }
+                            None => serde_json::json!({"error": "No project root"}).to_string(),
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            result.len(), result
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/api/settings") {
+                        use tokio::io::AsyncWriteExt;
+                        let body = match &project_root {
+                            Some(root) => {
+                                match crate::project::Project::from_root(root.clone()) {
+                                    Ok(proj) => {
+                                        let payload = settings_payload_from_config(&proj.config);
+                                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+                                    }
+                                    Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+                                }
+                            }
+                            None => serde_json::json!({"error": "No project root"}).to_string(),
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST") && request_line.contains("/session") {
                         let result = mint_session_token(&session_provider, &session_model).await;
                         let (status, body) = match result {
@@ -2727,7 +2885,7 @@ mod tests {
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
 
         // Give it a moment to bind
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -2747,7 +2905,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -2791,7 +2949,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -2842,7 +3000,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -2885,7 +3043,7 @@ mod tests {
             output_sample_rate: 24000,
             transcription_enabled: false,
         };
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -2923,7 +3081,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -2979,7 +3137,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3038,7 +3196,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None)
+                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -3097,7 +3255,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None)
+                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -3166,7 +3324,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None)
+                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -3242,7 +3400,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3292,7 +3450,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3346,7 +3504,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -3382,7 +3540,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -3420,7 +3578,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3476,7 +3634,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3546,7 +3704,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3644,7 +3802,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3717,7 +3875,7 @@ mod tests {
         drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None);
+        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

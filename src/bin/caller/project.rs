@@ -1,10 +1,10 @@
 use crate::autonomy::ApprovalConfig;
 use crate::error::CallerError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MemoryConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -20,14 +20,14 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct ModelConfig {
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct OrchestratorConfig {
     pub max_parallel_agents: Option<usize>,
@@ -35,7 +35,7 @@ pub struct OrchestratorConfig {
 }
 
 /// Configuration for an external MCP server to connect to as a client.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
@@ -48,7 +48,7 @@ pub struct McpServerConfig {
 /// Computer use configuration: provider/model overrides for tasks that involve
 /// visual grounding (reference frames). Configured via `[computer_use]` in
 /// intendant.toml or `CU_PROVIDER`/`CU_MODEL` env vars.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputerUseConfig {
     /// Provider name (e.g. "anthropic", "gemini").
     #[serde(default)]
@@ -66,7 +66,7 @@ fn default_backend() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -95,7 +95,7 @@ pub struct ProjectConfig {
 }
 
 /// Recording configuration in intendant.toml.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -143,7 +143,7 @@ impl RecordingConfig {
 }
 
 /// Live audio sub-agent configuration in intendant.toml.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveAudioConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -177,7 +177,7 @@ impl Default for LiveAudioConfig {
 }
 
 /// Sandbox configuration in intendant.toml.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct SandboxProjectConfig {
     #[serde(default)]
@@ -211,6 +211,17 @@ impl Project {
             ProjectConfig::default()
         };
         Ok(Self { root, config })
+    }
+
+    /// Write the current config back to intendant.toml.
+    /// Creates the file if it doesn't exist.
+    pub fn save_config(&self) -> Result<(), CallerError> {
+        let config_path = self.root.join("intendant.toml");
+        let content = toml::to_string_pretty(&self.config)
+            .map_err(|e| CallerError::Config(format!("Failed to serialize config: {}", e)))?;
+        std::fs::write(&config_path, content)
+            .map_err(|e| CallerError::Config(format!("Failed to write intendant.toml: {}", e)))?;
+        Ok(())
     }
 
     pub fn memory_path(&self) -> PathBuf {
@@ -475,7 +486,7 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
     #[test]
     fn parse_transcription_config_defaults() {
         let config: ProjectConfig = toml::from_str("").unwrap();
-        assert!(!config.transcription.enabled);
+        assert!(config.transcription.enabled);
         assert_eq!(config.transcription.provider, "openai");
         assert_eq!(config.transcription.model, "whisper-1");
         assert!(config.transcription.endpoint.is_none());

@@ -191,6 +191,54 @@ html, body {
   display: flex;
 }
 
+/* ── Settings ── */
+.settings-group {
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin: 0 0 16px;
+}
+.settings-group legend {
+  color: var(--blue);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 0 6px;
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 0;
+}
+.settings-row label {
+  min-width: 120px;
+  font-size: 13px;
+  color: var(--subtext1);
+}
+.settings-row input[type="text"],
+.settings-row input[type="number"],
+.settings-row select {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+.settings-row input[type="text"]:focus,
+.settings-row input[type="number"]:focus,
+.settings-row select:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.settings-row input[type="checkbox"] {
+  accent-color: var(--blue);
+  width: 16px;
+  height: 16px;
+}
+
 /* ── Activity Toolbar ── */
 .activity-toolbar {
   display: flex;
@@ -1995,6 +2043,7 @@ html, body {
     <button class="tab-btn" data-tab="displays">Video</button>
     <button class="tab-btn" data-tab="sessions">Sessions</button>
     <button class="tab-btn" data-tab="debug">Debug</button>
+    <button class="tab-btn" data-tab="settings">Settings</button>
   </nav>
 
   <!-- Tab Content -->
@@ -2249,6 +2298,149 @@ html, body {
           <p style="margin:4px 0">Display: <code style="color:var(--blue)">:<span id="debug-display-id"></span></code></p>
           <p style="margin:4px 0">VNC: <code style="color:var(--blue)">localhost:<span id="debug-vnc-port"></span></code></p>
           <p style="margin:4px 0;color:var(--overlay0)">Connect: <code>vncviewer localhost:<span id="debug-vnc-port2"></span></code></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Tab -->
+    <div id="tab-settings" class="tab-pane">
+      <div style="padding:20px;max-width:640px">
+        <h3 style="margin:0 0 16px;color:var(--text);font-size:16px">Configuration</h3>
+        <p style="color:var(--subtext0);font-size:12px;margin:0 0 16px">
+          Settings are saved to <code style="color:var(--blue)">intendant.toml</code> and take effect on the next task.
+        </p>
+
+        <!-- Computer Use -->
+        <fieldset class="settings-group">
+          <legend>Computer Use</legend>
+          <div class="settings-row">
+            <label>Provider</label>
+            <select id="set-cu-provider">
+              <option value="">Auto (gemini-3.0-flash)</option>
+              <option value="gemini">Gemini</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label>Model</label>
+            <input id="set-cu-model" type="text" placeholder="gemini-3.0-flash">
+          </div>
+          <div class="settings-row">
+            <label>Backend</label>
+            <select id="set-cu-backend">
+              <option value="auto">Auto-detect</option>
+              <option value="x11">X11</option>
+              <option value="wayland">Wayland</option>
+              <option value="macos">macOS</option>
+            </select>
+          </div>
+        </fieldset>
+
+        <!-- Presence -->
+        <fieldset class="settings-group">
+          <legend>Presence</legend>
+          <div class="settings-row">
+            <label>Enabled</label>
+            <input id="set-presence-enabled" type="checkbox">
+          </div>
+          <div class="settings-row">
+            <label>Text Provider</label>
+            <select id="set-presence-provider">
+              <option value="">Auto</option>
+              <option value="gemini">Gemini</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label>Text Model</label>
+            <input id="set-presence-model" type="text" placeholder="gemini-2.5-flash">
+          </div>
+          <div class="settings-row">
+            <label>Live Provider</label>
+            <select id="set-presence-live-provider">
+              <option value="">Auto</option>
+              <option value="gemini">Gemini</option>
+              <option value="openai">OpenAI</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label>Live Model</label>
+            <input id="set-presence-live-model" type="text" placeholder="">
+          </div>
+        </fieldset>
+
+        <!-- Transcription -->
+        <fieldset class="settings-group">
+          <legend>Transcription</legend>
+          <div class="settings-row">
+            <label>Enabled</label>
+            <input id="set-transcription-enabled" type="checkbox">
+          </div>
+          <div class="settings-row">
+            <label>Provider</label>
+            <input id="set-transcription-provider" type="text" placeholder="openai">
+          </div>
+          <div class="settings-row">
+            <label>Model</label>
+            <input id="set-transcription-model" type="text" placeholder="whisper-1">
+          </div>
+          <div class="settings-row">
+            <label>Endpoint</label>
+            <input id="set-transcription-endpoint" type="text" placeholder="Default (OpenAI)">
+          </div>
+          <div class="settings-row">
+            <label>Language</label>
+            <input id="set-transcription-language" type="text" placeholder="Auto-detect">
+          </div>
+        </fieldset>
+
+        <!-- Recording -->
+        <fieldset class="settings-group">
+          <legend>Recording</legend>
+          <div class="settings-row">
+            <label>Enabled</label>
+            <input id="set-recording-enabled" type="checkbox">
+          </div>
+          <div class="settings-row">
+            <label>Framerate</label>
+            <input id="set-recording-framerate" type="number" min="1" max="60" placeholder="15">
+          </div>
+          <div class="settings-row">
+            <label>Quality</label>
+            <select id="set-recording-quality">
+              <option value="low">Low</option>
+              <option value="medium" selected>Medium</option>
+              <option value="high">High</option>
+            </select>
+          </div>
+        </fieldset>
+
+        <!-- Live Audio -->
+        <fieldset class="settings-group">
+          <legend>Live Audio</legend>
+          <div class="settings-row">
+            <label>Enabled</label>
+            <input id="set-live-audio-enabled" type="checkbox">
+          </div>
+          <div class="settings-row">
+            <label>Timeout (s)</label>
+            <input id="set-live-audio-timeout" type="number" min="30" max="3600" placeholder="300">
+          </div>
+        </fieldset>
+
+        <!-- Env var overrides (read-only) -->
+        <div id="settings-env-overrides" class="hidden" style="margin:16px 0;padding:12px;background:var(--mantle);border-radius:6px">
+          <h4 style="margin:0 0 8px;color:var(--peach);font-size:13px">Environment Variable Overrides</h4>
+          <div id="settings-env-list" style="font-size:12px;color:var(--subtext0)"></div>
+        </div>
+
+        <!-- Save / Reset -->
+        <div style="display:flex;gap:8px;margin-top:16px">
+          <button id="settings-save-btn" style="padding:8px 20px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Save</button>
+          <button id="settings-reset-btn" style="padding:8px 20px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);cursor:pointer;font-size:13px">Reset</button>
+          <span id="settings-status" style="align-self:center;font-size:12px;color:var(--green)"></span>
         </div>
       </div>
     </div>
@@ -5836,7 +6028,98 @@ function switchTab(tabId) {
   if (tabId === 'usage' && !allSessionsUsageLoaded) {
     loadAllSessionsUsage();
   }
+  if (tabId === 'settings' && !settingsLoaded) {
+    loadSettings();
+  }
 }
+
+// ── Settings ──
+let settingsLoaded = false;
+
+async function loadSettings() {
+  try {
+    const resp = await fetch('/api/settings');
+    const d = await resp.json();
+    if (d.error) { console.warn('Settings load error:', d.error); return; }
+    document.getElementById('set-cu-provider').value = d.cu_provider || '';
+    document.getElementById('set-cu-model').value = d.cu_model || '';
+    document.getElementById('set-cu-backend').value = d.cu_backend || 'auto';
+    document.getElementById('set-presence-enabled').checked = d.presence_enabled;
+    document.getElementById('set-presence-provider').value = d.presence_provider || '';
+    document.getElementById('set-presence-model').value = d.presence_model || '';
+    document.getElementById('set-presence-live-provider').value = d.presence_live_provider || '';
+    document.getElementById('set-presence-live-model').value = d.presence_live_model || '';
+    document.getElementById('set-transcription-enabled').checked = d.transcription_enabled;
+    document.getElementById('set-transcription-provider').value = d.transcription_provider || '';
+    document.getElementById('set-transcription-model').value = d.transcription_model || '';
+    document.getElementById('set-transcription-endpoint').value = d.transcription_endpoint || '';
+    document.getElementById('set-transcription-language').value = d.transcription_language || '';
+    document.getElementById('set-recording-enabled').checked = d.recording_enabled;
+    document.getElementById('set-recording-framerate').value = d.recording_framerate || 15;
+    document.getElementById('set-recording-quality').value = d.recording_quality || 'medium';
+    document.getElementById('set-live-audio-enabled').checked = d.live_audio_enabled;
+    document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
+    const envDiv = document.getElementById('settings-env-list');
+    const envWrap = document.getElementById('settings-env-overrides');
+    if (d.env_overrides && Object.keys(d.env_overrides).length > 0) {
+      envDiv.innerHTML = Object.entries(d.env_overrides)
+        .map(([k, v]) => '<div><code style="color:var(--peach)">' + k + '</code> = <code>' + v + '</code></div>')
+        .join('');
+      envWrap.classList.remove('hidden');
+    } else {
+      envWrap.classList.add('hidden');
+    }
+    settingsLoaded = true;
+  } catch (e) {
+    console.error('Failed to load settings:', e);
+  }
+}
+
+async function saveSettings() {
+  const g = id => document.getElementById(id);
+  const payload = {
+    cu_provider: g('set-cu-provider').value || null,
+    cu_model: g('set-cu-model').value || null,
+    cu_backend: g('set-cu-backend').value,
+    presence_enabled: g('set-presence-enabled').checked,
+    presence_provider: g('set-presence-provider').value || null,
+    presence_model: g('set-presence-model').value || null,
+    presence_live_provider: g('set-presence-live-provider').value || null,
+    presence_live_model: g('set-presence-live-model').value || null,
+    transcription_enabled: g('set-transcription-enabled').checked,
+    transcription_provider: g('set-transcription-provider').value || 'openai',
+    transcription_model: g('set-transcription-model').value || 'whisper-1',
+    transcription_endpoint: g('set-transcription-endpoint').value || null,
+    transcription_language: g('set-transcription-language').value || null,
+    recording_enabled: g('set-recording-enabled').checked,
+    recording_framerate: parseInt(g('set-recording-framerate').value) || 15,
+    recording_quality: g('set-recording-quality').value,
+    live_audio_enabled: g('set-live-audio-enabled').checked,
+    live_audio_timeout_secs: parseInt(g('set-live-audio-timeout').value) || 300,
+  };
+  try {
+    const resp = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    const status = g('settings-status');
+    if (data.ok) {
+      status.textContent = 'Saved';
+      status.style.color = 'var(--green)';
+    } else {
+      status.textContent = 'Error: ' + (data.error || 'Unknown');
+      status.style.color = 'var(--red)';
+    }
+    setTimeout(() => { status.textContent = ''; }, 3000);
+  } catch (e) {
+    console.error('Failed to save settings:', e);
+  }
+}
+
+document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
+document.getElementById('settings-reset-btn').addEventListener('click', () => { settingsLoaded = false; loadSettings(); });
 
 // ── All Sessions Usage (in Usage tab) ──
 let allSessionsUsageLoaded = false;

@@ -2734,7 +2734,7 @@ pub fn select_cu_provider(
             let key = gemini_key.ok_or_else(|| {
                 CallerError::Config("CU provider=gemini but no GEMINI_API_KEY found.".into())
             })?;
-            let model = model_str.unwrap_or_else(|| "gemini-2.5-flash".to_string());
+            let model = model_str.unwrap_or_else(|| "gemini-3.0-flash".to_string());
             let display = crate::vision::display_config_for_provider("gemini");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
@@ -2777,8 +2777,44 @@ pub fn select_cu_provider(
             other
         ))),
         None => {
-            // No CU-specific override — fall back to the standard provider
-            select_provider()
+            // No CU-specific override — auto-detect best CU provider with CU enabled.
+            // Default to gemini-3.0-flash (fast, cheap CU model).
+            if let Some(key) = gemini_key {
+                let model = model_str.unwrap_or_else(|| "gemini-3.0-flash".to_string());
+                let display = crate::vision::display_config_for_provider("gemini");
+                let ctx = resolve_context_window(&model);
+                let max_out = resolve_max_output_tokens(&model);
+                let mut p =
+                    GeminiProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+                p.cu_enabled = true;
+                p.cu_display = Some((display.width, display.height));
+                Ok(Box::new(p))
+            } else if let Some(key) = openai_key {
+                let model = model_str.unwrap_or_else(|| "gpt-5.2-codex".to_string());
+                let display = crate::vision::display_config_for_provider("openai");
+                let ctx = resolve_context_window(&model);
+                let max_out = resolve_max_output_tokens(&model);
+                let mut p =
+                    OpenAIProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+                p.cu_enabled = true;
+                p.cu_display = Some((display.width, display.height));
+                Ok(Box::new(p))
+            } else if let Some(key) = anthropic_key {
+                let model =
+                    model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+                let display = crate::vision::display_config_for_provider("anthropic");
+                let ctx = resolve_context_window(&model);
+                let max_out = resolve_max_output_tokens(&model);
+                let mut p =
+                    AnthropicProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
+                p.cu_enabled = true;
+                p.cu_display = Some((display.width, display.height));
+                Ok(Box::new(p))
+            } else {
+                Err(CallerError::Config(
+                    "No API key found for CU provider. Set GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY.".into(),
+                ))
+            }
         }
     }
 }

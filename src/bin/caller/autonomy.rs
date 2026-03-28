@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -116,7 +116,7 @@ impl fmt::Display for ActionCategory {
 }
 
 /// Per-category approval rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalRule {
     Auto,
@@ -131,7 +131,7 @@ impl Default for ApprovalRule {
 }
 
 /// Category-level approval rules parsed from intendant.toml [approval] section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalConfig {
     #[serde(default = "default_auto")]
     pub file_read: ApprovalRule,

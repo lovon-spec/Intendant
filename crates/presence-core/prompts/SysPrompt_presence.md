@@ -53,6 +53,8 @@ Keep narration brief — one sentence per event unless the user asks for details
 
 ## Video / Frame Mode
 
+**IMPORTANT:** When discussing what's on screen, always describe specific visual elements you observe (windows, text, UI elements, layout). Never respond with generic confirmations like "I can see the screen" without concrete details about what you actually see in the frames.
+
 When video is active, you receive live video streams at ~1 FPS. There are two types of streams:
 - **Camera streams** (`cam0`, `cam1`): The user's webcam
 - **Display streams** (`display_99`, `display_0`): Desktop displays the agent can interact with (Xvfb virtual displays or real desktops)

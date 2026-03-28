@@ -4044,7 +4044,15 @@ async fn try_cu_first(
 
     let proj = Project::from_root(project_root.to_path_buf()).ok()?;
     let cu_provider = match provider::select_cu_provider(&proj.config.computer_use) {
-        Ok(p) => p,
+        Ok(p) => {
+            if !p.cu_enabled() {
+                slog(session_log, |l| {
+                    l.warn("CU provider selected but cu_enabled=false, skipping CU-first")
+                });
+                return None;
+            }
+            p
+        }
         Err(_) => return None,
     };
 
@@ -4372,15 +4380,61 @@ async fn run_cu_task(
             });
         }
 
+        // Handle unrecognized function tool calls: return error results so the
+        // model knows these tools are not available in CU mode.
+        let non_escalate_tools: Vec<_> = response
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.name != "escalate_to_agent")
+            .collect();
+        if !non_escalate_tools.is_empty() {
+            let refs: Vec<conversation::ToolCallRef> = non_escalate_tools
+                .iter()
+                .map(|tc| conversation::ToolCallRef {
+                    id: tc.id.clone(),
+                    call_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                })
+                .collect();
+            conv.add_assistant_tool_calls(
+                response.content.clone(),
+                refs,
+                response.raw_output.clone(),
+            );
+            for tc in &non_escalate_tools {
+                slog(session_log, |l| {
+                    l.warn(&format!(
+                        "CU turn {}: unrecognized tool '{}' — returning error result",
+                        turn, tc.name
+                    ))
+                });
+                conv.add_tool_result(
+                    &tc.id,
+                    &tc.name,
+                    &format!(
+                        "Error: tool '{}' is not available in computer-use mode. \
+                         Use your native computer use actions (click, type, scroll, screenshot) \
+                         or call escalate_to_agent to hand off to the coding agent.",
+                        tc.name
+                    ),
+                );
+            }
+            continue; // let model see the error results
+        }
+
         // Check for task completion
         let content_lower = response.content.to_lowercase();
-        let is_done = content_lower.contains("done") && response.cu_calls.is_empty()
+        let is_done = content_lower.contains("done")
+            && response.cu_calls.is_empty()
             && response.tool_calls.is_empty();
 
         // Store assistant message
         if !response.cu_calls.is_empty() {
             // CU calls: store as assistant with tool call refs
-            let refs: Vec<conversation::ToolCallRef> = response.cu_calls.iter()
+            let refs: Vec<conversation::ToolCallRef> = response
+                .cu_calls
+                .iter()
                 .map(|cu| conversation::ToolCallRef {
                     id: cu.call_id.clone(),
                     call_id: cu.call_id.clone(),
@@ -4388,13 +4442,19 @@ async fn run_cu_task(
                     arguments: String::new(),
                 })
                 .collect();
-            conv.add_assistant_tool_calls(response.content.clone(), refs, response.raw_output.clone());
+            conv.add_assistant_tool_calls(
+                response.content.clone(),
+                refs,
+                response.raw_output.clone(),
+            );
         } else {
             conv.add_assistant(response.content.clone());
         }
 
         if is_done {
-            slog(session_log, |l| l.info(&format!("CU task complete at turn {}", turn)));
+            slog(session_log, |l| {
+                l.info(&format!("CU task complete at turn {}", turn))
+            });
             break;
         }
 
@@ -4404,7 +4464,8 @@ async fn run_cu_task(
                 slog(session_log, |l| {
                     l.info(&format!(
                         "CU turn {}: {} action(s)",
-                        turn, cu_call.actions.len()
+                        turn,
+                        cu_call.actions.len()
                     ))
                 });
 
@@ -4414,13 +4475,16 @@ async fn run_cu_task(
                     backend,
                     log_dir,
                     &mut cu_counter,
-                ).await;
+                )
+                .await;
 
-                let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
+                let last_screenshot =
+                    results.iter().rev().find_map(|r| r.screenshot.as_ref());
                 let output = if results.iter().all(|r| r.success) {
                     "Actions executed successfully.".to_string()
                 } else {
-                    let errors: Vec<&str> = results.iter()
+                    let errors: Vec<&str> = results
+                        .iter()
                         .filter_map(|r| r.error.as_deref())
                         .collect();
                     format!("Some actions failed: {}", errors.join("; "))
@@ -4881,6 +4945,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 None, // MCP mode: no WebTui
                 None, // No task_tx in MCP mode
+                Some(project.root.clone()),
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -5319,6 +5384,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 web_tui_tx.clone(),
                 Some(task_tx.clone()),
+                Some(project.root.clone()),
             );
             app.log(
                 types::LogLevel::Info,
@@ -5743,6 +5809,7 @@ async fn main() -> Result<(), CallerError> {
                 transcriber,
                 None, // Headless mode: no WebTui
                 None, // No task_tx in headless mode
+                Some(project.root.clone()),
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
