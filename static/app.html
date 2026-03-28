@@ -2370,6 +2370,17 @@ html, body {
 
 import init, { PresenceWeb } from '/wasm-web/presence_web.js';
 
+// When running in the macOS app bundle, the page is served from a custom
+// scheme (intendant://) for secure-context access to getUserMedia. WebSocket
+// connections bypass the scheme handler and need the real backend address.
+function buildWsUrl(path) {
+  if (window.__intendantPort) {
+    return 'ws://127.0.0.1:' + window.__intendantPort + (path || '');
+  }
+  const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return p + '//' + location.host + (path || '');
+}
+
 // ── Constants (rendering only — all logic in WASM) ──
 const SPINNER_FRAMES = ['\u280b','\u2819','\u2839','\u2838','\u283c','\u2834','\u2826','\u2827','\u2807','\u280f'];
 const LEVEL_ICONS = {
@@ -2903,17 +2914,7 @@ async function main() {
     }
   });
 
-  // Connect to server.
-  // When running in the macOS app bundle, the page is served from a custom
-  // scheme (intendant://) for secure-context access to getUserMedia. WebSocket
-  // connections bypass the scheme handler and need the real backend address.
-  function buildWsUrl(path) {
-    if (window.__intendantPort) {
-      return 'ws://127.0.0.1:' + window.__intendantPort + (path || '');
-    }
-    const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return p + '//' + location.host + (path || '');
-  }
+  // Connect to server
   const wsUrl = buildWsUrl();
 
   // Store app globally for reconnect
