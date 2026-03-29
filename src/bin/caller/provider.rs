@@ -2734,7 +2734,7 @@ pub fn select_cu_provider(
             let key = gemini_key.ok_or_else(|| {
                 CallerError::Config("CU provider=gemini but no GEMINI_API_KEY found.".into())
             })?;
-            let model = model_str.unwrap_or_else(|| "gemini-3.0-flash".to_string());
+            let model = model_str.unwrap_or_else(|| "gemini-3-flash-preview".to_string());
             let display = crate::vision::display_config_for_provider("gemini");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
@@ -2778,9 +2778,9 @@ pub fn select_cu_provider(
         ))),
         None => {
             // No CU-specific override — auto-detect best CU provider with CU enabled.
-            // Default to gemini-3.0-flash (fast, cheap CU model).
+            // Default to gemini-3-flash-preview (fast, cheap CU model).
             if let Some(key) = gemini_key {
-                let model = model_str.unwrap_or_else(|| "gemini-3.0-flash".to_string());
+                let model = model_str.unwrap_or_else(|| "gemini-3-flash-preview".to_string());
                 let display = crate::vision::display_config_for_provider("gemini");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);

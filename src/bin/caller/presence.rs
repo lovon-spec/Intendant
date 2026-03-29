@@ -1082,7 +1082,7 @@ mod tests {
         let toml_str = r#"
             enabled = true
             provider = "gemini"
-            model = "gemini-3.0-flash"
+            model = "gemini-3-flash-preview"
             context_window = 1048576
             live_provider = "gemini"
             live_model = "gemini-2.5-flash-native-audio-preview-12-2025"
@@ -1091,7 +1091,7 @@ mod tests {
         let config: PresenceConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert_eq!(config.provider.as_deref(), Some("gemini"));
-        assert_eq!(config.model.as_deref(), Some("gemini-3.0-flash"));
+        assert_eq!(config.model.as_deref(), Some("gemini-3-flash-preview"));
         assert_eq!(config.context_window, 1_048_576);
         assert_eq!(config.live_provider.as_deref(), Some("gemini"));
         assert_eq!(

@@ -520,7 +520,7 @@ buffer_secs = 5.0
 [presence]
 enabled = false
 provider = "gemini"
-model = "gemini-3.0-flash"
+model = "gemini-3-flash-preview"
 context_window = 1048576
 live_provider = "openai"
 live_model = "gpt-4o-realtime-preview"
@@ -529,7 +529,7 @@ live_context_window = 65536
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.presence.enabled);
         assert_eq!(config.presence.provider.as_deref(), Some("gemini"));
-        assert_eq!(config.presence.model.as_deref(), Some("gemini-3.0-flash"));
+        assert_eq!(config.presence.model.as_deref(), Some("gemini-3-flash-preview"));
         assert_eq!(config.presence.context_window, 1_048_576);
         assert_eq!(config.presence.live_provider.as_deref(), Some("openai"));
         assert_eq!(
