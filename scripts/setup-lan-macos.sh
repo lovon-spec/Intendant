@@ -263,6 +263,16 @@ run_on_guest() {
     as_user ssh -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}" "$1"
 }
 
+run_guest_script() {
+    local args="$1"
+    if [[ "$GUEST_OS" == "linux" ]]; then
+        run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $args"
+    else
+        # Homebrew isn't in PATH for SSH sessions (macOS only sources .zprofile for login shells)
+        run_on_guest "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; /tmp/$SETUP_SCRIPT_NAME $args"
+    fi
+}
+
 copy_to_guest() {
     local script_dir
     script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -598,22 +608,37 @@ run_wizard() {
     info "running setup on VM..."
     local guest_args="--port $HTTPS_PORT"
     [[ "$NET_MODE" == "shared" ]] && guest_args="$guest_args --lan-ip $LAN_IP"
-    if [[ "$GUEST_OS" == "linux" ]]; then
-        run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $guest_args" || true
-    else
-        run_on_guest "/tmp/$SETUP_SCRIPT_NAME $guest_args" || true
-    fi
+    local guest_ok=true
+    run_guest_script "$guest_args" || guest_ok=false
 
     echo ""
-    echo "════════════════════════════════════════════════════════"
-    echo "  Setup complete!"
-    echo "════════════════════════════════════════════════════════"
-    echo ""
-    echo "  Phone connects to: https://${LAN_IP}:${HTTPS_PORT}"
-    echo ""
-    if [[ "$NET_MODE" == "shared" ]]; then
-        info "SSH tunnel survives reboot (launchd service)"
-        info "  Logs: $CONFIG_DIR/$INSTANCE_SLUG.log"
+    if $guest_ok; then
+        echo "════════════════════════════════════════════════════════"
+        echo "  Setup complete!"
+        echo "════════════════════════════════════════════════════════"
+        echo ""
+        echo "  Phone connects to: https://${LAN_IP}:${HTTPS_PORT}"
+        echo ""
+        if [[ "$NET_MODE" == "shared" ]]; then
+            info "SSH tunnel survives reboot (launchd service)"
+            info "  Logs: $CONFIG_DIR/$INSTANCE_SLUG.log"
+        fi
+    else
+        echo "════════════════════════════════════════════════════════"
+        echo "  Host setup complete — VM setup failed"
+        echo "════════════════════════════════════════════════════════"
+        echo ""
+        echo "  The SSH tunnel and config are in place, but the"
+        echo "  VM-side setup did not complete. SSH in and run:"
+        if [[ "$GUEST_OS" == "linux" ]]; then
+            echo "    sudo /tmp/$SETUP_SCRIPT_NAME $guest_args"
+        else
+            echo "    /tmp/$SETUP_SCRIPT_NAME $guest_args"
+        fi
+        echo ""
+        if [[ "$NET_MODE" == "shared" ]]; then
+            info "SSH tunnel is running — Logs: $CONFIG_DIR/$INSTANCE_SLUG.log"
+        fi
     fi
 }
 
@@ -664,11 +689,7 @@ run_recert() {
     copy_to_guest
 
     info "regenerating server cert on VM..."
-    if [[ "$GUEST_OS" == "linux" ]]; then
-        run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $recert_args"
-    else
-        run_on_guest "/tmp/$SETUP_SCRIPT_NAME $recert_args"
-    fi
+    run_guest_script "$recert_args"
 
     echo ""
     info "done — phone connects to: https://${LAN_IP}:${HTTPS_PORT}"
@@ -694,12 +715,10 @@ run_remove() {
     fi
 
     info "removing VM-side config..."
-    if [[ "$GUEST_OS" == "linux" ]]; then
-        run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME --remove" 2>/dev/null || \
-            warn "could not remove VM config — run 'sudo setup-lan.sh --remove' manually in the VM"
-    else
-        run_on_guest "/tmp/$SETUP_SCRIPT_NAME --remove" 2>/dev/null || \
-            warn "could not remove VM config — run 'setup-lan-guest-macos.sh --remove' manually in the VM"
+    if ! run_guest_script "--remove" 2>/dev/null; then
+        local manual_cmd="$SETUP_SCRIPT_NAME --remove"
+        [[ "$GUEST_OS" == "linux" ]] && manual_cmd="sudo $manual_cmd"
+        warn "could not remove VM config — run '$manual_cmd' manually in the VM"
     fi
 
     rm -f "$(instance_config)"
