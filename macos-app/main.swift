@@ -82,13 +82,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     var port: Int = 8765
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        port = findFreePort() ?? 8765
+        if !isPortAvailable(port) {
+            NSLog("Port \(port) in use — finding a free port")
+            port = findFreePort() ?? port
+            NSLog("Using port \(port)")
+        }
         startBackend()
         createWindow()
         pollUntilReady()
     }
 
-    /// Bind to port 0, read the assigned port, close the socket.
+    func isPortAvailable(_ p: Int) -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_port = UInt16(p).bigEndian
+        let result = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        return result == 0
+    }
+
     func findFreePort() -> Int? {
         let sock = socket(AF_INET, SOCK_STREAM, 0)
         guard sock >= 0 else { return nil }
@@ -275,7 +292,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
             backing: .buffered,
             defer: false
         )
-        window.title = "Intendant"
+        window.title = port == 8765 ? "Intendant" : "Intendant (port \(port))"
         window.contentView = webView
         window.minSize = NSSize(width: 600, height: 400)
         window.makeKeyAndOrderFront(nil)
