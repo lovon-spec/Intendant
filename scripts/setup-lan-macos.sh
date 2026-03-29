@@ -289,7 +289,7 @@ ensure_ssh_keys() {
     fi
 
     info "copying key to VM (enter password one last time)..."
-    as_user ssh-copy-id -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}"
+    as_user ssh-copy-id -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}" >/dev/null
     info "SSH keys configured"
 }
 
@@ -526,7 +526,7 @@ run_wizard() {
                     as_user ssh-keygen -t ed25519 -f "$key_file" -N "" -q
                 fi
                 info "copying key to VM (enter password one last time)..."
-                as_user ssh-copy-id -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}"
+                as_user ssh-copy-id -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}" >/dev/null
                 info "SSH keys configured — no more password prompts"
             fi
         fi
