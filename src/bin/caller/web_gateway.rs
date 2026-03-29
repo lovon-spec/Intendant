@@ -2432,7 +2432,7 @@ pub fn spawn_web_gateway(
                             body.len(), body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST") && request_line.contains("/session") {
+                    } else if request_line.starts_with("POST") && request_line.contains(" /session") && !request_line.contains("/api/session/") {
                         let result = mint_session_token(&session_provider, &session_model).await;
                         let (status, body) = match result {
                             Ok(json) => ("200 OK", json),
@@ -2669,7 +2669,38 @@ pub fn spawn_web_gateway(
                             body.len(), body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if (request_line.starts_with("DELETE") || request_line.starts_with("POST"))
+                        && request_line.contains("/api/session/")
+                        && request_line.contains("/delete")
+                    {
+                        // DELETE /api/session/{id}[/{target}]  (native DELETE)
+                        // POST  /api/session/{id}/delete[/{target}]  (WKWebView fallback)
+                        use tokio::io::AsyncWriteExt;
+                        let rest = request_line
+                            .split("/api/session/")
+                            .nth(1)
+                            .and_then(|r| r.split_whitespace().next())
+                            .unwrap_or("");
+                        let rest_parts: Vec<&str> = rest.split('/')
+                            .filter(|s| !s.is_empty() && *s != "delete")
+                            .collect();
+                        let session_id = rest_parts.first().copied().unwrap_or("");
+                        let target = rest_parts.get(1).copied().unwrap_or("session");
+                        let body = delete_session_data(session_id, target);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("DELETE") && request_line.contains("/api/session/") {
+                        // Plain DELETE without /delete in path (curl, regular browser)
                         use tokio::io::AsyncWriteExt;
                         let rest = request_line
                             .split("/api/session/")

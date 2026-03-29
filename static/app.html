@@ -6835,10 +6835,10 @@ function deleteSessionData(sessionId, target, label) {
   if (!confirm(`${label} for session ${shortId}?\nThis cannot be undone.`)) return;
 
   const url = target === 'session'
-    ? `/api/session/${sessionId}`
-    : `/api/session/${sessionId}/${target}`;
+    ? `/api/session/${sessionId}/delete`
+    : `/api/session/${sessionId}/delete/${target}`;
 
-  fetch(url, { method: 'DELETE' })
+  fetch(url, { method: 'POST' })
     .then(r => r.json())
     .then(result => {
       if (!result.ok) { alert('Delete failed: ' + (result.error || 'unknown')); return; }
