@@ -2808,6 +2808,109 @@ pub fn spawn_web_gateway(
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
+                        } else if rest_parts.len() >= 2 && rest_parts[1] == "frames" {
+                            // Session frame sub-routes: /api/session/{id}/frames[/{filename}]
+                            use tokio::io::AsyncWriteExt;
+                            let session_id = rest_parts[0];
+                            let frame_rest = &rest_parts[2..];
+
+                            if frame_rest.len() == 1 {
+                                // GET /api/session/{id}/frames/{filename}
+                                let filename = frame_rest[0];
+                                let valid = (filename.ends_with(".jpg") || filename.ends_with(".png"))
+                                    && filename.len() < 80
+                                    && !filename.contains("..");
+                                if valid {
+                                    let ct = if filename.ends_with(".png") { "image/png" } else { "image/jpeg" };
+                                    let frame_path = resolve_session_dir(session_id)
+                                        .map(|d| d.join("frames").join(filename));
+                                    if let Some(path) = frame_path.filter(|p| p.exists()) {
+                                        match tokio::fs::read(&path).await {
+                                            Ok(data) => {
+                                                let header = format!(
+                                                    "HTTP/1.1 200 OK\r\n\
+                                                     Content-Type: {}\r\n\
+                                                     Content-Length: {}\r\n\
+                                                     Cache-Control: public, max-age=3600\r\n\
+                                                     Connection: close\r\n\
+                                                     \r\n",
+                                                    ct, data.len()
+                                                );
+                                                let _ = stream.write_all(header.as_bytes()).await;
+                                                let _ = stream.write_all(&data).await;
+                                            }
+                                            Err(_) => {
+                                                let body = "Failed to read frame";
+                                                let response = format!(
+                                                    "HTTP/1.1 500 Internal Server Error\r\n\
+                                                     Content-Type: text/plain\r\n\
+                                                     Content-Length: {}\r\n\
+                                                     Connection: close\r\n\
+                                                     \r\n\
+                                                     {}",
+                                                    body.len(), body
+                                                );
+                                                let _ = stream.write_all(response.as_bytes()).await;
+                                            }
+                                        }
+                                    } else {
+                                        let body = "Frame not found";
+                                        let response = format!(
+                                            "HTTP/1.1 404 Not Found\r\n\
+                                             Content-Type: text/plain\r\n\
+                                             Content-Length: {}\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             {}",
+                                            body.len(), body
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                } else {
+                                    let body = "Invalid filename";
+                                    let response = format!(
+                                        "HTTP/1.1 400 Bad Request\r\n\
+                                         Content-Type: text/plain\r\n\
+                                         Content-Length: {}\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {}",
+                                        body.len(), body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                }
+                            } else {
+                                // GET /api/session/{id}/frames — list frame filenames
+                                let body = if let Some(session_dir) = resolve_session_dir(session_id) {
+                                    let frames_dir = session_dir.join("frames");
+                                    let mut names: Vec<String> = Vec::new();
+                                    if frames_dir.is_dir() {
+                                        if let Ok(entries) = std::fs::read_dir(&frames_dir) {
+                                            for e in entries.flatten() {
+                                                let n = e.file_name().to_string_lossy().to_string();
+                                                if n.ends_with(".jpg") || n.ends_with(".png") {
+                                                    names.push(n);
+                                                }
+                                            }
+                                        }
+                                        names.sort();
+                                    }
+                                    serde_json::to_string(&names).unwrap_or("[]".to_string())
+                                } else {
+                                    "[]".to_string()
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(), body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
                         } else {
                             // GET /api/session/{id} — session detail
                             let session_id = rest_parts[0].split('?').next().unwrap_or(rest_parts[0]);

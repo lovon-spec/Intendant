@@ -691,10 +691,11 @@ html, body {
   flex-direction: column;
   gap: 8px;
 }
-.session-detail { flex: 1; display: flex; flex-direction: column; }
+.session-detail { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .session-detail-header {
   display: flex; align-items: center; gap: 12px;
   padding: 8px 0; border-bottom: 1px solid var(--surface0); margin-bottom: 8px;
+  flex-shrink: 0;
 }
 .session-back-btn {
   background: var(--surface0); border: 1px solid var(--surface1);
@@ -703,42 +704,62 @@ html, body {
 }
 .session-back-btn:hover { background: var(--surface1); }
 .session-detail-title { color: var(--text); font-size: 13px; }
-.session-detail-logs {
-  flex: 1; overflow-y: auto; padding: 4px 0;
+.session-detail-body { flex: 1; overflow-y: auto; display: flex; flex-direction: column; min-height: 0; }
+.sd-section { border-bottom: 1px solid var(--surface0); }
+.sd-section:last-child { border-bottom: none; flex: 1; display: flex; flex-direction: column; min-height: 200px; }
+.sd-section-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 4px; cursor: pointer; user-select: none;
 }
+.sd-section-header:hover { background: var(--mantle); }
+.sd-section-chevron { color: var(--overlay0); font-size: 12px; width: 14px; transition: transform 0.15s; }
+.sd-section.collapsed .sd-section-chevron { transform: rotate(-90deg); }
+.sd-section-title { font-size: 13px; font-weight: 600; color: var(--subtext1); }
+.sd-section-badge { font-size: 11px; color: var(--overlay0); }
+.sd-section-content { overflow: hidden; }
+.sd-section.collapsed .sd-section-content { display: none; }
+.session-detail-logs { padding: 4px 0; overflow-y: auto; flex: 1; }
 .session-detail-logs .log-entry { display: flex; padding: 2px 0; line-height: 1.5; font-size: 13px; }
 .session-detail-logs .log-entry:hover { background: var(--mantle); }
 .session-detail-logs .log-ts { color: var(--overlay1); width: 70px; flex-shrink: 0; font-size: 11px; }
 .session-detail-logs .log-level { width: 52px; flex-shrink: 0; font-weight: 600; font-size: 11px; text-transform: uppercase; }
 .session-detail-logs .log-content { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
 .session-detail-logs .log-turn-sep { padding: 6px 0 2px; font-size: 11px; color: var(--overlay0); border-top: 1px solid var(--surface0); margin-top: 4px; }
-#session-detail-recordings {
-  border-bottom: 1px solid var(--surface0);
-  margin-bottom: 4px;
-}
-#session-detail-recordings .recording-player-wrap {
-  max-height: 40vh;
-}
+#session-detail-recordings .recording-player-wrap { max-height: 40vh; }
 #session-detail-recordings .session-rec-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 6px 12px;
-  background: var(--mantle);
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 12px; background: var(--mantle);
   border-bottom: 1px solid var(--surface0);
-  font-size: 13px;
-  color: var(--subtext1);
-  font-weight: 600;
+  font-size: 13px; color: var(--subtext1); font-weight: 600;
 }
 #session-detail-recordings .session-rec-header select {
-  padding: 2px 8px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
-  color: var(--text);
-  font-size: 12px;
-  font-family: monospace;
+  padding: 2px 8px; border: 1px solid var(--surface1);
+  border-radius: 4px; background: var(--surface0);
+  color: var(--text); font-size: 12px; font-family: monospace;
 }
+.sd-frames-gallery {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px; padding: 8px;
+}
+.sd-frame-thumb {
+  position: relative; cursor: pointer; border-radius: 4px;
+  overflow: hidden; border: 1px solid var(--surface1);
+  aspect-ratio: 16/9; background: var(--mantle);
+}
+.sd-frame-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.sd-frame-thumb:hover { border-color: var(--blue); }
+.sd-frame-thumb .frame-label {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  padding: 2px 6px; font-size: 10px; color: var(--text);
+  background: rgba(0,0,0,0.6); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sd-frame-lightbox {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+  z-index: 200; display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+}
+.sd-frame-lightbox img { max-width: 95vw; max-height: 95vh; object-fit: contain; }
 .session-card {
   background: var(--surface0);
   border: 1px solid var(--surface1);
@@ -2361,8 +2382,32 @@ html, body {
             <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
             <span class="session-detail-title" id="session-detail-title"></span>
           </div>
-          <div id="session-detail-recordings" style="display:none"></div>
-          <div class="session-detail-logs" id="session-detail-logs"></div>
+          <div class="session-detail-body" id="session-detail-body">
+            <div class="sd-section" id="sd-recordings" style="display:none">
+              <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                <span class="sd-section-chevron">&#x25BE;</span>
+                <span class="sd-section-title">Recordings</span>
+                <span class="sd-section-badge" id="sd-recordings-badge"></span>
+              </div>
+              <div class="sd-section-content" id="session-detail-recordings"></div>
+            </div>
+            <div class="sd-section" id="sd-frames" style="display:none">
+              <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                <span class="sd-section-chevron">&#x25BE;</span>
+                <span class="sd-section-title">Frames</span>
+                <span class="sd-section-badge" id="sd-frames-badge"></span>
+              </div>
+              <div class="sd-section-content" id="session-detail-frames"></div>
+            </div>
+            <div class="sd-section" id="sd-logs">
+              <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                <span class="sd-section-chevron">&#x25BE;</span>
+                <span class="sd-section-title">Logs</span>
+                <span class="sd-section-badge" id="sd-logs-badge"></span>
+              </div>
+              <div class="sd-section-content session-detail-logs" id="session-detail-logs"></div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -6791,6 +6836,11 @@ function openSessionDetail(sessionId, task) {
   titleEl.textContent = task + ' (' + sessionId.substring(0, 8) + ')';
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
 
+  // Reset sections
+  document.getElementById('sd-recordings').style.display = 'none';
+  document.getElementById('sd-frames').style.display = 'none';
+  document.getElementById('session-detail-frames').innerHTML = '';
+
   fetch('/api/session/' + sessionId)
     .then(r => r.json())
     .then(data => {
@@ -6798,7 +6848,15 @@ function openSessionDetail(sessionId, task) {
         logsEl.innerHTML = '<div class="empty-state">' + data.error + '</div>';
         return;
       }
-      renderSessionDetailLogs(data.entries || [], logsEl);
+      const entries = data.entries || [];
+      renderSessionDetailLogs(entries, logsEl);
+      document.getElementById('sd-logs-badge').textContent = entries.length + ' entries';
+
+      // Render frames gallery
+      const frames = data.frames || [];
+      if (frames.length > 0) {
+        renderSessionFrames(sessionId, frames);
+      }
     })
     .catch(e => {
       logsEl.innerHTML = '<div class="empty-state">Failed to load</div>';
@@ -6811,9 +6869,10 @@ function openSessionDetail(sessionId, task) {
 function closeSessionDetail() {
   // Clean up session recording player
   if (sessionRecPlayer) { sessionRecPlayer.destroy(); sessionRecPlayer = null; }
-  const recEl = document.getElementById('session-detail-recordings');
-  recEl.style.display = 'none';
-  recEl.innerHTML = '';
+  document.getElementById('session-detail-recordings').innerHTML = '';
+  document.getElementById('session-detail-frames').innerHTML = '';
+  document.getElementById('sd-recordings').style.display = 'none';
+  document.getElementById('sd-frames').style.display = 'none';
 
   document.getElementById('sessions-list').style.display = '';
   document.getElementById('sessions-aggregate').style.display = '';
@@ -6828,7 +6887,8 @@ let sessionRecPlayer = null;
 
 async function loadSessionRecordings(sessionId) {
   const container = document.getElementById('session-detail-recordings');
-  container.style.display = 'none';
+  const section = document.getElementById('sd-recordings');
+  section.style.display = 'none';
   container.innerHTML = '';
 
   let streams;
@@ -6838,13 +6898,16 @@ async function loadSessionRecordings(sessionId) {
   } catch { return; }
   if (!Array.isArray(streams) || streams.length === 0) return;
 
-  // Build the UI
-  container.style.display = '';
+  // Show the section
+  section.style.display = '';
+  const totalDur = streams.reduce((s, st) => s + (st.total_duration_secs || 0), 0);
+  document.getElementById('sd-recordings-badge').textContent =
+    streams.length + ' stream' + (streams.length > 1 ? 's' : '') +
+    (totalDur > 0 ? ' \u00b7 ' + Math.round(totalDur) + 's' : '');
 
-  // Header with stream selector
+  // Stream selector
   const header = document.createElement('div');
   header.className = 'session-rec-header';
-  header.innerHTML = '<span>Recordings</span>';
   const select = document.createElement('select');
   for (const s of streams) {
     const opt = document.createElement('option');
@@ -6913,6 +6976,51 @@ async function loadSessionRecordings(sessionId) {
 
   select.addEventListener('change', () => { if (select.value) initPlayer(select.value); });
   initPlayer(streams[0].stream_name);
+}
+
+function renderSessionFrames(sessionId, frames) {
+  const section = document.getElementById('sd-frames');
+  const container = document.getElementById('session-detail-frames');
+  section.style.display = '';
+
+  // Categorize
+  const annotations = frames.filter(f => f.startsWith('ann-'));
+  const clips = frames.filter(f => f.startsWith('clip-'));
+  const other = frames.filter(f => !f.startsWith('ann-') && !f.startsWith('clip-'));
+
+  const parts = [];
+  if (annotations.length) parts.push(annotations.length + ' annotation' + (annotations.length > 1 ? 's' : ''));
+  if (clips.length) parts.push(clips.length + ' clip' + (clips.length > 1 ? 's' : ''));
+  if (other.length) parts.push(other.length + ' other');
+  document.getElementById('sd-frames-badge').textContent = parts.join(' \u00b7 ');
+
+  const gallery = document.createElement('div');
+  gallery.className = 'sd-frames-gallery';
+
+  for (const name of frames) {
+    const thumb = document.createElement('div');
+    thumb.className = 'sd-frame-thumb';
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.src = `/api/session/${sessionId}/frames/${name}`;
+    img.alt = name;
+    thumb.appendChild(img);
+    const label = document.createElement('div');
+    label.className = 'frame-label';
+    label.textContent = name;
+    thumb.appendChild(label);
+    thumb.addEventListener('click', () => {
+      const lb = document.createElement('div');
+      lb.className = 'sd-frame-lightbox';
+      const full = document.createElement('img');
+      full.src = img.src;
+      lb.appendChild(full);
+      lb.addEventListener('click', () => lb.remove());
+      document.body.appendChild(lb);
+    });
+    gallery.appendChild(thumb);
+  }
+  container.appendChild(gallery);
 }
 
 let detailVerbosity = 'normal';
