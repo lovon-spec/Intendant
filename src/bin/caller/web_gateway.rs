@@ -2295,9 +2295,9 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(wasm_data).await;
-                    } else if request_line.contains("/frames/") {
+                    } else if request_line.contains(" /frames/") {
                         // Serve HQ frame images from the frame registry.
-                        // URL format: /frames/<frame_id>
+                        // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
                         use tokio::io::AsyncWriteExt;
                         let frame_id = request_line
                             .split("/frames/")

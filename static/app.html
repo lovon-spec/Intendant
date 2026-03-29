@@ -6765,9 +6765,10 @@ function renderSessionsList(sessions, el) {
           menu.appendChild(item);
         };
 
-        if ((s.recording_bytes || 0) > 0) addItem('Delete recordings', 'recordings', s.recording_bytes);
-        if ((s.frames_bytes || 0) > 0) addItem('Delete frames', 'frames', s.frames_bytes);
-        if ((s.recording_bytes || 0) + (s.frames_bytes || 0) > 0) addItem('Delete all media', 'media', (s.recording_bytes || 0) + (s.frames_bytes || 0));
+        if ((s.recordings || 0) > 0) addItem('Delete recordings', 'recordings', s.recording_bytes || 0);
+        if ((s.frames_bytes || 0) > 0 || (s.annotations || 0) > 0 || (s.clips || 0) > 0) addItem('Delete frames', 'frames', s.frames_bytes || 0);
+        const hasMedia = (s.recordings || 0) > 0 || (s.frames_bytes || 0) > 0;
+        if (hasMedia) addItem('Delete all media', 'media', (s.recording_bytes || 0) + (s.frames_bytes || 0));
         if ((s.turns_bytes || 0) > 0) addItem('Delete turn data', 'turns', s.turns_bytes);
         if (!isCurrent) addItem('Delete session', 'session', s.total_bytes, true);
 
