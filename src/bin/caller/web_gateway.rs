@@ -2275,6 +2275,22 @@ pub fn spawn_web_gateway(
                     // Route by request path
                     let request_line = header_text.lines().next().unwrap_or("");
 
+                    // CORS preflight: respond to OPTIONS with permissive headers.
+                    // Needed when the page is served from a custom scheme (intendant://)
+                    // in the macOS app bundle — API fetches become cross-origin.
+                    if request_line.starts_with("OPTIONS") {
+                        use tokio::io::AsyncWriteExt;
+                        let response = "HTTP/1.1 204 No Content\r\n\
+                            Access-Control-Allow-Origin: *\r\n\
+                            Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+                            Access-Control-Allow-Headers: Content-Type\r\n\
+                            Access-Control-Max-Age: 86400\r\n\
+                            Connection: close\r\n\
+                            \r\n";
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        return;
+                    }
+
                     // Route WASM binaries (need async write_all for large payloads)
                     let wasm_binary = if request_line.contains("/wasm-web/presence_web_bg.wasm") {
                         Some(WASM_WEB_BIN)
@@ -2384,6 +2400,7 @@ pub fn spawn_web_gateway(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
                              Content-Length: {}\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
                              Connection: close\r\n\
                              \r\n\
                              {}",
@@ -2667,6 +2684,7 @@ pub fn spawn_web_gateway(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
                              Content-Length: {}\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
                              Cache-Control: no-cache\r\n\
                              Connection: close\r\n\
                              \r\n\
