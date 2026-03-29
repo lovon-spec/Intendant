@@ -15,7 +15,24 @@
 
 set -euo pipefail
 
-PROFILE="${1:-release}"
+BUNDLE_ID="com.intendant.app"
+RESET_PERMS=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --reset-permissions) RESET_PERMS=true ;;
+    esac
+done
+
+# Filter out flags to get positional args
+PROFILE="release"
+for arg in "$@"; do
+    case "$arg" in
+        --*) ;;
+        *) PROFILE="$arg" ;;
+    esac
+done
+
 if [ "$PROFILE" = "debug" ]; then
     BINARY="target/debug/intendant"
     RUNTIME="target/debug/intendant-runtime"
@@ -86,9 +103,19 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
+if [ "$RESET_PERMS" = true ]; then
+    echo "Resetting TCC permissions for $BUNDLE_ID..."
+    tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
+    tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
+    tccutil reset Microphone "$BUNDLE_ID" 2>/dev/null || true
+    tccutil reset Camera "$BUNDLE_ID" 2>/dev/null || true
+    echo "Permissions reset — macOS will re-prompt on next launch."
+fi
+
 echo "✅ Built: $APP"
 echo ""
 echo "Launch:"
 echo "  open target/Intendant.app"
 echo ""
-echo "On first screen capture, macOS will prompt for Screen Recording permission."
+echo "If permissions seem stuck, rebuild with --reset-permissions:"
+echo "  ./scripts/bundle-macos.sh --reset-permissions"
