@@ -171,6 +171,7 @@ export class PresenceWeb {
     set_on_session_changed(f: Function): void;
     set_on_state_snapshot(f: Function): void;
     set_on_term(f: Function): void;
+    set_on_tool_response(f: Function): void;
     set_on_voice_audio(f: Function): void;
     set_on_voice_interrupted(f: Function): void;
     set_on_voice_ready(f: Function): void;
@@ -323,6 +324,7 @@ export interface InitOutput {
     readonly presenceweb_set_on_session_changed: (a: number, b: any) => void;
     readonly presenceweb_set_on_state_snapshot: (a: number, b: any) => void;
     readonly presenceweb_set_on_term: (a: number, b: any) => void;
+    readonly presenceweb_set_on_tool_response: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_audio: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_interrupted: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_ready: (a: number, b: any) => void;

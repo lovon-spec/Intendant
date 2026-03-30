@@ -3196,6 +3196,10 @@ async function main() {
     app.send_text_passive(text);
   });
 
+  app.set_on_tool_response((call, result) => {
+    app.send_voice_tool_response(call, result);
+  });
+
   app.set_on_inject_voice_image((base64Data, label) => {
     // Cap at logical resolution (not Retina) before injecting into voice model.
     // The stored HQ frames are already at logical res after our fix, but guard

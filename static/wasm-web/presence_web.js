@@ -542,6 +542,12 @@ export class PresenceWeb {
     /**
      * @param {Function} f
      */
+    set_on_tool_response(f) {
+        wasm.presenceweb_set_on_tool_response(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
     set_on_voice_audio(f) {
         wasm.presenceweb_set_on_voice_audio(this.__wbg_ptr, f);
     }

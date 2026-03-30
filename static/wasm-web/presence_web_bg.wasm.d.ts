@@ -59,6 +59,7 @@ export const presenceweb_set_on_server_state: (a: number, b: any) => void;
 export const presenceweb_set_on_session_changed: (a: number, b: any) => void;
 export const presenceweb_set_on_state_snapshot: (a: number, b: any) => void;
 export const presenceweb_set_on_term: (a: number, b: any) => void;
+export const presenceweb_set_on_tool_response: (a: number, b: any) => void;
 export const presenceweb_set_on_voice_audio: (a: number, b: any) => void;
 export const presenceweb_set_on_voice_interrupted: (a: number, b: any) => void;
 export const presenceweb_set_on_voice_ready: (a: number, b: any) => void;

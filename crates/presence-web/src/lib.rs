@@ -60,6 +60,9 @@ pub struct PresenceWeb {
     active_provider: RefCell<String>, // "gemini" or "openai" or ""
     pending_tool_requests:
         Rc<RefCell<std::collections::HashMap<String, js_sys::Function>>>,
+    /// Pending voice tool calls waiting for async_query_result from server.
+    /// Maps async query ID → original JsValue tool call (for send_voice_tool_response).
+    pending_async_calls: Rc<RefCell<std::collections::HashMap<String, JsValue>>>,
     tool_request_counter: RefCell<u32>,
     dashboard: RefCell<app_state::AppState>,
 }
@@ -91,6 +94,7 @@ impl PresenceWeb {
             presence,
             active_provider: RefCell::new(String::new()),
             pending_tool_requests: pending,
+            pending_async_calls: Rc::new(RefCell::new(std::collections::HashMap::new())),
             tool_request_counter: RefCell::new(0),
             dashboard: RefCell::new(app_state::AppState::new()),
         }
@@ -159,6 +163,11 @@ impl PresenceWeb {
     }
 
     #[wasm_bindgen]
+    pub fn set_on_tool_response(&self, f: Function) {
+        *self.callbacks.on_tool_response.borrow_mut() = Some(f);
+    }
+
+    #[wasm_bindgen]
     pub fn set_on_inject_voice_image(&self, f: Function) {
         *self.callbacks.on_inject_voice_image.borrow_mut() = Some(f);
     }
@@ -203,12 +212,14 @@ impl PresenceWeb {
     #[wasm_bindgen]
     pub fn connect_server(&self, url: &str) {
         let pending = self.pending_tool_requests.clone();
+        let pending_async = self.pending_async_calls.clone();
         let presence = self.presence.clone();
 
         // Create the message handler
         let handler: Rc<RefCell<Box<dyn FnMut(serde_json::Value)>>> = Rc::new(RefCell::new({
             let cb = self.callbacks.clone();
             let pending = pending;
+            let pending_async = pending_async;
             let presence = presence;
             let last_session_id: RefCell<Option<String>> = RefCell::new(None);
             Box::new(move |msg: serde_json::Value| {
@@ -288,7 +299,7 @@ impl PresenceWeb {
                         }
                     }
                     Some("async_query_result") => {
-                        // Async query result from server — inject into voice model
+                        let req_id = msg["id"].as_str().unwrap_or("");
                         let tool = msg["tool"].as_str().unwrap_or("query");
                         let result_text = msg["result"].as_str().unwrap_or("");
                         let truncated = if result_text.len() > 2000 {
@@ -298,8 +309,8 @@ impl PresenceWeb {
                         };
 
                         // If images are included (e.g. from inspect_frame), inject them
-                        // into the voice model via send_frame (uses client_content with
-                        // turn_complete: false, so it won't interrupt).
+                        // into the voice model via send_frame before the tool response
+                        // so the model sees the image in the same context.
                         if let Some(images) = msg["images"].as_array() {
                             for (i, img) in images.iter().enumerate() {
                                 if let Some(data) = img["data"].as_str() {
@@ -309,12 +320,19 @@ impl PresenceWeb {
                             }
                         }
 
-                        // Inject tool result text passively (turn_complete: false)
-                        // to avoid interrupting the model's current response.
-                        // Using turn_complete: true crashes Gemini with code 1008
-                        // when the model is mid-response.
-                        let text = format!("[System: {} result] {}", tool, truncated);
-                        cb.invoke_inject_voice_text_passive(&text);
+                        // Resolve the pending tool call with a proper tool_response.
+                        // This replaces the old placeholder approach — the model was
+                        // ignoring passively injected results because it had already
+                        // moved past the tool call turn.
+                        let pending_call = pending_async.borrow_mut().remove(req_id);
+                        if let Some(original_call) = pending_call {
+                            let result = serde_json::json!({"result": truncated});
+                            cb.invoke_tool_response(&original_call, &to_js(&result));
+                        } else {
+                            // Fallback: no pending call (e.g. fire-and-forget query)
+                            let text = format!("[System: {} result] {}", tool, truncated);
+                            cb.invoke_inject_voice_text_passive(&text);
+                        }
                     }
                     _ => {
                         // Event messages (have "event" field)
@@ -700,17 +718,19 @@ impl PresenceWeb {
                 self.send_voice_tool_response(call, to_js(&result));
             }
             PresenceAction::NeedsIO { tool_name, args } => {
-                // Respond immediately with placeholder — don't block voice model
-                let result = serde_json::json!({
-                    "result": format!("{} is being retrieved. In the meantime, use the live video frames you are already receiving to answer the user.", tool_name)
-                });
-                self.send_voice_tool_response(call, to_js(&result));
-
-                // Fire async query to server — result arrives as async_query_result
+                // Don't send a placeholder — hold the tool_response until the
+                // server returns the real result. The model waits (audio is
+                // buffered by the WebSocket, not lost). This ensures the model
+                // processes the actual data in the same turn.
                 let mut counter = self.tool_request_counter.borrow_mut();
                 *counter += 1;
                 let id = format!("aq_{}", *counter);
                 drop(counter);
+
+                // Store the pending call so async_query_result can resolve it
+                self.pending_async_calls
+                    .borrow_mut()
+                    .insert(id.clone(), call.clone());
 
                 self.server.borrow().send_async_query(&id, tool_name, args);
             }

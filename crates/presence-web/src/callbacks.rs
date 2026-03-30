@@ -40,6 +40,9 @@ pub struct Callbacks {
     /// Inject system text passively (turn_complete: false) so it doesn't interrupt
     /// the model's current response. Used for tool results arriving mid-response.
     pub on_inject_voice_text_passive: RefCell<Option<Function>>,
+    /// Send a proper tool_response for a deferred async query result.
+    /// Called with (original_call: JsValue, result: JsValue).
+    pub on_tool_response: RefCell<Option<Function>>,
     /// Inject an image into the active voice model (for inspect_frame results).
     /// Called with (base64_data: string, label: string).
     pub on_inject_voice_image: RefCell<Option<Function>>,
@@ -141,6 +144,12 @@ impl Callbacks {
     pub fn invoke_inject_voice_text_passive(&self, text: &str) {
         if let Some(ref f) = *self.on_inject_voice_text_passive.borrow() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
+        }
+    }
+
+    pub fn invoke_tool_response(&self, call: &JsValue, result: &JsValue) {
+        if let Some(ref f) = *self.on_tool_response.borrow() {
+            let _ = f.call2(&JsValue::NULL, call, result);
         }
     }
 
