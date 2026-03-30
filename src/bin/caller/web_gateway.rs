@@ -26,16 +26,8 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
             let api_key = std::env::var("OPENAI_API_KEY")
                 .map_err(|_| "OPENAI_API_KEY not set on server".to_string())?;
             let body = serde_json::json!({
-                "session": {
-                    "type": "realtime",
-                    "model": model,
-                    "modalities": ["audio", "text"],
-                    "voice": "alloy",
-                },
-                "expires_after": {
-                    "anchor": "created_at",
-                    "seconds": 600,
-                }
+                "model": model,
+                "voice": "alloy",
             });
             let resp = reqwest::Client::new()
                 .post("https://api.openai.com/v1/realtime/client_secrets")
@@ -53,11 +45,19 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
                 .json()
                 .await
                 .map_err(|e| format!("OpenAI parse failed: {}", e))?;
-            let token = data["value"]
+            // Response may have token at top level or nested under client_secret
+            let token = data["client_secret"]["value"]
                 .as_str()
-                .ok_or("No 'value' in OpenAI response")?;
-            let expires_at = data["expires_at"].as_i64().unwrap_or(0);
-            Ok(serde_json::json!({ "token": token, "expires_at": expires_at }).to_string())
+                .or_else(|| data["value"].as_str())
+                .ok_or_else(|| format!("No token in OpenAI response: {}", data))?;
+            let expires_at = data["client_secret"]["expires_at"]
+                .as_i64()
+                .or_else(|| data["expires_at"].as_i64())
+                .unwrap_or(0);
+            Ok(serde_json::json!({
+                "client_secret": { "value": token },
+                "expires_at": expires_at
+            }).to_string())
         }
         "gemini" => {
             let api_key = std::env::var("GEMINI_API_KEY")
