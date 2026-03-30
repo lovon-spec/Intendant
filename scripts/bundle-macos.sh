@@ -74,13 +74,56 @@ swiftc -O -o "$MACOS/Intendant" macos-app/main.swift \
 cp "$BINARY" "$MACOS/intendant-bin"
 cp "$RUNTIME" "$MACOS/intendant-runtime"
 
-# Code-sign the app bundle with a stable ad-hoc identity. This preserves
-# TCC permissions (Screen Recording, Accessibility) across recompiles.
-# Without signing, every recompile changes the binary hash and macOS
-# silently invalidates TCC grants — even though System Settings still
-# shows the app as "allowed".
+# Code-sign with a stable local identity so TCC permissions survive recompiles.
+# Without this, every recompile changes the binary hash and macOS silently
+# invalidates Screen Recording / Accessibility grants.
+SIGN_IDENTITY="Intendant Dev"
+if ! security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
+    echo "Creating local code signing certificate '$SIGN_IDENTITY'..."
+    # Generate a self-signed code signing certificate in the login keychain.
+    # Valid for 10 years, no Apple Developer account needed.
+    CERT_DIR=$(mktemp -d)
+    cat > "$CERT_DIR/cert.conf" << 'CERTCONF'
+[req]
+distinguished_name = req_dn
+x509_extensions = codesign
+prompt = no
+[req_dn]
+CN = Intendant Dev
+[codesign]
+keyUsage = digitalSignature
+extendedKeyUsage = codeSigning
+CERTCONF
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+        -days 3650 -config "$CERT_DIR/cert.conf" 2>/dev/null
+    openssl pkcs12 -export -out "$CERT_DIR/cert.p12" \
+        -inkey "$CERT_DIR/key.pem" -in "$CERT_DIR/cert.pem" \
+        -passout pass: 2>/dev/null
+    security import "$CERT_DIR/cert.p12" -k ~/Library/Keychains/login.keychain-db \
+        -T /usr/bin/codesign -P "" 2>/dev/null || \
+    security import "$CERT_DIR/cert.p12" -k ~/Library/Keychains/login.keychain \
+        -T /usr/bin/codesign -P "" 2>/dev/null || true
+    # Trust the certificate for code signing
+    security add-trusted-cert -d -r trustRoot \
+        -p codeSign -k ~/Library/Keychains/login.keychain-db \
+        "$CERT_DIR/cert.pem" 2>/dev/null || \
+    security add-trusted-cert -d -r trustRoot \
+        -p codeSign -k ~/Library/Keychains/login.keychain \
+        "$CERT_DIR/cert.pem" 2>/dev/null || true
+    rm -rf "$CERT_DIR"
+    echo "Certificate created. You may see a Keychain prompt — enter your login password."
+fi
+
 echo "Signing app bundle..."
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+if security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP" 2>/dev/null
+    echo "Signed with '$SIGN_IDENTITY' (TCC grants will persist across recompiles)"
+else
+    echo "Warning: '$SIGN_IDENTITY' certificate not found, falling back to ad-hoc signing"
+    echo "TCC permissions may be invalidated on each recompile"
+    codesign --force --deep --sign - "$APP" 2>/dev/null || true
+fi
 
 # Copy app icon
 if [ -f "macos-app/AppIcon.icns" ]; then
