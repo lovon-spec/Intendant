@@ -688,12 +688,22 @@ pub async fn handle_tool_query(
             Some(ToolQueryResult::text(format!("Message injected: {}", msg)))
         }
         "inspect_frame" => {
-            let reg = frame_registry?;
+            let reg = match frame_registry {
+                Some(r) => r,
+                None => return Some(ToolQueryResult::text(
+                    "Frame registry not available. No display frames have been captured yet.".to_string()
+                )),
+            };
             let reg = reg.read().await;
             let frame_id = args["frame_id"].as_str();
             let fid = match frame_id {
                 Some(id) => id.to_string(),
-                None => reg.latest(None)?.to_string(),
+                None => match reg.latest(None) {
+                    Some(id) => id.to_string(),
+                    None => return Some(ToolQueryResult::text(
+                        "No frames available yet. Start video streaming or wait for display frames to arrive.".to_string()
+                    )),
+                },
             };
             if let Some(meta) = reg.get(&fid) {
                 // Read HQ image and return alongside metadata
@@ -720,7 +730,12 @@ pub async fn handle_tool_query(
             }
         }
         "inspect_frames" => {
-            let reg = frame_registry?;
+            let reg = match frame_registry {
+                Some(r) => r,
+                None => return Some(ToolQueryResult::text(
+                    "Frame registry not available. No display frames have been captured yet.".to_string()
+                )),
+            };
             let reg = reg.read().await;
             let query = args["query"].as_str().unwrap_or("");
             let count = args["count"].as_u64().unwrap_or(10) as usize;
