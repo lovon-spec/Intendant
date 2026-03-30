@@ -243,6 +243,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         process.standardOutput = logHandle ?? FileHandle.nullDevice
         process.standardError = logHandle ?? FileHandle.nullDevice
 
+        // Pre-check macOS permissions by running screencapture and cliclick once.
+        // This triggers the system permission dialogs at launch rather than failing
+        // silently during a CU task minutes later.
+        DispatchQueue.global(qos: .utility).async {
+            let tmp = NSTemporaryDirectory() + "intendant_perm_check.png"
+            let sc = Process()
+            sc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            sc.arguments = ["-x", tmp]
+            sc.standardOutput = FileHandle.nullDevice
+            sc.standardError = FileHandle.nullDevice
+            try? sc.run()
+            sc.waitUntilExit()
+            try? FileManager.default.removeItem(atPath: tmp)
+
+            // cliclick: trigger Accessibility prompt by moving mouse 0 pixels
+            let cliclick = env["PATH"]?.split(separator: ":").compactMap { dir -> String? in
+                let p = "\(dir)/cliclick"
+                return FileManager.default.fileExists(atPath: p) ? p : nil
+            }.first
+            if let path = cliclick {
+                let cl = Process()
+                cl.executableURL = URL(fileURLWithPath: path)
+                cl.arguments = ["m:+0,+0"]
+                cl.standardOutput = FileHandle.nullDevice
+                cl.standardError = FileHandle.nullDevice
+                try? cl.run()
+                cl.waitUntilExit()
+            }
+        }
+
         do {
             try process.run()
             backendProcess = process

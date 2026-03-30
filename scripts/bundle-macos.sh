@@ -119,11 +119,34 @@ PLIST
 
 if [ "$RESET_PERMS" = true ]; then
     echo "Resetting TCC permissions for $BUNDLE_ID..."
-    tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
-    tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
-    tccutil reset Microphone "$BUNDLE_ID" 2>/dev/null || true
-    tccutil reset Camera "$BUNDLE_ID" 2>/dev/null || true
-    echo "Permissions reset — macOS will re-prompt on next launch."
+    echo ""
+    echo "Which permissions to reset?"
+    echo "  1) Screen Recording only (most common fix)"
+    echo "  2) All permissions (Screen Recording + Accessibility + Mic + Camera)"
+    echo "  3) Cancel"
+    printf "Choice [1]: "
+    read -r choice
+    choice="${choice:-1}"
+    case "$choice" in
+        1)
+            tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
+            echo "Screen Recording permission reset."
+            ;;
+        2)
+            tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
+            tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
+            tccutil reset Microphone "$BUNDLE_ID" 2>/dev/null || true
+            tccutil reset Camera "$BUNDLE_ID" 2>/dev/null || true
+            echo "All permissions reset."
+            ;;
+        3|*)
+            echo "Skipped."
+            ;;
+    esac
+    echo ""
+    echo "After launching, check System Settings > Privacy & Security and ensure"
+    echo "Intendant is toggled ON for: Screen Recording, Accessibility."
+    echo "macOS may not prompt automatically — you may need to toggle manually."
 fi
 
 echo "✅ Built: $APP"
