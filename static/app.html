@@ -3025,18 +3025,37 @@ function stopVideo() {
 }
 
 // ── Voice Connection ──
-function connectVoice() {
+async function connectVoice() {
   if (!app || voiceConnecting || !isActiveBrowser) return;
-  const apiKey = localStorage.getItem(getStorageKey());
-  if (!apiKey) { showFirstRunDialog(); return; }
-  voiceConnecting = true;
-  if (!audioCtx) audioCtx = new AudioContext();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   const model = (gatewayConfig && gatewayConfig.model) || null;
   const inputRate = (gatewayConfig && gatewayConfig.input_sample_rate) || null;
+
+  let token;
+  if (provider === 'openai') {
+    // OpenAI: fetch ephemeral client secret from server (uses OPENAI_API_KEY server-side)
+    showVoiceStatus('Requesting session token...');
+    try {
+      const resp = await fetch('/session', { method: 'POST' });
+      const data = await resp.json();
+      if (data.error) { showVoiceStatus('Token error: ' + data.error, true); return; }
+      token = data.client_secret?.value || data.client_secret;
+      if (!token) { showVoiceStatus('No client_secret in response', true); return; }
+    } catch (e) {
+      showVoiceStatus('Failed to get session token', true);
+      return;
+    }
+  } else {
+    // Gemini: use API key from localStorage
+    token = localStorage.getItem(getStorageKey());
+    if (!token) { showFirstRunDialog(); return; }
+  }
+
+  voiceConnecting = true;
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
   showVoiceStatus('Connecting...');
-  app.connect_voice(provider, apiKey, model, inputRate);
+  app.connect_voice(provider, token, model, inputRate);
   voiceConnecting = false;
 }
 
