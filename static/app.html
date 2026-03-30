@@ -2777,6 +2777,7 @@ let frameCounter = 0;
 const FRAME_STREAM = 'cam0';
 const LIVE_RES = 768;  // 768x768 for live model
 const VIDEO_FPS = 1;
+let lastLiveFrameLen = 0; // For frame dedup — skip if JPEG size barely changed
 
 // ── Audio Helpers ──
 function downsample(buffer, fromRate, toRate) {
@@ -2987,6 +2988,13 @@ async function startVideo() {
     ctx.drawImage(videoEl, sx, sy, side, side, 0, 0, LIVE_RES, LIVE_RES);
     const liveJpeg = canvas.toDataURL('image/jpeg', 0.8);
     const liveB64 = liveJpeg.split(',')[1];
+
+    // Skip duplicate frames — if JPEG size barely changed, screen is static
+    const sizeDelta = Math.abs(liveB64.length - lastLiveFrameLen) / (lastLiveFrameLen || 1);
+    if (sizeDelta < 0.02 && lastLiveFrameLen > 0) {
+      return; // <2% size change — skip both live and HQ
+    }
+    lastLiveFrameLen = liveB64.length;
 
     // Send live-res frame to voice model (frame ID annotation is bundled in)
     app.send_frame(liveB64, frameId);
@@ -3984,6 +3992,13 @@ class DisplaySlot {
       ctx.drawImage(srcCanvas, 0, 0, lw, lh);
       const liveJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.8);
       const liveB64 = liveJpeg.split(',')[1];
+      // Skip duplicate frames — if JPEG size barely changed, screen is static
+      const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
+      if (sizeDelta < 0.02 && this._lastFrameLen > 0) {
+        return; // <2% size change — skip both live and HQ
+      }
+      this._lastFrameLen = liveB64.length;
+
       app.send_frame(liveB64, frameId);
       // HQ: logical resolution (not Retina 2x)
       const dpr = window.devicePixelRatio || 1;

@@ -138,6 +138,10 @@ impl OpenAIProvider {
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
                 "tools": openai_tools,
+                "truncation": {
+                    "type": "retention_ratio",
+                    "retention_ratio": 0.8
+                }
             }
         });
         msg.to_string()
