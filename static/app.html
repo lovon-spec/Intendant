@@ -3037,17 +3037,18 @@ async function startVideo() {
     const liveJpeg = canvas.toDataURL('image/jpeg', 0.8);
     const liveB64 = liveJpeg.split(',')[1];
 
-    // Skip duplicate frames — if JPEG size barely changed, screen is static
+    // Skip duplicate frames for voice model — if JPEG size barely changed, screen is static.
+    // Still send HQ to server for archival regardless.
     const sizeDelta = Math.abs(liveB64.length - lastLiveFrameLen) / (lastLiveFrameLen || 1);
-    if (sizeDelta < 0.02 && lastLiveFrameLen > 0) {
-      return; // <2% size change — skip both live and HQ
+    const frameDup = sizeDelta < 0.02 && lastLiveFrameLen > 0;
+    if (!frameDup) {
+      lastLiveFrameLen = liveB64.length;
+      app.send_frame(liveB64, frameId);
+    } else {
+      try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
     }
-    lastLiveFrameLen = liveB64.length;
 
-    // Send live-res frame to voice model (frame ID annotation is bundled in)
-    app.send_frame(liveB64, frameId);
-
-    // Send HQ frame (logical resolution) to server for archival
+    // Send HQ frame (logical resolution) to server for archival (always)
     const camMax = 1920;
     const camScale = Math.min(1, camMax / Math.max(vw, vh));
     canvas.width = Math.round(vw * camScale);
@@ -4040,15 +4041,16 @@ class DisplaySlot {
       ctx.drawImage(srcCanvas, 0, 0, lw, lh);
       const liveJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.8);
       const liveB64 = liveJpeg.split(',')[1];
-      // Skip duplicate frames — if JPEG size barely changed, screen is static
+      // Skip duplicate frames for voice model — still send HQ to server for archival
       const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
-      if (sizeDelta < 0.02 && this._lastFrameLen > 0) {
-        return; // <2% size change — skip both live and HQ
+      const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
+      if (!frameDup) {
+        this._lastFrameLen = liveB64.length;
+        app.send_frame(liveB64, frameId);
+      } else {
+        try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
       }
-      this._lastFrameLen = liveB64.length;
-
-      app.send_frame(liveB64, frameId);
-      // HQ: logical resolution (not Retina 2x)
+      // HQ: logical resolution (not Retina 2x) — always sent for archival
       const dpr = window.devicePixelRatio || 1;
       this._streamCanvas.width = Math.round(sw / dpr);
       this._streamCanvas.height = Math.round(sh / dpr);
