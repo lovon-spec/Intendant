@@ -3756,13 +3756,13 @@ function updateTickerFrames() {
   flashEl(el);
 }
 
-function toggleTicker() {
+window.toggleTicker = function() {
   tickerExpanded = !tickerExpanded;
   document.getElementById('ticker-chevron').innerHTML = tickerExpanded ? '&#x25BE;' : '&#x25B8;';
   document.getElementById('ticker-collapsed').classList.toggle('hidden', tickerExpanded);
   document.getElementById('ticker-expanded').classList.toggle('hidden', !tickerExpanded);
   document.getElementById('ticker-expanded').style.display = tickerExpanded ? 'flex' : '';
-}
+};
 
 function renderUsageTab(c) {
   const cardsEl = document.getElementById('usage-cards');
