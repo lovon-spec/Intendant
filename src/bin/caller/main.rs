@@ -4097,7 +4097,7 @@ async fn try_cu_first(
     };
 
     let proj = Project::from_root(project_root.to_path_buf()).ok()?;
-    let cu_provider = match provider::select_cu_provider(&proj.config.computer_use) {
+    let mut cu_provider = match provider::select_cu_provider(&proj.config.computer_use) {
         Ok(p) => {
             if !p.cu_enabled() {
                 slog(session_log, |l| {
@@ -4109,6 +4109,27 @@ async fn try_cu_first(
         }
         Err(_) => return None,
     };
+
+    // Override cu_display with the actual display dimensions. The default
+    // from select_cu_provider is sized for virtual displays (e.g. 768x1024).
+    // On macOS or when targeting the user's real display, the actual resolution
+    // may differ (e.g. 1512x949), causing coordinate mismatches.
+    if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
+        let display_id = std::env::var("DISPLAY")
+            .ok()
+            .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
+            .unwrap_or(0);
+        let (w, h) = query_display_resolution(display_id);
+        if w > 0 && h > 0 {
+            slog(session_log, |l| {
+                l.info(&format!(
+                    "CU display override: {}x{} (actual user display)",
+                    w, h
+                ))
+            });
+            cu_provider.set_cu_display((w, h));
+        }
+    }
 
     slog(session_log, |l| {
         l.info(&format!(

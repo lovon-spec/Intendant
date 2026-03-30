@@ -148,6 +148,11 @@ pub trait ChatProvider: Send + Sync {
         None
     }
 
+    /// Override display dimensions for CU. Used when the actual display size
+    /// differs from the default (e.g. user's real display vs virtual display).
+    fn set_cu_display(&mut self, _dims: (u32, u32)) {}
+
+
     /// Return tool definitions when native tool calling is enabled.
     #[allow(dead_code)]
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -655,6 +660,10 @@ impl ChatProvider for OpenAIProvider {
 
     fn cu_display(&self) -> Option<(u32, u32)> {
         self.cu_display
+    }
+
+    fn set_cu_display(&mut self, dims: (u32, u32)) {
+        self.cu_display = Some(dims);
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -1354,6 +1363,10 @@ impl ChatProvider for AnthropicProvider {
         self.cu_display
     }
 
+    fn set_cu_display(&mut self, dims: (u32, u32)) {
+        self.cu_display = Some(dims);
+    }
+
     fn tools(&self) -> Vec<ToolDefinition> {
         if self.use_tools {
             self.custom_tools.clone().unwrap_or_else(|| crate::tools::all_tools())
@@ -2007,6 +2020,10 @@ impl ChatProvider for GeminiProvider {
 
     fn cu_display(&self) -> Option<(u32, u32)> {
         self.cu_display
+    }
+
+    fn set_cu_display(&mut self, dims: (u32, u32)) {
+        self.cu_display = Some(dims);
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
