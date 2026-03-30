@@ -3883,6 +3883,7 @@ class DisplaySlot {
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
         <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">&#x1F5D1; Delete</button>
+        <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0);margin-left:auto"></span>
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}">
         <div class="vnc-auth-overlay" id="ds-auth-${displayId}" style="display:none">
@@ -3903,6 +3904,7 @@ class DisplaySlot {
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
     this.releaseBtn = this.el.querySelector(`#ds-release-${displayId}`);
     this.streamBtn = this.el.querySelector(`#ds-stream-${displayId}`);
+    this.frameIdEl = this.el.querySelector(`#ds-frame-${displayId}`);
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
     this.authOverlay = this.el.querySelector(`#ds-auth-${displayId}`);
     this.authUserInput = this.el.querySelector(`#ds-auth-user-${displayId}`);
@@ -4022,6 +4024,7 @@ class DisplaySlot {
     this.streaming = true;
     this.streamBtn.classList.add('active');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
+    this.frameIdEl.style.display = '';
     const streamName = 'display_' + this.displayId;
     const ctx = this._streamCanvas.getContext('2d');
     this._streamIntervalId = setInterval(() => {
@@ -4047,7 +4050,11 @@ class DisplaySlot {
       if (!frameDup) {
         this._lastFrameLen = liveB64.length;
         app.send_frame(liveB64, frameId);
+        this.frameIdEl.textContent = frameId.split('-').pop();
+        this.frameIdEl.style.color = 'var(--overlay0)';
       } else {
+        this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
+        this.frameIdEl.style.color = 'var(--yellow)';
         try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
       }
       // HQ: logical resolution (not Retina 2x) — always sent for archival
@@ -4065,6 +4072,8 @@ class DisplaySlot {
     if (this._streamIntervalId) { clearInterval(this._streamIntervalId); this._streamIntervalId = null; }
     this.streamBtn.classList.remove('active');
     this.streamBtn.innerHTML = '&#x1F441; Stream';
+    this.frameIdEl.style.display = 'none';
+    this.frameIdEl.textContent = '';
   }
   toggleRecording() {
     if (!app) return;
