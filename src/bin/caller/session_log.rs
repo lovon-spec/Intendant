@@ -94,8 +94,9 @@ pub struct SessionSummary {
     pub duration_secs: f64,
     pub voice_provider: Option<String>,
     pub voice_model: Option<String>,
-    pub voice_turns: usize,
+    pub voice_connections: usize,
     pub voice_reconnects: usize,
+    pub model_turns: usize,
     pub cu_tasks: Vec<CuTaskSummary>,
     pub frames_sent: usize,
     pub errors: Vec<ErrorSummary>,
@@ -575,15 +576,38 @@ impl SessionLog {
                 });
             }
         }
+        // Count model turns from the rebuilt transcript
+        let model_turns = self
+            .dir
+            .join("transcript.jsonl")
+            .exists()
+            .then(|| {
+                fs::read_to_string(self.dir.join("transcript.jsonl"))
+                    .ok()
+                    .map(|c| {
+                        c.lines()
+                            .filter(|l| {
+                                serde_json::from_str::<serde_json::Value>(l)
+                                    .ok()
+                                    .and_then(|v| v["role"].as_str().map(|r| r == "model"))
+                                    .unwrap_or(false)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+
         let summary = SessionSummary {
             duration_secs: duration,
             voice_provider: self.summary_builder.voice_provider.clone(),
             voice_model: self.summary_builder.voice_model.clone(),
-            voice_turns: self.summary_builder.voice_connections,
+            voice_connections: self.summary_builder.voice_connections,
             voice_reconnects: self
                 .summary_builder
                 .voice_connections
                 .saturating_sub(1),
+            model_turns,
             cu_tasks,
             frames_sent: self.summary_builder.frames_sent,
             errors: self.summary_builder.errors.clone(),
@@ -753,7 +777,7 @@ impl SessionLog {
     pub fn voice_diagnostic(&mut self, kind: &str, detail: &str) {
         match kind {
             "audio_send" => self.voice_audio(kind, detail),
-            "video_send" => self.voice_frame(kind, detail),
+            "video_send" | "frame_skip" => self.voice_frame(kind, detail),
             "gemini_usage" => self.voice_usage(kind, detail),
             "error" | "gemini_close" | "action_drop" => self.voice_error(kind, detail),
             _ => self.voice_protocol(kind, detail),
@@ -828,6 +852,19 @@ impl SessionLog {
                         }
                         model_buf.push_str(text);
                     }
+                }
+                "tool_request" => {
+                    let tool = val["data"]["tool"].as_str().unwrap_or("unknown");
+                    let args = val["data"]["args"]
+                        .as_object()
+                        .map(|o| serde_json::to_string(o).unwrap_or_default())
+                        .unwrap_or_default();
+                    entries.push(TranscriptEntry {
+                        ts,
+                        role: "model".to_string(),
+                        text: format!("[tool:{}] {}", tool, args),
+                        tools_called: Some(vec![tool.to_string()]),
+                    });
                 }
                 "voice_protocol" => {
                     let detail = val["data"]["detail"].as_str().unwrap_or("");
