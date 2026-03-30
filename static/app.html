@@ -132,6 +132,28 @@ html, body {
   background: var(--surface1);
 }
 
+/* ── Token Ticker ── */
+.ticker-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+  font-size: 11px;
+  color: var(--subtext0);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.ticker-collapsed { display: flex; gap: 8px; align-items: center; white-space: nowrap; }
+.ticker-expanded { flex-direction: column; gap: 2px; font-size: 11px; }
+.ticker-expanded > div { white-space: nowrap; }
+.tk-sep { color: var(--surface2); }
+.ticker-chevron { color: var(--overlay0); font-size: 10px; line-height: 1; margin-top: 2px; flex-shrink: 0; }
+@keyframes tk-flash { 0% { color: var(--green); } 100% { color: inherit; } }
+.tk-flash { animation: tk-flash 0.8s ease-out; }
+
 /* ── Tab Bar ── */
 .tab-bar {
   display: flex;
@@ -2130,6 +2152,24 @@ html, body {
     <span class="active-badge is-active" id="sb-active-badge" title="This browser controls voice/video — click to switch to passive (observe-only) mode">Active</span>
   </div>
 
+  <!-- Token Ticker -->
+  <div class="ticker-bar" id="ticker-bar" onclick="toggleTicker()">
+    <span class="ticker-chevron" id="ticker-chevron">&#x25B8;</span>
+    <div class="ticker-collapsed" id="ticker-collapsed">
+      <span id="tk-tokens">-- tok</span>
+      <span class="tk-sep">|</span>
+      <span id="tk-cached">-- cached</span>
+      <span class="tk-sep">|</span>
+      <span id="tk-frames">0 frames</span>
+      <span class="tk-sep">|</span>
+      <span id="tk-cost">$0</span>
+    </div>
+    <div class="ticker-expanded hidden" id="ticker-expanded">
+      <div id="tk-detail-1">--</div>
+      <div id="tk-detail-2">--</div>
+    </div>
+  </div>
+
   <!-- Tab Bar -->
   <nav class="tab-bar">
     <button class="tab-btn active" data-tab="activity">Activity<span class="badge" id="badge-activity"></span></button>
@@ -2826,6 +2866,9 @@ const FRAME_STREAM = 'cam0';
 const LIVE_RES = 768;  // 768x768 for live model
 const VIDEO_FPS = 1;
 let lastLiveFrameLen = 0; // For frame dedup — skip if JPEG size barely changed
+let tickerFramesSent = 0;
+let tickerFramesDropped = 0;
+let tickerExpanded = false;
 
 // ── Audio Helpers ──
 function downsample(buffer, fromRate, toRate) {
@@ -3044,9 +3087,12 @@ async function startVideo() {
     if (!frameDup) {
       lastLiveFrameLen = liveB64.length;
       app.send_frame(liveB64, frameId);
+      tickerFramesSent++;
     } else {
+      tickerFramesDropped++;
       try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
     }
+    updateTickerFrames();
 
     // Send HQ frame (logical resolution) to server for archival (always)
     const camMax = 1920;
@@ -3494,7 +3540,7 @@ function processCommands(cmds) {
       case 'show_follow_up': showPanel('followup-panel'); break;
       case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
-      case 'update_usage': renderUsageTab(c); break;
+      case 'update_usage': renderUsageTab(c); updateTickerFromUsage(c); break;
       case 'add_display': addDisplaySlot(c.display_id, c.vnc_port, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
@@ -3659,6 +3705,65 @@ function hideBadge(tab) {
 }
 
 // ── Usage Tab Rendering ──
+// ── Token Ticker ──
+function fmtK(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return String(n);
+}
+
+function flashEl(el) {
+  el.classList.remove('tk-flash');
+  void el.offsetWidth; // force reflow
+  el.classList.add('tk-flash');
+}
+
+function updateTickerFromUsage(c) {
+  if (!c.live_json) return;
+  let d;
+  try { d = typeof c.live_json === 'string' ? JSON.parse(c.live_json) : c.live_json; } catch { return; }
+  if (!d || !d.total_tokens) return;
+
+  const total = d.total_tokens || 0;
+  const input = d.input_tokens || d.prompt_tokens || 0;
+  const output = d.output_tokens || d.completion_tokens || 0;
+  const cached = d.cached_tokens || 0;
+  const thinking = d.thinking_tokens || 0;
+  const cacheHit = input > 0 ? Math.round(cached / input * 100) : 0;
+
+  // Cost estimate (gpt-realtime-1.5: $5/1M in, $20/1M out, cached $2.50/1M)
+  const cost = (input * 5 + output * 20 + cached * 2.5) / 1000000;
+
+  // Collapsed view
+  const tkTokens = document.getElementById('tk-tokens');
+  const tkCached = document.getElementById('tk-cached');
+  const tkCost = document.getElementById('tk-cost');
+  tkTokens.textContent = fmtK(total) + ' tok';
+  tkCached.textContent = fmtK(cached) + ' cached (' + cacheHit + '%)';
+  tkCost.textContent = '$' + cost.toFixed(3);
+  flashEl(tkTokens);
+
+  // Expanded view
+  document.getElementById('tk-detail-1').textContent =
+    'Live: ' + total.toLocaleString() + ' tokens (in: ' + input.toLocaleString() + ' | out: ' + output.toLocaleString() + ' | think: ' + thinking.toLocaleString() + ')';
+  document.getElementById('tk-detail-2').textContent =
+    'Cache: ' + cached.toLocaleString() + ' / ' + input.toLocaleString() + ' input = ' + cacheHit + '% hit | Frames: ' + tickerFramesSent + ' sent, ' + tickerFramesDropped + ' dropped | Cost: $' + cost.toFixed(3);
+}
+
+function updateTickerFrames() {
+  const el = document.getElementById('tk-frames');
+  el.textContent = tickerFramesSent + ' frames' + (tickerFramesDropped > 0 ? ' (' + tickerFramesDropped + ' dropped)' : '');
+  flashEl(el);
+}
+
+function toggleTicker() {
+  tickerExpanded = !tickerExpanded;
+  document.getElementById('ticker-chevron').innerHTML = tickerExpanded ? '&#x25BE;' : '&#x25B8;';
+  document.getElementById('ticker-collapsed').classList.toggle('hidden', tickerExpanded);
+  document.getElementById('ticker-expanded').classList.toggle('hidden', !tickerExpanded);
+  document.getElementById('ticker-expanded').style.display = tickerExpanded ? 'flex' : '';
+}
+
 function renderUsageTab(c) {
   const cardsEl = document.getElementById('usage-cards');
   const emptyEl = document.getElementById('usage-empty');
@@ -4052,11 +4157,14 @@ class DisplaySlot {
         app.send_frame(liveB64, frameId);
         this.frameIdEl.textContent = frameId.split('-').pop();
         this.frameIdEl.style.color = 'var(--overlay0)';
+        tickerFramesSent++;
       } else {
         this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
         this.frameIdEl.style.color = 'var(--yellow)';
+        tickerFramesDropped++;
         try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
       }
+      updateTickerFrames();
       // HQ: logical resolution (not Retina 2x) — always sent for archival
       const dpr = window.devicePixelRatio || 1;
       this._streamCanvas.width = Math.round(sw / dpr);
