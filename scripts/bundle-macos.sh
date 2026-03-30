@@ -75,13 +75,14 @@ cp "$BINARY" "$MACOS/intendant-bin"
 cp "$RUNTIME" "$MACOS/intendant-runtime"
 
 # Code-sign with a stable local identity so TCC permissions survive recompiles.
-# Without this, every recompile changes the binary hash and macOS silently
-# invalidates Screen Recording / Accessibility grants.
+# Uses a dedicated keychain at ~/.intendant/signing.keychain-db (works over SSH,
+# no Apple Developer account needed, no GUI Keychain prompts).
 SIGN_IDENTITY="Intendant Dev"
-if ! security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
+SIGN_KEYCHAIN="$HOME/.intendant/signing.keychain-db"
+SIGN_KEYCHAIN_PASS="intendant-dev"
+
+if ! security find-identity -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
     echo "Creating local code signing certificate '$SIGN_IDENTITY'..."
-    # Generate a self-signed code signing certificate in the login keychain.
-    # Valid for 10 years, no Apple Developer account needed.
     CERT_DIR=$(mktemp -d)
     cat > "$CERT_DIR/cert.conf" << 'CERTCONF'
 [req]
@@ -99,25 +100,23 @@ CERTCONF
         -days 3650 -config "$CERT_DIR/cert.conf" 2>/dev/null
     openssl pkcs12 -export -out "$CERT_DIR/cert.p12" \
         -inkey "$CERT_DIR/key.pem" -in "$CERT_DIR/cert.pem" \
-        -passout pass: 2>/dev/null
-    security import "$CERT_DIR/cert.p12" -k ~/Library/Keychains/login.keychain-db \
-        -T /usr/bin/codesign -P "" 2>/dev/null || \
-    security import "$CERT_DIR/cert.p12" -k ~/Library/Keychains/login.keychain \
-        -T /usr/bin/codesign -P "" 2>/dev/null || true
-    # Trust the certificate for code signing
-    security add-trusted-cert -d -r trustRoot \
-        -p codeSign -k ~/Library/Keychains/login.keychain-db \
-        "$CERT_DIR/cert.pem" 2>/dev/null || \
-    security add-trusted-cert -d -r trustRoot \
-        -p codeSign -k ~/Library/Keychains/login.keychain \
-        "$CERT_DIR/cert.pem" 2>/dev/null || true
+        -passout pass:intendant 2>/dev/null
+    mkdir -p "$(dirname "$SIGN_KEYCHAIN")"
+    security create-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN" 2>/dev/null || true
+    security unlock-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN"
+    security set-keychain-settings "$SIGN_KEYCHAIN"
+    security import "$CERT_DIR/cert.p12" -k "$SIGN_KEYCHAIN" -P "intendant" -T /usr/bin/codesign -A
+    security set-key-partition-list -S apple-tool:,apple: -s -k "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN" >/dev/null 2>&1
+    # Add to search list so codesign can find it
+    security list-keychains -d user -s "$SIGN_KEYCHAIN" $(security list-keychains -d user | tr -d '"')
     rm -rf "$CERT_DIR"
-    echo "Certificate created. You may see a Keychain prompt — enter your login password."
+    echo "Certificate created in $SIGN_KEYCHAIN"
 fi
 
 echo "Signing app bundle..."
-if security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
-    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP" 2>/dev/null
+security unlock-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN" 2>/dev/null
+if security find-identity -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
+    codesign --force --deep --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$APP"
     echo "Signed with '$SIGN_IDENTITY' (TCC grants will persist across recompiles)"
 else
     echo "Warning: '$SIGN_IDENTITY' certificate not found, falling back to ad-hoc signing"
