@@ -220,7 +220,7 @@ impl OpenAIProvider {
                         },
                         {
                             "type": "input_image",
-                            "image": format!("data:image/jpeg;base64,{}", base64_jpeg)
+                            "image_url": format!("data:image/jpeg;base64,{}", base64_jpeg)
                         }
                     ]
                 }

@@ -3024,6 +3024,12 @@ function stopVideo() {
   document.getElementById('videoFrameId').textContent = '--';
 }
 
+function hasVoiceCredentials() {
+  const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+  if (provider === 'openai') return true; // server mints token from OPENAI_API_KEY
+  return !!localStorage.getItem(getStorageKey());
+}
+
 // ── Voice Connection ──
 async function connectVoice() {
   if (!app || voiceConnecting || !isActiveBrowser) return;
@@ -3283,10 +3289,8 @@ async function main() {
     if (conversationContext) storedConversationCtx = conversationContext;
     showVoiceStatus('Active');
     setTimeout(hideVoiceStatus, 3000);
-    // Only auto-connect voice if an API key is already stored —
-    // handover should succeed even without voice (display-only mode).
-    const apiKey = localStorage.getItem(getStorageKey());
-    if (apiKey) {
+    // Only auto-connect voice if credentials are available.
+    if (hasVoiceCredentials()) {
       connectVoice();
       if (handoverContext) {
         const waitForVoice = () => {
@@ -3330,8 +3334,7 @@ async function main() {
   document.getElementById('micBtn').addEventListener('click', async () => {
     if (!isActiveBrowser) return;
     if (!modelConnected) {
-      const apiKey = localStorage.getItem(getStorageKey());
-      if (!apiKey) { showFirstRunDialog(); return; }
+      if (!hasVoiceCredentials()) { showFirstRunDialog(); return; }
       connectVoice();
     }
     micActive = !micActive;
