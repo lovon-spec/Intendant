@@ -2279,26 +2279,7 @@ pub fn spawn_web_gateway(
                                                         level: Some(LogLevel::Debug),
                                                         turn: None,
                                                     });
-                                                    // Route StartTask directly to task_tx (bypasses
-                                                    // TUI phase gating which drops tasks when busy).
-                                                    if let ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target } = ctrl {
-                                                        if let Some(ref tx) = task_tx_inbound {
-                                                            let envelope = presence_core::TaskEnvelope {
-                                                                task: task.clone(),
-                                                                force_direct: orchestrate == Some(false),
-                                                                context_hints: vec![],
-                                                                reference_frame_ids,
-                                                                display_target,
-                                                            };
-                                                            let _ = tx.send(envelope).await;
-                                                        } else {
-                                                            bus_inbound.send(AppEvent::ControlCommand(
-                                                                ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target }
-                                                            ));
-                                                        }
-                                                    } else {
-                                                        bus_inbound.send(AppEvent::ControlCommand(ctrl));
-                                                    }
+                                                    bus_inbound.send(AppEvent::ControlCommand(ctrl));
                                                 }
                                                 Err(e) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {

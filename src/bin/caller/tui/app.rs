@@ -1170,51 +1170,38 @@ impl App {
                 }
             }
             ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target } => {
-                // StartTask is an explicit command — bypass server-side presence
-                // and dispatch directly to the worker task channel. This avoids
-                // the server-side presence re-processing decisions the browser
-                // live model (or control socket / MCP) already made.
-                eprintln!("[TUI StartTask] task={}, ref_frames={:?}, phase={:?}, task_tx={}",
-                    &task[..task.len().min(60)], reference_frame_ids, self.current_phase, self.task_tx.is_some());
-                if self.current_phase == Phase::WaitingFollowUp
-                    || self.current_phase == Phase::Done
-                    || self.current_phase == Phase::Idle
-                {
-                    let dispatched = if let Some(ref tx) = self.task_tx {
-                        let envelope = presence_core::TaskEnvelope {
-                            task: task.clone(),
-                            force_direct: orchestrate == Some(false),
-                            context_hints: vec![],
-                            reference_frame_ids,
-                            display_target,
-                        };
-                        tx.try_send(envelope).is_ok()
-                    } else if let Some(ref tx) = self.follow_up_tx {
-                        tx.try_send(task.clone()).is_ok()
-                    } else {
-                        false
+                // Dispatch unconditionally — no phase gating. The task_rx loop
+                // (main.rs) processes tasks sequentially, and the mpsc channel
+                // (capacity=4) buffers incoming tasks. The TUI tracks phase for
+                // display purposes only, not dispatch authority.
+                let dispatched = if let Some(ref tx) = self.task_tx {
+                    let envelope = presence_core::TaskEnvelope {
+                        task: task.clone(),
+                        force_direct: orchestrate == Some(false),
+                        context_hints: vec![],
+                        reference_frame_ids,
+                        display_target,
                     };
-                    if dispatched {
-                        self.follow_up_textarea = None;
-                        self.mode = AppMode::Normal;
-                        self.current_phase = Phase::Thinking;
-                        self.round += 1;
-                        self.log_sourced(LogLevel::Info, format!("[runtime] Task dispatched: {}", truncate_str(&task, 80)), LogSource::Live, None);
-                    } else {
-                        self.log(
-                            LogLevel::Warn,
-                            format!(
-                                "start_task: dispatch failed (phase: {:?}, task_tx: {}, follow_up_tx: {})",
-                                self.current_phase,
-                                self.task_tx.is_some(),
-                                self.follow_up_tx.is_some(),
-                            ),
-                        );
-                    }
+                    tx.try_send(envelope).is_ok()
+                } else if let Some(ref tx) = self.follow_up_tx {
+                    tx.try_send(task.clone()).is_ok()
+                } else {
+                    false
+                };
+                if dispatched {
+                    self.follow_up_textarea = None;
+                    self.mode = AppMode::Normal;
+                    self.current_phase = Phase::Thinking;
+                    self.round += 1;
+                    self.log_sourced(LogLevel::Info, format!("[runtime] Task dispatched: {}", truncate_str(&task, 80)), LogSource::Live, None);
                 } else {
                     self.log(
                         LogLevel::Warn,
-                        format!("start_task: agent is busy (phase: {:?})", self.current_phase),
+                        format!(
+                            "start_task: dispatch failed (task_tx: {}, follow_up_tx: {})",
+                            self.task_tx.is_some(),
+                            self.follow_up_tx.is_some(),
+                        ),
                     );
                 }
             }
