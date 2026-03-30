@@ -403,7 +403,8 @@ async fn move_stream(
 // ─── macOS backend (BlackHole + SwitchAudioSource) ──────────────────────────
 //
 // Requires:
-// - BlackHole 2ch AND BlackHole 16ch: https://github.com/ExistentialAudio/BlackHole
+// - BlackHole 2ch AND BlackHole 16ch: brew install --cask blackhole-2ch blackhole-16ch
+//   (reboot required after install)
 // - SwitchAudioSource: brew install switchaudio-osx
 // - sox (with CoreAudio support): brew install sox
 //
@@ -436,8 +437,9 @@ impl PlatformBridge {
             CallerError::Agent(
                 "BlackHole virtual audio driver not found. Two instances are required \
                  for bidirectional audio: BlackHole 2ch (virtual mic) and \
-                 BlackHole 16ch (app capture). Install from: \
-                 https://github.com/ExistentialAudio/BlackHole"
+                 BlackHole 16ch (app capture). Install with: \
+                 brew install --cask blackhole-2ch blackhole-16ch \
+                 (reboot required after install)"
                     .into(),
             )
         })?;

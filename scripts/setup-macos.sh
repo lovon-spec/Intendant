@@ -5,7 +5,6 @@
 # Usage:
 #   ./setup-macos.sh             # Install all dependencies and build
 #   ./setup-macos.sh --check     # Check what's installed without changing anything
-#   ./setup-macos.sh --all       # Also install audio routing deps (BlackHole, sox, etc.)
 #
 set -euo pipefail
 
@@ -16,14 +15,13 @@ ok()   { echo "   ✓ $1"; }
 miss() { echo "   ✗ $1 — $2"; }
 
 ACTION="install"
-INCLUDE_AUDIO_ROUTING=false
+NEEDS_REBOOT=false
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --check) ACTION="check"; shift ;;
-            --all)   INCLUDE_AUDIO_ROUTING=true; shift ;;
-            -h|--help) sed -n '3,9p' "$0" | sed 's/^# \?//'; exit 0 ;;
+            -h|--help) sed -n '3,8p' "$0" | sed 's/^# \?//'; exit 0 ;;
             *)       die "unknown option: $1" ;;
         esac
     done
@@ -38,7 +36,6 @@ check_macos() {
 has_cmd() { command -v "$1" &>/dev/null; }
 
 has_brew_pkg() { brew list --formula "$1" &>/dev/null 2>&1; }
-has_brew_cask() { brew list --cask "$1" &>/dev/null 2>&1; }
 
 # Check if a BlackHole device exists in the audio system
 has_blackhole() {
@@ -103,13 +100,13 @@ check_computer_use() {
     $all_ok
 }
 
-# Audio routing deps: only needed for spawn_live_audio (voice calls through
-# third-party apps like WhatsApp). Browser-based voice works without these.
+# Audio routing deps: needed for spawn_live_audio (voice calls through apps).
+# Browser-based voice (Gemini Live / OpenAI Realtime via WebRTC) works without these.
 check_audio() {
     local all_ok=true
 
     echo ""
-    echo "Audio routing dependencies (optional — for voice calls through apps):"
+    echo "Audio routing dependencies:"
 
     if has_cmd SwitchAudioSource; then
         ok "SwitchAudioSource"
@@ -128,14 +125,14 @@ check_audio() {
     if has_blackhole "BlackHole 2ch"; then
         ok "BlackHole 2ch"
     else
-        miss "BlackHole 2ch" "see below"
+        miss "BlackHole 2ch" "brew install --cask blackhole-2ch (reboot required)"
         all_ok=false
     fi
 
     if has_blackhole "BlackHole 16ch"; then
         ok "BlackHole 16ch"
     else
-        miss "BlackHole 16ch" "see below"
+        miss "BlackHole 16ch" "brew install --cask blackhole-16ch (reboot required)"
         all_ok=false
     fi
 
@@ -201,8 +198,6 @@ brew_install() {
 }
 
 install_blackhole() {
-    # BlackHole requires a kernel extension — can't be silently installed.
-    # Check if already present; if not, give clear instructions.
     local need_2ch=false need_16ch=false
 
     has_blackhole "BlackHole 2ch"  || need_2ch=true
@@ -210,34 +205,10 @@ install_blackhole() {
 
     if ! $need_2ch && ! $need_16ch; then return; fi
 
-    echo ""
-    echo "════════════════════════════════════════════════════════"
-    echo "  BlackHole Virtual Audio Driver"
-    echo "════════════════════════════════════════════════════════"
-    echo ""
-    echo "  BlackHole requires a system extension and cannot be"
-    echo "  installed fully automatically. You need both:"
-    echo ""
-    $need_2ch  && echo "    - BlackHole 2ch  (virtual mic for model output)"
-    $need_16ch && echo "    - BlackHole 16ch (virtual speaker for app capture)"
-    echo ""
-    echo "  Install from: https://github.com/ExistentialAudio/BlackHole"
-    echo ""
-    echo "  After installing, you may need to:"
-    echo "    1. Allow the system extension in System Settings → Privacy & Security"
-    echo "    2. Restart your Mac"
-    echo ""
+    $need_2ch  && { info "installing BlackHole 2ch (virtual mic)...";  brew install --cask blackhole-2ch;  }
+    $need_16ch && { info "installing BlackHole 16ch (app capture)..."; brew install --cask blackhole-16ch; }
 
-    # Try Homebrew cask as a convenience — this may or may not work
-    # depending on BlackHole's current Homebrew status
-    local try_brew
-    read -rp "  Attempt install via Homebrew? (y/n) [y]: " try_brew
-    try_brew="${try_brew:-y}"
-
-    if [[ "$try_brew" == "y" ]]; then
-        $need_2ch  && (brew install --cask blackhole-2ch  2>/dev/null && ok "BlackHole 2ch installed" || warn "Homebrew cask not available — install manually")
-        $need_16ch && (brew install --cask blackhole-16ch 2>/dev/null && ok "BlackHole 16ch installed" || warn "Homebrew cask not available — install manually")
-    fi
+    NEEDS_REBOOT=true
 }
 
 build_intendant() {
@@ -264,13 +235,10 @@ run_check() {
     echo "════════════════════════════════════════════════════════"
 
     local core_ok cu_ok audio_ok rec_ok
-    check_core       && core_ok=true  || core_ok=false
-    check_computer_use && cu_ok=true  || cu_ok=false
-
-    if $INCLUDE_AUDIO_ROUTING; then
-        check_audio    && audio_ok=true || audio_ok=false
-    fi
-    check_recording && rec_ok=true  || rec_ok=false
+    check_core         && core_ok=true  || core_ok=false
+    check_computer_use && cu_ok=true    || cu_ok=false
+    check_audio        && audio_ok=true || audio_ok=false
+    check_recording    && rec_ok=true   || rec_ok=false
 
     check_wasm
 
@@ -283,20 +251,16 @@ run_check() {
         echo "  Core + computer-use: missing dependencies"
     fi
 
-    if ${rec_ok:-false}; then
+    if $audio_ok; then
+        echo "  Audio routing: ready"
+    else
+        echo "  Audio routing: missing dependencies"
+    fi
+
+    if $rec_ok; then
         echo "  Recording: ready"
     else
         echo "  Recording: missing dependencies"
-    fi
-
-    if $INCLUDE_AUDIO_ROUTING; then
-        if ${audio_ok:-false}; then
-            echo "  Audio routing: ready"
-        else
-            echo "  Audio routing: missing dependencies"
-        fi
-    else
-        echo "  Audio routing: skipped (use --all to include)"
     fi
 
     echo ""
@@ -317,13 +281,11 @@ run_install() {
     info "installing Homebrew packages..."
     brew_install cliclick
     brew_install ffmpeg
+    brew_install switchaudio-osx
+    brew_install sox
 
-    # Phase 3: Audio routing (optional — only for voice calls through apps)
-    if $INCLUDE_AUDIO_ROUTING; then
-        brew_install switchaudio-osx
-        brew_install sox
-        install_blackhole
-    fi
+    # Phase 3: Audio routing (BlackHole virtual audio driver)
+    install_blackhole
 
     # Phase 4: Build
     echo ""
@@ -342,19 +304,21 @@ run_install() {
     echo "  Setup complete!"
     echo "════════════════════════════════════════════════════════"
     echo ""
+
+    if $NEEDS_REBOOT; then
+        warn "Reboot required before audio routing will work."
+        echo "   BlackHole was installed but needs a reboot to register"
+        echo "   its virtual audio devices. You may also need to allow"
+        echo "   the system extension in System Settings → Privacy & Security."
+        echo ""
+    fi
+
     echo "  Run intendant (recommended — proper macOS permissions):"
     echo "    open target/Intendant.app --args --web"
     echo ""
     echo "  Or without app bundle:"
     echo "    ./target/release/intendant \"your task\""
     echo ""
-
-    if ! $INCLUDE_AUDIO_ROUTING; then
-        echo "  Audio routing (voice calls through apps) was skipped."
-        echo "  Browser-based voice works without it."
-        echo "  Run with --all to install audio routing deps later."
-        echo ""
-    fi
 }
 
 main() {
