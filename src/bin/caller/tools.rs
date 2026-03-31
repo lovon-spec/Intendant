@@ -403,6 +403,10 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "display_id": {
                     "type": "integer",
                     "description": "X11 display number where the target app is running."
+                },
+                "initial_message": {
+                    "type": "string",
+                    "description": "Optional text sent to the model after setup, before audio bridging. Use to prompt the model when the other party is already on the line (e.g. 'The call has connected, introduce yourself.'). When omitted, the model waits for the other party to speak first."
                 }
             },
             "required": ["id", "provider", "playbook", "response_schema"],

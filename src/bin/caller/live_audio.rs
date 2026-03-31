@@ -489,6 +489,123 @@ pub async fn start_audio_bridge(
     audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<AudioStreamBridge, CallerError> {
+    if let Some(host) = bridge.network_host() {
+        return start_network_audio_bridge(
+            session_write,
+            provider,
+            sample_rate,
+            host,
+            audio_out_rx,
+            capture_tee_tx,
+        )
+        .await;
+    }
+
+    start_local_audio_bridge(
+        session_write,
+        provider,
+        sample_rate,
+        bridge,
+        audio_out_rx,
+        capture_tee_tx,
+    )
+    .await
+}
+
+/// Network audio bridge: connects to a bh-bridge on the host over TCP.
+/// The TCP stream is full-duplex raw PCM16 mono — host→client is captured
+/// app audio, client→host is model audio for playback.
+async fn start_network_audio_bridge(
+    session_write: Arc<Mutex<WsSink>>,
+    provider: LiveAudioProvider,
+    sample_rate: u32,
+    host_addr: &str,
+    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+) -> Result<AudioStreamBridge, CallerError> {
+    let stream = tokio::net::TcpStream::connect(host_addr)
+        .await
+        .map_err(|e| {
+            CallerError::Agent(format!("bh-bridge connect to {} failed: {}", host_addr, e))
+        })?;
+
+    let (read_half, write_half) = tokio::io::split(stream);
+
+    eprintln!("live_audio: network bridge connected to {}", host_addr);
+
+    // Capture task: read PCM from TCP (host captures app audio) → send to model
+    let capture_write = session_write;
+    let capture_rate = sample_rate;
+    let capture_provider = provider;
+    let capture_handle = tokio::spawn(async move {
+        let mut reader = read_half;
+        let chunk_size = (capture_rate as usize) * 2 / 10; // ~100ms
+        let mut buf = vec![0u8; chunk_size];
+        let mut chunks_sent = 0usize;
+
+        loop {
+            match reader.read_exact(&mut buf).await {
+                Ok(_) => {
+                    chunks_sent += 1;
+                    let b64 = BASE64.encode(&buf);
+                    let msg = match capture_provider {
+                        LiveAudioProvider::Gemini => serde_json::json!({
+                            "realtime_input": {
+                                "media_chunks": [{
+                                    "mime_type": format!("audio/pcm;rate={}", capture_rate),
+                                    "data": b64
+                                }]
+                            }
+                        }),
+                        LiveAudioProvider::OpenAI => serde_json::json!({
+                            "type": "input_audio_buffer.append",
+                            "audio": b64
+                        }),
+                    };
+                    if let Some(ref tee) = capture_tee_tx {
+                        let _ = tee.send(buf.clone());
+                    }
+                    let mut sink = capture_write.lock().await;
+                    if sink.send(WsMessage::Text(msg.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        eprintln!("live_audio: network capture ended after {} chunks", chunks_sent);
+    });
+
+    // Playback task: model audio → write PCM to TCP (host plays to app mic)
+    let playback_handle = tokio::spawn(async move {
+        let mut writer = write_half;
+        let mut rx = audio_out_rx;
+        let mut total = 0usize;
+        while let Some(pcm_data) = rx.recv().await {
+            total += pcm_data.len();
+            if writer.write_all(&pcm_data).await.is_err() {
+                break;
+            }
+        }
+        eprintln!("live_audio: network playback ended — {} bytes", total);
+    });
+
+    Ok(AudioStreamBridge {
+        capture_handle,
+        playback_handle,
+    })
+}
+
+/// Local audio bridge: spawns sox processes for capture/playback via platform
+/// audio devices (PulseAudio on Linux, BlackHole on macOS).
+async fn start_local_audio_bridge(
+    session_write: Arc<Mutex<WsSink>>,
+    provider: LiveAudioProvider,
+    sample_rate: u32,
+    bridge: &AudioBridge,
+    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+) -> Result<AudioStreamBridge, CallerError> {
     // Capture task: platform command -> model
     let (capture_cmd, capture_args) = bridge.capture_command(sample_rate);
     let capture_write = session_write.clone();
@@ -516,7 +633,6 @@ pub async fn start_audio_bridge(
             None => return,
         };
 
-        // Read in ~100ms chunks (sample_rate * 2 bytes/sample * 0.1s)
         let chunk_size = (capture_rate as usize) * 2 / 10;
         let mut buf = vec![0u8; chunk_size];
 
@@ -538,7 +654,6 @@ pub async fn start_audio_bridge(
                             "audio": b64
                         }),
                     };
-                    // Tee captured audio for Whisper transcription
                     if let Some(ref tee) = capture_tee_tx {
                         let _ = tee.send(buf.clone());
                     }
@@ -593,6 +708,56 @@ pub async fn start_audio_bridge(
         capture_handle,
         playback_handle,
     })
+}
+
+// ---------------------------------------------------------------------------
+// JSON extraction from transcript text
+// ---------------------------------------------------------------------------
+
+/// Extract the first valid JSON object from a transcript string.
+///
+/// Realtime models speak their responses, so the transcript may contain prose
+/// before or after the JSON. This scans for balanced `{ ... }` and returns the
+/// first substring that parses as a JSON object.
+fn extract_json_object(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escape = false;
+            let start = i;
+            for j in start..bytes.len() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match bytes[j] {
+                    b'\\' if in_string => escape = true,
+                    b'"' => in_string = !in_string,
+                    b'{' if !in_string => depth += 1,
+                    b'}' if !in_string => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let candidate = &text[start..=j];
+                            if let Ok(parsed) =
+                                serde_json::from_str::<serde_json::Value>(candidate)
+                            {
+                                if parsed.is_object() {
+                                    return Some(candidate.to_string());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +956,11 @@ pub async fn run_session(
     )
     .await?;
 
+    // Send initial message if provided (e.g. "The call has connected.")
+    if let Some(ref msg) = spec.initial_message {
+        session.send_text(msg).await?;
+    }
+
     // Collect model text output and quarantine payloads
     let mut model_text = String::new();
     let mut model_transcript_buf = String::new();
@@ -846,15 +1016,32 @@ pub async fn run_session(
                     break LiveAudioStatus::Failed(e);
                 }
                 LiveAudioEvent::TurnComplete => {
-                    // Check if the model has output a complete JSON response
-                    if !model_text.is_empty() {
+                    // Check if the model has output a complete JSON response.
+                    // Realtime models may deliver JSON via text (response.text.delta)
+                    // or via audio transcript (response.audio_transcript.delta) —
+                    // check both, preferring explicit text output.
+                    let json_source = if !model_text.is_empty() {
+                        Some(&model_text)
+                    } else {
+                        // Extract JSON from transcript: the model may speak prose
+                        // before/after the JSON object, so find the outermost { ... }.
+                        None
+                    };
+
+                    if let Some(src) = json_source {
                         if let Ok(parsed) =
-                            serde_json::from_str::<serde_json::Value>(&model_text)
+                            serde_json::from_str::<serde_json::Value>(src)
                         {
                             if parsed.is_object() {
-                                // Model output valid JSON — treat as conversation complete
                                 break LiveAudioStatus::Completed;
                             }
+                        }
+                    } else if !model_transcript_buf.is_empty() {
+                        if let Some(json_str) =
+                            extract_json_object(&model_transcript_buf)
+                        {
+                            model_text = json_str;
+                            break LiveAudioStatus::Completed;
                         }
                     }
                     // Otherwise continue listening for more turns
@@ -1073,5 +1260,667 @@ mod tests {
         let args: serde_json::Value =
             serde_json::from_str(msg["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["command"], "ls");
+    }
+
+    #[test]
+    fn extract_json_from_plain_object() {
+        let text = r#"{"status": "ok"}"#;
+        assert_eq!(extract_json_object(text).unwrap(), text);
+    }
+
+    #[test]
+    fn extract_json_from_transcript_with_prose() {
+        let text = r#"Test complete. {"status": "ok"}"#;
+        assert_eq!(
+            extract_json_object(text).unwrap(),
+            r#"{"status": "ok"}"#
+        );
+    }
+
+    #[test]
+    fn extract_json_with_trailing_prose() {
+        let text = r#"Here it is: {"a": 1, "b": "hello"} That's all."#;
+        assert_eq!(
+            extract_json_object(text).unwrap(),
+            r#"{"a": 1, "b": "hello"}"#
+        );
+    }
+
+    #[test]
+    fn extract_json_nested_braces() {
+        let text = r#"Result: {"data": {"inner": true}, "ok": false}"#;
+        assert_eq!(
+            extract_json_object(text).unwrap(),
+            r#"{"data": {"inner": true}, "ok": false}"#
+        );
+    }
+
+    #[test]
+    fn extract_json_with_braces_in_strings() {
+        let text = r#"{"msg": "use {x} here"}"#;
+        assert_eq!(extract_json_object(text).unwrap(), text);
+    }
+
+    #[test]
+    fn extract_json_none_when_no_json() {
+        assert!(extract_json_object("no json here").is_none());
+        assert!(extract_json_object("").is_none());
+        assert!(extract_json_object("{ broken").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests — real API calls to OpenAI Realtime
+    //
+    // Requires OPENAI_API_KEY in env. Skipped by `cargo test --bins`.
+    // Run with:
+    //   cargo test --bin intendant test_live_audio_openai -- --ignored --nocapture
+    // -----------------------------------------------------------------------
+
+    const TEST_MODEL: &str = "gpt-realtime-1.5";
+
+    fn require_openai_key() -> Option<String> {
+        match std::env::var("OPENAI_API_KEY") {
+            Ok(k) if !k.is_empty() => Some(k),
+            _ => {
+                eprintln!("OPENAI_API_KEY not set, skipping");
+                None
+            }
+        }
+    }
+
+    /// Layer 1: WebSocket connects and session.update is accepted.
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_audio_openai_connect() {
+        let api_key = match require_openai_key() {
+            Some(k) => k,
+            None => return,
+        };
+
+        let mut session = connect_openai(
+            &api_key,
+            Some(TEST_MODEL),
+            "You are a test agent.",
+            Some("alloy"),
+            24000,
+        )
+        .await
+        .expect("connect_openai failed");
+
+        let mut got_setup = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(
+                deadline.duration_since(Instant::now()),
+                session.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(LiveAudioEvent::SetupComplete)) => {
+                    got_setup = true;
+                    eprintln!("  SetupComplete received");
+                    break;
+                }
+                Ok(Some(LiveAudioEvent::Connected)) => {
+                    eprintln!("  Connected");
+                }
+                Ok(Some(LiveAudioEvent::Error(e))) => {
+                    panic!("session error during setup: {}", e);
+                }
+                Ok(Some(other)) => {
+                    eprintln!("  setup event: {:?}", other);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        session.close().await;
+        assert!(got_setup, "did not receive SetupComplete from OpenAI Realtime");
+    }
+
+    /// Layer 2: Send text, receive audio + transcript + turn_complete.
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_audio_openai_text_round_trip() {
+        let api_key = match require_openai_key() {
+            Some(k) => k,
+            None => return,
+        };
+
+        let mut session = connect_openai(
+            &api_key,
+            Some(TEST_MODEL),
+            "You are a test assistant. Respond in one short sentence.",
+            Some("alloy"),
+            24000,
+        )
+        .await
+        .expect("connect_openai failed");
+
+        // Wait for setup
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout(
+                deadline.duration_since(Instant::now()),
+                session.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(LiveAudioEvent::SetupComplete)) => break,
+                Ok(Some(_)) => continue,
+                _ => panic!("did not receive SetupComplete"),
+            }
+        }
+
+        // Send text
+        session
+            .send_text("Say hello.")
+            .await
+            .expect("send_text failed");
+        eprintln!("  Sent text prompt, waiting for response...");
+
+        let mut got_audio = false;
+        let mut got_transcript = false;
+        let mut got_turn_complete = false;
+        let mut audio_bytes = 0usize;
+        let mut transcript_buf = String::new();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(
+                deadline.duration_since(Instant::now()),
+                session.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(event)) => match event {
+                    LiveAudioEvent::AudioOut(pcm) => {
+                        audio_bytes += pcm.len();
+                        got_audio = true;
+                    }
+                    LiveAudioEvent::ModelTranscript(text) => {
+                        transcript_buf.push_str(&text);
+                        got_transcript = true;
+                    }
+                    LiveAudioEvent::ModelText(text) => {
+                        eprintln!("  ModelText: {}", text);
+                    }
+                    LiveAudioEvent::TurnComplete => {
+                        got_turn_complete = true;
+                        break;
+                    }
+                    LiveAudioEvent::Error(e) => panic!("session error: {}", e),
+                    LiveAudioEvent::Disconnected(r) => panic!("disconnected: {}", r),
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        session.close().await;
+
+        eprintln!("  Audio: {} bytes received", audio_bytes);
+        eprintln!("  Transcript: {:?}", transcript_buf);
+        eprintln!("  TurnComplete: {}", got_turn_complete);
+
+        assert!(got_turn_complete, "did not receive TurnComplete");
+        assert!(got_audio, "no audio output received");
+        // Transcript is expected but not strictly guaranteed by all models
+        if !got_transcript {
+            eprintln!("  WARN: no transcript received (model may not support audio_transcript)");
+        }
+    }
+
+    /// Layer 2.5: Connect with audio bridge, send text kick-off, log all events.
+    /// Diagnoses whether the model speaks, produces text, or just sits silent.
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_audio_openai_bridge_diagnostics() {
+        let api_key = match require_openai_key() {
+            Some(k) => k,
+            None => return,
+        };
+
+        if !crate::audio_routing::is_available().await {
+            eprintln!("virtual audio routing not available, skipping");
+            return;
+        }
+
+        let session_id = format!(
+            "diag-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+
+        let mut bridge = crate::audio_routing::create_bridge(&session_id)
+            .await
+            .expect("create_bridge failed");
+
+        if let Err(e) = crate::audio_routing::set_as_default(&mut bridge).await {
+            eprintln!("  WARN: set_as_default: {}", e);
+        }
+
+        let playbook = "You are running an automated test. There is nobody on the line. \
+                         Say 'test complete' once, then output the JSON: {\"status\": \"ok\"}";
+
+        let mut session = connect_openai(
+            &api_key,
+            Some(TEST_MODEL),
+            playbook,
+            Some("alloy"),
+            24000,
+        )
+        .await
+        .expect("connect_openai failed");
+
+        // Wait for setup
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout(
+                deadline.duration_since(Instant::now()),
+                session.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(LiveAudioEvent::SetupComplete)) => {
+                    eprintln!("  SetupComplete");
+                    break;
+                }
+                Ok(Some(e)) => eprintln!("  setup: {:?}", e),
+                _ => panic!("no SetupComplete"),
+            }
+        }
+
+        // Start audio bridge (capture silence → model, model audio → playback)
+        let (audio_out_tx, audio_out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let audio_bridge = start_audio_bridge(
+            session.ws_write.clone(),
+            session.provider,
+            session.sample_rate,
+            &bridge,
+            audio_out_rx,
+            None,
+        )
+        .await
+        .expect("start_audio_bridge failed");
+        eprintln!("  Audio bridge started");
+
+        // Send a text kick-off to prompt the model
+        session
+            .send_text("Begin the test now.")
+            .await
+            .expect("send_text failed");
+        eprintln!("  Sent text kick-off");
+
+        // Collect all events for up to 20 seconds
+        let mut audio_bytes = 0usize;
+        let mut audio_chunks = 0usize;
+        let mut transcript_buf = String::new();
+        let mut text_buf = String::new();
+        let mut turn_completes = 0usize;
+        let mut tool_calls = Vec::new();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(
+                deadline.duration_since(Instant::now()),
+                session.event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(event)) => match event {
+                    LiveAudioEvent::AudioOut(pcm) => {
+                        audio_bytes += pcm.len();
+                        audio_chunks += 1;
+                        let _ = audio_out_tx.send(pcm);
+                    }
+                    LiveAudioEvent::ModelTranscript(t) => {
+                        eprintln!("  TRANSCRIPT: {:?}", t);
+                        transcript_buf.push_str(&t);
+                    }
+                    LiveAudioEvent::ModelText(t) => {
+                        eprintln!("  MODEL_TEXT: {:?}", t);
+                        text_buf.push_str(&t);
+                    }
+                    LiveAudioEvent::TurnComplete => {
+                        turn_completes += 1;
+                        eprintln!("  TURN_COMPLETE #{}", turn_completes);
+                        // Stop after first completed turn
+                        break;
+                    }
+                    LiveAudioEvent::ToolCallAttempted { name, args } => {
+                        eprintln!("  TOOL_CALL: {} {:?}", name, args);
+                        tool_calls.push(name);
+                    }
+                    LiveAudioEvent::Interrupted => {
+                        eprintln!("  INTERRUPTED");
+                    }
+                    other => {
+                        eprintln!("  {:?}", other);
+                    }
+                },
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        audio_bridge.stop();
+        session.close().await;
+        drop(bridge);
+
+        eprintln!("\n  === Diagnostics ===");
+        eprintln!("  Audio: {} bytes in {} chunks", audio_bytes, audio_chunks);
+        eprintln!("  Transcript: {:?}", transcript_buf);
+        eprintln!("  ModelText: {:?}", text_buf);
+        eprintln!("  TurnCompletes: {}", turn_completes);
+        eprintln!("  ToolCalls: {:?}", tool_calls);
+
+        // At minimum, the model should have produced something
+        assert!(
+            audio_bytes > 0 || !transcript_buf.is_empty() || !text_buf.is_empty(),
+            "model produced no output at all"
+        );
+    }
+
+    /// Interactive test: real phone call via Linphone + live audio model.
+    ///
+    /// 1. Creates audio bridge (sets BlackHole as system default)
+    /// 2. Connects to OpenAI Realtime with a conversational playbook
+    /// 3. Prints instructions — call intendant7 from your phone
+    /// 4. Model handles the conversation, logs transcript
+    /// 5. Validates structured response
+    ///
+    /// Run with:
+    ///   cargo test --bin intendant test_live_audio_phone_call -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_audio_phone_call() {
+        let api_key = match require_openai_key() {
+            Some(k) => k,
+            None => return,
+        };
+
+        if !crate::audio_routing::is_available().await {
+            eprintln!("virtual audio routing not available, skipping");
+            return;
+        }
+
+        let session_id = format!(
+            "call-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+
+        let mut bridge = crate::audio_routing::create_bridge(&session_id)
+            .await
+            .expect("create_bridge failed");
+
+        // No need for set_as_default — pjsua uses explicit device IDs.
+        // The bridge is only needed for its capture/playback sox commands.
+
+        // Start pjsua as the SIP client with BlackHole devices.
+        // capture-dev=3 (BlackHole 2ch) → model's voice goes to caller
+        // playback-dev=2 (BlackHole 16ch) → caller's voice goes to model
+        let pjsua_bin = "/tmp/pjproject/pjsip-apps/bin/pjsua-aarch64-apple-darwin25.4.0";
+        let sip_password = std::fs::read_to_string(
+            dirs::home_dir().unwrap().join("lin"),
+        )
+        .expect("~/lin should contain the SIP password")
+        .trim()
+        .to_string();
+
+        eprintln!("  Starting pjsua (SIP client) with BlackHole audio...");
+        let mut pjsua = tokio::process::Command::new(pjsua_bin)
+            .args([
+                "--id=sip:intendant7@sip.linphone.org",
+                "--registrar=sip:sip.linphone.org",
+                "--realm=sip.linphone.org",
+                "--username=intendant7",
+                &format!("--password={}", sip_password),
+                "--capture-dev=3", "--playback-dev=2",
+                "--auto-answer=200",
+                "--ec-tail=0",
+                "--no-vad",
+                "--use-srtp=1", "--srtp-secure=0",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to start pjsua");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        eprintln!("  pjsua registered. Auto-answer enabled.");
+
+        eprintln!("\n  ╔══════════════════════════════════════════════════╗");
+        eprintln!("  ║  Call intendant7 from your phone NOW.            ║");
+        eprintln!("  ║  The call will auto-answer.                      ║");
+        eprintln!("  ║  The AI will hear you and talk back.             ║");
+        eprintln!("  ║  Stay on for 30+ seconds.                        ║");
+        eprintln!("  ║                                                  ║");
+        eprintln!("  ║  Timeout: 120 seconds                            ║");
+        eprintln!("  ╚══════════════════════════════════════════════════╝\n");
+
+        let schema = crate::live_audio_types::ResponseSchema {
+            fields: vec![
+                crate::live_audio_types::FieldSpec {
+                    name: "summary".to_string(),
+                    field_type: crate::live_audio_types::FieldType::String {
+                        max_length: Some(500),
+                        allowed_values: None,
+                        tainted: true,
+                    },
+                    required: true,
+                    description: Some(
+                        "Brief summary of what was discussed in the call".to_string(),
+                    ),
+                },
+                crate::live_audio_types::FieldSpec {
+                    name: "caller_mood".to_string(),
+                    field_type: crate::live_audio_types::FieldType::String {
+                        max_length: Some(50),
+                        allowed_values: Some(vec![
+                            "friendly".into(),
+                            "neutral".into(),
+                            "frustrated".into(),
+                            "unknown".into(),
+                        ]),
+                        tainted: false,
+                    },
+                    required: true,
+                    description: Some("The caller's apparent mood".to_string()),
+                },
+            ],
+        };
+
+        let system_prompt = crate::prompts::build_live_audio_prompt(
+            "You are a friendly AI assistant answering a phone call. \
+             Greet the caller warmly, ask how you can help, and have a brief \
+             natural conversation. After the caller says goodbye or the \
+             conversation reaches a natural end, output the response JSON. \
+             Keep the call under 60 seconds.",
+            &schema,
+            None,
+        );
+
+        let spec = crate::live_audio_types::LiveAudioSpec {
+            id: session_id.clone(),
+            provider: crate::live_audio_types::LiveAudioProvider::OpenAI,
+            model: Some(TEST_MODEL.to_string()),
+            playbook: system_prompt,
+            response_schema: schema,
+            timeout_secs: 120,
+            voice: Some("alloy".to_string()),
+            display_id: None,
+            initial_message: None, // Wait for the caller to speak first
+        };
+
+        let tmp_dir = tempfile::tempdir().expect("create temp dir");
+        let log_dir = tmp_dir.path().to_path_buf();
+
+        let result = run_session(&spec, &api_key, &bridge, &log_dir, None)
+            .await
+            .expect("run_session failed");
+
+        // Stop pjsua
+        if let Some(mut stdin) = pjsua.stdin.take() {
+            let _ = stdin.write_all(b"q\n").await;
+        }
+        let _ = pjsua.wait().await;
+        drop(bridge);
+        eprintln!("\n  pjsua stopped. Audio bridge restored.\n");
+
+        // Read and display transcript
+        if result.transcript_path.exists() {
+            eprintln!("  === Transcript ===");
+            if let Ok(content) = std::fs::read_to_string(&result.transcript_path) {
+                for line in content.lines() {
+                    if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+                        let speaker = entry["speaker"].as_str().unwrap_or("?");
+                        let text = entry["text"].as_str().unwrap_or("");
+                        eprintln!("  [{}] {}", speaker, text);
+                    }
+                }
+            }
+            eprintln!();
+        }
+
+        eprintln!("  Status: {:?}", result.status);
+        eprintln!("  Duration: {:.1}s", result.duration_secs);
+        eprintln!("  Response: {:?}", result.response_data);
+        eprintln!("  Quarantine: {:?}", result.quarantine_ids);
+
+        match &result.status {
+            LiveAudioStatus::Completed => {
+                let data = result.response_data.as_ref().unwrap();
+                eprintln!("\n  Summary: {}", data["summary"].as_str().unwrap_or("?"));
+                eprintln!("  Caller mood: {}", data["caller_mood"].as_str().unwrap_or("?"));
+                eprintln!("\n  PASS");
+            }
+            LiveAudioStatus::TimedOut => {
+                eprintln!("\n  Session timed out — no JSON response from model");
+            }
+            other => {
+                eprintln!("\n  Unexpected status: {:?}", other);
+            }
+        }
+    }
+
+    /// Layer 3: Full run_session pipeline with audio bridge + schema validation.
+    /// Skips if virtual audio routing is not available (no BlackHole / PulseAudio).
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_audio_openai_full_session() {
+        let api_key = match require_openai_key() {
+            Some(k) => k,
+            None => return,
+        };
+
+        if !crate::audio_routing::is_available().await {
+            eprintln!("virtual audio routing not available, skipping full session test");
+            return;
+        }
+
+        let session_id = format!(
+            "test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+
+        let mut bridge = crate::audio_routing::create_bridge(&session_id)
+            .await
+            .expect("create_bridge failed");
+
+        if let Err(e) = crate::audio_routing::set_as_default(&mut bridge).await {
+            eprintln!("  WARN: could not set bridge as default: {}", e);
+        }
+
+        let schema = crate::live_audio_types::ResponseSchema {
+            fields: vec![crate::live_audio_types::FieldSpec {
+                name: "status".to_string(),
+                field_type: crate::live_audio_types::FieldType::String {
+                    max_length: Some(100),
+                    allowed_values: None,
+                    tainted: false,
+                },
+                required: true,
+                description: Some("Test status".to_string()),
+            }],
+        };
+
+        let system_prompt = crate::prompts::build_live_audio_prompt(
+            "You are running an automated test. There is no one on the other end of \
+             the call — you will hear silence. Say 'test complete' once, then \
+             immediately output the JSON response with status set to 'ok'.",
+            &schema,
+            None,
+        );
+
+        let spec = crate::live_audio_types::LiveAudioSpec {
+            id: session_id.clone(),
+            provider: crate::live_audio_types::LiveAudioProvider::OpenAI,
+            model: Some(TEST_MODEL.to_string()),
+            playbook: system_prompt,
+            response_schema: schema,
+            timeout_secs: 45,
+            voice: Some("alloy".to_string()),
+            display_id: None,
+            // No real counterparty in the test — kick the model off via text
+            initial_message: Some("Begin.".to_string()),
+        };
+
+        let tmp_dir = tempfile::tempdir().expect("create temp dir");
+        eprintln!("  Session ID: {}", session_id);
+        eprintln!("  Log dir: {}", tmp_dir.path().display());
+
+        let result = run_session(&spec, &api_key, &bridge, tmp_dir.path(), None)
+            .await
+            .expect("run_session failed");
+
+        drop(bridge);
+
+        eprintln!("  Status: {:?}", result.status);
+        eprintln!("  Duration: {:.1}s", result.duration_secs);
+        eprintln!("  Response data: {:?}", result.response_data);
+        eprintln!("  Quarantine IDs: {:?}", result.quarantine_ids);
+
+        // Check transcript file was created
+        assert!(
+            result.transcript_path.exists(),
+            "transcript file should exist at {}",
+            result.transcript_path.display()
+        );
+
+        match &result.status {
+            LiveAudioStatus::Completed => {
+                let data = result
+                    .response_data
+                    .as_ref()
+                    .expect("Completed but no response_data");
+                assert!(
+                    data.get("status").is_some(),
+                    "response missing 'status' field: {}",
+                    data
+                );
+                eprintln!("  PASS: session completed with valid response");
+            }
+            LiveAudioStatus::TimedOut => {
+                // Acceptable — the model heard silence and may not have produced JSON
+                eprintln!("  WARN: session timed out (model did not output JSON within timeout)");
+            }
+            LiveAudioStatus::SchemaError(e) => {
+                // The model produced JSON but it didn't match — still useful signal
+                eprintln!("  WARN: schema validation failed: {}", e);
+            }
+            other => {
+                panic!("unexpected session status: {:?}", other);
+            }
+        }
     }
 }

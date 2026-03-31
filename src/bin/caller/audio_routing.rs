@@ -21,6 +21,10 @@ pub struct AudioBridge {
     prev_default_source: Option<String>,
     /// Previous default sink, saved for restore on drop.
     prev_default_sink: Option<String>,
+    /// Remote bh-bridge host:port for network audio routing.
+    /// When set, capture/playback bypass local audio devices and connect
+    /// to a bh-bridge instance on the host over TCP.
+    network_host: Option<String>,
 }
 
 impl AudioBridge {
@@ -45,6 +49,12 @@ impl AudioBridge {
     /// Returns (program, args) for spawning a subprocess whose stdin accepts raw PCM16.
     pub fn playback_command(&self, sample_rate: u32) -> (&'static str, Vec<String>) {
         self.inner.playback_command(sample_rate)
+    }
+
+    /// If set, audio is routed over TCP to a bh-bridge on the host instead of
+    /// through local audio devices. Returns the host:port address.
+    pub fn network_host(&self) -> Option<&str> {
+        self.network_host.as_deref()
     }
 }
 
@@ -76,6 +86,40 @@ pub async fn create_bridge(session_id: &str) -> Result<AudioBridge, CallerError>
         inner,
         prev_default_source: None,
         prev_default_sink: None,
+        network_host: None,
+    })
+}
+
+/// Create an audio bridge that routes over TCP to a bh-bridge on the host.
+///
+/// The host runs `bh-bridge --port <port>` which handles BlackHole
+/// capture/playback on real hardware. The VM connects over TCP and
+/// sends/receives raw PCM. No local virtual audio devices are needed.
+pub async fn create_network_bridge(
+    session_id: &str,
+    host_addr: &str,
+) -> Result<AudioBridge, CallerError> {
+    // Verify the host is reachable
+    let addr: std::net::SocketAddr = host_addr.parse().map_err(|e| {
+        CallerError::Agent(format!("invalid bh-bridge address '{}': {}", host_addr, e))
+    })?;
+    let stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
+        CallerError::Agent(format!(
+            "cannot connect to bh-bridge at {}: {} (is bh-bridge running on the host?)",
+            host_addr, e
+        ))
+    })?;
+    drop(stream); // Just testing connectivity; the real connection is made by start_audio_bridge
+
+    let inner = PlatformBridge::create(session_id).await.unwrap_or_else(|_| {
+        // Network bridge doesn't need local audio devices
+        PlatformBridge::stub()
+    });
+    Ok(AudioBridge {
+        inner,
+        prev_default_source: None,
+        prev_default_sink: None,
+        network_host: Some(host_addr.to_string()),
     })
 }
 
@@ -107,6 +151,17 @@ struct PlatformBridge {
 
 #[cfg(target_os = "linux")]
 impl PlatformBridge {
+    fn stub() -> Self {
+        Self {
+            mic_module_id: None,
+            speaker_module_id: None,
+            mic_sink_name: String::new(),
+            speaker_sink_name: String::new(),
+            speaker_monitor_name: String::new(),
+            mic_monitor_name: String::new(),
+        }
+    }
+
     async fn is_available() -> bool {
         tokio::process::Command::new("pactl")
             .arg("info")
@@ -421,6 +476,14 @@ struct PlatformBridge {
 
 #[cfg(target_os = "macos")]
 impl PlatformBridge {
+    /// Stub bridge for network mode — no local devices needed.
+    fn stub() -> Self {
+        Self {
+            mic_device_name: String::new(),
+            speaker_device_name: String::new(),
+        }
+    }
+
     async fn is_available() -> bool {
         has_switchaudio().await && find_blackhole_devices().await.is_some()
     }
@@ -625,6 +688,7 @@ struct PlatformBridge;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl PlatformBridge {
+    fn stub() -> Self { Self }
     async fn is_available() -> bool { false }
     async fn create(_session_id: &str) -> Result<Self, CallerError> {
         Err(CallerError::Agent("virtual audio routing is not supported on this platform".into()))

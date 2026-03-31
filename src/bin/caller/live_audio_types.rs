@@ -24,6 +24,12 @@ pub struct LiveAudioSpec {
     pub voice: Option<String>,
     #[serde(default)]
     pub display_id: Option<u32>,
+    /// Optional text sent to the model after setup completes, before audio
+    /// bridging begins. Use this to prompt the model when the other party is
+    /// already on the line (e.g. "The call has connected, introduce yourself.").
+    /// When None, the model waits for audio input from the other party.
+    #[serde(default)]
+    pub initial_message: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -175,6 +181,7 @@ mod tests {
             timeout_secs: 120,
             voice: Some("Aoede".to_string()),
             display_id: Some(99),
+            initial_message: None,
         };
 
         let json = serde_json::to_string_pretty(&spec).unwrap();
