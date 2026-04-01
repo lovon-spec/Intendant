@@ -2154,27 +2154,35 @@ async fn run_agent_loop(
                             }
                         };
 
-                        // Create virtual audio bridge
-                        let mut bridge = match audio_routing::create_bridge(session_id).await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                conversation.add_tool_result(
-                                    call_id,
-                                    "spawn_live_audio",
-                                    &format!("Error creating audio bridge: {}", e),
-                                );
-                                continue;
-                            }
-                        };
+                        // Create audio bridge: prefer Vortex (guest HAL plugin),
+                        // fall back to local platform audio devices.
+                        let mut bridge =
+                            if let Ok(socket_path) = std::env::var("VORTEX_AUDIO_SOCKET") {
+                                audio_routing::create_vortex_bridge(&socket_path)
+                            } else {
+                                match audio_routing::create_bridge(session_id).await {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        conversation.add_tool_result(
+                                            call_id,
+                                            "spawn_live_audio",
+                                            &format!("Error creating audio bridge: {}", e),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
 
-                        // Set virtual devices as system defaults (global routing)
-                        if let Err(e) = audio_routing::set_as_default(&mut bridge).await {
-                            slog(&session_log, |l| {
-                                l.warn(&format!(
-                                    "Could not set audio bridge as default: {} (per-app routing may be needed)",
-                                    e
-                                ))
-                            });
+                        // Set virtual devices as system defaults (not needed for Vortex)
+                        if bridge.vortex_socket_path().is_none() {
+                            if let Err(e) = audio_routing::set_as_default(&mut bridge).await {
+                                slog(&session_log, |l| {
+                                    l.warn(&format!(
+                                        "Could not set audio bridge as default: {} (per-app routing may be needed)",
+                                        e
+                                    ))
+                                });
+                            }
                         }
 
                         slog(&session_log, |l| {

@@ -63,9 +63,39 @@ fn spawn_playback(rate: u32) -> std::io::Result<Child> {
         .spawn()
 }
 
+fn get_default(device_type: &str) -> Option<String> {
+    let output = Command::new("SwitchAudioSource")
+        .args(["-c", "-t", device_type])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn set_default(device: &str, device_type: &str) {
+    let _ = Command::new("SwitchAudioSource")
+        .args(["-s", device, "-t", device_type])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn handle_client(stream: TcpStream, rate: u32) {
     let peer = stream.peer_addr().ok();
     eprintln!("[+] Client connected: {:?}", peer);
+
+    // Save current defaults and switch to BlackHole so the VM's VirtIO
+    // audio routes through BlackHole on the host.
+    let prev_output = get_default("output");
+    let prev_input = get_default("input");
+    eprintln!("[*] Switching host audio: output -> {}, input -> {}", CAPTURE_DEVICE, PLAYBACK_DEVICE);
+    set_default(CAPTURE_DEVICE, "output");
+    set_default(PLAYBACK_DEVICE, "input");
 
     let running = Arc::new(AtomicBool::new(true));
 
@@ -144,6 +174,16 @@ fn handle_client(stream: TcpStream, rate: u32) {
     let _ = playback.kill();
     let _ = capture.wait();
     let _ = playback.wait();
+
+    // Restore original audio defaults
+    if let Some(ref dev) = prev_output {
+        eprintln!("[*] Restoring host output -> {}", dev);
+        set_default(dev, "output");
+    }
+    if let Some(ref dev) = prev_input {
+        eprintln!("[*] Restoring host input -> {}", dev);
+        set_default(dev, "input");
+    }
 
     eprintln!("[-] Client disconnected: {:?}", peer);
 }
