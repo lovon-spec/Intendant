@@ -170,36 +170,40 @@ function Invoke-GuestCommand($cmd) {
     }
 }
 
-function Ensure-GuestScript {
+function Find-LocalGuestScript {
     # $PSScriptRoot is %TEMP% (bat copies itself there), so check $PWD first
     # (the batch preamble does cd /d "%~dp0")
     foreach ($dir in @($PWD.Path, $PSScriptRoot)) {
         $candidate = Join-Path $dir "setup-lan.sh"
         if (Test-Path $candidate) { return $candidate }
     }
-
-    $url = "https://raw.githubusercontent.com/lovon-spec/intendant/main/scripts/setup-lan.sh"
-    $tempPath = Join-Path $env:TEMP "setup-lan.sh"
-    Info "setup-lan.sh not found locally — downloading from GitHub..."
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $tempPath -UseBasicParsing
-    } catch {
-        Die "failed to download setup-lan.sh: $_"
-    }
-    return $tempPath
+    return $null
 }
 
 function Copy-ScriptToGuest {
-    $scriptPath = Ensure-GuestScript
+    $scriptPath = Find-LocalGuestScript
+    $ghUrl = "https://raw.githubusercontent.com/lovon-spec/intendant/main/scripts/setup-lan.sh"
 
     if ($script:Mode -eq "wsl") {
-        $wslPath = wsl wslpath -a ($scriptPath -replace '\\', '/')
-        wsl cp $wslPath /tmp/setup-lan.sh
+        if ($scriptPath) {
+            $wslPath = wsl wslpath -a ($scriptPath -replace '\\', '/')
+            wsl cp $wslPath /tmp/setup-lan.sh
+        } else {
+            Info "setup-lan.sh not found locally — downloading in WSL..."
+            wsl curl -sfL $ghUrl -o /tmp/setup-lan.sh
+            if ($LASTEXITCODE -ne 0) { Die "failed to download setup-lan.sh" }
+        }
         wsl chmod +x /tmp/setup-lan.sh
     } else {
-        $scpPort = if ($script:SshPort -ne 22) { @("-P", $script:SshPort) } else { @() }
-        scp @scpPort $scriptPath "$($script:VmUser)@$($script:SshHost):/tmp/setup-lan.sh"
         $sshArgs = Get-SshArgs
+        if ($scriptPath) {
+            $scpPort = if ($script:SshPort -ne 22) { @("-P", $script:SshPort) } else { @() }
+            scp @scpPort $scriptPath "$($script:VmUser)@$($script:SshHost):/tmp/setup-lan.sh"
+        } else {
+            Info "setup-lan.sh not found locally — downloading on guest..."
+            ssh @sshArgs "curl -sfL '$ghUrl' -o /tmp/setup-lan.sh"
+            if ($LASTEXITCODE -ne 0) { Die "failed to download setup-lan.sh on guest" }
+        }
         ssh @sshArgs "chmod +x /tmp/setup-lan.sh"
     }
 }
