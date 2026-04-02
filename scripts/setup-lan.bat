@@ -171,8 +171,12 @@ function Invoke-GuestCommand($cmd) {
 }
 
 function Ensure-GuestScript {
-    $scriptPath = Join-Path $PSScriptRoot "setup-lan.sh"
-    if (Test-Path $scriptPath) { return $scriptPath }
+    # $PSScriptRoot is %TEMP% (bat copies itself there), so check $PWD first
+    # (the batch preamble does cd /d "%~dp0")
+    foreach ($dir in @($PWD.Path, $PSScriptRoot)) {
+        $candidate = Join-Path $dir "setup-lan.sh"
+        if (Test-Path $candidate) { return $candidate }
+    }
 
     $url = "https://raw.githubusercontent.com/lovon-spec/intendant/main/scripts/setup-lan.sh"
     $tempPath = Join-Path $env:TEMP "setup-lan.sh"
@@ -363,7 +367,7 @@ function Run-Wizard {
     Copy-ScriptToGuest
 
     Info "running setup on guest (follow the prompts there)..."
-    Invoke-GuestCommand "sudo /tmp/setup-lan.sh --port $($script:Port)"
+    Invoke-GuestCommand "sudo /tmp/setup-lan.sh --port $($script:Port) --lan-ip $hostIp"
 
     # Save config for future --recert / --remove
     Save-Config
