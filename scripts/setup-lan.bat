@@ -173,10 +173,9 @@ function Invoke-GuestCommand($cmd) {
 }
 
 function Find-LocalGuestScript {
-    # $PSScriptRoot is %TEMP% (bat copies itself there as .ps1).
     # $ScriptDir is the bat's real directory, passed via -ScriptDir from the batch preamble.
-    $dirs = @($PSScriptRoot, $PWD.Path)
-    if ($ScriptDir) { $dirs = @($ScriptDir) + $dirs }
+    # $PSScriptRoot may be %TEMP% (bat copies itself there) or empty.
+    $dirs = @($ScriptDir, $PSScriptRoot, $PWD.Path) | Where-Object { $_ }
     foreach ($dir in $dirs) {
         $candidate = Join-Path $dir "setup-lan.sh"
         if (Test-Path $candidate) { return $candidate }
