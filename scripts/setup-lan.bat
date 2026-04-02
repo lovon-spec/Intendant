@@ -8,9 +8,10 @@ if %errorlevel% neq 0 (
     powershell -Command "Start-Process cmd.exe -Verb RunAs -ArgumentList '/c cd /d \"%~dp0\" && \"%~f0\" %*'"
     exit /b
 )
-copy "%~f0" "%TEMP%\setup-lan.ps1" >nul
-powershell -ExecutionPolicy Bypass -NoProfile -File "%TEMP%\setup-lan.ps1" -ScriptDir "%~dp0" %*
-del "%TEMP%\setup-lan.ps1" >nul 2>&1
+set "PS1=%TEMP%\setup-lan-%RANDOM%%RANDOM%.ps1"
+copy /y "%~f0" "%PS1%" >nul || (echo Failed to copy script to temp & pause & exit /b 1)
+powershell -ExecutionPolicy Bypass -NoProfile -File "%PS1%" -ScriptDir "%~dp0" %*
+del "%PS1%" >nul 2>&1
 pause
 exit /b
 #>
