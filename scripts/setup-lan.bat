@@ -183,34 +183,36 @@ function Find-LocalGuestScript {
     return $null
 }
 
-function Copy-ScriptToGuest {
+function Copy-AndRunOnGuest($setupArgs) {
     # Temporarily allow stderr from ssh/scp without crashing (host key warnings, etc.)
     $ErrorActionPreference = "Continue"
 
     $scriptPath = Find-LocalGuestScript
     $ghUrl = "https://raw.githubusercontent.com/lovon-spec/intendant/main/scripts/setup-lan.sh"
+    $runCmd = "sudo /tmp/setup-lan.sh $setupArgs"
 
     if ($script:Mode -eq "wsl") {
         if ($scriptPath) {
             $wslPath = wsl wslpath -a ($scriptPath -replace '\\', '/')
             wsl cp $wslPath /tmp/setup-lan.sh
         } else {
-            Info "setup-lan.sh not found locally — downloading in WSL..."
             wsl curl -sfL $ghUrl -o /tmp/setup-lan.sh
-            if ($LASTEXITCODE -ne 0) { Die "failed to download setup-lan.sh" }
+            if ($LASTEXITCODE -ne 0) { Die "failed to download setup-lan.sh in WSL" }
         }
-        wsl chmod +x /tmp/setup-lan.sh
+        wsl bash -c "chmod +x /tmp/setup-lan.sh && $runCmd"
     } else {
         $sshArgs = Get-SshArgs
         if ($scriptPath) {
             $scpPort = if ($script:SshPort -ne 22) { @("-P", $script:SshPort) } else { @() }
             scp @scpPort $scriptPath "$($script:VmUser)@$($script:SshHost):/tmp/setup-lan.sh"
-            ssh @sshArgs "chmod +x /tmp/setup-lan.sh"
-        } else {
-            Info "setup-lan.sh not found locally — downloading on guest..."
-            ssh @sshArgs "curl -sfL '$ghUrl' -o /tmp/setup-lan.sh && chmod +x /tmp/setup-lan.sh"
-            if ($LASTEXITCODE -ne 0) { Die "failed to download setup-lan.sh on guest" }
         }
+        # Single SSH session: download (if needed) + chmod + run
+        $remoteCmd = ""
+        if (-not $scriptPath) {
+            $remoteCmd = "curl -sfL '$ghUrl' -o /tmp/setup-lan.sh && "
+        }
+        $remoteCmd += "chmod +x /tmp/setup-lan.sh && $runCmd"
+        ssh @sshArgs $remoteCmd
     }
 }
 
@@ -373,11 +375,8 @@ function Run-Wizard {
     Add-PortForwarding
     Add-FirewallRule
 
-    Info "copying setup script to guest..."
-    Copy-ScriptToGuest
-
     Info "running setup on guest (follow the prompts there)..."
-    Invoke-GuestCommand "sudo /tmp/setup-lan.sh --port $($script:Port) --lan-ip $hostIp"
+    Copy-AndRunOnGuest "--port $($script:Port) --lan-ip $hostIp"
 
     # Save config for future --recert / --remove
     Save-Config
@@ -429,7 +428,7 @@ function Run-Remove {
         if ($script:Mode -eq "wsl") {
             Resolve-GuestIp
         }
-        Invoke-GuestCommand "sudo /tmp/setup-lan.sh --remove"
+        Copy-AndRunOnGuest "--remove"
     } catch {
         Warn "could not remove guest config (run 'sudo setup-lan.sh --remove' manually in the guest)"
     }
@@ -455,7 +454,7 @@ function Run-Recert {
     if ($Force) { $recertArgs += " --force" }
 
     Info "regenerating server cert on guest..."
-    Invoke-GuestCommand "sudo /tmp/setup-lan.sh $recertArgs"
+    Copy-AndRunOnGuest $recertArgs
 
     $hostIp = Get-HostLanIp
     Write-Host ""
