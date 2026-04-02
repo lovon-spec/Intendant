@@ -170,11 +170,23 @@ function Invoke-GuestCommand($cmd) {
     }
 }
 
-function Copy-ScriptToGuest {
+function Ensure-GuestScript {
     $scriptPath = Join-Path $PSScriptRoot "setup-lan.sh"
-    if (-not (Test-Path $scriptPath)) {
-        Die "setup-lan.sh not found in $PSScriptRoot"
+    if (Test-Path $scriptPath) { return $scriptPath }
+
+    $url = "https://raw.githubusercontent.com/lovon-spec/intendant/main/scripts/setup-lan.sh"
+    $tempPath = Join-Path $env:TEMP "setup-lan.sh"
+    Info "setup-lan.sh not found locally — downloading from GitHub..."
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tempPath -UseBasicParsing
+    } catch {
+        Die "failed to download setup-lan.sh: $_"
     }
+    return $tempPath
+}
+
+function Copy-ScriptToGuest {
+    $scriptPath = Ensure-GuestScript
 
     if ($script:Mode -eq "wsl") {
         $wslPath = wsl wslpath -a ($scriptPath -replace '\\', '/')
