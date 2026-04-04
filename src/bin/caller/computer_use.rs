@@ -288,13 +288,17 @@ pub async fn execute_actions(
     backend: DisplayBackend,
     screenshot_dir: &Path,
     action_counter: &mut u64,
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> Vec<CuActionResult> {
     match backend {
         DisplayBackend::Wayland => {
+            if let Some(session) = lookup_display_session(session_registry, &target).await {
+                return execute_via_session(&session, actions, screenshot_dir, action_counter).await;
+            }
             return vec![CuActionResult {
                 success: false,
                 screenshot: None,
-                error: Some("Wayland backend not yet implemented".to_string()),
+                error: Some("No display session for Wayland target".to_string()),
             }];
         }
         DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
@@ -744,6 +748,460 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+// ── Wayland: DisplaySession routing ─────────────────────────────────────────
+
+/// Look up the `DisplaySession` for the given target from the shared registry.
+async fn lookup_display_session(
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+    target: &DisplayTarget,
+) -> Option<std::sync::Arc<crate::display::DisplaySession>> {
+    let registry = session_registry.as_ref()?;
+    let display_id = match target {
+        DisplayTarget::UserSession => 0,
+        DisplayTarget::Virtual { id } => *id,
+    };
+    registry.read().await.get(display_id)
+}
+
+/// Execute CU actions by routing through a `DisplaySession` (WebRTC pipeline).
+///
+/// Converts CU pixel coordinates to normalised 0.0..1.0 coordinates expected by
+/// `InputEvent`, and maps `CuAction` variants to sequences of `InputEvent`
+/// injections.
+async fn execute_via_session(
+    session: &crate::display::DisplaySession,
+    actions: &[CuAction],
+    screenshot_dir: &std::path::Path,
+    action_counter: &mut u64,
+) -> Vec<CuActionResult> {
+    let (width, height) = session.resolution();
+    let mut results = Vec::with_capacity(actions.len());
+    let mut needs_auto_screenshot = false;
+
+    for action in actions {
+        match action {
+            CuAction::Screenshot => {
+                let result = take_session_screenshot(session, screenshot_dir, action_counter).await;
+                results.push(result);
+                needs_auto_screenshot = false;
+            }
+            CuAction::Click { x, y, button } => {
+                let nx = *x as f64 / width as f64;
+                let ny = *y as f64 / height as f64;
+                let b = mouse_button_index(*button);
+                let down = session
+                    .inject_input(crate::display::InputEvent::MouseDown { x: nx, y: ny, b })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let up = session
+                    .inject_input(crate::display::InputEvent::MouseUp { x: nx, y: ny, b })
+                    .await;
+                let success = down.is_ok() && up.is_ok();
+                let error = if !success {
+                    Some("Click injection failed".to_string())
+                } else {
+                    None
+                };
+                results.push(CuActionResult {
+                    success,
+                    screenshot: None,
+                    error,
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::DoubleClick { x, y, button } => {
+                let nx = *x as f64 / width as f64;
+                let ny = *y as f64 / height as f64;
+                let b = mouse_button_index(*button);
+                let mut success = true;
+                for _ in 0..2 {
+                    if session
+                        .inject_input(crate::display::InputEvent::MouseDown { x: nx, y: ny, b })
+                        .await
+                        .is_err()
+                    {
+                        success = false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if session
+                        .inject_input(crate::display::InputEvent::MouseUp { x: nx, y: ny, b })
+                        .await
+                        .is_err()
+                    {
+                        success = false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                results.push(CuActionResult {
+                    success,
+                    screenshot: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some("DoubleClick injection failed".to_string())
+                    },
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::Type { text } => {
+                let mut success = true;
+                for ch in text.chars() {
+                    let code = char_to_dom_code(ch);
+                    let shift = ch.is_uppercase() || "!@#$%^&*()_+{}|:\"<>?~".contains(ch);
+                    if shift {
+                        let _ = session
+                            .inject_input(crate::display::InputEvent::KeyDown {
+                                code: "ShiftLeft".to_string(),
+                                key: "Shift".to_string(),
+                                shift: true,
+                                ctrl: false,
+                                alt: false,
+                                meta: false,
+                            })
+                            .await;
+                    }
+                    if session
+                        .inject_input(crate::display::InputEvent::KeyDown {
+                            code: code.to_string(),
+                            key: ch.to_string(),
+                            shift,
+                            ctrl: false,
+                            alt: false,
+                            meta: false,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        success = false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let _ = session
+                        .inject_input(crate::display::InputEvent::KeyUp {
+                            code: code.to_string(),
+                            key: ch.to_string(),
+                            shift,
+                            ctrl: false,
+                            alt: false,
+                            meta: false,
+                        })
+                        .await;
+                    if shift {
+                        let _ = session
+                            .inject_input(crate::display::InputEvent::KeyUp {
+                                code: "ShiftLeft".to_string(),
+                                key: "Shift".to_string(),
+                                shift: false,
+                                ctrl: false,
+                                alt: false,
+                                meta: false,
+                            })
+                            .await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                results.push(CuActionResult {
+                    success,
+                    screenshot: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some("Type injection failed".to_string())
+                    },
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::Key { key } => {
+                let code = key_name_to_dom_code(key);
+                let down = session
+                    .inject_input(crate::display::InputEvent::KeyDown {
+                        code: code.to_string(),
+                        key: key.clone(),
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                        meta: false,
+                    })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let up = session
+                    .inject_input(crate::display::InputEvent::KeyUp {
+                        code: code.to_string(),
+                        key: key.clone(),
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                        meta: false,
+                    })
+                    .await;
+                let success = down.is_ok() && up.is_ok();
+                results.push(CuActionResult {
+                    success,
+                    screenshot: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some("Key injection failed".to_string())
+                    },
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::Scroll {
+                x,
+                y,
+                direction,
+                amount,
+            } => {
+                let nx = *x as f64 / width as f64;
+                let ny = *y as f64 / height as f64;
+                // Convert ScrollDirection + amount to pixel deltas.
+                let amt = (*amount).max(1) as f64;
+                let (dx, dy) = match direction {
+                    ScrollDirection::Up => (0.0, -amt),
+                    ScrollDirection::Down => (0.0, amt),
+                    ScrollDirection::Left => (-amt, 0.0),
+                    ScrollDirection::Right => (amt, 0.0),
+                };
+                let r = session
+                    .inject_input(crate::display::InputEvent::Scroll {
+                        x: nx,
+                        y: ny,
+                        dx,
+                        dy,
+                    })
+                    .await;
+                results.push(CuActionResult {
+                    success: r.is_ok(),
+                    screenshot: None,
+                    error: r.err().map(|e| e.to_string()),
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::MoveMouse { x, y } => {
+                let nx = *x as f64 / width as f64;
+                let ny = *y as f64 / height as f64;
+                let r = session
+                    .inject_input(crate::display::InputEvent::MouseMove { x: nx, y: ny })
+                    .await;
+                results.push(CuActionResult {
+                    success: r.is_ok(),
+                    screenshot: None,
+                    error: r.err().map(|e| e.to_string()),
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::Drag {
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+            } => {
+                let sx = *start_x as f64 / width as f64;
+                let sy = *start_y as f64 / height as f64;
+                let ex = *end_x as f64 / width as f64;
+                let ey = *end_y as f64 / height as f64;
+                // Drag uses left button (0).
+                let _ = session
+                    .inject_input(crate::display::InputEvent::MouseDown {
+                        x: sx,
+                        y: sy,
+                        b: 0,
+                    })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Interpolate intermediate points for smooth drag.
+                for i in 1..=5 {
+                    let t = i as f64 / 5.0;
+                    let mx = sx + (ex - sx) * t;
+                    let my = sy + (ey - sy) * t;
+                    let _ = session
+                        .inject_input(crate::display::InputEvent::MouseMove { x: mx, y: my })
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                let _ = session
+                    .inject_input(crate::display::InputEvent::MouseUp {
+                        x: ex,
+                        y: ey,
+                        b: 0,
+                    })
+                    .await;
+                results.push(CuActionResult {
+                    success: true,
+                    screenshot: None,
+                    error: None,
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::Wait { ms } => {
+                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+                results.push(CuActionResult {
+                    success: true,
+                    screenshot: None,
+                    error: None,
+                });
+            }
+        }
+    }
+
+    // Auto-screenshot after the last non-screenshot action (matches X11 path).
+    if needs_auto_screenshot {
+        let auto = take_session_screenshot(session, screenshot_dir, action_counter).await;
+        if auto.success {
+            let screenshot = auto.screenshot.clone();
+            results.push(auto);
+            // Attach to first result if it has no screenshot (convenience for callers).
+            if let (Some(ss), Some(first)) = (screenshot, results.first_mut()) {
+                if first.screenshot.is_none() {
+                    first.screenshot = Some(ss);
+                }
+            }
+        } else {
+            results.push(auto);
+        }
+    }
+
+    results
+}
+
+/// Capture a PNG screenshot from a `DisplaySession`.
+async fn take_session_screenshot(
+    session: &crate::display::DisplaySession,
+    screenshot_dir: &std::path::Path,
+    counter: &mut u64,
+) -> CuActionResult {
+    *counter += 1;
+    let path = screenshot_dir.join(format!("cu_screenshot_{}.png", counter));
+    match session.screenshot().await {
+        Ok(png_bytes) => match std::fs::write(&path, &png_bytes) {
+            Ok(_) => {
+                let (width, height) = png_dimensions(&png_bytes).unwrap_or((0, 0));
+                use base64::Engine;
+                let base64_png =
+                    base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+                CuActionResult {
+                    success: true,
+                    screenshot: Some(ScreenshotData {
+                        path,
+                        base64_png,
+                        width,
+                        height,
+                    }),
+                    error: None,
+                }
+            }
+            Err(e) => CuActionResult {
+                success: false,
+                screenshot: None,
+                error: Some(format!("Failed to write screenshot: {}", e)),
+            },
+        },
+        Err(e) => CuActionResult {
+            success: false,
+            screenshot: None,
+            error: Some(format!("Screenshot failed: {}", e)),
+        },
+    }
+}
+
+/// Map a `MouseButton` to the browser button index used by `InputEvent`.
+fn mouse_button_index(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+/// Map a character to a DOM `KeyboardEvent.code` value.
+fn char_to_dom_code(ch: char) -> &'static str {
+    match ch.to_ascii_lowercase() {
+        'a' => "KeyA",
+        'b' => "KeyB",
+        'c' => "KeyC",
+        'd' => "KeyD",
+        'e' => "KeyE",
+        'f' => "KeyF",
+        'g' => "KeyG",
+        'h' => "KeyH",
+        'i' => "KeyI",
+        'j' => "KeyJ",
+        'k' => "KeyK",
+        'l' => "KeyL",
+        'm' => "KeyM",
+        'n' => "KeyN",
+        'o' => "KeyO",
+        'p' => "KeyP",
+        'q' => "KeyQ",
+        'r' => "KeyR",
+        's' => "KeyS",
+        't' => "KeyT",
+        'u' => "KeyU",
+        'v' => "KeyV",
+        'w' => "KeyW",
+        'x' => "KeyX",
+        'y' => "KeyY",
+        'z' => "KeyZ",
+        '0' | ')' => "Digit0",
+        '1' | '!' => "Digit1",
+        '2' | '@' => "Digit2",
+        '3' | '#' => "Digit3",
+        '4' | '$' => "Digit4",
+        '5' | '%' => "Digit5",
+        '6' | '^' => "Digit6",
+        '7' | '&' => "Digit7",
+        '8' | '*' => "Digit8",
+        '9' | '(' => "Digit9",
+        ' ' => "Space",
+        '\n' | '\r' => "Enter",
+        '\t' => "Tab",
+        '-' | '_' => "Minus",
+        '=' | '+' => "Equal",
+        '[' | '{' => "BracketLeft",
+        ']' | '}' => "BracketRight",
+        '\\' | '|' => "Backslash",
+        ';' | ':' => "Semicolon",
+        '\'' | '"' => "Quote",
+        '`' | '~' => "Backquote",
+        ',' | '<' => "Comma",
+        '.' | '>' => "Period",
+        '/' | '?' => "Slash",
+        _ => "Unidentified",
+    }
+}
+
+/// Map a key name (from CU action) to a DOM `KeyboardEvent.code` value.
+fn key_name_to_dom_code(key: &str) -> &str {
+    match key.to_lowercase().as_str() {
+        "enter" | "return" => "Enter",
+        "escape" | "esc" => "Escape",
+        "backspace" => "Backspace",
+        "tab" => "Tab",
+        "space" | " " => "Space",
+        "arrowup" | "up" => "ArrowUp",
+        "arrowdown" | "down" => "ArrowDown",
+        "arrowleft" | "left" => "ArrowLeft",
+        "arrowright" | "right" => "ArrowRight",
+        "delete" => "Delete",
+        "home" => "Home",
+        "end" => "End",
+        "pageup" => "PageUp",
+        "pagedown" => "PageDown",
+        "f1" => "F1",
+        "f2" => "F2",
+        "f3" => "F3",
+        "f4" => "F4",
+        "f5" => "F5",
+        "f6" => "F6",
+        "f7" => "F7",
+        "f8" => "F8",
+        "f9" => "F9",
+        "f10" => "F10",
+        "f11" => "F11",
+        "f12" => "F12",
+        _ => key, // pass through as-is
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -915,5 +1373,63 @@ mod tests {
             format!("{}", DisplayTarget::UserSession),
             "user_session"
         );
+    }
+
+    #[test]
+    fn char_to_dom_code_letters() {
+        assert_eq!(char_to_dom_code('a'), "KeyA");
+        assert_eq!(char_to_dom_code('A'), "KeyA");
+        assert_eq!(char_to_dom_code('z'), "KeyZ");
+    }
+
+    #[test]
+    fn char_to_dom_code_digits() {
+        assert_eq!(char_to_dom_code('0'), "Digit0");
+        assert_eq!(char_to_dom_code('9'), "Digit9");
+        assert_eq!(char_to_dom_code('!'), "Digit1");
+        assert_eq!(char_to_dom_code('@'), "Digit2");
+    }
+
+    #[test]
+    fn char_to_dom_code_special() {
+        assert_eq!(char_to_dom_code(' '), "Space");
+        assert_eq!(char_to_dom_code('\n'), "Enter");
+        assert_eq!(char_to_dom_code('\t'), "Tab");
+        assert_eq!(char_to_dom_code('-'), "Minus");
+        assert_eq!(char_to_dom_code('/'), "Slash");
+    }
+
+    #[test]
+    fn char_to_dom_code_unknown() {
+        assert_eq!(char_to_dom_code('\u{2603}'), "Unidentified");
+    }
+
+    #[test]
+    fn key_name_to_dom_code_known_keys() {
+        assert_eq!(key_name_to_dom_code("Enter"), "Enter");
+        assert_eq!(key_name_to_dom_code("ENTER"), "Enter");
+        assert_eq!(key_name_to_dom_code("return"), "Enter");
+        assert_eq!(key_name_to_dom_code("Escape"), "Escape");
+        assert_eq!(key_name_to_dom_code("esc"), "Escape");
+        assert_eq!(key_name_to_dom_code("Tab"), "Tab");
+        assert_eq!(key_name_to_dom_code("Backspace"), "Backspace");
+        assert_eq!(key_name_to_dom_code("ArrowUp"), "ArrowUp");
+        assert_eq!(key_name_to_dom_code("up"), "ArrowUp");
+        assert_eq!(key_name_to_dom_code("F1"), "F1");
+        assert_eq!(key_name_to_dom_code("f12"), "F12");
+    }
+
+    #[test]
+    fn key_name_to_dom_code_passthrough() {
+        // Unknown keys pass through as-is
+        assert_eq!(key_name_to_dom_code("Meta"), "Meta");
+        assert_eq!(key_name_to_dom_code("ctrl+c"), "ctrl+c");
+    }
+
+    #[test]
+    fn mouse_button_index_values() {
+        assert_eq!(mouse_button_index(MouseButton::Left), 0);
+        assert_eq!(mouse_button_index(MouseButton::Middle), 1);
+        assert_eq!(mouse_button_index(MouseButton::Right), 2);
     }
 }

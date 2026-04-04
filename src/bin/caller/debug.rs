@@ -19,6 +19,7 @@ const DEBUG_DISPLAY_MAX: u32 = 59;
 
 /// RAII guard for the debug screen.
 /// On Linux: Xvfb + Firefox. On macOS: just a browser window.
+<<<<<<< HEAD
 /// Kills the browser on drop; XvfbGuard (if present) handles Xvfb.
 pub struct DebugScreen {
     pub xvfb_guard: Option<vision::XvfbGuard>,
