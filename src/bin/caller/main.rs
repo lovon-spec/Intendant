@@ -4221,9 +4221,22 @@ async fn activate_user_display(
     let display_id: u32 = 0;
     let (width, height) = query_display_resolution(display_id);
 
-    // On Wayland: create a DisplaySession with WaylandBackend
+    // On Wayland: create a DisplaySession with WaylandBackend.
+    // Detect Wayland even when WAYLAND_DISPLAY isn't in our env (e.g. started
+    // from a tty/ssh session while a graphical session is active).
     #[cfg(target_os = "linux")]
-    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+    if std::env::var("WAYLAND_DISPLAY").is_ok() || detect_wayland_socket().is_some() {
+        if let Some(socket) = detect_wayland_socket() {
+            if std::env::var("WAYLAND_DISPLAY").is_err() {
+                eprintln!("[user_display] WAYLAND_DISPLAY not set, detected socket: {}", socket);
+                std::env::set_var("WAYLAND_DISPLAY", &socket);
+            }
+            if std::env::var("XDG_RUNTIME_DIR").is_err() {
+                let uid = unsafe { libc::getuid() };
+                let runtime_dir = format!("/run/user/{}", uid);
+                std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+            }
+        }
         let backend = display::wayland::WaylandBackend::new();
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         if let Err(e) = session.start(30, frame_registry).await {
@@ -4254,6 +4267,29 @@ async fn activate_user_display(
     {
         eprintln!("[user_display] No supported display backend, no web slot");
     }
+}
+
+/// Detect a Wayland compositor socket even when WAYLAND_DISPLAY is not set.
+/// Checks /run/user/<uid>/ for wayland-* sockets.
+#[cfg(target_os = "linux")]
+fn detect_wayland_socket() -> Option<String> {
+    let uid = unsafe { libc::getuid() };
+    let runtime_dir = format!("/run/user/{}", uid);
+    let entries = std::fs::read_dir(&runtime_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Match "wayland-0", "wayland-1", etc. but not ".lock" files
+        if name.starts_with("wayland-") && !name.ends_with(".lock") {
+            if entry.file_type().ok().is_some_and(|ft| {
+                use std::os::unix::fs::FileTypeExt;
+                ft.is_socket() || ft.is_file()
+            }) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Parse a display target string from the presence model into a `DisplayTarget`.
