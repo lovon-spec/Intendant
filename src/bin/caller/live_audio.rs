@@ -698,96 +698,80 @@ async fn start_vortex_audio_bridge(
     // Wrap write_half in Arc<Mutex> for shared access from playback task
     let write_half = Arc::new(Mutex::new(write_half));
 
-    // Capture task: daemon PCM_OUTPUT → convert → model WebSocket
+    // Capture: two tasks to decouple socket reads from WebSocket writes.
+    // Task A drains the daemon socket as fast as possible (prevents buffer
+    // backup that deadlocks the daemon's send/recv). Task B forwards the
+    // converted PCM to the model WebSocket at its own pace.
+    let (cap_tx, mut cap_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    // Task A: drain daemon socket → channel
+    let capture_drain = tokio::spawn(async move {
+        let mut reader = read_half;
+        loop {
+            match vortex_read_msg(&mut reader).await {
+                Ok((VORTEX_MSG_PCM_OUTPUT, payload)) => {
+                    let pcm16 = vortex_capture_convert(&payload);
+                    if !pcm16.is_empty() {
+                        if cap_tx.send(pcm16).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok((VORTEX_MSG_STOP, _)) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        eprintln!("live_audio: vortex capture drain ended");
+    });
+
+    // Task B: channel → model WebSocket
     let capture_write = session_write;
     let capture_rate = sample_rate;
     let capture_provider = provider;
     let capture_handle = tokio::spawn(async move {
-        let mut reader = read_half;
-        loop {
-            let msg = vortex_read_msg(&mut reader).await;
-            match msg {
-                Ok((VORTEX_MSG_PCM_OUTPUT, payload)) => {
-                    let pcm16 = vortex_capture_convert(&payload);
-                    if pcm16.is_empty() {
-                        continue;
+        while let Some(pcm16) = cap_rx.recv().await {
+            let b64 = BASE64.encode(&pcm16);
+            let ws_msg = match capture_provider {
+                LiveAudioProvider::Gemini => serde_json::json!({
+                    "realtime_input": {
+                        "media_chunks": [{
+                            "mime_type": format!("audio/pcm;rate={}", capture_rate),
+                            "data": b64
+                        }]
                     }
-                    let b64 = BASE64.encode(&pcm16);
-                    let ws_msg = match capture_provider {
-                        LiveAudioProvider::Gemini => serde_json::json!({
-                            "realtime_input": {
-                                "media_chunks": [{
-                                    "mime_type": format!("audio/pcm;rate={}", capture_rate),
-                                    "data": b64
-                                }]
-                            }
-                        }),
-                        LiveAudioProvider::OpenAI => serde_json::json!({
-                            "type": "input_audio_buffer.append",
-                            "audio": b64
-                        }),
-                    };
-                    if let Some(ref tee) = capture_tee_tx {
-                        let _ = tee.send(pcm16);
-                    }
-                    let mut sink = capture_write.lock().await;
-                    if sink.send(WsMessage::Text(ws_msg.to_string())).await.is_err() {
-                        break;
-                    }
-                }
-                Ok((VORTEX_MSG_STOP, _)) => {
-                    eprintln!("live_audio: vortex daemon sent STOP");
-                    break;
-                }
-                Ok((msg_type, _)) => {
-                    // Ignore other message types (LATENCY_QUERY, etc.)
-                    let _ = msg_type;
-                }
-                Err(_) => break,
+                }),
+                LiveAudioProvider::OpenAI => serde_json::json!({
+                    "type": "input_audio_buffer.append",
+                    "audio": b64
+                }),
+            };
+            if let Some(ref tee) = capture_tee_tx {
+                let _ = tee.send(pcm16);
+            }
+            let mut sink = capture_write.lock().await;
+            if sink.send(WsMessage::Text(ws_msg.to_string())).await.is_err() {
+                break;
             }
         }
+        capture_drain.abort();
         eprintln!("live_audio: vortex capture ended");
     });
 
     // Playback task: model audio → convert → daemon PCM_INPUT
-    // Buffer audio and send at real-time pace (5ms intervals) to match
-    // the daemon's polling rate. Sending faster overwhelms/crashes it.
     let playback_write = write_half;
     let playback_handle = tokio::spawn(async move {
         let mut rx = audio_out_rx;
-        let mut buffer = Vec::<u8>::new();
-        // 5ms at 48kHz stereo f32 = 48000 * 2 * 4 / 200 = 1920 bytes
-        let chunk_bytes: usize = 1920;
-        let chunk_interval = Duration::from_millis(5);
-        let mut ticker = tokio::time::interval(chunk_interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                pcm = rx.recv() => {
-                    match pcm {
-                        Some(pcm_data) => {
-                            buffer.extend(vortex_playback_convert(&pcm_data));
-                        }
-                        None => break, // channel closed
-                    }
-                }
-                _ = ticker.tick() => {
-                    if buffer.len() >= chunk_bytes {
-                        let chunk: Vec<u8> = buffer.drain(..chunk_bytes).collect();
-                        let mut writer = playback_write.lock().await;
-                        if vortex_write_msg(&mut *writer, VORTEX_MSG_PCM_INPUT, &chunk)
-                            .await
-                            .is_err()
-                        {
-                            eprintln!("live_audio: vortex playback write failed");
-                            return;
-                        }
-                    }
-                }
+        while let Some(pcm_data) = rx.recv().await {
+            let f32_stereo = vortex_playback_convert(&pcm_data);
+            let mut writer = playback_write.lock().await;
+            if vortex_write_msg(&mut *writer, VORTEX_MSG_PCM_INPUT, &f32_stereo)
+                .await
+                .is_err()
+            {
+                break;
             }
         }
-        eprintln!("live_audio: vortex playback ended");
     });
 
     Ok(AudioStreamBridge {
@@ -1246,9 +1230,6 @@ pub async fn run_session(
     let mut model_text = String::new();
     let mut model_transcript_buf = String::new();
     let mut quarantine_ids = Vec::new();
-    let mut audio_out_count = 0usize;
-    let mut audio_out_bytes = 0usize;
-
     // Event processing loop
     let status = loop {
         let elapsed = start.elapsed();
@@ -1260,17 +1241,7 @@ pub async fn run_session(
         match tokio::time::timeout(remaining, session.event_rx.recv()).await {
             Ok(Some(event)) => match event {
                 LiveAudioEvent::AudioOut(pcm) => {
-                    audio_out_count += 1;
-                    audio_out_bytes += pcm.len();
-                    if audio_out_count <= 5 || audio_out_count % 50 == 0 {
-                        eprintln!(
-                            "live_audio: AudioOut #{} ({}B, total {}B)",
-                            audio_out_count, pcm.len(), audio_out_bytes
-                        );
-                    }
-                    if audio_out_tx.send(pcm).is_err() {
-                        eprintln!("live_audio: audio_out_tx send failed (receiver dropped?)");
-                    }
+                    let _ = audio_out_tx.send(pcm);
                 }
                 LiveAudioEvent::ModelTranscript(text) => {
                     let _ = transcript.log("model", &text).await;
@@ -2008,13 +1979,21 @@ mod tests {
         );
     }
 
-    /// Interactive test: real phone call via Linphone + live audio model.
+    /// Interactive phone call test via Vortex audio bridge + pjsua SIP client.
     ///
-    /// 1. Creates audio bridge (sets BlackHole as system default)
-    /// 2. Connects to OpenAI Realtime with a conversational playbook
-    /// 3. Prints instructions — call intendant7 from your phone
-    /// 4. Model handles the conversation, logs transcript
-    /// 5. Validates structured response
+    /// IMPORTANT: This test requires a GUI login session. macOS gates audio
+    /// input behind the WindowServer session — processes from SSH get silence.
+    /// Run this test from Terminal.app inside the VM's display, or install
+    /// pjsua as a LaunchAgent. The Vortex daemon and intendant can run from
+    /// any context; only pjsua (the app opening mic input) needs GUI session.
+    ///
+    /// Prerequisites:
+    ///   - Vortex guest tools installed (VortexAudioPlugin + VortexAudioDaemon)
+    ///   - "Vortex Audio" set as default input AND output in System Settings
+    ///   - VortexAudioDaemon running with --socket /tmp/intendant-audio.sock
+    ///   - ~/bin/pjsua built from pjsip source
+    ///   - ~/lin containing the SIP password
+    ///   - OPENAI_API_KEY in environment
     ///
     /// Run with:
     ///   cargo test --bin intendant test_live_audio_phone_call -- --ignored --nocapture
@@ -2035,42 +2014,82 @@ mod tests {
                 .as_millis()
         );
 
-        let bridge =
-            crate::audio_routing::create_vortex_bridge(vortex_socket);
+        let bridge = crate::audio_routing::create_vortex_bridge(vortex_socket);
 
-        // Start pjsua as the SIP client with Vortex Audio device.
-        // Device index 4 = "Vortex Audio" (in=2, out=2) — both capture and playback.
-        let pjsua_bin = format!(
-            "{}/bin/pjsua",
-            dirs::home_dir().unwrap().display()
-        );
-        let sip_password = std::fs::read_to_string(
+        // Discover Vortex Audio's pjsua device index dynamically.
+        let pjsua_bin = dirs::home_dir().unwrap().join("bin/pjsua");
+        if !pjsua_bin.exists() {
+            eprintln!("~/bin/pjsua not found, skipping");
+            return;
+        }
+        let dev_output = std::process::Command::new(&pjsua_bin)
+            .args(["--null-audio"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                if let Some(mut stdin) = c.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(b"q\n");
+                }
+                c.wait_with_output()
+            });
+        let vortex_dev_idx = match dev_output {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                stderr
+                    .lines()
+                    .filter(|l| l.contains("dev_id"))
+                    .position(|l| l.contains("Vortex Audio"))
+                    .map(|i| i.to_string())
+            }
+            Err(_) => None,
+        };
+        let dev_idx = match vortex_dev_idx {
+            Some(idx) => idx,
+            None => {
+                eprintln!("Vortex Audio not found in pjsua device list, skipping");
+                return;
+            }
+        };
+        let capture_arg = format!("--capture-dev={}", dev_idx);
+        let playback_arg = format!("--playback-dev={}", dev_idx);
+
+        let sip_password = match std::fs::read_to_string(
             dirs::home_dir().unwrap().join("lin"),
-        )
-        .expect("~/lin should contain the SIP password")
-        .trim()
-        .to_string();
+        ) {
+            Ok(p) => p.trim().to_string(),
+            Err(_) => {
+                eprintln!("~/lin not found (SIP password), skipping");
+                return;
+            }
+        };
 
-        eprintln!("  Starting pjsua (SIP client) with Vortex Audio...");
-        let mut pjsua = tokio::process::Command::new(pjsua_bin)
+        // Launch pjsua. NOTE: must run in the GUI login session for mic
+        // input to work. If running from SSH, wrap in a LaunchAgent.
+        let mut pjsua = tokio::process::Command::new(&pjsua_bin)
             .args([
                 "--id=sip:intendant7@sip.linphone.org",
                 "--registrar=sip:sip.linphone.org",
                 "--realm=sip.linphone.org",
                 "--username=intendant7",
                 &format!("--password={}", sip_password),
-                "--capture-dev=0", "--playback-dev=0",
+                &capture_arg,
+                &playback_arg,
                 "--auto-answer=200",
                 "--ec-tail=0",
                 "--no-vad",
-                "--use-srtp=2", "--srtp-secure=0",
+                "--use-srtp=2",
+                "--srtp-secure=0",
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("failed to start pjsua");
-        // Wait for registration, then make outbound call via stdin
+
+        // Wait for registration, then make outbound call
         tokio::time::sleep(Duration::from_secs(5)).await;
         if let Some(ref mut stdin) = pjsua.stdin {
             let _ = stdin.write_all(b"m\n").await;
@@ -2133,13 +2152,12 @@ mod tests {
             timeout_secs: 120,
             voice: Some("alloy".to_string()),
             display_id: None,
-            initial_message: None, // Wait for the caller to speak first
+            initial_message: None,
         };
 
         let tmp_dir = tempfile::tempdir().expect("create temp dir");
-        let log_dir = tmp_dir.path().to_path_buf();
 
-        let result = run_session(&spec, &api_key, &bridge, &log_dir, None)
+        let result = run_session(&spec, &api_key, &bridge, tmp_dir.path(), None)
             .await
             .expect("run_session failed");
 
@@ -2149,9 +2167,8 @@ mod tests {
         }
         let _ = pjsua.wait().await;
         drop(bridge);
-        eprintln!("\n  pjsua stopped. Audio bridge restored.\n");
 
-        // Read and display transcript
+        // Display transcript
         if result.transcript_path.exists() {
             eprintln!("  === Transcript ===");
             if let Ok(content) = std::fs::read_to_string(&result.transcript_path) {
@@ -2169,20 +2186,18 @@ mod tests {
         eprintln!("  Status: {:?}", result.status);
         eprintln!("  Duration: {:.1}s", result.duration_secs);
         eprintln!("  Response: {:?}", result.response_data);
-        eprintln!("  Quarantine: {:?}", result.quarantine_ids);
 
         match &result.status {
             LiveAudioStatus::Completed => {
                 let data = result.response_data.as_ref().unwrap();
-                eprintln!("\n  Summary: {}", data["summary"].as_str().unwrap_or("?"));
+                eprintln!("  Summary: {}", data["summary"].as_str().unwrap_or("?"));
                 eprintln!("  Caller mood: {}", data["caller_mood"].as_str().unwrap_or("?"));
-                eprintln!("\n  PASS");
             }
             LiveAudioStatus::TimedOut => {
-                eprintln!("\n  Session timed out — no JSON response from model");
+                eprintln!("  Session timed out — model did not produce JSON response");
             }
             other => {
-                eprintln!("\n  Unexpected status: {:?}", other);
+                eprintln!("  Unexpected status: {:?}", other);
             }
         }
     }
