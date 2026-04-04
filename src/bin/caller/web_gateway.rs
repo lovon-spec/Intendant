@@ -4,10 +4,16 @@ use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+
+/// Monotonically increasing counter for assigning unique peer IDs to WebSocket
+/// connections.  Used for WebRTC signaling so that each browser tab gets a
+/// stable identity within a display session.
+static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
 /// Only one connection can be active at a time; all others are "passive" (TUI-only).
@@ -509,101 +515,6 @@ fn asset_version_hash() -> String {
     WASM_WEB_BIN.hash(&mut hasher);
     WASM_WEB_JS.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
-}
-
-/// Bidirectional proxy: WebSocket (noVNC) ↔ TCP (x11vnc RFB).
-///
-/// noVNC sends/receives VNC protocol data as WebSocket binary frames.
-/// This function accepts the WebSocket handshake, connects to the local
-/// x11vnc TCP port, and forwards data in both directions until either
-/// side disconnects.
-async fn handle_vnc_proxy(stream: tokio::net::TcpStream, vnc_port: u32) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let ws_stream = match tokio_tungstenite::accept_hdr_async(
-        stream,
-        VncWsCallback,
-    )
-    .await
-    {
-        Ok(ws) => ws,
-        Err(_) => return,
-    };
-
-    let tcp = match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", vnc_port)).await {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    let (mut tcp_read, mut tcp_write) = tcp.into_split();
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
-
-    // WS → TCP: binary frames from noVNC to x11vnc
-    let ws_to_tcp = tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Binary(data) => {
-                    if tcp_write.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-    });
-
-    // TCP → WS: VNC data from x11vnc to noVNC as binary frames
-    let tcp_to_ws = tokio::spawn(async move {
-        let mut buf = [0u8; 16384];
-        loop {
-            let n = match tcp_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            if ws_tx
-                .send(Message::Binary(buf[..n].to_vec().into()))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    // When either direction closes, abort both
-    tokio::select! {
-        _ = ws_to_tcp => {}
-        _ = tcp_to_ws => {}
-    }
-}
-
-/// WebSocket handshake callback that adds the `Sec-WebSocket-Protocol: binary`
-/// header when the client requests it. noVNC requires this sub-protocol.
-struct VncWsCallback;
-
-impl tokio_tungstenite::tungstenite::handshake::server::Callback for VncWsCallback {
-    fn on_request(
-        self,
-        request: &tokio_tungstenite::tungstenite::http::Request<()>,
-        mut response: tokio_tungstenite::tungstenite::http::Response<()>,
-    ) -> Result<
-        tokio_tungstenite::tungstenite::http::Response<()>,
-        tokio_tungstenite::tungstenite::http::Response<Option<String>>,
-    > {
-        // noVNC sends Sec-WebSocket-Protocol: binary
-        if let Some(proto) = request.headers().get("sec-websocket-protocol") {
-            if let Ok(s) = proto.to_str() {
-                if s.contains("binary") {
-                    response.headers_mut().insert(
-                        "Sec-WebSocket-Protocol",
-                        "binary".parse().unwrap(),
-                    );
-                }
-            }
-        }
-        Ok(response)
-    }
 }
 
 /// List session directories from `~/.intendant/logs/`, returning JSON metadata
@@ -1165,30 +1076,20 @@ pub fn spawn_web_gateway(
     let last_live_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest status event (has autonomy, session_id, task).
     let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // Cache the latest VNC port from display_ready events for the /vnc proxy.
-    let last_vnc_port: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
     // Cache the last display_ready JSON for late-connecting browsers.
     let last_display_ready_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
         let status_cache = last_status_json.clone();
-        let vnc_cache = last_vnc_port.clone();
         let display_cache = last_display_ready_json.clone();
         let mut usage_rx = broadcast_tx.subscribe();
         tokio::spawn(async move {
             loop {
                 match usage_rx.recv().await {
                     Ok(line) => {
-                        // Cache VNC port and full event from display_ready events
+                        // Cache display_ready events for late-connecting browsers
                         if line.contains("\"event\":\"display_ready\"") {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                if let Some(port) = parsed.get("vnc_port").and_then(|v| v.as_u64()) {
-                                    if let Ok(mut guard) = vnc_cache.lock() {
-                                        *guard = Some(port as u32);
-                                    }
-                                }
-                            }
                             if let Ok(mut guard) = display_cache.lock() {
                                 *guard = Some(line.clone());
                             }
@@ -1259,7 +1160,6 @@ pub fn spawn_web_gateway(
             let last_usage_json = last_usage_json.clone();
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
-            let last_vnc_port = last_vnc_port.clone();
             let last_display_ready_json = last_display_ready_json.clone();
             let web_tui_tx = web_tui_tx.clone();
             let task_tx = task_tx.clone();
@@ -1272,6 +1172,7 @@ pub fn spawn_web_gateway(
                 let frame_registry = session_snap.frame_registry.clone();
                 let session_log = session_snap.session_log.clone();
                 let recording_registry = session_snap.recording_registry.clone();
+                let session_registry = session_snap.session_registry.clone();
                 drop(session_snap);
                 // Peek at the first bytes to detect WebSocket upgrade.
                 // peek() does not consume the data, so tokio_tungstenite
@@ -1288,26 +1189,6 @@ pub fn spawn_web_gateway(
                     .any(|l| l.to_lowercase().contains("upgrade: websocket"));
 
                 if is_websocket {
-                    // Detect /vnc path for VNC proxy before accepting
-                    let request_line = header_text.lines().next().unwrap_or("");
-                    let is_vnc_proxy = request_line.contains("/vnc");
-
-                    if is_vnc_proxy {
-                        // VNC WebSocket-to-TCP proxy
-                        let vnc_port = if let Some(port_str) = request_line.split("port=").nth(1) {
-                            port_str.split_whitespace().next()
-                                .and_then(|s| s.split('&').next())
-                                .and_then(|s| s.parse::<u32>().ok())
-                        } else {
-                            None
-                        }.or_else(|| last_vnc_port.lock().ok().and_then(|g| *g));
-
-                        let Some(port) = vnc_port else { return };
-
-                        handle_vnc_proxy(stream, port).await;
-                        return;
-                    }
-
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
                         Err(_) => return,
@@ -1411,6 +1292,9 @@ pub fn spawn_web_gateway(
                     //   {"t":"voice_diagnostic",...}      → AppEvent::VoiceDiagnostic
                     //   {"t":"tool_request", "id":"...", "tool":"...", "args":{}} → tool_response
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
+                    // Assign a unique peer ID for WebRTC signaling
+                    let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
+
                     let bus_inbound = bus.clone();
                     let query_ctx_inbound = query_ctx.clone();
                     let direct_tx_inbound = direct_tx.clone();
@@ -1424,6 +1308,7 @@ pub fn spawn_web_gateway(
                     let frame_registry_inbound = frame_registry.clone();
                     let recording_registry_inbound = recording_registry.clone();
                     let session_log_inbound = session_log.clone();
+                    let session_registry_inbound = session_registry.clone();
                     let task_tx_inbound = task_tx.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
@@ -1446,6 +1331,10 @@ pub fn spawn_web_gateway(
                             frames: Vec<(String, String)>, // (frame_id, base64_data)
                         }
                         let mut clip_accumulators: std::collections::HashMap<String, ClipAccumulator> = std::collections::HashMap::new();
+
+                        // Display IDs this peer has WebRTC connections to,
+                        // used for cleanup when the WebSocket disconnects.
+                        let mut peer_display_ids: Vec<u32> = Vec::new();
 
                         // Per-connection audio transcription buffer.
                         // PCM16 bytes are accumulated and drained every ~3s.
@@ -2268,6 +2157,76 @@ pub fn spawn_web_gateway(
                                             }
                                             let _ = direct_tx_inbound.send(response.to_string());
                                         }
+                                        Some("display_offer") => {
+                                            // WebRTC SDP offer from browser for a display session
+                                            let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                                            let sdp = json["sdp"].as_str().unwrap_or("").to_string();
+
+                                            if let Some(ref sr) = session_registry_inbound {
+                                                if let Some(session) = sr.read().await.get(display_id) {
+                                                    let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
+                                                    let ice_config = crate::display::IceConfig::default();
+
+                                                    match session.handle_offer(peer_id, &sdp, &ice_config, ice_tx).await {
+                                                        Ok(answer_sdp) => {
+                                                            peer_display_ids.push(display_id);
+                                                            let answer = serde_json::json!({
+                                                                "t": "display_answer",
+                                                                "display_id": display_id,
+                                                                "sdp": answer_sdp,
+                                                            });
+                                                            let _ = direct_tx_inbound.send(answer.to_string());
+
+                                                            // Forward server ICE candidates to browser
+                                                            let ice_direct_tx = direct_tx_inbound.clone();
+                                                            tokio::spawn(async move {
+                                                                while let Some((_pid, candidate_json)) = ice_rx.recv().await {
+                                                                    let msg = serde_json::json!({
+                                                                        "t": "display_ice",
+                                                                        "display_id": display_id,
+                                                                        "candidate": serde_json::from_str::<serde_json::Value>(&candidate_json).unwrap_or_default(),
+                                                                    });
+                                                                    if ice_direct_tx.send(msg.to_string()).is_err() {
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!("[web_gateway] WebRTC offer failed for display {}: {}", display_id, e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Some("display_ice") => {
+                                            // Trickle ICE candidate from browser
+                                            let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                                            let candidate = json["candidate"].to_string();
+
+                                            if let Some(ref sr) = session_registry_inbound {
+                                                if let Some(session) = sr.read().await.get(display_id) {
+                                                    if let Err(e) = session.add_ice_candidate(peer_id, &candidate).await {
+                                                        eprintln!("[web_gateway] ICE candidate failed for display {}: {}", display_id, e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Some("display_input") => {
+                                            // Input event (keyboard/mouse) for a display session
+                                            let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                                            if let Some(evt) = json.get("event") {
+                                                if let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(evt.clone()) {
+                                                    if let Some(ref sr) = session_registry_inbound {
+                                                        if let Some(session) = sr.read().await.get(display_id) {
+                                                            if let Err(e) = session.inject_input(input_event).await {
+                                                                eprintln!("[web_gateway] display input injection failed: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         _ => {
                                             // Fall through to ControlMsg parsing
                                             match serde_json::from_value::<ControlMsg>(json) {
@@ -2309,6 +2268,17 @@ pub fn spawn_web_gateway(
                         }
                         if is_presence_connected && is_active {
                             bus_inbound.send(AppEvent::PresenceDisconnected);
+                        }
+                        // Remove this peer from display sessions it connected to
+                        if !peer_display_ids.is_empty() {
+                            if let Some(ref sr) = session_registry_inbound {
+                                let reg = sr.read().await;
+                                for did in &peer_display_ids {
+                                    if let Some(session) = reg.get(*did) {
+                                        session.remove_peer(peer_id).await;
+                                    }
+                                }
+                            }
                         }
                         // Unregister from WebTui
                         if let Some(ref tx) = web_tui_tx_inbound {

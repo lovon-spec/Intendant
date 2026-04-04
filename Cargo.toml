@@ -39,6 +39,8 @@ rmcp = { version = "0.16", features = ["server", "transport-io", "client", "tran
 schemars = "1"
 base64 = "0.22"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 presence-core = { path = "crates/presence-core" }
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

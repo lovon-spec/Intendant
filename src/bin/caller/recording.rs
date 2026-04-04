@@ -597,10 +597,16 @@ fn parse_segment_csv(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
 
 /// Spawn a background task that listens for DisplayReady events and starts
 /// display recording automatically.
+///
+/// When a `DisplaySession` exists for the display (WebRTC pipeline), recording
+/// uses the frame-fed path: frames are subscribed from the session's broadcast
+/// channel, JPEG-encoded, and piped into ffmpeg via `image2pipe`.  Otherwise,
+/// the legacy path (x11grab / avfoundation) is used.
 pub fn spawn_recording_listener(
     mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
     registry: std::sync::Arc<tokio::sync::RwLock<RecordingRegistry>>,
     bus: EventBus,
+    session_registry: Option<crate::display::SharedSessionRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -622,15 +628,101 @@ pub fn spawn_recording_listener(
                         });
                         continue;
                     }
-                    match reg.start_display(display_id, width, height).await {
-                        Ok(stream_name) => {
-                            bus.send(AppEvent::RecordingStarted { stream_name });
+
+                    // Check if a DisplaySession exists for frame-fed recording
+                    let display_session = if let Some(ref sr) = session_registry {
+                        sr.read().await.get(display_id)
+                    } else {
+                        None
+                    };
+
+                    if let Some(session) = display_session {
+                        // Frame-fed recording via DisplaySession broadcast
+                        let stream_name = format!("display_{}", display_id);
+                        match reg.start_stream(&stream_name).await {
+                            Ok(()) => {
+                                let sn = stream_name.clone();
+                                let reg_clone = registry.clone();
+                                let mut frame_rx = session.subscribe_frames();
+
+                                // Bridge task: subscribe to raw frames, JPEG-encode,
+                                // feed into the recording pipeline.
+                                tokio::spawn(async move {
+                                    loop {
+                                        match frame_rx.recv().await {
+                                            Ok(frame) => {
+                                                let jpeg_data = tokio::task::spawn_blocking({
+                                                    let frame = frame.clone();
+                                                    move || {
+                                                        // Convert BGRA/RGBA to RGBA for image crate
+                                                        let rgba_data = match frame.format {
+                                                            crate::display::FrameFormat::Rgba => {
+                                                                frame.data.clone()
+                                                            }
+                                                            crate::display::FrameFormat::Bgra => {
+                                                                let mut rgba = frame.data.clone();
+                                                                for chunk in rgba.chunks_exact_mut(4) {
+                                                                    chunk.swap(0, 2);
+                                                                }
+                                                                rgba
+                                                            }
+                                                        };
+                                                        let img = image::RgbaImage::from_raw(
+                                                            frame.width,
+                                                            frame.height,
+                                                            rgba_data,
+                                                        );
+                                                        if let Some(img) = img {
+                                                            let mut buf = std::io::Cursor::new(Vec::new());
+                                                            if img.write_to(&mut buf, image::ImageFormat::Jpeg).is_ok() {
+                                                                Some(buf.into_inner())
+                                                            } else {
+                                                                None
+                                                            }
+                                                        } else {
+                                                            None
+                                                        }
+                                                    }
+                                                }).await.ok().flatten();
+
+                                                if let Some(jpeg) = jpeg_data {
+                                                    let mut r = reg_clone.write().await;
+                                                    let _ = r.feed_frame(&sn, &jpeg).await;
+                                                }
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                eprintln!(
+                                                    "[recording] lagged {} frames for {}",
+                                                    n, sn
+                                                );
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                                bus.send(AppEvent::RecordingStarted { stream_name });
+                            }
+                            Err(e) => {
+                                bus.send(AppEvent::RecordingError {
+                                    stream_name: format!("display_{}", display_id),
+                                    message: e,
+                                });
+                            }
                         }
-                        Err(e) => {
-                            bus.send(AppEvent::RecordingError {
-                                stream_name: format!("display_{}", display_id),
-                                message: e,
-                            });
+                    } else {
+                        // No DisplaySession — use legacy x11grab/avfoundation path
+                        match reg.start_display(display_id, width, height).await {
+                            Ok(stream_name) => {
+                                bus.send(AppEvent::RecordingStarted { stream_name });
+                            }
+                            Err(e) => {
+                                bus.send(AppEvent::RecordingError {
+                                    stream_name: format!("display_{}", display_id),
+                                    message: e,
+                                });
+                            }
                         }
                     }
                 }
