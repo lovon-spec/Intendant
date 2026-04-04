@@ -1144,66 +1144,7 @@ html, body {
   position: relative;
   background: #000;
 }
-.vnc-auth-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(17, 17, 27, 0.85);
-  z-index: 10;
-}
-.vnc-auth-box {
-  background: var(--surface0);
-  border: 1px solid var(--surface1);
-  border-radius: 8px;
-  padding: 20px 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-width: 280px;
-}
-.vnc-auth-title {
-  font-weight: 600;
-  font-size: 14px;
-  color: var(--text);
-}
-.vnc-auth-label {
-  font-size: 12px;
-  color: var(--overlay0);
-}
-.vnc-auth-input {
-  padding: 6px 10px;
-  border: 1px solid var(--surface2);
-  border-radius: 4px;
-  background: var(--base);
-  color: var(--text);
-  font-size: 13px;
-  outline: none;
-}
-.vnc-auth-input:focus { border-color: var(--blue); }
-.vnc-auth-submit {
-  padding: 5px 16px;
-  border: 1px solid var(--green);
-  border-radius: 4px;
-  background: var(--green);
-  color: var(--base);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.vnc-auth-cancel {
-  padding: 5px 16px;
-  border: 1px solid var(--surface2);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--overlay0);
-  font-size: 12px;
-  cursor: pointer;
-}
-.display-canvas canvas {
-  /* Let noVNC control canvas dimensions for correct aspect ratio and
-     coordinate mapping. Only constrain max size to fit the container. */
+.display-canvas video {
   max-width: 100%;
   max-height: 100%;
 }
@@ -2473,8 +2414,6 @@ html, body {
         </div>
         <div id="debug-info" class="hidden" style="padding:8px 12px;background:var(--mantle);border-radius:4px;font-size:12px;color:var(--subtext1);margin-bottom:8px">
           <p style="margin:4px 0">Display: <code style="color:var(--blue)">:<span id="debug-display-id"></span></code></p>
-          <p style="margin:4px 0">VNC: <code style="color:var(--blue)">localhost:<span id="debug-vnc-port"></span></code></p>
-          <p style="margin:4px 0;color:var(--overlay0)">Connect: <code>vncviewer localhost:<span id="debug-vnc-port2"></span></code></p>
         </div>
       </div>
     </div>
@@ -2828,13 +2767,11 @@ let termBuffer = [];
 
 // Displays
 const displaySlots = new Map();
-let noVNCLoaded = false;
 
 // Activity display strip
 const displayThumbs = new Map();
 let stripExpanded = false;
 let stripHeight = 280;
-let noVNCLoadCallbacks = [];
 
 // Recording replay
 const recordingStreams = new Map(); // stream_name -> {segments, totalDuration, manifest}
@@ -3541,13 +3478,15 @@ function processCommands(cmds) {
       case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage': renderUsageTab(c); updateTickerFromUsage(c); break;
-      case 'add_display': addDisplaySlot(c.display_id, c.vnc_port, c.width, c.height); break;
+      case 'add_display': addDisplaySlot(c.display_id, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started': onSessionStarted(c.session_id, c.task); break;
       case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
-      case 'debug_screen_ready': onDebugScreenReady(c.display_id, c.vnc_port); break;
+      case 'debug_screen_ready': onDebugScreenReady(c.display_id); break;
+      case 'display_answer': { const s = displaySlots.get(c.display_id); if (s) s.handleAnswer(c.sdp); break; }
+      case 'display_ice': { const s = displaySlots.get(c.display_id); if (s) s.handleIceCandidate(c.candidate); break; }
       case 'debug_screen_torn_down': onDebugScreenTornDown(); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;
@@ -3943,39 +3882,24 @@ function initTerminal() {
   document.head.appendChild(script);
 }
 
-// ── Displays (noVNC — stays JS, manages VNC WebSocket + canvas) ──
-function loadNoVNC(cb) {
-  if (noVNCLoaded) { cb(); return; }
-  noVNCLoadCallbacks.push(cb);
-  if (noVNCLoadCallbacks.length > 1) return;
-  const script = document.createElement('script');
-  script.type = 'module';
-  script.textContent = `
-    import RFB from 'https://cdn.jsdelivr.net/gh/novnc/noVNC@v1.6.0/core/rfb.js';
-    window.__noVNC_RFB = RFB;
-    window.dispatchEvent(new Event('novnc-loaded'));
-  `;
-  window.addEventListener('novnc-loaded', () => {
-    noVNCLoaded = true;
-    for (const fn of noVNCLoadCallbacks) fn();
-    noVNCLoadCallbacks = [];
-  }, { once: true });
-  document.head.appendChild(script);
-}
+// ── Displays (WebRTC — video track + data channels for input) ──
 
 class DisplaySlot {
-  constructor(displayId, vncPort, width, height) {
+  constructor(displayId, width, height) {
     this.displayId = displayId;
-    this.vncPort = vncPort;
-    this._displayReadyWidth = width || 0;
-    this._displayReadyHeight = height || 0;
-    this.rfb = null;
+    this.width = width || 0;
+    this.height = height || 0;
+    this.pc = null;
+    this.controlChannel = null;  // reliable, ordered — keys, mouse buttons
+    this.pointerChannel = null;  // unreliable, maxRetransmits:0 — mouse move, scroll
+    this.videoEl = null;
     this.interactive = false;
     this.connected = false;
     this.streaming = false;
     this._streamIntervalId = null;
     this._streamFrameCounter = 0;
     this._streamCanvas = document.createElement('canvas');
+    this._boundHandlers = {};
     this.el = document.createElement('div');
     this.el.className = 'display-slot';
     this.el.innerHTML = `
@@ -3990,20 +3914,7 @@ class DisplaySlot {
         <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">&#x1F5D1; Delete</button>
         <span class="stream-frame-id" id="ds-frame-${displayId}" style="display:none;font-size:10px;color:var(--overlay0);margin-left:auto"></span>
       </div>
-      <div class="display-canvas" id="display-canvas-${displayId}">
-        <div class="vnc-auth-overlay" id="ds-auth-${displayId}" style="display:none">
-          <div class="vnc-auth-box">
-            <div class="vnc-auth-title">VNC Authentication</div>
-            <div class="vnc-auth-label">Display :${displayId} requires credentials</div>
-            <input type="text" class="vnc-auth-input" id="ds-auth-user-${displayId}" placeholder="Username" autocomplete="username" style="display:none">
-            <input type="password" class="vnc-auth-input" id="ds-auth-pw-${displayId}" placeholder="Password" autocomplete="off">
-            <div style="display:flex;gap:8px;justify-content:flex-end">
-              <button class="vnc-auth-cancel" id="ds-auth-cancel-${displayId}">Cancel</button>
-              <button class="vnc-auth-submit" id="ds-auth-ok-${displayId}">Connect</button>
-            </div>
-          </div>
-        </div>
-      </div>`;
+      <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
     this.noteInput = this.el.querySelector(`#ds-note-${displayId}`);
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
@@ -4011,116 +3922,187 @@ class DisplaySlot {
     this.streamBtn = this.el.querySelector(`#ds-stream-${displayId}`);
     this.frameIdEl = this.el.querySelector(`#ds-frame-${displayId}`);
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
-    this.authOverlay = this.el.querySelector(`#ds-auth-${displayId}`);
-    this.authUserInput = this.el.querySelector(`#ds-auth-user-${displayId}`);
-    this.authPwInput = this.el.querySelector(`#ds-auth-pw-${displayId}`);
-    this._authNeedsUsername = false;
     this.recordBtn = this.el.querySelector(`#ds-record-${displayId}`);
     this.deleteRecBtn = this.el.querySelector(`#ds-delete-rec-${displayId}`);
     this.recording = false;
+
+    // Video element for WebRTC media track
+    this.videoEl = document.createElement('video');
+    this.videoEl.autoplay = true;
+    this.videoEl.playsinline = true;
+    this.videoEl.muted = true;
+    this.videoEl.style.width = '100%';
+    this.videoEl.style.backgroundColor = '#000';
+    this.canvasEl.appendChild(this.videoEl);
+
     this.takeBtn.addEventListener('click', () => this.takeControl());
     this.releaseBtn.addEventListener('click', () => this.releaseControl());
     this.streamBtn.addEventListener('click', () => this.toggleStreaming());
     this.recordBtn.addEventListener('click', () => this.toggleRecording());
     this.deleteRecBtn.addEventListener('click', () => this.deleteRecording());
-    this.el.querySelector(`#ds-auth-ok-${displayId}`).addEventListener('click', () => this._submitAuth());
-    this.el.querySelector(`#ds-auth-cancel-${displayId}`).addEventListener('click', () => this._cancelAuth());
-    this.authPwInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this._submitAuth(); });
-    this.authUserInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.authPwInput.focus(); });
   }
-  _showAuth(types) {
-    this._authNeedsUsername = types && types.includes('username');
-    this.authUserInput.style.display = this._authNeedsUsername ? '' : 'none';
-    this.authUserInput.value = '';
-    this.authPwInput.value = '';
-    this.authOverlay.style.display = 'flex';
-    this.statusEl.textContent = 'Credentials required';
-    this.statusEl.className = 'display-status';
-    setTimeout(() => (this._authNeedsUsername ? this.authUserInput : this.authPwInput).focus(), 50);
-  }
-  _submitAuth() {
-    const creds = { password: this.authPwInput.value };
-    if (this._authNeedsUsername) creds.username = this.authUserInput.value;
-    this.authOverlay.style.display = 'none';
-    if (creds.password && this.rfb) {
-      // Persist for auto-reconnect across page refreshes and browser restarts
-      localStorage.setItem(`vnc_pw_${this.displayId}`, creds.password);
-      if (this._authNeedsUsername && creds.username) localStorage.setItem(`vnc_user_${this.displayId}`, creds.username);
-      this.rfb.sendCredentials(creds);
-    }
-  }
-  _cancelAuth() {
-    this.authOverlay.style.display = 'none';
-    this.statusEl.textContent = 'Auth cancelled';
-    this.statusEl.className = 'display-status error';
-  }
-  connectPassive() { loadNoVNC(() => this._connectVNC()); }
-  _connectVNC() {
-    const RFB = window.__noVNC_RFB;
-    if (!RFB) return;
-    try {
-      this.rfb = new RFB(this.canvasEl, buildWsUrl(`/vnc?port=${this.vncPort}`));
-      this.rfb.viewOnly = true; this.rfb.scaleViewport = true;
-      this.rfb.resizeSession = false; this.rfb.background = '#1e1e2e';
-      this.rfb.showDotCursor = true; // Fallback cursor when VNC server doesn't send one
-      this.rfb.compressionLevel = 9; // Maximum compression to reduce data over the proxy
-      this.rfb.addEventListener('connect', () => {
+
+  connect() {
+    // ICE config — default empty for local, can be injected by server
+    const config = { iceServers: [] };
+    this.pc = new RTCPeerConnection(config);
+
+    // Create data channels BEFORE offer (browser is the offerer)
+    this.controlChannel = this.pc.createDataChannel('control', { ordered: true });
+    this.pointerChannel = this.pc.createDataChannel('pointer', {
+      ordered: false,
+      maxRetransmits: 0
+    });
+
+    // Handle incoming video track
+    this.pc.ontrack = (e) => {
+      this.videoEl.srcObject = e.streams[0];
+      this.connected = true;
+      const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
+      this.statusEl.textContent = `Connected (view-only)${res}`;
+      this.statusEl.className = 'display-status connected';
+    };
+
+    // ICE candidates — send to server via WASM app
+    this.pc.onicecandidate = (e) => {
+      if (e.candidate && app) {
+        app.send_server_action({
+          action: 'display_ice',
+          display_id: this.displayId,
+          candidate: e.candidate.toJSON()
+        });
+      }
+    };
+
+    // Connection state changes
+    this.pc.onconnectionstatechange = () => {
+      const state = this.pc.connectionState;
+      if (state === 'connected') {
         this.connected = true;
-        // Show framebuffer resolution from the RFB connection
-        const w = this.rfb._fbWidth || 0;
-        const h = this.rfb._fbHeight || 0;
-        const res = w > 0 ? ` ${w}x${h}` : '';
+        const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
         this.statusEl.textContent = `Connected (view-only)${res}`;
         this.statusEl.className = 'display-status connected';
-        // Note: no Retina coordinate correction needed here. noVNC with
-        // scaleViewport maps mouse events to framebuffer coordinates, and
-        // macOS Screen Sharing accepts device-pixel coordinates directly.
-      });
-      this.rfb.addEventListener('disconnect', (e) => {
+      } else if (state === 'disconnected' || state === 'failed') {
         this.connected = false;
-        this.statusEl.textContent = e.detail.clean ? 'Disconnected' : 'Connection lost';
+        this.statusEl.textContent = `Connection ${state}`;
         this.statusEl.className = 'display-status error';
-        if (!e.detail.clean) setTimeout(() => { if (!this.connected) this._connectVNC(); }, 3000);
-      });
-      this.rfb.addEventListener('credentialsrequired', (e) => {
-        // Auto-send stored credentials from localStorage
-        const storedPw = localStorage.getItem(`vnc_pw_${this.displayId}`);
-        if (storedPw && this.rfb) {
-          const creds = { password: storedPw };
-          const storedUser = localStorage.getItem(`vnc_user_${this.displayId}`);
-          if (storedUser) creds.username = storedUser;
-          this.rfb.sendCredentials(creds);
-        } else {
-          this._showAuth(e.detail && e.detail.types);
-        }
-      });
-      this.rfb.addEventListener('securityfailure', () => {
-        // Clear stored credentials so wrong passwords don't loop on auto-reconnect
-        localStorage.removeItem(`vnc_pw_${this.displayId}`);
-        localStorage.removeItem(`vnc_user_${this.displayId}`);
-        this.statusEl.textContent = 'Security error'; this.statusEl.className = 'display-status error';
-      });
-    } catch { this.statusEl.textContent = 'Failed'; this.statusEl.className = 'display-status error'; }
+      }
+    };
+
+    // Create offer and send to server
+    this.pc.createOffer().then(offer => {
+      return this.pc.setLocalDescription(offer);
+    }).then(() => {
+      if (app) {
+        app.send_server_action({
+          action: 'display_offer',
+          display_id: this.displayId,
+          sdp: this.pc.localDescription.sdp
+        });
+      }
+    }).catch(err => {
+      console.error('WebRTC offer failed:', err);
+      this.statusEl.textContent = 'Failed to create offer';
+      this.statusEl.className = 'display-status error';
+    });
   }
+
+  handleAnswer(sdp) {
+    if (!this.pc) return;
+    this.pc.setRemoteDescription({ type: 'answer', sdp }).catch(err => {
+      console.error('Failed to set remote description:', err);
+    });
+  }
+
+  handleIceCandidate(candidate) {
+    if (!this.pc) return;
+    this.pc.addIceCandidate(candidate).catch(err => {
+      console.error('Failed to add ICE candidate:', err);
+    });
+  }
+
   takeControl() {
-    if (!this.rfb) return;
-    this.interactive = true; this.rfb.viewOnly = false; this.rfb.focus();
+    if (!this.pc) return;
+    this.interactive = true;
     this.takeBtn.style.display = 'none'; this.releaseBtn.style.display = '';
     this.noteInput.style.display = '';
-    const w = this.rfb._fbWidth || 0, h = this.rfb._fbHeight || 0;
-    this.statusEl.textContent = w > 0 ? `Interactive ${w}x${h}` : 'Interactive';
+    const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
+    this.statusEl.textContent = `Interactive${res}`;
     this.statusEl.className = 'display-status connected';
     if (app) app.take_display(BigInt(this.displayId));
+
+    const vid = this.videoEl;
+    vid.tabIndex = 0;
+    vid.focus();
+
+    const normalize = (e) => {
+      const rect = vid.getBoundingClientRect();
+      return {
+        x: Math.max(0, Math.min((e.clientX - rect.left) / rect.width, 0.9999)),
+        y: Math.max(0, Math.min((e.clientY - rect.top) / rect.height, 0.9999))
+      };
+    };
+
+    const sendControl = (msg) => {
+      if (this.controlChannel && this.controlChannel.readyState === 'open') {
+        this.controlChannel.send(JSON.stringify(msg));
+      }
+    };
+    const sendPointer = (msg) => {
+      if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
+        this.pointerChannel.send(JSON.stringify(msg));
+      }
+    };
+
+    this._boundHandlers.keydown = (e) => {
+      e.preventDefault();
+      sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+    };
+    this._boundHandlers.keyup = (e) => {
+      e.preventDefault();
+      sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+    };
+    this._boundHandlers.mousedown = (e) => {
+      e.preventDefault();
+      vid.focus();
+      const { x, y } = normalize(e);
+      sendControl({ t: 'md', x, y, b: e.button });
+    };
+    this._boundHandlers.mouseup = (e) => {
+      e.preventDefault();
+      const { x, y } = normalize(e);
+      sendControl({ t: 'mu', x, y, b: e.button });
+    };
+    this._boundHandlers.mousemove = (e) => {
+      const { x, y } = normalize(e);
+      sendPointer({ t: 'mm', x, y });
+    };
+    this._boundHandlers.wheel = (e) => {
+      e.preventDefault();
+      const { x, y } = normalize(e);
+      sendPointer({ t: 'sc', x, y, dx: e.deltaX, dy: e.deltaY });
+    };
+    this._boundHandlers.contextmenu = (e) => e.preventDefault();
+
+    for (const [evt, handler] of Object.entries(this._boundHandlers)) {
+      vid.addEventListener(evt, handler, { passive: false });
+    }
   }
+
   releaseControl() {
-    if (!this.rfb) return;
-    this.interactive = false; this.rfb.viewOnly = true;
+    this.interactive = false;
+    const vid = this.videoEl;
+    for (const [evt, handler] of Object.entries(this._boundHandlers)) {
+      vid.removeEventListener(evt, handler);
+    }
+    this._boundHandlers = {};
     const note = this.noteInput.value.trim() || undefined;
     this.noteInput.value = ''; this.noteInput.style.display = 'none';
     this.takeBtn.style.display = ''; this.releaseBtn.style.display = 'none';
     this.statusEl.textContent = this.connected ? 'Connected (view-only)' : 'Disconnected';
     if (app) app.release_display(BigInt(this.displayId), note);
   }
+
   toggleStreaming() {
     if (this.streaming) { this.stopStreaming(); } else { this.startStreaming(); }
   }
@@ -4134,10 +4116,10 @@ class DisplaySlot {
     const ctx = this._streamCanvas.getContext('2d');
     this._streamIntervalId = setInterval(() => {
       if (!this.streaming || !this.connected || !app) return;
-      const srcCanvas = this.canvasEl.querySelector('canvas');
-      if (!srcCanvas || !srcCanvas.width || !srcCanvas.height) return;
-      const sw = srcCanvas.width;
-      const sh = srcCanvas.height;
+      const vid = this.videoEl;
+      if (!vid.videoWidth || !vid.videoHeight) return;
+      const sw = vid.videoWidth;
+      const sh = vid.videoHeight;
       this._streamFrameCounter++;
       const frameId = streamName + '-f' + String(this._streamFrameCounter).padStart(5, '0');
       // Live-res: scale to LIVE_RES maintaining aspect ratio within a square
@@ -4146,7 +4128,7 @@ class DisplaySlot {
       const lh = Math.round(sh * scale);
       this._streamCanvas.width = lw;
       this._streamCanvas.height = lh;
-      ctx.drawImage(srcCanvas, 0, 0, lw, lh);
+      ctx.drawImage(vid, 0, 0, lw, lh);
       const liveJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.8);
       const liveB64 = liveJpeg.split(',')[1];
       // Skip duplicate frames for voice model — still send HQ to server for archival
@@ -4165,11 +4147,11 @@ class DisplaySlot {
         try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
       }
       updateTickerFrames();
-      // HQ: logical resolution (not Retina 2x) — always sent for archival
+      // HQ: logical resolution — always sent for archival
       const dpr = window.devicePixelRatio || 1;
       this._streamCanvas.width = Math.round(sw / dpr);
       this._streamCanvas.height = Math.round(sh / dpr);
-      ctx.drawImage(srcCanvas, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
+      ctx.drawImage(vid, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
       const hqJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.80);
       const hqB64 = hqJpeg.split(',')[1];
       app.send_video_frame_to_server(hqB64, frameId, streamName);
@@ -4210,21 +4192,26 @@ class DisplaySlot {
   }
   disconnect() {
     this.stopStreaming();
-    if (this.rfb) { this.rfb.disconnect(); this.rfb = null; }
+    this.releaseControl();
+    if (this.controlChannel) { this.controlChannel.close(); this.controlChannel = null; }
+    if (this.pointerChannel) { this.pointerChannel.close(); this.pointerChannel = null; }
+    if (this.pc) { this.pc.close(); this.pc = null; }
     this.connected = false;
+    this.statusEl.textContent = 'Disconnected';
+    this.statusEl.className = 'display-status error';
   }
 }
 
-function addDisplaySlot(displayId, vncPort, width, height) {
-  if (displaySlots.has(displayId) || !vncPort) return;
-  const slot = new DisplaySlot(displayId, vncPort, width, height);
+function addDisplaySlot(displayId, width, height) {
+  if (displaySlots.has(displayId)) return;
+  const slot = new DisplaySlot(displayId, width, height);
   displaySlots.set(displayId, slot);
   const container = document.getElementById('displays-container');
   const placeholder = document.getElementById('displays-placeholder');
   if (placeholder) placeholder.style.display = 'none';
   container.classList.add('has-displays');
   container.appendChild(slot.el);
-  slot.connectPassive();
+  slot.connect();
   addDisplayThumb(displayId);
 }
 
@@ -4256,22 +4243,14 @@ function moveCanvasToThumb(slot) {
   if (!thumb || !slot.canvasEl) return;
   // Auto-release control when moving to view-only strip
   if (slot.interactive) {
-    slot.interactive = false;
-    if (slot.rfb) slot.rfb.viewOnly = true;
-    slot.takeBtn.style.display = '';
-    slot.releaseBtn.style.display = 'none';
-    slot.noteInput.style.display = 'none';
-    slot.noteInput.value = '';
-    slot.statusEl.textContent = slot.connected ? 'Connected (view-only)' : 'Disconnected';
+    slot.releaseControl();
   }
   thumb.appendChild(slot.canvasEl);
-  requestAnimationFrame(() => { if (slot.rfb) slot.rfb.scaleViewport = true; });
 }
 
 function moveCanvasToSlot(slot) {
   if (!slot.canvasEl) return;
   slot.el.appendChild(slot.canvasEl);
-  requestAnimationFrame(() => { if (slot.rfb) slot.rfb.scaleViewport = true; });
 }
 
 function relocateDisplays(tabId) {
@@ -4301,11 +4280,6 @@ function toggleDisplayStrip() {
     toggle.title = 'Expand displays';
   }
 
-  requestAnimationFrame(() => {
-    for (const slot of displaySlots.values()) {
-      if (slot.rfb) slot.rfb.scaleViewport = true;
-    }
-  });
 }
 
 // ── Activity display strip split-drag ──
@@ -4335,11 +4309,6 @@ function toggleDisplayStrip() {
     const h = Math.max(minPx, Math.min(maxPx, y));
     strip.style.height = h + 'px';
     stripHeight = h;
-    requestAnimationFrame(() => {
-      for (const slot of displaySlots.values()) {
-        if (slot.rfb) slot.rfb.scaleViewport = true;
-      }
-    });
   });
 
   document.addEventListener('mouseup', () => {
@@ -4973,7 +4942,7 @@ function switchRecordingStream(streamName) {
   });
 }
 
-// ── Displays split handle (drag to resize VNC vs Recording) ──
+// ── Displays split handle (drag to resize displays vs recording) ──
 {
   const handle = document.getElementById('displays-split-handle');
   const tab = document.getElementById('tab-displays');
@@ -4985,7 +4954,7 @@ function switchRecordingStream(streamName) {
     handle.classList.add('dragging');
     document.body.style.cursor = 'row-resize';
     document.body.style.userSelect = 'none';
-    // Prevent VNC canvas from capturing mouse during drag
+    // Prevent video element from capturing mouse during drag
     displays.style.pointerEvents = 'none';
     e.preventDefault();
   });
@@ -6682,7 +6651,7 @@ function toggleDebugRecording() {
   }
 }
 
-function onDebugScreenReady(displayId, vncPort) {
+function onDebugScreenReady(displayId) {
   debugScreenActive = true;
   document.getElementById('debug-status').textContent = 'Active';
   document.getElementById('debug-status').style.color = 'var(--green)';
@@ -6690,8 +6659,6 @@ function onDebugScreenReady(displayId, vncPort) {
   document.getElementById('debug-record-btn').disabled = false;
   document.getElementById('debug-info').classList.remove('hidden');
   document.getElementById('debug-display-id').textContent = displayId;
-  document.getElementById('debug-vnc-port').textContent = vncPort;
-  document.getElementById('debug-vnc-port2').textContent = vncPort;
 }
 
 function onDebugScreenTornDown() {
@@ -7556,11 +7523,6 @@ document.getElementById('activity-display-strip').querySelector('.activity-displ
     handle.classList.remove('dragging');
     document.body.style.cursor = '';
     document.body.style.userSelect = '';
-    requestAnimationFrame(() => {
-      for (const slot of displaySlots.values()) {
-        if (slot.rfb) slot.rfb.scaleViewport = true;
-      }
-    });
   });
 })();
 

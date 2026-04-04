@@ -66,7 +66,6 @@ pub enum UiCommand {
     },
     AddDisplay {
         display_id: u64,
-        vnc_port: u64,
         #[serde(default)]
         width: u64,
         #[serde(default)]
@@ -93,7 +92,6 @@ pub enum UiCommand {
     },
     DebugScreenReady {
         display_id: u64,
-        vnc_port: u64,
     },
     DebugScreenTornDown,
     ShowBadge {
@@ -318,7 +316,7 @@ pub struct AppState {
     active_tab: String,
 
     // Displays
-    known_displays: Vec<(u64, u64)>, // (display_id, vnc_port)
+    known_displays: Vec<u64>, // display_id
 
     // Recordings
     known_recordings: Vec<String>,
@@ -809,16 +807,13 @@ impl AppState {
 
             "display_ready" => {
                 let display_id = msg["display_id"].as_u64().unwrap_or(0);
-                let vnc_port = msg["vnc_port"].as_u64().unwrap_or(0);
                 let width = msg["width"].as_u64().unwrap_or(0);
                 let height = msg["height"].as_u64().unwrap_or(0);
                 cmds.extend(self.add_log("info", &format!("Display :{} ready", display_id), None, "system"));
-                if vnc_port > 0 {
-                    if !self.known_displays.iter().any(|&(id, _)| id == display_id) {
-                        self.known_displays.push((display_id, vnc_port));
-                    }
-                    cmds.push(UiCommand::AddDisplay { display_id, vnc_port, width, height });
+                if !self.known_displays.iter().any(|&id| id == display_id) {
+                    self.known_displays.push(display_id);
                 }
+                cmds.push(UiCommand::AddDisplay { display_id, width, height });
             }
 
             "display_taken" => {
@@ -876,9 +871,8 @@ impl AppState {
 
             "debug_screen_ready" => {
                 let display_id = msg["display_id"].as_u64().unwrap_or(0);
-                let vnc_port = msg["vnc_port"].as_u64().unwrap_or(0);
-                cmds.extend(self.add_log("info", &format!("Debug screen ready on :{}, VNC port {}", display_id, vnc_port), None, "system"));
-                cmds.push(UiCommand::DebugScreenReady { display_id, vnc_port });
+                cmds.extend(self.add_log("info", &format!("Debug screen ready on :{}", display_id), None, "system"));
+                cmds.push(UiCommand::DebugScreenReady { display_id });
             }
 
             "debug_screen_torn_down" => {
@@ -1416,10 +1410,11 @@ mod tests {
     #[test]
     fn handle_event_display_ready() {
         let mut s = AppState::new();
-        let msg = json!({"event": "display_ready", "display_id": 99, "vnc_port": 5999});
+        let msg = json!({"event": "display_ready", "display_id": 99});
         let cmds = s.handle_message(&msg);
         assert_eq!(s.known_displays.len(), 1);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::AddDisplay { display_id: 99, vnc_port: 5999, .. })));
+        assert_eq!(s.known_displays[0], 99);
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::AddDisplay { display_id: 99, .. })));
     }
 
     #[test]
