@@ -118,6 +118,7 @@ pub struct ActiveSessionState {
     pub frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
     pub session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
     pub recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
+    pub session_registry: Option<crate::display::SharedSessionRegistry>,
 }
 
 impl ActiveSessionState {
@@ -127,6 +128,7 @@ impl ActiveSessionState {
             frame_registry: None,
             session_log: None,
             recording_registry: None,
+            session_registry: None,
         }))
     }
 }
