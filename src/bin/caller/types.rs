@@ -141,14 +141,12 @@ pub enum OutboundEvent {
     },
     DebugScreenReady {
         display_id: u32,
-        vnc_port: u32,
     },
     DebugScreenTornDown {
         display_id: u32,
     },
     DisplayReady {
         display_id: u32,
-        vnc_port: Option<u32>,
         width: u32,
         height: u32,
     },

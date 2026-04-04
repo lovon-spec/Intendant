@@ -110,7 +110,6 @@ pub enum AppEvent {
     },
     DebugScreenReady {
         display_id: u32,
-        vnc_port: u32,
     },
     DebugScreenTornDown {
         display_id: u32,
@@ -145,7 +144,6 @@ pub enum AppEvent {
     // Vision display ready
     DisplayReady {
         display_id: u32,
-        vnc_port: Option<u32>,
         width: u32,
         height: u32,
     },
@@ -539,10 +537,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 reason: reason.clone(),
             })
         }
-        AppEvent::DebugScreenReady { display_id, vnc_port } => {
+        AppEvent::DebugScreenReady { display_id } => {
             Some(OutboundEvent::DebugScreenReady {
                 display_id: *display_id,
-                vnc_port: *vnc_port,
             })
         }
         AppEvent::DebugScreenTornDown { display_id } => {
@@ -578,12 +575,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         }),
         AppEvent::DisplayReady {
             display_id,
-            vnc_port,
             width,
             height,
         } => Some(OutboundEvent::DisplayReady {
             display_id: *display_id,
-            vnc_port: *vnc_port,
             width: *width,
             height: *height,
         }),
@@ -840,8 +835,8 @@ fn write_event_to_session_log(
         }
 
         // Display / vision
-        AppEvent::DisplayReady { display_id, vnc_port, width, height } => {
-            log.display_ready(*display_id, *vnc_port, *width, *height);
+        AppEvent::DisplayReady { display_id, width, height } => {
+            log.display_ready(*display_id, *width, *height);
         }
         AppEvent::DisplayTaken { display_id } => {
             log.display_taken(*display_id);
@@ -860,8 +855,8 @@ fn write_event_to_session_log(
             };
             log.info(&msg);
         }
-        AppEvent::DebugScreenReady { display_id, vnc_port } => {
-            log.debug_screen_ready(*display_id, *vnc_port);
+        AppEvent::DebugScreenReady { display_id } => {
+            log.debug_screen_ready(*display_id);
         }
         AppEvent::DebugScreenTornDown { display_id } => {
             log.debug_screen_torn_down(*display_id);

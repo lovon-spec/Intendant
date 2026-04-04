@@ -1,6 +1,6 @@
 //! Debug screen management for e2e testing.
 //!
-//! On Linux: Xvfb + x11vnc + passive Firefox.
+//! On Linux: Xvfb + passive Firefox.
 //! On macOS: opens a native browser window (no virtual display needed).
 //!
 //! Provides a one-click observer display that records what happens in the
@@ -18,13 +18,12 @@ const DEBUG_DISPLAY_MIN: u32 = 50;
 const DEBUG_DISPLAY_MAX: u32 = 59;
 
 /// RAII guard for the debug screen.
-/// On Linux: Xvfb + x11vnc + Firefox. On macOS: just a browser window.
-/// Kills the browser on drop; XvfbGuard (if present) handles Xvfb/x11vnc.
+/// On Linux: Xvfb + Firefox. On macOS: just a browser window.
+/// Kills the browser on drop; XvfbGuard (if present) handles Xvfb.
 pub struct DebugScreen {
     pub xvfb_guard: Option<vision::XvfbGuard>,
     pub firefox: Child,
     pub display_id: u32,
-    pub vnc_port: u32,
 }
 
 impl Drop for DebugScreen {
@@ -61,7 +60,7 @@ pub fn daemon_recordings_dir() -> PathBuf {
 }
 
 /// Set up a debug screen.
-/// Linux: Xvfb + x11vnc + passive Firefox.
+/// Linux: Xvfb + passive Firefox.
 /// macOS: opens a native browser window via `open`.
 #[cfg(target_os = "macos")]
 pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
@@ -82,11 +81,10 @@ pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
         xvfb_guard: None,
         firefox: browser,
         display_id: 0,
-        vnc_port: 0,
     })
 }
 
-/// Set up a debug screen: Xvfb + x11vnc + passive Firefox.
+/// Set up a debug screen: Xvfb + passive Firefox.
 #[cfg(target_os = "linux")]
 pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
     let display_id = find_free_debug_display();
@@ -99,8 +97,6 @@ pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
     let xvfb_guard = vision::launch_display(&config)
         .await
         .map_err(|e| format!("Failed to launch debug Xvfb: {}", e))?;
-
-    let vnc_port = xvfb_guard.vnc_port().unwrap_or(5900 + display_id);
 
     // Create/reuse debug Firefox profile
     let profile_dir = dirs::home_dir()
@@ -145,7 +141,6 @@ user_pref("datareporting.policy.dataSubmissionEnabled", false);
         xvfb_guard: Some(xvfb_guard),
         firefox,
         display_id,
-        vnc_port,
     })
 }
 
@@ -186,14 +181,12 @@ pub fn spawn_debug_screen_handler(
                     match setup_debug_screen(web_port).await {
                         Ok(s) => {
                             let display_id = s.display_id;
-                            let vnc_port = s.vnc_port;
                             eprintln!(
-                                "[debug] Screen ready on :{}, VNC port {}",
-                                display_id, vnc_port
+                                "[debug] Screen ready on :{}",
+                                display_id
                             );
                             bus.send(AppEvent::DebugScreenReady {
                                 display_id,
-                                vnc_port,
                             });
                             screen = Some(s);
                         }

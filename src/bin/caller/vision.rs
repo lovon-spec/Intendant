@@ -103,11 +103,11 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
 
 // ── Display allocation ──────────────────────────────────────────────────────
 
-/// Preferred display number. Keeps VNC port predictable at 5999.
+/// Preferred display number.
 #[cfg(target_os = "linux")]
 const PREFERRED_DISPLAY: u32 = 99;
 
-/// Find a free X display number, preferring :99 for a predictable VNC port.
+/// Find a free X display number, preferring :99.
 ///
 /// Strategy for each candidate display:
 /// 1. No lock file → use it
@@ -144,81 +144,22 @@ fn find_free_display() -> u32 {
 
 // ── Xvfb guard ──────────────────────────────────────────────────────────────
 
-/// Guard that kills the Xvfb (and optional x11vnc) process when dropped.
+/// Guard that kills the Xvfb process when dropped.
 /// Cleans up the lock file and socket after killing.
 pub struct XvfbGuard {
     child: Child,
-    vnc_child: Option<Child>,
     display_id: u32,
-    vnc_port: Option<u32>,
-}
-
-impl XvfbGuard {
-    /// Returns the VNC port if x11vnc was successfully launched.
-    pub fn vnc_port(&self) -> Option<u32> {
-        self.vnc_port
-    }
 }
 
 impl Drop for XvfbGuard {
     fn drop(&mut self) {
-        if let Some(ref mut vnc) = self.vnc_child {
-            let _ = vnc.start_kill();
-        }
         let _ = self.child.start_kill();
         // Clean up lock file and socket so the display number can be reused
         remove_stale_lock(self.display_id);
     }
 }
 
-// ── VNC detection ───────────────────────────────────────────────────────────
-
-/// Detect if a VNC server is already running for the given display.
-/// Checks the standard VNC port (5900 + display_id).
-pub fn detect_vnc_port(display_id: u32) -> Option<u32> {
-    let port = 5900 + display_id;
-    // Quick check: try to connect to the port
-    use std::net::TcpStream;
-    match TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", port).parse().ok()?,
-        std::time::Duration::from_millis(100),
-    ) {
-        Ok(_) => Some(port),
-        Err(_) => None,
-    }
-}
-
 // ── Display launch (Linux / X11) ────────────────────────────────────────────
-
-/// Best-effort launch of x11vnc on the given display.
-/// Returns `Some(Child)` on success, `None` if x11vnc is not installed or fails to start.
-#[cfg(target_os = "linux")]
-pub async fn launch_vnc(display_arg: &str, port: u32) -> Option<Child> {
-    let child = tokio::process::Command::new("x11vnc")
-        .args([
-            "-display",
-            display_arg,
-            "-rfbport",
-            &port.to_string(),
-            "-nopw",
-            "-forever",
-            "-shared",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn();
-
-    match child {
-        Ok(c) => {
-            // Brief wait for x11vnc to bind the port
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            Some(c)
-        }
-        Err(_) => None,
-    }
-}
 
 /// Launch Xvfb on the given display with the given resolution.
 /// The config's target must be `DisplayTarget::Virtual`; panics otherwise.
@@ -276,16 +217,9 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     // Set DISPLAY env var so the runtime subprocess inherits it
     std::env::set_var("DISPLAY", &display_arg);
 
-    // Best-effort: launch x11vnc so users can watch the display via VNC
-    let vnc_port_num = 5900 + display_id;
-    let vnc_child = launch_vnc(&display_arg, vnc_port_num).await;
-    let has_vnc = vnc_child.is_some();
-
     Ok(XvfbGuard {
         child,
         display_id,
-        vnc_child,
-        vnc_port: if has_vnc { Some(vnc_port_num) } else { None },
     })
 }
 
@@ -393,27 +327,6 @@ mod tests {
         assert!(!std::path::Path::new(&lock).exists());
         // Clean up socket if it was created
         let _ = std::fs::remove_file(&socket);
-    }
-
-    #[test]
-    fn vnc_port_tracks_display_id() {
-        // VNC port should always be 5900 + display_id
-        let config = display_config_for_provider("openai");
-        // Target should be a Virtual display
-        assert!(matches!(config.target, DisplayTarget::Virtual { .. }));
-        // With display :99, VNC port is 5999
-        assert_eq!(5900 + 99, 5999);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn launch_vnc_missing_binary() {
-        // x11vnc may or may not be installed; if not, launch_vnc returns None gracefully
-        let result = launch_vnc(":9999", 15999).await;
-        // Either way, this should not panic or error
-        if let Some(mut c) = result {
-            let _ = c.start_kill();
-        }
     }
 
     #[cfg(target_os = "linux")]

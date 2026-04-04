@@ -1152,7 +1152,6 @@ impl SessionLog {
     pub fn display_ready(
         &mut self,
         display_id: u32,
-        vnc_port: Option<u32>,
         width: u32,
         height: u32,
     ) {
@@ -1162,12 +1161,11 @@ impl SessionLog {
             event: "display_ready".to_string(),
             level: Some("info".to_string()),
             message: Some(format!(
-                "Display :{} ready ({}x{}, vnc={:?})",
-                display_id, width, height, vnc_port
+                "Display :{} ready ({}x{})",
+                display_id, width, height
             )),
             data: Some(serde_json::json!({
                 "display_id": display_id,
-                "vnc_port": vnc_port,
                 "width": width,
                 "height": height,
             })),
@@ -1212,19 +1210,15 @@ impl SessionLog {
     }
 
     /// Log debug screen ready.
-    pub fn debug_screen_ready(&mut self, display_id: u32, vnc_port: u32) {
+    pub fn debug_screen_ready(&mut self, display_id: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
             event: "debug_screen_ready".to_string(),
             level: Some("info".to_string()),
-            message: Some(format!(
-                "Debug screen :{} ready (vnc port {})",
-                display_id, vnc_port
-            )),
+            message: Some(format!("Debug screen :{} ready", display_id)),
             data: Some(serde_json::json!({
                 "display_id": display_id,
-                "vnc_port": vnc_port,
             })),
             file: None,
             file2: None,

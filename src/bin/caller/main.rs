@@ -670,17 +670,14 @@ async fn maybe_auto_launch_xvfb(
             .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
             .unwrap_or(default_display);
         let (width, height) = query_display_resolution(display_id);
-        // Check if x11vnc is already running on this display
-        let vnc_port = vision::detect_vnc_port(display_id);
         slog(session_log, |l| {
             l.info(&format!(
-                "Using existing display :{} ({}x{}, vnc={:?})",
-                display_id, width, height, vnc_port
+                "Using existing display :{} ({}x{})",
+                display_id, width, height
             ))
         });
         bus.send(AppEvent::DisplayReady {
             display_id,
-            vnc_port,
             width,
             height,
         });
@@ -704,16 +701,9 @@ async fn maybe_auto_launch_xvfb(
     });
     match vision::launch_display(&config).await {
         Ok(guard) => {
-            let vnc_port = guard.vnc_port();
-            if let Some(port) = vnc_port {
-                slog(session_log, |l| {
-                    l.info(&format!("VNC server available at vnc://localhost:{}", port))
-                });
-            }
             let display_id = virtual_id;
             bus.send(AppEvent::DisplayReady {
                 display_id,
-                vnc_port,
                 width: config.width,
                 height: config.height,
             });
@@ -826,7 +816,6 @@ async fn start_external_display_recordings(
             Ok(stream_name) => {
                 bus.send(AppEvent::DisplayReady {
                     display_id: id,
-                    vnc_port: None,
                     width,
                     height,
                 });
@@ -4178,10 +4167,10 @@ async fn try_cu_first(
     ).await)
 }
 
-/// Spawn a listener that reacts to `UserDisplayGranted` events by launching
-/// VNC and emitting `DisplayReady`. This ensures the user display is wired into
-/// the existing display lifecycle regardless of how the grant was triggered
-/// (approval flow, TUI hotkey, MCP, control socket).
+/// Spawn a listener that reacts to `UserDisplayGranted` events by emitting
+/// `DisplayReady`. This ensures the user display is wired into the existing
+/// display lifecycle regardless of how the grant was triggered (approval flow,
+/// TUI hotkey, MCP, control socket).
 pub fn spawn_user_display_listener(bus: EventBus) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut rx = bus.subscribe();
@@ -4197,73 +4186,16 @@ pub fn spawn_user_display_listener(bus: EventBus) -> tokio::task::JoinHandle<()>
     })
 }
 
-/// Handle user display grant: launch VNC on the user's display and emit DisplayReady.
+/// Handle user display grant: emit DisplayReady for the user's display.
 ///
 /// This wires the user's display into the same lifecycle as virtual displays —
-/// the recording listener starts ffmpeg, the web dashboard shows a VNC/noVNC
-/// slot, and the browser captures frames from the noVNC canvas to stream to
-/// the live model (Gemini Live / OpenAI Realtime). VNC is required — without
-/// it there is no canvas to capture from and no display slot in the dashboard.
+/// the recording listener starts ffmpeg and the web dashboard shows a display slot.
 async fn activate_user_display(bus: &EventBus) {
     let display_id: u32 = 0;
     let (width, height) = query_display_resolution(display_id);
 
-    // Best-effort: launch x11vnc on the user's display
-    #[allow(unused_mut)]
-    let mut vnc_port: Option<u32> = vision::detect_vnc_port(display_id);
-
-    #[cfg(target_os = "linux")]
-    if vnc_port.is_none() {
-        let display_arg = computer_use::DisplayTarget::UserSession.display_env_string();
-        let port = 5900 + display_id;
-        if let Some(child) = vision::launch_vnc(&display_arg, port).await {
-            // Keep x11vnc alive for the session by holding the Child in a task.
-            tokio::spawn(async move {
-                let mut c = child;
-                let _ = c.wait().await;
-            });
-            vnc_port = Some(port);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    if vnc_port.is_none() {
-        // Open System Settings to the Screen Sharing pane so the user can
-        // enable it with one click. Once VNC is up on port 5900, the web
-        // dashboard can connect and any further security prompts can be
-        // resolved through the VNC viewer.
-        eprintln!(
-            "[user_display] Screen Sharing not detected on port 5900. \
-             Opening System Settings — please enable Screen Sharing."
-        );
-        let _ = tokio::process::Command::new("open")
-            .arg("x-apple.systempreferences:com.apple.Sharing-Settings.extension")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-
-        // Poll for VNC to come up (user needs to click the toggle)
-        for _ in 0..30 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if let Some(port) = vision::detect_vnc_port(display_id) {
-                vnc_port = Some(port);
-                eprintln!("[user_display] Screen Sharing detected on port {}", port);
-                break;
-            }
-        }
-        if vnc_port.is_none() {
-            eprintln!(
-                "[user_display] Screen Sharing still not detected after 30s. \
-                 Display will not appear in the web dashboard. Enable Screen \
-                 Sharing in System Settings for VNC-based streaming."
-            );
-        }
-    }
-
     bus.send(AppEvent::DisplayReady {
         display_id,
-        vnc_port,
         width,
         height,
     });

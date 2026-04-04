@@ -1723,21 +1723,11 @@ impl App {
             }
             AppEvent::DisplayReady {
                 display_id,
-                vnc_port,
                 ..
             } => {
-                let info = if let Some(port) = vnc_port {
-                    format!(":{}  VNC:{}", display_id, port)
-                } else {
-                    format!(":{}", display_id)
-                };
+                let info = format!(":{}", display_id);
                 self.display_info = Some(info.clone());
-                let log_msg = if let Some(port) = vnc_port {
-                    format!("Display :{} ready, VNC on port {}", display_id, port)
-                } else {
-                    format!("Display :{} ready", display_id)
-                };
-                self.log(LogLevel::Detail, log_msg);
+                self.log(LogLevel::Detail, format!("Display :{} ready", display_id));
             }
             AppEvent::DisplayTaken { display_id } => {
                 let msg = format!(
@@ -1963,8 +1953,8 @@ impl App {
             AppEvent::SessionEnded { ref session_id, ref reason } => {
                 self.log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
             }
-            AppEvent::DebugScreenReady { display_id, vnc_port } => {
-                self.log(LogLevel::Info, format!("Debug screen ready on :{}, VNC port {}", display_id, vnc_port));
+            AppEvent::DebugScreenReady { display_id } => {
+                self.log(LogLevel::Info, format!("Debug screen ready on :{}", display_id));
             }
             AppEvent::DebugScreenTornDown { display_id } => {
                 self.log(LogLevel::Info, format!("Debug screen :{} torn down", display_id));

@@ -1970,15 +1970,9 @@ pub fn spawn_event_listener(
 
                     AppEvent::DisplayReady {
                         display_id,
-                        vnc_port,
                         ..
                     } => {
-                        let info = if let Some(port) = vnc_port {
-                            format!("Display :{}, VNC port {}", display_id, port)
-                        } else {
-                            format!("Display :{}", display_id)
-                        };
-                        s.push_log(LogLevel::Detail, info);
+                        s.push_log(LogLevel::Detail, format!("Display :{}", display_id));
                         resource_changed = Some("intendant://logs");
                     }
 
@@ -2134,8 +2128,8 @@ pub fn spawn_event_listener(
                     AppEvent::SessionEnded { ref session_id, ref reason } => {
                         s.push_log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
                     }
-                    AppEvent::DebugScreenReady { display_id, vnc_port } => {
-                        s.push_log(LogLevel::Info, format!("Debug screen ready on :{}, VNC port {}", display_id, vnc_port));
+                    AppEvent::DebugScreenReady { display_id } => {
+                        s.push_log(LogLevel::Info, format!("Debug screen ready on :{}", display_id));
                     }
                     AppEvent::DebugScreenTornDown { display_id } => {
                         s.push_log(LogLevel::Info, format!("Debug screen :{} torn down", display_id));

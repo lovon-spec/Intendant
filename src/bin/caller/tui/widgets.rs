@@ -88,7 +88,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App, view: &ViewState)
         ),
     ];
 
-    // Show display/VNC info when vision is active
+    // Show display info when vision is active
     if let Some(ref info) = app.display_info {
         spans.push(Span::styled(
             "  display:",
