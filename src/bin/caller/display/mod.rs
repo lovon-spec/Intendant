@@ -265,12 +265,20 @@ impl DisplaySession {
         });
 
         // Bridge task: broadcast subscriber -> I420 conversion -> encoder thread.
+        // Rate-limit to target fps to prevent CPU overload.
         let shutdown_bridge = self.shutdown.clone();
+        let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
         let bridge_handle = tokio::spawn(async move {
+            let mut last_encode = tokio::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = shutdown_bridge.cancelled() => break,
                     result = broadcast_rx.recv() => {
+                        // Rate limit: skip frames that arrive faster than target fps.
+                        if last_encode.elapsed() < frame_interval {
+                            continue;
+                        }
+                        last_encode = tokio::time::Instant::now();
                         let frame = match result {
                             Ok(f) => f,
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,

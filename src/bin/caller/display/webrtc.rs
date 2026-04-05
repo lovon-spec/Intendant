@@ -68,6 +68,19 @@ impl WebRtcPeer {
         // Include loopback candidates so localhost connections work (browser
         // and server on the same machine connect via 127.0.0.1).
         setting_engine.set_include_loopback_candidate(true);
+        // Explicitly configure ephemeral UDP with a port range to ensure
+        // the ICE agent actually binds sockets (default may fail silently).
+        setting_engine.set_udp_network(
+            webrtc::ice::udp_network::UDPNetwork::Ephemeral(
+                webrtc::ice::udp_network::EphemeralUDP::new(49152, 65535)
+                    .expect("valid port range")
+            )
+        );
+        // Allow UDP4 and UDP6 network types.
+        setting_engine.set_network_types(vec![
+            webrtc::ice::network_type::NetworkType::Udp4,
+            webrtc::ice::network_type::NetworkType::Udp6,
+        ]);
 
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -157,8 +170,20 @@ impl WebRtcPeer {
             let tx = ice_tx.clone();
             Box::pin(async move {
                 if let Some(c) = candidate {
-                    if let Ok(json) = c.to_json() {
-                        if let Ok(s) = serde_json::to_string(&json) {
+                    if let Ok(init) = c.to_json() {
+                        // webrtc-rs serializes sdp_mid as "sdp_mid" (snake_case)
+                        // but browsers expect "sdpMid" (camelCase). Build the
+                        // JSON manually with the correct field names.
+                        let sdp_mid = match init.sdp_mid.as_deref() {
+                            Some("") | None => init.sdp_mline_index.unwrap_or(0).to_string(),
+                            Some(mid) => mid.to_string(),
+                        };
+                        let candidate_json = serde_json::json!({
+                            "candidate": init.candidate,
+                            "sdpMid": sdp_mid,
+                            "sdpMLineIndex": init.sdp_mline_index.unwrap_or(0),
+                        });
+                        if let Ok(s) = serde_json::to_string(&candidate_json) {
                             let _ = tx.send((ice_peer_id, s)).await;
                         }
                     }
@@ -190,12 +215,38 @@ impl WebRtcPeer {
             .await
             .map_err(|e| CallerError::WebRtc(format!("create answer: {e}")))?;
 
-        let answer_sdp = answer.sdp.clone();
-
         peer_connection
             .set_local_description(answer)
             .await
             .map_err(|e| CallerError::WebRtc(format!("set local description: {e}")))?;
+
+        // Wait for ICE gathering to complete so the SDP answer includes
+        // candidates inline. This avoids trickle ICE timing issues where
+        // browsers reject candidates that arrive before setRemoteDescription.
+        let (gather_tx, gather_rx) = tokio::sync::oneshot::channel::<()>();
+        let gather_tx = std::sync::Mutex::new(Some(gather_tx));
+        peer_connection.on_ice_gathering_state_change(Box::new(move |state| {
+            if state == webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete {
+                if let Some(tx) = gather_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+            Box::pin(async {})
+        }));
+        // Timeout after 5s — don't block forever if gathering hangs.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            gather_rx,
+        ).await;
+
+        // Re-read local description — it now contains ICE candidates inline.
+        let answer_sdp = peer_connection
+            .local_description()
+            .await
+            .map(|d| d.sdp)
+            .unwrap_or_default();
+        eprintln!("[display/webrtc] Answer SDP ({} bytes, {} candidates)", answer_sdp.len(),
+            answer_sdp.lines().filter(|l| l.starts_with("a=candidate")).count());
 
         // --- Per-peer encoded frame channel (bounded, backpressure via drop) ---
         let (encoded_frame_tx, mut encoded_frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(8);
