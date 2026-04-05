@@ -34,6 +34,7 @@ export const presenceweb_send_key: (a: number, b: number, c: number, d: number, 
 export const presenceweb_send_live_usage: (a: number, b: bigint, c: bigint, d: bigint, e: bigint, f: bigint) => void;
 export const presenceweb_send_make_active: (a: number) => number;
 export const presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
+export const presenceweb_send_raw: (a: number, b: number, c: number) => number;
 export const presenceweb_send_resize: (a: number, b: number, c: number) => void;
 export const presenceweb_send_server_action: (a: number, b: any) => void;
 export const presenceweb_send_text: (a: number, b: number, c: number) => void;

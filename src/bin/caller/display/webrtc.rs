@@ -64,9 +64,15 @@ impl WebRtcPeer {
             })?;
 
         // --- API ---
+        let mut setting_engine = webrtc::api::setting_engine::SettingEngine::default();
+        // Include loopback candidates so localhost connections work (browser
+        // and server on the same machine connect via 127.0.0.1).
+        setting_engine.set_include_loopback_candidate(true);
+
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
+            .with_setting_engine(setting_engine)
             .build();
 
         // --- ICE configuration ---
@@ -158,6 +164,16 @@ impl WebRtcPeer {
                     }
                 }
             })
+        }));
+
+        // --- Connection state logging ---
+        peer_connection.on_peer_connection_state_change(Box::new(move |state| {
+            eprintln!("[display/webrtc] peer connection: {}", state);
+            Box::pin(async {})
+        }));
+        peer_connection.on_ice_connection_state_change(Box::new(move |state| {
+            eprintln!("[display/webrtc] ICE: {}", state);
+            Box::pin(async {})
         }));
 
         // --- Set remote description (offer) ---

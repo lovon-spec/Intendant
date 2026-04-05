@@ -345,6 +345,19 @@ export class PresenceWeb {
         wasm.presenceweb_send_presence_checkpoint(this.__wbg_ptr, ptr0, len0);
     }
     /**
+     * Send a raw JSON string through the server WebSocket.
+     * Use this for transport-level messages (WebRTC signaling) that don't
+     * need to go through the WASM state machine or serde conversion.
+     * @param {string} json_str
+     * @returns {boolean}
+     */
+    send_raw(json_str) {
+        const ptr0 = passStringToWasm0(json_str, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.presenceweb_send_raw(this.__wbg_ptr, ptr0, len0);
+        return ret !== 0;
+    }
+    /**
      * @param {number} cols
      * @param {number} rows
      */

@@ -121,6 +121,12 @@ export class PresenceWeb {
      * Send a presence checkpoint to the server.
      */
     send_presence_checkpoint(summary: string): void;
+    /**
+     * Send a raw JSON string through the server WebSocket.
+     * Use this for transport-level messages (WebRTC signaling) that don't
+     * need to go through the WASM state machine or serde conversion.
+     */
+    send_raw(json_str: string): boolean;
     send_resize(cols: number, rows: number): void;
     send_server_action(action: any): void;
     send_text(text: string): void;
@@ -299,6 +305,7 @@ export interface InitOutput {
     readonly presenceweb_send_live_usage: (a: number, b: bigint, c: bigint, d: bigint, e: bigint, f: bigint) => void;
     readonly presenceweb_send_make_active: (a: number) => number;
     readonly presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
+    readonly presenceweb_send_raw: (a: number, b: number, c: number) => number;
     readonly presenceweb_send_resize: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_server_action: (a: number, b: any) => void;
     readonly presenceweb_send_text: (a: number, b: number, c: number) => void;

@@ -243,6 +243,19 @@ impl ServerConnection {
         }
     }
 
+    /// Send a raw JSON string. Bypasses serde serialization — useful for
+    /// forwarding transport-level messages like WebRTC signaling.
+    pub fn send_raw(&self, json_str: &str) -> bool {
+        if let Some(ref ws) = self.ws {
+            if ws.ready_state() != 1 {
+                return false;
+            }
+            ws.send_with_str(json_str).is_ok()
+        } else {
+            false
+        }
+    }
+
     /// Send a keyboard event.
     pub fn send_key(&self, key: &str, ctrl: bool, alt: bool, shift: bool) {
         let msg = serde_json::json!({

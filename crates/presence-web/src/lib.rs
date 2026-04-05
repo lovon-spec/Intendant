@@ -593,6 +593,14 @@ impl PresenceWeb {
 
     // --- Server actions (sends ControlMsg via server WebSocket) ---
 
+    /// Send a raw JSON string through the server WebSocket.
+    /// Use this for transport-level messages (WebRTC signaling) that don't
+    /// need to go through the WASM state machine or serde conversion.
+    #[wasm_bindgen]
+    pub fn send_raw(&self, json_str: &str) -> bool {
+        self.server.borrow().send_raw(json_str)
+    }
+
     #[wasm_bindgen]
     pub fn send_server_action(&self, action: JsValue) {
         match serde_wasm_bindgen::from_value::<serde_json::Value>(action) {

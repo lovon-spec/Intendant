@@ -3980,11 +3980,11 @@ class DisplaySlot {
     // ICE candidates — send to server via WASM app
     this.pc.onicecandidate = (e) => {
       if (e.candidate && app) {
-        app.send_server_action({
+        app.send_raw(JSON.stringify({
           t: 'display_ice',
           display_id: this.displayId,
           candidate: e.candidate.toJSON()
-        });
+        }));
       }
     };
 
@@ -4008,11 +4008,11 @@ class DisplaySlot {
       return this.pc.setLocalDescription(offer);
     }).then(() => {
       if (app) {
-        app.send_server_action({
+        app.send_raw(JSON.stringify({
           t: 'display_offer',
           display_id: this.displayId,
           sdp: this.pc.localDescription.sdp
-        });
+        }));
       }
     }).catch(err => {
       console.error('WebRTC offer failed:', err);
