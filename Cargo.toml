@@ -43,13 +43,13 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 tokio-util = { version = "0.7", features = ["rt"] }
 presence-core = { path = "crates/presence-core" }
 libc = "0.2"
+webrtc = "0.12"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 ashpd = { version = "0.11", features = ["tokio"] }
 pipewire = "0.8"
 vpx-encode = { version = "0.6", features = ["ffi-generate"] }
-webrtc = "0.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = "1.5"

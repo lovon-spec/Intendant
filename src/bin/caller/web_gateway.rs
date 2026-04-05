@@ -2157,7 +2157,6 @@ pub fn spawn_web_gateway(
                                             }
                                             let _ = direct_tx_inbound.send(response.to_string());
                                         }
-                                        #[cfg(target_os = "linux")]
                                         Some("display_offer") => {
                                             // WebRTC SDP offer from browser for a display session
                                             let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
@@ -2200,7 +2199,6 @@ pub fn spawn_web_gateway(
                                                 }
                                             }
                                         }
-                                        #[cfg(target_os = "linux")]
                                         Some("display_ice") => {
                                             // Trickle ICE candidate from browser
                                             let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
@@ -2272,7 +2270,6 @@ pub fn spawn_web_gateway(
                             bus_inbound.send(AppEvent::PresenceDisconnected);
                         }
                         // Remove this peer from display sessions it connected to
-                        #[cfg(target_os = "linux")]
                         if !peer_display_ids.is_empty() {
                             if let Some(ref sr) = session_registry_inbound {
                                 let reg = sr.read().await;

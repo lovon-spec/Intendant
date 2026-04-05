@@ -38,7 +38,6 @@ pub mod keymap;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_keymap;
-#[cfg(target_os = "linux")]
 pub mod webrtc;
 #[cfg(target_os = "linux")]
 pub mod wayland;
@@ -167,7 +166,6 @@ pub struct DisplaySession {
     backend: Arc<dyn DisplayBackend>,
     frame_tx: broadcast::Sender<Arc<Frame>>,
     latest_frame: Arc<RwLock<Option<Arc<Frame>>>>,
-    #[cfg(target_os = "linux")]
     peers: Arc<RwLock<HashMap<PeerId, Arc<self::webrtc::WebRtcPeer>>>>,
     encoder_handle: Mutex<Option<JoinHandle<()>>>,
     capture_handle: Mutex<Option<JoinHandle<()>>>,
@@ -183,7 +181,6 @@ impl DisplaySession {
             backend,
             frame_tx,
             latest_frame: Arc::new(RwLock::new(None)),
-            #[cfg(target_os = "linux")]
             peers: Arc::new(RwLock::new(HashMap::new())),
             encoder_handle: Mutex::new(None),
             capture_handle: Mutex::new(None),
@@ -388,12 +385,9 @@ impl DisplaySession {
             let _ = h.await;
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            let mut peers = self.peers.write().await;
-            for (_, peer) in peers.drain() {
-                peer.close().await;
-            }
+        let mut peers = self.peers.write().await;
+        for (_, peer) in peers.drain() {
+            peer.close().await;
         }
     }
 
@@ -443,7 +437,6 @@ impl DisplaySession {
     ///
     /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
     /// the peer map, and returns the SDP answer.
-    #[cfg(target_os = "linux")]
     pub async fn handle_offer(
         &self,
         peer_id: PeerId,
@@ -471,7 +464,6 @@ impl DisplaySession {
     }
 
     /// Forward a trickle ICE candidate to a connected peer.
-    #[cfg(target_os = "linux")]
     pub async fn add_ice_candidate(
         &self,
         peer_id: PeerId,
@@ -485,7 +477,6 @@ impl DisplaySession {
     }
 
     /// Remove and close a peer.
-    #[cfg(target_os = "linux")]
     pub async fn remove_peer(&self, peer_id: PeerId) {
         if let Some(peer) = self.peers.write().await.remove(&peer_id) {
             peer.close().await;
