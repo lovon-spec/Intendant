@@ -398,6 +398,7 @@ impl DisplaySession {
         let shutdown = self.shutdown.clone();
         let cap_counters = Arc::clone(&self.counters);
         let cap_display_id = self.display_id;
+        let event_bus_for_encoder = event_bus.clone();
 
         let capture_handle = tokio::spawn(async move {
             let mut clean_shutdown = false;
@@ -467,6 +468,7 @@ impl DisplaySession {
             let shutdown_bridge = self.shutdown.clone();
             let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
             let display_id = self.display_id;
+            let event_bus = event_bus_for_encoder;
             let bridge_handle = tokio::spawn(async move {
                 let mut last_encode = tokio::time::Instant::now();
                 // Track current encoder dimensions for resize detection.
