@@ -107,6 +107,8 @@ impl DisplayBackend for MacOSBackend {
         let shutdown_flag = Arc::clone(&self.shutdown);
 
         let mut stream = SCStream::new(&filter, &config);
+        let frame_count = Arc::new(AtomicU32::new(0));
+        let frame_count_handler = Arc::clone(&frame_count);
         stream.add_output_handler(
             move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
                 if of_type != SCStreamOutputType::Screen {
@@ -115,8 +117,13 @@ impl DisplayBackend for MacOSBackend {
                 if shutdown_flag.load(Ordering::SeqCst) {
                     return;
                 }
+                let n = frame_count_handler.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    eprintln!("[display/macos] First frame from ScreenCaptureKit");
+                }
 
                 let Some(buffer) = sample.image_buffer() else {
+                    if n < 3 { eprintln!("[display/macos] No image_buffer in sample"); }
                     return;
                 };
                 let Ok(guard) = buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else {
