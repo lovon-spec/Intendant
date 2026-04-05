@@ -847,7 +847,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         // inference calls). Display state is available via check_status when the
         // model needs it for routing decisions.
         AppEvent::DisplayReady { .. }
-        | AppEvent::UserDisplayGranted
+        | AppEvent::UserDisplayGranted { .. }
         | AppEvent::UserDisplayRevoked { .. }
 
         // Pull-only events — not pushed to presence

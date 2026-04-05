@@ -40,6 +40,9 @@ pub struct MacOSBackend {
     width: AtomicU32,
     height: AtomicU32,
     shutdown: Arc<AtomicBool>,
+    /// Optional target display ID (CGDisplayID).  When `None`, captures the
+    /// first available display (backwards-compatible single-monitor behavior).
+    target_display_id: Option<u32>,
 }
 
 impl MacOSBackend {
@@ -51,8 +54,68 @@ impl MacOSBackend {
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
             shutdown: Arc::new(AtomicBool::new(false)),
+            target_display_id: None,
         }
     }
+
+    /// Create a backend targeting a specific display by its CGDisplayID.
+    pub fn with_display_id(display_id: u32) -> Self {
+        Self {
+            capture: Mutex::new(None),
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            target_display_id: Some(display_id),
+        }
+    }
+}
+
+/// Enumerate macOS displays via ScreenCaptureKit.
+///
+/// Returns a `DisplayInfo` per connected display.  The primary display
+/// (`CGMainDisplayID()`) gets `id: 0`; additional displays get sequential
+/// IDs starting from 1.
+pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
+    let content = match SCShareableContent::get() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[display/macos] SCShareableContent::get failed: {e}");
+            return Vec::new();
+        }
+    };
+
+    let main_id = CGDisplay::main().id;
+    let mut displays = Vec::new();
+    let mut next_id: u32 = 1;
+
+    for sc_display in content.displays() {
+        let cg = CGDisplay::new(sc_display.display_id());
+        let is_primary = sc_display.display_id() == main_id;
+        let id = if is_primary { 0 } else { let id = next_id; next_id += 1; id };
+        let width = cg.pixels_wide() as u32;
+        let height = cg.pixels_high() as u32;
+
+        // Build a human-readable name. SCDisplay does not expose a name
+        // property, so we use the display ID and resolution.
+        let name = if is_primary {
+            format!("Primary Display ({}x{})", width, height)
+        } else {
+            format!("Display {} ({}x{})", sc_display.display_id(), width, height)
+        };
+
+        displays.push(super::DisplayInfo {
+            id,
+            platform_id: sc_display.display_id() as u64,
+            name,
+            width,
+            height,
+            is_primary,
+        });
+    }
+
+    // Ensure primary is first.
+    displays.sort_by_key(|d| if d.is_primary { 0 } else { 1 });
+    displays
 }
 
 #[async_trait]
@@ -67,11 +130,26 @@ impl DisplayBackend for MacOSBackend {
         let content = SCShareableContent::get()
             .map_err(|e| CallerError::Display(format!("SCShareableContent::get: {e}")))?;
 
-        let display = content
-            .displays()
-            .into_iter()
-            .next()
-            .ok_or_else(|| CallerError::Display("no display found".into()))?;
+        let display = if let Some(target_id) = self.target_display_id {
+            // Find the specific display by CGDisplayID.
+            content
+                .displays()
+                .into_iter()
+                .find(|d| d.display_id() == target_id)
+                .ok_or_else(|| {
+                    CallerError::Display(format!(
+                        "display with CGDisplayID {} not found",
+                        target_id
+                    ))
+                })?
+        } else {
+            // Default: first available display (backwards-compatible).
+            content
+                .displays()
+                .into_iter()
+                .next()
+                .ok_or_else(|| CallerError::Display("no display found".into()))?
+        };
 
         // Use the *captured* display's CGDisplay for resolution, so input
         // injection targets the same monitor (avoids multi-monitor mismatch

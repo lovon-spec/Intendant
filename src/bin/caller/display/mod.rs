@@ -44,6 +44,71 @@ pub mod wayland;
 pub mod x11;
 
 // ---------------------------------------------------------------------------
+// Display enumeration
+// ---------------------------------------------------------------------------
+
+/// Information about a single physical display.
+///
+/// `id` is the intendant-stable identifier (0 = primary / user session default).
+/// `platform_id` carries the native display identifier (CGDisplayID on macOS,
+/// X11 screen number, PipeWire node_id on Wayland).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    /// Intendant-stable display ID.  0 is always the primary display.
+    pub id: u32,
+    /// Platform-native display identifier.
+    pub platform_id: u64,
+    /// Human-readable name (e.g. "Built-in Retina Display", "HDMI-1").
+    pub name: String,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Whether this display is the primary / main display.
+    pub is_primary: bool,
+}
+
+/// Enumerate displays available on the current platform.
+///
+/// Returns a list of `DisplayInfo` with the primary display at index 0 (id=0).
+/// On single-monitor setups this returns exactly one entry.  If enumeration
+/// fails, returns a single fallback entry with default resolution.
+pub async fn enumerate_displays() -> Vec<DisplayInfo> {
+    let displays = enumerate_displays_platform().await;
+    if displays.is_empty() {
+        vec![DisplayInfo {
+            id: 0,
+            platform_id: 0,
+            name: "Default Display".to_string(),
+            width: 1920,
+            height: 1080,
+            is_primary: true,
+        }]
+    } else {
+        displays
+    }
+}
+
+/// Platform-specific display enumeration.
+#[cfg(target_os = "macos")]
+async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
+    macos::enumerate_displays().await
+}
+
+#[cfg(target_os = "linux")]
+async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
+    // Try X11 first (works on both X11 sessions and Xwayland).
+    let displays = x11::enumerate_displays().await;
+    if !displays.is_empty() {
+        return displays;
+    }
+    // Wayland enumeration is portal-gated — returns empty unless a portal
+    // session is active.  Return empty so the caller falls back to the
+    // single-display default.
+    Vec::new()
+}
+
+// ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
 
@@ -566,6 +631,11 @@ impl SessionRegistry {
     pub fn remove(&mut self, display_id: u32) -> Option<Arc<DisplaySession>> {
         self.sessions.remove(&display_id)
     }
+
+    /// All active display IDs.
+    pub fn display_ids(&self) -> Vec<u32> {
+        self.sessions.keys().copied().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,5 +800,31 @@ mod tests {
         assert_eq!(config.ice_servers.len(), 1);
         assert_eq!(config.ice_servers[0].urls[0], "stun:stun.l.google.com:19302");
         assert!(config.ice_servers[0].username.is_none());
+    }
+
+    #[test]
+    fn display_info_serde_roundtrip() {
+        let info = DisplayInfo {
+            id: 0,
+            platform_id: 42,
+            name: "Primary Display (1920x1080)".to_string(),
+            width: 1920,
+            height: 1080,
+            is_primary: true,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: DisplayInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, 0);
+        assert_eq!(back.platform_id, 42);
+        assert!(back.is_primary);
+        assert_eq!(back.width, 1920);
+        assert_eq!(back.height, 1080);
+    }
+
+    #[test]
+    fn session_registry_display_ids() {
+        let mut reg = SessionRegistry::new();
+        assert!(reg.display_ids().is_empty());
+        // Verify the method works (we can't easily create sessions in tests).
     }
 }

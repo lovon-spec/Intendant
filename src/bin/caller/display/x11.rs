@@ -62,6 +62,138 @@ impl X11Backend {
             display: display_str,
         })
     }
+
+    /// Create a backend targeting a specific X11 display string (e.g. ":0", ":99").
+    #[allow(dead_code)]
+    pub fn with_display(display_str: &str) -> Result<Self, CallerError> {
+        let (conn, screen_num) = x11rb::connect(Some(display_str))
+            .map_err(|e| CallerError::Display(format!("X11 connect to {display_str}: {e}")))?;
+
+        let setup = conn.setup();
+        let screen = &setup.roots[screen_num];
+        let width = (screen.width_in_pixels as u32) & !1;
+        let height = (screen.height_in_pixels as u32) & !1;
+
+        Ok(Self {
+            capture: Mutex::new(None),
+            width: AtomicU32::new(width),
+            height: AtomicU32::new(height),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            display: display_str.to_string(),
+        })
+    }
+}
+
+/// Enumerate X11 displays using xrandr.
+///
+/// Parses `xrandr --query` output to find connected monitors.  The primary
+/// monitor gets `id: 0`; additional monitors get sequential IDs from 1.
+/// Falls back to the root window dimensions if xrandr is unavailable.
+pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
+    let display_str = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+
+    // Try xrandr first for multi-monitor enumeration.
+    if let Ok(output) = tokio::process::Command::new("xrandr")
+        .arg("--query")
+        .env("DISPLAY", &display_str)
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let displays = parse_xrandr_output(&text);
+            if !displays.is_empty() {
+                return displays;
+            }
+        }
+    }
+
+    // Fallback: use x11rb to get the root window size (single display).
+    if let Ok((conn, screen_num)) = x11rb::connect(Some(&display_str)) {
+        let setup = conn.setup();
+        let screen = &setup.roots[screen_num];
+        let width = (screen.width_in_pixels as u32) & !1;
+        let height = (screen.height_in_pixels as u32) & !1;
+        return vec![super::DisplayInfo {
+            id: 0,
+            platform_id: screen_num as u64,
+            name: format!("X11 Screen {} ({}x{})", screen_num, width, height),
+            width,
+            height,
+            is_primary: true,
+        }];
+    }
+
+    Vec::new()
+}
+
+/// Parse xrandr --query output into a list of `DisplayInfo`.
+///
+/// Looks for lines like:
+///   HDMI-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 527mm x 296mm
+///   DP-1 connected 2560x1440+1920+0 (normal left inverted right x axis y axis) 597mm x 336mm
+fn parse_xrandr_output(text: &str) -> Vec<super::DisplayInfo> {
+    let mut displays = Vec::new();
+    let mut next_id: u32 = 1;
+
+    for line in text.lines() {
+        // Match " connected " lines that include a mode+offset pattern.
+        if !line.contains(" connected ") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let output_name = parts[0];
+        let is_primary = parts.iter().any(|p| *p == "primary");
+
+        // Find the resolution+offset token: "WxH+X+Y".
+        let mode_token = parts.iter().find(|p| {
+            let s = **p;
+            s.contains('x') && s.contains('+')
+        });
+        let (width, height) = if let Some(tok) = mode_token {
+            parse_mode_token(tok)
+        } else {
+            continue; // Connected but no active mode — skip.
+        };
+
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let id = if is_primary { 0 } else { let id = next_id; next_id += 1; id };
+
+        displays.push(super::DisplayInfo {
+            id,
+            platform_id: id as u64,
+            name: format!("{} ({}x{})", output_name, width, height),
+            width,
+            height,
+            is_primary,
+        });
+    }
+
+    // Ensure primary is first.
+    displays.sort_by_key(|d| if d.is_primary { 0 } else { 1 });
+    displays
+}
+
+/// Parse "WxH+X+Y" into (width, height).
+fn parse_mode_token(tok: &str) -> (u32, u32) {
+    // "1920x1080+0+0" → split on 'x' → "1920", "1080+0+0" → split on '+' → "1080"
+    let x_pos = match tok.find('x') {
+        Some(p) => p,
+        None => return (0, 0),
+    };
+    let w_str = &tok[..x_pos];
+    let rest = &tok[x_pos + 1..];
+    let h_str = rest.split('+').next().unwrap_or("0");
+    let w = w_str.parse::<u32>().unwrap_or(0);
+    let h = h_str.parse::<u32>().unwrap_or(0);
+    (w, h)
 }
 
 #[async_trait]
@@ -693,5 +825,69 @@ mod tests {
     fn dom_code_to_xdotool_key_unknown() {
         assert_eq!(dom_code_to_xdotool_key("BogusKey"), None);
         assert_eq!(dom_code_to_xdotool_key(""), None);
+    }
+
+    #[test]
+    fn parse_xrandr_single_monitor() {
+        let output = "\
+Screen 0: minimum 8 x 8, current 1920 x 1080, maximum 32767 x 32767
+HDMI-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 527mm x 296mm
+   1920x1080     60.00*+  50.00    59.94
+";
+        let displays = parse_xrandr_output(output);
+        assert_eq!(displays.len(), 1);
+        assert_eq!(displays[0].id, 0);
+        assert!(displays[0].is_primary);
+        assert_eq!(displays[0].width, 1920);
+        assert_eq!(displays[0].height, 1080);
+        assert!(displays[0].name.contains("HDMI-1"));
+    }
+
+    #[test]
+    fn parse_xrandr_multi_monitor() {
+        let output = "\
+Screen 0: minimum 8 x 8, current 4480 x 1440, maximum 32767 x 32767
+HDMI-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 527mm x 296mm
+   1920x1080     60.00*+  50.00    59.94
+DP-1 connected 2560x1440+1920+0 (normal left inverted right x axis y axis) 597mm x 336mm
+   2560x1440     59.95*+  74.97
+";
+        let displays = parse_xrandr_output(output);
+        assert_eq!(displays.len(), 2);
+        // Primary first
+        assert_eq!(displays[0].id, 0);
+        assert!(displays[0].is_primary);
+        assert_eq!(displays[0].width, 1920);
+        assert_eq!(displays[0].height, 1080);
+        // Secondary
+        assert_eq!(displays[1].id, 1);
+        assert!(!displays[1].is_primary);
+        assert_eq!(displays[1].width, 2560);
+        assert_eq!(displays[1].height, 1440);
+        assert!(displays[1].name.contains("DP-1"));
+    }
+
+    #[test]
+    fn parse_xrandr_disconnected_ignored() {
+        let output = "\
+Screen 0: minimum 8 x 8, current 1920 x 1080, maximum 32767 x 32767
+HDMI-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 527mm x 296mm
+DP-1 disconnected (normal left inverted right x axis y axis)
+";
+        let displays = parse_xrandr_output(output);
+        assert_eq!(displays.len(), 1);
+        assert_eq!(displays[0].id, 0);
+    }
+
+    #[test]
+    fn parse_mode_token_basic() {
+        assert_eq!(parse_mode_token("1920x1080+0+0"), (1920, 1080));
+        assert_eq!(parse_mode_token("2560x1440+1920+0"), (2560, 1440));
+    }
+
+    #[test]
+    fn parse_mode_token_invalid() {
+        assert_eq!(parse_mode_token("primary"), (0, 0));
+        assert_eq!(parse_mode_token(""), (0, 0));
     }
 }

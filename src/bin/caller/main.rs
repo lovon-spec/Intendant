@@ -2340,7 +2340,7 @@ async fn run_agent_loop(
                                 if !state.user_display_granted {
                                     state.user_display_granted = true;
                                     std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                    bus.send(AppEvent::UserDisplayGranted);
+                                    bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
                                 }
                             }
                         }
@@ -2357,7 +2357,7 @@ async fn run_agent_loop(
                             {
                                 state.user_display_granted = true;
                                 std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                bus.send(AppEvent::UserDisplayGranted);
+                                bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
                             }
                         }
                         Ok(event::ApprovalResponse::Skip) => {
@@ -2701,7 +2701,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 if !state.user_display_granted {
                                     state.user_display_granted = true;
                                     std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                    bus.send(AppEvent::UserDisplayGranted);
+                                    bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
                                 }
                             }
                         }
@@ -2718,7 +2718,7 @@ Proceed with explicit assumptions and continue without additional questions."
                             {
                                 state.user_display_granted = true;
                                 std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                bus.send(AppEvent::UserDisplayGranted);
+                                bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
                             }
                         }
                         Ok(event::ApprovalResponse::Skip) => {
@@ -4186,8 +4186,8 @@ pub fn spawn_user_display_listener(
         let mut rx = bus.subscribe();
         loop {
             match rx.recv().await {
-                Ok(AppEvent::UserDisplayGranted) => {
-                    activate_user_display(&bus, &session_registry, frame_registry.clone()).await;
+                Ok(AppEvent::UserDisplayGranted { display_id }) => {
+                    activate_user_display(&bus, &session_registry, frame_registry.clone(), display_id).await;
                 }
                 Ok(AppEvent::UserDisplayRevoked { .. }) => {
                     deactivate_user_display(&session_registry).await;
@@ -4199,8 +4199,9 @@ pub fn spawn_user_display_listener(
     })
 }
 
-/// Tear down the user display session on revoke.
+/// Tear down all user display sessions on revoke.
 async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry) {
+    // Remove display_id 0 (the default user session slot).
     let display_id: u32 = 0;
     if let Some(session) = session_registry.write().await.remove(display_id) {
         eprintln!("[user_display] Stopping display session for :{}", display_id);
@@ -4208,17 +4209,19 @@ async fn deactivate_user_display(session_registry: &display::SharedSessionRegist
     }
 }
 
-/// Handle user display grant: create a `DisplaySession` (on Wayland) and emit
-/// `DisplayReady` for the user's display.
+/// Handle user display grant: create a `DisplaySession` and emit
+/// `DisplayReady` for the selected user display.
 ///
+/// `target_display_id` is the intendant-stable display ID (0 = primary).
 /// This wires the user's display into the same lifecycle as virtual displays —
 /// the recording listener starts ffmpeg and the web dashboard shows a display slot.
 async fn activate_user_display(
     bus: &EventBus,
     session_registry: &display::SharedSessionRegistry,
     frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
+    target_display_id: u32,
 ) {
-    let display_id: u32 = 0;
+    let display_id: u32 = target_display_id;
     let (width, height) = query_display_resolution(display_id);
 
     // On Wayland: create a DisplaySession with WaylandBackend.
@@ -4282,7 +4285,19 @@ async fn activate_user_display(
 
     #[cfg(target_os = "macos")]
     {
-        let backend = display::macos::MacOSBackend::new();
+        // If a specific display was requested, resolve its platform_id (CGDisplayID)
+        // from the enumerated list; otherwise use the default (first available).
+        let backend = if target_display_id != 0 {
+            let displays = display::enumerate_displays().await;
+            if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
+                display::macos::MacOSBackend::with_display_id(info.platform_id as u32)
+            } else {
+                eprintln!("[user_display] display_id {} not found, falling back to primary", target_display_id);
+                display::macos::MacOSBackend::new()
+            }
+        } else {
+            display::macos::MacOSBackend::new()
+        };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         if let Err(e) = session.start(30, frame_registry).await {
             eprintln!("[user_display] macOS display session failed: {}", e);

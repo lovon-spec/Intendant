@@ -158,7 +158,10 @@ pub enum AppEvent {
     },
 
     // User session display grant/revoke
-    UserDisplayGranted,
+    UserDisplayGranted {
+        /// The display ID that was granted.  0 = primary (default).
+        display_id: u32,
+    },
     UserDisplayRevoked {
         note: Option<String>,
     },
@@ -414,11 +417,17 @@ pub enum ControlMsg {
         #[serde(default)]
         note: Option<String>,
     },
-    GrantUserDisplay,
+    GrantUserDisplay {
+        /// Optional display ID to grant.  When `None`, grants the primary
+        /// display (id 0) -- backwards-compatible with single-monitor setups.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_id: Option<u32>,
+    },
     RevokeUserDisplay {
         #[serde(default)]
         note: Option<String>,
     },
+    ListDisplays,
     QueryDetail {
         scope: String,
         #[serde(default)]
@@ -591,7 +600,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 note: note.clone(),
             })
         }
-        AppEvent::UserDisplayGranted => Some(OutboundEvent::UserDisplayGranted),
+        AppEvent::UserDisplayGranted { .. } => Some(OutboundEvent::UserDisplayGranted),
         AppEvent::UserDisplayRevoked { note } => Some(OutboundEvent::UserDisplayRevoked {
             note: note.clone(),
         }),
@@ -844,8 +853,8 @@ fn write_event_to_session_log(
         AppEvent::DisplayReleased { display_id, note } => {
             log.display_released(*display_id, note.as_deref());
         }
-        AppEvent::UserDisplayGranted => {
-            log.info("User display access granted");
+        AppEvent::UserDisplayGranted { display_id } => {
+            log.info(&format!("User display access granted (display_id: {})", display_id));
         }
         AppEvent::UserDisplayRevoked { note } => {
             let msg = if let Some(n) = note {
@@ -1208,7 +1217,7 @@ mod tests {
                 display_id: 99,
                 note: Some("done testing".to_string()),
             },
-            ControlMsg::GrantUserDisplay,
+            ControlMsg::GrantUserDisplay { display_id: None },
             ControlMsg::RevokeUserDisplay {
                 note: Some("done with user display".to_string()),
             },
@@ -1403,7 +1412,12 @@ mod tests {
     fn control_msg_grant_user_display_deserialize() {
         let json = r#"{"action":"grant_user_display"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, ControlMsg::GrantUserDisplay));
+        assert!(matches!(msg, ControlMsg::GrantUserDisplay { display_id: None }));
+
+        // With explicit display_id
+        let json = r#"{"action":"grant_user_display","display_id":2}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ControlMsg::GrantUserDisplay { display_id: Some(2) }));
     }
 
     #[test]

@@ -1615,7 +1615,8 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "release_display", true, format!("Released control of :{}", display_id), None);
             Some(RESOURCE_LOGS_URI)
         }
-        ControlMsg::GrantUserDisplay => {
+        ControlMsg::GrantUserDisplay { display_id } => {
+            let did = display_id.unwrap_or(0);
             {
                 let s = state.read().await;
                 let autonomy = s.autonomy.clone();
@@ -1624,9 +1625,15 @@ async fn handle_control_command_mcp(
                 a.user_display_granted = true;
             }
             std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-            bus.send(AppEvent::UserDisplayGranted);
-            emit_control_result(control_tx, "grant_user_display", true, "User display access granted".to_string(), None);
+            bus.send(AppEvent::UserDisplayGranted { display_id: did });
+            emit_control_result(control_tx, "grant_user_display", true, format!("User display access granted (display_id: {})", did), None);
             Some(RESOURCE_LOGS_URI)
+        }
+        ControlMsg::ListDisplays => {
+            let displays = crate::display::enumerate_displays().await;
+            let json = serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string());
+            emit_control_result(control_tx, "list_displays", true, json, None);
+            None
         }
         ControlMsg::RevokeUserDisplay { note } => {
             {
@@ -1999,8 +2006,8 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::UserDisplayGranted => {
-                        s.push_log(LogLevel::Warn, "User display access granted".to_string());
+                    AppEvent::UserDisplayGranted { display_id } => {
+                        s.push_log(LogLevel::Warn, format!("User display access granted (display_id: {})", display_id));
                         resource_changed = Some("intendant://logs");
                     }
 

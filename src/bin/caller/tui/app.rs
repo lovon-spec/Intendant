@@ -850,7 +850,7 @@ impl App {
                                 note: None,
                             });
                         } else {
-                            self.handle_control_command(ControlMsg::GrantUserDisplay);
+                            self.handle_control_command(ControlMsg::GrantUserDisplay { display_id: None });
                         }
                         true
                     }
@@ -1357,7 +1357,8 @@ impl App {
                     note,
                 });
             }
-            ControlMsg::GrantUserDisplay => {
+            ControlMsg::GrantUserDisplay { display_id } => {
+                let did = display_id.unwrap_or(0);
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let autonomy = self.autonomy.clone();
                     handle.spawn(async move {
@@ -1368,10 +1369,14 @@ impl App {
                     state.user_display_granted = true;
                 }
                 std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                self.log(LogLevel::Warn, "User display access granted".to_string());
+                self.log(LogLevel::Warn, format!("User display access granted (display_id: {})", did));
                 self.broadcast_control(OutboundEvent::UserDisplayGranted);
                 // Emit to EventBus so spawn_user_display_listener activates display + recording
-                self.pending_derived.push(AppEvent::UserDisplayGranted);
+                self.pending_derived.push(AppEvent::UserDisplayGranted { display_id: did });
+            }
+            ControlMsg::ListDisplays => {
+                // ListDisplays is async — handled at the caller level, not in the TUI.
+                self.log(LogLevel::Info, "ListDisplays: use the control socket or web API".to_string());
             }
             ControlMsg::RevokeUserDisplay { note } => {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1756,8 +1761,8 @@ impl App {
                     q.push(crate::event::ContextInjection::text(msg));
                 }
             }
-            AppEvent::UserDisplayGranted => {
-                self.log(LogLevel::Warn, "User display access granted".to_string());
+            AppEvent::UserDisplayGranted { display_id } => {
+                self.log(LogLevel::Warn, format!("User display access granted (display_id: {})", display_id));
             }
             AppEvent::UserDisplayRevoked { ref note } => {
                 let msg = if let Some(n) = note {
