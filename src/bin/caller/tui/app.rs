@@ -1933,7 +1933,7 @@ impl App {
             }
             AppEvent::ApprovalResolved { .. }
             | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
-            | AppEvent::DisplayMetrics { .. } => {
+            | AppEvent::DisplayMetrics { .. } | AppEvent::DisplayResize { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }

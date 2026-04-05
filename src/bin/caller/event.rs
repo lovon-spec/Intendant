@@ -148,6 +148,15 @@ pub enum AppEvent {
         height: u32,
     },
 
+    /// Resolution changed on a live display (e.g. monitor mode switch, scale
+    /// factor change).  Emitted by the capture bridge when incoming frame
+    /// dimensions diverge from the current encoder dimensions.
+    DisplayResize {
+        display_id: u32,
+        width: u32,
+        height: u32,
+    },
+
     // Display takeover
     DisplayTaken {
         display_id: u32,
@@ -596,6 +605,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             width: *width,
             height: *height,
         }),
+        AppEvent::DisplayResize {
+            display_id,
+            width,
+            height,
+        } => Some(OutboundEvent::DisplayResize {
+            display_id: *display_id,
+            width: *width,
+            height: *height,
+        }),
         AppEvent::DisplayTaken { display_id } => Some(OutboundEvent::DisplayTaken {
             display_id: *display_id,
         }),
@@ -863,6 +881,9 @@ fn write_event_to_session_log(
         // Display / vision
         AppEvent::DisplayReady { display_id, width, height } => {
             log.display_ready(*display_id, *width, *height);
+        }
+        AppEvent::DisplayResize { display_id, width, height } => {
+            log.display_resize(*display_id, *width, *height);
         }
         AppEvent::DisplayTaken { display_id } => {
             log.display_taken(*display_id);

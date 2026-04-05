@@ -595,6 +595,9 @@ fn run_shm_capture(
     }
 
     let mut frame_count: u64 = 0;
+    // Track consecutive capture errors to detect hotplug / display loss.
+    let mut consecutive_errors: u32 = 0;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 30;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -615,6 +618,11 @@ fn run_shm_capture(
         ) {
             Ok(c) => c,
             Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    eprintln!("[display/x11] ShmGetImage request failed {consecutive_errors} times, display likely disconnected: {e}");
+                    break;
+                }
                 eprintln!("[display/x11] ShmGetImage request failed: {e}");
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
@@ -623,6 +631,7 @@ fn run_shm_capture(
 
         match cookie.reply() {
             Ok(reply) => {
+                consecutive_errors = 0;
                 // X11 ZPixmap at depth 24/32 is BGRA (or BGRx).
                 // For ShmGetImage the data is written into the shm segment
                 // tightly packed at width*4 for depth 24/32.
@@ -653,6 +662,11 @@ fn run_shm_capture(
                 let _ = tx.try_send(frame);
             }
             Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    eprintln!("[display/x11] ShmGetImage reply failed {consecutive_errors} times, display likely disconnected: {e}");
+                    break;
+                }
                 eprintln!("[display/x11] ShmGetImage reply failed: {e}");
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -684,6 +698,8 @@ fn run_getimage_capture(
     use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
     let mut frame_count: u64 = 0;
+    let mut consecutive_errors: u32 = 0;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 30;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -702,6 +718,11 @@ fn run_getimage_capture(
         ) {
             Ok(c) => c,
             Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    eprintln!("[display/x11] GetImage request failed {consecutive_errors} times, display likely disconnected: {e}");
+                    break;
+                }
                 eprintln!("[display/x11] GetImage request failed: {e}");
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
@@ -710,6 +731,7 @@ fn run_getimage_capture(
 
         match cookie.reply() {
             Ok(reply) => {
+                consecutive_errors = 0;
                 let data = reply.data;
                 // For ZPixmap, bytes_per_line can include padding.
                 // x11rb's GetImageReply doesn't expose bytes_per_line directly,
@@ -736,6 +758,11 @@ fn run_getimage_capture(
                 let _ = tx.try_send(frame);
             }
             Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    eprintln!("[display/x11] GetImage reply failed {consecutive_errors} times, display likely disconnected: {e}");
+                    break;
+                }
                 eprintln!("[display/x11] GetImage failed: {e}");
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }

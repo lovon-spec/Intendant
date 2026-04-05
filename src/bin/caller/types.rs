@@ -150,6 +150,11 @@ pub enum OutboundEvent {
         width: u32,
         height: u32,
     },
+    DisplayResize {
+        display_id: u32,
+        width: u32,
+        height: u32,
+    },
     DisplayTaken {
         display_id: u32,
     },

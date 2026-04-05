@@ -1983,6 +1983,21 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://logs");
                     }
 
+                    AppEvent::DisplayResize {
+                        display_id,
+                        width,
+                        height,
+                    } => {
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!(
+                                "Display :{} resized to {}x{}",
+                                display_id, width, height
+                            ),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
+
                     AppEvent::DisplayTaken { display_id } => {
                         s.push_log(
                             LogLevel::Warn,

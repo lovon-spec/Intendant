@@ -3205,6 +3205,21 @@ async function main() {
         if (s) s.handleIceCandidate(d.candidate);
         return;
       }
+      // Display resize — update stored dimensions and status text
+      if (d.t === 'display_resize' || d.event === 'display_resize') {
+        const slot = displaySlots.get(Number(d.display_id));
+        if (slot) {
+          slot.width = Number(d.width);
+          slot.height = Number(d.height);
+          if (slot.statusEl) {
+            const res = slot.width > 0 ? ` ${slot.width}x${slot.height}` : '';
+            const mode = slot.interactive ? 'interactive' : 'view-only';
+            slot.statusEl.textContent = slot.connected
+              ? `Connected (${mode})${res}`
+              : `Connecting...${res}`;
+          }
+        }
+      }
       // Track user display grant/revoke events
       if (d.event === 'user_display_granted') {
         setUserDisplayState(true);

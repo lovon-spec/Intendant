@@ -1174,6 +1174,32 @@ impl SessionLog {
         });
     }
 
+    /// Log display resolution change.
+    pub fn display_resize(
+        &mut self,
+        display_id: u32,
+        width: u32,
+        height: u32,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "display_resize".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Display :{} resized to {}x{}",
+                display_id, width, height
+            )),
+            data: Some(serde_json::json!({
+                "display_id": display_id,
+                "width": width,
+                "height": height,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log display takeover.
     pub fn display_taken(&mut self, display_id: u32) {
         self.emit(LogEvent {

@@ -4242,7 +4242,7 @@ async fn activate_user_display(
         }
         let backend = display::wayland::WaylandBackend::new();
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
-        if let Err(e) = session.start(30, frame_registry.clone()).await {
+        if let Err(e) = session.start(30, frame_registry.clone(), Some(bus.clone())).await {
             eprintln!("[user_display] Failed to start display session: {}", e);
         } else {
             // Use the backend's resolution (from portal), not xdpyinfo.
@@ -4270,7 +4270,7 @@ async fn activate_user_display(
                 .map_err(|e| eprintln!("[user_display] X11 backend failed: {}", e));
             if let Ok(backend) = backend {
                 let session = display::DisplaySession::new(display_id, Arc::new(backend));
-                if let Err(e) = session.start(30, frame_registry.clone()).await {
+                if let Err(e) = session.start(30, frame_registry.clone(), Some(bus.clone())).await {
                     eprintln!("[user_display] X11 display session failed: {}", e);
                 } else {
                     let (width, height) = session.resolution();
@@ -4299,7 +4299,7 @@ async fn activate_user_display(
             display::macos::MacOSBackend::new()
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
-        if let Err(e) = session.start(30, frame_registry).await {
+        if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
             eprintln!("[user_display] macOS display session failed: {}", e);
         } else {
             let (width, height) = session.resolution();

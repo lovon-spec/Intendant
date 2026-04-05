@@ -847,6 +847,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         // inference calls). Display state is available via check_status when the
         // model needs it for routing decisions.
         AppEvent::DisplayReady { .. }
+        | AppEvent::DisplayResize { .. }
         | AppEvent::UserDisplayGranted { .. }
         | AppEvent::UserDisplayRevoked { .. }
 
@@ -1067,6 +1068,24 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             };
             if !s.available_displays.iter().any(|d| d.starts_with(&prefix)) {
                 s.available_displays.push(label);
+            }
+        }
+        AppEvent::DisplayResize {
+            display_id, width, height, ..
+        } => {
+            let prefix = if *display_id == 0 {
+                "user_session".to_string()
+            } else {
+                format!(":{}", display_id)
+            };
+            let label = if *display_id == 0 {
+                format!("user_session ({}x{})", width, height)
+            } else {
+                format!(":{} ({}x{}, virtual)", display_id, width, height)
+            };
+            // Replace the existing entry with updated dimensions.
+            if let Some(entry) = s.available_displays.iter_mut().find(|d| d.starts_with(&prefix)) {
+                *entry = label;
             }
         }
         AppEvent::UserDisplayRevoked { .. } => {

@@ -377,10 +377,16 @@ impl DisplaySession {
     ///    channel.
     /// 3. **FrameRegistry sampler** (if provided) -- 1 Hz JPEG capture for
     ///    model sampling and presence tools.
+    ///
+    /// If `event_bus` is provided, `DisplayResize` events are emitted when
+    /// the capture backend delivers frames at a different resolution than the
+    /// current encoder expects.  The encoder is transparently recreated with
+    /// the new dimensions.
     pub async fn start(
         &self,
         fps: u32,
         frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
+        event_bus: Option<crate::event::EventBus>,
     ) -> Result<(), CallerError> {
         let mut capture_rx = self.backend.start_capture(fps).await?;
 
@@ -418,47 +424,34 @@ impl DisplaySession {
 
             let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
 
-            // Channel carries (i420_data, arrival_instant) so the encoder
-            // thread can measure end-to-end latency.
+            // Encoded frame channel — survives encoder restarts.  The fanout
+            // task reads from `efr_rx`; each encoder thread gets a clone of
+            // `efr_tx` so dropping+respawning the encoder thread does not
+            // close the channel.
+            let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
+
+            // Spawn the initial encoder thread.
             let (i420_tx, i420_rx) =
                 std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
-            let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
 
             let enc_counters = Arc::clone(&self.counters);
             let encoder_shutdown = self.shutdown.clone();
-            std::thread::spawn(move || {
-                let mut encoder = match encode::Vp8Encoder::new(width, height, 2000) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("[display/encoder] VP8 encoder FAILED: {}", e);
-                        return;
-                    }
-                };
-                while let Ok((i420, arrived)) = i420_rx.recv() {
-                    if encoder_shutdown.is_cancelled() {
-                        break;
-                    }
-                    if let Ok(packets) = encoder.encode(&i420, duration_ms) {
-                        let latency_us = arrived.elapsed().as_micros() as u64;
-                        for pkt in packets {
-                            enc_counters.encode_frames.fetch_add(1, Ordering::Relaxed);
-                            enc_counters
-                                .encode_latency_us_sum
-                                .fetch_add(latency_us, Ordering::Relaxed);
-                            let ef = Arc::new(pkt.into_encoded_frame());
-                            if efr_tx.blocking_send(ef).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
+            spawn_encoder_thread(
+                width, height, duration_ms,
+                i420_rx, efr_tx.clone(),
+                Arc::clone(&enc_counters), encoder_shutdown,
+            );
 
             let bridge_counters = Arc::clone(&self.counters);
             let shutdown_bridge = self.shutdown.clone();
             let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
+            let display_id = self.display_id;
             let bridge_handle = tokio::spawn(async move {
                 let mut last_encode = tokio::time::Instant::now();
+                // Track current encoder dimensions for resize detection.
+                let mut enc_width = width;
+                let mut enc_height = height;
+                let mut i420_tx = i420_tx;
                 loop {
                     tokio::select! {
                         _ = shutdown_bridge.cancelled() => break,
@@ -472,6 +465,48 @@ impl DisplaySession {
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                 Err(broadcast::error::RecvError::Closed) => break,
                             };
+
+                            // -- Resize detection --
+                            // Round to even dimensions for VP8 compatibility.
+                            let frame_w = frame.width & !1;
+                            let frame_h = frame.height & !1;
+                            if frame_w > 0 && frame_h > 0
+                                && (frame_w != enc_width || frame_h != enc_height)
+                            {
+                                eprintln!(
+                                    "[display/bridge] resolution changed {}x{} -> {}x{}, recreating encoder",
+                                    enc_width, enc_height, frame_w, frame_h,
+                                );
+                                enc_width = frame_w;
+                                enc_height = frame_h;
+
+                                // Drop the old sender — the encoder thread's
+                                // `i420_rx.recv()` will return Err and the
+                                // thread will exit cleanly.
+                                drop(i420_tx);
+
+                                // Spawn a fresh encoder thread at the new
+                                // dimensions, reusing the same `efr_tx`.
+                                let (new_tx, new_rx) =
+                                    std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
+                                i420_tx = new_tx;
+                                let counters_clone = Arc::clone(&bridge_counters);
+                                let shutdown_clone = shutdown_bridge.clone();
+                                spawn_encoder_thread(
+                                    enc_width, enc_height, duration_ms,
+                                    new_rx, efr_tx.clone(),
+                                    counters_clone, shutdown_clone,
+                                );
+
+                                if let Some(ref bus) = event_bus {
+                                    bus.send(crate::event::AppEvent::DisplayResize {
+                                        display_id,
+                                        width: enc_width,
+                                        height: enc_height,
+                                    });
+                                }
+                            }
+
                             let arrived = Instant::now();
                             let fd = frame.data.clone();
                             let fw = frame.width;
@@ -792,6 +827,55 @@ impl DisplaySession {
         self.backend.resolution()
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// Encoder thread helper
+// ---------------------------------------------------------------------------
+
+/// Spawn a VP8 encoder thread that reads I420 frames from `i420_rx`, encodes
+/// them, and sends `Arc<EncodedFrame>` to `efr_tx`.
+///
+/// The thread exits cleanly when `i420_rx` is closed (sender dropped) or
+/// the shutdown token is cancelled.  This is a free function so the
+/// broadcast-to-encoder bridge can call it on resize without needing
+/// `&self`.
+fn spawn_encoder_thread(
+    width: u32,
+    height: u32,
+    duration_ms: u64,
+    i420_rx: std::sync::mpsc::Receiver<(Vec<u8>, Instant)>,
+    efr_tx: mpsc::Sender<Arc<EncodedFrame>>,
+    counters: Arc<DisplayMetricsCounters>,
+    shutdown: CancellationToken,
+) {
+    std::thread::spawn(move || {
+        let mut encoder = match encode::Vp8Encoder::new(width, height, 2000) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[display/encoder] VP8 encoder FAILED for {}x{}: {}", width, height, e);
+                return;
+            }
+        };
+        while let Ok((i420, arrived)) = i420_rx.recv() {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            if let Ok(packets) = encoder.encode(&i420, duration_ms) {
+                let latency_us = arrived.elapsed().as_micros() as u64;
+                for pkt in packets {
+                    counters.encode_frames.fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .encode_latency_us_sum
+                        .fetch_add(latency_us, Ordering::Relaxed);
+                    let ef = Arc::new(pkt.into_encoded_frame());
+                    if efr_tx.blocking_send(ef).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
