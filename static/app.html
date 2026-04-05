@@ -3144,6 +3144,17 @@ async function main() {
         }
         return;
       }
+      // WebRTC signaling — intercept before WASM (not a UiCommand)
+      if (d.t === 'display_answer') {
+        const s = displaySlots.get(d.display_id);
+        if (s) s.handleAnswer(d.sdp);
+        return;
+      }
+      if (d.t === 'display_ice') {
+        const s = displaySlots.get(d.display_id);
+        if (s) s.handleIceCandidate(d.candidate);
+        return;
+      }
       // Track user display grant/revoke events
       if (d.event === 'user_display_granted') {
         setUserDisplayState(true);
@@ -3485,8 +3496,6 @@ function processCommands(cmds) {
       case 'session_started': onSessionStarted(c.session_id, c.task); break;
       case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
       case 'debug_screen_ready': onDebugScreenReady(c.display_id); break;
-      case 'display_answer': { const s = displaySlots.get(c.display_id); if (s) s.handleAnswer(c.sdp); break; }
-      case 'display_ice': { const s = displaySlots.get(c.display_id); if (s) s.handleIceCandidate(c.candidate); break; }
       case 'debug_screen_torn_down': onDebugScreenTornDown(); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
       case 'hide_badge': hideBadge(c.tab); break;

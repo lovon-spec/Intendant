@@ -4242,6 +4242,8 @@ async fn activate_user_display(
         if let Err(e) = session.start(30, frame_registry).await {
             eprintln!("[user_display] Failed to start display session: {}", e);
         } else {
+            // Use the backend's resolution (from portal), not xdpyinfo.
+            let (width, height) = session.resolution();
             let session = Arc::new(session);
             session_registry.write().await.insert(display_id, session);
             bus.send(AppEvent::DisplayReady { display_id, width, height });
