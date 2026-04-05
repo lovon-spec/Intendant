@@ -198,15 +198,19 @@ impl DisplayBackend for MacOSBackend {
                     ev.post(CGEventTapLocation::HID);
                 }
             }
-            InputEvent::MouseMove { x, y } => {
+            InputEvent::MouseMove { x, y, buttons } => {
                 let point = CGPoint::new(x * width, y * height);
-                let ev = CGEvent::new_mouse_event(
-                    source,
-                    CGEventType::MouseMoved,
-                    point,
-                    CGMouseButton::Left,
-                )
-                .map_err(|()| CallerError::Display("CGEvent mouse move failed".into()))?;
+                let (event_type, button) = if buttons & 1 != 0 {
+                    (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+                } else if buttons & 2 != 0 {
+                    (CGEventType::RightMouseDragged, CGMouseButton::Right)
+                } else if buttons & 4 != 0 {
+                    (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+                } else {
+                    (CGEventType::MouseMoved, CGMouseButton::Left)
+                };
+                let ev = CGEvent::new_mouse_event(source, event_type, point, button)
+                    .map_err(|()| CallerError::Display("CGEvent mouse move failed".into()))?;
                 ev.post(CGEventTapLocation::HID);
             }
             InputEvent::MouseDown { x, y, b } => {

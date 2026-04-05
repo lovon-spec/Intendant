@@ -980,7 +980,7 @@ async fn execute_via_session(
                 let nx = *x as f64 / width as f64;
                 let ny = *y as f64 / height as f64;
                 let r = session
-                    .inject_input(crate::display::InputEvent::MouseMove { x: nx, y: ny })
+                    .inject_input(crate::display::InputEvent::MouseMove { x: nx, y: ny, buttons: 0 })
                     .await;
                 results.push(CuActionResult {
                     success: r.is_ok(),
@@ -1014,7 +1014,7 @@ async fn execute_via_session(
                     let mx = sx + (ex - sx) * t;
                     let my = sy + (ey - sy) * t;
                     let _ = session
-                        .inject_input(crate::display::InputEvent::MouseMove { x: mx, y: my })
+                        .inject_input(crate::display::InputEvent::MouseMove { x: mx, y: my, buttons: 0 })
                         .await;
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }

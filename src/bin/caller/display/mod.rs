@@ -106,7 +106,7 @@ pub enum InputEvent {
     #[serde(rename = "mu")]
     MouseUp { x: f64, y: f64, b: u8 },
     #[serde(rename = "mm")]
-    MouseMove { x: f64, y: f64 },
+    MouseMove { x: f64, y: f64, #[serde(default)] buttons: u8 },
     #[serde(rename = "sc")]
     Scroll { x: f64, y: f64, dx: f64, dy: f64 },
 }
@@ -647,9 +647,38 @@ mod tests {
         let json = r#"{"t":"mm","x":0.33,"y":0.66}"#;
         let evt: InputEvent = serde_json::from_str(json).unwrap();
         match evt {
-            InputEvent::MouseMove { x, y } => {
+            InputEvent::MouseMove { x, y, buttons } => {
                 assert!((x - 0.33).abs() < f64::EPSILON);
                 assert!((y - 0.66).abs() < f64::EPSILON);
+                assert_eq!(buttons, 0); // default when omitted
+            }
+            other => panic!("expected MouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_event_deserialize_mouse_move_with_buttons() {
+        let json = r#"{"t":"mm","x":0.5,"y":0.5,"buttons":1}"#;
+        let evt: InputEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            InputEvent::MouseMove { x, y, buttons } => {
+                assert!((x - 0.5).abs() < f64::EPSILON);
+                assert!((y - 0.5).abs() < f64::EPSILON);
+                assert_eq!(buttons, 1); // left button held
+            }
+            other => panic!("expected MouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_event_deserialize_mouse_move_with_multiple_buttons() {
+        let json = r#"{"t":"mm","x":0.1,"y":0.9,"buttons":5}"#;
+        let evt: InputEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            InputEvent::MouseMove { x, y, buttons } => {
+                assert!((x - 0.1).abs() < f64::EPSILON);
+                assert!((y - 0.9).abs() < f64::EPSILON);
+                assert_eq!(buttons, 5); // left + middle
             }
             other => panic!("expected MouseMove, got {other:?}"),
         }

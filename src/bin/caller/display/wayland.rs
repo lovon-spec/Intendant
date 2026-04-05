@@ -190,7 +190,7 @@ impl DisplayBackend for WaylandBackend {
                         .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
                 }
             }
-            InputEvent::MouseMove { x, y } => {
+            InputEvent::MouseMove { x, y, .. } => {
                 rd.notify_pointer_motion_absolute(
                     session,
                     node_id,

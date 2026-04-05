@@ -4109,7 +4109,7 @@ class DisplaySlot {
     };
     this._boundHandlers.mousemove = (e) => {
       const { x, y } = normalize(e);
-      sendPointer({ t: 'mm', x, y });
+      sendPointer({ t: 'mm', x, y, buttons: e.buttons });
     };
     this._boundHandlers.wheel = (e) => {
       e.preventDefault();
