@@ -29,8 +29,8 @@ struct CaptureState {
 /// approach as the existing `computer_use.rs` X11 backend).
 pub struct X11Backend {
     capture: Mutex<Option<CaptureState>>,
-    width: AtomicU32,
-    height: AtomicU32,
+    width: Arc<AtomicU32>,
+    height: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
     display: String,
 }
@@ -56,14 +56,15 @@ impl X11Backend {
 
         Ok(Self {
             capture: Mutex::new(None),
-            width: AtomicU32::new(width),
-            height: AtomicU32::new(height),
+            width: Arc::new(AtomicU32::new(width)),
+            height: Arc::new(AtomicU32::new(height)),
             shutdown: Arc::new(AtomicBool::new(false)),
             display: display_str,
         })
     }
 
     /// Create a backend targeting a specific X11 display string (e.g. ":0", ":99").
+    /// Currently unused but available for virtual display sessions and multi-server setups.
     #[allow(dead_code)]
     pub fn with_display(display_str: &str) -> Result<Self, CallerError> {
         let (conn, screen_num) = x11rb::connect(Some(display_str))
@@ -76,8 +77,8 @@ impl X11Backend {
 
         Ok(Self {
             capture: Mutex::new(None),
-            width: AtomicU32::new(width),
-            height: AtomicU32::new(height),
+            width: Arc::new(AtomicU32::new(width)),
+            height: Arc::new(AtomicU32::new(height)),
             shutdown: Arc::new(AtomicBool::new(false)),
             display: display_str.to_string(),
         })
@@ -209,9 +210,11 @@ impl DisplayBackend for X11Backend {
         let display_str = self.display.clone();
         let width = self.width.load(Ordering::SeqCst);
         let height = self.height.load(Ordering::SeqCst);
+        let shared_w = Arc::clone(&self.width);
+        let shared_h = Arc::clone(&self.height);
 
         let thread = std::thread::spawn(move || {
-            run_x11_capture(display_str, tx, shutdown_flag, fps, width, height);
+            run_x11_capture(display_str, tx, shutdown_flag, fps, width, height, shared_w, shared_h);
         });
 
         *self.capture.lock().await = Some(CaptureState { thread });
@@ -505,6 +508,8 @@ fn run_x11_capture(
     fps: u32,
     width: u32,
     height: u32,
+    shared_width: Arc<AtomicU32>,
+    shared_height: Arc<AtomicU32>,
 ) {
     use x11rb::connection::Connection;
     use x11rb::protocol::shm;
@@ -533,11 +538,25 @@ fn run_x11_capture(
 
     if shm_available {
         eprintln!("[display/x11] XShm available, using shared memory capture {}x{}", width, height);
-        run_shm_capture(&conn, root, depth, width, height, &tx, &shutdown, frame_interval);
+        run_shm_capture(&conn, root, depth, width, height, &tx, &shutdown, frame_interval, &shared_width, &shared_height);
     } else {
         eprintln!("[display/x11] XShm unavailable, falling back to XGetImage {}x{}", width, height);
-        run_getimage_capture(&conn, root, depth, width, height, &tx, &shutdown, frame_interval);
+        run_getimage_capture(&conn, root, depth, width, height, &tx, &shutdown, frame_interval, &shared_width, &shared_height);
     }
+}
+
+/// Re-query root window geometry and return the (even-aligned) dimensions.
+///
+/// Returns `None` if the query fails (display disconnected, etc.).
+fn query_root_geometry(
+    conn: &impl x11rb::connection::Connection,
+    root: u32,
+) -> Option<(u32, u32)> {
+    use x11rb::protocol::xproto::ConnectionExt;
+    let geo = conn.get_geometry(root).ok()?.reply().ok()?;
+    let w = (geo.width as u32) & !1;
+    let h = (geo.height as u32) & !1;
+    if w > 0 && h > 0 { Some((w, h)) } else { None }
 }
 
 /// XShm-based capture loop.
@@ -550,9 +569,14 @@ fn run_shm_capture(
     tx: &mpsc::Sender<Frame>,
     shutdown: &Arc<AtomicBool>,
     frame_interval: std::time::Duration,
+    shared_width: &Arc<AtomicU32>,
+    shared_height: &Arc<AtomicU32>,
 ) {
     use x11rb::protocol::shm::ConnectionExt as ShmConnectionExt;
     use x11rb::protocol::xproto::ImageFormat;
+
+    let mut width = width;
+    let mut height = height;
 
     // Allocate shared memory segment.
     // 4 bytes per pixel (BGRA), full screen.
@@ -590,7 +614,7 @@ fn run_shm_capture(
     if !attach_ok {
         eprintln!("[display/x11] ShmAttach failed, falling back to XGetImage");
         unsafe { libc::shmdt(shm_addr) };
-        run_getimage_capture(conn, root, _depth, width, height, tx, shutdown, frame_interval);
+        run_getimage_capture(conn, root, _depth, width, height, tx, shutdown, frame_interval, shared_width, shared_height);
         return;
     }
 
@@ -598,12 +622,42 @@ fn run_shm_capture(
     // Track consecutive capture errors to detect hotplug / display loss.
     let mut consecutive_errors: u32 = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 30;
+    // Re-query root window geometry every N frames to detect resolution changes.
+    const GEOMETRY_CHECK_INTERVAL: u64 = 60;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
         let start = std::time::Instant::now();
+
+        // Periodically check for root window resize (e.g. xrandr change).
+        if frame_count > 0 && frame_count % GEOMETRY_CHECK_INTERVAL == 0 {
+            if let Some((new_w, new_h)) = query_root_geometry(conn, root) {
+                if new_w != width || new_h != height {
+                    eprintln!(
+                        "[display/x11] root window resize detected: {}x{} -> {}x{}, \
+                         shm segment may be too small -- falling back to XGetImage",
+                        width, height, new_w, new_h,
+                    );
+                    // The SHM segment was sized for the old dimensions.
+                    // Detach and fall through to XGetImage which can handle
+                    // any size per frame.
+                    let _ = conn.shm_detach(seg);
+                    let _ = conn.flush();
+                    unsafe { libc::shmdt(shm_addr) };
+                    width = new_w;
+                    height = new_h;
+                    shared_width.store(width, Ordering::SeqCst);
+                    shared_height.store(height, Ordering::SeqCst);
+                    run_getimage_capture(
+                        conn, root, _depth, width, height, tx, shutdown,
+                        frame_interval, shared_width, shared_height,
+                    );
+                    return;
+                }
+            }
+        }
 
         let cookie = match conn.shm_get_image(
             root,
@@ -694,18 +748,40 @@ fn run_getimage_capture(
     tx: &mpsc::Sender<Frame>,
     shutdown: &Arc<AtomicBool>,
     frame_interval: std::time::Duration,
+    shared_width: &Arc<AtomicU32>,
+    shared_height: &Arc<AtomicU32>,
 ) {
     use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
+    let mut width = width;
+    let mut height = height;
     let mut frame_count: u64 = 0;
     let mut consecutive_errors: u32 = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 30;
+    // Re-query root window geometry every N frames to detect resolution changes.
+    const GEOMETRY_CHECK_INTERVAL: u64 = 60;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
         let start = std::time::Instant::now();
+
+        // Periodically check for root window resize.
+        if frame_count > 0 && frame_count % GEOMETRY_CHECK_INTERVAL == 0 {
+            if let Some((new_w, new_h)) = query_root_geometry(conn, root) {
+                if new_w != width || new_h != height {
+                    eprintln!(
+                        "[display/x11] root window resize detected: {}x{} -> {}x{}",
+                        width, height, new_w, new_h,
+                    );
+                    width = new_w;
+                    height = new_h;
+                    shared_width.store(width, Ordering::SeqCst);
+                    shared_height.store(height, Ordering::SeqCst);
+                }
+            }
+        }
 
         let cookie = match conn.get_image(
             ImageFormat::Z_PIXMAP,

@@ -11,9 +11,25 @@ use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
+
+/// Enumerate Wayland displays.
+///
+/// Wayland portals do not expose display enumeration -- the user selects which
+/// monitor to share via the portal dialog.  We return a single entry that
+/// honestly represents this behavior.
+pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
+    vec![super::DisplayInfo {
+        id: 0,
+        platform_id: 0,
+        name: "Wayland Display (portal-selected)".to_string(),
+        width: 1920,
+        height: 1080,
+        is_primary: true,
+    }]
+}
 
 /// Portal session handle + PipeWire capture thread.
 ///
@@ -39,6 +55,9 @@ struct PortalSession {
 pub struct WaylandBackend {
     portal_session: Mutex<Option<PortalSession>>,
     resolution: RwLock<(u32, u32)>,
+    /// Shared atomics so the PipeWire thread can update resolution on resize.
+    shared_width: Arc<AtomicU32>,
+    shared_height: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -48,6 +67,8 @@ impl WaylandBackend {
         Self {
             portal_session: Mutex::new(None),
             resolution: RwLock::new((0, 0)),
+            shared_width: Arc::new(AtomicU32::new(0)),
+            shared_height: Arc::new(AtomicU32::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -122,7 +143,14 @@ impl DisplayBackend for WaylandBackend {
             None => (1920, 1080),
         };
 
+        eprintln!(
+            "[display/wayland] Portal granted stream: node_id={}, {}x{}, {} stream(s) available",
+            node_id, width, height, streams.len(),
+        );
+
         *self.resolution.write().await = (width, height);
+        self.shared_width.store(width, Ordering::SeqCst);
+        self.shared_height.store(height, Ordering::SeqCst);
 
         // Get PipeWire fd via the screencast portal.
         let pw_fd = screencast
@@ -135,8 +163,10 @@ impl DisplayBackend for WaylandBackend {
 
         // --- Spawn dedicated PipeWire thread ---
         let shutdown_flag = Arc::clone(&self.shutdown);
+        let shared_w = Arc::clone(&self.shared_width);
+        let shared_h = Arc::clone(&self.shared_height);
         let pw_thread = std::thread::spawn(move || {
-            run_pipewire_capture(pw_fd, node_id, tx, shutdown_flag, width, height);
+            run_pipewire_capture(pw_fd, node_id, tx, shutdown_flag, width, height, shared_w, shared_h);
         });
 
         // Store the RemoteDesktop proxy and session handle so inject_input()
@@ -165,7 +195,10 @@ impl DisplayBackend for WaylandBackend {
     }
 
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
-        let (width, height) = *self.resolution.read().await;
+        // Read the latest resolution from shared atomics (updated by the
+        // PipeWire thread when frame dimensions change).
+        let width = self.shared_width.load(Ordering::SeqCst);
+        let height = self.shared_height.load(Ordering::SeqCst);
         let guard = self.portal_session.lock().await;
         let ps = guard.as_ref().ok_or_else(|| {
             CallerError::Display("no active portal session for input injection".to_string())
@@ -270,10 +303,10 @@ impl DisplayBackend for WaylandBackend {
     }
 
     fn resolution(&self) -> (u32, u32) {
-        self.resolution
-            .try_read()
-            .map(|r| *r)
-            .unwrap_or((0, 0))
+        (
+            self.shared_width.load(Ordering::SeqCst),
+            self.shared_height.load(Ordering::SeqCst),
+        )
     }
 
     fn kind(&self) -> &'static str {
@@ -293,6 +326,8 @@ fn run_pipewire_capture(
     shutdown: Arc<AtomicBool>,
     width: u32,
     height: u32,
+    shared_width: Arc<AtomicU32>,
+    shared_height: Arc<AtomicU32>,
 ) {
     use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use pipewire::spa::param::video::VideoFormat;
@@ -344,6 +379,11 @@ fn run_pipewire_capture(
 
     // Stream listener: process frames from the PipeWire buffer.
     let tx_clone = tx.clone();
+    let sw = Arc::clone(&shared_width);
+    let sh = Arc::clone(&shared_height);
+    // Track the last known dimensions so we only log on actual changes.
+    let mut last_w = width;
+    let mut last_h = height;
     let _listener = stream
         .add_local_listener()
         .process(move |stream_ref, _: &mut ()| {
@@ -353,11 +393,37 @@ fn run_pipewire_capture(
                     let stride = buf.chunk().stride() as u32;
 
                     if let Some(data) = buf.data() {
-                        // Use the stream's actual dimensions, not stride-derived.
-                        // stride may include row padding for memory alignment,
-                        // so stride / 4 can be wider than the real pixel width.
-                        let frame_w = width;
-                        let frame_h = height;
+                        // Derive actual frame dimensions from the buffer data.
+                        // stride is bytes per row (may include padding); for
+                        // BGRA/BGRx each pixel is 4 bytes.  The frame height
+                        // is data.len() / stride (integer division).
+                        let frame_w = if stride > 0 {
+                            // Use the stored width as baseline; stride / 4 may
+                            // be wider due to alignment padding.
+                            let current_w = sw.load(Ordering::SeqCst);
+                            if current_w > 0 { current_w } else { stride / 4 }
+                        } else {
+                            sw.load(Ordering::SeqCst)
+                        };
+                        let frame_h = if stride > 0 && !data.is_empty() {
+                            (data.len() as u32) / stride
+                        } else {
+                            sh.load(Ordering::SeqCst)
+                        };
+
+                        // Update shared atomics if dimensions changed.
+                        if frame_w > 0 && frame_h > 0
+                            && (frame_w != last_w || frame_h != last_h)
+                        {
+                            eprintln!(
+                                "[display/wayland] frame resize detected: {}x{} -> {}x{}",
+                                last_w, last_h, frame_w, frame_h,
+                            );
+                            sw.store(frame_w, Ordering::SeqCst);
+                            sh.store(frame_h, Ordering::SeqCst);
+                            last_w = frame_w;
+                            last_h = frame_h;
+                        }
 
                         let frame = Frame {
                             data: data.to_vec(),

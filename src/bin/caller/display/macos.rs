@@ -37,8 +37,8 @@ struct CaptureState {
 /// CoreGraphics CGEvent for input injection.
 pub struct MacOSBackend {
     capture: Mutex<Option<CaptureState>>,
-    width: AtomicU32,
-    height: AtomicU32,
+    width: Arc<AtomicU32>,
+    height: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
     /// Optional target display ID (CGDisplayID).  When `None`, captures the
     /// first available display (backwards-compatible single-monitor behavior).
@@ -51,8 +51,8 @@ impl MacOSBackend {
     pub fn new() -> Self {
         Self {
             capture: Mutex::new(None),
-            width: AtomicU32::new(0),
-            height: AtomicU32::new(0),
+            width: Arc::new(AtomicU32::new(0)),
+            height: Arc::new(AtomicU32::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             target_display_id: None,
         }
@@ -62,8 +62,8 @@ impl MacOSBackend {
     pub fn with_display_id(display_id: u32) -> Self {
         Self {
             capture: Mutex::new(None),
-            width: AtomicU32::new(0),
-            height: AtomicU32::new(0),
+            width: Arc::new(AtomicU32::new(0)),
+            height: Arc::new(AtomicU32::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             target_display_id: Some(display_id),
         }
@@ -184,6 +184,11 @@ impl DisplayBackend for MacOSBackend {
         let (tx, rx) = mpsc::channel::<Frame>(4);
 
         let shutdown_flag = Arc::clone(&self.shutdown);
+        // Share width/height atomics with the output handler so it can
+        // update them when ScreenCaptureKit delivers frames at a different
+        // resolution (e.g. Retina scale change, resolution switch).
+        let shared_w = Arc::clone(&self.width);
+        let shared_h = Arc::clone(&self.height);
 
         let mut stream = SCStream::new(&filter, &config);
         stream.add_output_handler(
@@ -208,6 +213,21 @@ impl DisplayBackend for MacOSBackend {
 
                 if pixels.is_empty() {
                     return;
+                }
+
+                // Update shared resolution atomics if the frame dimensions
+                // changed (e.g. Retina scale change, display resolution
+                // switch).  inject_input() reads these for coordinate
+                // mapping, so keeping them current avoids stale geometry.
+                let prev_w = shared_w.load(Ordering::SeqCst);
+                let prev_h = shared_h.load(Ordering::SeqCst);
+                if w != prev_w || h != prev_h {
+                    shared_w.store(w, Ordering::SeqCst);
+                    shared_h.store(h, Ordering::SeqCst);
+                    eprintln!(
+                        "[display/macos] frame resize detected: {}x{} -> {}x{}",
+                        prev_w, prev_h, w, h,
+                    );
                 }
 
                 let frame = Frame {

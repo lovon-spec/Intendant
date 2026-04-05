@@ -103,9 +103,11 @@ async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
     if !displays.is_empty() {
         return displays;
     }
-    // Wayland enumeration is portal-gated — returns empty unless a portal
-    // session is active.  Return empty so the caller falls back to the
-    // single-display default.
+    // On pure Wayland (no Xwayland), the portal doesn't expose enumeration
+    // but we return a placeholder so callers know a display exists.
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        return wayland::enumerate_displays().await;
+    }
     Vec::new()
 }
 
