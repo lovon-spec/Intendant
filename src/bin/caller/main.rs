@@ -4947,16 +4947,41 @@ async fn main() -> Result<(), CallerError> {
         l.write_meta(Some(&project.root), None);
     });
 
-    let provider = provider::select_provider()?;
+    let provider_result = provider::select_provider();
+    let provider = match provider_result {
+        Ok(p) => {
+            slog(&session_log, |l| {
+                l.info(&format!("Provider: {}", p.name()));
+                l.info(&format!("Model: {}", p.model()));
+            });
+            Some(p)
+        }
+        Err(ref e) if flags.web || flags.mcp => {
+            // No API keys — start the dashboard anyway.
+            // Display control, session browsing, annotations, and clipping
+            // all work without inference.
+            eprintln!(
+                "Warning: {} AI features will be unavailable. \
+                 The web dashboard is starting without a model provider.",
+                e
+            );
+            slog(&session_log, |l| {
+                l.warn(&format!("No AI provider: {}", e));
+            });
+            None
+        }
+        Err(e) => return Err(e),
+    };
     slog(&session_log, |l| {
-        l.info(&format!("Provider: {}", provider.name()));
-        l.info(&format!("Model: {}", provider.model()));
         l.info(&format!("Project root: {}", project.root.display()));
         l.info(&format!("Autonomy: {}", flags.autonomy));
     });
 
     // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
+        let provider = provider.ok_or_else(|| {
+            CallerError::Config("Sub-agent mode requires an API key".to_string())
+        })?;
         run_sub_agent_mode(provider, id, role, session_log, log_dir).await?;
         return Ok(());
     }
@@ -5112,12 +5137,12 @@ async fn main() -> Result<(), CallerError> {
         };
 
         let mut mcp_app_state = mcp::McpAppState::new(
-            provider.name().to_string(),
-            provider.model().to_string(),
+            provider.as_ref().map(|p| p.name().to_string()).unwrap_or_else(|| "none".to_string()),
+            provider.as_ref().map(|p| p.model().to_string()).unwrap_or_else(|| "none".to_string()),
             autonomy.clone(),
             log_dir.clone(),
         );
-        mcp_app_state.context_window = provider.context_window();
+        mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
         mcp_app_state.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
         mcp_app_state.task_description = task.clone().unwrap_or_default();
         let mcp_state = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_app_state));
@@ -5354,12 +5379,12 @@ async fn main() -> Result<(), CallerError> {
 
         // Create app state
         let mut app = tui::app::App::new(
-            provider.name().to_string(),
-            provider.model().to_string(),
+            provider.as_ref().map(|p| p.name().to_string()).unwrap_or_else(|| "none".to_string()),
+            provider.as_ref().map(|p| p.model().to_string()).unwrap_or_else(|| "none".to_string()),
             autonomy.clone(),
             log_dir.clone(),
         );
-        app.context_window = provider.context_window();
+        app.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
         app.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
         app.task_description = task.clone().unwrap_or_default();
         app.project_root = Some(project.root.clone());
@@ -5666,6 +5691,17 @@ async fn main() -> Result<(), CallerError> {
                             (first_task, follow_up_rx)
                         }
                         None => return, // channel closed before a task arrived
+                    }
+                };
+
+                // Re-select provider at task start (may have been None at startup)
+                let provider = match provider.or_else(|| provider::select_provider().ok()) {
+                    Some(p) => p,
+                    None => {
+                        bus_clone.send(AppEvent::LoopError(
+                            "No API key configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.".to_string()
+                        ));
+                        return;
                     }
                 };
 
@@ -6072,6 +6108,9 @@ async fn main() -> Result<(), CallerError> {
         let project_root = project.root.clone();
         let autonomy_for_daemon = autonomy.clone();
 
+        let provider = provider.ok_or_else(|| {
+            CallerError::Config("Headless mode requires an API key".to_string())
+        })?;
         let result = if flags.direct || is_simple_task(&task) {
             run_direct_mode(
                 provider,
