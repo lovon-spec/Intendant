@@ -20,7 +20,7 @@
 //! - `latest_frame`: always overwritten, latest-wins.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -353,9 +353,11 @@ pub struct DisplaySession {
     /// Negotiated codec MIME type for the encoder pipeline.
     /// Set on the first peer connection, all subsequent peers use the same codec.
     codec_mime: RwLock<&'static str>,
-    /// Whether the encoder pipeline has been started.  The encoder is deferred
-    /// until the first `handle_offer()` so we know which codec the peer selected.
-    encoder_started: AtomicBool,
+    /// Serializes codec selection + encoder startup on the first `handle_offer()`.
+    /// Guards a bool: `false` = encoder not yet started, `true` = running.
+    /// All concurrent first-offer callers block on this mutex so only one
+    /// task performs codec negotiation and starts the encoder pipeline.
+    encoder_init_lock: Mutex<bool>,
     /// Capture FPS stored from `start()` for deferred encoder startup.
     fps: Mutex<u32>,
     /// EventBus stored from `start()` for deferred encoder startup.
@@ -382,7 +384,7 @@ impl DisplaySession {
             counters: Arc::new(DisplayMetricsCounters::new()),
             metrics_epoch: Mutex::new(Instant::now()),
             codec_mime: RwLock::new(encode::MIME_TYPE_VP8),
-            encoder_started: AtomicBool::new(false),
+            encoder_init_lock: Mutex::new(false),
             fps: Mutex::new(30),
             encoder_event_bus: Mutex::new(None),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
@@ -696,14 +698,9 @@ impl DisplaySession {
 
     /// Start the encoder pipeline with the given codec.
     ///
-    /// Called on the first `handle_offer()` so the encoder matches the
-    /// negotiated codec.  Subsequent calls are no-ops (guarded by
-    /// `encoder_started`).
-    async fn ensure_encoder_running(&self, codec_mime: &'static str) {
-        if self.encoder_started.swap(true, Ordering::SeqCst) {
-            return; // already running
-        }
-
+    /// Called exactly once from `handle_offer()` under `encoder_init_lock`.
+    /// The caller is responsible for guarding against double-start.
+    async fn start_encoder_pipeline(&self, codec_mime: &'static str) {
         let fps = *self.fps.lock().await;
         let event_bus = self.encoder_event_bus.lock().await.clone();
 
@@ -859,6 +856,12 @@ impl DisplaySession {
     /// encoder pipeline.  Subsequent peers reuse the running encoder's codec
     /// without re-negotiating -- all peers share one encoder, so the codec
     /// is locked once it starts.
+    ///
+    /// The `encoder_init_lock` mutex serializes codec selection and encoder
+    /// startup so that concurrent first-offer calls cannot race on codec
+    /// negotiation.  Only the first caller performs negotiation and starts
+    /// the encoder; all others wait and then use the established codec.
+    ///
     /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
     /// the peer map, starts clipboard monitoring, and returns the SDP answer.
     pub async fn handle_offer(
@@ -868,24 +871,23 @@ impl DisplaySession {
         ice_config: &IceConfig,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
+        // Serialize codec selection + encoder startup.
         let codec_mime = {
-            let current = *self.codec_mime.read().await;
-            if self.encoder_started.load(Ordering::SeqCst) {
+            let mut init = self.encoder_init_lock.lock().await;
+            if *init {
                 // Encoder already running -- use the established codec.
-                // Don't re-negotiate; all peers share one encoder.
-                current
+                *self.codec_mime.read().await
             } else {
-                // First peer -- negotiate codec from SDP.
+                // First peer -- negotiate codec from SDP and start encoder.
                 let (width, height) = self.backend.resolution();
                 let (_encoder, codec_choice) = encode::select_codec(sdp, width, height, 2000);
                 let mime = codec_choice.mime();
                 *self.codec_mime.write().await = mime;
+                self.start_encoder_pipeline(mime).await;
+                *init = true;
                 mime
             }
         };
-
-        // Start encoder if not yet running.
-        self.ensure_encoder_running(codec_mime).await;
 
         let backend = Arc::clone(&self.backend);
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =

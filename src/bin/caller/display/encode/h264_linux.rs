@@ -167,6 +167,12 @@ impl FfmpegH264Encoder {
                 "60",
                 "-bf",
                 "0",
+                // Force single-slice output so every frame contains exactly
+                // one slice NAL.  Without this, x264 may produce multi-slice
+                // frames that the NAL reader splits across WebRTC samples
+                // (it treats the first slice NAL as frame-complete).
+                "-x264-params",
+                "slices=1",
                 // Output: raw H264 Annex-B to stdout
                 "-f",
                 "h264",
