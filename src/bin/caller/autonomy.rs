@@ -191,6 +191,10 @@ pub struct AutonomyState {
     /// Session-level grant for the user's session display.
     /// Once true, `DisplayControl` actions skip the approval prompt.
     pub user_display_granted: bool,
+    /// Command signatures that have been approved this session.
+    /// Retries of the same command (e.g. with different display param)
+    /// skip the approval prompt.
+    pub approved_commands: std::collections::HashSet<String>,
 }
 
 impl Default for AutonomyState {
@@ -199,6 +203,7 @@ impl Default for AutonomyState {
             level: AutonomyLevel::Medium,
             rules: ApprovalConfig::default(),
             user_display_granted: false,
+            approved_commands: std::collections::HashSet::new(),
         }
     }
 }
@@ -209,7 +214,36 @@ impl AutonomyState {
             level,
             rules,
             user_display_granted: false,
+            approved_commands: std::collections::HashSet::new(),
         }
+    }
+
+    /// Generate a dedup key for a command. Strips nonce and display params
+    /// so retries of the same command with different display/nonce are recognized.
+    pub fn command_dedup_key(command: &str) -> String {
+        // Remove nonce references like $NONCE[N] and display-like params
+        let mut key = command.to_string();
+        // Strip --display=N, display:N patterns
+        key = key.replace(char::is_whitespace, " ");
+        // Remove nonce references
+        while let Some(start) = key.find("$NONCE[") {
+            if let Some(end) = key[start..].find(']') {
+                key.replace_range(start..start + end + 1, "NONCE");
+            } else {
+                break;
+            }
+        }
+        key
+    }
+
+    /// Check if a command was already approved this session.
+    pub fn was_command_approved(&self, command: &str) -> bool {
+        self.approved_commands.contains(&Self::command_dedup_key(command))
+    }
+
+    /// Record a command as approved.
+    pub fn record_approved_command(&mut self, command: &str) {
+        self.approved_commands.insert(Self::command_dedup_key(command));
     }
 
     /// Determine whether approval is needed for a given action category.

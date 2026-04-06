@@ -2301,6 +2301,13 @@ async fn run_agent_loop(
             let mut should_skip = false;
             if let Some((cat, denied_by_policy)) = needs_approval {
                 let preview = format_command_preview(&json_str);
+
+                // Dedup: skip approval for retries of already-approved commands
+                if !denied_by_policy && autonomy.read().await.was_command_approved(&preview) {
+                    slog(&session_log, |l| {
+                        l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
+                    });
+                } else {
                 slog(&session_log, |l| {
                     l.approval(&cat.to_string(), &preview, "waiting")
                 });
@@ -2334,6 +2341,8 @@ async fn run_agent_loop(
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
                             bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
+                            // Record approved command for dedup
+                            autonomy.write().await.record_approved_command(&preview);
                             // Session-grant: first DisplayControl approval unlocks the session
                             if cat == autonomy::ActionCategory::DisplayControl {
                                 let mut state = autonomy.write().await;
@@ -2431,6 +2440,7 @@ async fn run_agent_loop(
                         }
                     }
                 }
+            } // close dedup else block
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
                 let preview = format_command_preview(&json_str);
@@ -2662,6 +2672,13 @@ Proceed with explicit assumptions and continue without additional questions."
             let mut should_skip = false;
             if let Some((cat, denied_by_policy)) = needs_approval {
                 let preview = format_command_preview(&json_str);
+
+                // Dedup: skip approval for retries of already-approved commands
+                if !denied_by_policy && autonomy.read().await.was_command_approved(&preview) {
+                    slog(&session_log, |l| {
+                        l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
+                    });
+                } else {
                 slog(&session_log, |l| {
                     l.approval(&cat.to_string(), &preview, "waiting")
                 });
@@ -2695,6 +2712,8 @@ Proceed with explicit assumptions and continue without additional questions."
                                 l.approval(&cat.to_string(), &preview, "approved")
                             });
                             bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
+                            // Record approved command for dedup
+                            autonomy.write().await.record_approved_command(&preview);
                             // Session-grant: first DisplayControl approval unlocks the session
                             if cat == autonomy::ActionCategory::DisplayControl {
                                 let mut state = autonomy.write().await;
@@ -2792,6 +2811,7 @@ Proceed with explicit assumptions and continue without additional questions."
                         }
                     }
                 }
+            } // close dedup else block
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
                 let preview = format_command_preview(&json_str);

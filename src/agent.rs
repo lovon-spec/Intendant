@@ -233,7 +233,13 @@ impl Agent {
     /// set in the environment.
     fn default_display(&self) -> i32 {
         if cfg!(target_os = "macos") {
-            return 0;
+            // Default to virtual display 99 so CLI-only commands (pjsua, curl,
+            // etc.) don't trigger the user session display access gate. Commands
+            // that need the real display (Computer Use) specify display:0 explicitly.
+            if std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok() {
+                return 0;
+            }
+            return 99;
         }
         // Prefer the DISPLAY env var (set by the caller when Xvfb is auto-launched)
         if let Ok(d) = std::env::var("DISPLAY") {
@@ -494,14 +500,18 @@ impl Agent {
         };
 
         // Block sensitive filesystem roots and user secret directories.
-        if path == Path::new("/etc/shadow")
-            || path == Path::new("/etc/gshadow")
-            || path.starts_with("/proc")
-            || path.starts_with("/sys")
-            || path.starts_with("/dev")
-            || path.components().any(|c| c.as_os_str() == ".ssh")
-            || path.components().any(|c| c.as_os_str() == ".gnupg")
-        {
+        // Check both the raw and canonicalized paths — on macOS, symlinks like
+        // /etc → /private/etc mean the canonical path won't match the blocklist.
+        let is_sensitive = |p: &Path| {
+            p == Path::new("/etc/shadow")
+                || p == Path::new("/etc/gshadow")
+                || p.starts_with("/proc")
+                || p.starts_with("/sys")
+                || p.starts_with("/dev")
+                || p.components().any(|c| c.as_os_str() == ".ssh")
+                || p.components().any(|c| c.as_os_str() == ".gnupg")
+        };
+        if is_sensitive(&raw) || is_sensitive(&path) {
             return Err(AgentError::Process(format!(
                 "access to sensitive path blocked: {}",
                 path.display()
@@ -1688,12 +1698,14 @@ mod tests {
 
     #[tokio::test]
     async fn process_input_inspect_path() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
             commands: vec![AgentCommand {
                 function: "inspectPath".to_string(),
                 nonce: 1,
-                path: Some("/tmp".to_string()),
+                path: Some(dir),
                 ..Default::default()
             }],
         };
@@ -2406,14 +2418,16 @@ mod tests {
 
     #[tokio::test]
     async fn default_display_with_available() {
-        // When available_displays has entries, the first >0 is used (after env var).
-        // We can't safely manipulate DISPLAY in parallel tests, so just verify
-        // that the result is reasonable (>0).
         let (agent, _log) = create_test_agent();
-        // Test agent has empty available_displays, so result comes from
-        // DISPLAY env var (if set) or fallback to 1. Either is valid.
         let d = agent.default_display();
-        assert!(d >= 1, "default_display should be >= 1, got {}", d);
+        if cfg!(target_os = "macos") {
+            // macOS defaults to virtual display 99; returns 0 only when
+            // INTENDANT_USER_DISPLAY_GRANTED is set.
+            assert!(d == 0 || d == 99, "default_display on macOS should be 0 or 99, got {}", d);
+        } else {
+            // Linux: DISPLAY env var or fallback to 1
+            assert!(d >= 1, "default_display should be >= 1, got {}", d);
+        }
     }
 
     #[tokio::test]

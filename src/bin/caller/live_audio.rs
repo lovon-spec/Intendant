@@ -1577,14 +1577,24 @@ pub async fn run_session(
         });
     }
 
-    Ok(LiveAudioResult {
+    let result = LiveAudioResult {
         id: spec.id.clone(),
         status: final_status,
         response_data,
         quarantine_ids,
         transcript_path: transcript.path().to_path_buf(),
         duration_secs,
-    })
+    };
+
+    // Persist result to disk immediately — if the process is killed before
+    // run_session returns, the caller never gets the result. Writing it next
+    // to the transcript ensures it survives crashes.
+    let result_path = transcript.path().with_file_name("result.json");
+    if let Ok(json) = serde_json::to_string_pretty(&result) {
+        let _ = tokio::fs::write(&result_path, json).await;
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]

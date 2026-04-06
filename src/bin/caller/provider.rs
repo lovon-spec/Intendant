@@ -2530,7 +2530,7 @@ fn resolve_reasoning(model: &str) -> Option<ReasoningConfig> {
                 Some(v)
             }
         })
-        .unwrap_or_else(|| "xhigh".to_string());
+        .unwrap_or_else(|| "high".to_string());
     let summary = env::var("REASONING_SUMMARY")
         .ok()
         .and_then(|s| {
