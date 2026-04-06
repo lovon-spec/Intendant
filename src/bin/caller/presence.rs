@@ -335,7 +335,25 @@ impl PresenceLayer {
 
         // SubmitTask is special: it uses the dedicated task channel (preserves
         // the full TaskEnvelope including force_direct and context_hints).
+        // Guard: reject submit_task when a task is already running — the presence
+        // model can hallucinate unrelated tasks and try to override the active work.
         if let PresenceAction::SubmitTask(envelope) = action {
+            let is_busy = {
+                let state = self.agent_state.lock().unwrap_or_else(|e| e.into_inner());
+                !matches!(
+                    state.phase.as_str(),
+                    "idle" | "waiting_for_task" | "completed" | ""
+                )
+            };
+
+            if is_busy {
+                self.plog(
+                    format!("Rejected submit_task while agent is busy: {}", &envelope.task[..envelope.task.len().min(100)]),
+                    None,
+                );
+                return "Error: a task is already running. Wait for it to complete before submitting a new one.".to_string();
+            }
+
             let task = envelope.task.clone();
             return match self.task_tx.send(envelope).await {
                 Ok(()) => {

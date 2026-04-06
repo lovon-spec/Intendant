@@ -176,10 +176,12 @@ pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
-    // 1. Project-scoped skills
+    // 1. Project-scoped skills (check both <root>/skills/ and <root>/.intendant/skills/)
     if let Some(root) = project_root {
-        let skills_dir = root.join(".intendant").join("skills");
+        let skills_dir = root.join("skills");
         load_skills_from_dir(&skills_dir, SkillSource::Project, &mut skills, &mut seen_names);
+        let dotdir = root.join(".intendant").join("skills");
+        load_skills_from_dir(&dotdir, SkillSource::Project, &mut skills, &mut seen_names);
     }
 
     // 2. Personal skills (~/.intendant/skills/)

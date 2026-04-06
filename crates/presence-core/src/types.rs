@@ -43,7 +43,7 @@ fn default_live_context_window() -> u64 {
 }
 
 /// Default text presence model.
-pub const DEFAULT_TEXT_MODEL: &str = "gemini-2.5-flash";
+pub const DEFAULT_TEXT_MODEL: &str = "gemini-3.1-flash-preview";
 /// Preferred text presence model (Gemini 3 Flash, when available).
 #[allow(dead_code)]
 pub const PREFERRED_TEXT_MODEL: &str = "gemini-3-flash-preview";
