@@ -3977,6 +3977,7 @@ class DisplaySlot {
     this.pc = null;
     this.controlChannel = null;  // reliable, ordered — keys, mouse buttons
     this.pointerChannel = null;  // unreliable, maxRetransmits:0 — mouse move, scroll
+    this.clipboardChannel = null; // reliable, ordered — clipboard sync
     this.videoEl = null;
     this.interactive = false;
     this.connected = false;
@@ -4054,6 +4055,17 @@ class DisplaySlot {
       ordered: false,
       maxRetransmits: 0
     });
+    this.clipboardChannel = this.pc.createDataChannel('clipboard', { ordered: true });
+
+    // Handle incoming clipboard updates from the remote display
+    this.clipboardChannel.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        if (d.t === 'clipboard_update' && d.text && this.interactive) {
+          navigator.clipboard.writeText(d.text).catch(() => {});
+        }
+      } catch {}
+    };
 
     // Handle incoming video track
     this.pc.ontrack = (e) => {
@@ -4233,7 +4245,18 @@ class DisplaySlot {
     };
     this._boundHandlers.contextmenu = (e) => e.preventDefault();
 
+    // Clipboard: intercept paste events and send to remote display
+    this._boundHandlers.paste = (e) => {
+      const text = e.clipboardData?.getData('text');
+      if (text && this.clipboardChannel?.readyState === 'open') {
+        this.clipboardChannel.send(JSON.stringify({t: 'clipboard_set', text}));
+        e.preventDefault();
+      }
+    };
+    document.addEventListener('paste', this._boundHandlers.paste);
+
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {
+      if (evt === 'paste') continue; // already added to document
       vid.addEventListener(evt, handler, { passive: false });
     }
   }
@@ -4242,7 +4265,11 @@ class DisplaySlot {
     this.interactive = false;
     const vid = this.videoEl;
     for (const [evt, handler] of Object.entries(this._boundHandlers)) {
-      vid.removeEventListener(evt, handler);
+      if (evt === 'paste') {
+        document.removeEventListener('paste', handler);
+      } else {
+        vid.removeEventListener(evt, handler);
+      }
     }
     this._boundHandlers = {};
     const note = this.noteInput.value.trim() || undefined;
@@ -4344,6 +4371,7 @@ class DisplaySlot {
     this.releaseControl();
     if (this.controlChannel) { this.controlChannel.close(); this.controlChannel = null; }
     if (this.pointerChannel) { this.pointerChannel.close(); this.pointerChannel = null; }
+    if (this.clipboardChannel) { this.clipboardChannel.close(); this.clipboardChannel = null; }
     if (this.pc) { this.pc.close(); this.pc = null; }
     this.connected = false;
     this.statusEl.textContent = 'Disconnected';

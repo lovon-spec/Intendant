@@ -33,6 +33,8 @@ pub struct WebRtcPeer {
     encoded_frame_tx: mpsc::Sender<Arc<EncodedFrame>>,
     sender_handle: Mutex<Option<JoinHandle<()>>>,
     shutdown: CancellationToken,
+    /// Clipboard data channel for sending clipboard updates to the browser.
+    clipboard_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
 }
 
 impl WebRtcPeer {
@@ -43,11 +45,15 @@ impl WebRtcPeer {
     ///
     /// `input_handler` is invoked for each `InputEvent` received on the peer's
     /// data channels.
+    ///
+    /// `clipboard_handler` is invoked when the browser sends clipboard text via
+    /// the `clipboard` data channel.
     pub async fn new(
         peer_id: PeerId,
         offer_sdp: &str,
         ice_config: &IceConfig,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
+        clipboard_handler: Arc<dyn Fn(String) + Send + Sync>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<(Self, String), CallerError> {
         // --- Media engine ---
@@ -130,6 +136,10 @@ impl WebRtcPeer {
         // --- Data channels (browser creates them; we handle on_data_channel) ---
         let handler_control = Arc::clone(&input_handler);
         let handler_pointer = Arc::clone(&input_handler);
+        let handler_clipboard = Arc::clone(&clipboard_handler);
+        let clipboard_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>> =
+            Arc::new(Mutex::new(None));
+        let clipboard_channel_setter = Arc::clone(&clipboard_channel);
 
         peer_connection.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -154,6 +164,27 @@ impl WebRtcPeer {
                             if let Ok(text) = std::str::from_utf8(&msg.data) {
                                 if let Ok(evt) = serde_json::from_str::<InputEvent>(text) {
                                     handler(evt);
+                                }
+                            }
+                            Box::pin(async {})
+                        }));
+                    })
+                }
+                "clipboard" => {
+                    let handler = Arc::clone(&handler_clipboard);
+                    let setter = Arc::clone(&clipboard_channel_setter);
+                    Box::pin(async move {
+                        // Store reference for outbound messages.
+                        *setter.lock().await = Some(Arc::clone(&dc));
+                        dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                            if let Ok(text) = std::str::from_utf8(&msg.data) {
+                                // Parse {"t":"clipboard_set","text":"..."}
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                                    if parsed.get("t").and_then(|v| v.as_str()) == Some("clipboard_set") {
+                                        if let Some(clipboard_text) = parsed.get("text").and_then(|v| v.as_str()) {
+                                            handler(clipboard_text.to_string());
+                                        }
+                                    }
                                 }
                             }
                             Box::pin(async {})
@@ -281,6 +312,7 @@ impl WebRtcPeer {
                 encoded_frame_tx,
                 sender_handle: Mutex::new(Some(sender_handle)),
                 shutdown,
+                clipboard_channel,
             },
             answer_sdp,
         ))
@@ -291,6 +323,26 @@ impl WebRtcPeer {
     /// if the channel is full the frame is dropped for this peer.
     pub fn encoded_frame_tx(&self) -> &mpsc::Sender<Arc<EncodedFrame>> {
         &self.encoded_frame_tx
+    }
+
+    /// Send a clipboard update to the browser via the clipboard data channel.
+    ///
+    /// Returns `Ok(true)` if the message was sent, `Ok(false)` if no clipboard
+    /// channel is available yet, or `Err` on send failure.
+    pub async fn send_clipboard(&self, text: &str) -> Result<bool, CallerError> {
+        let guard = self.clipboard_channel.lock().await;
+        if let Some(ref dc) = *guard {
+            let msg = serde_json::json!({
+                "t": "clipboard_update",
+                "text": text,
+            });
+            dc.send_text(msg.to_string())
+                .await
+                .map_err(|e| CallerError::WebRtc(format!("clipboard send: {e}")))?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Add a trickle ICE candidate from the remote peer.

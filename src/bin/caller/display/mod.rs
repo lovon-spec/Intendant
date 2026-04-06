@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::CallerError;
 
+pub mod clipboard;
 pub mod encode;
 pub mod keymap;
 #[cfg(target_os = "macos")]
@@ -349,6 +350,10 @@ pub struct DisplaySession {
     counters: Arc<DisplayMetricsCounters>,
     /// Instant used as the epoch for rate computations.
     metrics_epoch: Mutex<Instant>,
+    /// Clipboard monitor for bidirectional clipboard sync.
+    clipboard_monitor: Arc<clipboard::ClipboardMonitor>,
+    /// Handle for the clipboard forwarding task (remote -> browser).
+    clipboard_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DisplaySession {
@@ -366,6 +371,8 @@ impl DisplaySession {
             shutdown: CancellationToken::new(),
             counters: Arc::new(DisplayMetricsCounters::new()),
             metrics_epoch: Mutex::new(Instant::now()),
+            clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
+            clipboard_handle: Mutex::new(None),
         }
     }
 
@@ -732,12 +739,16 @@ impl DisplaySession {
     /// Stop capture, cancel all tasks, and close all peers.
     pub async fn stop(&self) {
         self.shutdown.cancel();
+        self.clipboard_monitor.stop();
         self.backend.stop_capture().await;
 
         if let Some(h) = self.capture_handle.lock().await.take() {
             let _ = h.await;
         }
         if let Some(h) = self.encoder_handle.lock().await.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.clipboard_handle.lock().await.take() {
             let _ = h.await;
         }
 
@@ -812,7 +823,7 @@ impl DisplaySession {
     /// Handle a WebRTC SDP offer from a browser peer.
     ///
     /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
-    /// the peer map, and returns the SDP answer.
+    /// the peer map, starts clipboard monitoring, and returns the SDP answer.
     pub async fn handle_offer(
         &self,
         peer_id: PeerId,
@@ -831,13 +842,68 @@ impl DisplaySession {
                 });
             });
 
-        let (peer, answer_sdp) =
-            self::webrtc::WebRtcPeer::new(peer_id, sdp, ice_config, input_handler, ice_tx)
-                .await?;
+        // Clipboard handler: browser -> remote clipboard.
+        let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
+        let clipboard_handler: Arc<dyn Fn(String) + Send + Sync> =
+            Arc::new(move |text: String| {
+                let monitor = Arc::clone(&clipboard_monitor);
+                tokio::spawn(async move {
+                    if let Err(e) = monitor.set_text(&text).await {
+                        eprintln!("[display/clipboard] set_text failed: {e}");
+                    }
+                });
+            });
 
-        self.peers.write().await.insert(peer_id, Arc::new(peer));
+        let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new(
+            peer_id,
+            sdp,
+            ice_config,
+            input_handler,
+            clipboard_handler,
+            ice_tx,
+        )
+        .await?;
+
+        let peer = Arc::new(peer);
+        self.peers.write().await.insert(peer_id, Arc::clone(&peer));
         self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
+
+        // Start clipboard monitoring (remote -> browser) if not already running.
+        self.ensure_clipboard_forwarding().await;
+
         Ok(answer_sdp)
+    }
+
+    /// Ensure a clipboard forwarding task is running.
+    ///
+    /// Starts watching the system clipboard and forwards changes to all
+    /// connected peers via their clipboard data channel.
+    async fn ensure_clipboard_forwarding(&self) {
+        let mut handle = self.clipboard_handle.lock().await;
+        if handle.is_some() {
+            return; // already running
+        }
+
+        let mut rx = self.clipboard_monitor.start_watching();
+        let peers = Arc::clone(&self.peers);
+        let shutdown = self.shutdown.clone();
+
+        *handle = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    text = rx.recv() => {
+                        let Some(text) = text else { break };
+                        let peers_guard = peers.read().await;
+                        for peer in peers_guard.values() {
+                            if let Err(e) = peer.send_clipboard(&text).await {
+                                eprintln!("[display/clipboard] send to peer failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        }));
     }
 
     /// Forward a trickle ICE candidate to a connected peer.
