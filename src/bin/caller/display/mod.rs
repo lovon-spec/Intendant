@@ -861,9 +861,6 @@ impl DisplaySession {
                 });
             });
 
-        let (peer, answer_sdp) =
-            self::webrtc::WebRtcPeer::new(peer_id, sdp, codec_mime, ice_config, input_handler, ice_tx)
-                .await?;
         // Clipboard handler: browser -> remote clipboard.
         let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
         let clipboard_handler: Arc<dyn Fn(String) + Send + Sync> =
@@ -879,6 +876,7 @@ impl DisplaySession {
         let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new(
             peer_id,
             sdp,
+            codec_mime,
             ice_config,
             input_handler,
             clipboard_handler,
