@@ -23,8 +23,9 @@ struct Nal {
 /// Spawns an ffmpeg subprocess that reads raw I420 from stdin and writes
 /// Annex-B H264 to stdout.  A dedicated reader thread splits the stdout
 /// stream on Annex-B start codes and sends complete NAL units over a
-/// channel, replacing the previous poll-timeout approach with
-/// deterministic frame boundary detection.
+/// channel.  Frame boundaries are detected deterministically by parsing
+/// `first_mb_in_slice` from each slice NAL's Exp-Golomb header — a new
+/// frame starts whenever `first_mb_in_slice == 0`.
 pub struct FfmpegH264Encoder {
     child: Child,
     width: u32,
@@ -170,12 +171,6 @@ impl FfmpegH264Encoder {
                 "60",
                 "-bf",
                 "0",
-                // Force single-slice output so every frame contains exactly
-                // one slice NAL.  Without this, x264 may produce multi-slice
-                // frames that the NAL reader splits across WebRTC samples
-                // (it treats the first slice NAL as frame-complete).
-                "-x264-params",
-                "slices=1",
                 // Output: raw H264 Annex-B to stdout
                 "-f",
                 "h264",
@@ -236,40 +231,14 @@ impl FfmpegH264Encoder {
         })
     }
 
-    /// After receiving a slice NAL, drain any continuation slice NALs that
-    /// belong to the same frame.  Multi-slice encoders (e.g. VA-API without
-    /// a single-slice constraint) produce several slice NALs per access unit.
+    /// Check whether a slice NAL starts a new access unit (frame).
     ///
-    /// Uses a short `recv_timeout` to avoid blocking: if no NAL arrives
-    /// within 1 ms the frame is considered complete.  A non-slice NAL (e.g.
-    /// SPS/PPS of the next frame) is saved in `pending_nal` for the next
-    /// `encode()` call.
-    fn drain_continuation_slices(&mut self, collected: &mut Vec<Nal>) {
-        use std::time::Duration;
-        let timeout = Duration::from_millis(1);
-        loop {
-            match self.nal_rx.recv_timeout(timeout) {
-                Ok(nal) => {
-                    let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
-                    if is_slice {
-                        collected.push(nal);
-                        // Continue draining -- there may be more slices.
-                    } else {
-                        // Non-slice NAL belongs to the next access unit.
-                        self.pending_nal = Some(nal);
-                        break;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // No more NALs ready -- frame is complete.
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Reader thread exited.
-                    break;
-                }
-            }
-        }
+    /// In H264, the first field of every slice header is `first_mb_in_slice`,
+    /// encoded as an Exp-Golomb unsigned integer.  The first slice of a new
+    /// frame always has `first_mb_in_slice == 0`; continuation slices of the
+    /// same frame have `first_mb_in_slice > 0`.
+    fn is_first_slice(nal: &Nal) -> bool {
+        parse_first_mb_in_slice(&nal.data) == 0
     }
 }
 
@@ -300,43 +269,53 @@ impl Encoder for FfmpegH264Encoder {
         self.frame_count += 1;
 
         // Collect NALs from the reader thread until we have a complete
-        // access unit.  A complete access unit ends with a slice NAL
-        // (type 1 = non-IDR, type 5 = IDR).  Prefix NALs (SPS=7, PPS=8,
-        // SEI=6) are accumulated until the slice arrives.
+        // access unit (one video frame).
         //
-        // Multi-slice support: VA-API may produce multiple slice NALs per
-        // frame.  After the first slice NAL arrives, we drain additional
-        // NALs with a short timeout.  Continuation slice NALs (same frame)
-        // are accumulated.  A non-slice NAL or timeout signals the frame
-        // boundary; any non-slice NAL is saved for the next encode() call.
+        // Frame boundary detection uses `first_mb_in_slice` from the H264
+        // slice header.  The first slice of every new frame has
+        // `first_mb_in_slice == 0`.  When we already have a slice and
+        // receive another slice with `first_mb_in_slice == 0`, it belongs
+        // to the NEXT frame — we save it as `pending_nal` and emit the
+        // current frame.
+        //
+        // Non-slice NALs (SPS=7, PPS=8, SEI=6) are prefix metadata and
+        // always belong to the upcoming slice's frame.
         let mut collected: Vec<Nal> = Vec::new();
+        let mut have_slice = false;
 
-        // Consume a NAL buffered from the previous multi-slice drain.
+        // Consume a NAL buffered from the previous frame boundary.
         if let Some(pending) = self.pending_nal.take() {
             let is_slice = pending.nal_type == 1 || pending.nal_type == 5;
-            collected.push(pending);
             if is_slice {
-                // The pending NAL was itself a slice -- drain more below.
-                self.drain_continuation_slices(&mut collected);
-                // Frame complete after drain.
+                have_slice = true;
             }
+            collected.push(pending);
         }
 
-        // If we don't have a slice yet, keep reading.
-        let have_slice = collected.iter().any(|n| n.nal_type == 1 || n.nal_type == 5);
-        if !have_slice {
-            loop {
-                let nal = match self.nal_rx.recv() {
-                    Ok(n) => n,
-                    Err(_) => break, // reader thread exited
-                };
-                let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
-                collected.push(nal);
-                if is_slice {
-                    // Got first slice -- drain any continuation slices.
-                    self.drain_continuation_slices(&mut collected);
+        // Keep reading NALs until we detect the next frame boundary.
+        loop {
+            let nal = match self.nal_rx.recv() {
+                Ok(n) => n,
+                Err(_) => break, // reader thread exited
+            };
+            let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
+            if is_slice {
+                if have_slice && Self::is_first_slice(&nal) {
+                    // This slice starts a new frame — save it for next
+                    // encode() call and emit the current frame.
+                    self.pending_nal = Some(nal);
                     break;
                 }
+                have_slice = true;
+                collected.push(nal);
+            } else if have_slice {
+                // Non-slice after we already have a slice means this is
+                // prefix data (SPS/PPS) for the next frame.
+                self.pending_nal = Some(nal);
+                break;
+            } else {
+                // Non-slice before any slice — prefix for this frame.
+                collected.push(nal);
             }
         }
 
@@ -503,6 +482,55 @@ fn find_start_code(buf: &[u8], from: usize) -> Option<StartCode> {
     None
 }
 
+/// Parse `first_mb_in_slice` from a slice NAL's raw data.
+///
+/// The first byte is the NAL header (forbidden_bit + nal_ref_idc + nal_type).
+/// Immediately after that, the slice header begins with `first_mb_in_slice`
+/// encoded as an Exp-Golomb unsigned integer.
+///
+/// Exp-Golomb decoding: count N leading zero bits, then read (N+1) bits as a
+/// binary number, subtract 1.  For example:
+/// - `1`       → 0 leading zeros → value = 1 - 1 = 0
+/// - `010`     → 1 leading zero  → value = 2 - 1 = 1
+/// - `00110`   → 2 leading zeros → value = 6 - 1 = 5
+fn parse_first_mb_in_slice(nal_data: &[u8]) -> u32 {
+    if nal_data.len() < 2 {
+        return 0;
+    }
+    // Skip NAL header byte — slice header starts at bit 8.
+    let mut bit_offset: usize = 8;
+    // Count leading zero bits.
+    let mut leading_zeros = 0u32;
+    while bit_offset / 8 < nal_data.len() {
+        let byte_idx = bit_offset / 8;
+        let bit_idx = 7 - (bit_offset % 8);
+        if (nal_data[byte_idx] >> bit_idx) & 1 == 0 {
+            leading_zeros += 1;
+            bit_offset += 1;
+        } else {
+            break;
+        }
+    }
+    if leading_zeros == 0 {
+        // Code word is `1` → value = 0.
+        return 0;
+    }
+    // Skip the `1` bit that terminated the leading zeros.
+    bit_offset += 1;
+    // Read the next `leading_zeros` bits to form the suffix.
+    let mut value = 1u32;
+    for _ in 0..leading_zeros {
+        let byte_idx = bit_offset / 8;
+        if byte_idx >= nal_data.len() {
+            return 0;
+        }
+        let bit_idx = 7 - (bit_offset % 8);
+        value = (value << 1) | ((nal_data[byte_idx] >> bit_idx) & 1) as u32;
+        bit_offset += 1;
+    }
+    value - 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +635,60 @@ mod tests {
         assert_eq!(0x65 & 0x1F, 5);  // IDR slice
         assert_eq!(0x41 & 0x1F, 1);  // non-IDR slice
         assert_eq!(0x61 & 0x1F, 1);  // non-IDR slice (different NRI)
+    }
+
+    #[test]
+    fn parse_first_mb_zero() {
+        // first_mb_in_slice = 0 → Exp-Golomb code word: `1`
+        // NAL header byte 0x65 (IDR slice), then 0b1xxx_xxxx = first bit is 1.
+        let nal = [0x65, 0x80]; // 0x80 = 0b1000_0000
+        assert_eq!(parse_first_mb_in_slice(&nal), 0);
+    }
+
+    #[test]
+    fn parse_first_mb_one() {
+        // first_mb_in_slice = 1 → Exp-Golomb: `010`
+        // NAL header 0x41 (non-IDR), then bits: 0 1 0 ...
+        // 0b010x_xxxx = 0x40
+        let nal = [0x41, 0x40]; // 0x40 = 0b0100_0000
+        assert_eq!(parse_first_mb_in_slice(&nal), 1);
+    }
+
+    #[test]
+    fn parse_first_mb_five() {
+        // first_mb_in_slice = 5 → Exp-Golomb: value = 5, code = 5+1 = 6
+        // 6 in binary = 110, needs 3 bits, so 2 leading zeros: `00110`
+        // NAL header 0x41, then bits: 0 0 1 1 0 ...
+        // 0b00110_xxx = 0x30
+        let nal = [0x41, 0x30]; // 0x30 = 0b0011_0000
+        assert_eq!(parse_first_mb_in_slice(&nal), 5);
+    }
+
+    #[test]
+    fn parse_first_mb_short_nal() {
+        // Single byte NAL — not enough data, should return 0.
+        let nal = [0x65];
+        assert_eq!(parse_first_mb_in_slice(&nal), 0);
+    }
+
+    #[test]
+    fn parse_first_mb_large_value() {
+        // first_mb_in_slice = 14 → code_num = 14, code_num+1 = 15
+        // 15 in binary = 1111, 4 bits, so 3 leading zeros: `0001111`
+        // NAL header 0x41, then bits: 0 0 0 1 1 1 1 ...
+        // After NAL header byte: 0b0001_1110 = 0x1E
+        let nal = [0x41, 0x1E];
+        assert_eq!(parse_first_mb_in_slice(&nal), 14);
+    }
+
+    #[test]
+    fn is_first_slice_detection() {
+        // first_mb = 0 → first slice of frame
+        let first = Nal { data: vec![0x65, 0x80], nal_type: 5 };
+        assert!(FfmpegH264Encoder::is_first_slice(&first));
+
+        // first_mb = 1 → continuation slice
+        let cont = Nal { data: vec![0x41, 0x40], nal_type: 1 };
+        assert!(!FfmpegH264Encoder::is_first_slice(&cont));
     }
 }
