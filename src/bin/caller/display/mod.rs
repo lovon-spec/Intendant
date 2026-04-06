@@ -856,7 +856,9 @@ impl DisplaySession {
     /// Handle a WebRTC SDP offer from a browser peer.
     ///
     /// On the first call, selects the best available codec and starts the
-    /// encoder pipeline.  Subsequent peers reuse the running encoder.
+    /// encoder pipeline.  Subsequent peers reuse the running encoder's codec
+    /// without re-negotiating -- all peers share one encoder, so the codec
+    /// is locked once it starts.
     /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
     /// the peer map, starts clipboard monitoring, and returns the SDP answer.
     pub async fn handle_offer(
@@ -866,13 +868,23 @@ impl DisplaySession {
         ice_config: &IceConfig,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
-        // Select the best codec that both the browser and local encoder support.
-        let (width, height) = self.backend.resolution();
-        let (_encoder, codec_choice) = encode::select_codec(sdp, width, height, 2000);
-        let codec_mime = codec_choice.mime();
+        let codec_mime = {
+            let current = *self.codec_mime.read().await;
+            if self.encoder_started.load(Ordering::SeqCst) {
+                // Encoder already running -- use the established codec.
+                // Don't re-negotiate; all peers share one encoder.
+                current
+            } else {
+                // First peer -- negotiate codec from SDP.
+                let (width, height) = self.backend.resolution();
+                let (_encoder, codec_choice) = encode::select_codec(sdp, width, height, 2000);
+                let mime = codec_choice.mime();
+                *self.codec_mime.write().await = mime;
+                mime
+            }
+        };
 
-        // Store the negotiated codec and start the encoder if not yet running.
-        *self.codec_mime.write().await = codec_mime;
+        // Start encoder if not yet running.
         self.ensure_encoder_running(codec_mime).await;
 
         let backend = Arc::clone(&self.backend);

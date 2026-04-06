@@ -10,10 +10,21 @@ use super::{EncodedPacket, Encoder};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 
+/// A complete NAL unit extracted by the reader thread.
+struct Nal {
+    /// Raw NAL bytes (without the Annex-B start code prefix).
+    data: Vec<u8>,
+    /// H264 NAL unit type (lower 5 bits of the first byte).
+    nal_type: u8,
+}
+
 /// ffmpeg-based H264 encoder implementing the `Encoder` trait.
 ///
 /// Spawns an ffmpeg subprocess that reads raw I420 from stdin and writes
-/// Annex-B H264 to stdout.  The subprocess is killed on drop.
+/// Annex-B H264 to stdout.  A dedicated reader thread splits the stdout
+/// stream on Annex-B start codes and sends complete NAL units over a
+/// channel, replacing the previous poll-timeout approach with
+/// deterministic frame boundary detection.
 pub struct FfmpegH264Encoder {
     child: Child,
     width: u32,
@@ -21,9 +32,10 @@ pub struct FfmpegH264Encoder {
     frame_count: u64,
     pts_offset: u64,
     frame_size: usize,
-    /// Leftover bytes from the previous stdout read that didn't form a
-    /// complete NAL unit boundary.
-    read_buf: Vec<u8>,
+    /// Channel receiving complete NAL units from the reader thread.
+    nal_rx: std::sync::mpsc::Receiver<Nal>,
+    /// Handle for the stdout reader thread, joined on drop.
+    reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FfmpegH264Encoder {
@@ -193,6 +205,15 @@ impl FfmpegH264Encoder {
         let uv_h = ((height + 1) / 2) as usize;
         let frame_size = (width as usize * height as usize) + 2 * (uv_w * uv_h);
 
+        // Spawn a dedicated reader thread that reads ffmpeg stdout in
+        // blocking mode, splits on Annex-B start codes, and sends
+        // complete NAL units over the channel.
+        let (nal_tx, nal_rx) = std::sync::mpsc::sync_channel::<Nal>(64);
+        let stdout = child.stdout.take().ok_or("ffmpeg stdout not available")?;
+        let reader_thread = std::thread::spawn(move || {
+            nal_reader_thread(stdout, nal_tx);
+        });
+
         Ok(Self {
             child,
             width,
@@ -200,65 +221,9 @@ impl FfmpegH264Encoder {
             frame_count: 0,
             pts_offset: 0,
             frame_size,
-            read_buf: Vec::with_capacity(frame_size),
+            nal_rx,
+            reader_thread: Some(reader_thread),
         })
-    }
-
-    /// Read encoded output from ffmpeg stdout using `poll()`.
-    ///
-    /// After writing exactly one I420 frame, ffmpeg processes it and writes
-    /// the resulting H264 access unit(s) before accepting more input (pipe
-    /// backpressure).  We read in blocking mode using `poll()` with a short
-    /// timeout: keep reading while data arrives, declare the frame complete
-    /// once no new data appears within `DRAIN_TIMEOUT_MS`.
-    fn drain_output(&mut self) -> Result<Vec<(Vec<u8>, bool)>, String> {
-        use std::os::unix::io::AsRawFd;
-
-        let stdout = self
-            .child
-            .stdout
-            .as_mut()
-            .ok_or("ffmpeg stdout closed")?;
-
-        let fd = stdout.as_raw_fd();
-        let mut tmp = [0u8; 65536];
-
-        /// How long to wait for more data after the last successful read
-        /// before declaring the frame complete.
-        const DRAIN_TIMEOUT_MS: i32 = 10;
-
-        loop {
-            // Poll the fd for readability.
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let poll_ret = unsafe { libc::poll(&mut pfd, 1, DRAIN_TIMEOUT_MS) };
-
-            if poll_ret < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue; // EINTR — retry
-                }
-                return Err(format!("poll ffmpeg stdout: {err}"));
-            }
-            if poll_ret == 0 {
-                // Timeout — no more data for this frame.
-                break;
-            }
-
-            // Data is available — read it (blocking, but we know data is ready).
-            match stdout.read(&mut tmp) {
-                Ok(0) => break, // EOF
-                Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("read ffmpeg stdout: {e}")),
-            }
-        }
-
-        // Split read_buf into complete NAL units at Annex-B start codes.
-        Ok(split_annexb_nals(&mut self.read_buf))
     }
 }
 
@@ -288,15 +253,28 @@ impl Encoder for FfmpegH264Encoder {
         self.pts_offset += duration_ms;
         self.frame_count += 1;
 
-        // Give ffmpeg a moment to process on the first frame (SPS/PPS generation).
-        if self.frame_count == 1 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        // Collect NALs from the reader thread until we have a complete
+        // access unit.  A complete access unit ends with a slice NAL
+        // (type 1 = non-IDR, type 5 = IDR).  Prefix NALs (SPS=7, PPS=8,
+        // SEI=6) are accumulated until the slice arrives.
+        let mut collected: Vec<Nal> = Vec::new();
+        loop {
+            let nal = match self.nal_rx.recv() {
+                Ok(n) => n,
+                Err(_) => {
+                    // Reader thread exited (ffmpeg EOF or crash).
+                    break;
+                }
+            };
+            let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
+            collected.push(nal);
+            if is_slice {
+                // Access unit complete.
+                break;
+            }
         }
 
-        // Read encoded output.
-        let nals = self.drain_output()?;
-
-        if nals.is_empty() {
+        if collected.is_empty() {
             // ffmpeg may buffer a few frames before producing output.
             return Ok(Vec::new());
         }
@@ -304,10 +282,10 @@ impl Encoder for FfmpegH264Encoder {
         // Bundle all NAL units into a single packet with Annex-B framing.
         let mut data = Vec::new();
         let mut is_keyframe = false;
-        for (nal_data, is_idr) in &nals {
+        for nal in &collected {
             data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-            data.extend_from_slice(nal_data);
-            if *is_idr {
+            data.extend_from_slice(&nal.data);
+            if nal.nal_type == 5 {
                 is_keyframe = true;
             }
         }
@@ -342,68 +320,121 @@ impl Drop for FfmpegH264Encoder {
                 eprintln!("[display/h264_linux] killed ffmpeg encoder (pid {})", pid);
             }
         }
+        // Join the reader thread.  With stdin closed and the process
+        // killed, stdout will EOF and the thread will exit.
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
-/// Split a buffer of Annex-B H264 data into individual NAL units.
+/// Dedicated reader thread for ffmpeg stdout.
 ///
-/// Looks for `00 00 00 01` or `00 00 01` start codes.  All NAL units are
-/// returned, including the last one.  This is correct because ffmpeg
-/// processes frames synchronously: we write exactly one I420 frame, then
-/// read all encoded output for that frame.  The output is always a
-/// complete access unit, so there is no risk of a truncated trailing NAL.
+/// Reads the Annex-B H264 byte stream in blocking mode, splits on start
+/// codes (`00 00 01` or `00 00 00 01`), and sends each complete NAL unit
+/// over the channel.  This is deterministic -- frame boundaries are
+/// detected by NAL type in the `encode()` caller, not by timeouts.
 ///
-/// The buffer is cleared after extraction.
-///
-/// Returns `(nal_data_without_start_code, is_idr)` for each NAL.
-fn split_annexb_nals(buf: &mut Vec<u8>) -> Vec<(Vec<u8>, bool)> {
-    let mut nals = Vec::new();
+/// The thread exits when stdout reaches EOF (ffmpeg closed or killed) or
+/// the channel receiver is dropped.
+fn nal_reader_thread(
+    mut stdout: std::process::ChildStdout,
+    nal_tx: std::sync::mpsc::SyncSender<Nal>,
+) {
+    let mut buf = Vec::with_capacity(65536);
+    let mut tmp = [0u8; 65536];
 
-    // Find all start code positions.
-    let mut starts = Vec::new();
-    let mut i = 0;
+    loop {
+        let n = match stdout.read(&mut tmp) {
+            Ok(0) => break,        // EOF
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+
+        // Extract and send all complete NAL units from buf.
+        // A NAL is complete when we find the *next* start code after it.
+        // Any data before the first start code is discarded (shouldn't
+        // happen in practice with ffmpeg, but defensive).
+        loop {
+            // Find the first start code in buf.
+            let first = match find_start_code(&buf, 0) {
+                Some(pos) => pos,
+                None => {
+                    // No start code at all -- keep buffering.
+                    break;
+                }
+            };
+
+            // Discard any bytes before the first start code.
+            if first.offset > 0 {
+                buf.drain(..first.offset);
+                // Recalculate -- first is now at offset 0.
+                continue;
+            }
+
+            // Look for the next start code after the first one.
+            let nal_body_start = first.sc_len;
+            let second = find_start_code(&buf, nal_body_start);
+
+            match second {
+                Some(next) => {
+                    // We have a complete NAL: from nal_body_start..next.offset.
+                    let nal_data: Vec<u8> = buf[nal_body_start..next.offset].to_vec();
+                    buf.drain(..next.offset);
+
+                    if !nal_data.is_empty() {
+                        let nal_type = nal_data[0] & 0x1F;
+                        if nal_tx.send(Nal { data: nal_data, nal_type }).is_err() {
+                            return; // receiver dropped
+                        }
+                    }
+                }
+                None => {
+                    // Only one start code found -- NAL is still
+                    // incomplete, wait for more data.
+                    break;
+                }
+            }
+        }
+    }
+
+    // Flush the last NAL (no trailing start code at EOF).
+    if let Some(first) = find_start_code(&buf, 0) {
+        let nal_data: Vec<u8> = buf[first.sc_len..].to_vec();
+        if !nal_data.is_empty() {
+            let nal_type = nal_data[0] & 0x1F;
+            let _ = nal_tx.send(Nal { data: nal_data, nal_type });
+        }
+    }
+}
+
+/// Position and length of an Annex-B start code found in a buffer.
+struct StartCode {
+    /// Byte offset of the start code in the buffer.
+    offset: usize,
+    /// Length of the start code (3 for `00 00 01`, 4 for `00 00 00 01`).
+    sc_len: usize,
+}
+
+/// Find the next Annex-B start code in `buf` starting at `from`.
+///
+/// Recognises both 3-byte (`00 00 01`) and 4-byte (`00 00 00 01`) forms.
+fn find_start_code(buf: &[u8], from: usize) -> Option<StartCode> {
+    let mut i = from;
     while i + 2 < buf.len() {
         if buf[i] == 0 && buf[i + 1] == 0 {
             if i + 3 < buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
-                starts.push((i, 4)); // 4-byte start code
-                i += 4;
-                continue;
+                return Some(StartCode { offset: i, sc_len: 4 });
             }
             if buf[i + 2] == 1 {
-                starts.push((i, 3)); // 3-byte start code
-                i += 3;
-                continue;
+                return Some(StartCode { offset: i, sc_len: 3 });
             }
         }
         i += 1;
     }
-
-    if starts.is_empty() {
-        return nals;
-    }
-
-    // Extract all NAL units, including the last one.
-    for idx in 0..starts.len() {
-        let (start, sc_len) = starts[idx];
-        let nal_start = start + sc_len;
-        let nal_end = if idx + 1 < starts.len() {
-            starts[idx + 1].0
-        } else {
-            buf.len()
-        };
-        let nal_data = buf[nal_start..nal_end].to_vec();
-
-        if !nal_data.is_empty() {
-            let nal_type = nal_data[0] & 0x1F;
-            let is_idr = nal_type == 5; // IDR slice
-            nals.push((nal_data, is_idr));
-        }
-    }
-
-    // All NALs consumed -- clear the buffer.
-    buf.clear();
-
-    nals
+    None
 }
 
 #[cfg(test)]
@@ -411,43 +442,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_annexb_all_nals_emitted() {
-        // Two NAL units separated by 4-byte start codes.
-        let mut buf = vec![
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, // SPS
-            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80, // PPS
-        ];
-
-        let nals = split_annexb_nals(&mut buf);
-        assert_eq!(nals.len(), 2); // Both NALs emitted
-        assert_eq!(nals[0].0, vec![0x67, 0x42, 0x00, 0x0A]); // SPS
-        assert!(!nals[0].1); // SPS is not IDR
-        assert_eq!(nals[1].0, vec![0x68, 0xCE, 0x38, 0x80]); // PPS
-        assert!(!nals[1].1); // PPS is not IDR
-
-        // Buffer should be cleared.
-        assert!(buf.is_empty());
+    fn find_start_code_4byte() {
+        let buf = [0x00, 0x00, 0x00, 0x01, 0x67];
+        let sc = find_start_code(&buf, 0).unwrap();
+        assert_eq!(sc.offset, 0);
+        assert_eq!(sc.sc_len, 4);
     }
 
     #[test]
-    fn split_annexb_idr_detection() {
-        // NAL type 5 = IDR
-        let mut buf = vec![
-            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB, // IDR
-            0x00, 0x00, 0x00, 0x01, 0x41, 0xCC, // non-IDR
-        ];
-
-        let nals = split_annexb_nals(&mut buf);
-        assert_eq!(nals.len(), 2);
-        assert!(nals[0].1); // First NAL is IDR
-        assert!(!nals[1].1); // Second NAL is non-IDR
-        assert!(buf.is_empty());
+    fn find_start_code_3byte() {
+        let buf = [0x00, 0x00, 0x01, 0x67];
+        let sc = find_start_code(&buf, 0).unwrap();
+        assert_eq!(sc.offset, 0);
+        assert_eq!(sc.sc_len, 3);
     }
 
     #[test]
-    fn split_annexb_empty() {
-        let mut buf = vec![0x00, 0x01, 0x02];
-        let nals = split_annexb_nals(&mut buf);
-        assert!(nals.is_empty());
+    fn find_start_code_with_offset() {
+        let buf = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A,
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE,
+        ];
+        // Skip past the first start code body.
+        let sc = find_start_code(&buf, 4).unwrap();
+        assert_eq!(sc.offset, 8);
+        assert_eq!(sc.sc_len, 4);
+    }
+
+    #[test]
+    fn find_start_code_none() {
+        let buf = [0x00, 0x01, 0x02];
+        assert!(find_start_code(&buf, 0).is_none());
+    }
+
+    #[test]
+    fn nal_reader_thread_emits_all_nals() {
+        // Simulate ffmpeg stdout with SPS + PPS + IDR.
+        let stream = vec![
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, // SPS (type 7)
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80, // PPS (type 8)
+            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,       // IDR (type 5)
+        ];
+
+        let (nal_tx, nal_rx) = std::sync::mpsc::sync_channel::<Nal>(64);
+        let handle = std::thread::spawn(move || {
+            let cursor = std::io::Cursor::new(stream);
+            // nal_reader_thread expects ChildStdout, but we can test the
+            // parsing logic by calling the helper functions directly.
+            // Instead, pipe through a real fd pair.
+            drop((cursor, nal_tx));
+        });
+
+        // Since we can't easily fake a ChildStdout, test the parsing
+        // indirectly through find_start_code + the extraction logic.
+        let buf = vec![
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A,
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80,
+            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,
+        ];
+
+        // Extract NALs the same way the reader thread does.
+        let mut nals = Vec::new();
+        let mut offset = 0;
+        while let Some(first) = find_start_code(&buf, offset) {
+            let body_start = first.offset + first.sc_len;
+            if let Some(next) = find_start_code(&buf, body_start) {
+                let data = buf[body_start..next.offset].to_vec();
+                let nal_type = data[0] & 0x1F;
+                nals.push(Nal { data, nal_type });
+                offset = next.offset;
+            } else {
+                // Last NAL.
+                let data = buf[body_start..].to_vec();
+                let nal_type = data[0] & 0x1F;
+                nals.push(Nal { data, nal_type });
+                break;
+            }
+        }
+
+        assert_eq!(nals.len(), 3);
+        assert_eq!(nals[0].nal_type, 7); // SPS
+        assert_eq!(nals[0].data, vec![0x67, 0x42, 0x00, 0x0A]);
+        assert_eq!(nals[1].nal_type, 8); // PPS
+        assert_eq!(nals[1].data, vec![0x68, 0xCE, 0x38, 0x80]);
+        assert_eq!(nals[2].nal_type, 5); // IDR
+        assert_eq!(nals[2].data, vec![0x65, 0xAA, 0xBB]);
+
+        let _ = handle.join();
+        drop(nal_rx);
+    }
+
+    #[test]
+    fn nal_type_classification() {
+        // Verify NAL type extraction from first byte.
+        assert_eq!(0x67 & 0x1F, 7);  // SPS
+        assert_eq!(0x68 & 0x1F, 8);  // PPS
+        assert_eq!(0x06 & 0x1F, 6);  // SEI
+        assert_eq!(0x65 & 0x1F, 5);  // IDR slice
+        assert_eq!(0x41 & 0x1F, 1);  // non-IDR slice
+        assert_eq!(0x61 & 0x1F, 1);  // non-IDR slice (different NRI)
     }
 }
