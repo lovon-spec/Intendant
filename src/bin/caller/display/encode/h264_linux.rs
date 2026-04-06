@@ -36,6 +36,9 @@ pub struct FfmpegH264Encoder {
     nal_rx: std::sync::mpsc::Receiver<Nal>,
     /// Handle for the stdout reader thread, joined on drop.
     reader_thread: Option<std::thread::JoinHandle<()>>,
+    /// NAL received during multi-slice drain that belongs to the next frame.
+    /// Consumed at the start of the next `encode()` call.
+    pending_nal: Option<Nal>,
 }
 
 impl FfmpegH264Encoder {
@@ -167,6 +170,12 @@ impl FfmpegH264Encoder {
                 "60",
                 "-bf",
                 "0",
+                // Force single-slice output so every frame contains exactly
+                // one slice NAL.  Without this, x264 may produce multi-slice
+                // frames that the NAL reader splits across WebRTC samples
+                // (it treats the first slice NAL as frame-complete).
+                "-x264-params",
+                "slices=1",
                 // Output: raw H264 Annex-B to stdout
                 "-f",
                 "h264",
@@ -223,7 +232,44 @@ impl FfmpegH264Encoder {
             frame_size,
             nal_rx,
             reader_thread: Some(reader_thread),
+            pending_nal: None,
         })
+    }
+
+    /// After receiving a slice NAL, drain any continuation slice NALs that
+    /// belong to the same frame.  Multi-slice encoders (e.g. VA-API without
+    /// a single-slice constraint) produce several slice NALs per access unit.
+    ///
+    /// Uses a short `recv_timeout` to avoid blocking: if no NAL arrives
+    /// within 1 ms the frame is considered complete.  A non-slice NAL (e.g.
+    /// SPS/PPS of the next frame) is saved in `pending_nal` for the next
+    /// `encode()` call.
+    fn drain_continuation_slices(&mut self, collected: &mut Vec<Nal>) {
+        use std::time::Duration;
+        let timeout = Duration::from_millis(1);
+        loop {
+            match self.nal_rx.recv_timeout(timeout) {
+                Ok(nal) => {
+                    let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
+                    if is_slice {
+                        collected.push(nal);
+                        // Continue draining -- there may be more slices.
+                    } else {
+                        // Non-slice NAL belongs to the next access unit.
+                        self.pending_nal = Some(nal);
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // No more NALs ready -- frame is complete.
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // Reader thread exited.
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -257,20 +303,40 @@ impl Encoder for FfmpegH264Encoder {
         // access unit.  A complete access unit ends with a slice NAL
         // (type 1 = non-IDR, type 5 = IDR).  Prefix NALs (SPS=7, PPS=8,
         // SEI=6) are accumulated until the slice arrives.
+        //
+        // Multi-slice support: VA-API may produce multiple slice NALs per
+        // frame.  After the first slice NAL arrives, we drain additional
+        // NALs with a short timeout.  Continuation slice NALs (same frame)
+        // are accumulated.  A non-slice NAL or timeout signals the frame
+        // boundary; any non-slice NAL is saved for the next encode() call.
         let mut collected: Vec<Nal> = Vec::new();
-        loop {
-            let nal = match self.nal_rx.recv() {
-                Ok(n) => n,
-                Err(_) => {
-                    // Reader thread exited (ffmpeg EOF or crash).
+
+        // Consume a NAL buffered from the previous multi-slice drain.
+        if let Some(pending) = self.pending_nal.take() {
+            let is_slice = pending.nal_type == 1 || pending.nal_type == 5;
+            collected.push(pending);
+            if is_slice {
+                // The pending NAL was itself a slice -- drain more below.
+                self.drain_continuation_slices(&mut collected);
+                // Frame complete after drain.
+            }
+        }
+
+        // If we don't have a slice yet, keep reading.
+        let have_slice = collected.iter().any(|n| n.nal_type == 1 || n.nal_type == 5);
+        if !have_slice {
+            loop {
+                let nal = match self.nal_rx.recv() {
+                    Ok(n) => n,
+                    Err(_) => break, // reader thread exited
+                };
+                let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
+                collected.push(nal);
+                if is_slice {
+                    // Got first slice -- drain any continuation slices.
+                    self.drain_continuation_slices(&mut collected);
                     break;
                 }
-            };
-            let is_slice = nal.nal_type == 1 || nal.nal_type == 5;
-            collected.push(nal);
-            if is_slice {
-                // Access unit complete.
-                break;
             }
         }
 

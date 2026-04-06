@@ -103,7 +103,7 @@ pub fn select_codec(
 /// Parse `a=rtpmap:` lines from an SDP offer to extract codec names.
 ///
 /// Returns codec names such as `"VP8"`, `"VP9"`, `"H264"`, `"AV1"`.
-fn parse_offered_codecs(sdp: &str) -> Vec<String> {
+pub fn parse_offered_codecs(sdp: &str) -> Vec<String> {
     let mut codecs = Vec::new();
     for line in sdp.lines() {
         // Format: a=rtpmap:<payload> <codec>/<clock> [/<params>]
