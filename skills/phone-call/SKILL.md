@@ -70,18 +70,14 @@ Replace `DEV_IDX` with the Vortex Audio device index from step 1,
     > /tmp/pjsua-call.log 2>&1 &
 ```
 
-### 3. Wait for the call to connect
+### 3. Wait for the call to connect, then IMMEDIATELY call spawn_live_audio
 
-Wait 12 seconds for SIP registration + call setup:
+Wait 12 seconds for SIP registration + call setup, then call
+`spawn_live_audio` on the NEXT command. Do NOT spend extra turns
+verifying the call or reading source code — the caller is waiting.
 
 ```bash
 sleep 12
-```
-
-Optionally verify the call connected:
-
-```bash
-grep "CONFIRMED" /tmp/pjsua-call.log
 ```
 
 ### 4. Start the live audio model
@@ -97,6 +93,10 @@ through it.
 - `response_schema`: fields to extract (see schema format below)
 - `timeout_secs`: max call duration (default 120)
 - `voice`: model voice (e.g. `alloy`, `shimmer`)
+- `initial_message`: ALWAYS set this to `"Begin."` — this makes the
+  model start speaking immediately when the call connects instead of
+  waiting for audio input. Without it, the caller hears 5-10 seconds
+  of silence before the model speaks.
 
 ### 5. Process the result
 
