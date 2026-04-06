@@ -1464,7 +1464,11 @@ pub async fn run_session(
                     // Emit progress
                     if let Some(bus) = event_bus {
                         let preview = if model_transcript_buf.len() > 200 {
-                            model_transcript_buf[model_transcript_buf.len() - 200..].to_string()
+                            {
+                                let start = model_transcript_buf.len() - 200;
+                                let start = model_transcript_buf.ceil_char_boundary(start);
+                                model_transcript_buf[start..].to_string()
+                            }
                         } else {
                             model_transcript_buf.clone()
                         };

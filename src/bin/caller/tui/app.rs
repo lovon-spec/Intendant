@@ -1976,7 +1976,10 @@ impl App {
                     "Live audio '{}': {} ({:.0}s) - {}",
                     id, state, elapsed_secs,
                     if transcript_preview.len() > 80 {
-                        format!("...{}", &transcript_preview[transcript_preview.len()-80..])
+                        // Find a valid char boundary near the desired offset
+                        let start = transcript_preview.len() - 80;
+                        let start = transcript_preview.ceil_char_boundary(start);
+                        format!("...{}", &transcript_preview[start..])
                     } else {
                         transcript_preview.clone()
                     }
