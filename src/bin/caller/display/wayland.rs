@@ -314,6 +314,55 @@ impl DisplayBackend for WaylandBackend {
     }
 }
 
+/// Manually mmap an fd-backed buffer (DMA-BUF or MemFd), copy the pixel region,
+/// and munmap. Returns `None` on any failure so the caller can skip the frame.
+fn mmap_fd_and_read(
+    fd: std::os::raw::c_int,
+    map_offset: usize,
+    max_size: usize,
+    chunk_offset: usize,
+    chunk_size: usize,
+) -> Option<Vec<u8>> {
+    // Page-align the map offset downward.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let aligned_offset = map_offset & !(page_size - 1);
+    let offset_delta = map_offset - aligned_offset;
+    let map_len = max_size + offset_delta;
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            aligned_offset as libc::off_t,
+        )
+    };
+
+    if ptr == libc::MAP_FAILED || ptr.is_null() {
+        return None;
+    }
+
+    let base = unsafe { (ptr as *const u8).add(offset_delta) };
+    let effective_size = if chunk_size > 0 { chunk_size } else { max_size };
+    let start = chunk_offset;
+    let end = (start + effective_size).min(max_size);
+
+    let result = if start < end {
+        let slice = unsafe { std::slice::from_raw_parts(base.add(start), end - start) };
+        Some(slice.to_vec())
+    } else {
+        None
+    };
+
+    unsafe {
+        libc::munmap(ptr, map_len);
+    }
+
+    result
+}
+
 /// Run the PipeWire main loop on a dedicated OS thread.
 ///
 /// This function blocks until the `shutdown` flag is set or the PipeWire
@@ -333,6 +382,7 @@ fn run_pipewire_capture(
     use pipewire::spa::param::video::VideoFormat;
     use pipewire::spa::param::ParamType;
     use pipewire::spa::pod::{Object, Property, PropertyFlags, Value};
+    use pipewire::spa::sys as spa_sys;
     use pipewire::spa::utils::{Id, SpaTypes};
 
     pipewire::init();
@@ -378,35 +428,122 @@ fn run_pipewire_capture(
     };
 
     // Stream listener: process frames from the PipeWire buffer.
+    //
+    // Supports two buffer types:
+    // - SHM (MemPtr): PipeWire delivers a pointer to shared memory, auto-mapped
+    //   by the MAP_BUFFERS flag.
+    // - DMA-BUF: PipeWire delivers a GPU memory file descriptor. If MAP_BUFFERS
+    //   auto-maps it the data pointer is set and we use it directly. Otherwise
+    //   we manually mmap/munmap the fd for each frame.
+    //
+    // PipeWire auto-negotiates the buffer type. If the compositor doesn't
+    // support DMA-BUF, it falls back to SHM transparently.
     let tx_clone = tx.clone();
     let sw = Arc::clone(&shared_width);
     let sh = Arc::clone(&shared_height);
     // Track the last known dimensions so we only log on actual changes.
     let mut last_w = width;
     let mut last_h = height;
+    // Log the buffer type once on the first frame.
+    let mut buffer_type_logged = false;
     let _listener = stream
         .add_local_listener()
+        .param_changed(move |stream_ref, _: &mut (), param_id, _param| {
+            // When the format is negotiated, tell PipeWire we accept DMA-BUF,
+            // MemFd, and MemPtr buffers. PipeWire picks the best available.
+            if param_id != ParamType::Format.as_raw() {
+                return;
+            }
+            // dataType is a bitmask: bit N = accept spa_data_type N.
+            //   MemPtr  = 1 → bit 1 = 0x02
+            //   MemFd   = 2 → bit 2 = 0x04
+            //   DmaBuf  = 3 → bit 3 = 0x08
+            let data_type_mask: i32 =
+                (1 << spa_sys::SPA_DATA_DmaBuf) |
+                (1 << spa_sys::SPA_DATA_MemFd) |
+                (1 << spa_sys::SPA_DATA_MemPtr);
+
+            let buffers_pod_bytes = pipewire::spa::pod::serialize::PodSerializer::serialize(
+                std::io::Cursor::new(vec![0u8; 1024]),
+                &Value::Object(Object {
+                    type_: SpaTypes::ObjectParamBuffers.as_raw(),
+                    id: ParamType::Buffers.as_raw(),
+                    properties: vec![
+                        Property {
+                            key: spa_sys::SPA_PARAM_BUFFERS_dataType,
+                            flags: PropertyFlags::empty(),
+                            value: Value::Int(data_type_mask),
+                        },
+                    ],
+                }),
+            );
+            if let Ok((cursor, _)) = buffers_pod_bytes {
+                let bytes = cursor.into_inner();
+                if let Some(pod) = pipewire::spa::pod::Pod::from_bytes(&bytes) {
+                    let _ = stream_ref.update_params(&mut [pod]);
+                }
+            }
+        })
         .process(move |stream_ref, _: &mut ()| {
             if let Some(mut buffer) = stream_ref.dequeue_buffer() {
                 if let Some(buf) = buffer.datas_mut().first_mut() {
+                    let buf_type = buf.type_();
+
+                    // Log the buffer type once on the first successful frame.
+                    if !buffer_type_logged {
+                        if buf_type == pipewire::spa::buffer::DataType::DmaBuf {
+                            eprintln!("[display/wayland] Using DMA-BUF capture (zero-copy)");
+                        } else {
+                            eprintln!("[display/wayland] Using SHM capture");
+                        }
+                        buffer_type_logged = true;
+                    }
+
                     // Read chunk metadata before taking the mutable data borrow.
                     let stride = buf.chunk().stride() as u32;
+                    let chunk_size = buf.chunk().size() as usize;
+                    let chunk_offset = buf.chunk().offset() as usize;
 
-                    if let Some(data) = buf.data() {
-                        // Derive actual frame dimensions from the buffer data.
-                        // stride is bytes per row (may include padding); for
-                        // BGRA/BGRx each pixel is 4 bytes.  The frame height
-                        // is data.len() / stride (integer division).
+                    // Try the auto-mapped data pointer first (works for both
+                    // SHM and DMA-BUF when MAP_BUFFERS is set and the buffer
+                    // is mappable).
+                    let pixel_data: Option<Vec<u8>> = if let Some(data) = buf.data() {
+                        // Apply chunk offset/size: the valid region may be a
+                        // subset of the mapped buffer.
+                        let effective = if chunk_size > 0 && chunk_offset + chunk_size <= data.len() {
+                            &data[chunk_offset..chunk_offset + chunk_size]
+                        } else {
+                            data
+                        };
+                        Some(effective.to_vec())
+                    } else if buf_type == pipewire::spa::buffer::DataType::DmaBuf
+                           || buf_type == pipewire::spa::buffer::DataType::MemFd
+                    {
+                        // Fd-backed buffer without auto-mapping. Manually mmap
+                        // the fd, copy the pixels, then munmap.
+                        let raw = buf.as_raw();
+                        let fd = raw.fd as std::os::raw::c_int;
+                        let maxsize = raw.maxsize as usize;
+                        if fd >= 0 && maxsize > 0 {
+                            mmap_fd_and_read(fd, raw.mapoffset as usize, maxsize, chunk_offset, chunk_size)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(pixels) = pixel_data {
+                        // Derive actual frame dimensions from the pixel data.
+                        let data_len = pixels.len();
                         let frame_w = if stride > 0 {
-                            // Use the stored width as baseline; stride / 4 may
-                            // be wider due to alignment padding.
                             let current_w = sw.load(Ordering::SeqCst);
                             if current_w > 0 { current_w } else { stride / 4 }
                         } else {
                             sw.load(Ordering::SeqCst)
                         };
-                        let frame_h = if stride > 0 && !data.is_empty() {
-                            (data.len() as u32) / stride
+                        let frame_h = if stride > 0 && data_len > 0 {
+                            (data_len as u32) / stride
                         } else {
                             sh.load(Ordering::SeqCst)
                         };
@@ -426,7 +563,7 @@ fn run_pipewire_capture(
                         }
 
                         let frame = Frame {
-                            data: data.to_vec(),
+                            data: pixels,
                             format: FrameFormat::Bgra,
                             width: frame_w,
                             height: frame_h,
