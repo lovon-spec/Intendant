@@ -51,6 +51,10 @@ use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
 
+/// Session log directory for the panic hook to write panic.log into.
+/// Set once when a session starts; read by the panic hook on crash.
+static PANIC_LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// Shared slot for JSON-mode approval responses.
 /// The stdin reader stores approval senders here; the agent loop awaits them.
 type JsonApprovalSlot =
@@ -4861,23 +4865,36 @@ fn configure_sandbox_env(flags: &CliFlags, project: &Project, log_dir: &std::pat
 
 #[tokio::main]
 async fn main() -> Result<(), CallerError> {
-    // Handle broken pipe (EPIPE) gracefully instead of panicking.
-    // This occurs when stdout is piped into a consumer that exits early (e.g. `grep -q`),
-    // or when the terminal is killed during headless output.
+    // Panic hook: handle broken pipe gracefully and persist panic info
+    // to the active session's log directory for post-mortem auditing.
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            // Check if this is a broken pipe panic from println!/write!
-            let msg = if let Some(s) = info.payload().downcast_ref::<String>() {
+            // Broken pipe from println!/write! — exit cleanly
+            let is_broken_pipe = if let Some(s) = info.payload().downcast_ref::<String>() {
                 s.contains("Broken pipe")
             } else if let Some(s) = info.payload().downcast_ref::<&str>() {
                 s.contains("Broken pipe")
             } else {
                 false
             };
-            if msg {
+            if is_broken_pipe {
                 std::process::exit(0);
             }
+
+            // Write panic info to the session log directory if available.
+            // This makes panics discoverable by audit agents alongside
+            // session.jsonl and transcript files — no need to hunt for
+            // app-backend.log or stderr captures.
+            if let Some(dir) = PANIC_LOG_DIR.get() {
+                let panic_path = dir.join("panic.log");
+                let msg = format!("{}\n\nBacktrace:\n{:?}\n",
+                    info,
+                    std::backtrace::Backtrace::force_capture(),
+                );
+                let _ = std::fs::write(&panic_path, &msg);
+            }
+
             default_hook(info);
         }));
     }
@@ -4943,6 +4960,8 @@ async fn main() -> Result<(), CallerError> {
         Ok(log) => {
             eprintln!("Session log: {}/session.jsonl", log.dir().display());
             eprintln!("Session ID: {}", log.session_id());
+            // Register session dir for the panic hook
+            let _ = PANIC_LOG_DIR.set(log.dir().to_path_buf());
             Arc::new(Mutex::new(log))
         }
         Err(e) => {

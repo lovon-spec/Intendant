@@ -287,12 +287,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         process.currentDirectoryURL = dir
         NSLog("Working directory: \(dir.path)")
 
-        // Log backend output for debugging
+        // Log backend output for debugging (append mode — preserves crash info
+        // from previous sessions; the Rust panic hook writes per-session panic.log
+        // files for structured auditing, this is the fallback for pre-session crashes)
         let logDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".intendant")
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
         let logFile = logDir.appendingPathComponent("app-backend.log")
-        FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        if !FileManager.default.fileExists(atPath: logFile.path) {
+            FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        }
         let logHandle = FileHandle(forWritingAtPath: logFile.path)
+        logHandle?.seekToEndOfFile()
+        // Write launch separator
+        let sep = "\n--- Launch \(ISO8601DateFormatter().string(from: Date())) ---\n"
+        logHandle?.write(sep.data(using: .utf8) ?? Data())
         process.standardOutput = logHandle ?? FileHandle.nullDevice
         process.standardError = logHandle ?? FileHandle.nullDevice
 
