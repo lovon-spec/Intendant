@@ -132,8 +132,12 @@ struct CliFlags {
     transcription: bool,
     /// --record-display <ID>: Record an existing X11 display (repeatable).
     record_displays: Vec<u32>,
+
     /// --agent <BACKEND>: Use external agent backend (codex, claude-code).
     agent_backend: Option<external_agent::AgentBackend>,
+
+    /// --no-web: Disable web gateway (on by default).
+    no_web: bool,
 }
 
 fn print_help() {
@@ -158,7 +162,8 @@ fn print_help() {
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
-    println!("    --web [PORT]           Serve TUI via web (xterm.js + optional voice, default port: 8765)");
+    println!("    --web [PORT]          Web dashboard (default: on, port 8765). Use --no-web to disable");
+    println!("    --no-web              Disable web dashboard");
     println!("    --transcription       Enable user speech transcription");
     println!("    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)");
     println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code)");
@@ -187,6 +192,28 @@ fn print_help() {
     println!("    REASONING_SUMMARY     Reasoning summary: auto, concise, detailed");
 }
 
+/// Try binding to ports starting from `preferred`, returning the first available.
+async fn find_available_port(preferred: u16) -> Result<u16, CallerError> {
+    for offset in 0..20u16 {
+        let port = preferred.checked_add(offset).unwrap_or(preferred);
+        match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+            Ok(_listener) => return Ok(port), // drop releases the port
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => {
+                return Err(CallerError::Config(format!(
+                    "Failed to bind web gateway port: {}",
+                    e
+                )));
+            }
+        }
+    }
+    Err(CallerError::Config(format!(
+        "No available port found in range {}-{}",
+        preferred,
+        preferred + 19
+    )))
+}
+
 fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = CliFlags {
@@ -209,7 +236,10 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         web_port: web_gateway::DEFAULT_PORT,
         transcription: false,
         record_displays: Vec::new(),
+
         agent_backend: None,
+
+        no_web: false,
     };
 
     let mut task_parts = Vec::new();
@@ -303,6 +333,10 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--no-presence" => {
                 flags.no_presence = true;
+                i += 1;
+            }
+            "--no-web" => {
+                flags.no_web = true;
                 i += 1;
             }
             "--web" => {
@@ -1251,7 +1285,10 @@ Also: {"source": "bare"}"#;
             web_port: web_gateway::DEFAULT_PORT,
             transcription: false,
             record_displays: Vec::new(),
+
             agent_backend: None,
+
+            no_web: false,
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -1263,6 +1300,7 @@ Also: {"source": "bare"}"#;
         assert!(!flags.direct);
         assert!(!flags.no_presence);
         assert!(!flags.web);
+        assert!(!flags.no_web);
         assert!(!flags.transcription);
         assert_eq!(flags.web_port, 8765);
         assert_eq!(flags.autonomy, AutonomyLevel::Medium);
@@ -1290,7 +1328,10 @@ Also: {"source": "bare"}"#;
             web_port: web_gateway::DEFAULT_PORT,
             transcription: false,
             record_displays: Vec::new(),
+
             agent_backend: None,
+
+            no_web: false,
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, web_gateway::DEFAULT_PORT);
@@ -1318,7 +1359,10 @@ Also: {"source": "bare"}"#;
             web_port: 9000,
             transcription: false,
             record_displays: Vec::new(),
+
             agent_backend: None,
+
+            no_web: false,
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, 9000);
@@ -5513,6 +5557,17 @@ async fn main() -> Result<(), CallerError> {
         l.write_meta(Some(&project.root), None);
     });
 
+    // Web gateway is on by default unless explicitly disabled, or when running
+    // in MCP/JSON modes that own stdio.
+    let use_web = !flags.no_web && !flags.mcp && !flags.json_output;
+
+    // Resolve web port via auto-discovery (try preferred port, then +1..+19).
+    let web_port = if use_web {
+        find_available_port(flags.web_port).await?
+    } else {
+        flags.web_port
+    };
+
     let provider_result = provider::select_provider();
     let provider = match provider_result {
         Ok(p) => {
@@ -5522,7 +5577,7 @@ async fn main() -> Result<(), CallerError> {
             });
             Some(p)
         }
-        Err(ref e) if flags.web || flags.mcp => {
+        Err(ref e) if use_web || flags.mcp => {
             // No API keys — start the dashboard anyway.
             // Display control, session browsing, annotations, and clipping
             // all work without inference.
@@ -5553,8 +5608,8 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Determine whether to use TUI (needed early for task resolution).
-    // --web forces TUI mode (served via web) even without a real terminal.
-    let use_tui = flags.web
+    // Web gateway forces TUI mode (served via web) even without a real terminal.
+    let use_tui = use_web
         || (!flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal());
 
     // Task resolution: MCP and TUI modes allow starting without a task.
@@ -5596,11 +5651,11 @@ async fn main() -> Result<(), CallerError> {
         );
         let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
-        let _debug_handler = if flags.web {
+        let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
                 bus.subscribe(),
                 project.config.recording.clone(),
-                flags.web_port,
+                web_port,
                 bus.clone(),
             ))
         } else {
@@ -5624,7 +5679,7 @@ async fn main() -> Result<(), CallerError> {
         // channel; otherwise create a standalone one when web or broadcaster needs it.
         let outbound_tx = if let Some(ref tx) = mcp_control_tx {
             tx.clone()
-        } else if flags.web {
+        } else if use_web {
             let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
             tx
         } else {
@@ -5648,7 +5703,7 @@ async fn main() -> Result<(), CallerError> {
         );
 
         // Web gateway (WebSocket)
-        let _web_handle = if flags.web {
+        let _web_handle = if use_web {
             let broadcast_tx = outbound_tx.clone();
             let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
                 if project.config.transcription.enabled {
@@ -5678,7 +5733,7 @@ async fn main() -> Result<(), CallerError> {
                 },
             ));
             let handle = web_gateway::spawn_web_gateway(
-                flags.web_port,
+                web_port,
                 bus.clone(),
                 broadcast_tx,
                 config,
@@ -5687,16 +5742,17 @@ async fn main() -> Result<(), CallerError> {
                 None, // MCP mode: no WebTui
                 None, // No task_tx in MCP mode
                 Some(project.root.clone()),
+                None, // No MCP server for HTTP transport in MCP mode
             );
             slog(&session_log, |l| {
                 l.info(&format!(
                     "Web TUI: http://0.0.0.0:{}",
-                    flags.web_port
+                    web_port
                 ))
             });
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
-                flags.web_port
+                web_port
             );
             Some(handle)
         } else {
@@ -5933,8 +5989,8 @@ async fn main() -> Result<(), CallerError> {
         let event_rx = bus.subscribe();
 
         // Spawn background tasks.
-        // In web mode (--web), key events come from WebSocket, not the terminal.
-        let _crossterm_handle = if !flags.web {
+        // In web mode, key events come from WebSocket, not the terminal.
+        let _crossterm_handle = if !use_web {
             Some(tui::event::spawn_crossterm_reader(bus.clone()))
         } else {
             None
@@ -5949,11 +6005,11 @@ async fn main() -> Result<(), CallerError> {
         );
         let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
-        let _debug_handler = if flags.web {
+        let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
                 bus.subscribe(),
                 project.config.recording.clone(),
-                flags.web_port,
+                web_port,
                 bus.clone(),
             ))
         } else {
@@ -5988,8 +6044,8 @@ async fn main() -> Result<(), CallerError> {
             );
         }
 
-        // Per-connection WebTui command channel (only for --web mode).
-        let (web_tui_tx, web_tui_rx) = if flags.web {
+        // Per-connection WebTui command channel (only for web mode).
+        let (web_tui_tx, web_tui_rx) = if use_web {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<tui::web::WebTuiCommand>();
             (Some(tx), Some(rx))
         } else {
@@ -5999,7 +6055,7 @@ async fn main() -> Result<(), CallerError> {
         // Web gateway broadcast channel — shares with control socket if both enabled.
         // The actual web gateway spawn is deferred until after presence setup so we
         // can pass the WebQueryCtx (agent state, project root, etc.) for tool requests.
-        let web_broadcast_tx = if flags.web {
+        let web_broadcast_tx = if use_web {
             let tx = if let Some(ref tx) = app.control_tx {
                 tx.clone()
             } else {
@@ -6138,7 +6194,7 @@ async fn main() -> Result<(), CallerError> {
                 },
             ));
             let handle = web_gateway::spawn_web_gateway(
-                flags.web_port,
+                web_port,
                 bus.clone(),
                 broadcast_tx,
                 config,
@@ -6147,10 +6203,11 @@ async fn main() -> Result<(), CallerError> {
                 web_tui_tx.clone(),
                 Some(task_tx.clone()),
                 Some(project.root.clone()),
+                None, // MCP server for HTTP transport
             );
             app.log(
                 types::LogLevel::Info,
-                format!("Web TUI: http://0.0.0.0:{}", flags.web_port),
+                format!("Web TUI: http://0.0.0.0:{}", web_port),
             );
             Some(handle)
         } else {
@@ -6371,18 +6428,18 @@ async fn main() -> Result<(), CallerError> {
         };
 
         // Run the TUI event loop (blocks until quit).
-        // In web mode (--web), render to a buffer and stream to xterm.js.
+        // In web mode, render to a buffer and stream to xterm.js.
         // In terminal mode, render directly to stdout.
-        if flags.web {
+        if use_web {
             let broadcast_tx = app.control_tx.clone().unwrap_or_else(|| {
                 let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
                 app.set_control_socket(tx.clone());
                 tx
             });
-            eprintln!("Web TUI: http://0.0.0.0:{}", flags.web_port);
+            eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
             let mut web_tui = tui::web::WebTui::new(120, 40, broadcast_tx)
                 .map_err(|e| CallerError::Tui(format!("Failed to initialize Web TUI: {}", e)))?;
-            let cmd_rx = web_tui_rx.expect("web_tui_rx must exist in --web mode");
+            let cmd_rx = web_tui_rx.expect("web_tui_rx must exist in web mode");
             let _ = web_tui.run(&mut app, event_rx, cmd_rx, bus.clone()).await;
         } else {
             let mut terminal = tui::Tui::new()
@@ -6402,14 +6459,14 @@ async fn main() -> Result<(), CallerError> {
             Err(_) => loop_handle.abort(), // timed out — force stop
         }
 
-        if flags.web && !session_id.is_empty() {
+        if use_web && !session_id.is_empty() {
             bus.send(AppEvent::SessionEnded {
                 session_id,
                 reason: "completed".to_string(),
             });
             // Daemon mode: keep web gateway alive after TUI quits.
             // Fall through to a headless daemon loop (TUI is not re-created).
-            eprintln!("TUI exited. Web gateway still running on port {}. Waiting for new tasks...", flags.web_port);
+            eprintln!("TUI exited. Web gateway still running on port {}. Waiting for new tasks...", web_port);
             let mut event_rx = bus.subscribe();
             loop {
                 tokio::select! {
@@ -6542,11 +6599,11 @@ async fn main() -> Result<(), CallerError> {
         );
         let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
-        let _debug_handler = if flags.web {
+        let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
                 bus.subscribe(),
                 project.config.recording.clone(),
-                flags.web_port,
+                web_port,
                 bus.clone(),
             ))
         } else {
@@ -6583,7 +6640,7 @@ async fn main() -> Result<(), CallerError> {
         }
 
         // Web gateway in headless mode
-        let headless_shared_session: Option<web_gateway::SharedActiveSession> = if flags.web {
+        let headless_shared_session: Option<web_gateway::SharedActiveSession> = if use_web {
             let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
                 if project.config.transcription.enabled {
                     match transcription::WhisperTranscriber::new(&project.config.transcription) {
@@ -6612,7 +6669,7 @@ async fn main() -> Result<(), CallerError> {
                 },
             ));
             let _web_handle = web_gateway::spawn_web_gateway(
-                flags.web_port,
+                web_port,
                 bus.clone(),
                 outbound_tx.clone(),
                 config,
@@ -6621,10 +6678,11 @@ async fn main() -> Result<(), CallerError> {
                 None, // Headless mode: no WebTui
                 None, // No task_tx in headless mode
                 Some(project.root.clone()),
+                None, // MCP server for HTTP transport
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",
-                flags.web_port
+                web_port
             );
             Some(shared_session)
         } else {
@@ -6806,7 +6864,7 @@ async fn main() -> Result<(), CallerError> {
             reason: reason.clone(),
         });
 
-        if flags.web {
+        if use_web {
             // Daemon mode: keep web gateway alive, listen for new tasks from web UI.
             if let Some(ref shared_session) = headless_shared_session {
                 // Clear session-specific state so new connections see "no active session"
@@ -6817,7 +6875,7 @@ async fn main() -> Result<(), CallerError> {
                     // Keep frame_registry and recording_registry alive
                 }
             }
-            eprintln!("Session ended ({}). Web gateway running on port {}. Waiting for new tasks...", reason, flags.web_port);
+            eprintln!("Session ended ({}). Web gateway running on port {}. Waiting for new tasks...", reason, web_port);
 
             // Daemon loop: wait for StartTask from web UI or Ctrl+C
             let mut event_rx = bus.subscribe();
