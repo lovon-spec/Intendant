@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_VP8};
+use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
@@ -38,6 +38,9 @@ pub struct WebRtcPeer {
 impl WebRtcPeer {
     /// Create a new peer from an SDP offer, returning `(Self, answer_sdp)`.
     ///
+    /// `codec_mime` is the negotiated codec MIME type (e.g. `"video/VP8"`)
+    /// determined by `select_codec()` before the peer is created.
+    ///
     /// `ice_tx` receives trickle ICE candidates as JSON strings, tagged with the
     /// peer ID so the signaling layer can route them to the correct browser.
     ///
@@ -46,6 +49,7 @@ impl WebRtcPeer {
     pub async fn new(
         peer_id: PeerId,
         offer_sdp: &str,
+        codec_mime: &str,
         ice_config: &IceConfig,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
@@ -115,7 +119,7 @@ impl WebRtcPeer {
         // --- Video track ---
         let video_track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_VP8.to_owned(),
+                mime_type: codec_mime.to_owned(),
                 ..Default::default()
             },
             "video".to_string(),

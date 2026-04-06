@@ -349,6 +349,9 @@ pub struct DisplaySession {
     counters: Arc<DisplayMetricsCounters>,
     /// Instant used as the epoch for rate computations.
     metrics_epoch: Mutex<Instant>,
+    /// Negotiated codec MIME type for the encoder pipeline.
+    /// Set on the first peer connection, all subsequent peers use the same codec.
+    codec_mime: RwLock<&'static str>,
 }
 
 impl DisplaySession {
@@ -366,6 +369,7 @@ impl DisplaySession {
             shutdown: CancellationToken::new(),
             counters: Arc::new(DisplayMetricsCounters::new()),
             metrics_epoch: Mutex::new(Instant::now()),
+            codec_mime: RwLock::new(encode::MIME_TYPE_VP8),
         }
     }
 
@@ -460,8 +464,10 @@ impl DisplaySession {
 
             let enc_counters = Arc::clone(&self.counters);
             let encoder_shutdown = self.shutdown.clone();
+            let session_codec_mime = *self.codec_mime.read().await;
             spawn_encoder_thread(
                 width, height, duration_ms,
+                session_codec_mime,
                 i420_rx, efr_tx.clone(),
                 Arc::clone(&enc_counters), encoder_shutdown,
             );
@@ -471,6 +477,7 @@ impl DisplaySession {
             let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
             let display_id = self.display_id;
             let event_bus = event_bus_for_encoder;
+            let codec_mime_for_bridge = session_codec_mime;
             let bridge_handle = tokio::spawn(async move {
                 let mut last_encode = tokio::time::Instant::now();
                 // Track current encoder dimensions for resize detection.
@@ -519,6 +526,7 @@ impl DisplaySession {
                                 let shutdown_clone = shutdown_bridge.clone();
                                 spawn_encoder_thread(
                                     enc_width, enc_height, duration_ms,
+                                    codec_mime_for_bridge,
                                     new_rx, efr_tx.clone(),
                                     counters_clone, shutdown_clone,
                                 );
@@ -811,8 +819,9 @@ impl DisplaySession {
 
     /// Handle a WebRTC SDP offer from a browser peer.
     ///
-    /// Creates a `WebRtcPeer`, subscribes it to the encoder output, adds it to
-    /// the peer map, and returns the SDP answer.
+    /// Negotiates the codec from the SDP offer, creates a `WebRtcPeer` with the
+    /// selected codec, subscribes it to the encoder output, adds it to the peer
+    /// map, and returns the SDP answer.
     pub async fn handle_offer(
         &self,
         peer_id: PeerId,
@@ -820,6 +829,17 @@ impl DisplaySession {
         ice_config: &IceConfig,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
+        // Negotiate codec from the offer SDP.
+        let (width, height) = self.backend.resolution();
+        let codec_choice = encode::select_codec(sdp, width, height, 2000)
+            .map_err(|e| CallerError::WebRtc(format!("codec selection: {e}")))?;
+
+        // Store the negotiated codec for the encoder pipeline.
+        // The first peer's codec wins; subsequent peers use the same codec.
+        *self.codec_mime.write().await = codec_choice.mime_type;
+
+        let codec_mime = codec_choice.mime_type;
+
         let backend = Arc::clone(&self.backend);
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
             Arc::new(move |event: InputEvent| {
@@ -832,7 +852,7 @@ impl DisplaySession {
             });
 
         let (peer, answer_sdp) =
-            self::webrtc::WebRtcPeer::new(peer_id, sdp, ice_config, input_handler, ice_tx)
+            self::webrtc::WebRtcPeer::new(peer_id, sdp, codec_mime, ice_config, input_handler, ice_tx)
                 .await?;
 
         self.peers.write().await.insert(peer_id, Arc::new(peer));
@@ -877,8 +897,11 @@ impl DisplaySession {
 // Encoder thread helper
 // ---------------------------------------------------------------------------
 
-/// Spawn a VP8 encoder thread that reads I420 frames from `i420_rx`, encodes
-/// them, and sends `Arc<EncodedFrame>` to `efr_tx`.
+/// Spawn an encoder thread that reads I420 frames from `i420_rx`, encodes
+/// them using the negotiated codec, and sends `Arc<EncodedFrame>` to `efr_tx`.
+///
+/// `codec_mime` selects the encoder implementation (currently only `"video/VP8"`
+/// is supported; future codecs will be added here).
 ///
 /// The thread exits cleanly when `i420_rx` is closed (sender dropped) or
 /// the shutdown token is cancelled.  This is a free function so the
@@ -888,16 +911,17 @@ fn spawn_encoder_thread(
     width: u32,
     height: u32,
     duration_ms: u64,
+    codec_mime: &'static str,
     i420_rx: std::sync::mpsc::Receiver<(Vec<u8>, Instant)>,
     efr_tx: mpsc::Sender<Arc<EncodedFrame>>,
     counters: Arc<DisplayMetricsCounters>,
     shutdown: CancellationToken,
 ) {
     std::thread::spawn(move || {
-        let mut encoder = match encode::Vp8Encoder::new(width, height, 2000) {
+        let mut encoder: Box<dyn encode::Encoder> = match encode::select_codec_for_mime(codec_mime, width, height, 2000) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[display/encoder] VP8 encoder FAILED for {}x{}: {}", width, height, e);
+                eprintln!("[display/encoder] {} encoder FAILED for {}x{}: {}", codec_mime, width, height, e);
                 return;
             }
         };
