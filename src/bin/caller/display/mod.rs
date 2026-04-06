@@ -866,9 +866,9 @@ impl DisplaySession {
         ice_config: &IceConfig,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
-        // Select the best available codec (H264 hardware preferred, VP8 fallback).
+        // Select the best codec that both the browser and local encoder support.
         let (width, height) = self.backend.resolution();
-        let (_encoder, codec_choice) = encode::select_codec(width, height, 2000);
+        let (_encoder, codec_choice) = encode::select_codec(sdp, width, height, 2000);
         let codec_mime = codec_choice.mime();
 
         // Store the negotiated codec and start the encoder if not yet running.

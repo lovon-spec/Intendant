@@ -48,7 +48,7 @@ impl ClipboardMonitor {
                     None => continue,
                 };
                 let mut last = last_content.lock().await;
-                if !current.is_empty() && current != *last {
+                if current != *last {
                     *last = current.clone();
                     if tx.send(current).await.is_err() {
                         break; // receiver dropped

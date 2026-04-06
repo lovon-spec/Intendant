@@ -64,26 +64,63 @@ pub fn select_codec_for_mime(
     }
 }
 
-/// Pick the best available codec.
+/// Pick the best available codec that the browser also supports.
 ///
-/// Tries H264 (hardware) first, falls back to VP8 (software).
+/// Parses the browser's SDP offer to determine which codecs it advertises,
+/// then intersects with locally available encoders.  Tries H264 first (if
+/// the browser offered it *and* a local encoder is available), falls back to
+/// VP8 (universally supported by all WebRTC browsers).
 pub fn select_codec(
+    offer_sdp: &str,
     width: u32,
     height: u32,
     bitrate_kbps: u32,
 ) -> (Box<dyn Encoder>, CodecChoice) {
-    match create_h264_encoder(width, height, bitrate_kbps) {
-        Ok(pair) => pair,
-        Err(reason) => {
-            eprintln!(
-                "[display/encoder] H264 hardware encoder unavailable ({}), using VP8 software fallback",
-                reason,
-            );
-            let enc = Vp8Encoder::new(width, height, bitrate_kbps)
-                .expect("VP8 encoder creation must not fail");
-            (Box::new(enc), CodecChoice::Vp8)
+    let browser_codecs = parse_offered_codecs(offer_sdp);
+
+    if browser_codecs.iter().any(|c| c.eq_ignore_ascii_case("H264")) {
+        match create_h264_encoder(width, height, bitrate_kbps) {
+            Ok(pair) => return pair,
+            Err(reason) => {
+                eprintln!(
+                    "[display/encoder] H264 hardware encoder unavailable ({}), using VP8 software fallback",
+                    reason,
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "[display/encoder] browser SDP does not offer H264 (offered: {:?}), using VP8",
+            browser_codecs,
+        );
+    }
+
+    let enc = Vp8Encoder::new(width, height, bitrate_kbps)
+        .expect("VP8 encoder creation must not fail");
+    (Box::new(enc), CodecChoice::Vp8)
+}
+
+/// Parse `a=rtpmap:` lines from an SDP offer to extract codec names.
+///
+/// Returns codec names such as `"VP8"`, `"VP9"`, `"H264"`, `"AV1"`.
+fn parse_offered_codecs(sdp: &str) -> Vec<String> {
+    let mut codecs = Vec::new();
+    for line in sdp.lines() {
+        // Format: a=rtpmap:<payload> <codec>/<clock> [/<params>]
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            // Skip the payload-type number.
+            if let Some(after_pt) = rest.split_whitespace().nth(1) {
+                if let Some(codec_name) = after_pt.split('/').next() {
+                    let name = codec_name.to_uppercase();
+                    if !codecs.contains(&name) {
+                        codecs.push(name);
+                    }
+                }
+            }
         }
     }
+    codecs
 }
 
 /// Platform-specific H264 encoder creation.
@@ -334,6 +371,37 @@ mod tests {
         assert_eq!(i420[1], 255);
         assert_eq!(i420[2], 0);
         assert_eq!(i420[3], 0);
+    }
+
+    #[test]
+    fn parse_offered_codecs_extracts_names() {
+        let sdp = "\
+v=0\r\n\
+o=- 123 456 IN IP4 0.0.0.0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97 98\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 H264/90000\r\n\
+a=rtpmap:98 VP9/90000\r\n\
+a=fmtp:97 level-asymmetry-allowed=1\r\n";
+
+        let codecs = parse_offered_codecs(sdp);
+        assert_eq!(codecs, vec!["VP8", "H264", "VP9"]);
+    }
+
+    #[test]
+    fn parse_offered_codecs_deduplicates() {
+        let sdp = "\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 VP8/90000\r\n";
+
+        let codecs = parse_offered_codecs(sdp);
+        assert_eq!(codecs, vec!["VP8"]);
+    }
+
+    #[test]
+    fn parse_offered_codecs_empty_sdp() {
+        let codecs = parse_offered_codecs("");
+        assert!(codecs.is_empty());
     }
 
     #[test]

@@ -204,34 +204,55 @@ impl FfmpegH264Encoder {
         })
     }
 
-    /// Read whatever is available from ffmpeg stdout (non-blocking) and
-    /// split into NAL units.
+    /// Read encoded output from ffmpeg stdout using `poll()`.
+    ///
+    /// After writing exactly one I420 frame, ffmpeg processes it and writes
+    /// the resulting H264 access unit(s) before accepting more input (pipe
+    /// backpressure).  We read in blocking mode using `poll()` with a short
+    /// timeout: keep reading while data arrives, declare the frame complete
+    /// once no new data appears within `DRAIN_TIMEOUT_MS`.
     fn drain_output(&mut self) -> Result<Vec<(Vec<u8>, bool)>, String> {
+        use std::os::unix::io::AsRawFd;
+
         let stdout = self
             .child
             .stdout
             .as_mut()
             .ok_or("ffmpeg stdout closed")?;
 
-        // Read available data.  ffmpeg writes in chunks so we read whatever
-        // is buffered.  We use a fixed-size temp buffer and append to read_buf.
+        let fd = stdout.as_raw_fd();
         let mut tmp = [0u8; 65536];
+
+        /// How long to wait for more data after the last successful read
+        /// before declaring the frame complete.
+        const DRAIN_TIMEOUT_MS: i32 = 10;
+
         loop {
-            // Set stdout to non-blocking for this read.
-            use std::os::unix::io::AsRawFd;
-            let fd = stdout.as_raw_fd();
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            // Poll the fd for readability.
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let poll_ret = unsafe { libc::poll(&mut pfd, 1, DRAIN_TIMEOUT_MS) };
 
-            let n = stdout.read(&mut tmp);
+            if poll_ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue; // EINTR — retry
+                }
+                return Err(format!("poll ffmpeg stdout: {err}"));
+            }
+            if poll_ret == 0 {
+                // Timeout — no more data for this frame.
+                break;
+            }
 
-            // Restore blocking mode.
-            unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-
-            match n {
+            // Data is available — read it (blocking, but we know data is ready).
+            match stdout.read(&mut tmp) {
                 Ok(0) => break, // EOF
                 Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(format!("read ffmpeg stdout: {e}")),
             }
         }

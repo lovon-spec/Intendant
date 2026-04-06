@@ -4061,7 +4061,7 @@ class DisplaySlot {
     this.clipboardChannel.onmessage = (e) => {
       try {
         const d = JSON.parse(e.data);
-        if (d.t === 'clipboard_update' && d.text && this.interactive) {
+        if (d.t === 'clipboard_update' && d.text !== undefined && this.interactive) {
           navigator.clipboard.writeText(d.text).catch(() => {});
         }
       } catch {}
@@ -4248,7 +4248,7 @@ class DisplaySlot {
     // Clipboard: intercept paste events and send to remote display
     this._boundHandlers.paste = (e) => {
       const text = e.clipboardData?.getData('text');
-      if (text && this.clipboardChannel?.readyState === 'open') {
+      if (text !== undefined && this.clipboardChannel?.readyState === 'open') {
         this.clipboardChannel.send(JSON.stringify({t: 'clipboard_set', text}));
         e.preventDefault();
       }
