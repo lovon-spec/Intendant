@@ -668,6 +668,35 @@ html, body {
 .cost-grid .label { color: var(--overlay1); }
 .cost-grid .value { text-align: right; color: var(--green); font-weight: 600; }
 
+/* Display transport metrics */
+.display-metrics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.display-metrics-table th {
+  text-align: left;
+  color: var(--overlay1);
+  font-weight: 400;
+  padding: 4px 12px 4px 0;
+  border-bottom: 1px solid var(--surface0);
+}
+.display-metrics-table td {
+  padding: 4px 12px 4px 0;
+  color: var(--text);
+}
+.display-metrics-table td.dm-value {
+  text-align: right;
+  color: var(--green);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.display-metrics-table td.dm-unit {
+  color: var(--overlay1);
+  font-size: 11px;
+  padding-left: 4px;
+}
+
 /* Token history */
 .token-history {
   margin-top: 24px;
@@ -2268,6 +2297,19 @@ html, body {
           <div class="cost-title">Disk Usage</div>
           <div class="cost-grid" id="disk-usage-grid"></div>
         </div>
+        <div class="cost-section" id="display-metrics-section" style="display:none">
+          <div class="cost-title">Display Transport</div>
+          <table class="display-metrics-table">
+            <tbody>
+              <tr><td>Capture</td><td class="dm-value" id="dm-capture-fps">&mdash;</td><td class="dm-unit">fps</td></tr>
+              <tr><td>Encode</td><td class="dm-value" id="dm-encode-fps">&mdash;</td><td class="dm-unit">fps</td></tr>
+              <tr><td>Encode latency</td><td class="dm-value" id="dm-encode-latency">&mdash;</td><td class="dm-unit">ms avg</td></tr>
+              <tr><td>Peers</td><td class="dm-value" id="dm-peer-count">&mdash;</td><td class="dm-unit"></td></tr>
+              <tr><td>Resolution</td><td class="dm-value" id="dm-resolution">&mdash;</td><td class="dm-unit"></td></tr>
+              <tr><td>Drops</td><td class="dm-value" id="dm-drops">&mdash;</td><td class="dm-unit">cap / enc / peer</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -3275,6 +3317,19 @@ async function main() {
       } else if (d.event === 'recording_deleted' && d.stream_name) {
         const slot = [...displaySlots.values()].find(s => 'display_' + s.displayId === d.stream_name);
         if (slot) { slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
+      }
+      // Display transport metrics
+      if (d.event === 'display_metrics') {
+        const sec = document.getElementById('display-metrics-section');
+        if (sec) {
+          sec.style.display = '';
+          document.getElementById('dm-capture-fps').textContent = d.capture_fps.toFixed(1);
+          document.getElementById('dm-encode-fps').textContent = d.encode_fps.toFixed(1);
+          document.getElementById('dm-encode-latency').textContent = d.encode_latency_avg_ms.toFixed(1);
+          document.getElementById('dm-peer-count').textContent = d.peer_count;
+          document.getElementById('dm-resolution').textContent = d.resolution_width + '\u00d7' + d.resolution_height;
+          document.getElementById('dm-drops').textContent = d.capture_drops + ' / ' + d.encode_drops + ' / ' + d.peer_drops;
+        }
       }
     } catch(_) {}
     const cmds = app.handle_server_message(msg);
