@@ -241,10 +241,17 @@ export class PresenceWeb {
         wasm.presenceweb_release_display(this.__wbg_ptr, display_id, ptr0, len0);
     }
     /**
-     * Revoke agent access to the user's session display.
+     * Revoke agent access to the user's session display (primary / id 0).
      */
     revoke_user_display() {
         wasm.presenceweb_revoke_user_display(this.__wbg_ptr);
+    }
+    /**
+     * Revoke agent access to a specific user display by ID.
+     * @param {number} display_id
+     */
+    revoke_user_display_with_id(display_id) {
+        wasm.presenceweb_revoke_user_display_with_id(this.__wbg_ptr, display_id);
     }
     /**
      * Approve/skip/deny/approve_all a pending action.

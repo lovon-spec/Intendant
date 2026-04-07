@@ -1012,10 +1012,17 @@ impl PresenceWeb {
         self.server.borrow().send_json(&msg);
     }
 
-    /// Revoke agent access to the user's session display.
+    /// Revoke agent access to the user's session display (primary / id 0).
     #[wasm_bindgen]
     pub fn revoke_user_display(&self) {
         let msg = serde_json::json!({"action": "revoke_user_display"});
+        self.server.borrow().send_json(&msg);
+    }
+
+    /// Revoke agent access to a specific user display by ID.
+    #[wasm_bindgen]
+    pub fn revoke_user_display_with_id(&self, display_id: u32) {
+        let msg = serde_json::json!({"action": "revoke_user_display", "display_id": display_id});
         self.server.borrow().send_json(&msg);
     }
 }

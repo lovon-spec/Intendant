@@ -25,6 +25,7 @@ export const presenceweb_phase: (a: number) => [number, number];
 export const presenceweb_reconnect_server: (a: number, b: number, c: number) => void;
 export const presenceweb_release_display: (a: number, b: bigint, c: number, d: number) => void;
 export const presenceweb_revoke_user_display: (a: number) => void;
+export const presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
 export const presenceweb_send_approval: (a: number, b: number, c: number) => any;
 export const presenceweb_send_audio: (a: number, b: number, c: number) => void;
 export const presenceweb_send_follow_up: (a: number, b: number, c: number) => any;

@@ -84,9 +84,13 @@ export class PresenceWeb {
      */
     release_display(display_id: bigint, note?: string | null): void;
     /**
-     * Revoke agent access to the user's session display.
+     * Revoke agent access to the user's session display (primary / id 0).
      */
     revoke_user_display(): void;
+    /**
+     * Revoke agent access to a specific user display by ID.
+     */
+    revoke_user_display_with_id(display_id: number): void;
     /**
      * Approve/skip/deny/approve_all a pending action.
      * Returns `UiCommand[]` for UI updates. Sends the action to the server.
@@ -300,6 +304,7 @@ export interface InitOutput {
     readonly presenceweb_reconnect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_release_display: (a: number, b: bigint, c: number, d: number) => void;
     readonly presenceweb_revoke_user_display: (a: number) => void;
+    readonly presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_send_approval: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_audio: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_follow_up: (a: number, b: number, c: number) => any;

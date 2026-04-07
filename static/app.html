@@ -2297,19 +2297,7 @@ html, body {
           <div class="cost-title">Disk Usage</div>
           <div class="cost-grid" id="disk-usage-grid"></div>
         </div>
-        <div class="cost-section" id="display-metrics-section" style="display:none">
-          <div class="cost-title">Display Transport</div>
-          <table class="display-metrics-table">
-            <tbody>
-              <tr><td>Capture</td><td class="dm-value" id="dm-capture-fps">&mdash;</td><td class="dm-unit">fps</td></tr>
-              <tr><td>Encode</td><td class="dm-value" id="dm-encode-fps">&mdash;</td><td class="dm-unit">fps</td></tr>
-              <tr><td>Encode latency</td><td class="dm-value" id="dm-encode-latency">&mdash;</td><td class="dm-unit">ms avg</td></tr>
-              <tr><td>Peers</td><td class="dm-value" id="dm-peer-count">&mdash;</td><td class="dm-unit"></td></tr>
-              <tr><td>Resolution</td><td class="dm-value" id="dm-resolution">&mdash;</td><td class="dm-unit"></td></tr>
-              <tr><td>Drops</td><td class="dm-value" id="dm-drops">&mdash;</td><td class="dm-unit">cap / enc / peer</td></tr>
-            </tbody>
-          </table>
-        </div>
+        <div id="display-metrics-container"></div>
       </div>
     </div>
 
@@ -3318,18 +3306,9 @@ async function main() {
         const slot = [...displaySlots.values()].find(s => 'display_' + s.displayId === d.stream_name);
         if (slot) { slot.recording = false; slot.recordBtn.innerHTML = '&#x23FA; Record'; slot.recordBtn.classList.remove('active'); slot.deleteRecBtn.style.display = 'none'; }
       }
-      // Display transport metrics
+      // Display transport metrics (per-display sections)
       if (d.event === 'display_metrics') {
-        const sec = document.getElementById('display-metrics-section');
-        if (sec) {
-          sec.style.display = '';
-          document.getElementById('dm-capture-fps').textContent = d.capture_fps.toFixed(1);
-          document.getElementById('dm-encode-fps').textContent = d.encode_fps.toFixed(1);
-          document.getElementById('dm-encode-latency').textContent = d.encode_latency_avg_ms.toFixed(1);
-          document.getElementById('dm-peer-count').textContent = d.peer_count;
-          document.getElementById('dm-resolution').textContent = d.resolution_width + '\u00d7' + d.resolution_height;
-          document.getElementById('dm-drops').textContent = d.capture_drops + ' / ' + d.encode_drops + ' / ' + d.peer_drops;
-        }
+        updateDisplayMetrics(d);
       }
     } catch(_) {}
     const cmds = app.handle_server_message(msg);
@@ -7866,8 +7845,56 @@ window.sendFollowUp = function() {
   input.value = '';
 };
 
+// ── Display metrics (per-display sections) ──
+const displayMetricsIds = new Set();
+function updateDisplayMetrics(d) {
+  const container = document.getElementById('display-metrics-container');
+  if (!container) return;
+  const did = d.display_id;
+  const sectionId = 'display-metrics-' + did;
+  let section = document.getElementById(sectionId);
+  if (!section) {
+    displayMetricsIds.add(did);
+    section = document.createElement('div');
+    section.id = sectionId;
+    section.className = 'cost-section';
+    const title = document.createElement('div');
+    title.className = 'cost-title';
+    title.id = sectionId + '-title';
+    title.textContent = 'Display Transport';
+    section.appendChild(title);
+    const table = document.createElement('table');
+    table.className = 'display-metrics-table';
+    table.innerHTML =
+      '<tbody>' +
+      '<tr><td>Capture</td><td class="dm-value" id="' + sectionId + '-capture-fps">&mdash;</td><td class="dm-unit">fps</td></tr>' +
+      '<tr><td>Encode</td><td class="dm-value" id="' + sectionId + '-encode-fps">&mdash;</td><td class="dm-unit">fps</td></tr>' +
+      '<tr><td>Encode latency</td><td class="dm-value" id="' + sectionId + '-encode-latency">&mdash;</td><td class="dm-unit">ms avg</td></tr>' +
+      '<tr><td>Peers</td><td class="dm-value" id="' + sectionId + '-peer-count">&mdash;</td><td class="dm-unit"></td></tr>' +
+      '<tr><td>Resolution</td><td class="dm-value" id="' + sectionId + '-resolution">&mdash;</td><td class="dm-unit"></td></tr>' +
+      '<tr><td>Drops</td><td class="dm-value" id="' + sectionId + '-drops">&mdash;</td><td class="dm-unit">cap / enc / peer</td></tr>' +
+      '</tbody>';
+    section.appendChild(table);
+    container.appendChild(section);
+    // Update all titles when multiple displays exist
+    if (displayMetricsIds.size > 1) {
+      for (const id of displayMetricsIds) {
+        const t = document.getElementById('display-metrics-' + id + '-title');
+        if (t) t.textContent = 'Display :' + id;
+      }
+    }
+  }
+  document.getElementById(sectionId + '-capture-fps').textContent = d.capture_fps.toFixed(1);
+  document.getElementById(sectionId + '-encode-fps').textContent = d.encode_fps.toFixed(1);
+  document.getElementById(sectionId + '-encode-latency').textContent = d.encode_latency_avg_ms.toFixed(1);
+  document.getElementById(sectionId + '-peer-count').textContent = d.peer_count;
+  document.getElementById(sectionId + '-resolution').textContent = d.resolution_width + '\u00d7' + d.resolution_height;
+  document.getElementById(sectionId + '-drops').textContent = d.capture_drops + ' / ' + d.encode_drops + ' / ' + d.peer_drops;
+}
+
 // ── User display access toggle ──
 let userDisplayGranted = false;
+let grantedDisplayId = 0;
 let displayPickerVisible = false;
 let cachedDisplays = null;
 
@@ -7896,6 +7923,7 @@ function showDisplayPicker(displays) {
       hideDisplayPicker();
       if (!app) return;
       app.grant_user_display_with_id(d.id);
+      grantedDisplayId = d.id;
       setUserDisplayState(true);
     });
     picker.appendChild(item);
@@ -7907,7 +7935,7 @@ function showDisplayPicker(displays) {
 window.toggleUserDisplay = function() {
   if (!app) return;
   if (userDisplayGranted) {
-    app.revoke_user_display();
+    app.revoke_user_display_with_id(grantedDisplayId);
     setUserDisplayState(false);
     return;
   }
@@ -7919,6 +7947,7 @@ window.toggleUserDisplay = function() {
       if (!displays || displays.length <= 1) {
         // Single display or fallback: grant immediately (unchanged behavior)
         app.grant_user_display();
+        grantedDisplayId = 0;
         setUserDisplayState(true);
       } else {
         // Multiple displays: show picker
@@ -7928,6 +7957,7 @@ window.toggleUserDisplay = function() {
     .catch(() => {
       // Fetch failed: fall back to granting default display
       app.grant_user_display();
+      grantedDisplayId = 0;
       setUserDisplayState(true);
     });
 };

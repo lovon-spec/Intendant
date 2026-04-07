@@ -113,6 +113,10 @@ impl ClipboardMonitor {
 
     /// Inject image data into the system clipboard.
     ///
+    /// Incoming images may be JPEG, WebP, or other browser formats.  The OS
+    /// clipboard backends always write PNG, so we normalise to PNG first to
+    /// avoid a MIME/content mismatch.
+    ///
     /// Also updates the internal `last_image_hash` so the next poll does not
     /// re-emit this image as a "change".
     pub async fn set_image(&self, mime: &str, data: &[u8]) -> Result<(), String> {
@@ -122,8 +126,21 @@ impl ClipboardMonitor {
                 data.len()
             ));
         }
-        write_clipboard_image(mime, data).await?;
-        *self.last_image_hash.lock().await = simple_hash(data);
+
+        // Convert to PNG if the source is not already PNG.
+        let png_data = if mime == "image/png" {
+            data.to_vec()
+        } else {
+            let img = image::load_from_memory(data)
+                .map_err(|e| format!("image decode failed ({mime}): {e}"))?;
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png)
+                .map_err(|e| format!("PNG encode failed: {e}"))?;
+            buf.into_inner()
+        };
+
+        write_clipboard_image("image/png", &png_data).await?;
+        *self.last_image_hash.lock().await = simple_hash(&png_data);
         Ok(())
     }
 
