@@ -875,21 +875,32 @@ impl DisplaySession {
         let codec_mime = {
             let mut init = self.encoder_init_lock.lock().await;
             if *init {
-                // Encoder already running -- verify the new peer supports it.
-                // NOTE: name-only check (e.g. "H264"). Does not validate
-                // fmtp parameters (profile-level-id, packetization-mode).
-                // See encode::select_codec() doc for details.
+                // Encoder already running -- verify the new peer supports
+                // the locked codec (name + fmtp profile for H264).
                 let locked_mime = *self.codec_mime.read().await;
-                let browser_codecs = encode::parse_offered_codecs(sdp);
                 let locked_name = locked_mime.split('/').last().unwrap_or("");
-                if !browser_codecs
-                    .iter()
-                    .any(|c| c.eq_ignore_ascii_case(locked_name))
-                {
-                    return Err(CallerError::WebRtc(format!(
-                        "peer does not support session codec {} (offered: {:?})",
-                        locked_mime, browser_codecs,
-                    )));
+                if locked_name.eq_ignore_ascii_case("H264") {
+                    // For H264, verify fmtp compatibility (profile-level-id
+                    // and packetization-mode), not just codec name.
+                    if !encode::has_compatible_h264_offer(sdp) {
+                        let browser_codecs = encode::parse_offered_codecs(sdp);
+                        return Err(CallerError::WebRtc(format!(
+                            "peer does not support session codec {} with compatible profile (offered: {:?})",
+                            locked_mime, browser_codecs,
+                        )));
+                    }
+                } else {
+                    // Non-H264 codecs: name-only check.
+                    let browser_codecs = encode::parse_offered_codecs(sdp);
+                    if !browser_codecs
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(locked_name))
+                    {
+                        return Err(CallerError::WebRtc(format!(
+                            "peer does not support session codec {} (offered: {:?})",
+                            locked_mime, browser_codecs,
+                        )));
+                    }
                 }
                 locked_mime
             } else {

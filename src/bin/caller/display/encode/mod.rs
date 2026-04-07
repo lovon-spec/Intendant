@@ -64,28 +64,181 @@ pub fn select_codec_for_mime(
     }
 }
 
+// ---------------------------------------------------------------------------
+// H264 fmtp parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed H264 profile parameters from SDP `a=fmtp:` lines.
+///
+/// The `profile_level_id` is the 3-byte hex string from `a=fmtp:N
+/// profile-level-id=XXYYZZ` where XX is `profile_idc`, YY is constraint
+/// flags, and ZZ is the level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H264FmtpProfile {
+    /// RTP payload type (matches the number in `a=rtpmap:N H264/90000`).
+    pub payload_type: u32,
+    /// 6-hex-digit profile-level-id (e.g. `"42e01f"`), lowercased.
+    /// Empty string if the fmtp line did not contain one.
+    pub profile_level_id: String,
+    /// packetization-mode value (0 or 1 in practice).
+    pub packetization_mode: u32,
+}
+
+/// Collect H264 payload types from `a=rtpmap:` lines, then parse their
+/// corresponding `a=fmtp:` lines for `profile-level-id` and
+/// `packetization-mode`.
+///
+/// H264 payload types that have no `a=fmtp:` line are returned with an
+/// empty `profile_level_id` and `packetization_mode = 0` (the RFC 6184
+/// defaults, which map to Constrained Baseline).
+pub fn parse_h264_fmtp(sdp: &str) -> Vec<H264FmtpProfile> {
+    // Step 1: collect payload types that map to H264.
+    let mut h264_pts = Vec::new();
+    for line in sdp.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(pt_str), Some(codec_clock)) = (parts.next(), parts.next()) {
+                if let Some(codec_name) = codec_clock.split('/').next() {
+                    if codec_name.eq_ignore_ascii_case("H264") {
+                        if let Ok(pt) = pt_str.parse::<u32>() {
+                            h264_pts.push(pt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: parse fmtp lines for those payload types.
+    let mut fmtp_map: std::collections::HashMap<u32, (String, u32)> =
+        std::collections::HashMap::new();
+    for line in sdp.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("a=fmtp:") {
+            // Format: a=fmtp:<pt> <param=value>[;<param=value>]*
+            let mut parts = rest.splitn(2, ' ');
+            let pt_str = match parts.next() {
+                Some(s) => s,
+                None => continue,
+            };
+            let pt: u32 = match pt_str.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !h264_pts.contains(&pt) {
+                continue;
+            }
+            let params_str = parts.next().unwrap_or("");
+            let mut profile_level_id = String::new();
+            let mut packetization_mode = 0u32;
+            for kv in params_str.split(';') {
+                let kv = kv.trim();
+                if let Some((key, val)) = kv.split_once('=') {
+                    let key = key.trim().to_lowercase();
+                    let val = val.trim();
+                    if key == "profile-level-id" {
+                        profile_level_id = val.to_lowercase();
+                    } else if key == "packetization-mode" {
+                        packetization_mode = val.parse().unwrap_or(0);
+                    }
+                }
+            }
+            fmtp_map.insert(pt, (profile_level_id, packetization_mode));
+        }
+    }
+
+    // Step 3: build results, using defaults for PTs without fmtp.
+    h264_pts
+        .into_iter()
+        .map(|pt| {
+            let (profile_level_id, packetization_mode) = fmtp_map
+                .remove(&pt)
+                .unwrap_or_else(|| (String::new(), 0));
+            H264FmtpProfile {
+                payload_type: pt,
+                profile_level_id,
+                packetization_mode,
+            }
+        })
+        .collect()
+}
+
+/// Check whether a parsed H264 fmtp profile is compatible with our encoder.
+///
+/// Our encoders produce Baseline (profile_idc 66 / 0x42).  We accept:
+/// - `profile_idc` 66 (0x42): Baseline or Constrained Baseline (depending
+///   on constraint flags).
+/// - Empty `profile_level_id`: treated as the RFC 6184 default (Constrained
+///   Baseline, Level 1), which is compatible.
+/// - `packetization_mode` 0 or 1: mode 1 is what we produce (non-interleaved
+///   NAL units), mode 0 (single NAL unit) is a strict subset.
+///
+/// We do *not* accept High (100), Main (77), or other profiles because our
+/// encoder does not produce those.  A decoder that only accepts High will
+/// fail on Baseline input.
+pub fn is_compatible_h264_profile(profile: &H264FmtpProfile) -> bool {
+    // packetization-mode must be 0 or 1.
+    if profile.packetization_mode > 1 {
+        return false;
+    }
+
+    // No profile-level-id → RFC 6184 default (compatible).
+    if profile.profile_level_id.is_empty() {
+        return true;
+    }
+
+    // profile_level_id must be at least 2 hex digits for profile_idc.
+    if profile.profile_level_id.len() < 2 {
+        return false;
+    }
+
+    let profile_idc = match u8::from_str_radix(&profile.profile_level_id[..2], 16) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // 0x42 = 66 = Baseline family (Baseline or Constrained Baseline
+    // depending on constraint_set1_flag).  Both are compatible with our
+    // encoder output.
+    profile_idc == 0x42
+}
+
+/// Returns `true` if the SDP offer contains at least one H264 payload type
+/// with a compatible fmtp profile (or no fmtp at all, which implies
+/// compatible defaults).
+///
+/// Returns `false` if H264 is not offered at all, or if every offered H264
+/// variant has an incompatible profile.
+pub fn has_compatible_h264_offer(sdp: &str) -> bool {
+    let profiles = parse_h264_fmtp(sdp);
+    if profiles.is_empty() {
+        return false;
+    }
+    profiles.iter().any(is_compatible_h264_profile)
+}
+
 /// Pick the best available codec that the browser also supports.
 ///
 /// Parses the browser's SDP offer to determine which codecs it advertises,
 /// then intersects with locally available encoders.  Tries H264 first (if
-/// the browser offered it *and* a local encoder is available), falls back to
-/// VP8 (universally supported by all WebRTC browsers).
+/// the browser offered it with a compatible profile *and* a local encoder
+/// is available), falls back to VP8 (universally supported by all WebRTC
+/// browsers).
 ///
-/// **Limitation**: H264 matching is name-only (checks `a=rtpmap:` for "H264").
-/// It does not validate `a=fmtp:` parameters like `profile-level-id` or
-/// `packetization-mode`. Our encoders produce Constrained Baseline / Level 4.1
-/// / packetization-mode 1, which is the WebRTC mandatory-to-support profile
-/// and works with all mainstream browsers. Full fmtp negotiation is a
-/// follow-up item.
+/// H264 compatibility is determined by parsing `a=fmtp:` lines for
+/// `profile-level-id` and `packetization-mode`, then checking that at least
+/// one offered H264 variant matches our encoder's Baseline profile
+/// (profile_idc 0x42) with packetization-mode 0 or 1.  If no `a=fmtp:`
+/// line exists for an H264 payload type, it is accepted per RFC 6184
+/// defaults.
 pub fn select_codec(
     offer_sdp: &str,
     width: u32,
     height: u32,
     bitrate_kbps: u32,
 ) -> (Box<dyn Encoder>, CodecChoice) {
-    let browser_codecs = parse_offered_codecs(offer_sdp);
-
-    if browser_codecs.iter().any(|c| c.eq_ignore_ascii_case("H264")) {
+    if has_compatible_h264_offer(offer_sdp) {
         match create_h264_encoder(width, height, bitrate_kbps) {
             Ok(pair) => return pair,
             Err(reason) => {
@@ -96,8 +249,9 @@ pub fn select_codec(
             }
         }
     } else {
+        let browser_codecs = parse_offered_codecs(offer_sdp);
         eprintln!(
-            "[display/encoder] browser SDP does not offer H264 (offered: {:?}), using VP8",
+            "[display/encoder] browser SDP does not offer compatible H264 (offered: {:?}), using VP8",
             browser_codecs,
         );
     }
@@ -110,8 +264,8 @@ pub fn select_codec(
 /// Parse `a=rtpmap:` lines from an SDP offer to extract codec names.
 ///
 /// Returns codec names such as `"VP8"`, `"VP9"`, `"H264"`, `"AV1"`.
-/// Does NOT parse `a=fmtp:` parameters — see `select_codec()` doc for
-/// the limitation on H264 profile/level matching.
+/// For H264-specific fmtp parameter parsing (profile-level-id,
+/// packetization-mode), see [`parse_h264_fmtp()`].
 pub fn parse_offered_codecs(sdp: &str) -> Vec<String> {
     let mut codecs = Vec::new();
     for line in sdp.lines() {
@@ -430,5 +584,208 @@ a=rtpmap:97 VP8/90000\r\n";
         assert!(!packets.is_empty(), "expected at least one packet");
         assert!(packets[0].is_keyframe, "first frame should be keyframe");
         assert!(!packets[0].data.is_empty(), "packet data should not be empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // H264 fmtp parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_h264_fmtp_chrome_offer() {
+        // Realistic Chrome 125 SDP snippet with multiple H264 payload types.
+        let sdp = "\
+v=0\r\n\
+o=- 5765891208566location 2 IN IP4 127.0.0.1\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101 102\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 H264/90000\r\n\
+a=rtpmap:98 H264/90000\r\n\
+a=rtpmap:99 H264/90000\r\n\
+a=rtpmap:100 VP9/90000\r\n\
+a=rtpmap:101 H264/90000\r\n\
+a=rtpmap:102 AV1/90000\r\n\
+a=fmtp:97 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n\
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f\r\n\
+a=fmtp:99 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+a=fmtp:101 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f\r\n";
+
+        let profiles = parse_h264_fmtp(sdp);
+        assert_eq!(profiles.len(), 4);
+
+        // PT 97: Baseline, packetization-mode 1
+        assert_eq!(profiles[0].payload_type, 97);
+        assert_eq!(profiles[0].profile_level_id, "42001f");
+        assert_eq!(profiles[0].packetization_mode, 1);
+
+        // PT 98: Baseline, packetization-mode 0
+        assert_eq!(profiles[1].payload_type, 98);
+        assert_eq!(profiles[1].profile_level_id, "42001f");
+        assert_eq!(profiles[1].packetization_mode, 0);
+
+        // PT 99: Constrained Baseline (42e0), packetization-mode 1
+        assert_eq!(profiles[2].payload_type, 99);
+        assert_eq!(profiles[2].profile_level_id, "42e01f");
+        assert_eq!(profiles[2].packetization_mode, 1);
+
+        // PT 101: Main profile (4d), packetization-mode 1
+        assert_eq!(profiles[3].payload_type, 101);
+        assert_eq!(profiles[3].profile_level_id, "4d001f");
+        assert_eq!(profiles[3].packetization_mode, 1);
+    }
+
+    #[test]
+    fn parse_h264_fmtp_firefox_offer() {
+        // Firefox typically offers fewer H264 variants.
+        let sdp = "\
+a=rtpmap:126 H264/90000\r\n\
+a=rtpmap:97 H264/90000\r\n\
+a=fmtp:126 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1\r\n\
+a=fmtp:97 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=0\r\n";
+
+        let profiles = parse_h264_fmtp(sdp);
+        assert_eq!(profiles.len(), 2);
+
+        assert_eq!(profiles[0].payload_type, 126);
+        assert_eq!(profiles[0].profile_level_id, "42e01f");
+        assert_eq!(profiles[0].packetization_mode, 1);
+
+        assert_eq!(profiles[1].payload_type, 97);
+        assert_eq!(profiles[1].profile_level_id, "42e01f");
+        assert_eq!(profiles[1].packetization_mode, 0);
+    }
+
+    #[test]
+    fn parse_h264_fmtp_no_fmtp_line() {
+        // H264 offered by rtpmap but no corresponding fmtp line.
+        // Should use RFC 6184 defaults.
+        let sdp = "\
+a=rtpmap:97 H264/90000\r\n";
+
+        let profiles = parse_h264_fmtp(sdp);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].payload_type, 97);
+        assert_eq!(profiles[0].profile_level_id, "");
+        assert_eq!(profiles[0].packetization_mode, 0);
+    }
+
+    #[test]
+    fn parse_h264_fmtp_no_h264() {
+        let sdp = "\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:100 VP9/90000\r\n";
+
+        let profiles = parse_h264_fmtp(sdp);
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn is_compatible_baseline() {
+        let p = H264FmtpProfile {
+            payload_type: 97,
+            profile_level_id: "42001f".into(),
+            packetization_mode: 1,
+        };
+        assert!(is_compatible_h264_profile(&p));
+    }
+
+    #[test]
+    fn is_compatible_constrained_baseline() {
+        // 42e0 = profile_idc 0x42 with constraint_set1_flag set
+        let p = H264FmtpProfile {
+            payload_type: 99,
+            profile_level_id: "42e01f".into(),
+            packetization_mode: 1,
+        };
+        assert!(is_compatible_h264_profile(&p));
+    }
+
+    #[test]
+    fn is_compatible_packetization_mode_0() {
+        let p = H264FmtpProfile {
+            payload_type: 98,
+            profile_level_id: "42001f".into(),
+            packetization_mode: 0,
+        };
+        assert!(is_compatible_h264_profile(&p));
+    }
+
+    #[test]
+    fn is_compatible_empty_profile() {
+        // Missing fmtp → accept (RFC 6184 defaults are compatible).
+        let p = H264FmtpProfile {
+            payload_type: 97,
+            profile_level_id: "".into(),
+            packetization_mode: 0,
+        };
+        assert!(is_compatible_h264_profile(&p));
+    }
+
+    #[test]
+    fn is_incompatible_main_profile() {
+        // Main profile (0x4d = 77) — our encoder does not produce this.
+        let p = H264FmtpProfile {
+            payload_type: 101,
+            profile_level_id: "4d001f".into(),
+            packetization_mode: 1,
+        };
+        assert!(!is_compatible_h264_profile(&p));
+    }
+
+    #[test]
+    fn is_incompatible_high_profile() {
+        // High profile (0x64 = 100).
+        let p = H264FmtpProfile {
+            payload_type: 102,
+            profile_level_id: "640032".into(),
+            packetization_mode: 1,
+        };
+        assert!(!is_compatible_h264_profile(&p));
+    }
+
+    #[test]
+    fn is_incompatible_packetization_mode_2() {
+        // packetization-mode 2 (interleaved) — not supported.
+        let p = H264FmtpProfile {
+            payload_type: 97,
+            profile_level_id: "42001f".into(),
+            packetization_mode: 2,
+        };
+        assert!(!is_compatible_h264_profile(&p));
+    }
+
+    #[test]
+    fn has_compatible_h264_offer_mixed_profiles() {
+        // Offer has both compatible (Baseline) and incompatible (Main) H264.
+        // Should return true because at least one is compatible.
+        let sdp = "\
+a=rtpmap:97 H264/90000\r\n\
+a=rtpmap:98 H264/90000\r\n\
+a=fmtp:97 profile-level-id=4d001f;packetization-mode=1\r\n\
+a=fmtp:98 profile-level-id=42e01f;packetization-mode=1\r\n";
+
+        assert!(has_compatible_h264_offer(sdp));
+    }
+
+    #[test]
+    fn has_compatible_h264_offer_only_high() {
+        // Only High profile offered — incompatible.
+        let sdp = "\
+a=rtpmap:97 H264/90000\r\n\
+a=fmtp:97 profile-level-id=640032;packetization-mode=1\r\n";
+
+        assert!(!has_compatible_h264_offer(sdp));
+    }
+
+    #[test]
+    fn has_compatible_h264_offer_no_h264() {
+        let sdp = "a=rtpmap:96 VP8/90000\r\n";
+        assert!(!has_compatible_h264_offer(sdp));
+    }
+
+    #[test]
+    fn has_compatible_h264_offer_no_fmtp() {
+        // H264 offered without fmtp → accept (defaults are compatible).
+        let sdp = "a=rtpmap:97 H264/90000\r\n";
+        assert!(has_compatible_h264_offer(sdp));
     }
 }
