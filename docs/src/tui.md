@@ -39,6 +39,7 @@
 | `v` | Toggle verbose mode (cycle through quiet/normal/verbose/debug) |
 | `?` | Help overlay |
 | `+` / `-` | Cycle autonomy level |
+| `d` | Toggle user display access (grant/revoke DisplayControl) |
 | `Up`/`Down`/`PgUp`/`PgDn` | Scroll log |
 | `Home` / `End` | Jump to top/bottom of log |
 | `1`-`3` | Toggle panels (status, action, log) |
@@ -64,7 +65,7 @@ When a model is generating a response, text deltas are forwarded to the TUI in r
 
 ### Theme
 
-The TUI uses a Catppuccin Mocha-inspired color scheme with budget-aware color thresholds (green → yellow → red as context fills up).
+The TUI uses a Catppuccin Mocha-inspired color scheme with budget-aware color thresholds (green -> yellow -> red as context fills up).
 
 ## Autonomy System
 
@@ -102,12 +103,16 @@ Commands are classified into categories by inspecting the command JSON:
 | NetworkRequest | Commands with `curl`, `wget`, `ssh`, `git` |
 | Destructive | Commands with `rm -rf`, `kill`, `dd`, `mkfs`, `sudo` |
 | HumanInput | `askHuman` |
+| LiveAudioSpawn | `spawn_live_audio` (voice sessions, phone calls) |
+| DisplayControl | User session display access (session-grant model via `d` hotkey) |
 
 Shell commands are further classified by inspecting the command string for destructive patterns, network tools, and file writes (redirects, `tee`, `mv`, `cp`). The `sudo` prefix is detected as Destructive and the actual command after `sudo` is also classified.
 
+DisplayControl uses a **session-grant model**: approve once via the `d` hotkey, and the agent retains access to the user's display for the rest of the session. Revoke at any time by pressing `d` again or via the web dashboard.
+
 ## Web Dashboard
 
-The `--web` flag starts a web server that serves a modern 4-tab dashboard at `/` with Activity, Usage, Terminal, and Displays tabs. The Terminal tab provides the same ratatui interface as the native TUI via xterm.js, while the other tabs add event logging, cost tracking, and remote display viewing.
+The `--web` flag starts a web server that serves a multi-tab dashboard at `/` with Activity, Stats, Terminal, Video, Sessions, and Settings tabs. The Terminal tab provides the same ratatui interface as the native TUI via xterm.js, while the other tabs add event logging, cost tracking, WebRTC display viewing, and recording replay.
 
 ```bash
 # Default port 8765

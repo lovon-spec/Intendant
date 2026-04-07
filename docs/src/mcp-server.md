@@ -9,7 +9,7 @@ The `--mcp` flag launches Intendant as a [Model Context Protocol](https://modelc
 ./target/release/intendant --mcp "Deploy the application"
 
 # With provider/model overrides
-./target/release/intendant --mcp --provider anthropic --model claude-sonnet-4-5-20250929 "Fix the tests"
+./target/release/intendant --mcp --provider anthropic --model claude-sonnet-4-6-20250929 "Fix the tests"
 
 # With autonomy preset
 ./target/release/intendant --mcp --autonomy high "Refactor the auth module"

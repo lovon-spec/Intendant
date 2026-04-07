@@ -31,7 +31,9 @@ Each sub-agent role has a dedicated system prompt that is appended to the base p
 | `orchestrator` | `SysPrompt_orchestrator.md` | Task decomposition, sub-agent management, coordination, checkpointing |
 | `research` | `SysPrompt_research.md` | Investigation, file reading, browsing, synthesizing findings |
 | `implementation` | `SysPrompt_implementation.md` | Code writing, builds, testing, git worktree isolation |
-| `testing` | `SysPrompt_testing.md` | Validation, test execution, coverage |
+| `testing` | (base prompt only) | Validation, test execution, coverage |
+| `live_audio` | `SysPromptLiveAudio.md` | Voice conversations, phone calls, structured data extraction |
+| `custom` | (base prompt only) | User-defined role with custom system prompt |
 
 ## Sub-Agent Spawning
 

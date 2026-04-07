@@ -2,11 +2,11 @@
 
 ## Overview
 
-Intendant is a two-binary system: a command **runtime** that executes work, and a **caller** that drives it via AI model APIs.
+Intendant is a two-binary system: a sandboxed **runtime** that executes commands, and a **controller** that drives it via AI model APIs.
 
 ```
 stdin (JSON) --> intendant-runtime --> executes commands sequentially (blocking)
-                  |
+                  |                    (Landlock sandboxed on Linux)
                   +--> in-memory process state (HashMap<nonce, ProcessInfo>)
                   +--> $INTENDANT_LOG_DIR/  (stdout/stderr logs per nonce)
                   |
@@ -22,23 +22,36 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge/sk
   +--> Native tool calling (OpenAI/Anthropic/Gemini) with text extraction fallback
   +--> Streaming output:  SSE-based token streaming for all 3 providers
   +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
-  +--> Web dashboard:   4-tab app (Activity/Usage/Terminal/Displays) with WASM-driven state
+  +--> Web dashboard:   multi-tab app with WebRTC display streaming and live voice
   +--> Live voice:      Gemini Live / OpenAI Realtime via browser, active/passive multi-browser
   +--> MCP Server:      --mcp flag, stdio transport, full parity with TUI (tools + resources)
   +--> MCP Client:      connects to external MCP servers (configured in intendant.toml)
   +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
   +--> Skills system:   SKILL.md-based instruction sets with YAML frontmatter
+  +--> Computer use:    provider-agnostic CU abstraction (X11/Wayland/macOS)
+  +--> WebRTC display:  capture → VP8/H264 encode → per-peer streaming + remote input
+  +--> Live audio:      Gemini Live / OpenAI Realtime voice sessions via audio bridge
+  +--> Phone calls:     SIP outbound via pjsua + voice model + structured data extraction
   +--> Transcription:   server-side Whisper API for browser audio transcription
   +--> Landlock sandbox: filesystem restrictions on agent runtime (Linux)
   +--> Prompt caching:  Anthropic cache_control, OpenAI/Gemini implicit caching
   +--> Auto-compaction: triggers at 90% context usage, preserves system+tail messages
   +--> Control socket:  /tmp/intendant-<pid>.sock (JSON-line protocol)
-  +--> VNC proxy:       WebSocket-to-TCP bridge for noVNC display viewing
   +--> Token budget tracking (context-window-aware loop termination)
   +--> Session resume:  --continue (most recent) or --resume <id> (specific session)
   +--> Git worktree isolation for implementation agents
   +--> Tagged knowledge store with pub/sub channels between agents
+  +--> Recording:       segmented MP4 via ffmpeg (x11grab / avfoundation)
 ```
+
+## Security Model
+
+The two-binary split is a deliberate security boundary:
+
+- **intendant-runtime** executes arbitrary shell commands but runs under Landlock filesystem restrictions and never holds API keys
+- **intendant** (controller) holds API keys and manages model conversations but never executes user-requested shell commands directly
+
+This means a compromised model conversation cannot directly access API keys, and the runtime process cannot exfiltrate data through model APIs.
 
 ## Process State
 
@@ -46,7 +59,7 @@ In-memory `HashMap<u64, ProcessInfo>` tracking nonce, PID, status, exit code, an
 
 ## Session Directory
 
-Per-session directory at `~/.intendant/logs/<uuid>/` with UUID-based naming. Contains per-nonce stdout/stderr log files, structured session logs (`session.jsonl`), conversation history (`conversation.jsonl`), and askHuman IPC files. The log directory is passed to the runtime via `INTENDANT_LOG_DIR`.
+Per-session directory at `~/.intendant/logs/<uuid>/` with UUID-based naming. Contains per-nonce stdout/stderr log files, structured session logs (`session.jsonl`), conversation history, turn data, recording segments, and askHuman IPC files. The log directory is passed to the runtime via `INTENDANT_LOG_DIR`.
 
 ## Execution Model
 
@@ -95,11 +108,11 @@ See [Multi-Agent Orchestration](./multi-agent.md) for the full sub-agent archite
 9. Sends the task to the chat API via streaming (`chat_stream()`), with `max_tokens`/`max_output_tokens`, optional `reasoning`, optional JSON format, and native tool definitions when enabled. API requests use exponential backoff retry (up to 5 retries) for rate-limit (429) and server errors (5xx). Text deltas are forwarded to the TUI in real-time
 10. Logs reasoning content (both summary and full text) to `turn_NNN_reasoning.txt` when available
 11. Processes the model's response via one of two paths:
-    - **Native tool call path** (when response contains tool calls): Collects individual tool calls, assembles them into an `AgentInput` batch, pipes to the runtime, maps results back to per-tool-call responses. Handles `manage_context` and `signal_done` tool calls caller-side. Raw API output items (reasoning + function_call) are preserved for verbatim echo-back in subsequent requests, which reasoning models (GPT-5, o3, o4) require
+    - **Native tool call path** (when response contains tool calls): Collects individual tool calls, assembles them into an `AgentInput` batch, pipes to the runtime, maps results back to per-tool-call responses. Handles `manage_context` and `signal_done` tool calls caller-side. Raw API output items (reasoning + function_call) are preserved for verbatim echo-back in subsequent requests
     - **Legacy text extraction path** (fallback): Extracts JSON from the response text (handles structured output, code fences, and bare JSON), checks for explicit `done` signal (`{"done": true}`)
 12. Applies context directives (`drop_turns`, `summarize`) to the conversation
 13. Injects project context (`memory_file`) into relevant commands
-14. Classifies commands by action category (file read/write/delete, exec, network, destructive) and checks autonomy rules
+14. Classifies commands by action category (file read/write/delete, exec, network, destructive, display control, live audio) and checks autonomy rules
 15. If approval is required:
     - TUI mode: emits an approval request and waits for user response
     - Headless mode: denies execution (no implicit auto-approve fallback)
@@ -107,6 +120,10 @@ See [Multi-Agent Orchestration](./multi-agent.md) for the full sub-agent archite
 17. Feeds the agent output back as the next user message (text path) or as individual tool results (tool call path), appending a token budget summary
 18. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
 19. In headless mode, if the model emits `askHuman`, the loop sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
+
+## Frontend Parity
+
+The `UserAction` enum in `frontend.rs` is a compile-time contract between all interfaces. The TUI, web dashboard, MCP server, and control socket all produce the same variants. Adding a new action type forces all frontends to handle it via Rust's exhaustive match — no wildcard arms allowed. This guarantees every interface is functionally equivalent.
 
 ## askHuman Behavior
 
@@ -127,7 +144,7 @@ Text deltas are forwarded to the TUI via `AppEvent::ModelResponseDelta` and accu
 
 ## Rate-Limit Retry
 
-API requests use `send_with_retry()` with exponential backoff (1s × 2^attempt + jitter, up to 5 retries) for HTTP 429 and 5xx responses. Non-retryable errors (400, 401, etc.) fail immediately. API keys in error messages are masked via `mask_api_keys()`.
+API requests use `send_with_retry()` with exponential backoff (1s x 2^attempt + jitter, up to 5 retries) for HTTP 429 and 5xx responses. Non-retryable errors (400, 401, etc.) fail immediately. API keys in error messages are masked via `mask_api_keys()`.
 
 ## Prompt Caching
 
@@ -142,54 +159,10 @@ When context usage reaches 90% (`usage_fraction() >= 0.90`), `conversation.auto_
 - Summarizes: oldest half of remaining middle messages via `summarize_turns()`
 - Emits `ContextManagement` event to TUI/MCP
 
-## Vision / Display Management
-
-Xvfb is auto-launched lazily on the first turn containing an `execAsAgent` or `captureScreen` command when no accessible X display exists (checked via `xdpyinfo`). The detection flow:
-
-1. Already launched? → skip
-2. Batch contains `execAsAgent` or `captureScreen`? No → skip
-3. Current `DISPLAY` accessible? Yes → skip (user has working display)
-4. Auto-launch Xvfb, store guard, set `DISPLAY`, emit `DisplayReady` event
-5. On failure → log warning, let `captureScreen` fail naturally
-
-Display allocation prefers `:99` for a predictable VNC port (5999). If `:99` is locked by a live Xvfb from a previous session, it is automatically killed and reclaimed (detected via `/proc/<pid>/cmdline`). If `:99` is held by a non-Xvfb process, allocation falls through to `:100+`.
-
-Per-provider display resolutions:
-- **OpenAI**: 1024×768 (3 tiles of 512×512)
-- **Anthropic**: 819×1456 (9:16 aspect)
-- **Gemini**: 768×1024 (2 tiles of 768×768)
-
-### VNC Remote Observation
-
-An `x11vnc` server is launched alongside Xvfb as a best-effort co-process (port = `5900 + display_id`). If `x11vnc` is not installed, the display works normally. Both Xvfb and x11vnc are killed on drop via `XvfbGuard`.
-
-**On the guest VM** — install `x11vnc`:
-
-```bash
-sudo apt-get install -y x11vnc
-```
-
-**From your host machine** — connect with any VNC client:
-
-```bash
-# Direct connection (VM on local network)
-vncviewer <vm-ip>:5999
-
-# Over SSH tunnel (recommended for remote VMs)
-ssh -L 5999:localhost:5999 user@vm-host
-vncviewer localhost:5999
-```
-
-If display `:99` was already taken, intendant falls through to `:100+` and the VNC port shifts accordingly (`6000`, `6001`, ...). Check the TUI log panel or stderr for the actual port:
-
-```
-22:29:12  VNC server available at vnc://localhost:5999
-```
-
 ## Environment
 
-- **OS:** Linux (Debian 12+)
+- **OS:** macOS or Linux (Debian 12+)
 - **Runtime:** Tokio async (full features)
-- **Permissions:** Runs as unprivileged user with passwordless sudo
-- **Display:** Auto-managed Xvfb with x11vnc (see above)
+- **Permissions:** Runs as unprivileged user with passwordless sudo (Linux)
+- **Display:** Auto-managed Xvfb (Linux), native display (macOS). See [Display Pipeline](./display-pipeline.md)
 - **X11 auth:** At startup the runtime discovers active X displays and merges their xauth cookies into a session-scoped `session.Xauthority` file, passed as `XAUTHORITY` to all spawned commands

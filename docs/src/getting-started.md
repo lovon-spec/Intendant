@@ -7,8 +7,8 @@ cargo build --release
 ```
 
 Two binaries are produced:
-- `./target/release/intendant-runtime` — the command runtime
-- `./target/release/intendant` — the AI CLI/TUI/Web
+- `./target/release/intendant-runtime` — the sandboxed command runtime
+- `./target/release/intendant` — the AI controller (CLI/TUI/Web/MCP)
 
 ### Installing
 
@@ -21,12 +21,20 @@ Both binaries are installed to `~/.cargo/bin/`. The `intendant` binary embeds de
 ### Prerequisites
 
 - **Rust** toolchain (stable)
-- **wasm-pack** — `cargo install wasm-pack` (auto-rebuilds WASM on source changes)
-- **ffmpeg** — required for display recording (`brew install ffmpeg` / `apt install ffmpeg`)
-- **macOS**: `./scripts/setup-macos.sh` installs all platform dependencies
-- **Linux**: `sudo apt install imagemagick xdotool xvfb x11vnc ffmpeg`
+- **wasm-pack** — `cargo install wasm-pack`
+- **ffmpeg** — display recording and H264 encoding
+- **macOS**: `./scripts/setup-macos.sh` installs all platform dependencies (cliclick, ffmpeg, Vortex Audio, wasm-pack, app bundle)
+- **Linux**: `./scripts/setup-linux.sh` installs all platform dependencies (libvpx, libxcb, xdotool, PipeWire, ffmpeg, PulseAudio, Xvfb)
 
-### WASM auto-rebuild
+Manual Linux install if not using the setup script:
+
+```bash
+sudo apt install build-essential pkg-config libclang-dev \
+  libvpx-dev libpipewire-0.3-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
+  xdotool x11-utils imagemagick ffmpeg xvfb pulseaudio-utils xdg-utils
+```
+
+### WASM
 
 The `build.rs` script automatically rebuilds WASM when `crates/presence-web/` or `crates/presence-core/` source files change. This requires `wasm-pack` to be installed. If not installed, `cargo build` prints a warning and skips the WASM rebuild.
 
@@ -36,6 +44,8 @@ To rebuild manually:
 cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
 cargo build --release -p intendant   # Re-embed WASM
 ```
+
+**Important**: `cargo build` alone does NOT rebuild WASM. Any change to `crates/presence-web/` or `crates/presence-core/` requires the wasm-pack step above, then a re-embed build. The `static/wasm-web/` files are pre-compiled artifacts checked into the repo.
 
 ## Setup
 
@@ -60,10 +70,7 @@ GEMINI_API_KEY=AI...
 # If multiple keys are set, choose one:
 PROVIDER=openai          # or "anthropic" or "gemini"
 
-MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
-
-# Disable native tool calling (fall back to text-based JSON extraction)
-# USE_NATIVE_TOOLS=false
+MODEL_NAME=gpt-5         # optional, provider-specific default used if omitted
 ```
 
 ## Running
@@ -79,7 +86,7 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 ./target/release/intendant --autonomy low "rm -rf /tmp/test"
 
 # Specify provider and model
-./target/release/intendant --provider anthropic --model claude-sonnet-4-5-20250929 "List files"
+./target/release/intendant --provider anthropic --model claude-sonnet-4-6-20250929 "List files"
 
 # Use Gemini provider
 ./target/release/intendant --provider gemini --model gemini-2.5-pro "List files"
@@ -102,13 +109,13 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 # Force single-agent mode (skip orchestrator)
 ./target/release/intendant --direct "simple task"
 
-# Web dashboard (Activity + Usage + Terminal + Displays, default port 8765)
+# Web dashboard (default port 8765)
 ./target/release/intendant --web
 
 # Web dashboard on custom port
 ./target/release/intendant --web 9000
 
-# Enable filesystem sandboxing (Landlock, Linux 5.13+)
+# Enable Landlock filesystem sandboxing (Linux 5.13+)
 ./target/release/intendant --sandbox "run tests"
 
 # Run as MCP server (stdio transport)
@@ -123,6 +130,17 @@ MODEL_NAME=gpt-5.2-codex # optional, provider-specific default used if omitted
 # Pipe input (auto-detects non-TTY, runs headless)
 echo "task" | ./target/release/intendant
 ```
+
+## LAN Access
+
+For accessing the web dashboard from phones, tablets, or other devices on your network:
+
+```bash
+# Linux/macOS: sets up mTLS nginx reverse proxy with client certificates
+./scripts/setup-lan.sh
+```
+
+This generates CA, server, and client certificates. The client certificate is exported as `.p12` for installation on iOS/Android/desktop browsers.
 
 ## Testing
 

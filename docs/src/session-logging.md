@@ -11,11 +11,16 @@ Each `intendant` invocation creates a structured session log directory at `~/.in
 ├── session_meta.json               # Session metadata (id, created_at, project_root, task, status, last_turn)
 ├── session.jsonl                    # Structured event log (one JSON per line)
 ├── conversation.jsonl               # Serialized conversation for session resume
+├── transcript.jsonl                 # Simplified conversation log (role, text, tools_called)
+├── session_summary.json             # Accumulated session statistics (duration, voice, CU, tokens)
 ├── summary.json                     # Post-session summary (task, outcome, turns)
 ├── human_question                   # askHuman IPC: question file (session-scoped)
 ├── human_response                   # askHuman IPC: response file (session-scoped)
 ├── 1_stdout.log                     # Runtime stdout for nonce 1
 ├── 1_stderr.log                     # Runtime stderr for nonce 1
+├── frames/                          # Display and camera frame captures
+│   ├── frames.jsonl                 # Frame manifest (ID, stream, timestamp, sent_to_live)
+│   └── *.jpg                        # HQ JPEG frames
 └── turns/
     ├── turn_001_messages.json       # Full messages array sent to API
     ├── turn_001_model.txt           # Full model response
@@ -106,4 +111,4 @@ Integration tests in `tests/e2e/` spawn a real binary and exercise the full stac
 
 - **Tier 1 (JSON mode)**: Full-stack exec, approval approve/deny via stdin, multi-round follow-up. No display required.
 - **Tier 2 (Control socket)**: Status/usage queries, autonomy change, approve via Unix control socket. Requires Xvfb.
-- **Tier 3 (Web/Voice)**: WebSocket state_snapshot, tool_request/response, ANSI term frames, /debug endpoint. Voice tests require Firefox, PulseAudio, and espeak-ng.
+- **Tier 3 (Web/Voice/WebRTC)**: WebSocket state_snapshot, tool_request/response, ANSI term frames, WebRTC signaling (SDP offer/answer, ICE), /debug endpoint. Voice tests require Firefox, PulseAudio, and espeak-ng.

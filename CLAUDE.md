@@ -1,80 +1,131 @@
 # CLAUDE.md
 
-## Project Overview
+## What Intendant Is
 
-**Intendant** — Rust runtime for autonomous AI agents with process lifecycle management. Two binaries:
-- **intendant-runtime** — Reads JSON from stdin, executes commands sequentially (blocking), writes results to stdout
-- **intendant** — AI integration layer (CLI/TUI/Web/MCP) driving the runtime via OpenAI Responses API, Anthropic Messages API, or Gemini API
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop to work in — shell access, file editing, a graphical display it can see and control, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system.
 
-## Repository Structure
+Two binaries form a security boundary:
+
+- **intendant-runtime** — Sandboxed command executor. Reads JSON commands from stdin, executes them sequentially, writes results to stdout. Runs under Landlock filesystem restrictions. Never holds API keys.
+- **intendant** — Controller/caller. Manages the LLM conversation loop, calls model APIs, dispatches tool calls to the runtime subprocess, and runs all user-facing interfaces (CLI, TUI, Web, MCP).
+
+The system is **provider-agnostic** (OpenAI, Anthropic, Gemini), **cross-platform** (macOS, Linux/Debian), and designed around the principle that every capability should be accessible through any interface — TUI, web dashboard, MCP, voice, or programmatic control.
+
+## Vision and Direction
+
+Intendant is evolving toward an **always-on AI steward**: a persistent daemon that manages tasks, sees screens, hears voice, makes phone calls, coordinates sub-agents, and is accessible from any device. The arc is:
+
+1. CLI tool that executes agent commands (done)
+2. TUI application with approval gates (done)
+3. Web dashboard with real-time streaming (done)
+4. Voice-interactive presence layer (done)
+5. Full desktop agent with display control and computer use (done)
+6. WebRTC display transport with hardware encoding (done)
+7. Phone call capability via SIP (done)
+8. Persistent daemon with background agents, scheduled tasks, cross-session knowledge (in progress)
+
+## Architecture Pillars
+
+### 1. Agent Execution
+
+The core loop: select provider, load prompts/skills/knowledge, run a budget-aware conversation loop that dispatches tool calls to the runtime subprocess. Stops at context exhaustion, explicit `done` signal, or turn cap.
+
+Three execution modes:
+- **Direct** (`--direct`): Single agent loop
+- **User**: Spawns an orchestrator that decomposes tasks and delegates to specialized sub-agents (research, implementation, testing) running in isolated git worktrees
+- **Sub-Agent** (`INTENDANT_ROLE` set): Scoped child task with role-specific prompt
+
+### 2. Presence Layer
+
+A separate AI (defaulting to a fast model like Gemini Flash) that mediates between the human and the agent system. It observes agent state, narrates events, dispatches tasks, handles approval gates, and maintains conversational continuity. "You ARE Intendant" — the user talks to presence, not directly to the worker agent.
+
+Runs in two modes (mutually exclusive):
+- **Server-side text** (`presence.rs`): For TUI and non-voice web
+- **Browser-side voice** (`crates/presence-web/`): WASM-powered, connects directly to Gemini Live or OpenAI Realtime APIs from the browser
+
+The presence-core crate compiles to both native Rust and WASM, ensuring identical tool definitions and dispatch logic everywhere.
+
+### 3. Display Pipeline (WebRTC)
+
+Agents can see and interact with graphical displays via a custom WebRTC transport:
+
+```
+[CaptureBackend] → encode (VP8/H264) → WebRTC track → browser
+  browser input  → WebRTC data channel → input injection
+```
+
+Platform capture backends: X11 (XShm), Wayland (PipeWire DMA-BUF zero-copy), macOS (ScreenCaptureKit). Hardware H264 encoding via VideoToolbox (macOS) and VA-API/libx264 (Linux) with VP8 fallback. Bidirectional clipboard sync. Multi-monitor support with stable display identity, enumeration, and per-display metrics.
+
+CU-first routing: display tasks from voice go to a fast computer-use model first, with automatic escalation to the heavy agent for coding tasks.
+
+### 4. Live Audio and Phone Calls
+
+`spawn_live_audio` connects to Gemini Live or OpenAI Realtime APIs via WebSocket, piping audio through a virtual audio bridge (PulseAudio on Linux, BlackHole/Vortex on macOS). Untrusted: zero tools, zero file access. Responses validated against a `ResponseSchema`; unexpected content quarantined.
+
+The phone-call skill makes outbound SIP calls via pjsua with the voice model conducting the conversation, returning structured data.
+
+### 5. Human Oversight
+
+Three-layer autonomy system:
+1. **Global level** (`--autonomy` Low/Medium/High/Full)
+2. **Category rules** (`[approval]` in intendant.toml — per-category Auto/Ask/Deny)
+3. **Per-action approval** (y/s/a/n in any frontend)
+
+Categories: FileRead, FileWrite, FileDelete, CommandExec, NetworkRequest, Destructive, HumanInput, LiveAudioSpawn, DisplayControl.
+
+DisplayControl uses a session-grant model (approve once, revoke anytime via `d` hotkey). Landlock filesystem sandboxing restricts what the runtime can write.
+
+### 6. Frontend Parity
+
+The `UserAction` enum in `frontend.rs` forms a **compile-time contract** — the TUI, web dashboard, MCP server, and control socket all produce the same action variants. Adding a capability to one forces handling in all (no wildcard matches). All frontends are functionally equivalent.
+
+### 7. MCP (Server and Client)
+
+**Server** (`--mcp`): Exposes Intendant's full control surface as MCP tools — approve, deny, start tasks, query status, schedule controller restarts, intervene in loops. Architecturally a peer of the TUI, consuming the same EventBus. Supports hot-reload (rebuild + `exec()`).
+
+**Client**: Connects to external MCP servers configured in `intendant.toml`. Tools registered as `mcp__<server>_<tool>`.
+
+## Repository Layout
 
 ```
 src/
-├── main.rs              # intendant-runtime entry point
-├── agent.rs             # Runtime functions: execAsAgent, captureScreen, inspectPath, editFile, writeFile, browse, askHuman, execPty, storeMemory, recallMemory, nonce replacement
-├── models.rs            # Command, AgentInput, ProcessInfo, ProcessStatus
-├── error.rs             # AgentError enum
-├── utils.rs             # get_timestamp()
+├── main.rs                  # intendant-runtime entry point (sandboxed executor)
+├── agent.rs                 # Runtime functions (exec, edit, browse, screenshot, PTY, memory)
+├── models.rs, error.rs      # Shared types
 └── bin/caller/
-    ├── main.rs          # intendant entry: 3 modes (user/sub-agent/direct), budget loop, TUI init
-    ├── event.rs         # EventBus, AppEvent, ControlMsg, ApprovalRegistry, ContextInjectionQueue
-    ├── types.rs         # Phase, LogLevel, Verbosity, OutboundEvent, format_model_summary()
-    ├── provider.rs      # Multi-provider API client, structured output, reasoning, streaming, retry
-    ├── conversation.rs  # Message management, layer protection, budget tracking, auto-compaction
-    ├── agent_runner.rs  # Spawns runtime subprocess, hard timeout, optional Landlock sandboxing
-    ├── knowledge.rs     # Tagged knowledge store, pub/sub, cursor-based routing
-    ├── sub_agent.rs     # Sub-agent spawning, result/progress I/O, role-specific config
-    ├── worktree.rs      # Git worktree management for isolated agents
-    ├── user_mode.rs     # User-mode orchestrator spawning, progress monitoring
-    ├── prompts.rs       # System prompt resolution: include_str! + 3-layer cascade + INTENDANT.md
-    ├── project.rs       # Git root detection, intendant.toml parsing
-    ├── autonomy.rs      # Autonomy levels, action categories, approval rules, command classification
-    ├── control.rs       # Unix control socket (/tmp/intendant-<pid>.sock), JSON-line protocol
-    ├── frontend.rs      # Shared frontend contract (UserAction, StatusSnapshot, ModelUsageSnapshot)
-    ├── tools.rs         # 13 native tool definitions, provider format conversion, MCP tool registration
-    ├── tool_batch.rs    # Tool call batch assembly: runtime vs caller-handled vs MCP routing
-    ├── computer_use.rs  # CU abstraction: DisplayBackend (X11/Wayland/macOS), DisplayTarget, CuAction executor
-    ├── platform.rs      # Cross-platform helpers: process_alive(), process_cmdline(), current_uid()
-    ├── presence.rs      # PresenceLayer, tool dispatch, query functions, event filtering, session protocol
-    ├── mcp.rs           # MCP server (rmcp, stdio transport, hot-reload via exec()), 22 control tools
-    ├── mcp_client.rs    # MCP client: connects to external servers, discovers/proxies tools
-    ├── sandbox.rs       # Landlock filesystem sandboxing (Linux 5.13+, no-op on macOS)
-    ├── vision.rs        # Display management: Xvfb/x11vnc (Linux), native display (macOS), orphan reclaim
-    ├── audio_routing.rs # Virtual audio bridge: PulseAudio (Linux), BlackHole (macOS)
-    ├── recording.rs     # Segmented video recording: x11grab (Linux), avfoundation (macOS)
-    ├── debug.rs         # Debug screen: Xvfb+Firefox (Linux), native browser (macOS)
-    ├── live_audio.rs    # Live audio sessions: Gemini Live / OpenAI Realtime via virtual audio bridge
-    ├── live_audio_types.rs # LiveAudioSpec, LiveAudioResult, provider enums
-    ├── frames.rs        # FrameRegistry: video frame capture, inspection for presence tools
-    ├── quarantine.rs    # Untrusted live audio content quarantine and review
-    ├── schema_validator.rs # Tool call response schema validation
-    ├── app_state_pricing.rs # Session cost estimation for web dashboard
-    ├── skills.rs        # SKILL.md discovery (YAML frontmatter), catalog formatting
-    ├── transcription.rs # Whisper API transcription, WAV encoding, silence detection
-    ├── web_gateway.rs   # HTTP/WebSocket server, presence protocol, VNC proxy, session replay
-    ├── session_log.rs   # UUID session dirs, event logging, conversation persistence
-    ├── error.rs         # CallerError enum
-    └── tui/
-        ├── mod.rs       # Terminal init/restore, render loop
-        ├── app.rs       # App state machine, event dispatch, approval/input modes
-        ├── event.rs     # crossterm adapter, askHuman file monitor
-        ├── web.rs       # WebTui: per-connection buffer backend, ANSI→WebSocket, key parsing
-        ├── widgets.rs   # StatusBar, LogPanel, ActionPanel, InputPanel, ApprovalPanel, etc.
-        ├── layout.rs    # Panel sizing, responsive constraints
-        ├── markdown.rs  # Markdown-to-ratatui renderer
-        └── theme.rs     # Catppuccin Mocha color scheme
+    ├── main.rs              # intendant entry point (controller)
+    ├── provider.rs          # Multi-provider LLM abstraction
+    ├── event.rs             # EventBus, AppEvent, ControlMsg
+    ├── frontend.rs          # UserAction/StateQuery parity contract
+    ├── tools.rs             # Core tool definitions
+    ├── autonomy.rs          # Autonomy levels, action classification
+    ├── presence.rs          # Server-side presence layer
+    ├── computer_use.rs      # Cross-platform CU abstraction
+    ├── display/             # WebRTC display transport (capture, encode, signaling)
+    ├── web_gateway.rs       # HTTP/WebSocket server
+    ├── mcp.rs, mcp_client.rs # MCP server and client
+    ├── live_audio.rs        # Voice AI sessions
+    ├── sub_agent.rs         # Multi-agent orchestration
+    ├── worktree.rs          # Git worktree isolation
+    ├── sandbox.rs           # Landlock filesystem sandboxing
+    ├── recording.rs         # ffmpeg-based display recording
+    ├── knowledge.rs         # Tagged knowledge store, pub/sub
+    ├── session_log.rs       # Structured session logging
+    ├── quarantine.rs        # Untrusted content isolation
+    ├── tui/                 # ratatui TUI (widgets, layout, markdown, theme)
+    └── ...                  # conversation, prompts, skills, transcription, etc.
 crates/
-├── presence-core/       # WASM-compatible crate: types, tools (12), dispatch, format, prompt, session protocol
-└── presence-web/        # Browser WASM: app dashboard state, Gemini Live, OpenAI Realtime, WebSocket transport
+├── presence-core/           # WASM-compatible: types, tools, dispatch, prompt (native + wasm32)
+└── presence-web/            # Browser WASM: dashboard state, Gemini Live, OpenAI Realtime
 static/
-├── app.html             # 4-tab web dashboard (Activity, Usage, Terminal, Displays)
-├── audio-processor.js   # AudioWorklet for mic capture (PCM16)
-└── wasm-web/            # Compiled WASM + JS glue
-scripts/                 # Setup scripts: setup-macos.sh, setup-lan.sh, setup-lan-macos.sh, setup-lan-guest-macos.sh
-SysPrompt*.md            # System prompts (direct, tools, user, orchestrator, research, implementation, presence, live audio)
-docs/src/                # mdBook documentation
-tests/e2e/               # Integration tests (real API calls, 3 tiers)
-skills/                  # SKILL.md files (tui-e2e, web-e2e, voice-e2e, recording-e2e)
+├── app.html                 # Web dashboard SPA (Activity, Stats, Terminal, Video, Sessions, Settings)
+├── audio-processor.js       # AudioWorklet for mic capture
+└── wasm-web/                # Compiled WASM + JS glue
+scripts/                     # setup-linux.sh, setup-macos.sh, setup-lan.sh, bundle-macos.sh, etc.
+skills/                      # SKILL.md files (phone-call, tui-e2e, web-e2e, voice-e2e, recording-e2e)
+SysPrompt*.md                # System prompts per role (direct, tools, user, orchestrator, research, implementation, presence, live audio)
+docs/src/                    # mdBook documentation
+tests/e2e/                   # Integration tests (real API calls)
 ```
 
 ## Build and Run
@@ -85,12 +136,12 @@ cargo build               # Debug build
 cargo check               # Type-check only
 ```
 
-### WASM crate (presence-web)
+### WASM (presence-web)
 ```bash
 cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
 cargo build --release -p intendant   # Re-embed WASM
 ```
-**Important**: `cargo build` alone does NOT rebuild WASM. Any change to `crates/presence-web/` or `crates/presence-core/` requires the wasm-pack step above, then re-embed. The `static/wasm-web/` files are pre-compiled artifacts.
+**Important**: `cargo build` alone does NOT rebuild WASM. Any change to `crates/presence-web/` or `crates/presence-core/` requires the wasm-pack step above, then a re-embed build. The `static/wasm-web/` files are pre-compiled artifacts.
 
 ### CLI usage (requires `.env` with API key)
 ```bash
@@ -107,7 +158,7 @@ cargo build --release -p intendant   # Re-embed WASM
 ./target/release/intendant --sandbox "task"                # Landlock sandboxing (Linux)
 ./target/release/intendant --control-socket "task"         # Unix control socket
 ./target/release/intendant --no-presence "task"            # Disable presence layer
-echo "task" | ./target/release/intendant                   # Auto-detects non-TTY → headless
+echo "task" | ./target/release/intendant                   # Auto-detects non-TTY -> headless
 ```
 
 ### Runtime
@@ -134,145 +185,14 @@ cargo test --test e2e test_web -- --nocapture             # Tier 3: WebSocket, n
 cargo test --test e2e test_voice -- --nocapture           # Tier 3: needs Xvfb + Firefox + PulseAudio
 ```
 
-Tier 2/3 use Xvfb on `:50` with x11vnc on port 5950 for VNC monitoring.
-
-## Architecture
-
-### Execution Modes
-
-`intendant` operates in three modes:
-
-1. **Sub-Agent Mode** (`INTENDANT_ROLE` set): Scoped task, role-specific prompt, writes progress/results to files
-2. **User Mode** (complex task): Pure subprocess monitor — zero API calls, spawns orchestrator child, polls progress
-3. **Direct Mode** (`--direct` or simple task): Single-agent loop — select provider → load config → inject prompts/skills/knowledge → budget-aware loop (stops at context exhaustion, `done` signal, or 500-turn cap)
-
-### Process State & Sessions
-
-Runtime process state: in-memory `HashMap<u64, ProcessInfo>` behind `Arc<RwLock<...>>`, ephemeral per invocation.
-
-Sessions: UUID-based dirs at `~/.intendant/logs/<uuid>/` containing `session_meta.json`, `session.jsonl`, `conversation.jsonl`, `human_question`/`human_response` IPC files, `turns/` dir. Resume via `--continue` or `--resume <id>`.
-
-### Nonce Variables
-
-`$NONCE[id]` in commands → replaced with PID of process launched by that nonce via `replace_nonce_refs()`.
-
-### Autonomy System
-
-Three layers: global level (`--autonomy` Low/Medium/High/Full, +/- in TUI) → category rules (`[approval]` in intendant.toml, per-category Auto/Ask/Deny) → per-action approval (y/s/a/n in TUI).
-
-Categories: FileRead, FileWrite, FileDelete, CommandExec, NetworkRequest, Destructive, HumanInput, LiveAudioSpawn, DisplayControl. Shell commands classified by inspecting for destructive patterns, network tools, file writes. `sudo` detected as Destructive. `DisplayControl` uses session-grant model (approve once, revoke anytime via `d` hotkey).
-
-### Provider Features
-
-**All providers**: streaming via `chat_stream()` (SSE parsing), rate-limit retry (exponential backoff, 5 retries for 429/5xx), prompt caching, computer use action parsing.
-
-**OpenAI**: structured output (JSON object mode for gpt-5+/o3/o4, `STRUCTURED_OUTPUT` env), reasoning controls (`REASONING_EFFORT`, `REASONING_SUMMARY`), done signal via `{"commands":[],"done":true}`.
-
-**Anthropic**: `prompt-caching-2024-07-31` beta header, `cache_control` on system content.
-
-**Gemini**: `streamGenerateContent?alt=sse`, implicit caching.
-
-### Computer Use
-
-Provider-agnostic CU abstraction (`computer_use.rs`). `DisplayBackend` detects X11/Wayland/macOS; `DisplayTarget` distinguishes `Virtual { id }` from `UserSession`. CU-first routing sends display tasks to a fast model before escalating to the heavy agent.
-
-On Linux: xdotool (input), ImageMagick `import` (screenshots), Xvfb (virtual display).
-On macOS: cliclick (input), `screencapture` (screenshots), native display.
-
-### Display Management
-
-**Linux**: Xvfb auto-launched lazily on first `execAsAgent`/`captureScreen` when no accessible display exists. Prefers `:99` (VNC port 5999), reclaims orphaned Xvfb processes. x11vnc co-process launched if available. Both killed on drop via `XvfbGuard`.
-
-**macOS**: Native display always accessible, no virtual display needed. `is_display_accessible()` returns true, `find_free_display()` returns 0 as sentinel.
-
-### Audio Routing
-
-Virtual audio bridge for `spawn_live_audio` (voice calls through third-party apps). Linux: PulseAudio null sinks (`pactl`/`parec`/`pacat`). macOS: BlackHole 2ch + 16ch with SwitchAudioSource + sox. Optional — browser-based voice (Gemini Live / OpenAI Realtime via WebRTC) works without it.
-
-### Live Audio
-
-`spawn_live_audio` tool connects to Gemini Live or OpenAI Realtime APIs via WebSocket, pipes audio through the virtual audio bridge. Untrusted: zero tools, zero file access. Responses validated against a `ResponseSchema`; unexpected content quarantined (`quarantine.rs`). Whisper transcription runs in parallel for app-side audio.
-
-### Recording
-
-Segmented MP4 recording via ffmpeg. Linux: `x11grab`. macOS: `avfoundation`. Frame-fed mode (`image2pipe`) for browser camera streams. `RecordingRegistry` tracks active streams, auto-starts on `DisplayReady` events, stops agent streams on task completion.
-
-### TUI
-
-ratatui-based UI with panels: StatusBar, ActionPanel (phase + spinner), LogPanel (scrollable, markdown), ApprovalPanel, InputPanel (tui-textarea), FollowUpPanel, HelpOverlay. Agent loop communicates via `EventBus` (`mpsc` channel of `AppEvent`).
-
-### Control Socket & JSON Mode
-
-Control socket at `/tmp/intendant-<pid>.sock`: JSON-line protocol. Broadcasts events to all clients. Peer UID verification on Unix.
-
-`ControlMsg` variants: Approve, Deny, Skip, ApproveAll, Input, SetAutonomy, Quit, StartTask (with context_hints, reference_frame_ids, display_target), FollowUp, TakeDisplay, InvokeSkill, debug screen commands.
-
-`--json` mode: JSONL to stdout, stdin accepts plain text or `ControlMsg` JSON. Fully interactive without TUI.
-
-### Auto-Compaction
-
-At 90% context usage: keeps system + first 2 context + last 4 messages, summarizes oldest half of middle via `summarize_turns()`.
-
-### MCP
-
-**Server**: rmcp-based, stdio transport. 22 tools: agent control (approve, deny, skip, respond, quit, set_autonomy, set_verbosity), task management (start_task, get_status, get_logs, get_pending_approval, get_pending_input), controller restart management (schedule/cancel/get_restart_status, controller_turn_complete), loop intervention (request/clear halt, intervene, get_loop_status), and `reload` (rebuilds binary, replaces process via `exec()`).
-
-**Client**: configured via `[[mcp_servers]]` in intendant.toml. Tools registered as `mcp__<server>_<tool>`.
-
-### Sandboxing
-
-Landlock (Linux 5.13+): read `/` everywhere, write limited to project root + `/tmp` + log dir + `~/.intendant`. Extra write paths via `[sandbox] extra_write_paths`. Passed to runtime via `INTENDANT_SANDBOX_WRITE_PATHS`. Silently skipped on non-Linux or without kernel support.
-
-### Display Pipeline
-
-VNC is the foundation of the entire display pipeline. All displays — virtual and user session — go through the same lifecycle:
-
-1. VNC server runs on the display (x11vnc on Linux, Screen Sharing on macOS)
-2. `DisplayReady { display_id, vnc_port, width, height }` event fires
-3. Recording listener starts ffmpeg (x11grab / avfoundation) → segmented MP4
-4. Web dashboard shows noVNC viewer in the Displays tab
-5. "Stream" button captures frames from the **noVNC canvas** at 1 Hz on two parallel paths:
-   - 768×768 JPEG → sent **directly from browser WASM to live model** (Gemini Live / OpenAI Realtime). Server never sees these.
-   - HQ JPEG → sent to server → frame registry (`<session>/frames/`) + recording pipeline
-6. `sent_to_live` flag in `FrameMeta` tracks what the live model already saw
-
-**User session display** (`DisplayTarget::UserSession`): Opt-in via `DisplayControl` autonomy category (session-grant model, `d` hotkey). On grant: x11vnc launched on `:0` (Linux) or macOS Screen Sharing prompted on port 5900. `DisplayReady` emitted — same pipeline as virtual displays. Display state is pull-based in `AgentStateSnapshot.available_displays` (no proactive inference on grant/revoke).
-
-**CU-first routing**: `auto_attach_display_frames()` grabs the latest HQ frame per `display_*` stream from the registry. `submit_task` accepts `display_target` for explicit routing (`"user_session"`, `":99"`). Fallback: `resolve_cu_display_target()` heuristic.
-
-### Skills
-
-`SKILL.md` files with YAML frontmatter (`name`, `description`, `autonomy`, `disable-auto-invocation`, `sandbox`). Discovered from `<project_root>/.intendant/skills/` and `~/.intendant/skills/` (project takes precedence). Invoked via `invoke_skill` tool or control socket/TUI/presence.
-
-### INTENDANT.md
-
-Project instructions loaded from 2-layer cascade: `~/.config/intendant/INTENDANT.md` (global) → `<project_root>/INTENDANT.md` (local). Injected as user messages at conversation start.
-
-### Transcription
-
-Whisper API via `[transcription]` in intendant.toml. Web gateway buffers `user_audio` WebSocket messages in ~3s chunks, filters by RMS energy, wraps in WAV, sends to API. Custom endpoints supported for self-hosted whisper.cpp.
-
-### Presence Layer
-
-Conversational interface between user and agent system. Only one active at a time: server-side text OR browser-side live (Gemini Live / OpenAI Realtime).
-
-**Server-side** (`presence.rs`): `PresenceLayer` wraps a fast model (e.g., gemini-3.0-flash). 12 tools from `presence-core`: action tools (submit_task, approve/deny/skip_action, respond_to_question, set_autonomy, send_message), query tools (check_status, query_detail, recall_memory), and video tools (inspect_frame, inspect_frames). Dispatch via `dispatch_tool_call()` → `PresenceAction` enum. Display state is pull-based via `check_status` → `available_displays` field (no proactive inference on display events).
-
-**Browser-side** (`crates/presence-web/`): `presence_connect` pauses server-side presence, sends `presence_welcome` with state/replay/context. Tool calls via `tool_request`/`tool_response` WebSocket protocol. `presence_disconnect` resumes server-side.
-
-**Active/passive browsers**: one active (controls voice), others passive. `make_active` → handover with `force_disconnect_voice` + `active_granted`.
-
-**Session protocol**: `PresenceSession` tracks event windows/checkpoints. `presence_checkpoint` enables continuity across reconnects.
-
-**presence-core**: WASM-compatible, no tokio/reqwest. Compiles to native + wasm32-unknown-unknown.
-
-### Web Gateway
-
-`--web` (default 8765). HTTP: `/` (app.html), `/config`, `/debug`, `POST /session` (ephemeral tokens), `/wasm-web/*`, `/audio-processor.js`, `/api/sessions`, `/api/session/{id}`, `/api/session/{id}/recordings/*`, `/recordings/*`. WebSocket: `/` or `/ws` (events + terminal + presence), `/vnc` (VNC proxy).
-
-Per-connection `WebTui` instances with independent terminal dimensions. Caches latest `usage_update`, `status`, `display_ready` for late-connecting browsers.
-
-**Web App Dashboard**: 4-tab SPA (Activity, Usage, Terminal, Displays). WASM-driven state via `AppState` returning `Vec<UiCommand>`. Catppuccin Mocha theme, mobile-responsive.
+## Key Design Decisions
+
+- **Two-process security split**: Runtime executes commands under Landlock; controller holds API keys but never runs user-requested commands directly
+- **Provider-agnostic with native tool calling**: Not prompt-level abstraction — proper support for each provider's native tool calling, CU, and streaming APIs
+- **Quarantine for untrusted voice**: Live audio model outputs are schema-validated and quarantined, never exposed to agents
+- **Git worktree isolation**: Sub-agents work in isolated worktrees, enabling parallel development on separate branches
+- **Frontend parity via exhaustive enums**: Compile-time guarantee that all interfaces handle the same actions
+- **Presence as separate AI**: Not a chat wrapper — a distinct model with its own conversation, tools, and state awareness
 
 ## Code Conventions
 
@@ -292,7 +212,8 @@ Prefer platform-agnostic code by default. When platform-specific behavior is
 unavoidable, use `cfg!(target_os = ...)` runtime checks for small branches or
 `#[cfg(target_os = "...")]` compile-time gates for entire implementations.
 Collect OS-specific helpers in dedicated modules (e.g. `platform.rs`,
-per-platform blocks in `vision.rs`, `audio_routing.rs`, `computer_use.rs`).
+per-platform blocks in `vision.rs`, `audio_routing.rs`, `computer_use.rs`,
+`display/`).
 
 Every feature must either work or degrade gracefully with a clear error on all
 supported platforms — never panic or silently do nothing.
@@ -300,12 +221,13 @@ supported platforms — never panic or silently do nothing.
 ## Environment Requirements
 
 - **OS**: macOS or Linux (Debian), unprivileged user with passwordless sudo (Linux)
-- **API keys**: `.env` with `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`. Optional: `PROVIDER`, `MODEL_NAME`, `USE_NATIVE_TOOLS`, `STRUCTURED_OUTPUT`, `REASONING_EFFORT`, `REASONING_SUMMARY`
-- **captureScreen**: ImageMagick `import` + DISPLAY (Linux), `screencapture` (macOS)
-- **Computer use**: xdotool (Linux), cliclick (macOS)
-- **Recording**: ffmpeg (`brew install ffmpeg` / `apt install ffmpeg`)
+- **API keys**: `.env` with `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`
+- **Display capture**: libxcb + libxcb-shm (Linux X11), PipeWire (Linux Wayland), ScreenCaptureKit (macOS)
+- **Input injection**: xdotool (Linux X11), ydotool (Linux Wayland), cliclick (macOS)
+- **Encoding**: libvpx (VP8), ffmpeg with x264/VA-API (Linux H264), VideoToolbox (macOS H264)
+- **Recording**: ffmpeg
 - **WASM build**: `wasm-pack` (`cargo install wasm-pack`)
-- **macOS setup**: `./scripts/setup-macos.sh` installs all dependencies
+- **Full setup**: `./scripts/setup-linux.sh` (Debian/Ubuntu) or `./scripts/setup-macos.sh` (macOS)
 
 ## CI/CD
 

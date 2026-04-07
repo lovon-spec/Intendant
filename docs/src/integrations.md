@@ -44,12 +44,14 @@ When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/int
 {"event": "status", "turn": 3, "phase": "thinking", "autonomy": "medium", "session_id": "abc-123", "task": "fix tests"}
 {"event": "usage", "main": {"provider": "openai", "model": "gpt-5", "tokens_used": 12000, "context_window": 128000, "usage_pct": 9.4}}
 {"event": "usage_update", "main": {"provider": "openai", "model": "gpt-5", "tokens_used": 15000, "context_window": 128000, "usage_pct": 11.7}}
+{"event": "display_ready", "display_id": "virtual-99", "width": 1024, "height": 768}
 {"event": "command_result", "action": "get_restart_status", "ok": true, "message": "ok", "data": {...}}
 ```
 
-- The `status` event now includes `session_id` and `task` fields.
+- The `status` event includes `session_id` and `task` fields.
 - The `usage` event is a response to `{"action": "usage"}`, returning per-model token usage.
 - The `usage_update` event is broadcast automatically after each agent turn, providing streaming token consumption updates. The `presence` field is included when the presence layer is active.
+- The `display_ready` event fires when a display becomes available for WebRTC streaming.
 
 `command_result.ok` is `false` when a control action fails (for example, `schedule_controller_restart` with `restart_after="now"` and no executable restart action configured).
 
@@ -57,6 +59,16 @@ When `--control-socket` is enabled, a Unix domain socket is created at `/tmp/int
 
 ```bash
 echo '{"action":"status"}' | socat - UNIX:/tmp/intendant-$(pgrep intendant).sock
+```
+
+A helper script is also available:
+
+```bash
+# Using intendant-ctl.sh
+./scripts/intendant-ctl.sh status
+./scripts/intendant-ctl.sh approve
+./scripts/intendant-ctl.sh follow "fix that other bug too"
+./scripts/intendant-ctl.sh start "new task description"
 ```
 
 ## Web Gateway
@@ -75,7 +87,8 @@ Browser ──WebSocket──> Intendant web gateway (port 8765)
   │  Tool requests               │  State snapshot + log replay (on connect)
   │  presence_connect/disconnect │  Presence welcome (on voice connect)
   │  Voice logs/checkpoints      │  Per-connection TUI frames
-  │  Audio for transcription     │
+  │  Audio for transcription     │  WebRTC signaling (SDP, ICE)
+  │  WebRTC signaling            │
   v                              v
 App dashboard (WASM)        EventBus + AgentStateSnapshot
   +                              │
@@ -89,11 +102,11 @@ Intendant agent loop
 
 The web gateway has three layers:
 
-1. **App dashboard** — The primary web interface at `/` with 4 tabs (Activity, Usage, Terminal, Displays). State management is handled by `presence-web` WASM. Events are broadcast and late-connecting browsers get a full log replay.
+1. **App dashboard** — The primary web interface at `/` with tabs for Activity, Stats, Terminal, Video, Sessions, and Settings. State management is handled by `presence-web` WASM. Events are broadcast and late-connecting browsers get a full log replay.
 
 2. **Per-connection TUI rendering** — Each WebSocket connection gets its own `WebTui` instance with independent terminal dimensions. ANSI output is sent per-connection via the direct channel, not broadcast.
 
-3. **Presence bridge** (optional) — When a browser connects a live model (Gemini Live / OpenAI Realtime), the model uses 9 presence tools that map to `tool_request` WebSocket messages. The gateway handles these server-side and returns `tool_response` messages on the per-connection direct channel.
+3. **Presence bridge** (optional) — When a browser connects a live model (Gemini Live / OpenAI Realtime), the model uses presence tools that map to `tool_request` WebSocket messages. The gateway handles these server-side and returns `tool_response` messages on the per-connection direct channel.
 
 ### WebSocket Protocol
 
@@ -112,8 +125,11 @@ The web gateway has three layers:
 | `{"t":"user_audio","data":"<base64>"}` | PCM16 audio for server-side transcription |
 | `{"t":"tool_request","id":"...","tool":"...","args":{}}` | Presence tool call |
 | `{"t":"async_query","id":"...","tool":"...","args":{}}` | Async query (result as text, not tool response) |
+| `{"t":"display_offer","display_id":"...","sdp":"..."}` | WebRTC SDP offer for display streaming |
+| `{"t":"display_answer","display_id":"...","sdp":"..."}` | WebRTC SDP answer |
+| `{"t":"display_ice","display_id":"...","candidate":"..."}` | WebRTC ICE candidate |
+| `{"t":"frame","stream":"...","data":"<base64>"}` | Display/camera frame for frame registry |
 | `{"action":"..."}` | ControlMsg (same as Unix control socket) |
-| `{"t":"live_connected"}` / `{"t":"live_disconnected"}` | Legacy (still accepted) |
 
 #### Outbound Messages (server → browser)
 
@@ -128,7 +144,9 @@ The web gateway has three layers:
 | `{"t":"presence_checkpoint_ack","seq":N}` | Checkpoint acknowledgement |
 | `{"t":"tool_response","id":"...","result":"..."}` | Response to a tool_request |
 | `{"t":"async_query_result","id":"...","tool":"...","result":"..."}` | Response to async_query |
-| `{"event":"..."}` | OutboundEvent broadcast (status, agent_output, approval_required, etc.) |
+| `{"t":"display_answer","display_id":"...","sdp":"..."}` | WebRTC SDP answer for display |
+| `{"t":"display_ice","display_id":"...","candidate":"..."}` | WebRTC ICE candidate |
+| `{"event":"..."}` | OutboundEvent broadcast (status, agent_output, approval_required, display_ready, etc.) |
 
 #### Tool Request/Response Protocol
 
@@ -142,9 +160,11 @@ The browser live model calls presence tools via tagged request/response messages
 {"t":"tool_response","id":"req-42","result":"Phase: Running agent (turn 5). Budget: 23% used."}
 ```
 
-**Action tools** (`submit_task`, `approve_action`, `deny_action`, `skip_action`, `respond_to_question`, `set_autonomy`) are dispatched via the EventBus — the same path as TUI key presses and control socket commands.
+**Action tools** (`submit_task`, `approve_action`, `deny_action`, `skip_action`, `respond_to_question`, `set_autonomy`, `send_message`) are dispatched via the EventBus — the same path as TUI key presses and control socket commands.
 
 **Query tools** (`check_status`, `query_detail`, `recall_memory`) are handled asynchronously server-side via `presence::handle_tool_query()`, which reads from the shared `AgentStateSnapshot`, project files, and knowledge store.
+
+**Video tools** (`inspect_frame`, `inspect_frames`) examine frames from the frame registry for visual context.
 
 #### State Bootstrap
 
@@ -153,7 +173,7 @@ On WebSocket connect, the server sends multiple bootstrap messages:
 1. **`state_snapshot`** — Full `AgentStateSnapshot` with `connection_id`, config, and `session_id`
 2. **Cached `usage_update`** — Latest token usage data
 3. **Cached `status`** — Latest status (autonomy, session_id, task)
-4. **Cached `display_ready`** — Latest display info for VNC slots
+4. **Cached `display_ready`** — Latest display info for WebRTC sessions
 5. **`log_replay`** — Historical session events parsed from `session.jsonl`
 
 This ensures late-connecting browsers see the complete state immediately.
@@ -162,14 +182,17 @@ This ensures late-connecting browsers see the complete state immediately.
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /` | App dashboard (4-tab UI: Activity, Usage, Terminal, Displays) |
+| `GET /` | App dashboard |
 | `GET /config` | Live model configuration JSON |
 | `GET /debug` | Debug JSON (agent state, voice connection, active browser) |
 | `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime |
 | `GET /wasm-web/*` | WASM and JS glue (content-hash cache-busted) |
 | `GET /audio-processor.js` | AudioWorklet processor for microphone capture |
-| `WS /` | Main WebSocket (events, terminal I/O, presence protocol) |
-| `WS /vnc` | WebSocket-to-TCP VNC proxy for noVNC display viewing |
+| `GET /api/sessions` | List past sessions |
+| `GET /api/session/{id}` | Session detail |
+| `GET /api/session/{id}/recordings/*` | Session recording segments |
+| `GET /recordings/*` | Current session recording segments |
+| `WS /` or `WS /ws` | Main WebSocket (events, terminal I/O, presence, WebRTC signaling) |
 
 ### Requirements
 
@@ -186,6 +209,9 @@ This ensures late-connecting browsers see the complete state immediately.
 | `skip_action` | Action | Skip a pending action |
 | `respond_to_question` | Action | Answer an `askHuman` question |
 | `set_autonomy` | Action | Change autonomy level |
-| `check_status` | Query | Get current agent phase, turn, budget |
-| `query_detail` | Query | Get git diff, file contents, or log details |
+| `send_message` | Action | Send a mid-task interjection to the agent |
+| `check_status` | Query | Get current agent phase, turn, budget, available displays |
+| `query_detail` | Query | Get git diff, file contents, task results, or log details |
 | `recall_memory` | Query | Search the knowledge store by keywords/channel |
+| `inspect_frame` | Video | Examine a specific frame from the frame registry |
+| `inspect_frames` | Video | Examine multiple frames for visual context |

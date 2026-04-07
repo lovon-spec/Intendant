@@ -1,6 +1,6 @@
 # Web Dashboard
 
-The `--web` flag starts a web server that serves a modern dashboard for monitoring and interacting with Intendant remotely. The dashboard runs entirely in the browser with WASM-powered state management.
+The `--web` flag starts a web server that serves a modern dashboard for monitoring and interacting with Intendant remotely. The dashboard runs entirely in the browser with WASM-powered state management (Catppuccin Mocha theme, mobile-responsive).
 
 ## Running
 
@@ -26,34 +26,49 @@ A scrollable, color-coded event log showing everything happening in the system:
 - **live** — voice transcripts, presence lifecycle, tool requests
 - **server** — presence model internals (thinking, tool calls)
 
-Events are grouped by turn with visual separators. New events while viewing other tabs trigger a notification badge. Late-connecting browsers receive a full replay of historical events from `session.jsonl`.
+Events are grouped by turn with visual separators. New events while viewing other tabs trigger a notification badge. Late-connecting browsers receive a full replay of historical events from `session.jsonl`. Includes approval buttons (Approve/Skip/Approve All/Deny) and a follow-up text input for sending messages after rounds complete.
 
-### Usage
+### Stats
 
-Token consumption for the main model and presence model:
+Token consumption tracking:
 
-- Prompt, completion, and cached token breakdowns
-- Cost estimates using a built-in pricing table (OpenAI, Anthropic, Gemini models)
-- Usage history over time
-- Updated after each agent turn via `usage_update` events
+- Per-model breakdown for main and presence models
+- Prompt, completion, and cached token counts
+- Cost estimates using a built-in pricing table (OpenAI, Anthropic, Gemini)
+- All-sessions cumulative usage
+- Disk usage
+- Display transport metrics (frame rate, encode latency, bandwidth per display)
 
 ### Terminal
 
 An embedded xterm.js terminal connected to the server-side ratatui TUI. Each browser connection gets its own independent terminal rendering with separate dimensions. This shows the same interface as the native terminal TUI — status bar, log panel, action panel, approval/input panels.
 
-Key presses and terminal resizes in the browser are sent to the server and rendered independently per connection.
+### Video
 
-### Displays
+WebRTC display viewers for agent displays with interactive control:
 
-Remote viewing of Xvfb displays created by the agent. When the agent runs graphical applications (via `execAsAgent` with a DISPLAY), the display appears here as a noVNC viewer.
+- **View mode** (default) — watch the agent's graphical display in real-time
+- **Take Control** — forward mouse and keyboard events to the agent's display
+- **Release** — release control with an optional note
+- **Display picker** — select which monitor to view when multiple displays are available
+- **Recording replay** — browse and play back recorded display sessions with timeline seeking and speed control (1x/2x/4x)
 
-Displays are created lazily — the tab populates automatically when the agent's first command triggers Xvfb auto-launch. Each display shows the VNC port for direct connection too.
+Displays appear automatically when the agent's first command triggers Xvfb auto-launch or when user session display access is granted. WebRTC negotiation happens transparently — the browser and server exchange SDP offers/answers and ICE candidates over the existing WebSocket connection.
+
+### Sessions
+
+Session browser showing past sessions with metadata (task, duration, status). Click a session to view its recordings and event log.
+
+### Settings
+
+Configuration panel for the current session.
 
 ## Live Voice
 
 The dashboard supports optional live voice interaction via Gemini Live or OpenAI Realtime. When activated:
 
 - The browser connects directly to the model's realtime API for low-latency voice I/O
+- The WASM layer (`presence-web` crate) handles audio capture, resampling, and WebSocket streaming
 - The live model receives agent events and narrates progress
 - Tool calls from the live model (`submit_task`, `approve_action`, `check_status`, etc.) are routed through the WebSocket to the server
 - Server-side presence is automatically paused (mutual exclusion)
@@ -115,14 +130,17 @@ The `/config` endpoint returns the configured provider, model, and sample rates 
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /` | Web app dashboard (4-tab UI) |
+| `GET /` | Web app dashboard |
 | `GET /config` | Live model configuration JSON |
 | `GET /debug` | Debug JSON (agent state, voice connection, active browser) |
 | `POST /session` | Mint ephemeral session tokens for Gemini Live / OpenAI Realtime |
 | `GET /wasm-web/*` | WASM and JS glue (content-hash cache-busted) |
 | `GET /audio-processor.js` | AudioWorklet processor for microphone capture |
-| `WS /` | Main WebSocket (events, terminal I/O, presence protocol) |
-| `WS /vnc` | WebSocket-to-TCP VNC proxy (for noVNC) |
+| `GET /api/sessions` | List past sessions |
+| `GET /api/session/{id}` | Session detail |
+| `GET /api/session/{id}/recordings/*` | Session recording segments |
+| `GET /recordings/*` | Current session recording segments |
+| `WS /` or `WS /ws` | Main WebSocket (events, terminal I/O, presence protocol, WebRTC signaling) |
 
 ## Requirements
 

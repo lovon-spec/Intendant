@@ -18,7 +18,7 @@
 | `--no-presence` | Disable the presence layer (direct agent interaction) |
 | `--continue` / `-c` | Resume most recent session for this project |
 | `--resume <id>` / `-r <id>` | Resume specific session by ID or prefix |
-| `--web [PORT]` | Start web dashboard with Activity/Usage/Terminal/Displays tabs + optional voice (default port 8765) |
+| `--web [PORT]` | Start web dashboard (default port 8765) |
 | `--transcription` | Enable server-side audio transcription (Whisper API) |
 
 The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
@@ -31,12 +31,12 @@ The TUI launches only when both stdin and stdout are terminals. When piping inpu
 | `ANTHROPIC_API_KEY` / `ANTHROPIC` | — | Anthropic API key |
 | `GEMINI_API_KEY` | — | Google AI (Gemini) API key |
 | `PROVIDER` | auto-detect | `"openai"`, `"anthropic"`, or `"gemini"` (used when multiple keys are set) |
-| `MODEL_NAME` | per-provider default | Model to use (e.g. `gpt-5.2-codex`, `claude-sonnet-4-5-20250929`, `gemini-2.5-pro`) |
+| `MODEL_NAME` | per-provider default | Model to use |
 | `USE_NATIVE_TOOLS` | `true` | Enable native API tool calling; `false` falls back to text-based JSON extraction |
 | `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
 | `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call (sent to API) |
 | `STRUCTURED_OUTPUT` | `true` for gpt-5+/o3/o4 | Enable JSON object mode for deterministic parsing |
-| `REASONING_EFFORT` | — | Reasoning effort for GPT-5/o3/o4 models (`low`, `medium`, `high`) |
+| `REASONING_EFFORT` | — | Reasoning effort for reasoning models (`low`, `medium`, `high`) |
 | `REASONING_SUMMARY` | — | Reasoning summary mode (`auto`, `concise`, `detailed`) |
 | `PRESENCE_PROVIDER` | — | Override provider for the presence layer (fallback: `PROVIDER`) |
 | `PRESENCE_MODEL` | — | Override model for the presence layer |
@@ -83,14 +83,16 @@ file_delete = "ask"           # ask before file deletes (default)
 command_exec = "auto"         # auto-approve command execution
 network = "auto"              # auto-approve network requests
 destructive = "ask"           # ask before destructive commands (default)
+display_control = "ask"       # ask before user display access (default)
 
 [presence]
 enabled = true                # enable the conversational presence layer (default: true)
-provider = "gemini"           # provider for the presence model (optional, falls back to PROVIDER)
+provider = "gemini"           # provider for the presence model (optional)
 model = "gemini-2.5-flash"    # model for the presence layer (optional)
+context_window = 1048576      # context window for text presence (default: 1048576)
 live_provider = "gemini"      # provider for browser-side live presence (optional)
-live_model = "gemini-2.5-flash-native-audio-preview-12-2025"  # model for browser-side live presence (optional)
-context_window = 32768        # context window for the presence conversation (default: 32768)
+live_model = "gemini-2.5-flash-native-audio-preview-12-2025"  # model for browser-side live (optional)
+live_context_window = 32768   # context window for live presence (default: 32768)
 
 [transcription]
 enabled = false               # enable server-side audio transcription (default: false)
@@ -99,9 +101,37 @@ model = "whisper-1"           # transcription model (default: "whisper-1")
 language = "en"               # ISO-639-1 language hint (optional, auto-detect if omitted)
 # endpoint = "http://..."     # custom endpoint for self-hosted whisper.cpp
 
+[recording]
+enabled = false               # enable display recording (default: false)
+framerate = 15                # frames per second (default: 15)
+segment_duration_secs = 60    # segment duration in seconds (default: 60)
+quality = "medium"            # "low" (CRF 35), "medium" (CRF 28), "high" (CRF 20)
+# max_retention_hours = 24    # auto-delete recordings older than this (optional)
+
+[computer_use]
+provider = "gemini"           # provider for CU model (optional)
+model = "gemini-3-flash"      # model for CU tasks (optional)
+backend = "auto"              # "x11", "wayland", "macos", or "auto" (default)
+
+[live_audio]
+enabled = false               # enable live audio sessions (default: false)
+default_timeout_secs = 300    # session timeout (default: 300)
+gemini_model = "gemini-2.5-flash-native-audio-preview-12-2025"
+openai_model = "gpt-4o-realtime-preview"
+sample_rate = 24000           # audio sample rate (default: 24000)
+
 [sandbox]
 enabled = false               # enable Landlock filesystem sandboxing (default: false)
 extra_write_paths = ["/var/log"]  # additional writable paths beyond project root, /tmp, log dir
+
+[webrtc]
+[[webrtc.ice_servers]]
+urls = ["stun:stun.l.google.com:19302"]
+
+# [[webrtc.ice_servers]]
+# urls = ["turn:turn.example.com:3478"]
+# username = "user"
+# credential = "pass"
 
 # External MCP servers to connect to as a client
 [[mcp_servers]]
@@ -147,7 +177,10 @@ Frontmatter fields:
 - `description` — shown in skill catalog (required)
 - `autonomy` — override session autonomy level when active (optional)
 - `disable-auto-invocation` — if `true`, only user can trigger this skill (optional, default `false`)
+- `disable-model-invocation` — if `true`, runs without LLM calls (optional, default `false`)
 - `sandbox` — override session sandbox setting (optional)
+- `compatibility` — required system tools (optional)
+- `allowed-tools` — restrict which tools are available (optional)
 
 Project skills take precedence over personal skills with the same name. Available skills are formatted into a catalog and injected into the agent's conversation.
 
@@ -172,6 +205,6 @@ Prompts are resolved using a 3-layer cascade (highest priority first):
 2. **Global config** — `~/.config/intendant/SysPrompt.md` or `SysPrompt_tools.md` (user-wide customization)
 3. **Compiled-in default** — always available, zero-config
 
-Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`, `SysPrompt_implementation.md`) follow the same cascade and are appended to the base prompt. The presence layer uses its own standalone prompt (`SysPrompt_presence.md`).
+Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`, `SysPrompt_implementation.md`) follow the same cascade and are appended to the base prompt. The presence layer uses its own standalone prompt (`SysPrompt_presence.md`). The live audio voice agent uses `SysPromptLiveAudio.md` with `{PLAYBOOK}` and `{RESPONSE_SCHEMA}` placeholders substituted at runtime.
 
 To customize prompts for a specific project, place your modified `.md` files in the project's git root. For user-wide customization, place them in `~/.config/intendant/`.

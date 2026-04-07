@@ -1,9 +1,12 @@
 # Summary
 
+- [Introduction](./introduction.md)
 - [Getting Started](./getting-started.md)
 - [Architecture](./architecture.md)
 - [Configuration](./configuration.md)
 - [Runtime Protocol](./runtime-protocol.md)
+- [Display Pipeline](./display-pipeline.md)
+- [Computer Use & Live Audio](./computer-use-and-audio.md)
 - [TUI & Autonomy](./tui.md)
 - [Web Dashboard](./web-dashboard.md)
 - [Multi-Agent Orchestration](./multi-agent.md)
