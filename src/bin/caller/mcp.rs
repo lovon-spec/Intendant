@@ -1658,6 +1658,7 @@ async fn handle_control_command_mcp(
                     bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
                         task: task_text,
                         orchestrate: Some(false),
+                        direct: None,
                         reference_frame_ids: vec![],
                         display_target: None,
                     }));
@@ -2683,6 +2684,7 @@ impl IntendantServer {
             self.bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
                 task: params.task,
                 orchestrate: params.orchestrate,
+                direct: None,
                 reference_frame_ids: params.reference_frame_ids,
                 display_target: None,
             }));

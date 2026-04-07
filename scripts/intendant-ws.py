@@ -42,7 +42,7 @@ async def run(host, port, task, auto_approve, stream_only):
 
     async with websockets.connect(url) as ws:
         if task and not stream_only:
-            msg = json.dumps({"action": "start_task", "task": task})
+            msg = json.dumps({"action": "start_task", "task": task, "direct": True})
             await ws.send(msg)
             print(json.dumps({"event": "_submitted", "task": task[:100]}), flush=True)
 

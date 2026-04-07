@@ -33,6 +33,7 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                 ControlMsg::StartTask {
                     task: envelope.task.clone(),
                     orchestrate,
+                    direct: if envelope.force_direct { Some(true) } else { None },
                     reference_frame_ids: envelope.reference_frame_ids.clone(),
                     display_target: envelope.display_target.clone(),
                 },

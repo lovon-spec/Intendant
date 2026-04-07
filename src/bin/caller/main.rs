@@ -5905,8 +5905,8 @@ async fn main() -> Result<(), CallerError> {
                     }
                     event = event_rx.recv() => {
                         match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids, display_target })) => {
-                                eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, direct, reference_frame_ids, display_target })) => {
+                                eprintln!("New session{}: {}", if direct.unwrap_or(false) { " (direct)" } else { "" }, &new_task[..new_task.len().min(80)]);
                                 // Create fresh session resources
                                 let new_log_dir = session_log::SessionLog::resolve_path(None);
                                 let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
@@ -5973,7 +5973,7 @@ async fn main() -> Result<(), CallerError> {
                                 let bus_spawn = bus.clone();
                                 let autonomy_spawn = autonomy.clone();
                                 let session_log_spawn = new_session_log.clone();
-                                let use_direct = orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
+                                let use_direct = direct.unwrap_or(false) || orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
                                 tokio::spawn(async move {
                                     let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
                                     let result = if use_direct {
@@ -6281,8 +6281,8 @@ async fn main() -> Result<(), CallerError> {
                     }
                     event = event_rx.recv() => {
                         match event {
-                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, reference_frame_ids, display_target })) => {
-                                eprintln!("New session: {}", &new_task[..new_task.len().min(80)]);
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask { task: new_task, orchestrate, direct, reference_frame_ids, display_target })) => {
+                                eprintln!("New session{}: {}", if direct.unwrap_or(false) { " (direct)" } else { "" }, &new_task[..new_task.len().min(80)]);
 
                                 // Create fresh session resources
                                 let new_log_dir = session_log::SessionLog::resolve_path(None);
@@ -6377,7 +6377,7 @@ async fn main() -> Result<(), CallerError> {
                                 let autonomy_spawn = autonomy_for_daemon.clone();
                                 let session_log_spawn = new_session_log.clone();
                                 let shared_cleanup = headless_shared_session.clone();
-                                let use_direct = orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
+                                let use_direct = direct.unwrap_or(false) || orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
 
                                 tokio::spawn(async move {
                                     let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);

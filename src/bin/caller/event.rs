@@ -420,6 +420,11 @@ pub enum ControlMsg {
         task: String,
         #[serde(default)]
         orchestrate: Option<bool>,
+        /// When true, run in direct mode (no presence layer). Use for
+        /// programmatic clients that submit tasks via WebSocket/control
+        /// socket without a human on the other end.
+        #[serde(default)]
+        direct: Option<bool>,
         /// When present, routes to the ephemeral CU task runner instead of the
         /// regular agent loop.
         #[serde(default)]
@@ -1260,6 +1265,7 @@ mod tests {
             ControlMsg::StartTask {
                 task: "fix bug".to_string(),
                 orchestrate: None,
+                direct: None,
                 reference_frame_ids: vec![],
                 display_target: None,
             },
@@ -1340,7 +1346,7 @@ mod tests {
         let json = r#"{"action":"start_task","task":"fix bug"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target } => {
+            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target, .. } => {
                 assert_eq!(task, "fix bug");
                 assert!(orchestrate.is_none());
                 assert!(reference_frame_ids.is_empty());
@@ -1355,13 +1361,14 @@ mod tests {
         let msg = ControlMsg::StartTask {
             task: "deploy app".to_string(),
             orchestrate: Some(true),
+            direct: None,
             reference_frame_ids: vec!["display_99-f00001".to_string()],
             display_target: Some("user_session".to_string()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&json).unwrap();
         match parsed {
-            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target } => {
+            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target, .. } => {
                 assert_eq!(task, "deploy app");
                 assert_eq!(orchestrate, Some(true));
                 assert_eq!(reference_frame_ids.len(), 1);

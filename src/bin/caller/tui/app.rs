@@ -1170,7 +1170,7 @@ impl App {
                     );
                 }
             }
-            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target } => {
+            ControlMsg::StartTask { task, orchestrate, direct: _, reference_frame_ids, display_target } => {
                 // Dispatch unconditionally — no phase gating. The task_rx loop
                 // (main.rs) processes tasks sequentially, and the mpsc channel
                 // (capacity=4) buffers incoming tasks. The TUI tracks phase for
@@ -1413,6 +1413,7 @@ impl App {
                         self.handle_control_command(ControlMsg::StartTask {
                             task: task_text,
                             orchestrate: Some(false),
+                            direct: None,
                             reference_frame_ids: vec![],
                             display_target: None,
                         });
