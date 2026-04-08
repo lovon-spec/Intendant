@@ -4,6 +4,7 @@ description: >
   Make a voice call through any app (Element, FaceTime, WhatsApp, etc.)
   using computer use to navigate the UI and spawn_live_audio for the
   AI voice conversation. Returns typed structured data.
+compatibility: macOS only. Requires Vortex Audio HAL plugin, cliclick, and a GUI session with TCC mic permission.
 autonomy: full
 ---
 

@@ -5,6 +5,7 @@ description: >
   using spawn_live_audio. The AI model talks through the Vortex Audio
   virtual device, which pjsua routes to the SIP call. Returns typed
   structured data from the conversation.
+compatibility: macOS only. Requires Vortex Audio HAL plugin, pjsua, and a GUI session with TCC mic permission.
 autonomy: full
 ---
 
