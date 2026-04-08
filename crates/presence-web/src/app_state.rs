@@ -250,9 +250,10 @@ pub struct TokenHistoryEntry {
 fn source_label(source: &str) -> &'static str {
     match source {
         "system" => "\u{2139}",  // ℹ
-        "worker" => "Workr",
-        "agent" => "Agent",
+        "worker" => "Model",
+        "agent" => "Run",
         "server" => "Servr",
+        "presence" => "Prsnc",
         "live" => "Live",
         "sub" => "Sub",
         "orch" => "Orch",
@@ -617,10 +618,15 @@ impl AppState {
             }
 
             "model_response" => {
-                let summary = msg["summary"].as_str().unwrap_or("(thinking...)");
-                cmds.extend(self.add_log("model", summary, None, "worker"));
+                let summary = msg["summary"].as_str().unwrap_or("");
+                let display = if summary.is_empty() {
+                    "Model response".to_string()
+                } else {
+                    summary.to_string()
+                };
+                cmds.extend(self.add_log("model", &display, None, "worker"));
                 if let Some(rs) = msg["reasoning_summary"].as_str() {
-                    cmds.extend(self.add_log("detail", rs, None, "worker"));
+                    cmds.extend(self.add_log("detail", &format!("Reasoning: {}", rs), None, "worker"));
                 }
             }
 
@@ -633,7 +639,7 @@ impl AppState {
                 if !self.known_displays.is_empty() {
                     cmds.extend(self.add_log("detail", "Running on display", None, "agent"));
                 }
-                cmds.extend(self.add_log("detail", &format!("Running: {}", preview), None, "agent"));
+                cmds.extend(self.add_log("agent", preview, None, "agent"));
                 cmds.push(UiCommand::SetPhase { phase: "running".into() });
                 self.phase = "running".to_string();
             }
@@ -892,7 +898,7 @@ impl AppState {
             "presence_log" => {
                 let level = msg["level"].as_str().unwrap_or("info");
                 let message = msg["message"].as_str().unwrap_or("");
-                cmds.extend(self.add_log(level, message, None, "server"));
+                cmds.extend(self.add_log(level, message, None, "presence"));
             }
 
             "presence_usage_update" => {

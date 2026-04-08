@@ -1555,27 +1555,25 @@ impl App {
                 );
             }
             AppEvent::AgentOutput { stdout, stderr } => {
+                // Parse runtime JSON to extract human-readable output.
+                // Web UI receives AgentOutput directly and formats via WASM;
+                // TUI formats here. Do NOT broadcast raw lines as LogEntry
+                // (that causes duplicate unformatted entries in the Activity tab).
                 let t = self.turn;
                 let turn_opt = if t > 0 { Some(t) } else { None };
-                if !stdout.is_empty() {
-                    for line in stdout.lines() {
-                        self.log_sourced(
-                            LogLevel::Agent,
-                            line.to_string(),
-                            LogSource::Agent,
-                            turn_opt,
-                        );
+                let formatted = format_agent_output_for_tui(&stdout, &stderr);
+                if !formatted.is_empty() {
+                    let level = if !stderr.is_empty() { LogLevel::Warn } else { LogLevel::Agent };
+                    if self.log_entries.len() >= MAX_LOG_ENTRIES {
+                        self.log_entries.pop_front();
                     }
-                }
-                if !stderr.is_empty() {
-                    for line in stderr.lines() {
-                        self.log_sourced(
-                            LogLevel::Warn,
-                            format!("stderr: {}", line),
-                            LogSource::Agent,
-                            turn_opt,
-                        );
-                    }
+                    self.log_entries.push_back(LogEntry {
+                        ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        level,
+                        content: formatted,
+                        source: LogSource::Agent,
+                        turn: turn_opt,
+                    });
                 }
             }
             AppEvent::SubAgentResult { formatted } => {
@@ -2006,6 +2004,61 @@ impl App {
 }
 
 // format_model_summary and truncate_str are in crate::types
+
+/// Parse runtime JSON output into human-readable text for the TUI.
+/// Mirrors the WASM format_agent_output logic.
+pub fn format_agent_output_for_tui(stdout: &str, stderr: &str) -> String {
+    let mut parts = Vec::new();
+    for line in stdout.trim().split('\n') {
+        if line.is_empty() { continue; }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+            if obj["type"].as_str() == Some("result") {
+                let data = match obj.get("data") {
+                    Some(serde_json::Value::String(s)) => {
+                        serde_json::from_str::<serde_json::Value>(s).unwrap_or_default()
+                    }
+                    Some(other) => other.clone(),
+                    None => continue,
+                };
+                if let Some(st) = data["stdout_tail"].as_str() {
+                    let trimmed = st.trim();
+                    if !trimmed.is_empty() { parts.push(trimmed.to_string()); }
+                }
+                if let Some(se) = data["stderr_tail"].as_str() {
+                    let trimmed = se.trim();
+                    if !trimmed.is_empty() { parts.push(format!("[stderr] {}", trimmed)); }
+                }
+                if let Some(path) = data["path"].as_str() {
+                    let exists = data["exists"].as_bool().unwrap_or(false);
+                    if exists {
+                        let kind = data["type"].as_str().unwrap_or("?");
+                        let size = data["size"].as_u64().unwrap_or(0);
+                        parts.push(format!("{} ({}, {} bytes)", path, kind, size));
+                    } else {
+                        parts.push(format!("{} (not found)", path));
+                    }
+                }
+                if let Some(fp) = data["file_path"].as_str() {
+                    let op = data["operation"].as_str().unwrap_or("write");
+                    let ok = data["success"].as_bool().unwrap_or(false);
+                    if ok { parts.push(format!("{}: {}", op, fp)); }
+                    else { parts.push(format!("{} failed: {}", op, fp)); }
+                }
+                if let Some(ec) = data["exit_code"].as_i64() {
+                    if ec != 0 { parts.push(format!("exit code: {}", ec)); }
+                }
+            } else if obj["type"].as_str() != Some("status") {
+                parts.push(line.to_string());
+            }
+        } else {
+            parts.push(line.to_string());
+        }
+    }
+    if !stderr.is_empty() {
+        parts.push(format!("[stderr] {}", stderr.trim()));
+    }
+    parts.join("\n")
+}
 
 #[cfg(test)]
 mod tests {

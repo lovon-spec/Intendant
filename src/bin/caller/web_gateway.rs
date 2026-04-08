@@ -317,7 +317,8 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
                     }
                 }
                 if parts.is_empty() { continue; }
-                ("agent", parts.join("\n"), "agent")
+                let level = if parts.iter().any(|p| p.starts_with("[stderr]")) { "warn" } else { "agent" };
+                ("agent", parts.join("\n"), level)
             }
 
             // ── Voice / presence lifecycle ──
@@ -339,7 +340,7 @@ fn replay_session_log(contents: &str) -> Vec<serde_json::Value> {
                     .and_then(|v| v.as_str())
                     .unwrap_or(message);
                 if text.is_empty() { continue; }
-                ("live", format!("[You] {}", text), "info")
+                ("live", format!("[You] {}", text), "presence")
             }
             "presence_connected" => {
                 let provider = obj.get("data")

@@ -1863,15 +1863,10 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::AgentOutput { stdout, stderr } => {
-                        if !stdout.is_empty() {
-                            for line in stdout.lines() {
-                                s.push_log(LogLevel::Agent, line.to_string());
-                            }
-                        }
-                        if !stderr.is_empty() {
-                            for line in stderr.lines() {
-                                s.push_log(LogLevel::Warn, line.to_string());
-                            }
+                        let formatted = crate::tui::app::format_agent_output_for_tui(&stdout, &stderr);
+                        if !formatted.is_empty() {
+                            let level = if !stderr.is_empty() { LogLevel::Warn } else { LogLevel::Agent };
+                            s.push_log(level, formatted);
                         }
                         resource_changed = Some("intendant://logs");
                     }

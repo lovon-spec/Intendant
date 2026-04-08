@@ -654,10 +654,7 @@ fn format_commands_preview(json_str: &str) -> String {
                 let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
                 match func {
                     "execAsAgent" => cmd.get("command").and_then(|v| v.as_str())
-                        .map(|c| {
-                            let truncated: String = c.chars().take(120).collect();
-                            format!("exec: {}", truncated)
-                        }),
+                        .map(|c| format!("exec: {}", c)),
                     "inspectPath" => cmd.get("path").and_then(|v| v.as_str())
                         .map(|p| format!("inspect: {}", p)),
                     "editFile" | "writeFile" => cmd.get("file_path").and_then(|v| v.as_str())
@@ -672,7 +669,7 @@ fn format_commands_preview(json_str: &str) -> String {
             }
         }
     }
-    json_str.chars().take(200).collect()
+    json_str.to_string()
 }
 
 /// We launch on execAsAgent (not just captureScreen) because GUI applications
@@ -884,8 +881,8 @@ fn format_command_preview(json_str: &str) -> String {
             }
         }
     }
-    // Fallback: first 200 chars of raw JSON
-    json_str.chars().take(200).collect()
+    // Fallback: full raw JSON (UI handles collapsing)
+    json_str.to_string()
 }
 
 fn normalize_command_batch(json_str: &str) -> String {

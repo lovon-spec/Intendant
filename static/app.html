@@ -3681,7 +3681,11 @@ function renderLogEntry(c) {
 
   const cnt = document.createElement('span');
   cnt.className = 'log-content';
-  cnt.textContent = c.content || '';
+  // Render inline markdown (bold, italic, code) as HTML; escape first for safety
+  const raw = (c.content || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  cnt.innerHTML = raw
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
 
   entry.appendChild(icon);
   entry.appendChild(ts);
@@ -7745,8 +7749,9 @@ function renderSessionDetailEntries(entries, el) {
     detail: '#a2a8be', debug: 'var(--overlay1)',
   };
   const sourceLabels = {
-    system: '\u2139', worker: 'Workr', agent: 'Agent',
+    system: '\u2139', worker: 'Model', agent: 'Run',
     server: 'Servr', live: 'Live', sub: 'Sub', orch: 'Orch',
+    presence: 'Prsnc',
   };
   const normalLevels = ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'presence'];
   const verboseLevels = [...normalLevels, 'detail'];

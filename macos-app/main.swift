@@ -324,6 +324,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         // Allow media autoplay (for voice features)
         config.mediaTypesRequiringUserActionForPlayback = []
 
+        // Use a non-persistent data store so WKWebView never caches WASM/JS
+        // across app launches. Without this, recompiled WASM may not load.
+        config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
+
         // Serve pages from a custom scheme so WKWebView grants a secure
         // context (required for navigator.mediaDevices / getUserMedia).
         config.setURLSchemeHandler(BackendSchemeHandler(port: port), forURLScheme: "intendant")
