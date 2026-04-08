@@ -5,7 +5,6 @@ description: >
   using computer use to navigate the UI and spawn_live_audio for the
   AI voice conversation. Returns typed structured data.
 compatibility: macOS only. Requires Vortex Audio HAL plugin, cliclick, and a GUI session with TCC mic permission.
-autonomy: full
 ---
 
 # Voice Call via App + Live Audio

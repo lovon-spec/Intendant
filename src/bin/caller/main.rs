@@ -2085,18 +2085,6 @@ async fn run_agent_loop(
                 {
                     Some(skill) => {
                         let body = skills::load_skill_body(skill, arguments);
-                        // Apply autonomy override if specified
-                        if let Some(ref level_str) = skill.config.autonomy {
-                            let level = AutonomyLevel::from_str_loose(level_str);
-                            let mut state = autonomy.write().await;
-                            state.level = level;
-                            slog(&session_log, |l| {
-                                l.info(&format!(
-                                    "Skill '{}' set autonomy to {}",
-                                    skill_name, level_str
-                                ))
-                            });
-                        }
                         slog(&session_log, |l| {
                             l.info(&format!(
                                 "Invoked skill '{}' (args: {})",

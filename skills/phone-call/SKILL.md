@@ -6,7 +6,6 @@ description: >
   virtual device, which pjsua routes to the SIP call. Returns typed
   structured data from the conversation.
 compatibility: macOS only. Requires Vortex Audio HAL plugin, pjsua, and a GUI session with TCC mic permission.
-autonomy: full
 ---
 
 # Phone Call via SIP + Live Audio

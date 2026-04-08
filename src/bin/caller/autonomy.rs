@@ -256,14 +256,14 @@ impl AutonomyState {
             return true;
         }
 
-        // DisplayControl: always ask on first use, then session-grant takes over
-        if category == ActionCategory::DisplayControl {
-            return !self.user_display_granted;
-        }
-
         // Full autonomy auto-approves everything except HumanInput
         if self.level == AutonomyLevel::Full {
             return false;
+        }
+
+        // DisplayControl: ask on first use, then session-grant takes over
+        if category == ActionCategory::DisplayControl {
+            return !self.user_display_granted;
         }
 
         // Low autonomy asks for everything except FileRead (unless Deny overrides)
