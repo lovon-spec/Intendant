@@ -1062,6 +1062,15 @@ impl App {
                 state.level = parsed;
             });
         }
+        // Broadcast the change so all connected clients update their status bar
+        let label = format!("{}", parsed);
+        self.broadcast_control(OutboundEvent::Status {
+            turn: self.turn,
+            phase: String::new(),
+            autonomy: label,
+            session_id: String::new(),
+            task: String::new(),
+        });
     }
 
     fn broadcast_control(&self, event: OutboundEvent) {

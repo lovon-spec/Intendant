@@ -7943,11 +7943,9 @@ window.cycleAutonomy = function() {
   const current = el.textContent.trim();
   const idx = levels.indexOf(current);
   const next = levels[(idx + 1) % levels.length];
-  // Send to server
   if (app) {
     app.send_raw(JSON.stringify({action: 'set_autonomy', level: next.toLowerCase()}));
   }
-  el.textContent = next;
 };
 
 window.toggleUserDisplay = function() {
