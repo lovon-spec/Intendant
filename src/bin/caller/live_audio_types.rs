@@ -17,6 +17,7 @@ pub struct LiveAudioSpec {
     #[serde(default)]
     pub model: Option<String>,
     pub playbook: String,
+    #[serde(default)]
     pub response_schema: ResponseSchema,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -41,7 +42,7 @@ fn default_timeout() -> u64 {
 /// The parent defines this schema and the live model's output is validated
 /// against it programmatically. String fields support constraints (max length,
 /// enum values) and a "tainted" marker for fields that may contain injected text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseSchema {
     pub fields: Vec<FieldSpec>,
 }

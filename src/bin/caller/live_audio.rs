@@ -1429,6 +1429,8 @@ pub async fn run_session(
     // Turn counter: nudge the model to emit JSON after enough turns
     let mut turn_complete_count = 0u32;
     let mut json_nudged = false;
+    // Throttle progress events to avoid flooding the event bus
+    let mut last_progress_emit = Instant::now();
 
     // Event processing loop
     let status = loop {
@@ -1461,8 +1463,11 @@ pub async fn run_session(
                     let _ = transcript.log("model", &text).await;
                     model_transcript_buf.push_str(&text);
 
-                    // Emit progress
+                    // Emit progress (throttled to ~2s intervals to avoid
+                    // flooding the event bus with 100+ near-identical events)
                     if let Some(bus) = event_bus {
+                    if last_progress_emit.elapsed() >= Duration::from_secs(2) {
+                    last_progress_emit = Instant::now();
                         let preview = if model_transcript_buf.len() > 200 {
                             {
                                 let start = model_transcript_buf.len() - 200;
@@ -1478,7 +1483,8 @@ pub async fn run_session(
                             elapsed_secs: start.elapsed().as_secs_f64(),
                             transcript_preview: preview,
                         });
-                    }
+                    } // throttle
+                    } // bus
                 }
                 LiveAudioEvent::ModelText(text) => {
                     model_text.push_str(&text);

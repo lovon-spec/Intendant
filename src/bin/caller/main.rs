@@ -3247,7 +3247,7 @@ async fn run_with_presence(
         project.memory_path(),
         log_dir.clone(),
         project.root.clone(),
-        presence_paused,
+        presence_paused.clone(),
         context_injection.clone(),
     );
 
@@ -3325,8 +3325,21 @@ async fn run_with_presence(
     let mut persistent_project: Option<Project> = None;
 
     while let Some(envelope) = task_rx.recv().await {
+        // Resume presence from any previous direct-mode pause
+        presence_paused.store(0, std::sync::atomic::Ordering::Relaxed);
+        // Pause presence for direct-mode tasks — no narration, no hallucinated
+        // side-tasks, no 400 errors from Gemini. Presence is for human interaction;
+        // programmatic clients (WebSocket with direct:true) don't need it.
+        if envelope.force_direct {
+            presence_paused.store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         slog(&session_log, |l| {
-            l.info(&format!("Presence dispatched task: {}", envelope.task));
+            l.info(&format!(
+                "{}task: {}",
+                if envelope.force_direct { "Direct " } else { "Presence dispatched " },
+                envelope.task
+            ));
         });
 
         // Resolve frame context_hints → images
