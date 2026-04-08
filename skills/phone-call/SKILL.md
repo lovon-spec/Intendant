@@ -86,10 +86,9 @@ This eliminates the 12+ second delay the caller would otherwise experience.
 - `response_schema`: fields to extract (see schema format below)
 - `timeout_secs`: max call duration (default 120)
 - `voice`: model voice (e.g. `alloy`, `shimmer`)
-- `initial_message`: ALWAYS set this to `"Begin."` — this makes the
-  model start speaking immediately when the call connects instead of
-  waiting for audio input. Without it, the caller hears 5-10 seconds
-  of silence before the model speaks.
+- `initial_message`: Do NOT set this. The model will start speaking
+  when it hears the caller. Setting it causes the model to speak before
+  the call connects — the caller misses the opening words.
 
 ### 5. Process the result
 

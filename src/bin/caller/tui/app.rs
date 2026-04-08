@@ -1170,7 +1170,7 @@ impl App {
                     );
                 }
             }
-            ControlMsg::StartTask { task, orchestrate, direct: _, reference_frame_ids, display_target } => {
+            ControlMsg::StartTask { task, orchestrate, direct, reference_frame_ids, display_target } => {
                 // Dispatch unconditionally — no phase gating. The task_rx loop
                 // (main.rs) processes tasks sequentially, and the mpsc channel
                 // (capacity=4) buffers incoming tasks. The TUI tracks phase for
@@ -1178,7 +1178,7 @@ impl App {
                 let dispatched = if let Some(ref tx) = self.task_tx {
                     let envelope = presence_core::TaskEnvelope {
                         task: task.clone(),
-                        force_direct: orchestrate == Some(false),
+                        force_direct: direct.unwrap_or(false) || orchestrate == Some(false),
                         context_hints: vec![],
                         reference_frame_ids,
                         display_target,
