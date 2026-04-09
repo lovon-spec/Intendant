@@ -27,9 +27,26 @@ Mark all data fields you need to collect as `required: true` in the
 schema. The voice model cannot submit until all required fields are
 filled — this prevents premature hangups.
 
-### 2. Navigate to the app and start the call
+### 2. Call spawn_live_audio FIRST
 
-Use your native computer use actions to interact with the screen.
+Call `spawn_live_audio` with the arguments you prepared in step 1
+BEFORE you click the call button. The audio bridge polls and works
+before the call connects — it waits silently until audio flows.
+This eliminates dead air for the callee.
+
+**ALL of these parameters are REQUIRED:**
+- `id`: unique session identifier
+- `provider`: `openai`
+- `playbook`: the conversation script
+- `response_schema`: MANDATORY — see below
+- `timeout_secs`: max call duration (default 120)
+- `voice`: e.g. `alloy`, `shimmer`
+- Do NOT set `initial_message` — the model waits for the other party
+  to speak first, then responds naturally per the playbook.
+
+### 3. Navigate to the app and click call
+
+Now use your native computer use actions to navigate the screen.
 Take a screenshot, find the app (in the dock, taskbar, or already open),
 click to foreground it, navigate to the contact, and click the call button.
 
@@ -41,23 +58,8 @@ click, type, scroll, and screenshot actions for everything visual.
 (not Element Call). Element Call is a conference that requires the other
 party to manually join; Legacy call rings their device directly.
 
-### 3. Click call AND spawn_live_audio in the SAME turn
-
-When you click "Legacy call" (or the call button), include BOTH the
-CU click action AND the `spawn_live_audio` function call in the same
-response. This is critical — every extra inference round-trip adds
-10-20 seconds of dead air for the callee. The arguments are already
-prepared from step 1, so just emit them alongside the click.
-
-**ALL of these parameters are REQUIRED:**
-- `id`: unique session identifier
-- `provider`: `openai`
-- `playbook`: the conversation script
-- `response_schema`: MANDATORY — see below
-- `timeout_secs`: max call duration (default 120)
-- `voice`: e.g. `alloy`, `shimmer`
-- Do NOT set `initial_message` — the model waits for the other party
-  to speak first, then responds naturally per the playbook.
+The audio bridge is already running from step 2 — it will pick up
+audio as soon as the call connects. No further action needed.
 
 ### 4. Write the result immediately
 
