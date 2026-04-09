@@ -987,17 +987,22 @@ fn build_openai_request_parts(
                     if m.is_cu_result {
                         // Native CU result: computer_call_output format
                         let screenshot = m.images.as_ref().and_then(|imgs| imgs.first());
-                        let mut output_item = serde_json::json!({
-                            "type": "computer_call_output",
-                            "call_id": call_id,
-                        });
-                        if let Some(img) = screenshot {
-                            output_item["output"] = serde_json::json!({
+                        let output = if let Some(img) = screenshot {
+                            serde_json::json!({
                                 "type": "computer_screenshot",
                                 "image_url": format!("data:{};base64,{}", img.media_type, img.data),
-                            });
-                        }
-                        items.push(output_item);
+                            })
+                        } else {
+                            serde_json::json!({
+                                "type": "computer_screenshot",
+                                "image_url": "",
+                            })
+                        };
+                        items.push(serde_json::json!({
+                            "type": "computer_call_output",
+                            "call_id": call_id,
+                            "output": output,
+                        }));
                     } else {
                         items.push(openai_function_call_output(call_id, &m.content));
                         if let Some(ref images) = m.images {
