@@ -41,12 +41,13 @@ click, type, scroll, and screenshot actions for everything visual.
 (not Element Call). Element Call is a conference that requires the other
 party to manually join; Legacy call rings their device directly.
 
-### 3. Call spawn_live_audio immediately
+### 3. Click call AND spawn_live_audio in the SAME turn
 
-As soon as you click the call button (or select "Legacy call"),
-call `spawn_live_audio` on the VERY NEXT turn with the arguments you
-prepared in step 1. Do NOT compose them now — that adds seconds of
-dead air for the callee.
+When you click "Legacy call" (or the call button), include BOTH the
+CU click action AND the `spawn_live_audio` function call in the same
+response. This is critical — every extra inference round-trip adds
+10-20 seconds of dead air for the callee. The arguments are already
+prepared from step 1, so just emit them alongside the click.
 
 **ALL of these parameters are REQUIRED:**
 - `id`: unique session identifier

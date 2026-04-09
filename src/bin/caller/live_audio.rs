@@ -1613,6 +1613,12 @@ pub async fn run_session(
                 }
                 LiveAudioEvent::FunctionCall { name, call_id, args } => {
                     if name == FN_SUBMIT_RESPONSE {
+                        // Reject null/empty submissions — the voice model sometimes
+                        // calls submit_response with no arguments. Keep the session
+                        // alive so it can try again.
+                        if args.is_null() || (args.is_object() && args.as_object().unwrap().is_empty()) {
+                            continue;
+                        }
                         // The model submitted structured response via function call.
                         // Don't break yet — the model may still be speaking.
                         // Wait for end_call or a drain timeout.
