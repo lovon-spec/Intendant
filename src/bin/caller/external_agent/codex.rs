@@ -370,7 +370,8 @@ fn translate_notification(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let item_id = params
-                .get("itemId")
+                .pointer("/item/id")
+                .or_else(|| params.get("itemId"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -426,19 +427,45 @@ fn translate_notification(
         }
 
         "item/completed" => {
-            let item_id = params
-                .get("itemId")
+            let item = params.get("item").unwrap_or(params);
+            let item_id = item
+                .get("id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let status_str = params
-                .pointer("/item/status")
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Extract command output from commandExecution items
+            if item_type == "commandExecution" {
+                if let Some(output) = item.get("aggregatedOutput").and_then(|v| v.as_str()) {
+                    if !output.is_empty() {
+                        let _ = event_tx.send(AgentEvent::ToolOutputDelta {
+                            item_id: item_id.clone(),
+                            text: output.to_string(),
+                        });
+                    }
+                }
+            }
+
+            // Extract final message text from agentMessage items
+            if item_type == "agentMessage" {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        let _ = event_tx.send(AgentEvent::Message {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+
+            let status_str = item
+                .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("success");
+                .unwrap_or("completed");
             let status = match status_str {
                 "failed" => {
-                    let message = params
-                        .pointer("/item/error")
+                    let message = item
+                        .get("error")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error")
                         .to_string();
@@ -501,7 +528,7 @@ fn translate_notification(
         }
 
         other => {
-            eprintln!("[codex] unknown notification method: {:?}", other);
+            eprintln!("[codex] unknown notification method: {:?} params: {}", other, serde_json::to_string(params).unwrap_or_default());
         }
     }
 }
@@ -956,10 +983,19 @@ mod tests {
     fn translate_item_completed_success() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
-            "itemId": "item-1",
-            "item": {"status": "success"}
+            "item": {"id": "item-1", "type": "commandExecution", "status": "completed", "aggregatedOutput": "hello\n"}
         });
         translate_notification("item/completed", &params, &tx);
+        // First event: ToolOutputDelta with the aggregated output
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "item-1");
+                assert_eq!(text, "hello\n");
+            }
+            other => panic!("expected ToolOutputDelta, got {:?}", other),
+        }
+        // Second event: ToolCompleted
         let event = rx.try_recv().unwrap();
         match event {
             AgentEvent::ToolCompleted { item_id, status } => {
@@ -974,8 +1010,7 @@ mod tests {
     fn translate_item_completed_failed() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
-            "itemId": "item-1",
-            "item": {"status": "failed", "error": "permission denied"}
+            "item": {"id": "item-1", "type": "commandExecution", "status": "failed", "error": "permission denied"}
         });
         translate_notification("item/completed", &params, &tx);
         let event = rx.try_recv().unwrap();
@@ -997,8 +1032,7 @@ mod tests {
     fn translate_item_completed_cancelled() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
-            "itemId": "item-1",
-            "item": {"status": "cancelled"}
+            "item": {"id": "item-1", "type": "commandExecution", "status": "cancelled"}
         });
         translate_notification("item/completed", &params, &tx);
         let event = rx.try_recv().unwrap();

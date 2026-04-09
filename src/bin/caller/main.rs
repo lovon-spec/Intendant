@@ -3641,14 +3641,12 @@ async fn run_with_presence(
                         bus.send(AppEvent::AgentOutput { stdout: text, stderr: String::new() });
                     }
                     Some(external_agent::AgentEvent::ToolCompleted { item_id, status }) => {
-                        let status_str = match &status {
-                            external_agent::ToolCompletionStatus::Success => "completed",
-                            external_agent::ToolCompletionStatus::Failed { .. } => "failed",
-                            external_agent::ToolCompletionStatus::Cancelled => "cancelled",
-                        };
-                        bus.send(AppEvent::AutoApproved {
-                            preview: format!("[{}] {}", status_str, item_id),
-                        });
+                        match &status {
+                            external_agent::ToolCompletionStatus::Failed { message } => {
+                                slog(&session_log, |l| l.warn(&format!("Tool {} failed: {}", item_id, message)));
+                            }
+                            _ => {} // Success/Cancelled don't need logging — output already logged
+                        }
                     }
                     Some(external_agent::AgentEvent::ApprovalRequest { request_id, command, category }) => {
                         let cat = match category {
