@@ -2,7 +2,7 @@ use crate::presence::{self, AgentStateSnapshot};
 use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1156,8 +1156,104 @@ fn handle_set_api_keys(body: &str) -> String {
     serde_json::json!({"ok": true}).to_string()
 }
 
+// ---------------------------------------------------------------------------
+// MCP-over-HTTP types
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct McpHttpRequest {
+    #[serde(default)]
+    #[allow(dead_code)]
+    jsonrpc: Option<String>,
+    id: Option<serde_json::Value>,
+    method: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct McpHttpResponse {
+    jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<McpHttpError>,
+}
+
+#[derive(Serialize)]
+struct McpHttpError {
+    code: i64,
+    message: String,
+}
+
+async fn handle_mcp_http_request(
+    body: &str,
+    server: &crate::mcp::IntendantServer,
+) -> McpHttpResponse {
+    let request: McpHttpRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return McpHttpResponse {
+                jsonrpc: "2.0".into(),
+                id: None,
+                result: None,
+                error: Some(McpHttpError {
+                    code: -32700,
+                    message: format!("Parse error: {}", e),
+                }),
+            };
+        }
+    };
+
+    let result = match request.method.as_str() {
+        "initialize" => Ok(serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "tools": {} },
+            "serverInfo": {
+                "name": "intendant",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        })),
+        "notifications/initialized" => Ok(serde_json::json!({})),
+        "tools/list" => Ok(server.list_tools_json()),
+        "tools/call" => {
+            let params = request.params.unwrap_or_default();
+            let name = params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            match server.call_tool_by_name(name, args).await {
+                Ok(result_text) => Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": result_text}]
+                })),
+                Err(e) => Err(McpHttpError {
+                    code: -32603,
+                    message: e,
+                }),
+            }
+        }
+        _ => Err(McpHttpError {
+            code: -32601,
+            message: format!("Method not found: {}", request.method),
+        }),
+    };
+
+    McpHttpResponse {
+        jsonrpc: "2.0".into(),
+        id: request.id,
+        result: result.as_ref().ok().cloned(),
+        error: result.err(),
+    }
+}
+
 pub fn spawn_web_gateway(
-    port: u16,
+    listener: TcpListener,
     bus: EventBus,
     broadcast_tx: broadcast::Sender<String>,
     config: WebGatewayConfig,
@@ -1166,6 +1262,7 @@ pub fn spawn_web_gateway(
     web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
     task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
     project_root: Option<std::path::PathBuf>,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -1260,14 +1357,7 @@ pub fn spawn_web_gateway(
     );
 
     tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Live gateway bind failed on {}: {}", addr, e);
-                return;
-            }
-        };
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
 
         loop {
             let (stream, _peer) = match listener.accept().await {
@@ -1293,6 +1383,7 @@ pub fn spawn_web_gateway(
             let web_tui_tx = web_tui_tx.clone();
             let task_tx = task_tx.clone();
             let project_root = project_root.clone();
+            let mcp_server = mcp_server.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -3293,6 +3384,59 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST") && request_line.contains(" /mcp") {
+                        // MCP-over-HTTP endpoint
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        if let Some(ref mcp) = mcp_server {
+                            let content_length: usize = header_text
+                                .lines()
+                                .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                .and_then(|l| l.split(':').nth(1))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+                            let body_owned;
+                            let body_text = if peeked_body.len() >= content_length {
+                                &peeked_body[..content_length]
+                            } else {
+                                let remaining = content_length.saturating_sub(peeked_body.len());
+                                let mut full = peeked_body.to_string();
+                                if remaining > 0 {
+                                    let mut rest = vec![0u8; remaining];
+                                    if stream.read_exact(&mut rest).await.is_ok() {
+                                        full.push_str(&String::from_utf8_lossy(&rest));
+                                    }
+                                }
+                                body_owned = full;
+                                &body_owned
+                            };
+                            let mcp_response = handle_mcp_http_request(body_text, mcp).await;
+                            let response_json = serde_json::to_string(&mcp_response).unwrap_or_default();
+                            let http_response = format!(
+                                "HTTP/1.1 200 OK\r\n\
+                                 Content-Type: application/json\r\n\
+                                 Access-Control-Allow-Origin: *\r\n\
+                                 Content-Length: {}\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {}",
+                                response_json.len(),
+                                response_json
+                            );
+                            let _ = stream.write_all(http_response.as_bytes()).await;
+                        } else {
+                            let err = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"MCP server not available"}}"#;
+                            let http = format!(
+                                "HTTP/1.1 503 Service Unavailable\r\n\
+                                 Content-Type: application/json\r\n\
+                                 Content-Length: {}\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {}",
+                                err.len(), err
+                            );
+                            let _ = stream.write_all(http.as_bytes()).await;
+                        }
                     } else {
                         let (content_type, body, cache) = if request_line.contains("/wasm-web/presence_web.js") {
                             ("application/javascript", WASM_WEB_JS.to_string(), "no-cache, must-revalidate")
@@ -3467,10 +3611,11 @@ mod tests {
     async fn test_spawn_web_gateway_lifecycle() {
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(0, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
 
-        // Give it a moment to bind
+        // Give it a moment to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         handle.abort();
@@ -3485,10 +3630,9 @@ mod tests {
         // Bind to port 0 for a random free port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -3529,10 +3673,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -3580,10 +3723,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -3617,7 +3759,6 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig {
             provider: "openai".to_string(),
@@ -3627,7 +3768,7 @@ mod tests {
             transcription_enabled: false,
             ice_servers: Vec::new(),
         };
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -3662,10 +3803,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3718,10 +3858,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -3758,7 +3897,6 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         // Create a query context with a known agent state
         let agent_state = Arc::new(Mutex::new(AgentStateSnapshot {
@@ -3780,7 +3918,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -3817,7 +3955,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // listener passed directly to spawn_web_gateway (no TOCTOU)
 
         let agent_state = Arc::new(Mutex::new(AgentStateSnapshot {
             phase: "running_agent".to_string(),
@@ -3839,7 +3977,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -3892,7 +4030,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // listener passed directly to spawn_web_gateway (no TOCTOU)
 
         let agent_state = Arc::new(Mutex::new(AgentStateSnapshot::default()));
         let query_ctx = Some(WebQueryCtx {
@@ -3908,7 +4046,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(port, bus, broadcast_tx, config, ss, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None)
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -3981,10 +4119,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -4031,10 +4168,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -4085,10 +4221,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -4121,10 +4256,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -4159,10 +4293,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -4215,10 +4348,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -4285,10 +4417,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -4383,10 +4514,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -4456,10 +4586,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(port, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

@@ -103,6 +103,94 @@ fn default_backend() -> String {
     "auto".to_string()
 }
 
+/// Configuration for external agent backends.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExternalAgentConfig {
+    /// Default backend when --agent is not specified. None means use native agent.
+    #[serde(default)]
+    pub default_backend: Option<String>,
+    /// Codex app-server settings.
+    #[serde(default)]
+    pub codex: CodexConfig,
+    /// Claude Code settings.
+    #[serde(default)]
+    pub claude_code: ClaudeCodeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexConfig {
+    /// Path or command name for the codex binary.
+    #[serde(default = "default_codex_command")]
+    pub command: String,
+    /// Model to use (e.g. "o4-mini", "codex-mini-latest").
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Approval policy: "never", "onRequest", "onFailure", "unlessTrusted".
+    #[serde(default = "default_codex_approval_policy")]
+    pub approval_policy: String,
+    /// Sandbox mode within Codex.
+    #[serde(default = "default_codex_sandbox")]
+    pub sandbox: String,
+}
+
+fn default_codex_command() -> String {
+    "codex".to_string()
+}
+
+fn default_codex_approval_policy() -> String {
+    "onRequest".to_string()
+}
+
+fn default_codex_sandbox() -> String {
+    "workspaceWrite".to_string()
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            command: default_codex_command(),
+            model: None,
+            approval_policy: default_codex_approval_policy(),
+            sandbox: default_codex_sandbox(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeCodeConfig {
+    /// Path or command name for the claude binary.
+    #[serde(default = "default_claude_code_command")]
+    pub command: String,
+    /// Model to use.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Permission mode: "default", "acceptEdits", "plan", "auto", "bypassPermissions".
+    #[serde(default = "default_claude_code_permission_mode")]
+    pub permission_mode: String,
+    /// Allowed tools list (empty = all).
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+}
+
+fn default_claude_code_command() -> String {
+    "claude".to_string()
+}
+
+fn default_claude_code_permission_mode() -> String {
+    "auto".to_string()
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            command: default_claude_code_command(),
+            model: None,
+            permission_mode: default_claude_code_permission_mode(),
+            allowed_tools: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
     #[serde(default)]
@@ -127,6 +215,8 @@ pub struct ProjectConfig {
     pub recording: RecordingConfig,
     #[serde(default)]
     pub computer_use: ComputerUseConfig,
+    #[serde(default)]
+    pub agent: ExternalAgentConfig,
     #[serde(default)]
     pub live_audio: LiveAudioConfig,
     #[serde(default)]
@@ -676,5 +766,89 @@ ice_servers = [
         assert!(ice.ice_servers[0].username.is_none());
         assert_eq!(ice.ice_servers[1].username.as_deref(), Some("u"));
         assert_eq!(ice.ice_servers[1].credential.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn parse_agent_config_backward_compat() {
+        let toml_str = r#"
+[memory]
+enabled = true
+
+[model]
+context_window = 200000
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.agent.default_backend.is_none());
+        assert_eq!(config.agent.codex.command, "codex");
+        assert_eq!(config.agent.codex.approval_policy, "onRequest");
+        assert_eq!(config.agent.codex.sandbox, "workspaceWrite");
+        assert!(config.agent.codex.model.is_none());
+        assert_eq!(config.agent.claude_code.command, "claude");
+        assert_eq!(config.agent.claude_code.permission_mode, "auto");
+        assert!(config.agent.claude_code.model.is_none());
+        assert!(config.agent.claude_code.allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn parse_agent_config_full() {
+        let toml_str = r#"
+[agent]
+default_backend = "codex"
+
+[agent.codex]
+command = "/usr/local/bin/codex"
+model = "o4-mini"
+approval_policy = "never"
+sandbox = "workspaceWrite"
+
+[agent.claude_code]
+command = "/usr/local/bin/claude"
+model = "claude-sonnet-4-20250514"
+permission_mode = "acceptEdits"
+allowed_tools = ["Read", "Edit", "Bash"]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
+        assert_eq!(config.agent.codex.command, "/usr/local/bin/codex");
+        assert_eq!(config.agent.codex.model.as_deref(), Some("o4-mini"));
+        assert_eq!(config.agent.codex.approval_policy, "never");
+        assert_eq!(config.agent.codex.sandbox, "workspaceWrite");
+        assert_eq!(config.agent.claude_code.command, "/usr/local/bin/claude");
+        assert_eq!(
+            config.agent.claude_code.model.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+        assert_eq!(config.agent.claude_code.permission_mode, "acceptEdits");
+        assert_eq!(
+            config.agent.claude_code.allowed_tools,
+            vec!["Read", "Edit", "Bash"]
+        );
+    }
+
+    #[test]
+    fn parse_agent_config_minimal_defaults() {
+        let toml_str = r#"
+[agent]
+default_backend = "codex"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
+        assert_eq!(config.agent.codex.command, "codex");
+        assert!(config.agent.codex.model.is_none());
+        assert_eq!(config.agent.codex.approval_policy, "onRequest");
+        assert_eq!(config.agent.codex.sandbox, "workspaceWrite");
+        assert_eq!(config.agent.claude_code.command, "claude");
+        assert!(config.agent.claude_code.model.is_none());
+        assert_eq!(config.agent.claude_code.permission_mode, "auto");
+        assert!(config.agent.claude_code.allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn codex_config_defaults() {
+        let config = CodexConfig::default();
+        assert_eq!(config.command, "codex");
+        assert!(config.model.is_none());
+        assert_eq!(config.approval_policy, "onRequest");
+        assert_eq!(config.sandbox, "workspaceWrite");
     }
 }

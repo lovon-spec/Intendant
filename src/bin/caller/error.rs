@@ -13,6 +13,7 @@ pub enum CallerError {
     Tui(String),
     Display(String),
     WebRtc(String),
+    ExternalAgent(String),
 }
 
 impl fmt::Display for CallerError {
@@ -29,6 +30,7 @@ impl fmt::Display for CallerError {
             CallerError::Tui(msg) => write!(f, "TUI error: {}", msg),
             CallerError::Display(msg) => write!(f, "Display error: {}", msg),
             CallerError::WebRtc(msg) => write!(f, "WebRTC error: {}", msg),
+            CallerError::ExternalAgent(msg) => write!(f, "External agent error: {}", msg),
         }
     }
 }
@@ -133,6 +135,12 @@ mod tests {
     fn webrtc_error_display() {
         let err = CallerError::WebRtc("peer closed".to_string());
         assert_eq!(format!("{}", err), "WebRTC error: peer closed");
+    }
+
+    #[test]
+    fn external_agent_error_display() {
+        let err = CallerError::ExternalAgent("codex crashed".to_string());
+        assert_eq!(format!("{}", err), "External agent error: codex crashed");
     }
 
     #[test]

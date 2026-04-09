@@ -1,10 +1,14 @@
 //! Skill discovery, parsing, and invocation.
 //!
 //! Skills are named instruction sets stored as `SKILL.md` files with YAML
-//! frontmatter. They are discovered from two locations (project-scoped first):
+//! frontmatter, following the Agent Skills open standard (agentskills.io).
+//! They are discovered from these locations (first match wins per name):
 //!
-//! 1. `<project_root>/.intendant/skills/<name>/SKILL.md`
-//! 2. `~/.intendant/skills/<name>/SKILL.md`
+//! 1. `<project_root>/.agents/skills/<name>/SKILL.md`  (standard path)
+//! 2. `<project_root>/.intendant/skills/<name>/SKILL.md`
+//! 3. `<project_root>/skills/<name>/SKILL.md`
+//! 4. `~/.agents/skills/<name>/SKILL.md`  (standard path)
+//! 5. `~/.intendant/skills/<name>/SKILL.md`
 //!
 //! The model can invoke skills via the `invoke_skill` tool, or the user can
 //! trigger them via the control socket / TUI / presence layer.
@@ -31,9 +35,9 @@ pub struct SkillConfig {
 /// Where a skill was discovered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkillSource {
-    /// `<project_root>/.intendant/skills/`
+    /// `<project_root>/.agents/skills/` or `<project_root>/.intendant/skills/` or `<project_root>/skills/`
     Project,
-    /// `~/.intendant/skills/`
+    /// `~/.agents/skills/` or `~/.intendant/skills/`
     Personal,
 }
 
@@ -172,22 +176,43 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillConfig, String> {
 /// Discover skills from project and personal directories.
 ///
 /// Project skills take precedence over personal skills with the same name.
+/// Scans the Agent Skills standard path (`.agents/skills/`) first, then
+/// Intendant-specific paths for backward compatibility.
 pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
-    // 1. Project-scoped skills (check both <root>/skills/ and <root>/.intendant/skills/)
+    // 1. Project-scoped skills (standard path first, then legacy paths)
     if let Some(root) = project_root {
-        let skills_dir = root.join("skills");
-        load_skills_from_dir(&skills_dir, SkillSource::Project, &mut skills, &mut seen_names);
-        let dotdir = root.join(".intendant").join("skills");
-        load_skills_from_dir(&dotdir, SkillSource::Project, &mut skills, &mut seen_names);
+        // Standard: .agents/skills/
+        load_skills_from_dir(
+            &root.join(".agents").join("skills"),
+            SkillSource::Project, &mut skills, &mut seen_names,
+        );
+        // Legacy: .intendant/skills/
+        load_skills_from_dir(
+            &root.join(".intendant").join("skills"),
+            SkillSource::Project, &mut skills, &mut seen_names,
+        );
+        // Legacy: skills/
+        load_skills_from_dir(
+            &root.join("skills"),
+            SkillSource::Project, &mut skills, &mut seen_names,
+        );
     }
 
-    // 2. Personal skills (~/.intendant/skills/)
+    // 2. Personal skills (standard path first, then legacy)
     if let Some(home) = dirs::home_dir() {
-        let skills_dir = home.join(".intendant").join("skills");
-        load_skills_from_dir(&skills_dir, SkillSource::Personal, &mut skills, &mut seen_names);
+        // Standard: ~/.agents/skills/
+        load_skills_from_dir(
+            &home.join(".agents").join("skills"),
+            SkillSource::Personal, &mut skills, &mut seen_names,
+        );
+        // Legacy: ~/.intendant/skills/
+        load_skills_from_dir(
+            &home.join(".intendant").join("skills"),
+            SkillSource::Personal, &mut skills, &mut seen_names,
+        );
     }
 
     skills
@@ -416,7 +441,7 @@ Instructions here.
     }
 
     #[test]
-    fn discover_skills_project() {
+    fn discover_skills_project_legacy() {
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp
             .path()
@@ -430,6 +455,44 @@ Instructions here.
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].config.name, "lint");
         assert_eq!(skills[0].source, SkillSource::Project);
+    }
+
+    #[test]
+    fn discover_skills_standard_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+
+        let skills = discover_skills(Some(tmp.path()));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].config.name, "lint");
+        assert_eq!(skills[0].source, SkillSource::Project);
+    }
+
+    #[test]
+    fn discover_skills_standard_takes_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Same skill name in both standard and legacy paths
+        let standard_dir = tmp.path().join(".agents").join("skills").join("lint");
+        std::fs::create_dir_all(&standard_dir).unwrap();
+        std::fs::write(standard_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+
+        // Legacy path has the same skill name ("lint")
+        let legacy_dir = tmp.path().join(".intendant").join("skills").join("lint");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+
+        let skills = discover_skills(Some(tmp.path()));
+        // Standard path wins — only 1 skill loaded, from .agents/skills/
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].config.name, "lint");
+        assert!(skills[0].source_path.to_string_lossy().contains(".agents"));
     }
 
     #[test]

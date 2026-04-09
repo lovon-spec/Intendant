@@ -103,6 +103,12 @@ pub struct McpAppState {
     pub presence_tokens: u64,
     pub presence_context_window: u64,
     pub presence_usage_pct: f64,
+    /// Frame registry for display frame access.
+    pub frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
+    /// Display session registry for CU action dispatch.
+    pub session_registry: Option<crate::display::SharedSessionRegistry>,
+    /// Directory for screenshot output.
+    pub screenshot_dir: Option<std::path::PathBuf>,
 }
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
@@ -150,6 +156,9 @@ impl McpAppState {
             presence_tokens: 0,
             presence_context_window: 0,
             presence_usage_pct: 0.0,
+            frame_registry: None,
+            session_registry: None,
+            screenshot_dir: None,
         }
     }
 
@@ -2255,6 +2264,59 @@ pub struct StartTaskParams {
     /// CU-capable model instead of the regular agent loop.
     #[serde(default)]
     pub reference_frame_ids: Vec<String>,
+    /// Explicit display target for CU tasks: "user_session", ":99", etc.
+    #[serde(default)]
+    pub display_target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TakeDisplayParams {
+    /// Display ID to claim (e.g. 99 for virtual display :99).
+    pub display_id: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReleaseDisplayParams {
+    /// Display ID to release.
+    pub display_id: u32,
+    /// Optional note explaining why control was released.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TakeScreenshotParams {
+    /// Display target: "user_session", ":99", etc. Auto-detects if omitted.
+    #[serde(default)]
+    pub display_target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExecuteCuActionsParams {
+    /// Array of computer-use actions to execute.
+    pub actions: Vec<serde_json::Value>,
+    /// Display target. Auto-detects if omitted.
+    #[serde(default)]
+    pub display_target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListFramesParams {
+    /// Filter by stream name (e.g. "display_99", "display_user_session").
+    #[serde(default)]
+    pub stream: Option<String>,
+    /// Maximum number of frames to return. Default: 20.
+    #[serde(default)]
+    pub count: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadFrameParams {
+    /// Frame ID to read. Use "latest" for the most recent frame.
+    pub frame_id: String,
+    /// Stream filter (used when frame_id is "latest").
+    #[serde(default)]
+    pub stream: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2364,6 +2426,117 @@ impl IntendantServer {
 
     async fn run_scheduled_controller_restart(&self) -> Result<String, String> {
         run_scheduled_controller_restart_with_state(&self.state, &self.bus).await
+    }
+
+    /// Return MCP tool definitions as JSON for the HTTP transport.
+    pub fn list_tools_json(&self) -> serde_json::Value {
+        let tools: Vec<serde_json::Value> = self.tool_router.list_all()
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": tool.input_schema,
+                })
+            })
+            .collect();
+        serde_json::json!({ "tools": tools })
+    }
+
+    /// Dispatch a tool call by name for the HTTP transport.
+    pub async fn call_tool_by_name(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
+        match name {
+            "get_status" => Ok(self.get_status().await),
+            "get_logs" => {
+                let params: GetLogsParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.get_logs(Parameters(params)).await)
+            }
+            "get_pending_approval" => Ok(self.get_pending_approval().await),
+            "get_pending_input" => Ok(self.get_pending_input().await),
+            "approve" => {
+                let params: ApproveParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.approve(Parameters(params)).await)
+            }
+            "deny" => {
+                let params: DenyParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.deny(Parameters(params)).await)
+            }
+            "skip" => {
+                let params: SkipParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.skip(Parameters(params)).await)
+            }
+            "approve_all" => {
+                let params: ApproveAllParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.approve_all(Parameters(params)).await)
+            }
+            "respond" => {
+                let params: RespondParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.respond(Parameters(params)).await)
+            }
+            "set_autonomy" => {
+                let params: SetAutonomyParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.set_autonomy(Parameters(params)).await)
+            }
+            "set_verbosity" => {
+                let params: SetVerbosityParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.set_verbosity(Parameters(params)).await)
+            }
+            "quit" => Ok(self.quit().await),
+            "start_task" => {
+                let params: StartTaskParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.start_task(Parameters(params)).await)
+            }
+            "schedule_controller_restart" => {
+                let params: ScheduleControllerRestartParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.schedule_controller_restart(Parameters(params)).await)
+            }
+            "controller_turn_complete" => {
+                let params: ControllerTurnCompleteParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.controller_turn_complete(Parameters(params)).await)
+            }
+            "get_restart_status" => Ok(self.get_restart_status().await),
+            "cancel_controller_restart" => {
+                let params: CancelControllerRestartParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.cancel_controller_restart(Parameters(params)).await)
+            }
+            "request_controller_loop_halt" => {
+                let params: RequestControllerLoopHaltParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.request_controller_loop_halt(Parameters(params)).await)
+            }
+            "clear_controller_loop_halt" => Ok(self.clear_controller_loop_halt().await),
+            "intervene_controller_loop" => {
+                let params: InterveneControllerLoopParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.intervene_controller_loop(Parameters(params)).await)
+            }
+            "get_controller_loop_status" => Ok(self.get_controller_loop_status().await),
+            "reload" => Ok(self.reload().await),
+            "list_displays" => Ok(self.list_displays().await),
+            "take_display" => {
+                let params: TakeDisplayParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.take_display(Parameters(params)).await)
+            }
+            "release_display" => {
+                let params: ReleaseDisplayParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.release_display(Parameters(params)).await)
+            }
+            "take_screenshot" => {
+                let params: TakeScreenshotParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.take_screenshot(Parameters(params)).await)
+            }
+            "execute_cu_actions" => {
+                let params: ExecuteCuActionsParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.execute_cu_actions(Parameters(params)).await)
+            }
+            "list_frames" => {
+                let params: ListFramesParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.list_frames(Parameters(params)).await)
+            }
+            "read_frame" => {
+                let params: ReadFrameParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(self.read_frame(Parameters(params)).await)
+            }
+            _ => Err(format!("Unknown tool: {}", name)),
+        }
     }
 }
 
@@ -2675,13 +2848,13 @@ impl IntendantServer {
     async fn start_task(&self, Parameters(params): Parameters<StartTaskParams>) -> String {
         // If reference_frame_ids are present, dispatch as a CU task via ControlMsg
         // so the main loop can route it to the ephemeral CU runner.
-        if !params.reference_frame_ids.is_empty() {
+        if !params.reference_frame_ids.is_empty() || params.display_target.is_some() {
             self.bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
                 task: params.task,
                 orchestrate: params.orchestrate,
                 direct: None,
                 reference_frame_ids: params.reference_frame_ids,
-                display_target: None,
+                display_target: params.display_target,
             }));
             return "ok (CU task dispatched)".to_string();
         }
@@ -3072,6 +3245,210 @@ impl IntendantServer {
         });
 
         "ok - reloading in-place (MCP connection preserved)".to_string()
+    }
+
+    #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
+    async fn list_displays(&self) -> String {
+        let displays = crate::display::enumerate_displays().await;
+        serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    #[tool(description = "Claim control of a virtual display by ID (e.g. 99 for :99).")]
+    async fn take_display(
+        &self,
+        Parameters(params): Parameters<TakeDisplayParams>,
+    ) -> String {
+        self.bus.send(AppEvent::DisplayTaken {
+            display_id: params.display_id,
+        });
+        format!("Took control of :{}", params.display_id)
+    }
+
+    #[tool(description = "Release control of a virtual display.")]
+    async fn release_display(
+        &self,
+        Parameters(params): Parameters<ReleaseDisplayParams>,
+    ) -> String {
+        self.bus.send(AppEvent::DisplayReleased {
+            display_id: params.display_id,
+            note: params.note.clone(),
+        });
+        format!("Released control of :{}", params.display_id)
+    }
+
+    #[tool(description = "Take a screenshot of a display. Returns base64-encoded image data.")]
+    async fn take_screenshot(
+        &self,
+        Parameters(params): Parameters<TakeScreenshotParams>,
+    ) -> String {
+        use crate::computer_use::{CuAction, DisplayBackend, execute_actions};
+
+        let target = resolve_display_target(params.display_target.as_deref());
+        let backend = DisplayBackend::detect();
+
+        let state = self.state.read().await;
+        let screenshot_dir = state.screenshot_dir.clone()
+            .unwrap_or_else(|| state.log_dir.join("screenshots"));
+        let session_registry = state.session_registry.clone();
+        drop(state);
+
+        let _ = std::fs::create_dir_all(&screenshot_dir);
+        let mut counter = 0u64;
+        let results = execute_actions(
+            &[CuAction::Screenshot],
+            target,
+            backend,
+            &screenshot_dir,
+            &mut counter,
+            &session_registry,
+        ).await;
+
+        if let Some(result) = results.first() {
+            if let Some(ref screenshot) = result.screenshot {
+                // screenshot.base64_png is already base64-encoded
+                return format!("data:image/png;base64,{}", screenshot.base64_png);
+            }
+            if let Some(ref err) = result.error {
+                return format!("Screenshot error: {}", err);
+            }
+        }
+
+        "No screenshot result".to_string()
+    }
+
+    #[tool(description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns results.")]
+    async fn execute_cu_actions(
+        &self,
+        Parameters(params): Parameters<ExecuteCuActionsParams>,
+    ) -> String {
+        use crate::computer_use::{CuAction, DisplayBackend, execute_actions};
+
+        // Parse actions from JSON values
+        let actions: Vec<CuAction> = match params.actions.iter()
+            .map(|v| serde_json::from_value::<CuAction>(v.clone()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(a) => a,
+            Err(e) => return format!("Failed to parse actions: {}", e),
+        };
+
+        if actions.is_empty() {
+            return "No actions provided".to_string();
+        }
+
+        let target = resolve_display_target(params.display_target.as_deref());
+        let backend = DisplayBackend::detect();
+
+        let state = self.state.read().await;
+        let screenshot_dir = state.screenshot_dir.clone()
+            .unwrap_or_else(|| state.log_dir.join("screenshots"));
+        let session_registry = state.session_registry.clone();
+        drop(state);
+
+        let _ = std::fs::create_dir_all(&screenshot_dir);
+        let mut counter = 0u64;
+        let results = execute_actions(
+            &actions,
+            target,
+            backend,
+            &screenshot_dir,
+            &mut counter,
+            &session_registry,
+        ).await;
+
+        // Format results
+        let result_summaries: Vec<String> = results.iter().enumerate().map(|(i, r)| {
+            let status = if r.error.is_some() { "failed" } else { "ok" };
+            let detail = r.error.as_deref().unwrap_or("");
+            let screenshot_info = r.screenshot.as_ref()
+                .map(|s| format!(", screenshot: {}", s.path.display()))
+                .unwrap_or_default();
+            format!("action[{}]: {}{}{}", i, status, if detail.is_empty() { "" } else { ": " }, detail.to_string() + &screenshot_info)
+        }).collect();
+
+        result_summaries.join("\n")
+    }
+
+    #[tool(description = "List available display frames with metadata. Frames are captured from display streams.")]
+    async fn list_frames(
+        &self,
+        Parameters(params): Parameters<ListFramesParams>,
+    ) -> String {
+        let state = self.state.read().await;
+        let registry = match &state.frame_registry {
+            Some(r) => r.clone(),
+            None => return "Frame registry not available".to_string(),
+        };
+        drop(state);
+
+        let reg = registry.read().await;
+        let count = params.count.unwrap_or(20);
+        let frames = reg.query(params.stream.as_deref(), count);
+
+        if frames.is_empty() {
+            let streams = reg.active_streams();
+            if streams.is_empty() {
+                return "No frames available. No active display streams.".to_string();
+            }
+            return format!("No frames matching filter. Active streams: {}", streams.join(", "));
+        }
+
+        crate::frames::FrameRegistry::format_frame_list(&frames)
+    }
+
+    #[tool(description = "Read a specific frame's image data as base64-encoded JPEG. Use frame_id='latest' for the most recent.")]
+    async fn read_frame(
+        &self,
+        Parameters(params): Parameters<ReadFrameParams>,
+    ) -> String {
+        use base64::Engine;
+
+        let state = self.state.read().await;
+        let registry = match &state.frame_registry {
+            Some(r) => r.clone(),
+            None => return "Frame registry not available".to_string(),
+        };
+        drop(state);
+
+        let reg = registry.read().await;
+
+        let frame_id = if params.frame_id == "latest" {
+            match reg.latest(params.stream.as_deref()) {
+                Some(id) => id.to_string(),
+                None => return "No frames available".to_string(),
+            }
+        } else {
+            params.frame_id.clone()
+        };
+
+        match reg.read_hq(&frame_id) {
+            Ok(data) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                format!("data:image/jpeg;base64,{}", b64)
+            }
+            Err(e) => format!("Error reading frame '{}': {}", frame_id, e),
+        }
+    }
+}
+
+fn resolve_display_target(target: Option<&str>) -> crate::computer_use::DisplayTarget {
+    use crate::computer_use::DisplayTarget;
+    match target {
+        Some("user_session") | Some("user") | Some(":0") | Some("0") => {
+            DisplayTarget::UserSession
+        }
+        Some(s) if s.starts_with(':') => {
+            let id: u32 = s[1..].parse().unwrap_or(99);
+            DisplayTarget::Virtual { id }
+        }
+        Some(s) => {
+            let id: u32 = s.parse().unwrap_or(99);
+            DisplayTarget::Virtual { id }
+        }
+        None => {
+            // Default: first virtual display
+            DisplayTarget::Virtual { id: 99 }
+        }
     }
 }
 
