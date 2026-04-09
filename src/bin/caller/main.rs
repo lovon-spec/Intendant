@@ -1992,9 +1992,28 @@ async fn run_agent_loop(
             }
         }
 
+        // For CU-only turns, synthesize a content summary from the actions
+        let display_content = if response.content.is_empty() && has_cu_calls {
+            let descs: Vec<String> = response.cu_calls.iter().flat_map(|cu| {
+                cu.actions.iter().map(|a| match a {
+                    computer_use::CuAction::Click { x, y, .. } => format!("click({},{})", x, y),
+                    computer_use::CuAction::DoubleClick { x, y, .. } => format!("double_click({},{})", x, y),
+                    computer_use::CuAction::Type { text } => format!("type(\"{}\")", &text[..text.len().min(30)]),
+                    computer_use::CuAction::Key { key } => format!("key({})", key),
+                    computer_use::CuAction::Scroll { x, y, .. } => format!("scroll({},{})", x, y),
+                    computer_use::CuAction::Screenshot => "screenshot".to_string(),
+                    computer_use::CuAction::Wait { .. } => "wait".to_string(),
+                    _ => format!("{:?}", a),
+                })
+            }).collect();
+            descs.join(" → ")
+        } else {
+            response.content.clone()
+        };
+
         bus.send(AppEvent::ModelResponse {
             turn,
-            content: response.content.clone(),
+            content: display_content,
             usage: response.usage.clone(),
             reasoning: response.reasoning_summary.clone(),
         });
@@ -4801,13 +4820,22 @@ async fn execute_cu_calls(
     };
 
     for cu_call in cu_calls {
-        slog(session_log, |l| {
-            l.info(&format!(
-                "CU: executing {} action(s) for call {}",
-                cu_call.actions.len(),
-                cu_call.call_id
-            ))
-        });
+        // Build human-readable description of CU actions
+        let action_descs: Vec<String> = cu_call.actions.iter().map(|a| {
+            match a {
+                computer_use::CuAction::Click { x, y, button } => format!("click({},{} {:?})", x, y, button),
+                computer_use::CuAction::DoubleClick { x, y, .. } => format!("double_click({},{})", x, y),
+                computer_use::CuAction::Type { text } => format!("type(\"{}\")", &text[..text.len().min(50)]),
+                computer_use::CuAction::Key { key } => format!("key({})", key),
+                computer_use::CuAction::Scroll { x, y, direction, amount } => format!("scroll({},{} {:?} {})", x, y, direction, amount),
+                computer_use::CuAction::MoveMouse { x, y } => format!("move({},{})", x, y),
+                computer_use::CuAction::Drag { start_x, start_y, end_x, end_y } => format!("drag({},{}->{},{})", start_x, start_y, end_x, end_y),
+                computer_use::CuAction::Screenshot => "screenshot".to_string(),
+                computer_use::CuAction::Wait { ms } => format!("wait({}ms)", ms),
+            }
+        }).collect();
+        let desc = action_descs.join(" → ");
+        slog(session_log, |l| l.info(&format!("CU: {}", desc)));
 
         let backend = computer_use::DisplayBackend::detect();
         let results = computer_use::execute_actions(
