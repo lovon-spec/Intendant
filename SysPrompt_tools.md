@@ -12,10 +12,8 @@ Example: If nonce `10` starts a server, `kill -9 $NONCE[10]` kills that specific
 
 ## Skills
 
-When the user mentions a skill by name (e.g. "use the X skill"), call
-`invoke_skill` immediately with that skill name. Do NOT read source code
-or research how the skill works — the skill's own instructions will be
-loaded when you invoke it. Follow them step by step.
+When a task matches an available skill, call `invoke_skill` immediately.
+The skill's instructions will be loaded — follow them step by step.
 
 ## Computer Use
 
