@@ -1072,16 +1072,9 @@ fn build_openai_request_parts(
         tools_vec.extend(defs.iter().map(|t| t.to_openai()));
     }
     if provider.cu_enabled {
-        if let Some((w, h)) = provider.cu_display {
-            tools_vec.push(serde_json::json!({
-                "type": "computer_use_preview",
-                "display_width": w,
-                "display_height": h,
-                "environment": if cfg!(target_os = "macos") { "mac" }
-                    else if cfg!(target_os = "windows") { "windows" }
-                    else { "linux" }
-            }));
-        }
+        tools_vec.push(serde_json::json!({
+            "type": "computer"
+        }));
     }
     let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
 

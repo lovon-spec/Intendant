@@ -3447,19 +3447,7 @@ async fn run_with_presence(
                     continue;
                 }
             };
-
-            // Enable CU on this provider if display is accessible
-            if vision::is_display_accessible() || cfg!(target_os = "macos") {
-                let display_id = std::env::var("DISPLAY")
-                    .ok()
-                    .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
-                    .unwrap_or(0);
-                let (w, h) = query_display_resolution(display_id);
-                if w > 0 && h > 0 {
-                    task_provider.set_cu_enabled(true);
-                    task_provider.set_cu_display((w, h));
-                }
-            }
+            task_provider.set_cu_enabled(true);
 
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -3862,6 +3850,7 @@ async fn run_user_mode(
 async fn run_direct_mode(
     mut provider: Box<dyn provider::ChatProvider>,
     task: String,
+
     project: Project,
     bus: EventBus,
     autonomy: SharedAutonomy,
@@ -3935,23 +3924,9 @@ async fn run_direct_mode(
         tools::register_extra_tools(mgr.all_tools());
     }
 
-    // Enable native CU on the main provider when a display is accessible.
-    // This gives the model structured click/type/scroll tools instead of
-    // requiring ad-hoc `exec cliclick` commands.
-    if vision::is_display_accessible() || cfg!(target_os = "macos") {
-        let display_id = std::env::var("DISPLAY")
-            .ok()
-            .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
-            .unwrap_or(0);
-        let (w, h) = query_display_resolution(display_id);
-        if w > 0 && h > 0 {
-            provider.set_cu_enabled(true);
-            provider.set_cu_display((w, h));
-            slog(&session_log, |l| {
-                l.info(&format!("CU enabled on main agent ({}x{})", w, h))
-            });
-        }
-    }
+    // Enable native CU on the main provider. The "computer" tool type
+    // requires no display dimensions — the model infers from screenshots.
+    provider.set_cu_enabled(true);
 
     if headless {
         println!("Task: {}", task);
