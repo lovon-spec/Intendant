@@ -100,7 +100,8 @@ type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<RequestResult>>>>;
 
 /// Maps our synthetic `request_id` strings back to the JSON-RPC `id` from
 /// server-initiated approval requests.
-type PendingApprovals = Arc<Mutex<HashMap<String, u64>>>;
+/// Stores (jsonrpc_id, method) so resolve_approval knows the response format.
+type PendingApprovals = Arc<Mutex<HashMap<String, (u64, String)>>>;
 
 // ---------------------------------------------------------------------------
 // CodexAgent
@@ -309,7 +310,7 @@ async fn reader_task(
             pending_approvals
                 .lock()
                 .await
-                .insert(request_id.clone(), jsonrpc_id);
+                .insert(request_id.clone(), (jsonrpc_id, method.to_string()));
 
             let params = msg.params.unwrap_or(serde_json::Value::Null);
 
@@ -414,17 +415,28 @@ fn translate_notification(
                 }
                 "mcpToolCall" => {
                     // Codex is calling an MCP tool (e.g. spawn_live_audio, take_screenshot).
-                    // The MCP server handles execution; we just surface it in the Activity tab.
                     let tool_name = params
                         .pointer("/item/name")
                         .or_else(|| params.pointer("/item/toolName"))
+                        .or_else(|| params.pointer("/item/serverLabel"))
+                        .or_else(|| params.pointer("/item/arguments/name"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("mcp_tool")
                         .to_string();
+                    let server = params
+                        .pointer("/item/serverName")
+                        .or_else(|| params.pointer("/item/server"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let preview = if server.is_empty() {
+                        tool_name.clone()
+                    } else {
+                        format!("{}:{}", server, tool_name)
+                    };
                     let _ = event_tx.send(AgentEvent::ToolStarted {
                         item_id,
-                        tool_name: format!("mcp:{}", tool_name),
-                        preview: String::new(),
+                        tool_name: "mcp".to_string(),
+                        preview,
                     });
                 }
                 other => {
@@ -768,7 +780,7 @@ impl ExternalAgent for CodexAgent {
         request_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), CallerError> {
-        let jsonrpc_id = self
+        let (jsonrpc_id, method) = self
             .pending_approvals
             .lock()
             .await
@@ -780,15 +792,25 @@ impl ExternalAgent for CodexAgent {
                 ))
             })?;
 
-        let decision_str = match decision {
-            ApprovalDecision::Accept => "accept",
-            ApprovalDecision::AcceptForSession => "acceptForSession",
-            ApprovalDecision::Decline => "decline",
-            ApprovalDecision::Cancel => "cancel",
+        // MCP elicitation requests use {"action": "allow/deny"} format.
+        // Command/file approval requests use {"decision": "accept/decline"} format.
+        let result = if method.contains("mcpServer") || method.contains("elicit") {
+            let action = match decision {
+                ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => "accept",
+                ApprovalDecision::Decline | ApprovalDecision::Cancel => "decline",
+            };
+            serde_json::json!({ "action": action, "content": {} })
+        } else {
+            let decision_str = match decision {
+                ApprovalDecision::Accept => "accept",
+                ApprovalDecision::AcceptForSession => "acceptForSession",
+                ApprovalDecision::Decline => "decline",
+                ApprovalDecision::Cancel => "cancel",
+            };
+            serde_json::json!({ "decision": decision_str })
         };
 
-        self.send_response(jsonrpc_id, serde_json::json!({ "decision": decision_str }))
-            .await
+        self.send_response(jsonrpc_id, result).await
     }
 
     async fn shutdown(&mut self) -> Result<(), CallerError> {
