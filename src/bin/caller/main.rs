@@ -4928,18 +4928,43 @@ async fn activate_user_display(
                 std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
             }
         }
+        eprintln!(
+            "[user_display] Requesting Wayland screen capture via XDG portal..."
+        );
+        eprintln!(
+            "[user_display] A screen-sharing dialog should appear on the display — \
+             approve it to enable video capture"
+        );
         let backend = display::wayland::WaylandBackend::new();
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
-        if let Err(e) = session.start(30, frame_registry.clone(), Some(bus.clone())).await {
-            eprintln!("[user_display] Failed to start display session: {}", e);
-        } else {
-            // Use the backend's resolution (from portal), not xdpyinfo.
-            let (width, height) = session.resolution();
-            let session = Arc::new(session);
-            session.spawn_metrics_logger(Some(bus.clone()));
-            session_registry.write().await.insert(display_id, session);
-            bus.send(AppEvent::DisplayReady { display_id, width, height });
-            return;
+        // The portal dialog requires user interaction on the physical display.
+        // If the user is accessing intendant remotely (web dashboard, SSH) they
+        // may never see the dialog, so apply a generous timeout to avoid hanging
+        // forever and fall through to X11 capture.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            session.start(30, frame_registry.clone(), Some(bus.clone())),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                // Use the backend's resolution (from portal), not xdpyinfo.
+                let (width, height) = session.resolution();
+                let session = Arc::new(session);
+                session.spawn_metrics_logger(Some(bus.clone()));
+                session_registry.write().await.insert(display_id, session);
+                bus.send(AppEvent::DisplayReady { display_id, width, height });
+                return;
+            }
+            Ok(Err(e)) => {
+                eprintln!("[user_display] Wayland display session failed: {}", e);
+            }
+            Err(_) => {
+                eprintln!(
+                    "[user_display] Wayland portal timed out after 45s \
+                     (screen-sharing dialog was not approved), trying X11"
+                );
+            }
         }
     }
 
