@@ -10,7 +10,9 @@ if %errorlevel% neq 0 (
 )
 set "PS1=%TEMP%\setup-lan-%RANDOM%%RANDOM%.ps1"
 copy /y "%~f0" "%PS1%" >nul || (echo Failed to copy script to temp & pause & exit /b 1)
-powershell -ExecutionPolicy Bypass -NoProfile -File "%PS1%" -ScriptDir "%~dp0" %*
+set "SDIR=%~dp0"
+if "%SDIR:~-1%"=="\" set "SDIR=%SDIR:~0,-1%"
+powershell -ExecutionPolicy Bypass -NoProfile -File "%PS1%" -ScriptDir "%SDIR%" %*
 del "%PS1%" >nul 2>&1
 pause
 exit /b
