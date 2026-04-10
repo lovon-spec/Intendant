@@ -3472,12 +3472,10 @@ pub fn spawn_web_gateway(
                                 body_owned = full;
                                 &body_owned
                             };
-                            eprintln!("[mcp] POST /mcp body: {}", body_text);
                             let outcome = handle_mcp_http_request(body_text, mcp).await;
                             let http_response = match outcome {
                                 McpHttpOutcome::Response(resp) => {
                                     let json = serde_json::to_string(&resp).unwrap_or_default();
-                                    eprintln!("[mcp] -> 200 OK ({}B): {}", json.len(), json);
                                     format!(
                                         "HTTP/1.1 200 OK\r\n\
                                          Content-Type: application/json\r\n\
@@ -3490,7 +3488,6 @@ pub fn spawn_web_gateway(
                                     )
                                 }
                                 McpHttpOutcome::Accepted => {
-                                    eprintln!("[mcp] -> 202 Accepted (notification)");
                                     "HTTP/1.1 202 Accepted\r\n\
                                      Access-Control-Allow-Origin: *\r\n\
                                      Content-Length: 0\r\n\
@@ -3517,8 +3514,6 @@ pub fn spawn_web_gateway(
                         // are not supported by our stateless endpoint.  Return 405 so rmcp
                         // gracefully falls back (skips SSE / ignores session delete).
                         use tokio::io::AsyncWriteExt;
-                        let method = if request_line.starts_with("GET") { "GET" } else { "DELETE" };
-                        eprintln!("[mcp] {} /mcp -> 405 Method Not Allowed", method);
                         let http = "HTTP/1.1 405 Method Not Allowed\r\n\
                                     Access-Control-Allow-Origin: *\r\n\
                                     Content-Length: 0\r\n\

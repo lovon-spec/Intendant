@@ -23,18 +23,19 @@ Compose the `spawn_live_audio` arguments (playbook, response_schema,
 timeout_secs, voice, id) BEFORE you start the call. You will need them
 ready to fire instantly once the call connects.
 
-Mark all data fields you need to collect as `required: true` in the
-schema. The voice model cannot submit until all required fields are
-filled — this prevents premature hangups.
+Mark data fields as `required: true` only if they MUST be collected.
+Fields that might not always be obtainable (quotes, optional details)
+should be `required: false`. The voice model cannot submit until all
+required fields are filled.
 
-### 2. Navigate to the app and click call
+If the callee speaks a specific language, state it in the playbook
+(e.g. "Speak in English only"). Otherwise the voice model may pick a
+language based on context clues.
 
-Use your native CU actions to navigate the screen. Take a screenshot,
-find the app in the dock, click to foreground it, navigate to the
-contact, and click the call button.
+### 2. Navigate to the app and click call + spawn_live_audio together
 
-Do NOT use exec commands for GUI navigation. Use your built-in
-click, type, scroll, and screenshot actions for everything visual.
+Use CU actions to navigate the screen. Take a screenshot, find the app,
+click to foreground it, navigate to the contact, and click the call button.
 
 **Element-specific:** When you click the phone icon, a dropdown asks
 "Voice call using: Element Call / Legacy call". Always pick **Legacy call**
@@ -43,8 +44,10 @@ party to manually join; Legacy call rings their device directly.
 
 ### 3. Call spawn_live_audio
 
-After clicking the call button, call `spawn_live_audio` with the
-arguments you prepared in step 1.
+Call `spawn_live_audio` with the arguments you prepared in step 1.
+If your tools support multiple calls in one turn, combine the
+Legacy Call click and spawn_live_audio in the same turn to minimize
+dead air.
 
 **ALL of these parameters are REQUIRED:**
 - `id`: unique session identifier
