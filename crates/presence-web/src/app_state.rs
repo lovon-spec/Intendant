@@ -1216,7 +1216,7 @@ pub fn format_agent_output(raw: &str) -> FormattedOutput {
                         if let Some(data) = block.get("data").and_then(|v| v.as_str()) {
                             has_mcp_blocks = true;
                             // Base64 image — extract separately for lazy loading
-                            if data.len() > 100 {
+                            if data.len() > 20 {
                                 images.push(data.to_string());
                             }
                         }

@@ -7,16 +7,18 @@
 //!
 //! JavaScript surface shrinks to: xterm.js, DOM updates, audio capture/playback.
 
-mod callbacks;
-mod gemini;
-mod openai;
-mod server;
+// app_state is pure Rust (no WASM deps) — available on all targets for testing.
 pub mod app_state;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use callbacks::Callbacks;
+// Everything below is WASM-only: browser WebSocket transport, voice providers, bindings.
+#[cfg(target_arch = "wasm32")]
+mod callbacks;
+#[cfg(target_arch = "wasm32")]
+mod gemini;
+#[cfg(target_arch = "wasm32")]
+mod openai;
+#[cfg(target_arch = "wasm32")]
+mod server;
 
 /// Provider-agnostic live model usage snapshot.
 /// Both Gemini Live and OpenAI Realtime map their provider-specific
@@ -34,6 +36,13 @@ pub struct LiveUsage {
     /// Thinking/reasoning tokens (model-dependent, 0 if not applicable).
     pub thinking_tokens: u64,
 }
+
+#[cfg(target_arch = "wasm32")]
+mod wasm_impl {
+use super::*;
+use std::cell::RefCell;
+use std::rc::Rc;
+use callbacks::Callbacks;
 use js_sys::Function;
 use presence_core::wasm::WasmPresence;
 use presence_core::PresenceAction;
@@ -1026,3 +1035,4 @@ impl PresenceWeb {
         self.server.borrow().send_json(&msg);
     }
 }
+} // mod wasm_impl
