@@ -3388,17 +3388,29 @@ impl IntendantServer {
             &session_registry,
         ).await;
 
-        // Format results
-        let result_summaries: Vec<String> = results.iter().enumerate().map(|(i, r)| {
+        // Format results — include the last screenshot as base64 so the caller
+        // can see the display state after actions without a separate take_screenshot call.
+        let mut summaries = Vec::new();
+        for (i, r) in results.iter().enumerate() {
             let status = if r.error.is_some() { "failed" } else { "ok" };
             let detail = r.error.as_deref().unwrap_or("");
-            let screenshot_info = r.screenshot.as_ref()
-                .map(|s| format!(", screenshot: {}", s.path.display()))
-                .unwrap_or_default();
-            format!("action[{}]: {}{}{}", i, status, if detail.is_empty() { "" } else { ": " }, detail.to_string() + &screenshot_info)
-        }).collect();
+            if detail.is_empty() {
+                summaries.push(format!("action[{}]: {}", i, status));
+            } else {
+                summaries.push(format!("action[{}]: {}: {}", i, status, detail));
+            }
+        }
 
-        result_summaries.join("\n")
+        // Attach the last screenshot inline
+        let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
+        if let Some(ss) = last_screenshot {
+            summaries.push(format!(
+                "screenshot: data:image/png;base64,{}",
+                ss.base64_png
+            ));
+        }
+
+        summaries.join("\n")
     }
 
     #[tool(description = "List available display frames with metadata. Frames are captured from display streams.")]
