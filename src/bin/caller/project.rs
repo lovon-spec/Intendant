@@ -115,6 +115,9 @@ pub struct ExternalAgentConfig {
     /// Claude Code settings.
     #[serde(default)]
     pub claude_code: ClaudeCodeConfig,
+    /// Gemini CLI settings.
+    #[serde(default)]
+    pub gemini_cli: GeminiCliConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +190,29 @@ impl Default for ClaudeCodeConfig {
             model: None,
             permission_mode: default_claude_code_permission_mode(),
             allowed_tools: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiCliConfig {
+    /// Command to run Gemini CLI. Default: "gemini".
+    #[serde(default = "default_gemini_cli_command")]
+    pub command: String,
+    /// Model to use (e.g. "gemini-2.5-pro").
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+fn default_gemini_cli_command() -> String {
+    "gemini".to_string()
+}
+
+impl Default for GeminiCliConfig {
+    fn default() -> Self {
+        Self {
+            command: default_gemini_cli_command(),
+            model: None,
         }
     }
 }

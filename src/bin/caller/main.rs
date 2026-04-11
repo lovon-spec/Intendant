@@ -3561,6 +3561,20 @@ async fn run_with_presence(
                         };
                         (agent, config)
                     }
+                    AgentBackend::GeminiCli => {
+                        let cfg = &proj.config.agent.gemini_cli;
+                        let agent = Box::new(external_agent::gemini::GeminiAgent::new(
+                            cfg.command.clone(), cfg.model.clone(), web_port,
+                        ));
+                        let config = AgentConfig {
+                            model: cfg.model.clone(),
+                            working_dir: proj.root.clone(),
+                            approval_policy: String::new(),
+                            sandbox: false,
+                            web_port,
+                        };
+                        (agent, config)
+                    }
                     AgentBackend::ClaudeCode => {
                         bus.send(AppEvent::PresenceLog {
                             message: "Claude Code backend not yet implemented".into(),
@@ -4302,6 +4316,22 @@ async fn run_external_agent_mode(
                 working_dir: project.root.clone(),
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: cfg.sandbox != "danger-full-access",
+                web_port,
+            };
+            (agent, config)
+        }
+        AgentBackend::GeminiCli => {
+            let cfg = &project.config.agent.gemini_cli;
+            let agent = Box::new(external_agent::gemini::GeminiAgent::new(
+                cfg.command.clone(),
+                cfg.model.clone(),
+                web_port,
+            ));
+            let config = AgentConfig {
+                model: cfg.model.clone(),
+                working_dir: project.root.clone(),
+                approval_policy: String::new(),
+                sandbox: false,
                 web_port,
             };
             (agent, config)

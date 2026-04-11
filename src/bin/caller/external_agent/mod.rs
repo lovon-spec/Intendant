@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 pub mod codex;
+pub mod gemini;
 
 /// Identifies which external agent backend is in use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,6 +13,7 @@ pub mod codex;
 pub enum AgentBackend {
     Codex,
     ClaudeCode,
+    GeminiCli,
 }
 
 impl AgentBackend {
@@ -19,6 +21,7 @@ impl AgentBackend {
         match s.to_lowercase().as_str() {
             "codex" => Some(Self::Codex),
             "claude-code" | "claude_code" | "claudecode" | "cc" => Some(Self::ClaudeCode),
+            "gemini" | "gemini-cli" | "gemini_cli" => Some(Self::GeminiCli),
             _ => None,
         }
     }
@@ -29,6 +32,7 @@ impl std::fmt::Display for AgentBackend {
         match self {
             AgentBackend::Codex => write!(f, "Codex"),
             AgentBackend::ClaudeCode => write!(f, "Claude Code"),
+            AgentBackend::GeminiCli => write!(f, "Gemini CLI"),
         }
     }
 }
@@ -200,10 +204,29 @@ mod tests {
     }
 
     #[test]
+    fn from_str_loose_gemini_variants() {
+        assert_eq!(
+            AgentBackend::from_str_loose("gemini"),
+            Some(AgentBackend::GeminiCli)
+        );
+        assert_eq!(
+            AgentBackend::from_str_loose("gemini-cli"),
+            Some(AgentBackend::GeminiCli)
+        );
+        assert_eq!(
+            AgentBackend::from_str_loose("gemini_cli"),
+            Some(AgentBackend::GeminiCli)
+        );
+        assert_eq!(
+            AgentBackend::from_str_loose("GEMINI"),
+            Some(AgentBackend::GeminiCli)
+        );
+    }
+
+    #[test]
     fn from_str_loose_invalid() {
         assert_eq!(AgentBackend::from_str_loose(""), None);
         assert_eq!(AgentBackend::from_str_loose("gpt"), None);
-        assert_eq!(AgentBackend::from_str_loose("gemini"), None);
         assert_eq!(AgentBackend::from_str_loose("claude"), None);
     }
 
@@ -211,6 +234,7 @@ mod tests {
     fn display_impl() {
         assert_eq!(format!("{}", AgentBackend::Codex), "Codex");
         assert_eq!(format!("{}", AgentBackend::ClaudeCode), "Claude Code");
+        assert_eq!(format!("{}", AgentBackend::GeminiCli), "Gemini CLI");
     }
 
     #[test]
@@ -226,5 +250,11 @@ mod tests {
 
         let parsed: AgentBackend = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, AgentBackend::ClaudeCode);
+
+        let json = serde_json::to_string(&AgentBackend::GeminiCli).unwrap();
+        assert_eq!(json, r#""gemini_cli""#);
+
+        let parsed: AgentBackend = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, AgentBackend::GeminiCli);
     }
 }
