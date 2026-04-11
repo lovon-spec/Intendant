@@ -407,6 +407,63 @@ struct PermissionOption_ {
 }
 
 /// Extract human-readable text from a `ToolCallContent` block.
+/// Format ACP tool content blocks as MCP-style JSON so the WASM Activity tab
+/// can extract text and base64 images (for lazy-loaded screenshot rendering).
+/// Output format: `{"content":[{"text":"...","type":"text"},{"data":"...","type":"image","mimeType":"image/png"}]}`
+fn format_tool_content_blocks(blocks: &[ToolCallContent]) -> String {
+    let mut json_blocks = Vec::new();
+    let mut has_image = false;
+
+    for block in blocks {
+        match block {
+            ToolCallContent::Content(c) => match &c.content {
+                ContentBlock::Text(t) if !t.text.is_empty() => {
+                    json_blocks.push(serde_json::json!({"text": t.text, "type": "text"}));
+                }
+                ContentBlock::Image(img) if !img.data.is_empty() => {
+                    json_blocks.push(serde_json::json!({
+                        "data": img.data,
+                        "type": "image",
+                        "mimeType": img.mime_type,
+                    }));
+                    has_image = true;
+                }
+                _ => {}
+            },
+            ToolCallContent::Diff(d) => {
+                let text = format!(
+                    "diff {}: {} -> {} bytes",
+                    d.path.display(),
+                    d.old_text.as_ref().map(|t| t.len()).unwrap_or(0),
+                    d.new_text.len()
+                );
+                json_blocks.push(serde_json::json!({"text": text, "type": "text"}));
+            }
+            ToolCallContent::Terminal(t) => {
+                json_blocks.push(serde_json::json!({"text": format!("[terminal {}]", t.terminal_id), "type": "text"}));
+            }
+            _ => {}
+        }
+    }
+
+    if json_blocks.is_empty() {
+        return String::new();
+    }
+
+    // Only wrap in MCP JSON if there are images (so WASM can extract them).
+    // Plain text output stays as plain text for readability.
+    if has_image {
+        serde_json::json!({"content": json_blocks}).to_string()
+    } else {
+        // Collect text blocks as plain lines
+        json_blocks
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 fn extract_tool_content_text(block: &ToolCallContent) -> String {
     match block {
         ToolCallContent::Content(c) => match &c.content {
@@ -495,12 +552,12 @@ fn translate_session_update(update: &SessionUpdate) -> Vec<AgentEvent> {
                 ToolCallStatus::Completed | ToolCallStatus::Failed
             );
             if is_terminal {
-                for block in &tc.content {
-                    let text = extract_tool_content_text(block);
-                    if !text.is_empty() {
+                if !tc.content.is_empty() {
+                    let output = format_tool_content_blocks(&tc.content);
+                    if !output.is_empty() {
                         events.push(AgentEvent::ToolOutputDelta {
                             item_id: item_id.clone(),
-                            text,
+                            text: output,
                         });
                     }
                 }
@@ -527,16 +584,16 @@ fn translate_session_update(update: &SessionUpdate) -> Vec<AgentEvent> {
             let item_id = tcu.tool_call_id.to_string();
             let fields = &tcu.fields;
 
-            // Emit output delta if there's content
+            // Emit output delta if there's content.
+            // Format as MCP-style JSON so the WASM Activity tab can extract
+            // text and images (lazy-loaded screenshots) from the same output.
             if let Some(ref content) = fields.content {
-                for block in content {
-                    let text = extract_tool_content_text(block);
-                    if !text.is_empty() {
-                        events.push(AgentEvent::ToolOutputDelta {
-                            item_id: item_id.clone(),
-                            text,
-                        });
-                    }
+                let output = format_tool_content_blocks(content);
+                if !output.is_empty() {
+                    events.push(AgentEvent::ToolOutputDelta {
+                        item_id: item_id.clone(),
+                        text: output,
+                    });
                 }
             }
 
