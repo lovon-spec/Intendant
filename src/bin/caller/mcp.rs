@@ -2353,10 +2353,32 @@ pub enum McpFieldType {
     },
     Boolean,
     Array {
-        element_type: Box<McpFieldType>,
+        /// Element type for the array. Non-recursive: arrays of arrays are
+        /// not supported in response schemas.
+        element_type: McpArrayElement,
         #[serde(default)]
         max_items: Option<usize>,
     },
+}
+
+/// Non-recursive array element type. Keeps the MCP schema free of self-
+/// referencing `$ref`s so inlining is straightforward.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum McpArrayElement {
+    String {
+        #[serde(default)]
+        max_length: Option<usize>,
+        #[serde(default)]
+        tainted: bool,
+    },
+    Integer {
+        #[serde(default)]
+        min: Option<i64>,
+        #[serde(default)]
+        max: Option<i64>,
+    },
+    Boolean,
 }
 
 fn default_timeout() -> u64 { 300 }
@@ -4077,10 +4099,12 @@ fn inline_schema_refs(schema: &mut serde_json::Value) {
 
 /// Recursively walk a JSON value and replace `{"$ref": "#/$defs/Name"}` or
 /// `{"$ref": "#/definitions/Name"}` with the corresponding definition.
+///
+/// Safe from infinite recursion because our MCP schema types are non-recursive
+/// (McpFieldType uses McpArrayElement for array elements instead of Box<Self>).
 fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, serde_json::Value>) {
     match value {
         serde_json::Value::Object(map) => {
-            // Check if this object is a $ref
             if let Some(ref_val) = map.get("$ref").and_then(|v| v.as_str()).map(String::from) {
                 let name = ref_val
                     .strip_prefix("#/$defs/")
@@ -4088,14 +4112,12 @@ fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, se
                 if let Some(def_name) = name {
                     if let Some(def) = defs.get(def_name) {
                         let mut resolved = def.clone();
-                        // Recursively resolve nested $refs in the inlined definition
                         resolve_refs(&mut resolved, defs);
                         *value = resolved;
                         return;
                     }
                 }
             }
-            // Recurse into all values
             for v in map.values_mut() {
                 resolve_refs(v, defs);
             }

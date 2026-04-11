@@ -470,7 +470,7 @@ impl ExternalAgent for GeminiAgent {
 
         // ACP initialize handshake with 10s timeout
         let init_params = serde_json::json!({
-            "protocolVersion": "1",
+            "protocolVersion": 1,
             "clientInfo": {
                 "name": "intendant",
                 "version": env!("CARGO_PKG_VERSION"),
