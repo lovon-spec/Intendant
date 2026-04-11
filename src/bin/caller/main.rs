@@ -3701,13 +3701,12 @@ async fn run_with_presence(
                             source: agent_source.clone(),
                         });
                     }
-                    Some(external_agent::AgentEvent::ToolStarted { preview, tool_name, .. }) => {
+                    Some(external_agent::AgentEvent::ToolStarted { .. }) => {
+                        // Don't emit AgentStarted for external agents — the
+                        // model reasoning is already shown via ModelResponse,
+                        // and tool results via AgentOutput. Emitting AgentStarted
+                        // duplicates the model text in the Activity tab.
                         turn_in_round += 1;
-                        bus.send(AppEvent::AgentStarted {
-                            turn: cumulative_stats.turns + turn_in_round,
-                            commands_preview: format!("{}: {}", tool_name, preview),
-                            source: agent_source.clone(),
-                        });
                     }
                     Some(external_agent::AgentEvent::ToolOutputDelta { text, .. }) => {
                         // Gemini CLI strips images from ACP, sending "[Image: image/png]".

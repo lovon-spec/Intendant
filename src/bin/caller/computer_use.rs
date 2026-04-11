@@ -402,7 +402,14 @@ async fn execute_single(
         CuAction::Click { x, y, button } => match backend {
             DisplayBackend::MacOS => {
                 let (sx, sy) = scale_coords(*x, *y);
-                run_cliclick(&[&format!("{}:{},{}", button.cliclick_prefix(), sx, sy)]).await
+                // Move first so hover-to-reveal UIs register the pointer,
+                // then click. Without this, UIs like Element's call controls
+                // don't respond because cliclick's c: doesn't hover first.
+                run_cliclick(&[
+                    &format!("m:{},{}", sx, sy),
+                    "w:50",
+                    &format!("{}:{},{}", button.cliclick_prefix(), sx, sy),
+                ]).await
             }
             _ => {
                 run_xdotool(display, &[
