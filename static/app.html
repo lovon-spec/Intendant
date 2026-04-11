@@ -404,14 +404,26 @@ html, body {
   overflow: hidden;
   position: relative;
 }
+.log-entry.collapsible:not(.expanded) .log-content::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 4em;
+  height: 1.5em;
+  background: linear-gradient(to right, transparent, var(--base));
+  pointer-events: none;
+}
+.log-entry.collapsible:not(.expanded):hover .log-content::after {
+  background: linear-gradient(to right, transparent, var(--mantle));
+}
 .log-entry.collapsible .collapse-toggle {
   color: var(--blue);
   font-size: 11px;
   flex-shrink: 0;
   padding: 2px 6px;
-  opacity: 0.7;
 }
-.log-entry.collapsible:hover .collapse-toggle { opacity: 1; }
+.log-entry.collapsible:hover .collapse-toggle { color: var(--sapphire); }
 .log-entry.collapsible.expanded .log-content {
   max-height: none;
 }
@@ -3749,7 +3761,7 @@ function renderLogEntry(c) {
     if (hasImages) _logImageStore.set(entry, c.images);
     const toggle = document.createElement('span');
     toggle.className = 'collapse-toggle';
-    toggle.innerHTML = '<span class="arrow">\u25B8</span><span class="arrow-up">\u25BE</span>';
+    toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';
     entry.appendChild(toggle);
     entry.addEventListener('click', () => {
       const expanding = !entry.classList.contains('expanded');
