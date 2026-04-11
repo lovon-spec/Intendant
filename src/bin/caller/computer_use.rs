@@ -360,7 +360,7 @@ pub async fn execute_actions(
 /// Get the logical display size for the main display. Cached after first call.
 /// Used to map CU model coordinates (which are in a normalized 1024-wide space)
 /// to actual logical points for cliclick/xdotool.
-fn logical_display_size() -> (u32, u32) {
+pub fn logical_display_size() -> (u32, u32) {
     use std::sync::OnceLock;
     static SIZE: OnceLock<(u32, u32)> = OnceLock::new();
     *SIZE.get_or_init(|| {

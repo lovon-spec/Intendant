@@ -2402,6 +2402,11 @@ pub struct ExecuteCuActionsParams {
     /// Display target. Auto-detects if omitted.
     #[serde(default)]
     pub display_target: Option<String>,
+    /// Coordinate space for click/scroll/move coordinates. Default: "pixel"
+    /// (coordinates are in display logical points). Set to "normalized_1000"
+    /// if the model outputs coordinates on a 0-1000 grid (e.g. Gemini CU).
+    #[serde(default)]
+    pub coordinate_space: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3429,20 +3434,28 @@ impl IntendantServer {
         "No screenshot result".to_string()
     }
 
-    #[tool(description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns results.")]
+    #[tool(description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns results. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid.")]
     async fn execute_cu_actions(
         &self,
         Parameters(params): Parameters<ExecuteCuActionsParams>,
     ) -> String {
         use crate::computer_use::{DisplayBackend, execute_actions};
 
-        let actions = params.actions;
+        let mut actions = params.actions;
 
         if actions.is_empty() {
             return "No actions provided".to_string();
         }
 
         let target = resolve_display_target(params.display_target.as_deref());
+
+        // Denormalize 0-1000 grid coordinates to pixel coordinates
+        if params.coordinate_space.as_deref() == Some("normalized_1000") {
+            let (sw, sh) = crate::computer_use::logical_display_size();
+            for action in &mut actions {
+                denormalize_action(action, sw, sh);
+            }
+        }
         let backend = DisplayBackend::detect();
 
         let state = self.state.read().await;
@@ -4083,6 +4096,29 @@ pub async fn run_mcp_server(
 // ---------------------------------------------------------------------------
 // Screenshot click annotation
 // ---------------------------------------------------------------------------
+
+/// Denormalize a CU action's coordinates from 0-1000 grid to pixel space.
+fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32, screen_h: u32) {
+    use crate::computer_use::CuAction;
+    let dn_x = |x: &mut i32| *x = (*x as f64 * screen_w as f64 / 1000.0) as i32;
+    let dn_y = |y: &mut i32| *y = (*y as f64 * screen_h as f64 / 1000.0) as i32;
+    match action {
+        CuAction::Click { x, y, .. } | CuAction::DoubleClick { x, y, .. } => {
+            dn_x(x); dn_y(y);
+        }
+        CuAction::Scroll { x, y, .. } => {
+            dn_x(x); dn_y(y);
+        }
+        CuAction::MoveMouse { x, y } => {
+            dn_x(x); dn_y(y);
+        }
+        CuAction::Drag { start_x, start_y, end_x, end_y } => {
+            dn_x(start_x); dn_y(start_y);
+            dn_x(end_x); dn_y(end_y);
+        }
+        _ => {} // Type, Key, Screenshot, Wait — no coordinates
+    }
+}
 
 /// Format a CU action as a short description for logs.
 fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {

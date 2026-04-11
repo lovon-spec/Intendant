@@ -24,6 +24,15 @@ use super::{
 // Re-use the same display tools prompt as Codex — the MCP tools are identical.
 use super::codex::DISPLAY_TOOLS_PROMPT;
 
+/// Gemini CU uses a 0-1000 normalized coordinate grid. Tell the model to pass
+/// coordinate_space so we denormalize before executing clicks.
+const GEMINI_CU_ADDENDUM: &str = "\n\n\
+### Coordinate Space\n\
+When calling `execute_cu_actions`, ALWAYS pass `\"coordinate_space\": \"normalized_1000\"` \
+as a parameter. Your click/scroll/move coordinates use a 0-1000 normalized grid \
+and need to be converted to display pixels. Without this parameter, coordinates \
+will be interpreted as raw pixel values and clicks will miss their targets.\n";
+
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types (same framing as Codex — JSONL over stdio)
 // ---------------------------------------------------------------------------
@@ -810,7 +819,7 @@ impl ExternalAgent for GeminiAgent {
     ) -> Result<(), CallerError> {
         let augmented = if self.web_port.is_some() && !self.prompt_sent {
             self.prompt_sent = true;
-            format!("{}{}", message, DISPLAY_TOOLS_PROMPT)
+            format!("{}{}{}", message, DISPLAY_TOOLS_PROMPT, GEMINI_CU_ADDENDUM)
         } else {
             message.to_string()
         };
