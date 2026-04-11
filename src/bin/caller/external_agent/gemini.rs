@@ -245,8 +245,12 @@ async fn reader_task(
 
         let msg: JsonRpcMessage = match serde_json::from_str(&line) {
             Ok(m) => m,
-            Err(_) => continue, // skip non-JSON lines
+            Err(_) => {
+                eprintln!("[gemini-acp] non-JSON: {}", &line[..line.len().min(200)]);
+                continue;
+            }
         };
+        eprintln!("[gemini-acp] method={:?} id={:?}", msg.method, msg.id);
 
         // 1. Response to our request (has id + result/error, no method)
         if msg.method.is_none() {
@@ -545,7 +549,7 @@ impl ExternalAgent for GeminiAgent {
 
         // ACP initialize handshake with 10s timeout
         let init_params = serde_json::json!({
-            "protocolVersion": "1",
+            "protocolVersion": 1,
             "clientInfo": {
                 "name": "intendant",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -578,19 +582,30 @@ impl ExternalAgent for GeminiAgent {
     }
 
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
-        let mut params = serde_json::Map::new();
-        params.insert(
-            "cwd".into(),
-            serde_json::Value::String(
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-            ),
-        );
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Build MCP server list — include Intendant's HTTP MCP if web port is set
+        let mcp_servers: Vec<serde_json::Value> = if let Some(port) = self.web_port {
+            vec![serde_json::json!({
+                "type": "http",
+                "name": "intendant",
+                "url": format!("http://127.0.0.1:{}/mcp", port),
+                "headers": [],
+            })]
+        } else {
+            vec![]
+        };
+
+        let params = serde_json::json!({
+            "cwd": cwd,
+            "mcpServers": mcp_servers,
+        });
 
         let result = self
-            .send_request("session/new", Some(serde_json::Value::Object(params)))
+            .send_request("session/new", Some(params))
             .await?;
 
         let session_id = result
@@ -625,22 +640,55 @@ impl ExternalAgent for GeminiAgent {
             "prompt": [{"type": "text", "text": augmented}],
         });
 
-        // session/prompt is a request — it blocks until the turn completes.
-        // The reader task will emit events as they stream in.
-        // When the request completes, the agent has finished its turn.
-        let result = self.send_request("session/prompt", Some(params)).await?;
+        // session/prompt blocks until the turn completes. We must NOT await it
+        // here because the caller's event drain loop needs to run concurrently to
+        // handle ApprovalRequest events (permission requests from Gemini). Instead,
+        // fire the request and spawn a task that emits TurnCompleted when it resolves.
+        let event_tx = self.event_tx.clone();
+        let pending = Arc::clone(&self.pending_requests);
+        let writer = self.writer.as_ref()
+            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?
+            .clone();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        // Extract stop reason and emit TurnCompleted
-        let stop_reason = result
-            .get("stopReason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("end_turn");
+        // Register the pending request
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().await.insert(id, tx);
 
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx.send(AgentEvent::TurnCompleted {
-                message: Some(format!("Turn completed: {}", stop_reason)),
-            });
+        // Write the request to stdin
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": params,
+        });
+        let line = serde_json::to_string(&request)
+            .map_err(|e| CallerError::ExternalAgent(e.to_string()))?;
+        {
+            let mut w = writer.lock().await;
+            w.write_all(line.as_bytes()).await?;
+            w.write_all(b"\n").await?;
+            w.flush().await?;
         }
+
+        // Spawn a task to await the response and emit TurnCompleted
+        tokio::spawn(async move {
+            let result = rx.await;
+            if let Some(ref etx) = event_tx {
+                let stop_reason = match &result {
+                    Ok(Ok(val)) => val
+                        .get("stopReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("end_turn")
+                        .to_string(),
+                    Ok(Err(e)) => format!("error: {}", e),
+                    Err(_) => "channel closed".to_string(),
+                };
+                let _ = etx.send(AgentEvent::TurnCompleted {
+                    message: Some(format!("Turn completed: {}", stop_reason)),
+                });
+            }
+        });
 
         Ok(())
     }
