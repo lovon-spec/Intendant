@@ -2256,8 +2256,9 @@ html, body {
       </div>
 
       <!-- Task Input -->
-      <div style="display:flex;gap:4px;padding:4px 8px;border-bottom:1px solid var(--surface1)">
+      <div style="display:flex;gap:4px;padding:4px 8px;border-bottom:1px solid var(--surface1);align-items:center">
         <input id="activity-task-input" placeholder="Enter task..." style="flex:1;padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px" />
+        <label style="display:flex;align-items:center;gap:3px;font-size:11px;color:var(--overlay0);cursor:pointer;white-space:nowrap" title="Bypass presence layer — send task directly to the agent"><input type="checkbox" id="direct-mode-toggle" style="margin:0;accent-color:var(--blue)" />Direct</label>
         <button onclick="submitActivityTask()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:transparent;color:var(--green);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">Send</button>
       </div>
 
@@ -7151,7 +7152,10 @@ window.submitActivityTask = function() {
   if (currentPhase && currentPhase !== 'idle' && currentPhase !== 'done') {
     processCommands(app.send_follow_up(text));
   } else {
-    app.send_server_action({ action: 'start_task', task: text });
+    const direct = document.getElementById('direct-mode-toggle')?.checked || false;
+    const msg = { action: 'start_task', task: text };
+    if (direct) msg.direct = true;
+    app.send_server_action(msg);
   }
 };
 
@@ -7162,7 +7166,10 @@ function startNewSession() {
   if (!task) return;
   input.value = '';
   if (app) {
-    app.send_server_action({ action: 'start_task', task: task });
+    const direct = document.getElementById('direct-mode-toggle')?.checked || false;
+    const msg = { action: 'start_task', task: task };
+    if (direct) msg.direct = true;
+    app.send_server_action(msg);
   }
 }
 
