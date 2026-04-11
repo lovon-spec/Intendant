@@ -1504,37 +1504,57 @@ impl App {
                     presence: self.presence_usage_snapshot(),
                 });
                 self.streaming_buffer.clear();
-                // Show human-readable command summary at Model level (visible at Normal verbosity)
+                // Show human-readable command summary at Model level (visible at Normal verbosity).
+                // Push directly to log_entries instead of log_sourced to avoid
+                // broadcasting a duplicate LogEntry — the outbound bridge already
+                // sends OutboundEvent::ModelResponse to web/control consumers.
                 let summary = format_model_summary(&content);
-                self.log_sourced(
-                    LogLevel::Model,
-                    format!("T{}: {}", turn, summary),
-                    LogSource::Agent,
-                    Some(turn),
-                );
-                if let Some(ref reasoning_text) = reasoning {
-                    self.log_sourced(
-                        LogLevel::Model,
-                        format!("Reasoning: {}", reasoning_text),
-                        LogSource::Agent,
-                        Some(turn),
-                    );
+                let turn_opt = Some(turn);
+                if self.log_entries.len() >= MAX_LOG_ENTRIES {
+                    self.log_entries.pop_front();
                 }
-                self.log_sourced(
-                    LogLevel::Detail,
-                    format!(
+                self.log_entries.push_back(LogEntry {
+                    ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                    level: LogLevel::Model,
+                    content: format!("T{}: {}", turn, summary),
+                    source: LogSource::Agent,
+                    turn: turn_opt,
+                });
+                if let Some(ref reasoning_text) = reasoning {
+                    if self.log_entries.len() >= MAX_LOG_ENTRIES {
+                        self.log_entries.pop_front();
+                    }
+                    self.log_entries.push_back(LogEntry {
+                        ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        level: LogLevel::Model,
+                        content: format!("Reasoning: {}", reasoning_text),
+                        source: LogSource::Agent,
+                        turn: turn_opt,
+                    });
+                }
+                if self.log_entries.len() >= MAX_LOG_ENTRIES {
+                    self.log_entries.pop_front();
+                }
+                self.log_entries.push_back(LogEntry {
+                    ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                    level: LogLevel::Detail,
+                    content: format!(
                         "tokens: prompt={} completion={} total={}",
                         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
                     ),
-                    LogSource::Agent,
-                    Some(turn),
-                );
-                self.log_sourced(
-                    LogLevel::Debug,
-                    format!("Raw model response: {}", content),
-                    LogSource::Agent,
-                    Some(turn),
-                );
+                    source: LogSource::Agent,
+                    turn: turn_opt,
+                });
+                if self.log_entries.len() >= MAX_LOG_ENTRIES {
+                    self.log_entries.pop_front();
+                }
+                self.log_entries.push_back(LogEntry {
+                    ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                    level: LogLevel::Debug,
+                    content: format!("Raw model response: {}", content),
+                    source: LogSource::Agent,
+                    turn: turn_opt,
+                });
             }
             AppEvent::ModelResponseDelta { text } => {
                 // Accumulate streaming text; shown at Debug level to avoid noise
