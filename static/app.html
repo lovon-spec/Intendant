@@ -2258,7 +2258,7 @@ html, body {
       <!-- Task Input -->
       <div style="display:flex;gap:4px;padding:4px 8px;border-bottom:1px solid var(--surface1);align-items:center">
         <input id="activity-task-input" placeholder="Enter task..." style="flex:1;padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px" />
-        <label style="display:flex;align-items:center;gap:3px;font-size:11px;color:var(--overlay0);cursor:pointer;white-space:nowrap" title="Bypass presence layer — send task directly to the agent"><input type="checkbox" id="direct-mode-toggle" style="margin:0;accent-color:var(--blue)" />Direct</label>
+        <label style="display:flex;align-items:center;gap:3px;font-size:11px;color:var(--overlay0);cursor:pointer;white-space:nowrap" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" style="margin:0;accent-color:var(--blue)" />Direct</label>
         <button onclick="submitActivityTask()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:transparent;color:var(--green);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">Send</button>
       </div>
 
