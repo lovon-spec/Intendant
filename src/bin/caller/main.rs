@@ -3370,6 +3370,7 @@ async fn run_with_presence(
     context_injection: event::ContextInjectionQueue,
     session_registry: display::SharedSessionRegistry,
     agent_backend_override: Option<external_agent::AgentBackend>,
+    shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     web_port: Option<u16>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Create presence provider (small/fast model)
@@ -3479,11 +3480,18 @@ async fn run_with_presence(
     let mut cumulative_stats = LoopStats::default();
     let project_root = project.root.clone();
 
-    // Resolve external agent backend: CLI override > config default > None.
-    let agent_backend = agent_backend_override.or_else(|| {
+    // Resolve external agent backend: CLI override > web UI selection > config default > None.
+    let initial_agent_backend = agent_backend_override.or_else(|| {
         project.config.agent.default_backend.as_ref()
             .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
     });
+    // Seed the shared state so the web UI reflects the initial selection.
+    {
+        let mut guard = shared_external_agent.write().await;
+        if guard.is_none() {
+            *guard = initial_agent_backend.clone();
+        }
+    }
 
     // Conversation, provider, project — created on first task, reused thereafter.
     let mut persistent_conv: Option<Conversation> = None;
@@ -3494,6 +3502,9 @@ async fn run_with_presence(
     let mut persistent_agent: Option<Box<dyn external_agent::ExternalAgent>> = None;
     let mut persistent_thread: Option<external_agent::AgentThread> = None;
     let mut persistent_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>> = None;
+    // Track which backend the persistent agent was created for, so we can reset
+    // when the web UI changes the selection between tasks.
+    let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
 
     while let Some(envelope) = task_rx.recv().await {
         // Resume presence from any previous direct-mode pause
@@ -3576,6 +3587,16 @@ async fn run_with_presence(
 
         // ── Regular agent path (for escalated or non-CU tasks) ──
         let task_text = task_for_agent.unwrap_or_else(|| envelope.task.clone());
+
+        // Re-read the agent backend each task: the web UI may have changed it.
+        let agent_backend = shared_external_agent.read().await.clone();
+
+        // If the backend changed since the persistent agent was created, tear it down.
+        if agent_backend != persistent_agent_backend && persistent_agent.is_some() {
+            persistent_agent = None;
+            persistent_thread = None;
+            persistent_event_rx = None;
+        }
 
         if let Some(ref backend) = agent_backend {
             // ── External agent path ──
@@ -3660,6 +3681,7 @@ async fn run_with_presence(
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
+                persistent_agent_backend = agent_backend.clone();
             }
 
             // Send the task as a new turn in the existing thread
@@ -3701,12 +3723,13 @@ async fn run_with_presence(
                             source: agent_source.clone(),
                         });
                     }
-                    Some(external_agent::AgentEvent::ToolStarted { .. }) => {
-                        // Don't emit AgentStarted for external agents — the
-                        // model reasoning is already shown via ModelResponse,
-                        // and tool results via AgentOutput. Emitting AgentStarted
-                        // duplicates the model text in the Activity tab.
+                    Some(external_agent::AgentEvent::ToolStarted { preview, tool_name, .. }) => {
                         turn_in_round += 1;
+                        bus.send(AppEvent::AgentStarted {
+                            turn: cumulative_stats.turns + turn_in_round,
+                            commands_preview: format!("{}: {}", tool_name, preview),
+                            source: agent_source.clone(),
+                        });
                     }
                     Some(external_agent::AgentEvent::ToolOutputDelta { text, .. }) => {
                         // Gemini CLI strips images from ACP, sending "[Image: image/png]".
@@ -6132,9 +6155,11 @@ async fn main() -> Result<(), CallerError> {
                 let task_for_summary = task_str.clone();
                 let session_log_summary = session_log.clone();
                 let mcp_state_cleanup = mcp_state.clone();
-                // Resolve external agent backend from config (no CLI flags in MCP launcher)
-                let agent_backend = project.config.agent.default_backend.as_ref()
-                    .and_then(|s| external_agent::AgentBackend::from_str_loose(s));
+                // Resolve external agent backend: MCP shared state > config default
+                let agent_backend = mcp_state.read().await.external_agent.clone().or_else(|| {
+                    project.config.agent.default_backend.as_ref()
+                        .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
+                });
 
                 tokio::spawn(async move {
                     let result = if let Some(backend) = agent_backend {
@@ -6524,6 +6549,10 @@ async fn main() -> Result<(), CallerError> {
             project.config.agent.default_backend.as_ref()
                 .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
         });
+        // Shared state for dynamic external agent selection from the web UI.
+        // Seeded with the resolved CLI/config value; updated by SetExternalAgent ControlMsg.
+        let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
+            Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
         let mut loop_handle = if use_presence {
             // Presence mode: the presence layer mediates between user and agent
             let presence_user_rx = presence_user_rx.unwrap();
@@ -6559,6 +6588,7 @@ async fn main() -> Result<(), CallerError> {
             });
 
             let agent_backend_for_presence = agent_backend.clone();
+            let shared_external_agent_for_presence = shared_external_agent.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
                     task,
@@ -6580,6 +6610,7 @@ async fn main() -> Result<(), CallerError> {
                     context_injection_clone,
                     session_registry.clone(),
                     agent_backend_for_presence,
+                    shared_external_agent_for_presence,
                     if use_web { Some(web_port) } else { None },
                 )
                 .await;
@@ -6829,8 +6860,11 @@ async fn main() -> Result<(), CallerError> {
                                 let autonomy_spawn = autonomy.clone();
                                 let session_log_spawn = new_session_log.clone();
                                 let use_direct = direct.unwrap_or(false) || orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
-                                let restart_agent_backend = new_project.config.agent.default_backend.as_ref()
-                                    .and_then(|s| external_agent::AgentBackend::from_str_loose(s));
+                                // Read shared state (web UI may have changed it)
+                                let restart_agent_backend = shared_external_agent.read().await.clone().or_else(|| {
+                                    new_project.config.agent.default_backend.as_ref()
+                                        .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
+                                });
                                 tokio::spawn(async move {
                                     let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
                                     let result = if let Some(backend) = restart_agent_backend {
@@ -6865,6 +6899,14 @@ async fn main() -> Result<(), CallerError> {
                                     };
                                     bus_spawn.send(AppEvent::SessionEnded { session_id: new_session_id, reason });
                                 });
+                            }
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::SetExternalAgent { agent })) => {
+                                let parsed = agent.as_deref()
+                                    .filter(|s| !s.is_empty())
+                                    .and_then(external_agent::AgentBackend::from_str_loose);
+                                let label = parsed.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
+                                *shared_external_agent.write().await = parsed;
+                                eprintln!("External agent set to {} (takes effect on next task)", label);
                             }
                             Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -7091,6 +7133,9 @@ async fn main() -> Result<(), CallerError> {
             project.config.agent.default_backend.as_ref()
                 .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
         });
+        // Shared state for dynamic external agent selection from the web UI (headless mode).
+        let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
+            Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
 
         let result = if let Some(backend) = agent_backend {
             run_external_agent_mode(
@@ -7274,8 +7319,11 @@ async fn main() -> Result<(), CallerError> {
                                 let session_log_spawn = new_session_log.clone();
                                 let shared_cleanup = headless_shared_session.clone();
                                 let use_direct = direct.unwrap_or(false) || orchestrate.map(|o| !o).unwrap_or_else(|| flags.direct || is_simple_task(&new_task));
-                                let restart_agent_backend = new_project.config.agent.default_backend.as_ref()
-                                    .and_then(|s| external_agent::AgentBackend::from_str_loose(s));
+                                // Read shared state (web UI may have changed it)
+                                let restart_agent_backend = shared_external_agent.read().await.clone().or_else(|| {
+                                    new_project.config.agent.default_backend.as_ref()
+                                        .and_then(|s| external_agent::AgentBackend::from_str_loose(s))
+                                });
 
                                 tokio::spawn(async move {
                                     let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -7335,6 +7383,14 @@ async fn main() -> Result<(), CallerError> {
                                         state.query_ctx = None;
                                     }
                                 });
+                            }
+                            Ok(AppEvent::ControlCommand(event::ControlMsg::SetExternalAgent { agent })) => {
+                                let parsed = agent.as_deref()
+                                    .filter(|s| !s.is_empty())
+                                    .and_then(external_agent::AgentBackend::from_str_loose);
+                                let label = parsed.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
+                                *shared_external_agent.write().await = parsed;
+                                eprintln!("External agent set to {} (takes effect on next task)", label);
                             }
                             Ok(_) => {} // Ignore other events
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

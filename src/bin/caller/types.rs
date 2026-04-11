@@ -194,6 +194,8 @@ pub enum OutboundEvent {
         autonomy: String,
         session_id: String,
         task: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        external_agent: Option<String>,
     },
     Usage {
         main: crate::frontend::ModelUsageSnapshot,

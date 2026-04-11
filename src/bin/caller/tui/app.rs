@@ -1070,6 +1070,7 @@ impl App {
             autonomy: label,
             session_id: String::new(),
             task: String::new(),
+            external_agent: None,
         });
     }
 
@@ -1088,6 +1089,7 @@ impl App {
                     autonomy: self.autonomy_display.to_lowercase(),
                     session_id: self.session_id.clone(),
                     task: self.task_description.clone(),
+                    external_agent: None,
                 });
             }
             ControlMsg::Usage => {
@@ -1156,6 +1158,13 @@ impl App {
             }
             ControlMsg::SetAutonomy { level } => {
                 self.set_autonomy_level(&level);
+            }
+            ControlMsg::SetExternalAgent { agent } => {
+                let label = agent.as_deref().unwrap_or("none");
+                self.log(
+                    LogLevel::Info,
+                    format!("External agent set to {} (takes effect on next task)", label),
+                );
             }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {

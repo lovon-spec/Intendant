@@ -219,6 +219,7 @@ mod tests {
             autonomy: "medium".to_string(),
             session_id: "abc-123".to_string(),
             task: "list files".to_string(),
+            external_agent: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"status\""));

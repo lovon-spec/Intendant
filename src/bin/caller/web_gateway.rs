@@ -3775,6 +3775,7 @@ mod tests {
             autonomy: "medium".to_string(),
             session_id: "test-session".to_string(),
             task: "test task".to_string(),
+            external_agent: None,
         };
         crate::control::broadcast_event(&broadcast_tx, &event);
 

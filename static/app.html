@@ -2179,6 +2179,9 @@ html, body {
     <span class="sep">|</span>
     <span class="field-label">autonomy</span>
     <span class="autonomy" id="sb-autonomy" style="cursor:pointer;text-decoration:underline dotted" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
+    <span class="sep" id="sb-agent-sep" style="display:none">|</span>
+    <span class="field-label" id="sb-agent-label" style="display:none">agent</span>
+    <span id="sb-external-agent" style="display:none;font-weight:600;color:var(--peach)"></span>
     <span class="sep">|</span>
     <span class="display-toggle-wrap">
       <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display (d) — grant/revoke agent access to your screen for computer use tasks">your display</span>
@@ -2552,6 +2555,22 @@ html, body {
           <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
             <button id="settings-save-keys" style="padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Save Keys</button>
             <span id="settings-keys-status" style="font-size:12px"></span>
+          </div>
+        </fieldset>
+
+        <!-- External Agent -->
+        <fieldset class="settings-group">
+          <legend>External Agent</legend>
+          <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
+            Route tasks to an external agent backend. Takes effect on the next task.
+          </p>
+          <div class="settings-row">
+            <label>Backend</label>
+            <select id="set-external-agent">
+              <option value="">None (internal agent)</option>
+              <option value="codex">Codex (OpenAI)</option>
+              <option value="gemini">Gemini CLI (Google)</option>
+            </select>
           </div>
         </fieldset>
 
@@ -3788,6 +3807,29 @@ function updateStatusBar(d) {
   if (d.session_id) {
     currentSessionFullId = d.session_id;
     document.getElementById('sb-session').textContent = d.session_id.substring(0, 8);
+  }
+  if (d.external_agent !== undefined) {
+    const el = document.getElementById('sb-external-agent');
+    const sep = document.getElementById('sb-agent-sep');
+    const lbl = document.getElementById('sb-agent-label');
+    if (d.external_agent) {
+      el.textContent = d.external_agent;
+      el.style.display = '';
+      sep.style.display = '';
+      lbl.style.display = '';
+    } else {
+      el.style.display = 'none';
+      sep.style.display = 'none';
+      lbl.style.display = 'none';
+    }
+    // Sync the Settings dropdown
+    const sel = document.getElementById('set-external-agent');
+    if (sel) {
+      const v = (d.external_agent || '').toLowerCase();
+      // Map display names (from AgentBackend::Display) to option values
+      const map = { 'codex': 'codex', 'gemini cli': 'gemini', 'claude code': '', 'gemini_cli': 'gemini' };
+      sel.value = map[v] !== undefined ? map[v] : '';
+    }
   }
 }
 
@@ -6874,6 +6916,14 @@ async function saveSettings() {
 
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
 document.getElementById('settings-reset-btn').addEventListener('click', () => { settingsLoaded = false; loadSettings(); });
+
+// External agent dropdown — sends a WebSocket control message (deferred, not saved to config)
+document.getElementById('set-external-agent').addEventListener('change', (e) => {
+  const val = e.target.value || null;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ action: 'set_external_agent', agent: val }));
+  }
+});
 
 function updateFramerateWarning() {
   const val = parseInt(document.getElementById('set-recording-framerate').value) || 0;

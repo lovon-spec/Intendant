@@ -44,6 +44,8 @@ pub enum UiCommand {
         autonomy: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        external_agent: Option<String>,
     },
     SetPhase {
         phase: String,
@@ -449,6 +451,7 @@ impl AppState {
             budget_pct: Some(budget_pct),
             autonomy: None,
             session_id: None,
+            external_agent: None,
         });
 
         // Provider/model from config
@@ -457,7 +460,7 @@ impl AppState {
                 self.provider = p.to_string();
                 cmds.push(UiCommand::UpdateStatusBar {
                     provider: Some(p.to_string()),
-                    model: None, turn: None, budget_pct: None, autonomy: None, session_id: None,
+                    model: None, turn: None, budget_pct: None, autonomy: None, session_id: None, external_agent: None,
                 });
             }
             if let Some(m) = cfg["model"].as_str() {
@@ -465,7 +468,7 @@ impl AppState {
                 cmds.push(UiCommand::UpdateStatusBar {
                     provider: None,
                     model: Some(m.to_string()),
-                    turn: None, budget_pct: None, autonomy: None, session_id: None,
+                    turn: None, budget_pct: None, autonomy: None, session_id: None, external_agent: None,
                 });
             }
         }
@@ -475,7 +478,7 @@ impl AppState {
             self.session_id = sid.to_string();
             cmds.push(UiCommand::UpdateStatusBar {
                 provider: None, model: None, turn: None, budget_pct: None,
-                autonomy: None, session_id: Some(sid.to_string()),
+                autonomy: None, session_id: Some(sid.to_string()), external_agent: None,
             });
         }
 
@@ -515,20 +518,20 @@ impl AppState {
                 self.autonomy = rest.to_string();
                 cmds.push(UiCommand::UpdateStatusBar {
                     provider: None, model: None, turn: None, budget_pct: None,
-                    autonomy: Some(rest.to_string()), session_id: None,
+                    autonomy: Some(rest.to_string()), session_id: None, external_agent: None,
                 });
             } else if let Some(rest) = c.strip_prefix("Provider: ") {
                 self.provider = rest.to_string();
                 cmds.push(UiCommand::UpdateStatusBar {
                     provider: Some(rest.to_string()),
-                    model: None, turn: None, budget_pct: None, autonomy: None, session_id: None,
+                    model: None, turn: None, budget_pct: None, autonomy: None, session_id: None, external_agent: None,
                 });
             } else if let Some(rest) = c.strip_prefix("Model: ") {
                 self.model = rest.to_string();
                 cmds.push(UiCommand::UpdateStatusBar {
                     provider: None,
                     model: Some(rest.to_string()),
-                    turn: None, budget_pct: None, autonomy: None, session_id: None,
+                    turn: None, budget_pct: None, autonomy: None, session_id: None, external_agent: None,
                 });
             }
             if let Some(t) = e["turn"].as_u64() {
@@ -536,7 +539,7 @@ impl AppState {
                 cmds.push(UiCommand::UpdateStatusBar {
                     provider: None, model: None,
                     turn: Some(t),
-                    budget_pct: None, autonomy: None, session_id: None,
+                    budget_pct: None, autonomy: None, session_id: None, external_agent: None,
                 });
             }
         }
@@ -619,7 +622,7 @@ impl AppState {
                     provider: None, model: None,
                     turn: Some(turn),
                     budget_pct: Some(budget),
-                    autonomy: None, session_id: None,
+                    autonomy: None, session_id: None, external_agent: None,
                 });
                 cmds.push(UiCommand::SetPhase { phase: "thinking".into() });
                 self.phase = "thinking".to_string();
@@ -796,6 +799,7 @@ impl AppState {
                     budget_pct: msg["budget_pct"].as_f64(),
                     autonomy: msg["autonomy"].as_str().map(String::from),
                     session_id: msg["session_id"].as_str().map(String::from),
+                    external_agent: msg["external_agent"].as_str().map(String::from),
                 };
                 if let Some(p) = msg["provider"].as_str() { self.provider = p.to_string(); }
                 if let Some(m) = msg["model"].as_str() { self.model = m.to_string(); }
@@ -817,7 +821,7 @@ impl AppState {
                         cmds.push(UiCommand::UpdateStatusBar {
                             provider: None, model: None, turn: None,
                             budget_pct: Some(u.usage_pct),
-                            autonomy: None, session_id: None,
+                            autonomy: None, session_id: None, external_agent: None,
                         });
                         cmds.extend(self.add_log(
                             "detail",

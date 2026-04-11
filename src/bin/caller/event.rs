@@ -380,6 +380,10 @@ pub enum ControlMsg {
     SetAutonomy {
         level: String,
     },
+    SetExternalAgent {
+        #[serde(default)]
+        agent: Option<String>,
+    },
     SetVerbosity {
         level: String,
     },
@@ -739,6 +743,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             autonomy: autonomy.clone(),
             session_id: session_id.clone(),
             task: task.clone(),
+            external_agent: None,
         }),
         AppEvent::LogEntry {
             level,
@@ -1183,6 +1188,26 @@ mod tests {
     }
 
     #[test]
+    fn control_msg_set_external_agent_deserialize() {
+        let json = r#"{"action":"set_external_agent","agent":"codex"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::SetExternalAgent { agent } => assert_eq!(agent, Some("codex".to_string())),
+            _ => panic!("expected SetExternalAgent"),
+        }
+    }
+
+    #[test]
+    fn control_msg_set_external_agent_null_deserialize() {
+        let json = r#"{"action":"set_external_agent","agent":null}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::SetExternalAgent { agent } => assert_eq!(agent, None),
+            _ => panic!("expected SetExternalAgent"),
+        }
+    }
+
+    #[test]
     fn control_msg_quit_deserialize() {
         let json = r#"{"action":"quit"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
@@ -1262,6 +1287,9 @@ mod tests {
             ControlMsg::ApproveAll { id: 4 },
             ControlMsg::SetAutonomy {
                 level: "low".to_string(),
+            },
+            ControlMsg::SetExternalAgent {
+                agent: Some("codex".to_string()),
             },
             ControlMsg::SetVerbosity {
                 level: "verbose".to_string(),

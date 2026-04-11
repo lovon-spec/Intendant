@@ -111,6 +111,8 @@ pub struct McpAppState {
     pub screenshot_dir: Option<std::path::PathBuf>,
     /// Persistent counter for screenshot filenames (avoids overwriting).
     pub screenshot_counter: std::sync::atomic::AtomicU64,
+    /// External agent backend selected via web UI (deferred: takes effect on next task).
+    pub external_agent: Option<crate::external_agent::AgentBackend>,
 }
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
@@ -162,6 +164,7 @@ impl McpAppState {
             session_registry: None,
             screenshot_dir: None,
             screenshot_counter: std::sync::atomic::AtomicU64::new(0),
+            external_agent: None,
         }
     }
 
@@ -451,6 +454,7 @@ async fn emit_control_status(
             autonomy: current_autonomy_label(autonomy_level),
             session_id: s.session_id.clone(),
             task: s.task_description.clone(),
+            external_agent: s.external_agent.as_ref().map(|b| b.to_string()),
         };
         control::broadcast_event(tx, &event);
     }
@@ -1081,6 +1085,24 @@ async fn handle_control_command_mcp(
                 "set_autonomy",
                 true,
                 format!("Autonomy set to {}", parsed),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetExternalAgent { agent } => {
+            let parsed = agent.as_deref()
+                .filter(|s| !s.is_empty())
+                .and_then(crate::external_agent::AgentBackend::from_str_loose);
+            {
+                let mut s = state.write().await;
+                s.external_agent = parsed.clone();
+            }
+            let label = parsed.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
+            emit_control_result(
+                control_tx,
+                "set_external_agent",
+                true,
+                format!("External agent set to {}", label),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
