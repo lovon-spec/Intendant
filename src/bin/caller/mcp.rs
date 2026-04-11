@@ -3476,12 +3476,13 @@ impl IntendantServer {
             }
         }
 
-        // Attach the last screenshot inline
+        // Attach the last screenshot inline, annotated with click markers
         let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
         if let Some(ss) = last_screenshot {
+            let annotated = annotate_screenshot_with_clicks(&ss.base64_png, &actions);
             summaries.push(format!(
                 "screenshot: data:image/png;base64,{}",
-                ss.base64_png
+                annotated
             ));
         }
 
@@ -4068,6 +4069,92 @@ pub async fn run_mcp_server(
     running.waiting().await?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot click annotation
+// ---------------------------------------------------------------------------
+
+/// Draw red crosshairs on a screenshot at click/double_click coordinates.
+/// Returns annotated base64 PNG, or the original if annotation fails.
+fn annotate_screenshot_with_clicks(
+    base64_png: &str,
+    actions: &[crate::computer_use::CuAction],
+) -> String {
+    use crate::computer_use::CuAction;
+
+    // Collect click coordinates
+    let clicks: Vec<(i32, i32)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            CuAction::Click { x, y, .. } | CuAction::DoubleClick { x, y, .. } => Some((*x, *y)),
+            _ => None,
+        })
+        .collect();
+
+    if clicks.is_empty() {
+        return base64_png.to_string();
+    }
+
+    // Decode PNG
+    let png_bytes = match base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        base64_png,
+    ) {
+        Ok(b) => b,
+        Err(_) => return base64_png.to_string(),
+    };
+
+    let mut img = match image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png) {
+        Ok(i) => i.to_rgba8(),
+        Err(_) => return base64_png.to_string(),
+    };
+
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let red = image::Rgba([255u8, 0, 0, 255]);
+    let arm = 15i32; // crosshair arm length
+    let thickness = 2i32;
+
+    for (cx, cy) in &clicks {
+        // Draw crosshair
+        for offset in -arm..=arm {
+            for t in -thickness..=thickness {
+                // Horizontal arm
+                let hx = cx + offset;
+                let hy = cy + t;
+                if hx >= 0 && hx < w && hy >= 0 && hy < h {
+                    img.put_pixel(hx as u32, hy as u32, red);
+                }
+                // Vertical arm
+                let vx = cx + t;
+                let vy = cy + offset;
+                if vx >= 0 && vx < w && vy >= 0 && vy < h {
+                    img.put_pixel(vx as u32, vy as u32, red);
+                }
+            }
+        }
+        // Draw circle (radius 10)
+        let r = 10i32;
+        for angle in 0..360 {
+            let rad = (angle as f64) * std::f64::consts::PI / 180.0;
+            let px = *cx + (r as f64 * rad.cos()) as i32;
+            let py = *cy + (r as f64 * rad.sin()) as i32;
+            for t in 0..=1 {
+                let px2 = px + t;
+                let py2 = py + t;
+                if px2 >= 0 && px2 < w && py2 >= 0 && py2 < h {
+                    img.put_pixel(px2 as u32, py2 as u32, red);
+                }
+            }
+        }
+    }
+
+    // Re-encode to PNG
+    let mut buf = std::io::Cursor::new(Vec::new());
+    if img.write_to(&mut buf, image::ImageFormat::Png).is_err() {
+        return base64_png.to_string();
+    }
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf.into_inner())
 }
 
 // ---------------------------------------------------------------------------

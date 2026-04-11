@@ -681,6 +681,56 @@ fn has_exec_command(json_str: &str) -> bool {
 
 /// Try to encode a captureScreen result as base64 image data.
 /// Returns `Some(vec![ImageData])` on success, `None` on any failure.
+/// Replace "[Image: image/png]" placeholders in Gemini agent output with
+/// the actual screenshot data from disk, formatted as MCP JSON so the Activity
+/// tab's format_agent_output can extract and lazy-load the images.
+fn substitute_screenshot_from_disk(text: &str, log_dir: &std::path::Path) -> String {
+    let screenshots_dir = log_dir.join("screenshots");
+    // Find the latest cu_screenshot_*.png by modification time
+    let latest = std::fs::read_dir(&screenshots_dir)
+        .ok()
+        .and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with("cu_screenshot_") && n.ends_with(".png"))
+                        .unwrap_or(false)
+                })
+                .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
+        });
+
+    let Some(entry) = latest else {
+        return text.to_string();
+    };
+
+    let Ok(png_bytes) = std::fs::read(entry.path()) else {
+        return text.to_string();
+    };
+
+    let base64_data = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &png_bytes,
+    );
+
+    // Build MCP-style JSON with both text and image content blocks
+    let text_part = text.replace("[Image: image/png]", "").replace("[Image: image/jpeg]", "");
+    let text_part = text_part.trim();
+
+    let mut content = Vec::new();
+    if !text_part.is_empty() {
+        content.push(serde_json::json!({"text": text_part, "type": "text"}));
+    }
+    content.push(serde_json::json!({
+        "data": base64_data,
+        "type": "image",
+        "mimeType": "image/png",
+    }));
+
+    serde_json::json!({"content": content}).to_string()
+}
+
 fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> {
     let parsed: serde_json::Value = serde_json::from_str(result_text).ok()?;
     if parsed.get("success").and_then(|v| v.as_bool()) != Some(true) {
@@ -3660,7 +3710,15 @@ async fn run_with_presence(
                         });
                     }
                     Some(external_agent::AgentEvent::ToolOutputDelta { text, .. }) => {
-                        bus.send(AppEvent::AgentOutput { stdout: text, stderr: String::new(), source: agent_source.clone() });
+                        // Gemini CLI strips images from ACP, sending "[Image: image/png]".
+                        // Substitute with the latest screenshot from disk so the Activity
+                        // tab can render it.
+                        let stdout = if text.contains("[Image: image/png]") || text.contains("[Image: image/jpeg]") {
+                            substitute_screenshot_from_disk(&text, &log_dir)
+                        } else {
+                            text
+                        };
+                        bus.send(AppEvent::AgentOutput { stdout, stderr: String::new(), source: agent_source.clone() });
                     }
                     Some(external_agent::AgentEvent::ToolCompleted { item_id, status }) => {
                         match &status {
