@@ -51,6 +51,7 @@ parse_args() {
             --recert)    ACTION="recert"; shift ;;
             --force)    FORCE=true; shift ;;
             --remove)   ACTION="remove"; shift ;;
+            --stop-cert-server) ACTION="stop-cert-server"; shift ;;
             -h|--help)  usage ;;
             *)          die "unknown option: $1" ;;
         esac
@@ -438,6 +439,25 @@ print_instructions_chrome_windows() {
 EOF
 }
 
+stop_cert_server() {
+    local pid_file="$CERT_DIR/cert_server.pid"
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$pid_file"
+        # Clean up the temp serve directory recorded alongside the PID
+        local dir_file="$CERT_DIR/cert_server.dir"
+        if [[ -f "$dir_file" ]]; then
+            rm -rf "$(cat "$dir_file")"
+            rm -f "$dir_file"
+        fi
+        info "cert server stopped"
+    else
+        info "no cert server running"
+    fi
+}
+
 serve_certs() {
     local serve_dir
     serve_dir=$(mktemp -d)
@@ -445,6 +465,21 @@ serve_certs() {
     cp "$CERT_DIR/client.p12" "$serve_dir/"
     cp "$CERT_DIR/client.p12" "$serve_dir/client.pfx"  # Android compat
 
+    # Non-interactive (called via SSH from the .bat script): start the cert
+    # server as a background daemon and exit immediately so SSH can return.
+    # The .bat handles the interactive cert-installation UX on its own console.
+    if [[ ! -t 0 ]]; then
+        # Kill any leftover cert server from a previous run.
+        stop_cert_server
+        cd "$serve_dir"
+        nohup python3 -m http.server "$CERT_SERVE_PORT" --bind 0.0.0.0 > /dev/null 2>&1 &
+        echo $! > "$CERT_DIR/cert_server.pid"
+        echo "$serve_dir" > "$CERT_DIR/cert_server.dir"
+        info "cert server started on port $CERT_SERVE_PORT (background)"
+        return
+    fi
+
+    # Interactive: show platform menu and block until user is done.
     cat <<EOF
 
 ════════════════════════════════════════════════════════
@@ -517,6 +552,9 @@ EOF
 remove_all() {
     info "removing intendant LAN setup..."
 
+    # cert server (if still running from a bat-initiated setup)
+    stop_cert_server
+
     # nginx
     rm -f "/etc/nginx/sites-enabled/$NGINX_SITE"
     rm -f "/etc/nginx/sites-available/$NGINX_SITE"
@@ -554,6 +592,12 @@ main() {
 
     if [[ "$ACTION" == "recert" ]]; then
         recert
+        exit 0
+    fi
+
+    if [[ "$ACTION" == "stop-cert-server" ]]; then
+        [[ $(id -u) -eq 0 ]] || die "run with sudo"
+        stop_cert_server
         exit 0
     fi
 

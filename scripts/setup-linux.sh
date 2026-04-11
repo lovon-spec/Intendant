@@ -106,6 +106,9 @@ APT_PACKAGES=(
     # Rust build dep for vpx-encode (ffi-generate needs libclang)
     libclang-dev
 
+    # PNG encoding/decoding (libpng)
+    libpng-dev
+
     # VP8 encoding (libvpx)
     libvpx-dev
 

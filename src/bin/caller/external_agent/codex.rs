@@ -19,7 +19,7 @@ use super::{
 // Display tools system prompt
 // ---------------------------------------------------------------------------
 
-const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
+pub(super) const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
 ## Intendant MCP Tools\n\
 \n\
 You have access to these tools through the `intendant` MCP server.\n\
