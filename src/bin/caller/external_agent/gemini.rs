@@ -752,10 +752,16 @@ impl ExternalAgent for GeminiAgent {
     }
 
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let cwd = self
+            .config_working_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            });
 
         // Build MCP server list — include Intendant's HTTP MCP if web port is set
         let mcp_servers: Vec<serde_json::Value> = if let Some(port) = self.web_port {
@@ -769,10 +775,13 @@ impl ExternalAgent for GeminiAgent {
             vec![]
         };
 
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
         });
+        if let Some(ref model) = self.model {
+            params["model"] = serde_json::Value::String(model.clone());
+        }
 
         let result = self
             .send_request("session/new", Some(params))
@@ -968,6 +977,17 @@ impl Drop for GeminiAgent {
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
+        }
+        // Restore .gemini/settings.json from backup if shutdown() wasn't called
+        if let Some(ref wd) = self.config_working_dir {
+            let gemini_dir = wd.join(".gemini");
+            let settings_path = gemini_dir.join("settings.json");
+            let backup_path = gemini_dir.join("settings.json.intendant-backup");
+            if backup_path.exists() {
+                let _ = std::fs::rename(&backup_path, &settings_path);
+            } else if settings_path.exists() {
+                let _ = std::fs::remove_file(&settings_path);
+            }
         }
     }
 }

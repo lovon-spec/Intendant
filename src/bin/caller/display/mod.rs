@@ -78,14 +78,22 @@ pub struct DisplayInfo {
 pub async fn enumerate_displays() -> Vec<DisplayInfo> {
     let displays = enumerate_displays_platform().await;
     if displays.is_empty() {
-        vec![DisplayInfo {
-            id: 0,
-            platform_id: 0,
-            name: "Default Display".to_string(),
-            width: 1920,
-            height: 1080,
-            is_primary: true,
-        }]
+        // macOS ScreenCaptureKit may not be ready on first call (TCC prompt,
+        // cold start). Retry once after a brief delay before falling back.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let retry = enumerate_displays_platform().await;
+        if retry.is_empty() {
+            vec![DisplayInfo {
+                id: 0,
+                platform_id: 0,
+                name: "Default Display".to_string(),
+                width: 1920,
+                height: 1080,
+                is_primary: true,
+            }]
+        } else {
+            retry
+        }
     } else {
         displays
     }
