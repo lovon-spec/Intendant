@@ -6933,8 +6933,8 @@ document.getElementById('settings-reset-btn').addEventListener('click', () => { 
 // External agent dropdown — sends a WebSocket control message (deferred, not saved to config)
 document.getElementById('set-external-agent').addEventListener('change', (e) => {
   const val = e.target.value || null;
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ action: 'set_external_agent', agent: val }));
+  if (app) {
+    app.send_server_action({ action: 'set_external_agent', agent: val });
   }
 });
 
