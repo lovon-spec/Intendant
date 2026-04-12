@@ -2204,104 +2204,24 @@ impl App {
 
 // format_model_summary and truncate_str are in crate::types
 
-/// Parse runtime JSON output into human-readable text for the TUI.
-/// Mirrors the WASM format_agent_output logic.
-/// Extract top-level JSON objects from a string using balanced-brace scanning.
-/// Handles embedded newlines inside JSON string values correctly.
-fn extract_json_objects(raw: &str) -> Vec<String> {
-    let mut objects = Vec::new();
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            let mut depth = 0i32;
-            let mut in_string = false;
-            let mut escape = false;
-            let start = i;
-            for j in start..bytes.len() {
-                if escape { escape = false; continue; }
-                match bytes[j] {
-                    b'\\' if in_string => escape = true,
-                    b'"' => in_string = !in_string,
-                    b'{' if !in_string => depth += 1,
-                    b'}' if !in_string => {
-                        depth -= 1;
-                        if depth == 0 {
-                            objects.push(raw[start..=j].to_string());
-                            i = j + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                if j == bytes.len() - 1 { i = bytes.len(); }
-            }
-            if depth != 0 { break; }
-        } else {
-            i += 1;
-        }
-    }
-    objects
-}
-
+/// Render an agent tool output as a single TUI-friendly string.
+///
+/// Delegates parsing to the shared `presence_core::format_agent_output`,
+/// then appends a `[stderr] ...` tail if the raw stderr parameter is
+/// non-empty. The shared parser replaces embedded base64 images with
+/// `[mime/type N KB]` markers so ratatui never paints thousands of base64
+/// characters into its buffer (which the web Terminal tab would otherwise
+/// mirror via SharedWriter).
 pub fn format_agent_output_for_tui(stdout: &str, stderr: &str) -> String {
-    let mut parts = Vec::new();
-    // Use balanced-brace extraction to handle embedded newlines in JSON values
-    let objects = extract_json_objects(stdout);
-    let lines: Vec<&str> = if objects.is_empty() {
-        stdout.trim().split('\n').collect()
-    } else {
-        objects.iter().map(|s| s.as_str()).collect()
-    };
-    for line in &lines {
-        if line.is_empty() { continue; }
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
-            if obj["type"].as_str() == Some("result") {
-                let data = match obj.get("data") {
-                    Some(serde_json::Value::String(s)) => {
-                        serde_json::from_str::<serde_json::Value>(s).unwrap_or_default()
-                    }
-                    Some(other) => other.clone(),
-                    None => continue,
-                };
-                if let Some(st) = data["stdout_tail"].as_str() {
-                    let trimmed = st.trim();
-                    if !trimmed.is_empty() { parts.push(trimmed.to_string()); }
-                }
-                if let Some(se) = data["stderr_tail"].as_str() {
-                    let trimmed = se.trim();
-                    if !trimmed.is_empty() { parts.push(format!("[stderr] {}", trimmed)); }
-                }
-                if let Some(path) = data["path"].as_str() {
-                    let exists = data["exists"].as_bool().unwrap_or(false);
-                    if exists {
-                        let kind = data["type"].as_str().unwrap_or("?");
-                        let size = data["size"].as_u64().unwrap_or(0);
-                        parts.push(format!("{} ({}, {} bytes)", path, kind, size));
-                    } else {
-                        parts.push(format!("{} (not found)", path));
-                    }
-                }
-                if let Some(fp) = data["file_path"].as_str() {
-                    let op = data["operation"].as_str().unwrap_or("write");
-                    let ok = data["success"].as_bool().unwrap_or(false);
-                    if ok { parts.push(format!("{}: {}", op, fp)); }
-                    else { parts.push(format!("{} failed: {}", op, fp)); }
-                }
-                if let Some(ec) = data["exit_code"].as_i64() {
-                    if ec != 0 { parts.push(format!("exit code: {}", ec)); }
-                }
-            } else if obj["type"].as_str() != Some("status") {
-                parts.push(line.to_string());
-            }
-        } else {
-            parts.push(line.to_string());
-        }
-    }
+    let mut text = presence_core::format_agent_output(stdout).text;
     if !stderr.is_empty() {
-        parts.push(format!("[stderr] {}", stderr.trim()));
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[stderr] ");
+        text.push_str(stderr.trim());
     }
-    parts.join("\n")
+    text
 }
 
 #[cfg(test)]
