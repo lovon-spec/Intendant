@@ -1,614 +1,69 @@
 #!/usr/bin/env bash
 #
-# Intendant LAN Access Setup
-# Sets up mTLS nginx reverse proxy for secure phone access to intendant --web.
+# Intendant LAN Access Setup (Linux daemon side)
+#
+# This script is now a thin shim. The real implementation lives in the
+# intendant binary as `intendant lan <action>`. The shim forwards the
+# same flags and positional args, so existing invocations — including
+# from the macOS host orchestrator (scripts/setup-lan-macos.sh) — keep
+# working unchanged.
 #
 # Usage:
-#   sudo ./setup-lan.sh                                # Direct: intendant on this machine
-#   sudo ./setup-lan.sh --tunnel user@192.168.122.163  # VM: auto-tunnel to guest
-#   sudo ./setup-lan.sh --backend 10.0.0.5:8765        # Manual: proxy to another host
-#   sudo ./setup-lan.sh --recert                       # Regenerate server cert (IP changed)
-#   sudo ./setup-lan.sh --remove                       # Uninstall everything
+#   sudo ./setup-lan.sh                      # Full setup
+#   sudo ./setup-lan.sh --recert             # Regenerate server cert
+#   sudo ./setup-lan.sh --remove             # Tear everything down
+#   sudo ./setup-lan.sh --name mac-work      # Label this host
 #
-# Security tiers:
-#   Trusted LAN  — mTLS (this script)
-#   Public WiFi   — WireGuard + mTLS
-#   NAT traversal — Tailscale
+# Or use the native subcommand directly:
+#   sudo intendant lan setup [flags]
+#   sudo intendant lan recert
+#   sudo intendant lan remove
 #
 set -euo pipefail
 
-CERT_DIR="/etc/intendant-lan"
-NGINX_SITE="intendant-lan"
-TUNNEL_SERVICE="intendant-tunnel"
-BACKEND="127.0.0.1:8765"
-HTTPS_PORT=8443
-CERT_SERVE_PORT=9999
-TUNNEL_TARGET=""
-ACTION="setup"
-FORCE=false
-LAN_IP=""
-P12_PASS=""
-CERT_LABEL=""
-
-die()   { echo "error: $*" >&2; exit 1; }
-info()  { echo ":: $*"; }
-warn()  { echo "!! $*" >&2; }
-
-usage() {
-    sed -n '3,16p' "$0" | sed 's/^# \?//'
-    exit 0
-}
-
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --backend)  BACKEND="$2"; shift 2 ;;
-            --tunnel)   TUNNEL_TARGET="$2"; shift 2 ;;
-            --port)     HTTPS_PORT="$2"; shift 2 ;;
-            --lan-ip)     LAN_IP="$2"; shift 2 ;;
-            --cert-port) CERT_SERVE_PORT="$2"; shift 2 ;;
-            --name)      CERT_LABEL="$2"; shift 2 ;;
-            --recert)    ACTION="recert"; shift ;;
-            --force)    FORCE=true; shift ;;
-            --remove)   ACTION="remove"; shift ;;
-            --stop-cert-server) ACTION="stop-cert-server"; shift ;;
-            -h|--help)  usage ;;
-            *)          die "unknown option: $1" ;;
-        esac
-    done
-}
-
-detect_lan_ip() {
-    if [[ -n "$LAN_IP" ]]; then
-        info "LAN IP: $LAN_IP (override)"
-        return
+# Find the intendant binary: prefer the project's release build, then
+# fall back to PATH. Don't force PATH-only, because setup-lan-macos.sh
+# copies this shim to /tmp on the target VM where only $PATH is usable.
+find_intendant() {
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    local project_bin="$script_dir/../target/release/intendant"
+    if [[ -x "$project_bin" ]]; then
+        echo "$project_bin"
+        return 0
     fi
-    LAN_IP=$(hostname -I | awk '{print $1}')
-    [[ -n "$LAN_IP" ]] || die "could not detect LAN IP"
-    info "LAN IP: $LAN_IP"
-}
-
-generate_server_cert() {
-    info "generating server cert for IP $LAN_IP..."
-    openssl genrsa -out "$CERT_DIR/server.key" 2048 2>/dev/null
-    openssl req -new \
-        -key "$CERT_DIR/server.key" \
-        -out "$CERT_DIR/server.csr" \
-        -subj "/CN=$LAN_IP" 2>/dev/null
-
-    # iOS requires: <=825 days, serverAuth EKU, CA:FALSE, SAN
-    openssl x509 -req \
-        -in "$CERT_DIR/server.csr" \
-        -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
-        -days 825 -out "$CERT_DIR/server.crt" \
-        -extfile <(cat <<EXTFILE
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
-subjectAltName=IP:$LAN_IP
-EXTFILE
-        ) 2>/dev/null
-
-    rm -f "$CERT_DIR/server.csr"
-    info "server cert issued for $LAN_IP (valid 825 days)"
-}
-
-recert() {
-    [[ $(id -u) -eq 0 ]] || die "run with sudo"
-    [[ -f "$CERT_DIR/ca.key" ]] || die "no CA found in $CERT_DIR — run full setup first"
-
-    detect_lan_ip
-
-    local old_ip
-    old_ip=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -ext subjectAltName 2>/dev/null \
-        | grep -oP 'IP Address:\K[0-9.]+' || echo "unknown")
-
-    if [[ "$old_ip" == "$LAN_IP" ]] && ! $FORCE; then
-        info "server cert already matches $LAN_IP — nothing to do (use --force to regenerate)"
-        exit 0
+    if command -v intendant &>/dev/null; then
+        command -v intendant
+        return 0
     fi
-
-    info "IP changed: $old_ip → $LAN_IP"
-    generate_server_cert
-    systemctl restart nginx
-    info "done — nginx restarted with new cert"
-    info "no changes needed on your phone (same CA)"
-    warn "if you get certificate errors, clear your browser's cache/history:"
-    warn "  iOS Safari: Settings → Safari → Clear History and Website Data"
-    warn "  Android Chrome: Settings → Privacy → Clear Browsing Data"
-    warn "  Desktop: clear SSL state or restart browser"
+    echo "error: intendant binary not found." >&2
+    echo "       build it first: cargo build --release" >&2
+    echo "       or install it on PATH before running this script." >&2
+    exit 1
 }
 
-generate_certs() {
-    if [[ -f "$CERT_DIR/ca.crt" && -f "$CERT_DIR/client.p12" ]]; then
-        P12_PASS=$(cat "$CERT_DIR/p12_password" 2>/dev/null || echo "unknown")
-        info "certs already exist in $CERT_DIR (run --remove to regenerate)"
-        # Still regenerate server cert if IP changed
-        local old_ip
-        old_ip=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -ext subjectAltName 2>/dev/null \
-            | grep -oP 'IP Address:\K[0-9.]+' || echo "none")
-        if [[ "$old_ip" != "$LAN_IP" ]]; then
-            warn "IP changed ($old_ip → $LAN_IP) — regenerating server cert"
-            generate_server_cert
-        fi
-        return
-    fi
-
-    info "generating certificates..."
-    mkdir -p "$CERT_DIR"
-
-    local cert_id="${CERT_LABEL:-$LAN_IP}"
-
-    # CA
-    openssl genrsa -out "$CERT_DIR/ca.key" 2048 2>/dev/null
-    openssl req -x509 -new -nodes \
-        -key "$CERT_DIR/ca.key" \
-        -days 3650 -out "$CERT_DIR/ca.crt" \
-        -subj "/CN=Intendant CA ($cert_id)" 2>/dev/null
-
-    # Server cert (SAN required by modern iOS/browsers)
-    generate_server_cert
-
-    # Client cert
-    openssl genrsa -out "$CERT_DIR/client.key" 2048 2>/dev/null
-    openssl req -new \
-        -key "$CERT_DIR/client.key" \
-        -out "$CERT_DIR/client.csr" \
-        -subj "/CN=Intendant Client ($cert_id)" 2>/dev/null
-    openssl x509 -req \
-        -in "$CERT_DIR/client.csr" \
-        -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
-        -days 3650 -out "$CERT_DIR/client.crt" 2>/dev/null
-
-    # .p12 for iOS (must have a password)
-    P12_PASS=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)
-    echo "$P12_PASS" > "$CERT_DIR/p12_password"
-    chmod 600 "$CERT_DIR/p12_password"
-
-    openssl pkcs12 -export \
-        -out "$CERT_DIR/client.p12" \
-        -inkey "$CERT_DIR/client.key" \
-        -in "$CERT_DIR/client.crt" \
-        -certfile "$CERT_DIR/ca.crt" \
-        -passout "pass:$P12_PASS" 2>/dev/null
-
-    # Cleanup intermediates
-    rm -f "$CERT_DIR"/*.csr "$CERT_DIR"/*.srl
-
-    info "certificates generated in $CERT_DIR"
-}
-
-install_nginx() {
-    if command -v nginx &>/dev/null; then
-        info "nginx already installed"
-    else
-        info "installing nginx..."
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx
-    fi
-}
-
-write_nginx_config() {
-    info "configuring nginx..."
-
-    cat > "/etc/nginx/sites-available/$NGINX_SITE" <<'NGINX_HEADER'
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    '' close;
-}
-NGINX_HEADER
-    cat >> "/etc/nginx/sites-available/$NGINX_SITE" <<NGINX
-
-server {
-    listen ${HTTPS_PORT} ssl;
-
-    ssl_certificate     ${CERT_DIR}/server.crt;
-    ssl_certificate_key ${CERT_DIR}/server.key;
-
-    # mTLS — clients with a cert signed by our CA get access.
-    # "optional" so Safari WebSocket connections work (they don't send
-    # client certs). The HTML page itself requires a valid cert to load,
-    # so unauthenticated clients get no content to interact with.
-    ssl_client_certificate ${CERT_DIR}/ca.crt;
-    ssl_verify_client optional;
-
-    # Block requests without a valid client cert (except WebSocket upgrades,
-    # which Safari sends without certs after the page is already loaded)
-    set \$auth_ok 0;
-    if (\$ssl_client_verify = SUCCESS) { set \$auth_ok 1; }
-    if (\$http_upgrade = websocket)    { set \$auth_ok 1; }
-    if (\$auth_ok = 0) { return 403; }
-
-    location / {
-        proxy_pass http://${BACKEND};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-
-        # Keep WebSocket alive (24h)
-        proxy_read_timeout 86400s;
-        proxy_send_timeout 86400s;
-
-        # Custom error page when intendant isn't running
-        proxy_intercept_errors on;
-        error_page 502 =502 @intendant_down;
-    }
-
-    location @intendant_down {
-        default_type text/html;
-        return 502 '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Intendant</title><style>body{background:#1e1e2e;color:#cdd6f4;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{text-align:center}.status{font-size:1.5em;margin-bottom:.5em;color:#f9e2af}p{color:#a6adc8}</style></head><body><div><div class="status">Waiting for intendant</div><p>The agent is not running yet. Start it with:<br><code style="color:#89b4fa">intendant --web</code></p><script>setTimeout(()=>location.reload(),3000)</script></div></body></html>';
-    }
-}
-NGINX
-
-    ln -sf "/etc/nginx/sites-available/$NGINX_SITE" /etc/nginx/sites-enabled/
-
-    nginx -t 2>/dev/null || die "nginx config test failed"
-    systemctl restart nginx
-    info "nginx listening on https://0.0.0.0:$HTTPS_PORT (mTLS)"
-}
-
-setup_tunnel() {
-    [[ -z "$TUNNEL_TARGET" ]] && return
-
-    # With nginx handling external access, tunnel only needs localhost
-    BACKEND="127.0.0.1:8765"
-
-    info "setting up SSH tunnel to $TUNNEL_TARGET..."
-
-    # Determine which user invoked sudo
-    local run_user="${SUDO_USER:-root}"
-    local run_home
-    run_home=$(eval echo "~$run_user")
-
-    # Ensure key-based auth works
-    local ssh_key="$run_home/.ssh/id_ed25519"
-    if ! sudo -u "$run_user" ssh -o BatchMode=yes -o ConnectTimeout=5 "$TUNNEL_TARGET" true 2>/dev/null; then
-        if [[ ! -f "$ssh_key" ]]; then
-            info "generating SSH key for $run_user..."
-            sudo -u "$run_user" ssh-keygen -t ed25519 -f "$ssh_key" -N "" -q
-        fi
-        info "copying SSH key to $TUNNEL_TARGET (password prompt)..."
-        sudo -u "$run_user" ssh-copy-id -i "${ssh_key}.pub" "$TUNNEL_TARGET"
-    fi
-
-    # Check if port 8765 is already in use
-    if ss -tlnp | grep -q ":8765 " 2>/dev/null; then
-        warn "port 8765 already in use — stop your manual SSH tunnel first"
-        warn "(the systemd service will manage the tunnel from now on)"
-        info "continuing anyway — service will retry until port is free"
-    fi
-
-    cat > "/etc/systemd/system/${TUNNEL_SERVICE}.service" <<SERVICE
-[Unit]
-Description=Intendant SSH tunnel to VM guest
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${run_user}
-ExecStart=/usr/bin/ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L 127.0.0.1:8765:localhost:8765 ${TUNNEL_TARGET}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-    systemctl daemon-reload
-    systemctl enable --now "$TUNNEL_SERVICE"
-    info "tunnel service started (systemctl status $TUNNEL_SERVICE)"
-}
-
-print_instructions_ios() {
-    cat <<EOF
-
-  Step 1 — Install CA certificate:
-
-    Open Safari → http://${LAN_IP}:${CERT_SERVE_PORT}/ca.crt
-
-    Settings → General → VPN & Device Management → Install
-    Settings → General → About → Certificate Trust Settings → Enable
-
-  Step 2 — Install client certificate:
-
-    Open Safari → http://${LAN_IP}:${CERT_SERVE_PORT}/client.p12
-
-    Password:  ${P12_PASS}
-
-    Settings → General → VPN & Device Management → Install
-EOF
-}
-
-print_instructions_android() {
-    cat <<EOF
-
-  Step 1 — Install CA certificate:
-
-    Open Chrome → http://${LAN_IP}:${CERT_SERVE_PORT}/ca.crt
-
-    Settings → Security → Encryption & Credentials
-      → Install a certificate → CA certificate
-
-  Step 2 — Install client certificate:
-
-    Open Chrome → http://${LAN_IP}:${CERT_SERVE_PORT}/client.p12
-
-    Password:  ${P12_PASS}
-
-    Settings → Security → Encryption & Credentials
-      → Install a certificate → VPN & app user certificate
-
-    (If .p12 doesn't work, try: http://${LAN_IP}:${CERT_SERVE_PORT}/client.pfx)
-EOF
-}
-
-print_instructions_firefox() {
-    cat <<EOF
-
-  Step 1 — Install CA certificate:
-
-    Option A (import from browser):
-      Settings → Privacy & Security → Certificates → View Certificates
-      → Authorities tab → Import → select ca.crt
-      → Check "Trust this CA to identify websites"
-
-    Option B (download):
-      Open http://${LAN_IP}:${CERT_SERVE_PORT}/ca.crt
-      Firefox may prompt to trust it directly.
-
-  Step 2 — Install client certificate:
-
-    Settings → Privacy & Security → Certificates → View Certificates
-    → Your Certificates tab → Import → select client.p12
-
-    Password:  ${P12_PASS}
-
-    (Download from: http://${LAN_IP}:${CERT_SERVE_PORT}/client.p12)
-EOF
-}
-
-print_instructions_chrome_linux() {
-    cat <<EOF
-
-  Step 1 — Install CA certificate (run in terminal):
-
-    certutil -d sql:\$HOME/.pki/nssdb -A -t "C,," \\
-      -n "Intendant CA" -i <(curl -s http://${LAN_IP}:${CERT_SERVE_PORT}/ca.crt)
-
-    (Install libnss3-tools if certutil is missing: sudo apt install libnss3-tools)
-
-  Step 2 — Install client certificate (run in terminal):
-
-    curl -so /tmp/client.p12 http://${LAN_IP}:${CERT_SERVE_PORT}/client.p12
-    pk12util -d sql:\$HOME/.pki/nssdb -i /tmp/client.p12
-    rm /tmp/client.p12
-
-    Password:  ${P12_PASS}
-
-  Restart Chrome after importing.
-EOF
-}
-
-print_instructions_chrome_mac() {
-    cat <<EOF
-
-  Step 1 — Install CA certificate:
-
-    Download: http://${LAN_IP}:${CERT_SERVE_PORT}/ca.crt
-
-    Double-click → opens Keychain Access → add to "login" keychain
-    Find "Intendant CA" → Get Info → Trust → "Always Trust"
-
-  Step 2 — Install client certificate:
-
-    Download: http://${LAN_IP}:${CERT_SERVE_PORT}/client.p12
-
-    Double-click → opens Keychain Access → enter password
-
-    Password:  ${P12_PASS}
-
-  Restart Chrome after importing.
-EOF
-}
-
-print_instructions_chrome_windows() {
-    cat <<EOF
-
-  Step 1 — Install CA certificate:
-
-    Download: http://${LAN_IP}:${CERT_SERVE_PORT}/ca.crt
-
-    Double-click → Install Certificate → Local Machine → "Trusted Root Certification Authorities"
-
-    Or via PowerShell (admin):
-      certutil.exe -addstore Root ca.crt
-
-  Step 2 — Install client certificate:
-
-    Download: http://${LAN_IP}:${CERT_SERVE_PORT}/client.p12
-
-    Double-click → Import → enter password → place in "Personal"
-
-    Password:  ${P12_PASS}
-
-  Restart Chrome after importing.
-EOF
-}
-
-stop_cert_server() {
-    local pid_file="$CERT_DIR/cert_server.pid"
-    if [[ -f "$pid_file" ]]; then
-        local pid
-        pid=$(cat "$pid_file")
-        kill "$pid" 2>/dev/null || true
-        rm -f "$pid_file"
-        # Clean up the temp serve directory recorded alongside the PID
-        local dir_file="$CERT_DIR/cert_server.dir"
-        if [[ -f "$dir_file" ]]; then
-            rm -rf "$(cat "$dir_file")"
-            rm -f "$dir_file"
-        fi
-        info "cert server stopped"
-    else
-        info "no cert server running"
-    fi
-}
-
-serve_certs() {
-    local serve_dir
-    serve_dir=$(mktemp -d)
-    cp "$CERT_DIR/ca.crt" "$serve_dir/"
-    cp "$CERT_DIR/client.p12" "$serve_dir/"
-    cp "$CERT_DIR/client.p12" "$serve_dir/client.pfx"  # Android compat
-
-    # Non-interactive (called via SSH from the .bat script): start the cert
-    # server as a background daemon and exit immediately so SSH can return.
-    # The .bat handles the interactive cert-installation UX on its own console.
-    if [[ ! -t 0 ]]; then
-        # Kill any leftover cert server from a previous run.
-        stop_cert_server
-        cd "$serve_dir"
-        nohup python3 -m http.server "$CERT_SERVE_PORT" --bind 0.0.0.0 > /dev/null 2>&1 &
-        echo $! > "$CERT_DIR/cert_server.pid"
-        echo "$serve_dir" > "$CERT_DIR/cert_server.dir"
-        info "cert server started on port $CERT_SERVE_PORT (background)"
-        return
-    fi
-
-    # Interactive: show platform menu and block until user is done.
-    cat <<EOF
-
-════════════════════════════════════════════════════════
-  Certificate Installation
-════════════════════════════════════════════════════════
-
-  What will you use to access intendant?
-
-    1) iPhone / iPad  (Safari)
-    2) Android        (Chrome)
-    3) Desktop Firefox
-    4) Desktop Chrome / Edge (Linux)
-    5) Desktop Chrome / Edge (macOS)
-    6) Desktop Chrome / Edge (Windows)
-    7) Show all
-
-EOF
-
-    local choice
-    read -rp "  Choose [1-7]: " choice
-    echo ""
-
-    case "$choice" in
-        1) print_instructions_ios ;;
-        2) print_instructions_android ;;
-        3) print_instructions_firefox ;;
-        4) print_instructions_chrome_linux ;;
-        5) print_instructions_chrome_mac ;;
-        6) print_instructions_chrome_windows ;;
-        7|*)
-            echo "  ── iPhone / iPad (Safari) ──"
-            print_instructions_ios
-            echo ""
-            echo "  ── Android (Chrome) ──"
-            print_instructions_android
-            echo ""
-            echo "  ── Desktop Firefox ──"
-            print_instructions_firefox
-            echo ""
-            echo "  ── Desktop Chrome/Edge (Linux) ──"
-            print_instructions_chrome_linux
-            echo ""
-            echo "  ── Desktop Chrome/Edge (macOS) ──"
-            print_instructions_chrome_mac
-            echo ""
-            echo "  ── Desktop Chrome/Edge (Windows) ──"
-            print_instructions_chrome_windows
+INTENDANT="$(find_intendant)"
+
+# Parse the flags the old bash script supported and translate them to
+# the new subcommand form. Only a few flags changed shape:
+#   --recert / --remove / --stop-cert-server → subcommand names
+#   everything else → passed through verbatim
+action="setup"
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --recert)           action="recert"; shift ;;
+        --remove)           action="remove"; shift ;;
+        --stop-cert-server) action="remove"; shift ;;  # closest equivalent
+        --tunnel|--backend) args+=("--backend" "$2"); shift 2 ;;
+        -h|--help)
+            "$INTENDANT" lan --help
+            exit 0
+            ;;
+        *)
+            args+=("$1"); shift
             ;;
     esac
+done
 
-    cat <<EOF
-
-  Then open:  https://${LAN_IP}:${HTTPS_PORT}
-
-════════════════════════════════════════════════════════
-
-  Serving certs at http://${LAN_IP}:${CERT_SERVE_PORT}/
-  Press Ctrl+C when done.
-
-EOF
-
-    cd "$serve_dir"
-    python3 -m http.server "$CERT_SERVE_PORT" --bind 0.0.0.0 &
-    local http_pid=$!
-    trap "kill $http_pid 2>/dev/null; rm -rf '$serve_dir'" EXIT
-    wait $http_pid 2>/dev/null
-    rm -rf "$serve_dir"
-}
-
-remove_all() {
-    info "removing intendant LAN setup..."
-
-    # cert server (if still running from a bat-initiated setup)
-    stop_cert_server
-
-    # nginx
-    rm -f "/etc/nginx/sites-enabled/$NGINX_SITE"
-    rm -f "/etc/nginx/sites-available/$NGINX_SITE"
-    if systemctl is-active nginx &>/dev/null; then
-        systemctl restart nginx
-    fi
-
-    # tunnel service
-    if [[ -f "/etc/systemd/system/${TUNNEL_SERVICE}.service" ]]; then
-        systemctl disable --now "$TUNNEL_SERVICE" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${TUNNEL_SERVICE}.service"
-        systemctl daemon-reload
-    fi
-
-    # certs
-    if [[ -d "$CERT_DIR" ]]; then
-        read -rp "Remove certificates in $CERT_DIR? [y/N] " yn
-        if [[ "$yn" == [yY] ]]; then
-            rm -rf "$CERT_DIR"
-            info "certificates removed"
-        fi
-    fi
-
-    info "done"
-}
-
-main() {
-    parse_args "$@"
-
-    if [[ "$ACTION" == "remove" ]]; then
-        [[ $(id -u) -eq 0 ]] || die "run with sudo"
-        remove_all
-        exit 0
-    fi
-
-    if [[ "$ACTION" == "recert" ]]; then
-        recert
-        exit 0
-    fi
-
-    if [[ "$ACTION" == "stop-cert-server" ]]; then
-        [[ $(id -u) -eq 0 ]] || die "run with sudo"
-        stop_cert_server
-        exit 0
-    fi
-
-    [[ $(id -u) -eq 0 ]] || die "run with sudo"
-
-    detect_lan_ip
-    install_nginx
-    [[ -n "$TUNNEL_TARGET" ]] && setup_tunnel
-    generate_certs
-    write_nginx_config
-    serve_certs
-}
-
-main "$@"
+exec "$INTENDANT" lan "$action" "${args[@]}"

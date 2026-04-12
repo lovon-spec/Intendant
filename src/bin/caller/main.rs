@@ -12,6 +12,7 @@ mod external_agent;
 mod frames;
 mod frontend;
 mod knowledge;
+mod lan;
 mod live_audio;
 mod live_audio_types;
 mod mcp;
@@ -6247,6 +6248,20 @@ async fn main() -> Result<(), CallerError> {
 
     // Ensure platform tool directories (Homebrew etc.) are in PATH.
     platform::ensure_tool_paths();
+
+    // Intercept `intendant lan <action>` before the main runtime setup —
+    // the lan subcommand is a pure system-setup path with no project,
+    // no .env, no provider selection.
+    if env::args().nth(1).as_deref() == Some("lan") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match lan::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
 
     // Load .env: cwd (+ parents) first, then project root, then ~/.config/intendant/
     dotenvy::dotenv().ok();

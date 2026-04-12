@@ -15,6 +15,19 @@ fn main() {
     println!("cargo:rerun-if-changed=static/wasm-web/presence_web_bg.wasm");
     println!("cargo:rerun-if-changed=static/wasm-web/presence_web.js");
 
+    // Detect OpenSSL 3 so the `lan` subcommand can conditionally load the
+    // legacy provider for RC2-40 (required for iOS-compatible PKCS#12).
+    // openssl-sys sets DEP_OPENSSL_VERSION_NUMBER via its `links = "openssl"`
+    // manifest entry; we forward it as a cfg for our own code.
+    println!("cargo:rustc-check-cfg=cfg(ossl3)");
+    if let Ok(version) = std::env::var("DEP_OPENSSL_VERSION_NUMBER") {
+        if let Ok(n) = u64::from_str_radix(&version, 16) {
+            if n >= 0x3000_0000 {
+                println!("cargo:rustc-cfg=ossl3");
+            }
+        }
+    }
+
     // Write a hash of the WASM binary to OUT_DIR so cargo detects changes
     // reliably. `rerun-if-changed` on binary files can be flaky across
     // worktrees; writing a derived file to OUT_DIR is bulletproof because
