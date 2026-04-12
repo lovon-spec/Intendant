@@ -2388,7 +2388,11 @@ pub fn session_log_entry_to_app_event(
 
         // ── Info / warn / error / debug → LogEntry ──
         //
-        // Source derivation mirrors the old replay_session_log prefix logic.
+        // Source and level are derived from message prefixes to match what
+        // the live WASM renders for the same messages.  Presence layer and
+        // model chatter route to the "server" source; everything else is
+        // "system".  `[model] Thinking` / `[model] Tool call:` are demoted
+        // to "detail" so they only show under verbose verbosity.
         "info" | "warn" | "error" | "debug" => {
             let source = if message.starts_with("[presence]")
                 || message.starts_with("[model]")
