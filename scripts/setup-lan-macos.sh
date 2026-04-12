@@ -11,7 +11,6 @@
 #
 set -euo pipefail
 
-SETUP_SCRIPT_NAME="setup-lan.sh"
 GUEST_OS="linux"
 
 REAL_USER="${SUDO_USER:-$(whoami)}"
@@ -67,14 +66,6 @@ as_user() {
         sudo -u "$SUDO_USER" -- "$@"
     else
         "$@"
-    fi
-}
-
-set_guest_script() {
-    if [[ "$GUEST_OS" == "macos" ]]; then
-        SETUP_SCRIPT_NAME="setup-lan-guest-macos.sh"
-    else
-        SETUP_SCRIPT_NAME="setup-lan.sh"
     fi
 }
 
@@ -182,7 +173,6 @@ migrate_legacy() {
     INSTANCE_NAME="${INSTANCE_NAME:-}"
     GUEST_OS="${GUEST_OS:-linux}"
     INSTANCE_SLUG=$(ip_to_slug "$VM_IP")
-    set_guest_script
 
     save_config
 
@@ -208,7 +198,6 @@ migrate_legacy() {
     NET_MODE=""
     INSTANCE_NAME=""
     GUEST_OS="linux"
-    SETUP_SCRIPT_NAME="setup-lan.sh"
 }
 
 # ── Config persistence ──
@@ -263,24 +252,96 @@ run_on_guest() {
     as_user ssh -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}" "$1"
 }
 
-run_guest_script() {
-    local args="$1"
-    if [[ "$GUEST_OS" == "linux" ]]; then
-        run_on_guest "sudo /tmp/$SETUP_SCRIPT_NAME $args"
-    else
-        # Homebrew isn't in PATH for SSH sessions (macOS only sources .zprofile for login shells)
-        run_on_guest "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; /tmp/$SETUP_SCRIPT_NAME $args"
+# Like run_on_guest but forces a PTY with `-tt`. Needed for interactive
+# long-running commands (notably `intendant lan setup` which blocks on
+# its cert distribution server until Ctrl+C) so that local SIGINT
+# propagates via the PTY to the remote process tree. Without `-tt`,
+# Ctrl+C only closes the local ssh client and leaves the remote process
+# orphaned.
+run_on_guest_interactive() {
+    as_user ssh -tt -o StrictHostKeyChecking=accept-new "${VM_USER}@${VM_IP}" "$1"
+}
+
+# Cached absolute path to the `intendant` binary on the VM, resolved once
+# by `resolve_intendant_path` and reused across subsequent SSH calls.
+REMOTE_INTENDANT=""
+
+# Shell prefix the VM needs for each command. macOS doesn't load
+# Homebrew's PATH for non-login SSH sessions, so we seed it ourselves.
+# Linux VMs don't need anything — PATH defaults are fine.
+remote_shell_prefix() {
+    if [[ "$GUEST_OS" == "macos" ]]; then
+        echo "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; "
     fi
 }
 
-copy_to_guest() {
-    local script_dir
-    script_dir="$(cd "$(dirname "$0")" && pwd)"
-    local script_path="$script_dir/$SETUP_SCRIPT_NAME"
-    [[ -f "$script_path" ]] || die "$SETUP_SCRIPT_NAME not found in $script_dir"
+# Resolve the absolute path of `intendant` on the VM once and cache it.
+# Dies with a clear error if the binary isn't on the remote user's PATH.
+resolve_intendant_path() {
+    [[ -n "$REMOTE_INTENDANT" ]] && return 0
 
-    as_user scp -o StrictHostKeyChecking=accept-new "$script_path" "${VM_USER}@${VM_IP}:/tmp/$SETUP_SCRIPT_NAME"
-    run_on_guest "chmod +x /tmp/$SETUP_SCRIPT_NAME"
+    local prefix
+    prefix="$(remote_shell_prefix)"
+    local resolved
+    resolved=$(run_on_guest "${prefix}command -v intendant 2>/dev/null || true")
+    resolved=$(echo "$resolved" | tr -d '\r\n')
+
+    if [[ -z "$resolved" ]]; then
+        echo ""
+        echo "error: 'intendant' is not on the VM user's PATH" >&2
+        echo "" >&2
+        echo "Build and install it on the VM before re-running this script:" >&2
+        echo "  ssh ${VM_USER}@${VM_IP}" >&2
+        if [[ "$GUEST_OS" == "linux" ]]; then
+            echo "  cd ~/path/to/intendant && cargo build --release" >&2
+            echo "  sudo ln -sf \$(pwd)/target/release/intendant /usr/local/bin/intendant" >&2
+        else
+            echo "  cd ~/path/to/intendant && cargo build --release" >&2
+            echo "  ln -sf \$(pwd)/target/release/intendant /opt/homebrew/bin/intendant" >&2
+        fi
+        echo "" >&2
+        die "intendant not found on VM"
+    fi
+    REMOTE_INTENDANT="$resolved"
+    info "remote intendant: $REMOTE_INTENDANT"
+}
+
+# Run `intendant lan <action> [args]` on the VM. On Linux the command
+# is prefixed with `sudo` because the Linux backend writes to /etc and
+# requires root; on macOS the backend is user-level and refuses to run
+# as root, so no sudo.
+#
+# Setup blocks on the interactive cert distribution server, so we use
+# `run_on_guest_interactive` (PTY-allocating) for that action so that
+# local Ctrl+C propagates cleanly to the remote process tree. All other
+# actions are short-lived and use plain `run_on_guest`.
+run_intendant_lan() {
+    local action="$1"
+    shift
+
+    resolve_intendant_path
+
+    local prefix
+    prefix="$(remote_shell_prefix)"
+
+    # Quote each arg so it survives a round-trip through ssh's shell.
+    local remote_args=""
+    for a in "$@"; do
+        remote_args+=" $(printf '%q' "$a")"
+    done
+
+    local cmd
+    if [[ "$GUEST_OS" == "linux" ]]; then
+        cmd="${prefix}sudo ${REMOTE_INTENDANT} lan ${action}${remote_args}"
+    else
+        cmd="${prefix}${REMOTE_INTENDANT} lan ${action}${remote_args}"
+    fi
+
+    if [[ "$action" == "setup" || "$action" == "serve-certs" ]]; then
+        run_on_guest_interactive "$cmd"
+    else
+        run_on_guest "$cmd"
+    fi
 }
 
 ensure_ssh_keys() {
@@ -442,7 +503,6 @@ run_wizard() {
     else
         GUEST_OS="macos"
     fi
-    set_guest_script
 
     # Step 2: Network mode
     local net_choice=0
@@ -602,15 +662,17 @@ run_wizard() {
     save_config
     info "config saved to $(instance_config)"
 
-    info "copying setup script to VM..."
-    copy_to_guest
+    info "resolving intendant on VM..."
+    resolve_intendant_path
 
     info "running setup on VM..."
-    local guest_args="--port $HTTPS_PORT"
-    [[ "$NET_MODE" == "shared" ]] && guest_args="$guest_args --lan-ip $LAN_IP --cert-port $CERT_PORT"
-    guest_args="$guest_args --name '${INSTANCE_NAME:-$VM_IP}'"
+    local guest_args=("--port" "$HTTPS_PORT")
+    if [[ "$NET_MODE" == "shared" ]]; then
+        guest_args+=("--lan-ip" "$LAN_IP" "--cert-port" "$CERT_PORT")
+    fi
+    guest_args+=("--name" "${INSTANCE_NAME:-$VM_IP}")
     local guest_exit=0
-    run_guest_script "$guest_args" || guest_exit=$?
+    run_intendant_lan setup "${guest_args[@]}" || guest_exit=$?
 
     echo ""
     # Exit 0 = clean exit; >128 = killed by signal (Ctrl+C on cert server = normal)
@@ -633,11 +695,11 @@ run_wizard() {
         echo ""
         echo "  The SSH tunnel and config are in place, but the"
         echo "  VM-side setup did not complete. SSH in and run:"
-        if [[ "$GUEST_OS" == "linux" ]]; then
-            echo "    sudo /tmp/$SETUP_SCRIPT_NAME $guest_args"
-        else
-            echo "    /tmp/$SETUP_SCRIPT_NAME $guest_args"
-        fi
+        local manual_prefix=""
+        [[ "$GUEST_OS" == "linux" ]] && manual_prefix="sudo "
+        printf '    %s%s lan setup' "$manual_prefix" "${REMOTE_INTENDANT:-intendant}"
+        printf ' %q' "${guest_args[@]}"
+        printf '\n'
         echo ""
         if [[ "$NET_MODE" == "shared" ]]; then
             info "SSH tunnel is running — Logs: $CONFIG_DIR/$INSTANCE_SLUG.log"
@@ -674,7 +736,6 @@ run_list() {
 run_recert() {
     select_instance
     load_config || die "could not load config"
-    set_guest_script
 
     detect_lan_iface
     detect_lan_ip
@@ -684,15 +745,12 @@ run_recert() {
         setup_tunnel
     fi
 
-    local recert_args="--recert"
-    $FORCE && recert_args="$recert_args --force"
-    [[ "$NET_MODE" == "shared" ]] && recert_args="$recert_args --lan-ip $LAN_IP"
-
-    info "copying setup script to VM..."
-    copy_to_guest
+    local recert_args=()
+    $FORCE && recert_args+=("--force")
+    [[ "$NET_MODE" == "shared" ]] && recert_args+=("--lan-ip" "$LAN_IP")
 
     info "regenerating server cert on VM..."
-    run_guest_script "$recert_args"
+    run_intendant_lan recert "${recert_args[@]}"
 
     echo ""
     info "done — phone connects to: https://${LAN_IP}:${HTTPS_PORT}"
@@ -707,7 +765,6 @@ run_remove() {
         info "done (VM-side config may need manual removal)"
         return
     fi
-    set_guest_script
 
     local display="$VM_IP"
     [[ -n "$INSTANCE_NAME" ]] && display="$INSTANCE_NAME ($VM_IP)"
@@ -718,10 +775,10 @@ run_remove() {
     fi
 
     info "removing VM-side config..."
-    if ! run_guest_script "--remove" 2>/dev/null; then
-        local manual_cmd="$SETUP_SCRIPT_NAME --remove"
-        [[ "$GUEST_OS" == "linux" ]] && manual_cmd="sudo $manual_cmd"
-        warn "could not remove VM config — run '$manual_cmd' manually in the VM"
+    if ! run_intendant_lan remove 2>/dev/null; then
+        local manual_prefix=""
+        [[ "$GUEST_OS" == "linux" ]] && manual_prefix="sudo "
+        warn "could not remove VM config — run '${manual_prefix}intendant lan remove' manually in the VM"
     fi
 
     rm -f "$(instance_config)"

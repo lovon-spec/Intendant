@@ -224,49 +224,64 @@ function Invoke-GuestCommand($cmd) {
     }
 }
 
-function Find-LocalGuestScript {
-    # $ScriptDir is the bat's real directory, passed via -ScriptDir from the batch preamble.
-    # $PSScriptRoot may be %TEMP% (bat copies itself there) or empty.
-    $dirs = @($ScriptDir, $PSScriptRoot, $PWD.Path) | Where-Object { $_ }
-    foreach ($dir in $dirs) {
-        $candidate = Join-Path $dir "setup-lan.sh"
-        if (Test-Path $candidate) { return $candidate }
+# Cached absolute path to the `intendant` binary on the guest, resolved
+# once by Resolve-GuestIntendantPath and reused across subsequent calls.
+$script:RemoteIntendant = ""
+
+function Resolve-GuestIntendantPath {
+    if ($script:RemoteIntendant) { return $script:RemoteIntendant }
+
+    $ErrorActionPreference = "Continue"
+    $resolved = Invoke-GuestCommand "command -v intendant 2>/dev/null || true"
+    $ErrorActionPreference = "Stop"
+    $resolved = ($resolved -join "`n").Trim()
+
+    if (-not $resolved) {
+        Write-Host ""
+        Write-Host "error: 'intendant' is not on the guest user's PATH" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Build and install it on the guest before re-running this script:"
+        if ($script:Mode -eq "wsl") {
+            Write-Host "  wsl"
+            Write-Host "  cd ~/path/to/intendant && cargo build --release"
+            Write-Host "  sudo ln -sf `$(pwd)/target/release/intendant /usr/local/bin/intendant"
+        } else {
+            Write-Host "  ssh $($script:VmUser)@$($script:SshHost)"
+            Write-Host "  cd ~/path/to/intendant && cargo build --release"
+            Write-Host "  sudo ln -sf `$(pwd)/target/release/intendant /usr/local/bin/intendant"
+        }
+        Write-Host ""
+        Die "intendant not found on guest"
     }
-    return $null
+    $script:RemoteIntendant = $resolved
+    Info "remote intendant: $($script:RemoteIntendant)"
+    return $script:RemoteIntendant
 }
 
-function Copy-AndRunOnGuest($setupArgs) {
-    # Temporarily allow stderr from ssh/scp without crashing (host key warnings, etc.)
+# Build a shell-quoted string of args so they survive a round-trip
+# through the guest's shell. PowerShell's argument passing through
+# `wsl bash -c` and `ssh host cmd` is notoriously fragile.
+function Quote-GuestArg($s) {
+    # Single-quote the argument, escape any embedded single quotes.
+    return "'" + ($s -replace "'", "'\''") + "'"
+}
+
+# Run `intendant lan <action> [args]` on the guest. Linux guest means
+# sudo is required (backend writes to /etc); we only support Linux
+# guests on the Windows orchestrator.
+function Invoke-IntendantLan {
+    param(
+        [string]$Action,
+        [string[]]$LanArgs = @()
+    )
+
     $ErrorActionPreference = "Continue"
 
-    $scriptPath = Find-LocalGuestScript
-    $ghUrl = "https://raw.githubusercontent.com/lovon-spec/intendant/main/scripts/setup-lan.sh"
-    $runCmd = "sudo /tmp/setup-lan.sh $setupArgs"
+    $intendant = Resolve-GuestIntendantPath
+    $quoted = ($LanArgs | ForEach-Object { Quote-GuestArg $_ }) -join " "
+    $cmd = "sudo $intendant lan $Action $quoted"
 
-    if ($script:Mode -eq "wsl") {
-        if ($scriptPath) {
-            $wslPath = wsl wslpath -a ($scriptPath -replace '\\', '/')
-            wsl cp $wslPath /tmp/setup-lan.sh
-        } else {
-            wsl curl -sfL $ghUrl -o /tmp/setup-lan.sh
-            if ($LASTEXITCODE -ne 0) { Die "failed to download setup-lan.sh in WSL" }
-        }
-        wsl bash -c "sed -i 's/\r`$//' /tmp/setup-lan.sh && chmod +x /tmp/setup-lan.sh && $runCmd"
-    } else {
-        $sshArgs = Get-SshArgs
-        if ($scriptPath) {
-            $scpPort = if ($script:SshPort -ne 22) { @("-P", $script:SshPort) } else { @() }
-            scp @scpPort $scriptPath "$($script:VmUser)@$($script:SshHost):/tmp/setup-lan.sh"
-        }
-        # Single SSH session: download (if needed) + chmod + run
-        # Strip \r in case the file was checked out with CRLF on Windows.
-        $remoteCmd = ""
-        if (-not $scriptPath) {
-            $remoteCmd = "curl -sfL '$ghUrl' -o /tmp/setup-lan.sh && "
-        }
-        $remoteCmd += "sed -i 's/\r`$//' /tmp/setup-lan.sh && chmod +x /tmp/setup-lan.sh && $runCmd"
-        ssh @sshArgs $remoteCmd
-    }
+    Invoke-GuestCommand $cmd
 }
 
 function Test-GuestSsh {
@@ -437,22 +452,34 @@ function Run-Wizard {
     # Step 5: Execute
     Write-Host ""
 
-    # Set up port forwarding FIRST -- setup-lan.sh will start a temporary
-    # HTTP server for cert download, which needs to be reachable from the phone
+    # Set up port forwarding FIRST -- the cert distribution server
+    # started below needs to be reachable from the phone on the host
+    # interface, not just the guest's localhost.
     Info "setting up port forwarding..."
     Add-PortForwarding
     Add-FirewallRule
 
     Info "running setup on guest..."
-    Copy-AndRunOnGuest "--port $($script:Port) --lan-ip $hostIp"
+    # --no-serve-certs: the guest-side `intendant lan setup` returns
+    # once the certs + nginx config are in place. We run the cert
+    # distribution server ourselves below so we can display the p12
+    # password in the Windows console (the guest's SSH stdout isn't
+    # always visible, especially for WSL flows).
+    Invoke-IntendantLan "setup" @(
+        "--port", "$($script:Port)"
+        "--lan-ip", "$hostIp"
+        "--cert-port", "$($script:CertPort)"
+        "--no-serve-certs"
+    )
 
-    # Save config for future --recert / --remove
+    # Save config for future -Recert / -Remove
     Save-Config
     Info "config saved to $($script:ConfigPath)"
 
     # --- Certificate installation (interactive, on the Windows console) ---
-    # The guest script started a background HTTP cert server. Read the
-    # P12 password from the guest so we can display it here.
+    # Read the p12 password the guest just generated, start the cert
+    # distribution server as a background job, show the password on
+    # Windows, and tear down the job when the user confirms.
     $p12Pass = ""
     try {
         $p12Pass = (Invoke-GuestCommand "sudo cat /etc/intendant-lan/p12_password 2>/dev/null").Trim()
@@ -461,6 +488,24 @@ function Run-Wizard {
     if ($p12Pass) {
         $caUrl   = "http://${hostIp}:$($script:CertPort)/ca.crt"
         $p12Url  = "http://${hostIp}:$($script:CertPort)/client.p12"
+
+        # Start the cert distribution server as a background job so the
+        # Windows UI can show the password and wait for user input.
+        # `ssh -t` allocates a PTY so SIGHUP propagates to the remote
+        # process when the job is killed, cleaning up `intendant lan
+        # serve-certs` without needing an explicit stop RPC.
+        $certJob = Start-Job -ScriptBlock {
+            param($mode, $intendant, $sshHost, $sshPort, $vmUser, $hostIp, $certPort, $httpsPort)
+            $remoteCmd = "sudo $intendant lan serve-certs --lan-ip $hostIp --cert-port $certPort --port $httpsPort"
+            if ($mode -eq "wsl") {
+                wsl bash -c $remoteCmd
+            } else {
+                $sshArgs = @("-tt")
+                if ($sshPort -ne 22) { $sshArgs += @("-p", $sshPort) }
+                $sshArgs += "$vmUser@$sshHost"
+                ssh @sshArgs $remoteCmd
+            }
+        } -ArgumentList $script:Mode, $script:RemoteIntendant, $script:SshHost, $script:SshPort, $script:VmUser, $hostIp, $script:CertPort, $script:Port
 
         Write-Host ""
         Write-Host "========================================================" -ForegroundColor Cyan
@@ -485,10 +530,20 @@ function Run-Wizard {
 
         $null = Read-Host "  Press Enter when certs are installed on your phone"
 
-        # Stop the background cert server on the guest
-        try { Copy-AndRunOnGuest "--stop-cert-server" } catch {}
+        # Stop the background cert distribution job. Killing the job
+        # terminates the ssh -tt / wsl process, which propagates SIGHUP
+        # to the guest's `intendant lan serve-certs` via the PTY.
+        Stop-Job $certJob -ErrorAction SilentlyContinue
+        Remove-Job $certJob -Force -ErrorAction SilentlyContinue
+
+        # Belt and braces: in case PTY propagation didn't work (orphaned
+        # sudo children, broken tty, etc.), explicitly kill any remaining
+        # cert server on the guest.
+        try {
+            Invoke-GuestCommand "sudo pkill -f 'intendant lan serve-certs' 2>/dev/null || true" | Out-Null
+        } catch {}
     } else {
-        Warn "could not read cert password from guest -- run setup-lan.sh on the guest directly for cert setup"
+        Warn "could not read cert password from guest -- run 'sudo intendant lan serve-certs' on the guest manually"
     }
 
     # WSL warning
@@ -537,9 +592,9 @@ function Run-Remove {
         if ($script:Mode -eq "wsl") {
             Resolve-GuestIp
         }
-        Copy-AndRunOnGuest "--remove"
+        Invoke-IntendantLan "remove"
     } catch {
-        Warn "could not remove guest config (run 'sudo setup-lan.sh --remove' manually in the guest)"
+        Warn "could not remove guest config (run 'sudo intendant lan remove' manually in the guest)"
     }
 
     Remove-Item $script:ConfigPath -ErrorAction SilentlyContinue
@@ -559,11 +614,11 @@ function Run-Recert {
     Add-PortForwarding
     Info "port forwarding updated"
 
-    $recertArgs = "--recert"
-    if ($Force) { $recertArgs += " --force" }
+    $recertArgs = @()
+    if ($Force) { $recertArgs += "--force" }
 
     Info "regenerating server cert on guest..."
-    Copy-AndRunOnGuest $recertArgs
+    Invoke-IntendantLan "recert" $recertArgs
 
     $hostIp = Get-HostLanIp
     Write-Host ""

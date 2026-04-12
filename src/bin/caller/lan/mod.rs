@@ -64,6 +64,11 @@ pub struct LanArgs {
     pub name: Option<String>,
     pub backend_addr: String,
     pub force: bool,
+    /// Skip the interactive cert distribution server at the end of setup.
+    /// Used by host orchestrators (e.g. the Windows batch script) that
+    /// manage the distribution flow themselves and need setup to return
+    /// as soon as the certs are written and nginx is reloaded.
+    pub no_serve_certs: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +91,7 @@ impl Default for LanArgs {
             name: None,
             backend_addr: "127.0.0.1:8765".to_string(),
             force: false,
+            no_serve_certs: false,
         }
     }
 }
@@ -163,6 +169,9 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
             "--force" => {
                 args.force = true;
             }
+            "--no-serve-certs" => {
+                args.no_serve_certs = true;
+            }
             "-h" | "--help" => {
                 args.action = LanAction::Help;
                 return Ok(args);
@@ -196,6 +205,7 @@ fn print_help() {
     println!("    --name <LABEL>     Host label shown in cert CN and multi-host dashboard");
     println!("    --backend <ADDR>   Upstream intendant address (default 127.0.0.1:8765)");
     println!("    --force            Skip idempotency checks (regenerate even if current)");
+    println!("    --no-serve-certs   Skip the cert distribution server at the end of setup");
     println!();
     println!("SECURITY TIERS:");
     println!("    Trusted LAN    — mTLS (this command)");
@@ -236,6 +246,17 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     println!();
     println!("  Phone connects to: https://{lan_ip}:{}", args.https_port);
     println!();
+
+    if args.no_serve_certs {
+        // Host orchestrators (e.g. the Windows batch script) run the cert
+        // distribution server separately so they can intercept the p12
+        // password and display it in the host console instead of the
+        // guest's SSH output.
+        println!("  Skipping cert distribution server (--no-serve-certs).");
+        println!("  Run `intendant lan serve-certs` later to distribute the client cert.");
+        println!();
+        return Ok(());
+    }
 
     // Start the cert distribution server (blocks until Ctrl+C).
     println!("  Starting client cert distribution server on port {}...", args.cert_port);
