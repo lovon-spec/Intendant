@@ -153,9 +153,22 @@ async fn create_external_agent(
             (agent, config)
         }
         AgentBackend::ClaudeCode => {
-            return Err(CallerError::ExternalAgent(
-                "Claude Code backend not yet implemented".into(),
+            let cfg = &project.config.agent.claude_code;
+            let agent = Box::new(external_agent::claude_code::ClaudeCodeAgent::new(
+                cfg.command.clone(),
+                cfg.model.clone(),
+                cfg.permission_mode.clone(),
+                cfg.allowed_tools.clone(),
+                web_port,
             ));
+            let config = AgentConfig {
+                model: cfg.model.clone(),
+                working_dir: project.root.clone(),
+                approval_policy: cfg.permission_mode.clone(),
+                sandbox: false,
+                web_port,
+            };
+            (agent, config)
         }
     };
 

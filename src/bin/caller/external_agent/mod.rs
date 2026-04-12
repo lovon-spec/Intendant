@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
+pub mod claude_code;
 pub mod codex;
 pub mod gemini;
 
