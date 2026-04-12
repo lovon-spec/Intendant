@@ -313,6 +313,14 @@ pub struct AppState {
     // Logs
     log_buffer: Vec<LogEntry>,
     verbosity: String,
+    /// When set, `add_log_with_images` uses this as the timestamp for
+    /// emitted entries instead of the wallclock.  Used by replay so the
+    /// historical `ts` from session.jsonl flows through the live rendering
+    /// path.  Live callers pass `None` and wallclock is used as before.
+    ///
+    /// Set at the top of `handle_event` when the inbound message carries
+    /// a `ts` field; cleared by the guard returned from `begin_replay_ts`.
+    replay_ts: Option<String>,
 
     // Usage
     main_usage: Option<UsageSnapshot>,
@@ -344,6 +352,7 @@ impl AppState {
             pending_approval_id: None,
             log_buffer: Vec::new(),
             verbosity: "normal".to_string(),
+            replay_ts: None,
             main_usage: None,
             presence_usage: None,
             live_usage: None,
@@ -507,107 +516,78 @@ impl AppState {
     }
 
     /// Replay historical log entries on connect.
+    ///
+    /// The gateway converts each session.jsonl line into an `OutboundEvent`
+    /// JSON object (matching the live broadcast shape) and prepends a
+    /// `replay_start` marker carrying persisted provider/model/autonomy.
+    /// This function clears the log buffer, seeds the status bar from the
+    /// marker, and delegates every other entry to `handle_event` so the
+    /// live rendering path is the single source of truth.
     fn handle_log_replay(&mut self, entries: &[serde_json::Value]) -> Vec<UiCommand> {
         let mut cmds = vec![UiCommand::ClearLogs];
         self.log_buffer.clear();
 
-        // Extract status info from replay entries
-        for e in entries {
-            let c = e["content"].as_str().unwrap_or("");
-            if let Some(rest) = c.strip_prefix("Autonomy: ") {
-                self.autonomy = rest.to_string();
-                cmds.push(UiCommand::UpdateStatusBar {
-                    provider: None, model: None, turn: None, budget_pct: None,
-                    autonomy: Some(rest.to_string()), session_id: None, external_agent: None,
-                });
-            } else if let Some(rest) = c.strip_prefix("Provider: ") {
-                self.provider = rest.to_string();
-                cmds.push(UiCommand::UpdateStatusBar {
-                    provider: Some(rest.to_string()),
-                    model: None, turn: None, budget_pct: None, autonomy: None, session_id: None, external_agent: None,
-                });
-            } else if let Some(rest) = c.strip_prefix("Model: ") {
-                self.model = rest.to_string();
-                cmds.push(UiCommand::UpdateStatusBar {
-                    provider: None,
-                    model: Some(rest.to_string()),
-                    turn: None, budget_pct: None, autonomy: None, session_id: None, external_agent: None,
-                });
-            }
-            if let Some(t) = e["turn"].as_u64() {
-                self.turn = t;
-                cmds.push(UiCommand::UpdateStatusBar {
-                    provider: None, model: None,
-                    turn: Some(t),
-                    budget_pct: None, autonomy: None, session_id: None, external_agent: None,
-                });
-            }
-        }
-
-        let visible = visible_levels(&self.verbosity);
-        let mut last_turn: Option<u64> = None;
-
-        for e in entries {
-            let level = e["level"].as_str().unwrap_or("info");
-            let source = e["source"].as_str().unwrap_or("system");
-            let content = e["content"].as_str().unwrap_or("");
-            let ts = e["ts"].as_str().unwrap_or("");
-            let turn = e["turn"].as_u64();
-
-            let is_collapsible = content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
-                || content.len() > COLLAPSE_CHAR_THRESHOLD;
-
-            // Store in buffer
-            self.log_buffer.push(LogEntry {
-                ts: ts.to_string(),
-                level: level.to_string(),
-                source: source_label(source).to_string(),
-                content: content.to_string(),
-                collapsible: is_collapsible,
-                turn,
-            });
-
-            if !visible.contains(&level) {
+        for entry in entries {
+            if entry.get("event").and_then(|v| v.as_str()) == Some("replay_start") {
+                if let Some(p) = entry.get("provider").and_then(|v| v.as_str()) {
+                    self.provider = p.to_string();
+                    cmds.push(UiCommand::UpdateStatusBar {
+                        provider: Some(p.to_string()),
+                        model: None,
+                        turn: None,
+                        budget_pct: None,
+                        autonomy: None,
+                        session_id: None,
+                        external_agent: None,
+                    });
+                }
+                if let Some(m) = entry.get("model").and_then(|v| v.as_str()) {
+                    self.model = m.to_string();
+                    cmds.push(UiCommand::UpdateStatusBar {
+                        provider: None,
+                        model: Some(m.to_string()),
+                        turn: None,
+                        budget_pct: None,
+                        autonomy: None,
+                        session_id: None,
+                        external_agent: None,
+                    });
+                }
+                if let Some(a) = entry.get("autonomy").and_then(|v| v.as_str()) {
+                    self.autonomy = a.to_string();
+                    cmds.push(UiCommand::UpdateStatusBar {
+                        provider: None,
+                        model: None,
+                        turn: None,
+                        budget_pct: None,
+                        autonomy: Some(a.to_string()),
+                        session_id: None,
+                        external_agent: None,
+                    });
+                }
                 continue;
             }
 
-            // Turn separator
-            if let Some(t) = turn {
-                if last_turn != Some(t) {
-                    cmds.push(UiCommand::AddTurnSeparator { turn: t });
-                    last_turn = Some(t);
-                }
-            }
-
-            // For agent output, parse MCP content blocks to extract images
-            let (display_content, images) = if level == "agent" {
-                let out = format_agent_output(content);
-                (out.text, out.images)
-            } else {
-                (content.to_string(), vec![])
-            };
-
-            let is_collapsible = !images.is_empty()
-                || display_content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
-                || display_content.len() > COLLAPSE_CHAR_THRESHOLD;
-
-            cmds.push(UiCommand::AddLogEntry {
-                ts: ts[..8.min(ts.len())].to_string(),
-                level: level.to_string(),
-                source: source_label(source).to_string(),
-                content: display_content,
-                collapsible: is_collapsible,
-                turn: None, // separator already handled
-                images,
-            });
+            // All other entries are `OutboundEvent` JSON — run the live path.
+            cmds.extend(self.handle_event(entry));
         }
 
         cmds
     }
 
     /// Handle an OutboundEvent.
+    ///
+    /// If `msg` carries a `ts` field (injected by replay), that timestamp is
+    /// threaded through to the log entries emitted by this handler.  Live
+    /// broadcasts don't include `ts`, so wallclock is used in that path.
     fn handle_event(&mut self, msg: &serde_json::Value) -> Vec<UiCommand> {
         let event = msg["event"].as_str().unwrap_or("");
+        // Replay-path timestamp override: set for the duration of this call
+        // so every add_log_with_images emission picks up the historical ts.
+        self.replay_ts = msg
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let mut cmds = Vec::new();
 
         match event {
@@ -642,15 +622,24 @@ impl AppState {
 
             "model_response" => {
                 let summary = msg["summary"].as_str().unwrap_or("");
+                let reasoning = msg["reasoning_summary"].as_str();
                 let source = msg["source"].as_str().unwrap_or("worker");
-                let display = if summary.is_empty() {
-                    "Model response".to_string()
-                } else {
-                    summary.to_string()
-                };
-                cmds.extend(self.add_log("model", &display, None, source));
-                if let Some(rs) = msg["reasoning_summary"].as_str() {
-                    cmds.extend(self.add_log("detail", &format!("Reasoning: {}", rs), None, source));
+                // Skip spurious empty "Model response" rows.  Replay emits
+                // a reasoning-only ModelResponse (empty content + reasoning
+                // set) when the on-disk session has a `reasoning` event
+                // without a preceding model_response; rendering "Model
+                // response" in that case is drift.
+                if !summary.is_empty() {
+                    cmds.extend(self.add_log("model", summary, None, source));
+                } else if reasoning.is_none() {
+                    // Live path with no summary and no reasoning — keep the
+                    // old placeholder so debugging stays possible.
+                    cmds.extend(self.add_log("model", "Model response", None, source));
+                }
+                if let Some(rs) = reasoning {
+                    if !rs.is_empty() {
+                        cmds.extend(self.add_log("detail", &format!("Reasoning: {}", rs), None, source));
+                    }
                 }
             }
 
@@ -998,6 +987,9 @@ impl AppState {
             }
         }
 
+        // Clear replay timestamp override so subsequent live calls revert
+        // to wallclock.
+        self.replay_ts = None;
         cmds
     }
 
@@ -1007,6 +999,10 @@ impl AppState {
     }
 
     /// Add a log entry with optional images, respecting verbosity.
+    ///
+    /// When `self.replay_ts` is set (during replay), that timestamp is used
+    /// for the emitted entry instead of the wallclock.  Callers in live mode
+    /// leave `replay_ts` as `None` so wallclock is used as before.
     fn add_log_with_images(
         &mut self,
         level: &str,
@@ -1015,7 +1011,15 @@ impl AppState {
         source: &str,
         images: Vec<String>,
     ) -> Vec<UiCommand> {
-        let ts = current_time_str();
+        // Trim replay timestamps to HH:MM:SS so they render identically to
+        // the old replay path (which truncated via `ts[..8.min(ts.len())]`).
+        let ts = match &self.replay_ts {
+            Some(t) => {
+                let end = 8.min(t.len());
+                t[..end].to_string()
+            }
+            None => current_time_str(),
+        };
         let source_str = source_label(source).to_string();
         let is_collapsible = !images.is_empty()
             || content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
@@ -1399,20 +1403,171 @@ mod tests {
     #[test]
     fn handle_log_replay() {
         let mut s = AppState::new();
+        // Entries are OutboundEvent-shaped JSON objects (what the gateway
+        // emits after running session.jsonl through
+        // session_log_entry_to_app_event → app_event_to_outbound).
         let msg = json!({
             "t": "log_replay",
             "entries": [
-                {"ts": "10:00:00", "level": "info", "source": "system", "content": "Turn 1 started", "turn": 1},
-                {"ts": "10:00:01", "level": "agent", "source": "agent", "content": "hello world", "turn": 1},
-                {"ts": "10:00:02", "level": "debug", "source": "system", "content": "internal", "turn": 1},
+                {"event": "replay_start", "provider": "openai", "model": "gpt-5", "autonomy": "Medium"},
+                {"event": "turn_started", "turn": 1, "budget_pct": 0.0, "ts": "10:00:00"},
+                {"event": "agent_output", "stdout": "hello world", "stderr": "", "ts": "10:00:01"},
+                {"event": "log_entry", "level": "debug", "source": "system", "content": "internal", "ts": "10:00:02"},
             ]
         });
         let cmds = s.handle_message(&msg);
-        // debug entry should not be visible at normal verbosity
-        assert_eq!(s.log_buffer.len(), 3); // all stored
-        // ClearLogs + status updates + turn separator + 2 visible entries
+        // ClearLogs emitted at the top.
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ClearLogs)));
+        // replay_start marker propagated to status bar.
+        assert_eq!(s.provider, "openai");
+        assert_eq!(s.model, "gpt-5");
+        // Debug entry hidden at normal verbosity → 2 visible entries
+        // (turn started + agent output).
         let visible_entries: Vec<_> = cmds.iter().filter(|c| matches!(c, UiCommand::AddLogEntry { .. })).collect();
-        assert_eq!(visible_entries.len(), 2); // info + agent, not debug
+        assert_eq!(visible_entries.len(), 2);
+    }
+
+    #[test]
+    fn handle_log_replay_applies_replay_start_marker() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "t": "log_replay",
+            "entries": [
+                {"event": "replay_start", "provider": "openai", "model": "gpt-5", "autonomy": "High"},
+            ]
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ClearLogs)));
+        let status_updates: Vec<_> = cmds
+            .iter()
+            .filter(|c| matches!(c, UiCommand::UpdateStatusBar { .. }))
+            .collect();
+        // Three UpdateStatusBar calls — provider, model, autonomy.
+        assert_eq!(status_updates.len(), 3);
+        assert_eq!(s.provider, "openai");
+        assert_eq!(s.model, "gpt-5");
+        assert_eq!(s.autonomy, "High");
+    }
+
+    #[test]
+    fn handle_event_respects_ts_override() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "model_response",
+            "turn": 1,
+            "summary": "hello",
+            "source": "worker",
+            "ts": "12:34:56.789",
+        });
+        let cmds = s.handle_event(&msg);
+        let ts = cmds
+            .iter()
+            .find_map(|c| match c {
+                UiCommand::AddLogEntry { ts, content, .. } if content == "hello" => {
+                    Some(ts.clone())
+                }
+                _ => None,
+            })
+            .expect("model_response should emit an AddLogEntry for 'hello'");
+        // Trimmed to HH:MM:SS.
+        assert_eq!(ts, "12:34:56");
+        // After the call, replay_ts must be cleared so subsequent live calls
+        // revert to wallclock.
+        assert!(s.replay_ts.is_none());
+    }
+
+    #[test]
+    fn round_complete_uses_system_source_on_replay() {
+        let mut s = AppState::new();
+        let entries = vec![
+            json!({"event": "replay_start", "provider": "x", "model": "y", "autonomy": "Medium"}),
+            json!({"event": "round_complete", "round": 2, "turns_in_round": 5, "ts": "01:00:00"}),
+        ];
+        let cmds = s.handle_log_replay(&entries);
+        let source = cmds
+            .iter()
+            .find_map(|c| match c {
+                UiCommand::AddLogEntry { source, content, .. }
+                    if content.contains("Round 2 complete") =>
+                {
+                    Some(source.clone())
+                }
+                _ => None,
+            })
+            .expect("round_complete should emit an AddLogEntry");
+        // "system" → source_label("system") → ℹ glyph.
+        assert_eq!(source, "\u{2139}");
+    }
+
+    #[test]
+    fn auto_approved_prefix_preserved_on_replay() {
+        let mut s = AppState::new();
+        let entries = vec![
+            json!({"event": "replay_start", "provider": "p", "model": "m", "autonomy": "Medium"}),
+            json!({"event": "auto_approved", "preview": "exec: ls /tmp", "ts": "01:00:00"}),
+        ];
+        let cmds = s.handle_log_replay(&entries);
+        let entry = cmds.iter().find_map(|c| match c {
+            UiCommand::AddLogEntry { content, source, .. } => {
+                if content.starts_with("Auto-approved: ") {
+                    Some((content.clone(), source.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        });
+        let (content, source) = entry
+            .expect("auto_approved should emit an entry with the Auto-approved: prefix");
+        assert_eq!(content, "Auto-approved: exec: ls /tmp");
+        // Source label for "system" is the ℹ glyph.
+        assert_eq!(source, "\u{2139}");
+    }
+
+    #[test]
+    fn model_response_skips_empty_summary_and_reasoning() {
+        // When a reasoning event is replayed as a ModelResponse with empty
+        // content and no reasoning (Risk E), the WASM must NOT emit a
+        // spurious empty "Model response" row.
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "model_response",
+            "turn": 1,
+            "summary": "",
+            "source": "worker",
+            "ts": "01:00:00",
+        });
+        let cmds = s.handle_event(&msg);
+        // With no summary and no reasoning, live path still emits the
+        // placeholder so debug output stays visible.
+        let lines: Vec<_> = cmds
+            .iter()
+            .filter(|c| matches!(c, UiCommand::AddLogEntry { .. }))
+            .collect();
+        assert_eq!(lines.len(), 1);
+
+        // But with reasoning-only (replay path for a bare `reasoning`
+        // session.jsonl event) we get only the reasoning row.
+        let mut s2 = AppState::new();
+        s2.verbosity = "verbose".to_string();
+        let msg2 = json!({
+            "event": "model_response",
+            "turn": 1,
+            "summary": "",
+            "reasoning_summary": "thinking about X",
+            "source": "worker",
+            "ts": "01:00:00",
+        });
+        let cmds2 = s2.handle_event(&msg2);
+        let lines2: Vec<_> = cmds2
+            .iter()
+            .filter_map(|c| match c {
+                UiCommand::AddLogEntry { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines2.len(), 1);
+        assert!(lines2[0].starts_with("Reasoning: "));
     }
 
     #[test]
