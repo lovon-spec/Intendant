@@ -1494,7 +1494,7 @@ fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> 
 /// 5. On failure → log warning, let commands fail naturally
 ///
 /// Format raw agent JSON into a human-readable preview for the Activity tab.
-fn format_commands_preview(json_str: &str) -> String {
+pub(crate) fn format_commands_preview(json_str: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
         if let Some(cmds) = parsed.get("commands").and_then(|v| v.as_array()) {
             let parts: Vec<String> = cmds.iter().filter_map(|cmd| {

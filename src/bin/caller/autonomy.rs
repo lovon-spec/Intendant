@@ -97,6 +97,24 @@ impl ActionCategory {
             Self::DisplayControl => 8,
         }
     }
+
+    /// Inverse of `Display`: parse the lowercase snake-case category name
+    /// back into a variant.  Used by session-log replay to reconstruct
+    /// `ApprovalRequired` events from persisted approval rows.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "file_read" => Some(Self::FileRead),
+            "file_write" => Some(Self::FileWrite),
+            "file_delete" => Some(Self::FileDelete),
+            "command_exec" => Some(Self::CommandExec),
+            "network" => Some(Self::NetworkRequest),
+            "destructive" => Some(Self::Destructive),
+            "human_input" => Some(Self::HumanInput),
+            "live_audio_spawn" => Some(Self::LiveAudioSpawn),
+            "display_control" => Some(Self::DisplayControl),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ActionCategory {

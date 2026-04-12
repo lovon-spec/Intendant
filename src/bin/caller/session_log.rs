@@ -1905,6 +1905,583 @@ impl Drop for SessionLog {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inverse: JSONL entry → AppEvent
+// ---------------------------------------------------------------------------
+
+/// Helper: parse a `u32` numeric field from the `data` block.
+fn u32_from_data(data: Option<&serde_json::Value>, key: &str) -> Option<u32> {
+    data?.get(key)?.as_u64().map(|v| v as u32)
+}
+
+/// Reconstruct an `AppEvent` from a parsed `session.jsonl` entry.
+///
+/// Inverse of the typed writer methods above.  Used during replay to drive
+/// the live `app_event_to_outbound` → WASM `handle_event` path so there is
+/// a single rendering path for both live broadcast and historical replay.
+///
+/// Returns `None` for:
+///   - internal bookkeeping events (`session_start`, `messages_input`,
+///     `json_extracted`, `agent_input`),
+///   - high-frequency telemetry (`voice_audio`, `voice_frame`),
+///   - events whose `AppEvent` variants are explicitly filtered out of the
+///     live outbound path (`voice_log`, `tool_request`, `presence_connected`,
+///     `live_audio_*`, …).  These don't render on live either — keeping
+///     replay silent here is the cost of guaranteeing a single rendering
+///     path.  If any of these graduate to live visibility later, extend both
+///     `app_event_to_outbound` and this function together.
+///
+/// For events with a `file` field (`model_response`, `agent_output`,
+/// `reasoning`), reads the full content from the turn file under `log_dir`
+/// and substitutes it for the 200-char `message` preview.
+pub fn session_log_entry_to_app_event(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+) -> Option<crate::event::AppEvent> {
+    use crate::event::AppEvent;
+    use crate::provider::TokenUsage;
+    use crate::types::LogLevel;
+
+    let event_type = entry.get("event").and_then(|v| v.as_str())?;
+    let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let turn = entry
+        .get("turn")
+        .and_then(|v| v.as_u64())
+        .map(|t| t as usize);
+    let data = entry.get("data");
+
+    // Helper: read full content from a file-reference field, relative to log_dir.
+    let read_file = |key: &str| -> Option<String> {
+        entry
+            .get(key)
+            .and_then(|f| f.as_str())
+            .and_then(|f| fs::read_to_string(log_dir.join(f)).ok())
+    };
+
+    // Helper: parse LogLevel from persisted string.
+    let parse_log_level = |s: &str| -> Option<LogLevel> {
+        match s {
+            "info" => Some(LogLevel::Info),
+            "warn" => Some(LogLevel::Warn),
+            "error" => Some(LogLevel::Error),
+            "debug" => Some(LogLevel::Debug),
+            "detail" => Some(LogLevel::Detail),
+            "model" => Some(LogLevel::Model),
+            "agent" => Some(LogLevel::Agent),
+            "subagent" => Some(LogLevel::SubAgent),
+            _ => None,
+        }
+    };
+
+    match event_type {
+        // ── Skip: internal bookkeeping / high-frequency / not-on-live ──
+        //
+        // These events either have no AppEvent counterpart, or their AppEvent
+        // variants are filtered out in `app_event_to_outbound`.  Returning
+        // `None` is the price of a single-rendering-path refactor.
+        "session_start"
+        | "messages_input"
+        | "json_extracted"
+        | "agent_input"
+        | "voice_audio"
+        | "voice_frame"
+        | "summary"
+        | "interrupted"
+        | "voice_log"
+        | "voice_protocol"
+        | "voice_usage"
+        | "voice_error"
+        | "voice_diagnostic"
+        | "presence_connected"
+        | "presence_disconnected"
+        | "presence_checkpoint"
+        | "tool_request"
+        | "tool_response"
+        | "live_audio_started"
+        | "live_audio_progress"
+        | "live_audio_completed" => None,
+
+        // ── Turn lifecycle ──
+        "turn_start" => {
+            let budget_pct = data
+                .and_then(|d| d.get("budget_pct"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let remaining = data
+                .and_then(|d| d.get("remaining_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Some(AppEvent::TurnStarted {
+                turn: turn?,
+                budget_pct,
+                remaining,
+            })
+        }
+
+        // ── Model response ──
+        "model_response" => {
+            let content = read_file("file").unwrap_or_else(|| message.to_string());
+            let tokens = data.and_then(|d| d.get("tokens"));
+            let usage = TokenUsage {
+                prompt_tokens: tokens
+                    .and_then(|t| t.get("prompt"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                completion_tokens: tokens
+                    .and_then(|t| t.get("completion"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                total_tokens: tokens
+                    .and_then(|t| t.get("total"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cached_tokens: tokens
+                    .and_then(|t| t.get("cached"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            };
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Some(AppEvent::ModelResponse {
+                turn: turn.unwrap_or(0),
+                content,
+                usage,
+                reasoning: None,
+                source,
+            })
+        }
+
+        // ── Reasoning: emit as a ModelResponse carrying only the reasoning ──
+        //
+        // Returns None when both summary and full content are empty so that
+        // replay does not render a spurious empty "Model response" row.
+        "reasoning" => {
+            let full = read_file("file");
+            let summary = if message.is_empty() {
+                None
+            } else {
+                Some(message.to_string())
+            };
+            let reasoning = full.or(summary)?;
+            if reasoning.is_empty() {
+                return None;
+            }
+            Some(AppEvent::ModelResponse {
+                turn: turn.unwrap_or(0),
+                content: String::new(),
+                usage: TokenUsage::default(),
+                reasoning: Some(reasoning),
+                source: None,
+            })
+        }
+
+        // ── Agent lifecycle ──
+        "agent_started" => {
+            // Backward compat: older sessions stored the raw JSON blob in
+            // `message`; newer sessions store a pre-formatted preview.
+            let commands_preview = if message.starts_with('{') {
+                crate::format_commands_preview(message)
+            } else {
+                message.to_string()
+            };
+            Some(AppEvent::AgentStarted {
+                turn: turn.unwrap_or(0),
+                commands_preview,
+                source: None,
+            })
+        }
+        "agent_output" => {
+            let stdout = read_file("file").unwrap_or_else(|| message.to_string());
+            let stderr = read_file("file2").unwrap_or_default();
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Some(AppEvent::AgentOutput {
+                stdout,
+                stderr,
+                source,
+            })
+        }
+
+        "done_signal" => Some(AppEvent::DoneSignal {
+            message: Some(message.to_string()).filter(|m| !m.is_empty()),
+        }),
+        "task_complete" => {
+            let reason = data
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| message.to_string());
+            let summary = data
+                .and_then(|d| d.get("summary"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Some(AppEvent::TaskComplete { reason, summary })
+        }
+        "session_started" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let task = data
+                .and_then(|d| d.get("task"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Some(AppEvent::SessionStarted { session_id, task })
+        }
+        "session_ended" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reason = data
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AppEvent::SessionEnded { session_id, reason })
+        }
+
+        // ── Approval ──
+        //
+        // The approval id is not persisted directly; we reuse `turn` (set at
+        // write time to `self.current_turn`, matching the live convention at
+        // `main.rs:3229`).  This breaks if a single turn can emit multiple
+        // approval rounds — not the case today, and asserted in tests.
+        "auto_approved" => Some(AppEvent::AutoApproved {
+            preview: message.to_string(),
+        }),
+        "approval" => {
+            let decision = data
+                .and_then(|d| d.get("decision"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let preview = data
+                .and_then(|d| d.get("preview"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(message)
+                .to_string();
+            let category_str = data
+                .and_then(|d| d.get("category"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let id = turn.unwrap_or(0) as u64;
+            match decision {
+                "waiting" => {
+                    let category = crate::autonomy::ActionCategory::from_str(category_str)
+                        .unwrap_or(crate::autonomy::ActionCategory::CommandExec);
+                    Some(AppEvent::ApprovalRequired {
+                        id,
+                        command_preview: preview,
+                        category,
+                    })
+                }
+                "approved" => Some(AppEvent::ApprovalResolved {
+                    id,
+                    action: "approve".to_string(),
+                }),
+                "approve-all" => Some(AppEvent::ApprovalResolved {
+                    id,
+                    action: "approve_all".to_string(),
+                }),
+                "skipped" => Some(AppEvent::ApprovalResolved {
+                    id,
+                    action: "skip".to_string(),
+                }),
+                "denied" => Some(AppEvent::ApprovalResolved {
+                    id,
+                    action: "deny".to_string(),
+                }),
+                "dedup-auto-approved" => Some(AppEvent::AutoApproved { preview }),
+                "denied-policy" | "denied-no-approver" => Some(AppEvent::LogEntry {
+                    level: "warn".to_string(),
+                    source: "system".to_string(),
+                    content: format!("Denied ({}): {}", decision, preview),
+                    turn,
+                }),
+                _ => None,
+            }
+        }
+        "approval_resolved" => {
+            // The writer formats the message as "Approval {action} (turn {id})".
+            // Split on whitespace to recover the action; the id is `turn`.
+            let action = message
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            Some(AppEvent::ApprovalResolved {
+                id: turn.unwrap_or(0) as u64,
+                action,
+            })
+        }
+        "human_question" => Some(AppEvent::HumanQuestionDetected {
+            question: message.to_string(),
+        }),
+        "human_response_sent" => Some(AppEvent::HumanResponseSent),
+
+        // ── Round / safety ──
+        "round_complete" => {
+            let round = data
+                .and_then(|d| d.get("round"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let turns_in_round = data
+                .and_then(|d| d.get("turns_in_round"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            Some(AppEvent::RoundComplete {
+                round,
+                turns_in_round,
+            })
+        }
+        "safety_cap_reached" => Some(AppEvent::SafetyCapReached),
+
+        // ── Display / debug ──
+        "display_ready" => Some(AppEvent::DisplayReady {
+            display_id: u32_from_data(data, "display_id")?,
+            width: u32_from_data(data, "width").unwrap_or(0),
+            height: u32_from_data(data, "height").unwrap_or(0),
+        }),
+        "display_resize" => Some(AppEvent::DisplayResize {
+            display_id: u32_from_data(data, "display_id")?,
+            width: u32_from_data(data, "width").unwrap_or(0),
+            height: u32_from_data(data, "height").unwrap_or(0),
+        }),
+        "display_taken" => Some(AppEvent::DisplayTaken {
+            display_id: u32_from_data(data, "display_id")?,
+        }),
+        "display_released" => Some(AppEvent::DisplayReleased {
+            display_id: u32_from_data(data, "display_id")?,
+            note: data
+                .and_then(|d| d.get("note"))
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        }),
+        "debug_screen_ready" => Some(AppEvent::DebugScreenReady {
+            display_id: u32_from_data(data, "display_id")?,
+        }),
+        "debug_screen_torn_down" => Some(AppEvent::DebugScreenTornDown {
+            display_id: u32_from_data(data, "display_id")?,
+        }),
+
+        // ── Recording ──
+        "recording_started" => Some(AppEvent::RecordingStarted {
+            stream_name: data
+                .and_then(|d| d.get("stream_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "recording_stopped" => Some(AppEvent::RecordingStopped {
+            stream_name: data
+                .and_then(|d| d.get("stream_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "recording_error" => {
+            // `recording_error` writer stores `error` in data; AppEvent field
+            // is named `message`.
+            let error = data
+                .and_then(|d| d.get("error"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| message.to_string());
+            let stream_name = data
+                .and_then(|d| d.get("stream_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AppEvent::RecordingError {
+                stream_name,
+                message: error,
+            })
+        }
+
+        // ── Sub-agent / orchestrator ──
+        "sub_agent_result" => Some(AppEvent::SubAgentResult {
+            formatted: message.to_string(),
+        }),
+        "orchestrator_progress" => Some(AppEvent::OrchestratorProgress {
+            turn: 0,
+            status: message.to_string(),
+            last_action: String::new(),
+        }),
+
+        // ── Presence / live usage ──
+        "presence_log" => {
+            let level = entry
+                .get("level")
+                .and_then(|v| v.as_str())
+                .and_then(parse_log_level);
+            Some(AppEvent::PresenceLog {
+                message: message.to_string(),
+                level,
+                turn: None,
+            })
+        }
+        "presence_usage_update" => Some(AppEvent::PresenceUsageUpdate {
+            total_tokens: data
+                .and_then(|d| d.get("total_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            context_window: data
+                .and_then(|d| d.get("context_window"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            usage_pct: data
+                .and_then(|d| d.get("usage_pct"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            provider: data
+                .and_then(|d| d.get("provider"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            model: data
+                .and_then(|d| d.get("model"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+        }),
+        "live_usage_update" => Some(AppEvent::LiveUsageUpdate {
+            provider: data
+                .and_then(|d| d.get("provider"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            model: data
+                .and_then(|d| d.get("model"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            total_tokens: data
+                .and_then(|d| d.get("total_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            thinking_tokens: 0,
+        }),
+
+        // ── User transcript ──
+        "user_transcript" => {
+            let seq = data
+                .and_then(|d| d.get("seq"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Some(AppEvent::UserTranscript {
+                text: message.to_string(),
+                seq,
+            })
+        }
+
+        // ── Info / warn / error / debug → LogEntry ──
+        //
+        // Source derivation mirrors the old replay_session_log prefix logic.
+        "info" | "warn" | "error" | "debug" => {
+            let source = if message.starts_with("[presence]")
+                || message.starts_with("[model]")
+                || message.starts_with("Presence")
+                || message.starts_with("[ws]")
+            {
+                "server"
+            } else {
+                "system"
+            };
+            let level = if event_type == "info"
+                && (message.starts_with("[model] Thinking")
+                    || message.starts_with("[model] Tool call:"))
+            {
+                "detail"
+            } else {
+                event_type
+            };
+            Some(AppEvent::LogEntry {
+                level: level.to_string(),
+                source: source.to_string(),
+                content: message.to_string(),
+                turn,
+            })
+        }
+
+        // ── CU (Computer Use) structured events → LogEntry ──
+        "cu_task_start" | "cu_turn" | "cu_task_complete" | "cu_task_error" => {
+            let (content, level) = match event_type {
+                "cu_task_start" => {
+                    let task = data
+                        .and_then(|d| d.get("task"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(message);
+                    let provider = data
+                        .and_then(|d| d.get("provider"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let model = data
+                        .and_then(|d| d.get("model"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (
+                        format!("CU task: {} ({}:{})", task, provider, model),
+                        "info",
+                    )
+                }
+                "cu_turn" => {
+                    let t = data
+                        .and_then(|d| d.get("turn"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let actions = data
+                        .and_then(|d| d.get("actions"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    (format!("CU turn {}: {}", t, actions), "debug")
+                }
+                "cu_task_complete" => {
+                    let turns = data
+                        .and_then(|d| d.get("turns"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    (format!("CU complete ({} turns)", turns), "info")
+                }
+                "cu_task_error" => (format!("CU error: {}", message), "warn"),
+                _ => unreachable!(),
+            };
+            Some(AppEvent::LogEntry {
+                level: level.to_string(),
+                source: "worker".to_string(),
+                content,
+                turn: None,
+            })
+        }
+        "session_end" => Some(AppEvent::LogEntry {
+            level: "info".to_string(),
+            source: "system".to_string(),
+            content: message.to_string(),
+            turn: None,
+        }),
+
+        // ── Unknown / forward-compat ──
+        _ => None,
+    }
+}
+
 /// A reconstructed conversation turn from voice_log / user_transcript events.
 #[derive(Debug, Clone)]
 pub struct ConversationTurn {
@@ -2762,5 +3339,572 @@ mod tests {
             10,
         );
         assert!(results.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Round-trip tests for `session_log_entry_to_app_event`.
+    // Each test writes to session.jsonl using the typed writer methods,
+    // parses the resulting line, runs it through the inverse function,
+    // and asserts the reconstructed AppEvent matches expectations.
+    // ------------------------------------------------------------------
+
+    use crate::event::AppEvent;
+
+    /// Helper: drop `log`, read session.jsonl, and return the last entry
+    /// whose `event` field matches `event_type`.
+    fn read_last_event(
+        log_dir: &std::path::Path,
+        event_type: &str,
+    ) -> serde_json::Value {
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some(event_type))
+            .last()
+            .unwrap_or_else(|| panic!("no {} event found", event_type))
+    }
+
+    #[test]
+    fn rt_model_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(5, 0.5, 100_000);
+        log.model_response(
+            "Hello world — full content here",
+            100,
+            50,
+            150,
+            10,
+            Some("Codex"),
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "model_response");
+        let evt = session_log_entry_to_app_event(&entry, &log_dir).unwrap();
+        match evt {
+            AppEvent::ModelResponse {
+                turn,
+                content,
+                usage,
+                reasoning,
+                source,
+            } => {
+                assert_eq!(turn, 5);
+                // Verifies the full content was read from the turn file,
+                // not truncated to the 200-char preview in `message`.
+                assert_eq!(content, "Hello world — full content here");
+                assert_eq!(usage.prompt_tokens, 100);
+                assert_eq!(usage.completion_tokens, 50);
+                assert_eq!(usage.total_tokens, 150);
+                assert_eq!(usage.cached_tokens, 10);
+                assert!(reasoning.is_none());
+                assert_eq!(source.as_deref(), Some("Codex"));
+            }
+            other => panic!("expected ModelResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_auto_approved_preserves_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.auto_approved("exec: ls -la /tmp");
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "auto_approved");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::AutoApproved { preview } => {
+                assert_eq!(preview, "exec: ls -la /tmp");
+            }
+            other => panic!("expected AutoApproved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_round_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.round_complete(2, 5);
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "round_complete");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::RoundComplete {
+                round,
+                turns_in_round,
+            } => {
+                assert_eq!(round, 2);
+                assert_eq!(turns_in_round, 5);
+            }
+            other => panic!("expected RoundComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_approval_waiting_to_approval_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(7, 0.0, 100_000);
+        log.approval("command_exec", "exec: rm -rf /tmp/x", "waiting");
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "approval");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::ApprovalRequired {
+                id,
+                command_preview,
+                category,
+            } => {
+                assert_eq!(id, 7, "id should be synthesized from turn");
+                assert_eq!(command_preview, "exec: rm -rf /tmp/x");
+                assert_eq!(category, crate::autonomy::ActionCategory::CommandExec);
+            }
+            other => panic!("expected ApprovalRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_approval_approved_to_approval_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(3, 0.0, 100_000);
+        log.approval("file_write", "writeFile: a.rs", "approved");
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "approval");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::ApprovalResolved { id, action } => {
+                assert_eq!(id, 3);
+                assert_eq!(action, "approve");
+            }
+            other => panic!("expected ApprovalResolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_approval_dedup_autoapproved() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(4, 0.0, 100_000);
+        log.approval("command_exec", "exec: ls", "dedup-auto-approved");
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "approval");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::AutoApproved { preview } => {
+                assert_eq!(preview, "exec: ls");
+            }
+            other => panic!("expected AutoApproved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_approval_denied_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(6, 0.0, 100_000);
+        log.approval("network", "browse: evil.com", "denied-policy");
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "approval");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::LogEntry {
+                level,
+                source,
+                content,
+                turn,
+            } => {
+                assert_eq!(level, "warn");
+                assert_eq!(source, "system");
+                assert!(
+                    content.contains("Denied (denied-policy)"),
+                    "content was: {content}"
+                );
+                assert!(content.contains("browse: evil.com"));
+                assert_eq!(turn, Some(6));
+            }
+            other => panic!("expected LogEntry for policy deny, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_agent_output_reads_turn_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        // stdout large enough that the 200-char preview differs from the full text
+        let big_stdout: String = (0..600).map(|i| ((i % 26) as u8 + b'a') as char).collect();
+        log.agent_output(&big_stdout, "small stderr", Some("Codex"));
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "agent_output");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::AgentOutput {
+                stdout,
+                stderr,
+                source,
+            } => {
+                // Full content read from turn file, not truncated preview.
+                assert_eq!(stdout.len(), 600);
+                assert_eq!(stdout, big_stdout);
+                assert_eq!(stderr, "small stderr");
+                assert_eq!(source.as_deref(), Some("Codex"));
+            }
+            other => panic!("expected AgentOutput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_agent_started_old_json_format() {
+        // Synthesize an old-style `agent_started` entry where `message`
+        // contains raw JSON rather than a pre-formatted preview.
+        let raw_json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls -la"}]}"#;
+        let entry = serde_json::json!({
+            "ts": "01:00:00.000",
+            "turn": 1,
+            "event": "agent_started",
+            "level": "info",
+            "message": raw_json,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        match session_log_entry_to_app_event(&entry, dir.path()).unwrap() {
+            AppEvent::AgentStarted {
+                turn,
+                commands_preview,
+                source,
+            } => {
+                assert_eq!(turn, 1);
+                // format_commands_preview normalized it.
+                assert_eq!(commands_preview, "exec: ls -la");
+                assert!(source.is_none());
+            }
+            other => panic!("expected AgentStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_reasoning_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.reasoning_content(
+            Some("The model is thinking about X"),
+            Some("Full detailed reasoning about X and Y spanning many lines"),
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "reasoning");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::ModelResponse {
+                turn,
+                content,
+                reasoning,
+                source,
+                ..
+            } => {
+                assert_eq!(turn, 1);
+                assert!(content.is_empty());
+                // Full content preferred over summary.
+                assert_eq!(
+                    reasoning.as_deref(),
+                    Some("Full detailed reasoning about X and Y spanning many lines")
+                );
+                assert!(source.is_none());
+            }
+            other => panic!("expected ModelResponse with reasoning, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_reasoning_skipped_when_empty() {
+        // Synthetic: reasoning entry with neither message nor file.
+        let entry = serde_json::json!({
+            "ts": "01:00:00.000",
+            "turn": 1,
+            "event": "reasoning",
+            "level": "info",
+            "data": {"has_summary": false, "has_full_content": false, "full_content_length": 0},
+        });
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            session_log_entry_to_app_event(&entry, dir.path()).is_none(),
+            "reasoning entry with no content should return None"
+        );
+    }
+
+    #[test]
+    fn rt_display_ready_taken_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.display_ready(99, 1920, 1080);
+        log.display_taken(99);
+        log.display_released(99, Some("session ended"));
+        drop(log);
+
+        let ready = read_last_event(&log_dir, "display_ready");
+        match session_log_entry_to_app_event(&ready, &log_dir).unwrap() {
+            AppEvent::DisplayReady {
+                display_id,
+                width,
+                height,
+            } => {
+                assert_eq!(display_id, 99);
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+            }
+            other => panic!("expected DisplayReady, got {:?}", other),
+        }
+
+        let taken = read_last_event(&log_dir, "display_taken");
+        match session_log_entry_to_app_event(&taken, &log_dir).unwrap() {
+            AppEvent::DisplayTaken { display_id } => assert_eq!(display_id, 99),
+            other => panic!("expected DisplayTaken, got {:?}", other),
+        }
+
+        let released = read_last_event(&log_dir, "display_released");
+        match session_log_entry_to_app_event(&released, &log_dir).unwrap() {
+            AppEvent::DisplayReleased { display_id, note } => {
+                assert_eq!(display_id, 99);
+                assert_eq!(note.as_deref(), Some("session ended"));
+            }
+            other => panic!("expected DisplayReleased, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_recording_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.recording_started("rec-1");
+        log.recording_error("rec-1", "encoder crashed");
+        log.recording_stopped("rec-1");
+        drop(log);
+
+        let started = read_last_event(&log_dir, "recording_started");
+        match session_log_entry_to_app_event(&started, &log_dir).unwrap() {
+            AppEvent::RecordingStarted { stream_name } => {
+                assert_eq!(stream_name, "rec-1")
+            }
+            other => panic!("expected RecordingStarted, got {:?}", other),
+        }
+
+        let err = read_last_event(&log_dir, "recording_error");
+        match session_log_entry_to_app_event(&err, &log_dir).unwrap() {
+            AppEvent::RecordingError {
+                stream_name,
+                message,
+            } => {
+                assert_eq!(stream_name, "rec-1");
+                assert_eq!(message, "encoder crashed");
+            }
+            other => panic!("expected RecordingError, got {:?}", other),
+        }
+
+        let stopped = read_last_event(&log_dir, "recording_stopped");
+        match session_log_entry_to_app_event(&stopped, &log_dir).unwrap() {
+            AppEvent::RecordingStopped { stream_name } => {
+                assert_eq!(stream_name, "rec-1")
+            }
+            other => panic!("expected RecordingStopped, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_cu_task_events_become_log_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.cu_task_start("click send button", "openai", "gpt-5-cu", true, None, 0);
+        log.cu_turn(1, 0, 2, 1, 50, 30, &["click(100,200)".to_string(), "type(hi)".to_string()]);
+        log.cu_task_complete(3, true, "done");
+        log.cu_task_error("display lost", None);
+        drop(log);
+
+        let start = read_last_event(&log_dir, "cu_task_start");
+        match session_log_entry_to_app_event(&start, &log_dir).unwrap() {
+            AppEvent::LogEntry {
+                level,
+                source,
+                content,
+                ..
+            } => {
+                assert_eq!(level, "info");
+                assert_eq!(source, "worker");
+                assert!(content.contains("CU task: click send button"));
+                assert!(content.contains("openai:gpt-5-cu"));
+            }
+            other => panic!("expected LogEntry for cu_task_start, got {:?}", other),
+        }
+
+        let turn_entry = read_last_event(&log_dir, "cu_turn");
+        match session_log_entry_to_app_event(&turn_entry, &log_dir).unwrap() {
+            AppEvent::LogEntry {
+                level,
+                source,
+                content,
+                ..
+            } => {
+                assert_eq!(level, "debug");
+                assert_eq!(source, "worker");
+                assert!(content.contains("CU turn 1"));
+                assert!(content.contains("click(100,200)"));
+            }
+            other => panic!("expected LogEntry for cu_turn, got {:?}", other),
+        }
+
+        let complete = read_last_event(&log_dir, "cu_task_complete");
+        match session_log_entry_to_app_event(&complete, &log_dir).unwrap() {
+            AppEvent::LogEntry { content, .. } => {
+                assert!(content.contains("CU complete (3 turns)"));
+            }
+            other => panic!("expected LogEntry for cu_task_complete, got {:?}", other),
+        }
+
+        let err = read_last_event(&log_dir, "cu_task_error");
+        match session_log_entry_to_app_event(&err, &log_dir).unwrap() {
+            AppEvent::LogEntry {
+                level, content, ..
+            } => {
+                assert_eq!(level, "warn");
+                assert!(content.contains("display lost"));
+            }
+            other => panic!("expected LogEntry for cu_task_error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_info_level_source_derivation() {
+        // Build synthetic entries to cover prefix-based source/level detection.
+        let dir = tempfile::tempdir().unwrap();
+
+        // "Provider: openai …" → generic system/info
+        let provider = serde_json::json!({
+            "ts": "01:00:00.000",
+            "event": "info",
+            "level": "info",
+            "message": "Provider: openai (key: ...)",
+        });
+        match session_log_entry_to_app_event(&provider, dir.path()).unwrap() {
+            AppEvent::LogEntry {
+                level,
+                source,
+                content,
+                ..
+            } => {
+                assert_eq!(level, "info");
+                assert_eq!(source, "system");
+                assert!(content.starts_with("Provider: "));
+            }
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+
+        // "[model] Thinking …" → detail level, server source
+        let thinking = serde_json::json!({
+            "ts": "01:00:00.000",
+            "event": "info",
+            "level": "info",
+            "message": "[model] Thinking about the task",
+        });
+        match session_log_entry_to_app_event(&thinking, dir.path()).unwrap() {
+            AppEvent::LogEntry { level, source, .. } => {
+                assert_eq!(level, "detail");
+                assert_eq!(source, "server");
+            }
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+
+        // "[presence] connected" → server source
+        let presence = serde_json::json!({
+            "ts": "01:00:00.000",
+            "event": "info",
+            "level": "info",
+            "message": "[presence] connected",
+        });
+        match session_log_entry_to_app_event(&presence, dir.path()).unwrap() {
+            AppEvent::LogEntry { source, .. } => assert_eq!(source, "server"),
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn skip_internal_events_return_none() {
+        let dir = tempfile::tempdir().unwrap();
+        for evt in [
+            "session_start",
+            "messages_input",
+            "json_extracted",
+            "agent_input",
+            "voice_audio",
+            "voice_frame",
+            "voice_log",
+            "voice_protocol",
+            "voice_usage",
+            "voice_error",
+            "voice_diagnostic",
+            "presence_connected",
+            "presence_disconnected",
+            "presence_checkpoint",
+            "tool_request",
+            "tool_response",
+            "live_audio_started",
+            "live_audio_progress",
+            "live_audio_completed",
+            "summary",
+            "interrupted",
+        ] {
+            let entry = serde_json::json!({"event": evt, "ts": "01:00:00"});
+            assert!(
+                session_log_entry_to_app_event(&entry, dir.path()).is_none(),
+                "{} should return None",
+                evt
+            );
+        }
+    }
+
+    #[test]
+    fn missing_turn_file_falls_back_to_preview() {
+        // Synthesize a model_response entry whose `file` reference points
+        // to a non-existent turn file.  The inverse function should fall
+        // back to the preview stored in `message`.
+        let entry = serde_json::json!({
+            "ts": "01:00:00.000",
+            "turn": 2,
+            "event": "model_response",
+            "level": "info",
+            "message": "short preview",
+            "file": "turns/turn_999_model.txt",
+            "data": {
+                "tokens": {"prompt": 10, "completion": 5, "total": 15, "cached": 0}
+            },
+        });
+        let dir = tempfile::tempdir().unwrap();
+        match session_log_entry_to_app_event(&entry, dir.path()).unwrap() {
+            AppEvent::ModelResponse { content, .. } => {
+                assert_eq!(content, "short preview");
+            }
+            other => panic!("expected ModelResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unknown_event_type_returns_none() {
+        let entry = serde_json::json!({
+            "event": "some_future_event_type_we_dont_know",
+            "ts": "01:00:00.000",
+        });
+        let dir = tempfile::tempdir().unwrap();
+        assert!(session_log_entry_to_app_event(&entry, dir.path()).is_none());
     }
 }
