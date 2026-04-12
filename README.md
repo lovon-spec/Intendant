@@ -12,11 +12,11 @@ An autonomous AI agent operating environment written in Rust. Intendant gives AI
                           ┌──────────────────────────────────────────┐
                           │           intendant (controller)         │
                           │                                          │
-  Web Dashboard ◄─────────┤  presence ─── agent loop ───┐           │
-  TUI / MCP     ◄─────────┤     │            │          │           │
-  Voice         ◄─────────┤     │      ┌─────┴──────┐   │           │
-                          │     │      │ sub-agents  │   │           │
-                          │     │      └────────────┘   │           │
+  Web Dashboard ◄─────────┤  presence ─── agent loop ────┐           │
+  TUI / MCP     ◄─────────┤     │            │           │           │
+  Voice         ◄─────────┤     │      ┌─────┴──────┐    │           │
+                          │     │      │ sub-agents │    │           │
+                          │     │      └────────────┘    │           │
                           └─────┼────────────────────────┼───────────┘
                                 │                        │
                     ┌───────────┤                        │
