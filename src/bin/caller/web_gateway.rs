@@ -3523,11 +3523,17 @@ pub fn spawn_web_gateway(
                             ("text/html; charset=utf-8", app_html.to_string(), "no-cache")
                         };
 
+                        // CORS: allow the multi-host dashboard to
+                        // `fetch()` /config on this daemon from a page
+                        // served by a sibling daemon (cross-origin).
+                        // `*` works because our fetches don't send
+                        // credentials (see fetchRemoteHostLabel).
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: {}\r\n\
                              Content-Length: {}\r\n\
                              Cache-Control: {}\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
                              Connection: close\r\n\
                              \r\n\
                              {}",

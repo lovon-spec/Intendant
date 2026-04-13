@@ -294,6 +294,101 @@ html, body {
   width: 16px;
   height: 16px;
 }
+
+/* ── Daemons (multi-host) ── */
+.daemons-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
+.daemon-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.daemon-row.self {
+  background: var(--mantle);
+}
+.daemon-row .label {
+  font-weight: 600;
+  color: var(--peach);
+  min-width: 100px;
+}
+.daemon-row .url {
+  flex: 1;
+  color: var(--subtext0);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.daemon-row .conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--overlay0);
+  flex-shrink: 0;
+}
+.daemon-row .conn-dot.ok { background: var(--green); }
+.daemon-row .conn-dot.err { background: var(--red); }
+.daemon-row .remove-btn {
+  padding: 2px 8px;
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--subtext0);
+  cursor: pointer;
+  font-size: 11px;
+}
+.daemon-row .remove-btn:hover {
+  color: var(--red);
+  border-color: var(--red);
+}
+.daemon-add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.daemon-add-row input {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+  min-width: 0;
+}
+.daemon-add-row input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.daemon-add-row button {
+  padding: 6px 16px;
+  border: none;
+  border-radius: 4px;
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 12px;
+}
+.daemons-status {
+  display: block;
+  font-size: 11px;
+  color: var(--subtext0);
+  margin-top: 8px;
+  min-height: 14px;
+}
+.daemons-status.error { color: var(--red); }
+.daemons-status.ok { color: var(--green); }
 .settings-row input[type="password"] {
   flex: 1;
   padding: 6px 10px;
@@ -2856,6 +2951,21 @@ html, body {
           </div>
         </fieldset>
 
+        <!-- Daemons (multi-host) -->
+        <fieldset class="settings-group">
+          <legend>Daemons</legend>
+          <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
+            Connect to additional intendant daemons on other machines to observe their activity alongside this one. Use <code style="color:var(--blue)">https://</code> (mTLS, required on iOS) or <code style="color:var(--blue)">http://</code> (trusted LAN / same hypervisor). Browser mixed-content rules apply — HTTPS pages can only reach HTTPS secondaries.
+          </p>
+          <div id="daemons-list" class="daemons-list"></div>
+          <div class="daemon-add-row">
+            <input id="daemon-add-url" type="text" placeholder="http://macos-guest:8765 or https://mac-work:8443" autocomplete="off">
+            <input id="daemon-add-label" type="text" placeholder="label (optional)" autocomplete="off">
+            <button id="daemon-add-btn" type="button">Add</button>
+          </div>
+          <span id="daemons-status" class="daemons-status"></span>
+        </fieldset>
+
         <!-- Computer Use -->
         <fieldset class="settings-group">
           <legend>Computer Use</legend>
@@ -3199,6 +3309,15 @@ let termBuffer = [];
 // Resolved from /config at startup. Used to tag activity entries and
 // drive the Settings "Daemons" panel.
 let selfHostLabel = 'local';
+
+// Multi-host: list of configured secondary daemons. Each entry:
+//   { host_id, label, url, connected }
+// Stored in localStorage under DAEMONS_KEY. Registered with the WASM
+// app via `app.add_secondary_host(host_id, label, wss_url)`. The self
+// host (the daemon serving app.html) is not stored here — it's
+// implicit and always rendered first in the UI.
+const DAEMONS_KEY = 'intendant_daemons';
+let daemons = [];
 
 // Standalone shell (lazy) — separate xterm instance in the Terminal tab's
 // "Shell" sub-tab. Keyed by (hostId, terminalId) so the same state shape
@@ -3770,6 +3889,15 @@ async function main() {
     if (cmds) processCommands(cmds);
   });
 
+  // Multi-host: callbacks for secondary daemon connections. Settings
+  // panel registers each secondary via `app.add_secondary_host(...)`.
+  app.set_on_secondary_state((hostId, connected) => {
+    handleSecondaryState(hostId, connected);
+  });
+  app.set_on_secondary_event((hostId, msg) => {
+    handleSecondaryEvent(hostId, msg);
+  });
+
   app.set_on_error((msg) => {
     if (!msg.startsWith('Server')) {
       if (modelConnected) voiceHadPriorSession = true;
@@ -3913,6 +4041,11 @@ async function main() {
       if (el) el.textContent = cfg.host_label;
     }
   } catch {}
+
+  // Initialize multi-host state now that self-label is resolved and the
+  // WASM app is ready. Opens any previously-configured secondary
+  // daemon connections from localStorage.
+  initDaemons();
 
   // Check for existing recordings (late-connecting browser)
   checkExistingRecordings();
@@ -7745,6 +7878,218 @@ function switchTab(tabId) {
   if (tabId === 'settings' && !apiKeyStatusLoaded) {
     loadApiKeyStatus();
   }
+  if (tabId === 'settings') {
+    // Always re-render so connection states reflect current WASM state.
+    renderDaemonsList();
+  }
+}
+
+// ── Daemons (multi-host) ──
+//
+// The self host (the daemon serving this page) is always rendered
+// first, followed by any configured secondaries. Connection state is
+// tracked locally and updated from WASM's `on_secondary_state` callback.
+
+function loadDaemonsFromStorage() {
+  try {
+    const raw = localStorage.getItem(DAEMONS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(d => d && d.host_id && d.url);
+  } catch {
+    return [];
+  }
+}
+
+function saveDaemonsToStorage() {
+  // Strip `connected` before persisting — it's transient runtime state.
+  const clean = daemons.map(({ host_id, label, url }) => ({ host_id, label, url }));
+  localStorage.setItem(DAEMONS_KEY, JSON.stringify(clean));
+}
+
+// Convert a base URL (what the user enters) to a WebSocket URL pointing
+// at the same origin. `https://` → `wss://`, `http://` → `ws://`.
+// Preserves host + port and strips any trailing slash. Returns null
+// for anything that isn't a recognizable http(s) URL.
+function baseToWsUrl(baseUrl) {
+  const trimmed = baseUrl.trim().replace(/\/$/, '');
+  if (trimmed.startsWith('https://')) return trimmed.replace(/^https:\/\//, 'wss://');
+  if (trimmed.startsWith('http://'))  return trimmed.replace(/^http:\/\//,  'ws://');
+  return null;
+}
+
+// Fetch the remote daemon's /config to learn its real host_label.
+// Uses default `credentials: 'same-origin'` (no cookies sent on
+// cross-origin requests) so the CORS handshake stays in the simple
+// lane — the server can answer with `Access-Control-Allow-Origin: *`
+// instead of having to echo the exact origin + credentials headers.
+async function fetchRemoteHostLabel(baseUrl) {
+  const url = baseUrl.trim().replace(/\/$/, '') + '/config';
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`fetch ${url} → ${r.status}`);
+  const cfg = await r.json();
+  if (!cfg.host_label) throw new Error('remote /config missing host_label');
+  return cfg.host_label;
+}
+
+function renderDaemonsList() {
+  const el = document.getElementById('daemons-list');
+  if (!el) return;
+
+  const rows = [];
+  // Self entry first — always present, can't be removed.
+  rows.push(renderDaemonRow({
+    host_id: selfHostLabel,
+    label: selfHostLabel,
+    url: location.origin,
+    connected: true,
+  }, true));
+  for (const d of daemons) {
+    rows.push(renderDaemonRow(d, false));
+  }
+  el.innerHTML = rows.join('');
+
+  // Wire remove buttons.
+  el.querySelectorAll('.daemon-row .remove-btn').forEach(btn => {
+    btn.addEventListener('click', () => removeDaemon(btn.dataset.hostId));
+  });
+}
+
+function renderDaemonRow(d, isSelf) {
+  const dotClass = d.connected ? 'ok' : (isSelf ? 'ok' : 'err');
+  const selfMark = isSelf ? ' (this daemon)' : '';
+  const removeBtn = isSelf
+    ? ''
+    : `<button class="remove-btn" data-host-id="${escapeHtml(d.host_id)}" title="Remove this daemon">Remove</button>`;
+  return `
+    <div class="daemon-row${isSelf ? ' self' : ''}">
+      <span class="conn-dot ${dotClass}" title="${d.connected ? 'connected' : 'disconnected'}"></span>
+      <span class="label">${escapeHtml(d.label || d.host_id)}${selfMark}</span>
+      <span class="url" title="${escapeHtml(d.url)}">${escapeHtml(d.url)}</span>
+      ${removeBtn}
+    </div>
+  `;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function setDaemonsStatus(msg, kind) {
+  const el = document.getElementById('daemons-status');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.className = 'daemons-status' + (kind ? ' ' + kind : '');
+}
+
+async function addDaemon() {
+  const urlInput = document.getElementById('daemon-add-url');
+  const labelInput = document.getElementById('daemon-add-label');
+  const baseUrl = urlInput.value.trim();
+  const userLabel = labelInput.value.trim();
+
+  if (!baseUrl) { setDaemonsStatus('URL is required', 'error'); return; }
+  if (!/^https?:\/\//.test(baseUrl)) {
+    setDaemonsStatus('URL must start with http:// or https://', 'error');
+    return;
+  }
+
+  // Mixed-content guard: an HTTPS page can't fetch() or open ws:// to
+  // an http:// target. Catch this here with a clearer message than
+  // the browser's cryptic CORS/mixed-content error.
+  if (location.protocol === 'https:' && baseUrl.startsWith('http://')) {
+    setDaemonsStatus(
+      'This dashboard is served over HTTPS, so secondaries must also be HTTPS (browser mixed-content rule). Either set up mTLS on the remote daemon via `intendant lan setup`, or open this dashboard over plain HTTP.',
+      'error'
+    );
+    return;
+  }
+
+  setDaemonsStatus('Connecting...', '');
+
+  let hostLabel;
+  try {
+    hostLabel = await fetchRemoteHostLabel(baseUrl);
+  } catch (e) {
+    const hint = baseUrl.startsWith('https://')
+      ? 'Is the mTLS client cert for this daemon installed in this browser?'
+      : 'Is the remote daemon running and reachable on this network?';
+    setDaemonsStatus(`Could not reach ${baseUrl}: ${e.message}. ${hint}`, 'error');
+    return;
+  }
+
+  if (hostLabel === selfHostLabel || daemons.some(d => d.host_id === hostLabel)) {
+    setDaemonsStatus(`Daemon '${hostLabel}' is already in the list`, 'error');
+    return;
+  }
+
+  const entry = {
+    host_id: hostLabel,
+    label: userLabel || hostLabel,
+    url: baseUrl,
+    connected: false,
+  };
+  daemons.push(entry);
+  saveDaemonsToStorage();
+  registerDaemonWithWasm(entry);
+  renderDaemonsList();
+  setDaemonsStatus(`Added ${hostLabel}`, 'ok');
+  urlInput.value = '';
+  labelInput.value = '';
+}
+
+function removeDaemon(hostId) {
+  const i = daemons.findIndex(d => d.host_id === hostId);
+  if (i < 0) return;
+  daemons.splice(i, 1);
+  saveDaemonsToStorage();
+  if (app && app.remove_secondary_host) app.remove_secondary_host(hostId);
+  renderDaemonsList();
+  setDaemonsStatus(`Removed ${hostId}`, '');
+}
+
+function registerDaemonWithWasm(entry) {
+  if (!app || !app.add_secondary_host) return;
+  const wsUrl = baseToWsUrl(entry.url);
+  if (!wsUrl) return;
+  app.add_secondary_host(entry.host_id, entry.label, wsUrl);
+}
+
+function initDaemons() {
+  daemons = loadDaemonsFromStorage();
+  for (const d of daemons) {
+    d.connected = false;
+    registerDaemonWithWasm(d);
+  }
+  renderDaemonsList();
+
+  // Wire the add form.
+  document.getElementById('daemon-add-btn').addEventListener('click', addDaemon);
+  document.getElementById('daemon-add-url').addEventListener('keydown', e => {
+    if (e.key === 'Enter') addDaemon();
+  });
+  document.getElementById('daemon-add-label').addEventListener('keydown', e => {
+    if (e.key === 'Enter') addDaemon();
+  });
+}
+
+function handleSecondaryState(hostId, connected) {
+  const d = daemons.find(e => e.host_id === hostId);
+  if (d) {
+    d.connected = connected;
+    renderDaemonsList();
+  }
+}
+
+function handleSecondaryEvent(hostId, msg) {
+  // Placeholder: Activity interleaving, Stats aggregation, etc. will
+  // route events here. For now we just record that we received one so
+  // the console shows signs of life during testing.
+  if (!window.__secondary_event_count) window.__secondary_event_count = {};
+  window.__secondary_event_count[hostId] = (window.__secondary_event_count[hostId] || 0) + 1;
 }
 
 // ── Settings ──
