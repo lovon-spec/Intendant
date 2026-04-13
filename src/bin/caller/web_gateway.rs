@@ -804,6 +804,10 @@ pub struct SettingsPayload {
     // Live Audio
     pub live_audio_enabled: bool,
     pub live_audio_timeout_secs: u64,
+    // External agent default (persisted to `[agent] default_backend`).
+    // Values: "codex" | "claude-code" | "gemini" | None (internal agent).
+    #[serde(default)]
+    pub external_agent: Option<String>,
     // Env var overrides (read-only, shown in UI)
     #[serde(default)]
     pub env_overrides: std::collections::HashMap<String, String>,
@@ -844,6 +848,7 @@ fn settings_payload_from_config(
         recording_quality: config.recording.quality.clone(),
         live_audio_enabled: config.live_audio.enabled,
         live_audio_timeout_secs: config.live_audio.default_timeout_secs,
+        external_agent: config.agent.default_backend.clone(),
         env_overrides,
     }
 }
@@ -870,6 +875,13 @@ fn apply_settings_payload(
     config.recording.quality = payload.recording_quality.clone();
     config.live_audio.enabled = payload.live_audio_enabled;
     config.live_audio.default_timeout_secs = payload.live_audio_timeout_secs;
+    // Normalize empty strings to None so the TOML doesn't end up with
+    // `default_backend = ""` — the loader treats "" as a valid override
+    // and would try to resolve it to a backend.
+    config.agent.default_backend = payload
+        .external_agent
+        .as_ref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) });
 }
 
 /// Return JSON with boolean flags indicating which API keys are configured.
@@ -1175,6 +1187,12 @@ pub fn spawn_web_gateway(
     let last_live_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest status event (has autonomy, session_id, task).
     let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache the latest external_agent_changed event so a refreshed
+    // browser learns the current value without having to re-fetch
+    // settings. Without this the dashboard dropdown snaps back to
+    // "None (internal agent)" on every page refresh even though the
+    // daemon still has the value in memory.
+    let last_external_agent_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache display_ready JSON per display_id for late-connecting browsers.
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1182,6 +1200,7 @@ pub fn spawn_web_gateway(
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
         let status_cache = last_status_json.clone();
+        let external_agent_cache = last_external_agent_json.clone();
         let display_cache = display_ready_cache.clone();
         let mut usage_rx = broadcast_tx.subscribe();
         tokio::spawn(async move {
@@ -1223,6 +1242,11 @@ pub fn spawn_web_gateway(
                         }
                         if line.contains("\"event\":\"status\"") {
                             if let Ok(mut guard) = status_cache.lock() {
+                                *guard = Some(line.clone());
+                            }
+                        }
+                        if line.contains("\"event\":\"external_agent_changed\"") {
+                            if let Ok(mut guard) = external_agent_cache.lock() {
                                 *guard = Some(line);
                             }
                         }
@@ -1269,6 +1293,7 @@ pub fn spawn_web_gateway(
             let last_usage_json = last_usage_json.clone();
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
+            let last_external_agent_json = last_external_agent_json.clone();
             let display_ready_cache = display_ready_cache.clone();
             let web_tui_tx = web_tui_tx.clone();
             let task_tx = task_tx.clone();
@@ -1368,6 +1393,15 @@ pub fn spawn_web_gateway(
                     if let Ok(guard) = last_status_json.lock() {
                         if let Some(ref status_json) = *guard {
                             let _ = direct_tx.send(status_json.clone());
+                        }
+                    }
+
+                    // Send cached external_agent_changed so the dropdown
+                    // and status badge reflect the current value on a
+                    // fresh browser connection.
+                    if let Ok(guard) = last_external_agent_json.lock() {
+                        if let Some(ref ea_json) = *guard {
+                            let _ = direct_tx.send(ea_json.clone());
                         }
                     }
 
@@ -4009,6 +4043,7 @@ mod tests {
             output_sample_rate: 24000,
             transcription_enabled: false,
             ice_servers: Vec::new(),
+            ..Default::default()
         };
         let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

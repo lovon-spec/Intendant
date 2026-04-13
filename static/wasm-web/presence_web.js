@@ -165,6 +165,27 @@ export class PresenceWeb {
         return ret;
     }
     /**
+     * Route a raw server message from a secondary daemon through that
+     * secondary's dashboard state machine. Reuses the same formatting
+     * path as the primary (command_result extraction, agent_output
+     * parsing, screenshot decoding, level filtering) so secondary log
+     * entries look identical to the primary's — no parallel translator
+     * to drift out of sync.
+     *
+     * Returns `UiCommand[]` as a JS array. The JS side filters these
+     * to the log-entry subset, tags them with the host_id for badge
+     * rendering, and routes to the DOM.
+     * @param {string} host_id
+     * @param {any} msg
+     * @returns {any}
+     */
+    handle_secondary_message(host_id, msg) {
+        const ptr0 = passStringToWasm0(host_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.presenceweb_handle_secondary_message(this.__wbg_ptr, ptr0, len0, msg);
+        return ret;
+    }
+    /**
      * Handle a server event by injecting system text into the voice model.
      * Returns true if a message was sent to the voice model.
      * @param {any} evt
@@ -691,6 +712,10 @@ export class PresenceWeb {
     }
     /**
      * Change log verbosity and return commands to re-filter.
+     * Also propagates the change to every secondary host's AppState
+     * so their historical log filtering stays in sync — otherwise a
+     * verbosity change on the primary would leave secondaries showing
+     * the old set of entries.
      * @param {string} level
      * @returns {any}
      */
@@ -1182,17 +1207,17 @@ function __wbg_get_imports() {
             console.warn(arg0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 100, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 101, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 109, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 110, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h28609f58d1fe129e, wasm_bindgen__convert__closures_____invoke__h0038094974226a74);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 100, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 101, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 109, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 110, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h28609f58d1fe129e, wasm_bindgen__convert__closures_____invoke__h0038094974226a74);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 100, function: Function { arguments: [], shim_idx: 103, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 109, function: Function { arguments: [], shim_idx: 112, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h28609f58d1fe129e, wasm_bindgen__convert__closures_____invoke__hd1cdbc32e70fbdd2);
             return ret;
         },

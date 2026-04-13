@@ -7143,6 +7143,7 @@ async fn main() -> Result<(), CallerError> {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 bus: bus.clone(),
+                project_root: Some(project.root.clone()),
             },
         );
         let mut loop_handle = if use_presence {
@@ -7615,6 +7616,7 @@ async fn main() -> Result<(), CallerError> {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 bus: bus.clone(),
+                project_root: Some(project.root.clone()),
             },
         );
 

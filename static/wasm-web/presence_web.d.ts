@@ -58,6 +58,19 @@ export class PresenceWeb {
      */
     handle_live_usage(usage: any): any;
     /**
+     * Route a raw server message from a secondary daemon through that
+     * secondary's dashboard state machine. Reuses the same formatting
+     * path as the primary (command_result extraction, agent_output
+     * parsing, screenshot decoding, level filtering) so secondary log
+     * entries look identical to the primary's — no parallel translator
+     * to drift out of sync.
+     *
+     * Returns `UiCommand[]` as a JS array. The JS side filters these
+     * to the log-entry subset, tags them with the host_id for badge
+     * rendering, and routes to the DOM.
+     */
+    handle_secondary_message(host_id: string, msg: any): any;
+    /**
      * Handle a server event by injecting system text into the voice model.
      * Returns true if a message was sent to the voice model.
      */
@@ -229,6 +242,10 @@ export class PresenceWeb {
     set_state(state: any): void;
     /**
      * Change log verbosity and return commands to re-filter.
+     * Also propagates the change to every secondary host's AppState
+     * so their historical log filtering stays in sync — otherwise a
+     * verbosity change on the primary would leave secondaries showing
+     * the old set of entries.
      */
     set_verbosity(level: string): any;
     /**
@@ -323,6 +340,7 @@ export interface InitOutput {
     readonly presenceweb_grant_user_display: (a: number) => void;
     readonly presenceweb_grant_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_handle_live_usage: (a: number, b: any) => any;
+    readonly presenceweb_handle_secondary_message: (a: number, b: number, c: number, d: any) => any;
     readonly presenceweb_handle_server_event: (a: number, b: any) => number;
     readonly presenceweb_handle_server_message: (a: number, b: any) => any;
     readonly presenceweb_handle_voice_tool_call: (a: number, b: any) => any;

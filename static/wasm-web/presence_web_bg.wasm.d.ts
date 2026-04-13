@@ -15,6 +15,7 @@ export const presenceweb_get_tools: (a: number) => any;
 export const presenceweb_grant_user_display: (a: number) => void;
 export const presenceweb_grant_user_display_with_id: (a: number, b: number) => void;
 export const presenceweb_handle_live_usage: (a: number, b: any) => any;
+export const presenceweb_handle_secondary_message: (a: number, b: number, c: number, d: any) => any;
 export const presenceweb_handle_server_event: (a: number, b: any) => number;
 export const presenceweb_handle_server_message: (a: number, b: any) => any;
 export const presenceweb_handle_voice_tool_call: (a: number, b: any) => any;
