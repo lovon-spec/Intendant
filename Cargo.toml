@@ -43,7 +43,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 tokio-util = { version = "0.7", features = ["rt"] }
 presence-core = { path = "crates/presence-core" }
 libc = "0.2"
-webrtc = "0.12"
+str0m = { version = "=0.18.0", default-features = false, features = ["openssl"] }
 vpx-encode = { version = "0.6", features = ["ffi-generate"] }
 agent-client-protocol-schema = "0.11.5"
 openssl = "0.10"

@@ -745,19 +745,24 @@ impl DisplaySession {
         let display_id = self.display_id;
         let codec_mime_for_bridge = codec_mime;
         let bridge_handle = tokio::spawn(async move {
-            let mut last_encode = tokio::time::Instant::now();
             // Track current encoder dimensions for resize detection.
             let mut enc_width = width;
             let mut enc_height = height;
             let mut i420_tx = i420_tx;
+            // Buffer holding the most recently captured (and converted) I420
+            // frame. The bridge ticks at fps and forwards this buffer to the
+            // encoder on every tick — including when no new capture has
+            // arrived. This keeps the encoder's input cadence steady even
+            // when the source desktop is idle, so its periodic GOP keyframes
+            // happen on a wallclock schedule (and so peers that join during
+            // idle periods don't sit on a black screen forever).
+            let mut latest_i420: Option<(Vec<u8>, Instant)> = None;
+            let mut tick = tokio::time::interval(frame_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = shutdown_bridge.cancelled() => break,
                     result = broadcast_rx.recv() => {
-                        if last_encode.elapsed() < frame_interval {
-                            continue;
-                        }
-                        last_encode = tokio::time::Instant::now();
                         let frame = match result {
                             Ok(f) => f,
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -782,6 +787,8 @@ impl DisplaySession {
                             // `i420_rx.recv()` will return Err and the
                             // thread will exit cleanly.
                             drop(i420_tx);
+                            // Drop stale buffer: dimensions changed.
+                            latest_i420 = None;
 
                             // Spawn a fresh encoder thread at the new
                             // dimensions, reusing the same `efr_tx`.
@@ -806,6 +813,9 @@ impl DisplaySession {
                             }
                         }
 
+                        // Convert the new BGRA capture to I420 and stash
+                        // it as the latest buffer. The tick branch will
+                        // hand it to the encoder on the next interval.
                         let arrived = Instant::now();
                         let fd = frame.data.clone();
                         let fw = frame.width;
@@ -815,7 +825,17 @@ impl DisplaySession {
                             encode::bgra_to_i420(&fd, fw, fh, fs)
                         }).await;
                         if let Ok(i420) = i420 {
-                            if i420_tx.try_send((i420, arrived)).is_err() {
+                            latest_i420 = Some((i420, arrived));
+                        }
+                    }
+                    _ = tick.tick() => {
+                        // Re-send the latest frame (new or repeated) so the
+                        // encoder sees a steady input cadence. If we have
+                        // nothing yet (initial seconds before the first
+                        // capture), skip — the encoder thread is happy to
+                        // sit idle until input arrives.
+                        if let Some((ref i420, arrived)) = latest_i420 {
+                            if i420_tx.try_send((i420.clone(), arrived)).is_err() {
                                 bridge_counters
                                     .encode_drops
                                     .fetch_add(1, Ordering::Relaxed);
