@@ -70,6 +70,14 @@ pub struct PresenceWeb {
     /// `host_label` from `/config`). Each connection forwards received
     /// messages to JS via `on_secondary_event` for host-scoped rendering.
     secondary_conns: RefCell<std::collections::HashMap<String, secondary::SecondaryConnection>>,
+    /// Per-host dashboard state for each secondary. Events from
+    /// secondaries are fed through their matching `AppState::handle_message`
+    /// so they get the same formatting (command_result extraction,
+    /// screenshot decoding, log level filtering) as the primary — no
+    /// duplicated event parsing on the JS side. Verbosity changes on
+    /// the primary are propagated to all secondary states so filters
+    /// stay in sync.
+    secondary_states: RefCell<std::collections::HashMap<String, app_state::AppState>>,
     gemini: RefCell<Option<gemini::GeminiProvider>>,
     openai: Rc<RefCell<Option<openai::OpenAIProvider>>>,
     presence: Rc<RefCell<WasmPresence>>,
@@ -106,6 +114,7 @@ impl PresenceWeb {
             callbacks,
             server: RefCell::new(server),
             secondary_conns: RefCell::new(std::collections::HashMap::new()),
+            secondary_states: RefCell::new(std::collections::HashMap::new()),
             gemini: RefCell::new(None),
             openai: Rc::new(RefCell::new(None)),
             presence,
@@ -407,6 +416,13 @@ impl PresenceWeb {
         self.secondary_conns
             .borrow_mut()
             .insert(host_id.to_string(), conn);
+        // Spin up a fresh AppState for this host. Log buffer, turn,
+        // phase, etc. are host-local so events feed cleanly without
+        // contaminating the primary's state.
+        self.secondary_states
+            .borrow_mut()
+            .entry(host_id.to_string())
+            .or_insert_with(app_state::AppState::new);
     }
 
     /// Close and forget a secondary daemon connection.
@@ -415,6 +431,30 @@ impl PresenceWeb {
         if let Some(mut conn) = self.secondary_conns.borrow_mut().remove(host_id) {
             conn.disconnect();
         }
+        self.secondary_states.borrow_mut().remove(host_id);
+    }
+
+    /// Route a raw server message from a secondary daemon through that
+    /// secondary's dashboard state machine. Reuses the same formatting
+    /// path as the primary (command_result extraction, agent_output
+    /// parsing, screenshot decoding, level filtering) so secondary log
+    /// entries look identical to the primary's — no parallel translator
+    /// to drift out of sync.
+    ///
+    /// Returns `UiCommand[]` as a JS array. The JS side filters these
+    /// to the log-entry subset, tags them with the host_id for badge
+    /// rendering, and routes to the DOM.
+    #[wasm_bindgen]
+    pub fn handle_secondary_message(&self, host_id: &str, msg: JsValue) -> JsValue {
+        let Ok(val) = serde_wasm_bindgen::from_value::<serde_json::Value>(msg) else {
+            return JsValue::NULL;
+        };
+        let mut states = self.secondary_states.borrow_mut();
+        let state = states
+            .entry(host_id.to_string())
+            .or_insert_with(app_state::AppState::new);
+        let cmds = state.handle_message(&val);
+        to_js(&cmds)
     }
 
     /// Called from the JS trampoline scheduled by a secondary's onclose
@@ -1012,9 +1052,21 @@ impl PresenceWeb {
     }
 
     /// Change log verbosity and return commands to re-filter.
+    /// Also propagates the change to every secondary host's AppState
+    /// so their historical log filtering stays in sync — otherwise a
+    /// verbosity change on the primary would leave secondaries showing
+    /// the old set of entries.
     #[wasm_bindgen]
     pub fn set_verbosity(&self, level: &str) -> JsValue {
         let cmds = self.dashboard.borrow_mut().set_verbosity(level);
+        for state in self.secondary_states.borrow_mut().values_mut() {
+            // Discard secondary UiCommands here — the JS layer hasn't
+            // rendered the full secondary history per-host (we only
+            // render streaming entries), so there's nothing for the
+            // returned commands to target. The verbosity update still
+            // matters for future incoming events on that state.
+            let _ = state.set_verbosity(level);
+        }
         to_js(&cmds)
     }
 
@@ -1049,11 +1101,17 @@ impl PresenceWeb {
         to_js(&cmds)
     }
 
-    /// Send a follow-up message.
+    /// Send a follow-up message. `direct = true` bypasses the presence
+    /// layer and dispatches the follow-up straight to the agent as a
+    /// force_direct task, mirroring how direct start_task works. Used
+    /// when the Direct toggle is checked at follow-up submit time.
     #[wasm_bindgen]
-    pub fn send_follow_up(&self, text: &str) -> JsValue {
+    pub fn send_follow_up(&self, text: &str, direct: bool) -> JsValue {
         let cmds = self.dashboard.borrow_mut().follow_up(text);
-        let msg = serde_json::json!({"action": "follow_up", "text": text});
+        let mut msg = serde_json::json!({"action": "follow_up", "text": text});
+        if direct {
+            msg["direct"] = serde_json::Value::Bool(true);
+        }
         self.server.borrow().send_json(&msg);
         to_js(&cmds)
     }

@@ -55,11 +55,29 @@ pub enum AgentBackend {
 
 impl AgentBackend {
     pub fn from_str_loose(s: &str) -> Option<Self> {
+        // Accept the canonical short forms (what the dashboard and new
+        // TOML writes use) plus the Display forms ("Claude Code",
+        // "Gemini CLI" — with spaces) so existing intendant.toml files
+        // that were written by earlier code still parse. Case-insensitive.
         match s.to_lowercase().as_str() {
             "codex" => Some(Self::Codex),
-            "claude-code" | "claude_code" | "claudecode" | "cc" => Some(Self::ClaudeCode),
-            "gemini" | "gemini-cli" | "gemini_cli" => Some(Self::GeminiCli),
+            "claude-code" | "claude_code" | "claudecode" | "cc" | "claude code" => {
+                Some(Self::ClaudeCode)
+            }
+            "gemini" | "gemini-cli" | "gemini_cli" | "gemini cli" => Some(Self::GeminiCli),
             _ => None,
+        }
+    }
+
+    /// Canonical short-form identifier used in wire formats and the
+    /// `[agent] default_backend` TOML field. Matches the `<option value>`
+    /// attributes in the dashboard's external-agent dropdown, so a
+    /// round-trip through /api/settings preserves identity.
+    pub fn as_short_str(&self) -> &'static str {
+        match self {
+            AgentBackend::Codex => "codex",
+            AgentBackend::ClaudeCode => "claude-code",
+            AgentBackend::GeminiCli => "gemini",
         }
     }
 }
@@ -257,6 +275,38 @@ mod tests {
             AgentBackend::from_str_loose("CC"),
             Some(AgentBackend::ClaudeCode)
         );
+    }
+
+    #[test]
+    fn from_str_loose_accepts_display_forms() {
+        // The Display impl produces "Codex" / "Claude Code" / "Gemini CLI".
+        // `from_str_loose` must accept those (lowercased) so TOML files
+        // written in the Display form by earlier code don't break startup.
+        assert_eq!(
+            AgentBackend::from_str_loose("Gemini CLI"),
+            Some(AgentBackend::GeminiCli)
+        );
+        assert_eq!(
+            AgentBackend::from_str_loose("Claude Code"),
+            Some(AgentBackend::ClaudeCode)
+        );
+        assert_eq!(
+            AgentBackend::from_str_loose("gemini cli"),
+            Some(AgentBackend::GeminiCli)
+        );
+    }
+
+    #[test]
+    fn as_short_str_matches_dashboard_option_values() {
+        // These MUST match the <option value> attributes in the Settings
+        // dropdown or the TOML round-trip breaks.
+        assert_eq!(AgentBackend::Codex.as_short_str(), "codex");
+        assert_eq!(AgentBackend::ClaudeCode.as_short_str(), "claude-code");
+        assert_eq!(AgentBackend::GeminiCli.as_short_str(), "gemini");
+        // And from_str_loose must round-trip every as_short_str output.
+        for v in [AgentBackend::Codex, AgentBackend::ClaudeCode, AgentBackend::GeminiCli] {
+            assert_eq!(AgentBackend::from_str_loose(v.as_short_str()), Some(v));
+        }
     }
 
     #[test]

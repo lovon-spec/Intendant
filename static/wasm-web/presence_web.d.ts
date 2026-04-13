@@ -58,6 +58,19 @@ export class PresenceWeb {
      */
     handle_live_usage(usage: any): any;
     /**
+     * Route a raw server message from a secondary daemon through that
+     * secondary's dashboard state machine. Reuses the same formatting
+     * path as the primary (command_result extraction, agent_output
+     * parsing, screenshot decoding, level filtering) so secondary log
+     * entries look identical to the primary's — no parallel translator
+     * to drift out of sync.
+     *
+     * Returns `UiCommand[]` as a JS array. The JS side filters these
+     * to the log-entry subset, tags them with the host_id for badge
+     * rendering, and routes to the DOM.
+     */
+    handle_secondary_message(host_id: string, msg: any): any;
+    /**
      * Handle a server event by injecting system text into the voice model.
      * Returns true if a message was sent to the voice model.
      */
@@ -125,9 +138,12 @@ export class PresenceWeb {
     send_approval(action: string): any;
     send_audio(base64_pcm: string): void;
     /**
-     * Send a follow-up message.
+     * Send a follow-up message. `direct = true` bypasses the presence
+     * layer and dispatches the follow-up straight to the agent as a
+     * force_direct task, mirroring how direct start_task works. Used
+     * when the Direct toggle is checked at follow-up submit time.
      */
-    send_follow_up(text: string): any;
+    send_follow_up(text: string, direct: boolean): any;
     /**
      * Send a video frame to the active live provider.
      * `base64_jpeg` is the 768x768 live-resolution frame.
@@ -229,6 +245,10 @@ export class PresenceWeb {
     set_state(state: any): void;
     /**
      * Change log verbosity and return commands to re-filter.
+     * Also propagates the change to every secondary host's AppState
+     * so their historical log filtering stays in sync — otherwise a
+     * verbosity change on the primary would leave secondaries showing
+     * the old set of entries.
      */
     set_verbosity(level: string): any;
     /**
@@ -323,6 +343,7 @@ export interface InitOutput {
     readonly presenceweb_grant_user_display: (a: number) => void;
     readonly presenceweb_grant_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_handle_live_usage: (a: number, b: any) => any;
+    readonly presenceweb_handle_secondary_message: (a: number, b: number, c: number, d: any) => any;
     readonly presenceweb_handle_server_event: (a: number, b: any) => number;
     readonly presenceweb_handle_server_message: (a: number, b: any) => any;
     readonly presenceweb_handle_voice_tool_call: (a: number, b: any) => any;
@@ -340,7 +361,7 @@ export interface InitOutput {
     readonly presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_send_approval: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_audio: (a: number, b: number, c: number) => void;
-    readonly presenceweb_send_follow_up: (a: number, b: number, c: number) => any;
+    readonly presenceweb_send_follow_up: (a: number, b: number, c: number, d: number) => any;
     readonly presenceweb_send_frame: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_send_frame_context: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_human_response: (a: number, b: number, c: number) => any;

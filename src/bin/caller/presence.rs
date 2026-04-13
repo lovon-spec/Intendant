@@ -337,15 +337,19 @@ impl PresenceLayer {
 
         // SubmitTask is special: it uses the dedicated task channel (preserves
         // the full TaskEnvelope including force_direct and context_hints).
-        // Guard: reject submit_task when a task is already running — the presence
-        // model can hallucinate unrelated tasks and try to override the active work.
+        // Guard: reject submit_task when a task is actively processing —
+        // the presence model can hallucinate unrelated tasks and try to
+        // override the active work. States where the agent is *not*
+        // processing (and a new task is safe to dispatch) include:
+        //   - idle / "" / waiting_for_task: fresh daemon, no task yet
+        //   - completed / waiting_followup: a round just finished; this
+        //     is exactly when the user types a follow-up, so accepting
+        //     submit_task here is what unblocks follow-up dispatch
+        //   - "done: <reason>": TaskComplete-style terminal state
         if let PresenceAction::SubmitTask(envelope) = action {
             let is_busy = {
                 let state = self.agent_state.lock().unwrap_or_else(|e| e.into_inner());
-                !matches!(
-                    state.phase.as_str(),
-                    "idle" | "waiting_for_task" | "completed" | ""
-                )
+                !is_agent_idle(state.phase.as_str())
             };
 
             if is_busy {
@@ -1005,6 +1009,16 @@ impl PresenceSession {
     }
 }
 
+/// Return true when the agent is in a state where dispatching a new
+/// (or follow-up) task is safe. Mirror phases produced by
+/// `update_agent_state` below.
+pub fn is_agent_idle(phase: &str) -> bool {
+    matches!(
+        phase,
+        "" | "idle" | "waiting_for_task" | "waiting_followup" | "completed"
+    ) || phase.starts_with("done")
+}
+
 pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot>>) {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     match event {
@@ -1123,6 +1137,28 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
 mod tests {
     use super::*;
     use crate::provider;
+
+    #[test]
+    fn is_agent_idle_accepts_done_states() {
+        // Fresh-start states.
+        assert!(is_agent_idle(""));
+        assert!(is_agent_idle("idle"));
+        assert!(is_agent_idle("waiting_for_task"));
+        // Completed states (the whole point of the fix — follow-ups
+        // from these states must be allowed to dispatch).
+        assert!(is_agent_idle("completed"));
+        assert!(is_agent_idle("waiting_followup"));
+        assert!(is_agent_idle("done"));
+        assert!(is_agent_idle("done: signal"));
+        assert!(is_agent_idle("done: max_turns"));
+        // Busy states must still be rejected.
+        assert!(!is_agent_idle("thinking"));
+        assert!(!is_agent_idle("running_agent"));
+        assert!(!is_agent_idle("waiting_approval"));
+        assert!(!is_agent_idle("waiting_human"));
+        assert!(!is_agent_idle("orchestrating: foo"));
+        assert!(!is_agent_idle("error: boom"));
+    }
 
     #[test]
     fn presence_config_defaults() {

@@ -1265,23 +1265,56 @@ impl App {
                     "Controller control commands are only supported in MCP mode".to_string(),
                 );
             }
-            ControlMsg::FollowUp { text } => {
+            ControlMsg::FollowUp { text, direct } => {
                 // Accept follow-ups when waiting for follow-up or task is done,
                 // regardless of AppMode (user may have pressed Esc to browse logs).
                 if self.current_phase == Phase::WaitingFollowUp
                     || self.current_phase == Phase::Done
                 {
-                    // Route through presence layer if active
-                    if let Some(ref tx) = self.presence_tx {
-                        let _ = tx.try_send(text.clone());
+                    // Routing:
+                    //   direct=true + task_tx available → build a force_direct
+                    //     TaskEnvelope and push it through task_tx, bypassing
+                    //     presence entirely. Mirrors how a `direct: true`
+                    //     StartTask is dispatched. This is the only way a
+                    //     user can issue a follow-up that skips presence
+                    //     narration on a running daemon.
+                    //   direct=false/None → existing behaviour: route through
+                    //     presence_tx if presence is active, else follow_up_tx.
+                    let is_direct = direct.unwrap_or(false);
+                    let routed = if is_direct {
+                        if let Some(ref tx) = self.task_tx {
+                            let envelope = presence_core::TaskEnvelope {
+                                task: text.clone(),
+                                force_direct: true,
+                                context_hints: vec![],
+                                reference_frame_ids: vec![],
+                                display_target: None,
+                                attachment_frame_ids: vec![],
+                            };
+                            tx.try_send(envelope).is_ok()
+                        } else if let Some(ref tx) = self.follow_up_tx {
+                            // No task channel (non-presence mode) — follow_up_tx
+                            // feeds run_direct_mode / run_external_agent_mode
+                            // directly, which is inherently "direct" anyway.
+                            tx.try_send(text.clone()).is_ok()
+                        } else {
+                            false
+                        }
+                    } else if let Some(ref tx) = self.presence_tx {
+                        tx.try_send(text.clone()).is_ok()
                     } else if let Some(ref tx) = self.follow_up_tx {
-                        let _ = tx.try_send(text.clone());
+                        tx.try_send(text.clone()).is_ok()
+                    } else {
+                        false
+                    };
+                    if routed {
+                        self.follow_up_textarea = None;
+                        self.mode = AppMode::Normal;
+                        self.current_phase = Phase::Thinking;
+                        self.round += 1;
+                        let tag = if is_direct { " (direct)" } else { "" };
+                        self.log(LogLevel::Info, format!("Follow-up{} via control socket: {}", tag, truncate_str(&text, 80)));
                     }
-                    self.follow_up_textarea = None;
-                    self.mode = AppMode::Normal;
-                    self.current_phase = Phase::Thinking;
-                    self.round += 1;
-                    self.log(LogLevel::Info, format!("Follow-up via control socket: {}", truncate_str(&text, 80)));
                 }
             }
             ControlMsg::QueryDetail { scope, target } => {

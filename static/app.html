@@ -467,8 +467,8 @@ html, body {
   border-bottom: 1px solid var(--surface0);
   flex-shrink: 0;
 }
-.verbosity-select {
-  margin-left: auto;
+.verbosity-select,
+.host-filter-select {
   padding: 2px 6px;
   background: var(--surface0);
   border: 1px solid var(--surface1);
@@ -478,7 +478,10 @@ html, body {
   font-size: 11px;
   cursor: pointer;
 }
-.verbosity-select:focus { outline: none; border-color: var(--blue); }
+.verbosity-select { margin-left: auto; }
+.host-filter-select { margin-left: 6px; }
+.verbosity-select:focus,
+.host-filter-select:focus { outline: none; border-color: var(--blue); }
 
 /* ── Phase Banner ── */
 .phase-banner {
@@ -538,6 +541,32 @@ html, body {
   text-transform: uppercase;
   padding-top: 2px;
 }
+/* Multi-host: per-host badge between timestamp and source.
+   Color is derived from a stable hash of the host_id so different
+   daemons get visually distinct pills. */
+.log-entry .log-host {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--base);
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
+}
+/* Hide host badges entirely when no secondaries are configured —
+   keeps single-host dashboards visually clean. JS adds the
+   `.show-host-badges` class to #log-stream when >=1 secondary exists. */
+#log-stream:not(.show-host-badges) .log-entry .log-host { display: none; }
+/* Host-filter hiding: log entries whose data-host-id doesn't match
+   the active filter get this class added in renderLogEntry and
+   applyHostFilter. Uses display:none rather than visibility so filtered
+   entries don't leave empty rows in the stream. */
+.log-entry.hidden-by-filter { display: none; }
 .log-entry .log-content {
   flex: 1;
   min-width: 0;
@@ -2647,6 +2676,9 @@ html, body {
           <option value="verbose">Verbose</option>
           <option value="debug">Debug</option>
         </select>
+        <select class="host-filter-select" id="host-filter-select" title="Filter activity by source host" style="display:none">
+          <option value="">All hosts</option>
+        </select>
       </div>
 
       <!-- Pending attachments bar (frames the user has Attached but not yet sent) -->
@@ -3416,6 +3448,21 @@ let selfHostLabel = 'local';
 let selfGitSha = '';
 let selfVersion = '';
 
+// Pure-client UI toggles and filters that persist across refreshes
+// via localStorage. Declared up front so any `let` initializers below
+// that read from localStorage (e.g. `activeHostFilter`) can reference
+// these without hitting a JS temporal-dead-zone error.
+const DIRECT_MODE_KEY = 'intendant_direct_mode';
+const VERBOSITY_KEY = 'intendant_verbosity';
+const HOST_FILTER_KEY = 'intendant_host_filter';
+const SESSIONS_FILTER_ABANDONED_KEY = 'intendant_sessions_filter_abandoned';
+const SESSIONS_FILTER_IDLE_KEY = 'intendant_sessions_filter_idle';
+
+// Current Activity host filter selection. Empty string = show all
+// hosts. Otherwise matches log entries whose `data-host-id` equals
+// this value. Persisted to localStorage so it survives refreshes.
+let activeHostFilter = localStorage.getItem(HOST_FILTER_KEY) || '';
+
 // Multi-host: list of configured secondary daemons. Each entry:
 //   { host_id, label, url, connected }
 // Stored in localStorage under DAEMONS_KEY. Registered with the WASM
@@ -3424,6 +3471,9 @@ let selfVersion = '';
 // implicit and always rendered first in the UI.
 const DAEMONS_KEY = 'intendant_daemons';
 let daemons = [];
+
+// (Storage key constants are declared earlier, above activeHostFilter,
+// to avoid a temporal-dead-zone reference error.)
 
 // Standalone shell (lazy) — separate xterm instance in the Terminal tab's
 // "Shell" sub-tab. Keyed by (hostId, terminalId) so the same state shape
@@ -4173,6 +4223,23 @@ async function main() {
   // daemon connections from localStorage.
   initDaemons();
 
+  // Fetch settings once at startup so the status bar badge (external
+  // agent) reflects the persisted value without waiting for the user
+  // to open the Settings tab. Idempotent — visiting Settings after
+  // this won't refetch.
+  loadSettings();
+
+  // Restore pure-client toggles from localStorage. These are UI
+  // preferences that don't belong in intendant.toml but also shouldn't
+  // reset on every browser refresh.
+  restoreClientToggles();
+
+  // Apply the URL hash to navigate to the right tab/sub-tab. This
+  // runs AFTER the Settings sub-tab localStorage fallback has been
+  // applied (inside initDaemons), so an explicit sub-tab in the hash
+  // wins but an empty hash falls through to the remembered value.
+  applyCurrentRoute();
+
   // Check for existing recordings (late-connecting browser)
   checkExistingRecordings();
 
@@ -4330,11 +4397,32 @@ function renderTurnSeparator(turn) {
 // Stores base64 image data keyed by DOM element — lazy-loaded on expand
 const _logImageStore = new WeakMap();
 
+// Stable hash-to-hue mapping so each host gets its own visually
+// distinct badge color. Same host → same color across reloads.
+function hostBadgeColor(hostId) {
+  let hash = 0;
+  for (let i = 0; i < hostId.length; i++) {
+    hash = ((hash << 5) - hash) + hostId.charCodeAt(i);
+    hash |= 0;
+  }
+  const hue = ((hash % 360) + 360) % 360;
+  return `hsl(${hue}, 55%, 65%)`;
+}
+
 function renderLogEntry(c) {
   const stream = document.getElementById('log-stream');
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + c.level;
   entry.dataset.level = c.level;
+
+  // Multi-host: tag entry with its source host so the host filter
+  // dropdown can hide entries from other hosts. Primary entries get
+  // `selfHostLabel` injected by the caller path in processCommands.
+  const hostId = c.host_id || selfHostLabel;
+  entry.dataset.hostId = hostId;
+  if (activeHostFilter && activeHostFilter !== hostId) {
+    entry.classList.add('hidden-by-filter');
+  }
 
   const icon = document.createElement('span');
   icon.className = 'log-icon';
@@ -4344,6 +4432,12 @@ function renderLogEntry(c) {
   const ts = document.createElement('span');
   ts.className = 'log-ts';
   ts.textContent = (c.ts || '').substring(0, 8);
+
+  const host = document.createElement('span');
+  host.className = 'log-host';
+  host.textContent = hostId;
+  host.style.background = hostBadgeColor(hostId);
+  host.title = `source host: ${hostId}`;
 
   const lvl = document.createElement('span');
   lvl.className = 'log-level';
@@ -4367,6 +4461,7 @@ function renderLogEntry(c) {
 
   entry.appendChild(icon);
   entry.appendChild(ts);
+  entry.appendChild(host);
   entry.appendChild(lvl);
   entry.appendChild(cnt);
 
@@ -4438,8 +4533,16 @@ function updateStatusBar(d) {
     const el = document.getElementById('sb-external-agent');
     const sep = document.getElementById('sb-agent-sep');
     const lbl = document.getElementById('sb-agent-label');
-    if (d.external_agent) {
-      el.textContent = d.external_agent;
+    // Accept any of the serialization forms we might see on the wire:
+    //   short:      "codex" | "claude-code" | "gemini"
+    //   display:    "Codex" | "Claude Code" | "Gemini CLI"
+    //   serde enum: "gemini_cli" | "claude_code"
+    //   agent.name: "gemini-cli"
+    // Normalize to the canonical short form used by the dropdown
+    // <option value> attributes, then derive a pretty label from that.
+    const shortId = normalizeAgentId(d.external_agent);
+    if (shortId) {
+      el.textContent = prettyAgentName(shortId);
       el.style.display = '';
       sep.style.display = '';
       lbl.style.display = '';
@@ -4448,15 +4551,33 @@ function updateStatusBar(d) {
       sep.style.display = 'none';
       lbl.style.display = 'none';
     }
-    // Sync the Settings dropdown
     const sel = document.getElementById('set-external-agent');
     if (sel) {
-      const v = (d.external_agent || '').toLowerCase();
-      // Map display names (from AgentBackend::Display) to option values
-      const map = { 'codex': 'codex', 'gemini cli': 'gemini', 'claude code': 'claude-code', 'gemini_cli': 'gemini' };
-      sel.value = map[v] !== undefined ? map[v] : '';
+      sel.value = shortId || '';
     }
   }
+}
+
+// Map any agent identifier form to the canonical short string used
+// by the dashboard dropdown options and (now) the TOML field. Returns
+// an empty string for `null`/empty/unknown values.
+function normalizeAgentId(raw) {
+  if (!raw) return '';
+  const v = String(raw).toLowerCase().trim();
+  if (v === 'codex') return 'codex';
+  if (v === 'claude-code' || v === 'claude_code' || v === 'claudecode' ||
+      v === 'cc' || v === 'claude code') return 'claude-code';
+  if (v === 'gemini' || v === 'gemini-cli' || v === 'gemini_cli' ||
+      v === 'gemini cli') return 'gemini';
+  return '';
+}
+
+function prettyAgentName(shortId) {
+  return {
+    'codex': 'Codex',
+    'claude-code': 'Claude Code',
+    'gemini': 'Gemini CLI',
+  }[shortId] || shortId;
 }
 
 function setPhase(phase) {
@@ -7967,18 +8088,102 @@ document.getElementById('recording-timeline').addEventListener('contextmenu', (e
 
 // ── Tab Switching ──
 document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  btn.addEventListener('click', () => routeTo(btn.dataset.tab));
 });
 
 // Terminal sub-tab switching (TUI | Shell).
 document.querySelectorAll('#tab-terminal .subtab-btn[data-term-tab]').forEach(btn => {
-  btn.addEventListener('click', () => switchTerminalSubtab(btn.dataset.termTab));
+  btn.addEventListener('click', () => routeTo('terminal', btn.dataset.termTab));
 });
 
 // Settings sub-tab switching (Account | Agent | Network | Debug).
 document.querySelectorAll('#tab-settings .subtab-btn[data-settings-tab]').forEach(btn => {
-  btn.addEventListener('click', () => switchSettingsSubtab(btn.dataset.settingsTab));
+  btn.addEventListener('click', () => routeTo('settings', btn.dataset.settingsTab));
 });
+
+// ── Hash-based router ──
+//
+// URL is the source of truth for which tab + sub-tab is active:
+//   #activity
+//   #stats
+//   #terminal           → defaults to TUI sub-tab
+//   #terminal/shell     → opens the Shell sub-tab directly
+//   #settings/agent     → opens the Settings tab on the Agent sub-tab
+//
+// This gives us three things for free:
+//   1. Browser back/forward navigates between tabs
+//   2. Refresh preserves the current tab (no localStorage hack needed
+//      for main/sub-tab persistence)
+//   3. Deep links like `http://host:8765#stats` or
+//      `http://host:8765#settings/network` open the dashboard at a
+//      specific view — useful for bookmarking multi-host daemons.
+//
+// We still use localStorage for preferences that aren't navigation
+// (verbosity, direct-mode, host filter, sessions filters).
+
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'settings'];
+const VALID_TERM_SUBTABS = ['tui', 'shell'];
+const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
+
+function parseRoute() {
+  const raw = window.location.hash.slice(1); // strip leading '#'
+  if (!raw) return { tab: 'activity', subtab: null };
+  const [tab, subtab] = raw.split('/');
+  if (!VALID_TABS.includes(tab)) return { tab: 'activity', subtab: null };
+  if (tab === 'terminal' && subtab && !VALID_TERM_SUBTABS.includes(subtab)) {
+    return { tab, subtab: null };
+  }
+  if (tab === 'settings' && subtab && !VALID_SETTINGS_SUBTABS.includes(subtab)) {
+    return { tab, subtab: null };
+  }
+  return { tab, subtab: subtab || null };
+}
+
+// Navigate the dashboard. Updates the URL via history.pushState (so
+// back/forward works) and calls the existing switch* functions.
+// `subtab` is optional; when omitted, the target tab's default sub-tab
+// is used (or preserved if it's already the active one).
+function routeTo(tab, subtab) {
+  const target = subtab ? `${tab}/${subtab}` : tab;
+  const nextHash = `#${target}`;
+  if (window.location.hash !== nextHash) {
+    history.pushState(null, '', nextHash);
+  }
+  // Main tab first so sub-tab logic runs in the correct pane.
+  if (tab !== activeTab) {
+    switchTab(tab);
+  }
+  if (tab === 'terminal' && subtab) {
+    switchTerminalSubtab(subtab);
+  } else if (tab === 'settings' && subtab) {
+    switchSettingsSubtab(subtab);
+  }
+}
+
+// Apply the URL's current hash to the actual DOM. Called on initial
+// load, and on popstate (back/forward) and hashchange (manual hash
+// edit) events.
+function applyCurrentRoute() {
+  const { tab, subtab } = parseRoute();
+  // Normalize the URL if an invalid or partially-valid hash got
+  // parsed to a different route. `replaceState` avoids polluting
+  // browser history with bogus entries.
+  const normalized = subtab ? `#${tab}/${subtab}` : `#${tab}`;
+  if (window.location.hash !== normalized && window.location.hash !== '') {
+    history.replaceState(null, '', normalized);
+  }
+  if (tab !== activeTab) {
+    switchTab(tab);
+  }
+  if (tab === 'terminal' && subtab) {
+    switchTerminalSubtab(subtab);
+  } else if (tab === 'settings' && subtab) {
+    switchSettingsSubtab(subtab);
+  }
+}
+
+window.addEventListener('popstate', applyCurrentRoute);
+window.addEventListener('hashchange', applyCurrentRoute);
 
 function switchTab(tabId) {
   activeTab = tabId;
@@ -8077,6 +8282,62 @@ function updateSettingsSaveRow() {
 // first, followed by any configured secondaries. Connection state is
 // tracked locally and updated from WASM's `on_secondary_state` callback.
 
+// Restore pure-client UI toggles from localStorage and wire change
+// listeners so subsequent flips are persisted immediately. Called
+// once at startup.
+function restoreClientToggles() {
+  // Direct-mode checkbox — persists between refreshes instead of
+  // snapping back to unchecked. Stored as "true" / "false" strings.
+  const directToggle = document.getElementById('direct-mode-toggle');
+  if (directToggle) {
+    directToggle.checked = localStorage.getItem(DIRECT_MODE_KEY) === 'true';
+    directToggle.addEventListener('change', () => {
+      localStorage.setItem(DIRECT_MODE_KEY, String(directToggle.checked));
+    });
+  }
+
+  // Log verbosity — the Activity-tab dropdown. WASM's AppState resets
+  // to "normal" on every page load, so we restore the stored value
+  // AND push it through to WASM via set_verbosity so log filtering
+  // matches the dropdown immediately.
+  const verbSelect = document.getElementById('verbosity-select');
+  if (verbSelect) {
+    const stored = localStorage.getItem(VERBOSITY_KEY);
+    if (stored && ['normal', 'verbose', 'debug'].includes(stored)) {
+      verbSelect.value = stored;
+      if (app) processCommands(app.set_verbosity(stored));
+    }
+    // Note: the 'change' listener that calls app.set_verbosity is
+    // wired separately below (see existing handler). We extend it
+    // rather than duplicate to keep a single source of truth.
+  }
+
+  // Sessions filter checkboxes default to checked in HTML; restore
+  // explicit stored preferences if the user toggled them previously.
+  const fa = document.getElementById('filter-abandoned');
+  if (fa) {
+    const stored = localStorage.getItem(SESSIONS_FILTER_ABANDONED_KEY);
+    if (stored !== null) fa.checked = stored === 'true';
+    fa.addEventListener('change', () => {
+      localStorage.setItem(SESSIONS_FILTER_ABANDONED_KEY, String(fa.checked));
+    });
+  }
+  const fi = document.getElementById('filter-idle');
+  if (fi) {
+    const stored = localStorage.getItem(SESSIONS_FILTER_IDLE_KEY);
+    if (stored !== null) fi.checked = stored === 'true';
+    fi.addEventListener('change', () => {
+      localStorage.setItem(SESSIONS_FILTER_IDLE_KEY, String(fi.checked));
+    });
+  }
+
+  // Host filter (Activity tab). The dropdown's option list is built
+  // later by refreshHostFilterOptions() — that function reads from
+  // `activeHostFilter` which we've already initialized from storage
+  // above, so the correct option gets marked selected once the
+  // options exist.
+}
+
 function loadDaemonsFromStorage() {
   try {
     const raw = localStorage.getItem(DAEMONS_KEY);
@@ -8142,6 +8403,17 @@ function renderDaemonsList() {
   el.querySelectorAll('.daemon-row .remove-btn').forEach(btn => {
     btn.addEventListener('click', () => removeDaemon(btn.dataset.hostId));
   });
+
+  // Toggle host-badge visibility in the Activity tab. Single-host
+  // setups stay visually clean; multi-host setups see the badges.
+  const logStream = document.getElementById('log-stream');
+  if (logStream) {
+    logStream.classList.toggle('show-host-badges', daemons.length > 0);
+  }
+
+  // Keep the Activity host filter dropdown in sync with the current
+  // daemon list (options may have been added/removed).
+  refreshHostFilterOptions();
 }
 
 function renderDaemonRow(d, isSelf) {
@@ -8314,12 +8586,100 @@ function handleSecondaryState(hostId, connected) {
   }
 }
 
+// Route a secondary-daemon event through its per-host AppState on the
+// Rust/WASM side so it gets the same formatting path as the primary
+// (command_result extraction, agent_output parsing, screenshot
+// decoding, verbosity filtering). Returned UiCommands are filtered
+// to the log-rendering subset and tagged with the host_id before
+// being rendered — side-effects of other command types (status bar,
+// approvals, usage, display lifecycle) would stomp the primary's own
+// state and are deliberately dropped.
 function handleSecondaryEvent(hostId, msg) {
-  // Placeholder: Activity interleaving, Stats aggregation, etc. will
-  // route events here. For now we just record that we received one so
-  // the console shows signs of life during testing.
-  if (!window.__secondary_event_count) window.__secondary_event_count = {};
-  window.__secondary_event_count[hostId] = (window.__secondary_event_count[hostId] || 0) + 1;
+  if (!app || !app.handle_secondary_message) return;
+  let cmds = app.handle_secondary_message(hostId, msg);
+  if (!cmds || !Array.isArray(cmds)) return;
+  for (const c of cmds) {
+    if (!c || !c.cmd) continue;
+    switch (c.cmd) {
+      case 'add_log_entry':
+        // Tag with the source host so the Activity badge and filter
+        // see it as belonging to the secondary.
+        c.host_id = hostId;
+        renderLogEntry(c);
+        break;
+      case 'add_turn_separator':
+        renderTurnSeparator(c.turn);
+        break;
+      case 'clear_logs':
+        // Explicitly ignored: clearing the whole stream when a
+        // secondary resets would delete primary history too.
+        break;
+      default:
+        // Everything else (status_bar, approvals, usage, displays,
+        // recordings, phase, badges, terminal data) is intentionally
+        // dropped — those tabs are primary-scoped in phase 1.
+        break;
+    }
+  }
+}
+
+// ── Activity host filter ──
+//
+// Dropdown at the top of the Activity tab lets the user restrict the
+// log stream to a single host. Options are rebuilt whenever the
+// daemon list changes (renderDaemonsList → refreshHostFilterOptions).
+// Filter application is a DOM sweep that toggles a hiding class on
+// each log-entry, so past entries respect the new filter too.
+
+function refreshHostFilterOptions() {
+  const sel = document.getElementById('host-filter-select');
+  if (!sel) return;
+
+  // Hide the dropdown entirely when there are no secondaries — nothing
+  // to filter. Matches the host-badge show/hide behavior. We don't
+  // clear `activeHostFilter` here because the user may still have a
+  // previously-configured filter in localStorage that they want back
+  // as soon as they re-add that secondary.
+  sel.style.display = daemons.length > 0 ? '' : 'none';
+  if (daemons.length === 0) {
+    return;
+  }
+
+  const seen = new Set([selfHostLabel, ...daemons.map(d => d.host_id)]);
+  sel.innerHTML = '';
+  const all = document.createElement('option');
+  all.value = '';
+  all.textContent = 'All hosts';
+  sel.appendChild(all);
+  for (const hostId of seen) {
+    const opt = document.createElement('option');
+    opt.value = hostId;
+    opt.textContent = hostId;
+    sel.appendChild(opt);
+  }
+  // Restore from the persisted `activeHostFilter` if the host still
+  // exists in the set. If not (e.g. user removed that daemon), leave
+  // the filter selection visible but set the DOM back to "All hosts"
+  // — we keep the localStorage value as a sticky preference though,
+  // so re-adding the same daemon resurfaces the filter.
+  if (activeHostFilter && seen.has(activeHostFilter)) {
+    sel.value = activeHostFilter;
+    applyHostFilter();
+  } else {
+    sel.value = '';
+  }
+}
+
+function applyHostFilter() {
+  const stream = document.getElementById('log-stream');
+  if (!stream) return;
+  for (const entry of stream.querySelectorAll('.log-entry')) {
+    const hostId = entry.dataset.hostId || selfHostLabel;
+    entry.classList.toggle(
+      'hidden-by-filter',
+      !!activeHostFilter && activeHostFilter !== hostId,
+    );
+  }
 }
 
 // ── Settings ──
@@ -8349,6 +8709,37 @@ async function loadSettings() {
     document.getElementById('set-recording-quality').value = d.recording_quality || 'medium';
     document.getElementById('set-live-audio-enabled').checked = d.live_audio_enabled;
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
+    // External agent: persisted to intendant.toml via `[agent]
+    // default_backend`. Sync both the Settings dropdown AND the
+    // status bar badge here — on a fresh daemon boot there are no
+    // ExternalAgentChanged events yet, so updateStatusBar has never
+    // been called with an external_agent field, and without this
+    // branch the status bar badge would stay hidden until the user
+    // interacts with the dropdown.
+    //
+    // Route through normalizeAgentId so legacy TOML files written in
+    // the Display form ("Gemini CLI") or serde-enum form ("gemini_cli")
+    // still populate the dropdown correctly — the old code just did
+    // `sel.value = "Gemini CLI"` which didn't match any <option> and
+    // left the dropdown visually blank.
+    {
+      const shortId = normalizeAgentId(d.external_agent);
+      document.getElementById('set-external-agent').value = shortId;
+
+      const el = document.getElementById('sb-external-agent');
+      const sep = document.getElementById('sb-agent-sep');
+      const lbl = document.getElementById('sb-agent-label');
+      if (shortId) {
+        el.textContent = prettyAgentName(shortId);
+        el.style.display = '';
+        sep.style.display = '';
+        lbl.style.display = '';
+      } else {
+        el.style.display = 'none';
+        sep.style.display = 'none';
+        lbl.style.display = 'none';
+      }
+    }
     const envDiv = document.getElementById('settings-env-list');
     const envWrap = document.getElementById('settings-env-overrides');
     const debugEmpty = document.getElementById('debug-empty');
@@ -8389,6 +8780,8 @@ async function saveSettings() {
     recording_quality: g('set-recording-quality').value,
     live_audio_enabled: g('set-live-audio-enabled').checked,
     live_audio_timeout_secs: parseInt(g('set-live-audio-timeout').value) || 300,
+    // Persisted to intendant.toml so it survives daemon restart.
+    external_agent: g('set-external-agent').value || null,
   };
   try {
     const resp = await fetch('/api/settings', {
@@ -8409,8 +8802,10 @@ async function saveSettings() {
   } catch (e) {
     console.error('Failed to save settings:', e);
   }
-  // External agent is runtime-only (not persisted to config), sent via
-  // WebSocket to the ControlPlane which updates shared state.
+  // Also emit the control message so the in-memory shared state
+  // updates immediately (without waiting for the next daemon restart
+  // to re-read the TOML). The POST above persists, this command
+  // propagates.
   const agentVal = g('set-external-agent').value || null;
   if (app) {
     app.send_server_action({ action: 'set_external_agent', agent: agentVal });
@@ -8637,16 +9032,19 @@ window.submitActivityTask = function() {
   // committed to a task. Lost on reload — that's expected, the user can
   // re-attach from the Video tab.
   const attachments = pendingAttachments.map(a => a.frameId);
+  const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   // If a task is running, send as follow-up; otherwise start new task
   if (currentPhase && currentPhase !== 'idle' && currentPhase !== 'done') {
-    // Follow-ups go through presence and don't carry attachments yet —
-    // log so the user knows their attachments will not be auto-included.
+    // Follow-ups don't carry attachments yet — log so the user knows
+    // their attachments will not be auto-included.
     if (attachments.length > 0) {
       console.warn('[intendant] Pending attachments dropped: follow-up does not support attachments yet');
     }
-    processCommands(app.send_follow_up(text));
+    // Pass the direct-mode bit so a checked toggle routes the follow-up
+    // straight to the agent (bypassing presence), mirroring direct
+    // start_task behavior.
+    processCommands(app.send_follow_up(text, direct));
   } else {
-    const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const msg = { action: 'start_task', task: text };
     if (direct) msg.direct = true;
     if (attachments.length > 0) msg.attachments = attachments;
@@ -9469,7 +9867,8 @@ window.sendFollowUp = function() {
   const input = document.getElementById('followup-input');
   const text = input.value.trim();
   if (!text || !app) return;
-  processCommands(app.send_follow_up(text));
+  const direct = document.getElementById('direct-mode-toggle')?.checked || false;
+  processCommands(app.send_follow_up(text, direct));
   input.value = '';
 };
 
@@ -9639,6 +10038,14 @@ document.getElementById('activity-task-input')?.addEventListener('keydown', (e) 
 // Verbosity toggle
 document.getElementById('verbosity-select').addEventListener('change', (e) => {
   if (app) processCommands(app.set_verbosity(e.target.value));
+  localStorage.setItem(VERBOSITY_KEY, e.target.value);
+});
+
+// Host filter (Activity tab)
+document.getElementById('host-filter-select').addEventListener('change', (e) => {
+  activeHostFilter = e.target.value;
+  localStorage.setItem(HOST_FILTER_KEY, activeHostFilter);
+  applyHostFilter();
 });
 
 // Auto-scroll detection
