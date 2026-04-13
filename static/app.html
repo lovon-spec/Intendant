@@ -1399,6 +1399,35 @@ html, body {
 .keybar-toggle.active { color: var(--blue); border-color: var(--blue); }
 
 /* ── Displays Tab ── */
+.display-approval-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 8px 12px 0;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: rgba(249, 226, 175, 0.12);
+  border: 1px solid rgba(249, 226, 175, 0.4);
+  color: var(--text);
+}
+.display-approval-banner.hidden {
+  display: none;
+}
+.display-approval-banner .icon {
+  font-size: 22px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+.display-approval-banner .text { flex: 1; }
+.display-approval-banner .title {
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 2px;
+}
+.display-approval-banner .subtitle {
+  font-size: 12px;
+  color: var(--subtext0);
+}
 .displays-container {
   flex: 1;
   min-height: 120px;
@@ -2753,6 +2782,13 @@ html, body {
 
     <!-- Displays Tab -->
     <div id="tab-displays" class="tab-pane">
+      <div class="display-approval-banner hidden" id="display-approval-banner">
+        <div class="icon">&#x26A0;</div>
+        <div class="text">
+          <div class="title">Screen sharing approval needed</div>
+          <div class="subtitle">A dialog should be visible on the guest desktop — approve it to start the video stream.</div>
+        </div>
+      </div>
       <div class="displays-container" id="displays-container">
         <div class="displays-placeholder" id="displays-placeholder">
           <div class="icon">&#x1f5b5;</div>
@@ -3867,6 +3903,8 @@ async function main() {
       } else if (d.event === 'user_display_revoked') {
         setUserDisplayState(false);
         removeDisplaySlot(Number(d.display_id || 0));
+        const banner = document.getElementById('display-approval-banner');
+        if (banner) banner.classList.add('hidden');
       }
       // Handle display capture lost — disconnect but keep slot for possible re-grant
       if (d.event === 'display_capture_lost') {
@@ -3877,6 +3915,20 @@ async function main() {
           slot.statusEl.textContent = 'Display lost: ' + (d.reason || 'capture ended');
           slot.statusEl.className = 'display-status error';
         }
+        // Hide the approval banner — capture lost supersedes any pending grant.
+        const banner = document.getElementById('display-approval-banner');
+        if (banner) banner.classList.add('hidden');
+      }
+      // Approval pending: server has raised the OS portal dialog and is
+      // waiting for the user to click Allow on the guest desktop.
+      if (d.event === 'display_approval_pending') {
+        const banner = document.getElementById('display-approval-banner');
+        if (banner) banner.classList.remove('hidden');
+      }
+      // DisplayReady (or add_display via processCommands) clears the banner.
+      if (d.event === 'display_ready') {
+        const banner = document.getElementById('display-approval-banner');
+        if (banner) banner.classList.add('hidden');
       }
       // Track recording state on display slots
       if (d.event === 'recording_started' && d.stream_name) {

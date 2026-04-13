@@ -2201,6 +2201,9 @@ pub fn spawn_event_listener(
                     AppEvent::DisplayCaptureLost { display_id, ref reason } => {
                         s.push_log(LogLevel::Warn, format!("Display :{} capture lost: {}", display_id, reason));
                     }
+                    AppEvent::DisplayApprovalPending { display_id, backend } => {
+                        s.push_log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
+                    }
                 }
             }
 

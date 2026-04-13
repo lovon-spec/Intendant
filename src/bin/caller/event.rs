@@ -207,6 +207,17 @@ pub enum AppEvent {
         reason: String,
     },
 
+    /// The OS screen-share approval dialog has been raised on the guest
+    /// desktop and we're waiting for the user to approve. The dashboard
+    /// surfaces this as a banner so a remote user (e.g. via the web UI)
+    /// knows to look at the physical display, not just sit on a blank
+    /// video tab.  Cleared by `DisplayReady` (success) or
+    /// `DisplayCaptureLost` (timeout / denial).
+    DisplayApprovalPending {
+        display_id: u32,
+        backend: &'static str,
+    },
+
     // User session display grant/revoke
     UserDisplayGranted {
         /// The display ID that was granted.  0 = primary (default).
@@ -840,6 +851,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 reason: reason.clone(),
             })
         }
+        AppEvent::DisplayApprovalPending { display_id, backend } => {
+            Some(OutboundEvent::DisplayApprovalPending {
+                display_id: *display_id,
+                backend: backend.to_string(),
+            })
+        }
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -984,6 +1001,12 @@ fn write_event_to_session_log(
             log.warn(&format!(
                 "Display :{} capture lost: {}",
                 display_id, reason
+            ));
+        }
+        AppEvent::DisplayApprovalPending { display_id, backend } => {
+            log.info(&format!(
+                "Display :{} waiting for OS approval ({backend} portal)",
+                display_id
             ));
         }
         AppEvent::UserDisplayGranted { display_id } => {

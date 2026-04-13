@@ -5612,8 +5612,13 @@ async fn activate_user_display(
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         // The portal dialog requires user interaction on the physical display.
         // If the user is accessing intendant remotely (web dashboard, SSH) they
-        // may never see the dialog, so apply a generous timeout to avoid hanging
-        // forever and fall through to X11 capture.
+        // may never see the dialog, so emit a status event for the dashboard to
+        // surface a banner — and apply a generous timeout to avoid hanging
+        // forever, falling through to X11 capture if the user never approves.
+        bus.send(AppEvent::DisplayApprovalPending {
+            display_id,
+            backend: "wayland",
+        });
         match tokio::time::timeout(
             std::time::Duration::from_secs(45),
             session.start(30, frame_registry.clone(), Some(bus.clone())),

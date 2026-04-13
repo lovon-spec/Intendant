@@ -2174,6 +2174,9 @@ impl App {
                 // LogEntry is the primary visible source.
                 self.log(LogLevel::Warn, format!("Display :{} capture lost: {}", display_id, reason));
             }
+            AppEvent::DisplayApprovalPending { display_id, backend } => {
+                self.log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
+            }
         }
 
         // Drain log entries emitted during this handle_event call

@@ -175,6 +175,10 @@ pub enum OutboundEvent {
         display_id: u32,
         reason: String,
     },
+    DisplayApprovalPending {
+        display_id: u32,
+        backend: String,
+    },
     RecordingStarted {
         stream_name: String,
     },
