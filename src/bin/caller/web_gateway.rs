@@ -184,6 +184,16 @@ pub struct WebGatewayConfig {
     /// by the multi-host dashboard to tag events with their source.
     #[serde(default)]
     pub host_label: String,
+    /// Cargo package version (from `CARGO_PKG_VERSION`). Human-readable.
+    #[serde(default)]
+    pub version: String,
+    /// Short git commit SHA the binary was built from (from the
+    /// `INTENDANT_GIT_SHA` env var emitted by build.rs). The multi-host
+    /// dashboard compares this against each secondary's sha and shows
+    /// a yellow warning dot when they don't match, so version skew
+    /// across daemons is visible instead of silently causing confusion.
+    #[serde(default)]
+    pub git_sha: String,
 }
 
 impl Default for WebGatewayConfig {
@@ -196,6 +206,8 @@ impl Default for WebGatewayConfig {
             transcription_enabled: false,
             ice_servers: Vec::new(),
             host_label: String::new(),
+            version: String::new(),
+            git_sha: String::new(),
         }
     }
 }
@@ -3569,6 +3581,8 @@ pub fn build_config(
         ice_servers,
     );
     cfg.host_label = crate::lan::resolve_host_label();
+    cfg.version = env!("CARGO_PKG_VERSION").to_string();
+    cfg.git_sha = env!("INTENDANT_GIT_SHA").to_string();
     cfg
 }
 

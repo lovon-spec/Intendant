@@ -28,6 +28,33 @@ fn main() {
         }
     }
 
+    // Expose the current git commit SHA as an env var so `/config` can
+    // report it. The multi-host dashboard compares the primary's SHA
+    // against each secondary's SHA and warns on mismatch — same class of
+    // version-skew confusion we just hit when the mac guest was running
+    // stale code without CORS headers.
+    //
+    // rerun-if-changed on HEAD + the branch ref file covers the common
+    // "committed but didn't recompile" path. If the git command fails
+    // (no .git, binary missing, detached head in weird state) the value
+    // falls back to "unknown".
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(ref_path) = head.strip_prefix("ref: ").map(|s| s.trim()) {
+            println!("cargo:rerun-if-changed=.git/{}", ref_path);
+        }
+    }
+    let git_sha = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { Some(o.stdout) } else { None })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=INTENDANT_GIT_SHA={git_sha}");
+
     // Write a hash of the WASM binary to OUT_DIR so cargo detects changes
     // reliably. `rerun-if-changed` on binary files can be flaky across
     // worktrees; writing a derived file to OUT_DIR is bulletproof because

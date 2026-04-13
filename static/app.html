@@ -337,7 +337,14 @@ html, body {
   flex-shrink: 0;
 }
 .daemon-row .conn-dot.ok { background: var(--green); }
+.daemon-row .conn-dot.warn { background: var(--yellow); }
 .daemon-row .conn-dot.err { background: var(--red); }
+.daemon-row .version {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 10px;
+  color: var(--overlay1);
+  flex-shrink: 0;
+}
 .daemon-row .remove-btn {
   padding: 2px 8px;
   border: 1px solid var(--surface2);
@@ -3309,6 +3316,8 @@ let termBuffer = [];
 // Resolved from /config at startup. Used to tag activity entries and
 // drive the Settings "Daemons" panel.
 let selfHostLabel = 'local';
+let selfGitSha = '';
+let selfVersion = '';
 
 // Multi-host: list of configured secondary daemons. Each entry:
 //   { host_id, label, url, connected }
@@ -4040,6 +4049,10 @@ async function main() {
       const el = document.getElementById('sb-host-label');
       if (el) el.textContent = cfg.host_label;
     }
+    // Version + git SHA are used by the Daemons panel to flag
+    // version skew across multi-host connections.
+    selfGitSha = cfg.git_sha || '';
+    selfVersion = cfg.version || '';
   } catch {}
 
   // Initialize multi-host state now that self-label is resolved and the
@@ -7919,18 +7932,17 @@ function baseToWsUrl(baseUrl) {
   return null;
 }
 
-// Fetch the remote daemon's /config to learn its real host_label.
-// Uses default `credentials: 'same-origin'` (no cookies sent on
-// cross-origin requests) so the CORS handshake stays in the simple
-// lane — the server can answer with `Access-Control-Allow-Origin: *`
-// instead of having to echo the exact origin + credentials headers.
-async function fetchRemoteHostLabel(baseUrl) {
+// Fetch the remote daemon's /config to learn its real host_label and
+// version (used for skew detection). Uses default credentials mode so
+// the CORS handshake stays in the simple lane — the server can answer
+// with `Access-Control-Allow-Origin: *` instead of echoing the origin.
+async function fetchRemoteConfig(baseUrl) {
   const url = baseUrl.trim().replace(/\/$/, '') + '/config';
   const r = await fetch(url);
   if (!r.ok) throw new Error(`fetch ${url} → ${r.status}`);
   const cfg = await r.json();
   if (!cfg.host_label) throw new Error('remote /config missing host_label');
-  return cfg.host_label;
+  return cfg;
 }
 
 function renderDaemonsList() {
@@ -7944,6 +7956,8 @@ function renderDaemonsList() {
     label: selfHostLabel,
     url: location.origin,
     connected: true,
+    version: selfVersion,
+    git_sha: selfGitSha,
   }, true));
   for (const d of daemons) {
     rows.push(renderDaemonRow(d, false));
@@ -7957,16 +7971,35 @@ function renderDaemonsList() {
 }
 
 function renderDaemonRow(d, isSelf) {
-  const dotClass = d.connected ? 'ok' : (isSelf ? 'ok' : 'err');
+  // Dot colors:
+  //   green → connected + version matches self (or is self)
+  //   yellow → connected but git SHA differs from self (version skew)
+  //   gray/red → not connected
+  const skewed = !isSelf && d.connected && selfGitSha && d.git_sha && d.git_sha !== selfGitSha;
+  let dotClass, dotTitle;
+  if (isSelf || (d.connected && !skewed)) {
+    dotClass = 'ok';
+    dotTitle = 'connected';
+  } else if (skewed) {
+    dotClass = 'warn';
+    dotTitle = `version mismatch: self=${selfGitSha} remote=${d.git_sha} — rebuild the remote to match`;
+  } else {
+    dotClass = 'err';
+    dotTitle = 'disconnected';
+  }
   const selfMark = isSelf ? ' (this daemon)' : '';
   const removeBtn = isSelf
     ? ''
     : `<button class="remove-btn" data-host-id="${escapeHtml(d.host_id)}" title="Remove this daemon">Remove</button>`;
+  const versionText = d.git_sha
+    ? `${escapeHtml(d.version || '?')} · ${escapeHtml(d.git_sha)}`
+    : '';
   return `
     <div class="daemon-row${isSelf ? ' self' : ''}">
-      <span class="conn-dot ${dotClass}" title="${d.connected ? 'connected' : 'disconnected'}"></span>
+      <span class="conn-dot ${dotClass}" title="${escapeHtml(dotTitle)}"></span>
       <span class="label">${escapeHtml(d.label || d.host_id)}${selfMark}</span>
       <span class="url" title="${escapeHtml(d.url)}">${escapeHtml(d.url)}</span>
+      <span class="version" title="version · git SHA">${versionText}</span>
       ${removeBtn}
     </div>
   `;
@@ -8010,9 +8043,9 @@ async function addDaemon() {
 
   setDaemonsStatus('Connecting...', '');
 
-  let hostLabel;
+  let cfg;
   try {
-    hostLabel = await fetchRemoteHostLabel(baseUrl);
+    cfg = await fetchRemoteConfig(baseUrl);
   } catch (e) {
     const hint = baseUrl.startsWith('https://')
       ? 'Is the mTLS client cert for this daemon installed in this browser?'
@@ -8021,6 +8054,7 @@ async function addDaemon() {
     return;
   }
 
+  const hostLabel = cfg.host_label;
   if (hostLabel === selfHostLabel || daemons.some(d => d.host_id === hostLabel)) {
     setDaemonsStatus(`Daemon '${hostLabel}' is already in the list`, 'error');
     return;
@@ -8031,6 +8065,8 @@ async function addDaemon() {
     label: userLabel || hostLabel,
     url: baseUrl,
     connected: false,
+    version: cfg.version || '',
+    git_sha: cfg.git_sha || '',
   };
   daemons.push(entry);
   saveDaemonsToStorage();
@@ -8062,6 +8098,10 @@ function initDaemons() {
   daemons = loadDaemonsFromStorage();
   for (const d of daemons) {
     d.connected = false;
+    // Clear any stale version info from a previous session so it
+    // gets refreshed on reconnect rather than showing outdated skew.
+    d.version = d.version || '';
+    d.git_sha = d.git_sha || '';
     registerDaemonWithWasm(d);
   }
   renderDaemonsList();
@@ -8078,9 +8118,23 @@ function initDaemons() {
 
 function handleSecondaryState(hostId, connected) {
   const d = daemons.find(e => e.host_id === hostId);
-  if (d) {
-    d.connected = connected;
-    renderDaemonsList();
+  if (!d) return;
+  const wasConnected = d.connected;
+  d.connected = connected;
+  renderDaemonsList();
+
+  // On (re)connect, refresh the remote's /config so the version
+  // string and skew dot reflect what's actually running right now.
+  // Without this, rebuilding the remote daemon fixes skew but the
+  // dashboard still shows yellow until you re-add it manually.
+  if (connected && !wasConnected) {
+    fetchRemoteConfig(d.url)
+      .then(cfg => {
+        d.version = cfg.version || '';
+        d.git_sha = cfg.git_sha || '';
+        renderDaemonsList();
+      })
+      .catch(() => { /* silently leave old version on failure */ });
   }
 }
 
