@@ -446,8 +446,41 @@ fn run_pipewire_capture(
     let mut last_h = height;
     // Log the buffer type once on the first frame.
     let mut buffer_type_logged = false;
+    // Detect portal session ending (user clicks the orange share-stop
+    // indicator, compositor crash, etc.) by listening for stream state
+    // transitions. The XDG portal pauses the producer-side PipeWire stream
+    // when the user revokes — that surfaces here as `Streaming → Paused`,
+    // *not* `Unconnected` or `Error` (those only happen on hard errors or
+    // explicit teardown). So once we've been in Streaming at least once,
+    // treat any non-Streaming state as a stop signal: setting the shared
+    // shutdown flag, the mainloop's idle callback quits, the function
+    // returns, `tx` drops, the capture channel closes, and
+    // `DisplayCaptureLost` fires upstream — same path as a normal
+    // teardown.
+    //
+    // We gate on `has_been_streaming` rather than reacting to every
+    // non-Streaming state, because the normal startup sequence is
+    // `Unconnected → Connecting → Paused → Streaming` and we don't want to
+    // tear ourselves down before the first frame ever flows.
+    let state_shutdown = Arc::clone(&shutdown);
+    let mut has_been_streaming = false;
     let _listener = stream
         .add_local_listener()
+        .state_changed(move |_stream_ref, _: &mut (), _old, new| {
+            use pipewire::stream::StreamState;
+            match new {
+                StreamState::Streaming => {
+                    has_been_streaming = true;
+                }
+                _ if has_been_streaming => {
+                    eprintln!(
+                        "[display/wayland] stream left Streaming ({new:?}); shutting down capture"
+                    );
+                    state_shutdown.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        })
         .param_changed(move |stream_ref, _: &mut (), param_id, _param| {
             // When the format is negotiated, tell PipeWire we accept DMA-BUF,
             // MemFd, and MemPtr buffers. PipeWire picks the best available.
