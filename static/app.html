@@ -8952,16 +8952,19 @@ window.submitActivityTask = function() {
   // committed to a task. Lost on reload — that's expected, the user can
   // re-attach from the Video tab.
   const attachments = pendingAttachments.map(a => a.frameId);
+  const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   // If a task is running, send as follow-up; otherwise start new task
   if (currentPhase && currentPhase !== 'idle' && currentPhase !== 'done') {
-    // Follow-ups go through presence and don't carry attachments yet —
-    // log so the user knows their attachments will not be auto-included.
+    // Follow-ups don't carry attachments yet — log so the user knows
+    // their attachments will not be auto-included.
     if (attachments.length > 0) {
       console.warn('[intendant] Pending attachments dropped: follow-up does not support attachments yet');
     }
-    processCommands(app.send_follow_up(text));
+    // Pass the direct-mode bit so a checked toggle routes the follow-up
+    // straight to the agent (bypassing presence), mirroring direct
+    // start_task behavior.
+    processCommands(app.send_follow_up(text, direct));
   } else {
-    const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const msg = { action: 'start_task', task: text };
     if (direct) msg.direct = true;
     if (attachments.length > 0) msg.attachments = attachments;
@@ -9784,7 +9787,8 @@ window.sendFollowUp = function() {
   const input = document.getElementById('followup-input');
   const text = input.value.trim();
   if (!text || !app) return;
-  processCommands(app.send_follow_up(text));
+  const direct = document.getElementById('direct-mode-toggle')?.checked || false;
+  processCommands(app.send_follow_up(text, direct));
   input.value = '';
 };
 

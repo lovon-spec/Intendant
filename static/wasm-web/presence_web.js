@@ -350,14 +350,18 @@ export class PresenceWeb {
         wasm.presenceweb_send_audio(this.__wbg_ptr, ptr0, len0);
     }
     /**
-     * Send a follow-up message.
+     * Send a follow-up message. `direct = true` bypasses the presence
+     * layer and dispatches the follow-up straight to the agent as a
+     * force_direct task, mirroring how direct start_task works. Used
+     * when the Direct toggle is checked at follow-up submit time.
      * @param {string} text
+     * @param {boolean} direct
      * @returns {any}
      */
-    send_follow_up(text) {
+    send_follow_up(text, direct) {
         const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.presenceweb_send_follow_up(this.__wbg_ptr, ptr0, len0);
+        const ret = wasm.presenceweb_send_follow_up(this.__wbg_ptr, ptr0, len0, direct);
         return ret;
     }
     /**

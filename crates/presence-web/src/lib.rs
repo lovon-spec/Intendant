@@ -1101,11 +1101,17 @@ impl PresenceWeb {
         to_js(&cmds)
     }
 
-    /// Send a follow-up message.
+    /// Send a follow-up message. `direct = true` bypasses the presence
+    /// layer and dispatches the follow-up straight to the agent as a
+    /// force_direct task, mirroring how direct start_task works. Used
+    /// when the Direct toggle is checked at follow-up submit time.
     #[wasm_bindgen]
-    pub fn send_follow_up(&self, text: &str) -> JsValue {
+    pub fn send_follow_up(&self, text: &str, direct: bool) -> JsValue {
         let cmds = self.dashboard.borrow_mut().follow_up(text);
-        let msg = serde_json::json!({"action": "follow_up", "text": text});
+        let mut msg = serde_json::json!({"action": "follow_up", "text": text});
+        if direct {
+            msg["direct"] = serde_json::Value::Bool(true);
+        }
         self.server.borrow().send_json(&msg);
         to_js(&cmds)
     }

@@ -138,9 +138,12 @@ export class PresenceWeb {
     send_approval(action: string): any;
     send_audio(base64_pcm: string): void;
     /**
-     * Send a follow-up message.
+     * Send a follow-up message. `direct = true` bypasses the presence
+     * layer and dispatches the follow-up straight to the agent as a
+     * force_direct task, mirroring how direct start_task works. Used
+     * when the Direct toggle is checked at follow-up submit time.
      */
-    send_follow_up(text: string): any;
+    send_follow_up(text: string, direct: boolean): any;
     /**
      * Send a video frame to the active live provider.
      * `base64_jpeg` is the 768x768 live-resolution frame.
@@ -358,7 +361,7 @@ export interface InitOutput {
     readonly presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
     readonly presenceweb_send_approval: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_audio: (a: number, b: number, c: number) => void;
-    readonly presenceweb_send_follow_up: (a: number, b: number, c: number) => any;
+    readonly presenceweb_send_follow_up: (a: number, b: number, c: number, d: number) => any;
     readonly presenceweb_send_frame: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_send_frame_context: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_human_response: (a: number, b: number, c: number) => any;

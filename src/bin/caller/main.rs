@@ -7567,7 +7567,11 @@ async fn main() -> Result<(), CallerError> {
                                         log_dir_for_stdin.join("human_response");
                                     let _ = std::fs::write(&resp_path, text.as_bytes());
                                 }
-                                event::ControlMsg::FollowUp { text } => {
+                                event::ControlMsg::FollowUp { text, direct: _ } => {
+                                    // This stdin handler only exists in
+                                    // the headless `--json` path where
+                                    // there's no presence layer, so the
+                                    // direct bit is implicitly always on.
                                     if follow_up_tx.send(text).await.is_err() {
                                         break;
                                     }

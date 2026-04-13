@@ -491,6 +491,13 @@ pub enum ControlMsg {
     },
     FollowUp {
         text: String,
+        /// When true, bypass the presence layer for this follow-up and
+        /// dispatch it directly to the agent — mirrors `direct: true`
+        /// on `StartTask`. Frontends set this when the user has the
+        /// Direct toggle checked at the time of the follow-up. Absent
+        /// (or `Some(false)`) means route through presence as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct: Option<bool>,
     },
     TakeDisplay {
         display_id: u32,
@@ -1381,6 +1388,7 @@ mod tests {
             },
             ControlMsg::FollowUp {
                 text: "continue working".to_string(),
+                direct: None,
             },
             ControlMsg::QueryDetail {
                 scope: "diff".to_string(),
