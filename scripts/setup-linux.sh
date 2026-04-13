@@ -353,9 +353,18 @@ build_intendant() {
     (cd "$REPO_ROOT" && cargo build --release)
 
     local bin_dir="$REPO_ROOT/target/release"
+
+    # Symlink into /usr/local/bin so `command -v intendant` works for
+    # downstream tools (e.g. setup-lan.bat invoking `intendant lan` over
+    # SSH on this guest).
+    info "linking intendant into /usr/local/bin..."
+    sudo ln -sf "$bin_dir/intendant" /usr/local/bin/intendant
+    sudo ln -sf "$bin_dir/intendant-runtime" /usr/local/bin/intendant-runtime
+
     echo ""
     ok "intendant          -> $bin_dir/intendant"
     ok "intendant-runtime  -> $bin_dir/intendant-runtime"
+    ok "symlinked          -> /usr/local/bin/{intendant,intendant-runtime}"
 }
 
 # ── Check mode ────────────────────────────────────────────────────────────
