@@ -4009,6 +4009,9 @@ mod tests {
             output_sample_rate: 24000,
             transcription_enabled: false,
             ice_servers: Vec::new(),
+            host_label: String::new(),
+            version: String::new(),
+            git_sha: String::new(),
         };
         let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
