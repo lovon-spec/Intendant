@@ -157,13 +157,10 @@ pub enum ApprovalCategory {
     FileChange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApprovalDecision {
-    Accept,
-    AcceptForSession,
-    Decline,
-    Cancel,
-}
+/// Re-export of the shared approval decision type. The canonical
+/// definition lives in [`crate::approval`] because `peer::event`
+/// needs the same vocabulary and a duplicate would drift.
+pub use crate::approval::ApprovalDecision;
 
 /// Configuration passed to an external agent on initialization.
 pub struct AgentConfig {

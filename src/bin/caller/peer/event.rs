@@ -387,19 +387,13 @@ pub struct ApprovalRequest {
     pub auto_resolvable: bool,
 }
 
-/// Approval decision. Mirrors `external_agent::ApprovalDecision` by design
-/// — both encode the same four-way user response. Kept separate today to
-/// avoid coupling `peer` to `external_agent`; a follow-up should extract a
-/// shared `crate::approval` module that both consume. Deliberately closed
-/// — this vocabulary is stable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalDecision {
-    Accept,
-    AcceptForSession,
-    Decline,
-    Cancel,
-}
+/// Re-export of the shared approval decision type. The canonical
+/// definition lives in [`crate::approval`] — both this module and
+/// `external_agent` consume it so the four-way vocabulary stays in
+/// exactly one place. Deliberately closed (no Unknown fallback):
+/// cross-ecosystem stable, any other wire value is a bug worth
+/// failing on.
+pub use crate::approval::ApprovalDecision;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {

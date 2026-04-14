@@ -1,4 +1,5 @@
 mod agent_runner;
+mod approval;
 mod autonomy;
 mod computer_use;
 mod control;
