@@ -7034,10 +7034,23 @@ async fn main() -> Result<(), CallerError> {
         app.presence_session = Some(presence_session.clone());
         app.session_log = Some(session_log.clone());
 
-        // Task dispatch channel: browser tool calls → presence task loop (CU-first routing)
-        let (task_tx, task_rx) =
-            tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
-        app.set_task_sender(task_tx.clone());
+        // Task dispatch channel: browser tool calls / dashboard StartTask →
+        // presence task loop (CU-first routing). Only created when presence
+        // is enabled, because the channel is consumed by `run_with_presence`.
+        // In non-presence mode, leaving `task_tx` unset on the TUI app makes
+        // the `StartTask` / direct-`FollowUp` handlers fall through to
+        // `follow_up_tx`, which is actually consumed by
+        // `run_external_agent_mode` / `run_direct_mode`. Creating the channel
+        // unconditionally would orphan `task_rx` and silently drop every
+        // dashboard-dispatched task after the first round completes.
+        let (task_tx, task_rx) = if use_presence {
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
+            app.set_task_sender(tx.clone());
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         // Deferred web gateway spawn — now we have the agent state for tool queries.
         // Note: WebQueryCtx is built UNCONDITIONALLY (not gated on presence).
@@ -7103,7 +7116,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_session,
                 transcriber,
                 web_tui_tx.clone(),
-                Some(task_tx.clone()),
+                task_tx.clone(),
                 Some(project.root.clone()),
                 mcp_http_server,
             );
@@ -7156,6 +7169,9 @@ async fn main() -> Result<(), CallerError> {
             let presence_user_rx = presence_user_rx.unwrap();
             let presence_event_rx = presence_event_rx_for_task.unwrap();
             let agent_state = presence_agent_state.unwrap();
+            // task_tx/task_rx are Some when use_presence is true (see above).
+            let task_tx = task_tx.expect("task_tx created in presence mode");
+            let task_rx = task_rx.expect("task_rx created in presence mode");
             let (response_tx, mut response_rx) =
                 tokio::sync::mpsc::channel::<String>(8);
 

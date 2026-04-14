@@ -3480,13 +3480,17 @@ pub fn spawn_web_gateway(
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/sessions") {
-                        // Session listing endpoint
+                        // Session listing endpoint. CORS `*` so the
+                        // multi-host Stats tab can fetch sibling
+                        // daemons' session lists to populate its "All
+                        // Sessions" and "Disk Usage" cards per host.
                         let body = list_sessions();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
                              Content-Length: {}\r\n\
                              Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
                              Connection: close\r\n\
                              \r\n\
                              {}",

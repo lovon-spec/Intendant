@@ -53,7 +53,24 @@ fn main() {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=INTENDANT_GIT_SHA={git_sha}");
+
+    // Append `-dirty` when the working tree has uncommitted changes, so
+    // the multi-host skew detector catches "I rebuilt but didn't commit"
+    // cases. Without this, a dev rebuilding locally on top of HEAD
+    // would report the same SHA as a sibling daemon still on that
+    // commit, and the yellow warning wouldn't fire.
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    let sha_with_dirty = if dirty {
+        format!("{git_sha}-dirty")
+    } else {
+        git_sha
+    };
+    println!("cargo:rustc-env=INTENDANT_GIT_SHA={sha_with_dirty}");
 
     // Write a hash of the WASM binary to OUT_DIR so cargo detects changes
     // reliably. `rerun-if-changed` on binary files can be flaky across

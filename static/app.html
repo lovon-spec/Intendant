@@ -80,6 +80,21 @@ html, body {
   font-size: 10px;
   letter-spacing: 0.3px;
 }
+/* Aggregate multi-host connection state: one dot summarizing all
+   configured secondaries. Hidden on single-host setups. Click jumps
+   to Settings → Network → Daemons. */
+.hosts-aggregate-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--overlay0);
+  flex-shrink: 0;
+  cursor: pointer;
+  margin-right: 4px;
+}
+.hosts-aggregate-dot.ok { background: var(--green); }
+.hosts-aggregate-dot.warn { background: var(--yellow); }
+.hosts-aggregate-dot.err { background: var(--red); }
 .status-bar .provider { color: var(--blue); }
 .status-bar .model { color: var(--green); }
 .status-bar .turn { color: var(--yellow); }
@@ -87,7 +102,14 @@ html, body {
 .status-bar .autonomy { font-weight: 600; }
 .status-bar .sep { color: var(--surface2); }
 .status-bar .field-label { color: var(--overlay0); font-size: 10px; margin-right: -6px; }
-.display-toggle-wrap { position: relative; display: inline-flex; align-items: center; }
+/* The negative margin above is sized for direct status-bar children
+   (which have an 8px flex gap, so -6 leaves a 2px effective gap).
+   Inside our nested wrappers (`inline-flex` with their own small gap)
+   it overshoots into a visible overlap. Reset the margin in those
+   contexts so the wrapper's own gap rule controls the spacing. */
+.status-bar .display-toggle-wrap .field-label,
+.status-bar .sb-dot-group .field-label { margin-right: 0; }
+.display-toggle-wrap { position: relative; display: inline-flex; align-items: center; gap: 4px; }
 .display-picker {
   display: none;
   position: absolute;
@@ -137,11 +159,26 @@ html, body {
   width: 8px; height: 8px;
   border-radius: 50%;
   display: inline-block;
-  margin-left: auto;
   flex-shrink: 0;
 }
 .conn-dot.ok { background: var(--green); }
 .conn-dot.err { background: var(--red); }
+
+/* Group wrapper for status-bar dot + label pairs. Each group is an
+   `inline-flex` with a tight gap so the label sticks to its dot, and
+   the wrapper's `title` attribute provides a generous hover target
+   for the tooltip instead of relying on the bare 8x8 dot. The right-
+   anchor (`margin-left: auto` for "everything floats right") lives on
+   `.active-badge` instead of any of these groups so separators flow
+   naturally between them. */
+.status-bar .sb-dot-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: default;
+}
+.status-bar .sb-dot-group.clickable { cursor: pointer; }
+.status-bar .active-badge { margin-left: auto; }
 
 /* ── Active/Passive Badge ── */
 .active-badge {
@@ -786,6 +823,34 @@ html, body {
 .input-area button:hover { opacity: 0.9; }
 
 /* ── Usage Tab ── */
+.stats-host-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+}
+.stats-host-bar .stats-host-label {
+  font-size: 11px;
+  color: var(--overlay0);
+}
+.stats-host-select {
+  padding: 2px 6px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.stats-host-select:focus { outline: none; border-color: var(--blue); }
+/* Primary-only Stats sections: hidden when the picker is on a secondary.
+   The individual renderers still set display:block/none based on data,
+   so we use !important to override that when the host scope forbids it. */
+.hidden-by-secondary-host { display: none !important; }
 .usage-container {
   padding: 16px;
   overflow-y: auto;
@@ -2626,9 +2691,21 @@ html, body {
     <span class="sep">|</span>
     <span class="field-label">session</span>
     <span class="session" id="sb-session"></span>
-    <span class="conn-dot err" id="sb-conn"></span>
-    <span class="voice-dot" id="sb-voice" title="Voice model"></span>
-    <span style="font-size:11px;color:var(--overlay0)" id="sb-voice-label"></span>
+    <span class="sep">|</span>
+    <span class="sb-dot-group" title="WebSocket connection to this daemon">
+      <span class="field-label">ws</span>
+      <span class="conn-dot err" id="sb-conn"></span>
+    </span>
+    <span class="sb-dot-group" title="Live model connection (voice + video — Gemini Live / OpenAI Realtime)">
+      <span class="field-label">live</span>
+      <span class="voice-dot" id="sb-voice"></span>
+      <span style="font-size:11px;color:var(--overlay0)" id="sb-voice-label"></span>
+    </span>
+    <span class="sb-dot-group clickable" id="sb-hosts-group" style="display:none" title="Aggregate state of configured secondary daemons — click to open the Daemons panel">
+      <span class="sep" style="margin:0 2px">|</span>
+      <span class="field-label">hosts</span>
+      <span class="hosts-aggregate-dot" id="sb-hosts-dot"></span>
+    </span>
     <span class="active-badge is-active" id="sb-active-badge" title="This browser controls voice/video — click to switch to passive (observe-only) mode">Active</span>
   </div>
 
@@ -2750,6 +2827,12 @@ html, body {
 
     <!-- Stats Tab -->
     <div id="tab-stats" class="tab-pane">
+      <div class="stats-host-bar" id="stats-host-bar" style="display:none">
+        <label class="stats-host-label">Host:</label>
+        <select class="stats-host-select" id="stats-host-select">
+          <option value="">(self)</option>
+        </select>
+      </div>
       <div class="usage-container" id="usage-container">
         <div class="empty-state" id="usage-empty">Waiting for usage data...</div>
         <div class="usage-cards" id="usage-cards" style="display:none"></div>
@@ -3462,6 +3545,16 @@ const SESSIONS_FILTER_IDLE_KEY = 'intendant_sessions_filter_idle';
 // hosts. Otherwise matches log entries whose `data-host-id` equals
 // this value. Persisted to localStorage so it survives refreshes.
 let activeHostFilter = localStorage.getItem(HOST_FILTER_KEY) || '';
+
+// Multi-host: latest `update_usage` payload per host_id. Primary's
+// payload is stored under selfHostLabel (replaces any earlier 'local'
+// entry once /config resolves). Secondaries store under their own
+// host_id. The Stats host picker reads from this cache on switch so
+// you can inspect any daemon's usage without round-tripping the WS.
+const hostStatsCache = new Map();
+
+// Current Stats tab host selection. Empty string or selfHostLabel → self.
+let activeStatsHost = '';
 
 // Multi-host: list of configured secondary daemons. Each entry:
 //   { host_id, label, url, connected }
@@ -4360,7 +4453,16 @@ function processCommands(cmds) {
       case 'show_follow_up': showPanel('followup-panel'); break;
       case 'hide_follow_up': hidePanel('followup-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
-      case 'update_usage': renderUsageTab(c); updateTickerFromUsage(c); break;
+      case 'update_usage':
+        // Cache the payload under the self host so the Stats host
+        // picker can re-render it on demand. Only drive the live
+        // rendering path when the picker is on self (or unset) — when
+        // the user is viewing a secondary's stats, primary updates
+        // silently refresh the cache without stomping the view.
+        hostStatsCache.set(selfHostLabel, c);
+        if (isStatsShowingSelf()) renderUsageTab(c);
+        updateTickerFromUsage(c);
+        break;
       case 'add_display': addDisplaySlot(c.display_id, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
       case 'remove_recording': removeRecordingStream(c.stream_name); break;
@@ -4398,7 +4500,9 @@ function renderTurnSeparator(turn) {
 const _logImageStore = new WeakMap();
 
 // Stable hash-to-hue mapping so each host gets its own visually
-// distinct badge color. Same host → same color across reloads.
+// distinct badge color. Saturation is intentionally low so the pills
+// recede as backgrounds next to the log-level colors (info/model/
+// agent/etc.) rather than competing with them for attention.
 function hostBadgeColor(hostId) {
   let hash = 0;
   for (let i = 0; i < hostId.length; i++) {
@@ -4406,7 +4510,7 @@ function hostBadgeColor(hostId) {
     hash |= 0;
   }
   const hue = ((hash % 360) + 360) % 360;
-  return `hsl(${hue}, 55%, 65%)`;
+  return `hsl(${hue}, 32%, 58%)`;
 }
 
 function renderLogEntry(c) {
@@ -8414,6 +8518,56 @@ function renderDaemonsList() {
   // Keep the Activity host filter dropdown in sync with the current
   // daemon list (options may have been added/removed).
   refreshHostFilterOptions();
+
+  // Same for the Stats tab host picker.
+  refreshStatsHostPicker();
+
+  // Refresh the aggregate connection dot in the status bar.
+  updateHostsAggregateDot();
+}
+
+// Update the always-visible status-bar dot summarizing multi-host
+// connection state. Priority: red (any disconnected) > yellow (any
+// SHA mismatch) > green. The whole group (separator + label + dot) is
+// hidden when no secondaries are configured so single-host setups
+// stay clean.
+function updateHostsAggregateDot() {
+  const group = document.getElementById('sb-hosts-group');
+  const dot = document.getElementById('sb-hosts-dot');
+  if (!dot || !group) return;
+  if (daemons.length === 0) {
+    group.style.display = 'none';
+    return;
+  }
+  group.style.display = '';
+
+  let anyDisconnected = false;
+  let anySkewed = false;
+  const skewedHosts = [];
+  const disconnectedHosts = [];
+  for (const d of daemons) {
+    if (!d.connected) {
+      anyDisconnected = true;
+      disconnectedHosts.push(d.label || d.host_id);
+      continue;
+    }
+    if (selfGitSha && d.git_sha && d.git_sha !== selfGitSha) {
+      anySkewed = true;
+      skewedHosts.push(`${d.label || d.host_id} (${d.git_sha} vs ${selfGitSha})`);
+    }
+  }
+
+  dot.classList.remove('ok', 'warn', 'err');
+  if (anyDisconnected) {
+    dot.classList.add('err');
+    dot.title = `Disconnected: ${disconnectedHosts.join(', ')}`;
+  } else if (anySkewed) {
+    dot.classList.add('warn');
+    dot.title = `Version mismatch: ${skewedHosts.join(', ')}. Rebuild to match self (${selfGitSha}).`;
+  } else {
+    dot.classList.add('ok');
+    dot.title = `All ${daemons.length} secondary daemon${daemons.length === 1 ? '' : 's'} connected and on matching version`;
+  }
 }
 
 function renderDaemonRow(d, isSelf) {
@@ -8610,14 +8764,22 @@ function handleSecondaryEvent(hostId, msg) {
       case 'add_turn_separator':
         renderTurnSeparator(c.turn);
         break;
+      case 'update_usage':
+        // Cache under the secondary's host_id so the Stats host picker
+        // can render it. Live-render only if the picker is currently
+        // showing this host — otherwise it'd stomp whatever the user
+        // is viewing.
+        hostStatsCache.set(hostId, c);
+        if (activeStatsHost === hostId) renderUsageTab(c);
+        break;
       case 'clear_logs':
         // Explicitly ignored: clearing the whole stream when a
         // secondary resets would delete primary history too.
         break;
       default:
-        // Everything else (status_bar, approvals, usage, displays,
-        // recordings, phase, badges, terminal data) is intentionally
-        // dropped — those tabs are primary-scoped in phase 1.
+        // Everything else (status_bar, approvals, displays, recordings,
+        // phase, badges, terminal data) is intentionally dropped —
+        // those tabs are primary-scoped in phase 1.
         break;
     }
   }
@@ -8679,6 +8841,92 @@ function applyHostFilter() {
       'hidden-by-filter',
       !!activeHostFilter && activeHostFilter !== hostId,
     );
+  }
+}
+
+// ── Stats host picker ──
+//
+// Dropdown at the top of the Stats tab switches between the primary's
+// usage/cost/history view and each configured secondary's. Payloads
+// are captured from `update_usage` commands as they flow in (primary
+// via processCommands, secondaries via handleSecondaryEvent) so switching
+// is instant from cache.
+
+function isStatsShowingSelf() {
+  return !activeStatsHost || activeStatsHost === selfHostLabel;
+}
+
+function refreshStatsHostPicker() {
+  const bar = document.getElementById('stats-host-bar');
+  const sel = document.getElementById('stats-host-select');
+  if (!bar || !sel) return;
+
+  // Hide the picker on single-host setups — nothing to pick between.
+  if (daemons.length === 0) {
+    bar.style.display = 'none';
+    if (activeStatsHost) {
+      activeStatsHost = '';
+      renderStatsForActiveHost();
+    }
+    return;
+  }
+  bar.style.display = 'flex';
+
+  const current = sel.value;
+  sel.innerHTML = '';
+  const addOpt = (value, text) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = text;
+    sel.appendChild(opt);
+  };
+  addOpt('', `${selfHostLabel} (self)`);
+  for (const d of daemons) {
+    addOpt(d.host_id, d.label || d.host_id);
+  }
+
+  // Preserve the previous selection if it's still present.
+  const keepSelection = Array.from(sel.options).some(o => o.value === current);
+  sel.value = keepSelection ? current : '';
+  if (!keepSelection && activeStatsHost) {
+    activeStatsHost = '';
+    renderStatsForActiveHost();
+  }
+}
+
+function switchStatsHost(hostId) {
+  activeStatsHost = hostId || '';
+  renderStatsForActiveHost();
+}
+
+// Render the Stats tab from whichever host is currently active,
+// pulling from hostStatsCache for the live usage cards and from the
+// per-host session list cache for the "All Sessions" + "Disk Usage"
+// cards. Display metrics stay primary-only for now — they come from
+// a display pipeline event stream, not an HTTP fetch, and the
+// secondary WS forwards them but we don't have per-host DOM targets.
+function renderStatsForActiveHost() {
+  const key = activeStatsHost || selfHostLabel;
+  const cached = hostStatsCache.get(key);
+  if (cached) {
+    renderUsageTab(cached);
+  } else {
+    // No cached payload yet — show the empty state. renderUsageTab's
+    // "no main_json" branch does exactly this, so pass an empty command.
+    renderUsageTab({ main_json: null });
+  }
+
+  // All Sessions + Disk Usage: fetch from the selected host's
+  // /api/sessions. The loader caches per host so switching back is
+  // instant, and guards against stale fetches winning a race against
+  // the user switching away.
+  loadAllSessionsUsage(key);
+
+  // Display metrics: primary-only for now. Hide when viewing a
+  // secondary; restore when viewing self.
+  const metricsEl = document.getElementById('display-metrics-container');
+  if (metricsEl) {
+    metricsEl.classList.toggle('hidden-by-secondary-host', !isStatsShowingSelf());
   }
 }
 
@@ -8899,13 +9147,47 @@ document.getElementById('settings-save-keys').addEventListener('click', saveApiK
 // ── All Sessions Usage (in Stats tab) ──
 let allSessionsUsageLoaded = false;
 
-function loadAllSessionsUsage() {
-  fetch('/api/sessions')
+// Per-host cache of the last `/api/sessions` response so switching
+// between hosts in the Stats picker is instant after first fetch.
+// Keyed by host_id; the primary is cached under selfHostLabel.
+const sessionsListCache = new Map();
+
+// Load and render the "All Sessions" + "Disk Usage" cards for a
+// specific host. Defaults to self (same-origin fetch). When `hostId`
+// is a secondary, the fetch targets that daemon's base URL — which
+// means the browser needs CORS on the remote's /api/sessions (we set
+// `Access-Control-Allow-Origin: *` on that endpoint in web_gateway.rs)
+// and, for HTTPS primaries, the remote must also be HTTPS because of
+// mixed content. Those are the same rules as for /config on add.
+function loadAllSessionsUsage(hostId) {
+  hostId = hostId || selfHostLabel;
+  const cached = sessionsListCache.get(hostId);
+  if (cached) {
+    renderAllSessionsUsage(cached);
+    renderDiskUsage(cached);
+    return;
+  }
+
+  let baseUrl = '';
+  if (hostId !== selfHostLabel) {
+    const d = daemons.find(x => x.host_id === hostId);
+    if (!d) return;
+    baseUrl = d.url.replace(/\/$/, '');
+  }
+
+  fetch(baseUrl + '/api/sessions')
     .then(r => r.json())
     .then(sessions => {
+      sessionsListCache.set(hostId, sessions);
       allSessionsUsageLoaded = true;
-      renderAllSessionsUsage(sessions);
-      renderDiskUsage(sessions);
+      // Only render if the user is still viewing this host. A slow
+      // fetch that finishes after the user switched away would
+      // otherwise stomp the current view.
+      const currentHost = activeStatsHost || selfHostLabel;
+      if (currentHost === hostId) {
+        renderAllSessionsUsage(sessions);
+        renderDiskUsage(sessions);
+      }
     })
     .catch(() => {});
 }
@@ -10046,6 +10328,19 @@ document.getElementById('host-filter-select').addEventListener('change', (e) => 
   activeHostFilter = e.target.value;
   localStorage.setItem(HOST_FILTER_KEY, activeHostFilter);
   applyHostFilter();
+});
+
+// Stats host picker — switches between self and each secondary.
+document.getElementById('stats-host-select').addEventListener('change', (e) => {
+  switchStatsHost(e.target.value);
+});
+
+// Hosts aggregate dot (and its surrounding label group) in the status
+// bar — click jumps to the Daemons panel so the user can investigate
+// which host is disconnected/skewed.
+document.getElementById('sb-hosts-group').addEventListener('click', () => {
+  switchTab('settings');
+  switchSettingsSubtab('network');
 });
 
 // Auto-scroll detection
