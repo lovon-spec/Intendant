@@ -1150,16 +1150,13 @@ pub fn spawn_web_gateway(
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
     // Build the local Agent Card from live runtime state so
-    // `/.well-known/agent-card.json` can serve it. Uses the listener's
-    // bound address for the native Intendant WebSocket transport URL;
-    // LAN-aware URL resolution (nginx mTLS proxy URL, Tailscale) lands
-    // in a later pass. Cached once and cloned into each per-connection
-    // handler, same pattern as `config_json`.
-    let transport_url = listener
-        .local_addr()
-        .ok()
-        .map(|addr| format!("ws://{addr}/ws"))
-        .unwrap_or_else(|| "ws://127.0.0.1:0/ws".to_string());
+    // `/.well-known/agent-card.json` can serve it. The transport URL
+    // comes from [`resolve_advertise_url`], which replaces a wildcard
+    // bind address (0.0.0.0 / ::) with the resolved host label so
+    // remote peers get a dialable URL. A specific bind address is
+    // used as-is. LAN-aware URL resolution (nginx mTLS proxy URL,
+    // Tailscale) is a separate layer and lands in a later pass.
+    let transport_url = resolve_advertise_url(listener.local_addr().ok());
     let agent_card = build_local_agent_card(transport_url);
     let agent_card_json =
         serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
@@ -3669,6 +3666,49 @@ pub fn build_config(
     )
 }
 
+/// Resolve the WebSocket URL to advertise in the Agent Card for
+/// this daemon.
+///
+/// When the listener is bound to a wildcard address (0.0.0.0 or ::),
+/// a remote peer cannot dial that URL — wildcards name "every
+/// interface I'm listening on", not a reachable endpoint. In that
+/// case we substitute [`crate::lan::resolve_host_label`] as the
+/// hostname, which gives a real label (system hostname or
+/// `intendant lan setup --name …`) that resolves via mDNS on a
+/// trusted LAN.
+///
+/// When the listener has a specific bind address (127.0.0.1, or a
+/// real LAN IP the operator chose explicitly), that address is used
+/// as-is — we trust the operator knows why they picked it.
+///
+/// If `local_addr` is `None` (shouldn't happen in practice; the
+/// listener is always bound by the time spawn is called), we fall
+/// back to `ws://localhost:0/ws` rather than panicking. The card
+/// is still valid JSON; the transport URL just won't work until
+/// the next daemon restart.
+pub(crate) fn resolve_advertise_url(
+    local_addr: Option<std::net::SocketAddr>,
+) -> String {
+    use std::net::IpAddr;
+    let (host, port) = match local_addr {
+        Some(addr) => {
+            let port = addr.port();
+            match addr.ip() {
+                IpAddr::V4(v4) if v4.is_unspecified() => {
+                    (crate::lan::resolve_host_label(), port)
+                }
+                IpAddr::V6(v6) if v6.is_unspecified() => {
+                    (crate::lan::resolve_host_label(), port)
+                }
+                IpAddr::V6(v6) => (format!("[{v6}]"), port),
+                ip => (ip.to_string(), port),
+            }
+        }
+        None => ("localhost".to_string(), 0),
+    };
+    format!("ws://{host}:{port}/ws")
+}
+
 /// Assemble the [`crate::peer::AgentCard`] for this daemon from live
 /// runtime state.
 ///
@@ -3779,6 +3819,77 @@ mod tests {
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
+    }
+
+    /// A specific bind address is preserved verbatim in the
+    /// advertised URL. The operator chose it; we trust them.
+    #[test]
+    fn advertise_url_preserves_specific_bind_address() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let specific = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8765);
+        assert_eq!(
+            resolve_advertise_url(Some(specific)),
+            "ws://127.0.0.1:8765/ws"
+        );
+        let lan_ip = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
+        assert_eq!(
+            resolve_advertise_url(Some(lan_ip)),
+            "ws://192.168.1.42:8765/ws"
+        );
+    }
+
+    /// A wildcard bind (0.0.0.0) is replaced with the resolved host
+    /// label, because 0.0.0.0 isn't a dialable address from a
+    /// remote peer. This is the guard against the production case
+    /// where main.rs binds to 0.0.0.0:8765 and the previous
+    /// implementation was handing out `ws://0.0.0.0:8765/ws` in the
+    /// Agent Card — an unusable URL that the transport-url-is-the-
+    /// listener-addr assumption let slip through localhost-only
+    /// tests.
+    #[test]
+    fn advertise_url_replaces_ipv4_wildcard_with_host_label() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
+        let url = resolve_advertise_url(Some(wildcard));
+        assert!(
+            !url.contains("0.0.0.0"),
+            "wildcard must be replaced: got {url}"
+        );
+        assert!(url.starts_with("ws://"), "scheme preserved: {url}");
+        assert!(url.ends_with(":8765/ws"), "port preserved: {url}");
+        let host = url
+            .strip_prefix("ws://")
+            .and_then(|rest| rest.strip_suffix(":8765/ws"))
+            .expect("url has expected prefix/suffix");
+        assert!(
+            !host.is_empty(),
+            "host must resolve to something non-empty: {url}"
+        );
+    }
+
+    /// Same guard for IPv6 wildcards (::), which have the same
+    /// unreachability problem as 0.0.0.0.
+    #[test]
+    fn advertise_url_replaces_ipv6_wildcard_with_host_label() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let wildcard = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 8765);
+        let url = resolve_advertise_url(Some(wildcard));
+        assert!(
+            !url.contains("::"),
+            "ipv6 wildcard must be replaced: got {url}"
+        );
+        assert!(url.ends_with(":8765/ws"));
+    }
+
+    /// IPv6 specific addresses are bracketed in the URL per RFC 3986
+    /// so a literal address like `::1` doesn't collide with the
+    /// `:port` separator.
+    #[test]
+    fn advertise_url_brackets_specific_ipv6_address() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let specific = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8765);
+        let url = resolve_advertise_url(Some(specific));
+        assert!(url.contains("[::1]"), "ipv6 literal must be bracketed: {url}");
     }
 
     #[test]
