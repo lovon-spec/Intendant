@@ -1,3 +1,10 @@
+// The substrate lands before the main.rs wiring that consumes it,
+// so the re-exports below and several constants/types look "unused"
+// to clippy until the integration commits land. The allow is
+// scoped to the peer module tree and will come off once
+// PeerRegistry is wired into main.rs.
+#![allow(dead_code, unused_imports)]
+
 //! Peer agent federation layer.
 //!
 //! Intendant federates with other autonomous agent daemons — other
@@ -67,22 +74,20 @@
 //!
 //! ## Module layout
 //!
-//! - [`id`]      — `PeerId`, `PeerKind`. Stable opaque identity.
-//! - [`card`]    — `AgentCard`, `Capability`, `TransportSpec`, `AuthScheme`.
-//!                 Served at `/.well-known/agent-card.json`. Replaces the
-//!                 host_label/version/git_sha fields of `WebGatewayConfig`.
-//! - [`event`]   — `PeerEvent`, the lean transport-neutral event vocabulary.
-//!                 The native Intendant transport upcasts `AppEvent` into
-//!                 these variants; there is no `Native(AppEvent)` escape
-//!                 hatch by design.
-//! - [`traits`]  — `PeerTransport` (single trait), `PeerOp`/`PeerOpAck`
-//!                 envelope, `TransportFeatures`, and the `check_feature`
-//!                 invariant guard.
-//! - [`handle`]  — `PeerHandle` (registry-facing concrete struct),
-//!                 `ConnectionState`, `spawn_peer` constructor.
-//! - [`actor`]   — Internal per-peer actor task that owns the transport
-//!                 and runs the connect → main-loop → reconnect state
-//!                 machine.
+//! - [`id`] — `PeerId`, `PeerKind`. Stable opaque identity.
+//! - [`card`] — `AgentCard`, `Capability`, `TransportSpec`, `AuthScheme`.
+//!   Served at `/.well-known/agent-card.json`. Replaces the
+//!   host_label/version/git_sha fields of `WebGatewayConfig`.
+//! - [`event`] — `PeerEvent`, the lean transport-neutral event vocabulary.
+//!   The native Intendant transport upcasts `AppEvent` into these
+//!   variants; there is no `Native(AppEvent)` escape hatch by design.
+//! - [`traits`] — `PeerTransport` (single trait), `PeerOp`/`PeerOpAck`
+//!   envelope, `TransportFeatures`, and the `check_feature`
+//!   invariant guard.
+//! - [`handle`] — `PeerHandle` (registry-facing concrete struct),
+//!   `ConnectionState`, `spawn_peer` constructor.
+//! - [`actor`] — Internal per-peer actor task that owns the transport
+//!   and runs the connect → main-loop → reconnect state machine.
 //!
 //! Transport implementations and the registry/coordinator land in
 //! follow-up modules (`transport::intendant`, `transport::a2a`,
