@@ -258,6 +258,38 @@ pub struct ProjectConfig {
     pub live_audio: LiveAudioConfig,
     #[serde(default)]
     pub webrtc: WebRtcConfig,
+    /// Federated peer daemons to auto-register at startup.
+    ///
+    /// Each `[[peer]]` section in `intendant.toml` becomes one
+    /// [`PeerConfig`] entry; the daemon hydrates them into the
+    /// [`crate::peer::PeerRegistry`] after the web gateway comes up,
+    /// so the dashboard shows them as known peers from first load
+    /// without the user having to add each one through the UI.
+    /// Peers added via the dashboard at runtime live only in the
+    /// registry (and the browser's localStorage mirror) — they're
+    /// not written back to `intendant.toml` automatically.
+    #[serde(default, rename = "peer")]
+    pub peers: Vec<PeerConfig>,
+}
+
+/// A federated peer daemon advertised via `intendant.toml [[peer]]`.
+///
+/// `card_url` is the only required field — the registry fetches the
+/// peer's Agent Card from that URL at startup, picks a supported
+/// transport, and spawns the actor. `label` is an optional display
+/// override; when absent the card's own `label` field is used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// URL of the peer's Agent Card. Typically
+    /// `https://<host>:<port>/.well-known/agent-card.json` or
+    /// `http://<host>:<port>/.well-known/agent-card.json` for
+    /// non-TLS local testing.
+    pub card_url: String,
+    /// Optional display label override. Rendered in the dashboard
+    /// Daemons panel instead of `card.label` when set. Does not
+    /// affect routing — the registry still keys on `card.id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Recording configuration in intendant.toml.
@@ -437,6 +469,63 @@ mod tests {
         assert!(config.model.max_output_tokens.is_none());
         assert!(config.orchestrator.max_parallel_agents.is_none());
         assert!(config.orchestrator.sub_agent_dir.is_none());
+        assert!(config.peers.is_empty());
+    }
+
+    /// `[[peer]]` sections parse into `ProjectConfig.peers` via the
+    /// `#[serde(rename = "peer")]` attribute on the field. A config
+    /// with no peer sections leaves the vec empty (covered by
+    /// default_project_config).
+    #[test]
+    fn parse_peer_sections() {
+        let toml_str = r#"
+[[peer]]
+card_url = "https://nicks-mac.local:8443/.well-known/agent-card.json"
+label = "Nick's Mac"
+
+[[peer]]
+card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.peers.len(), 2);
+        assert_eq!(
+            config.peers[0].card_url,
+            "https://nicks-mac.local:8443/.well-known/agent-card.json"
+        );
+        assert_eq!(config.peers[0].label.as_deref(), Some("Nick's Mac"));
+        assert_eq!(
+            config.peers[1].card_url,
+            "http://127.0.0.1:9000/.well-known/agent-card.json"
+        );
+        assert!(config.peers[1].label.is_none());
+    }
+
+    /// Round-trip: serializing a config with peer entries back to
+    /// TOML produces a string that parses to the same values.
+    /// Guards against a future rename or field change breaking the
+    /// save path that's used by `Project::save_config`.
+    #[test]
+    fn peer_config_round_trip_through_toml() {
+        let original = ProjectConfig {
+            peers: vec![
+                PeerConfig {
+                    card_url: "http://a.local/.well-known/agent-card.json".into(),
+                    label: Some("A".into()),
+                },
+                PeerConfig {
+                    card_url: "http://b.local/.well-known/agent-card.json".into(),
+                    label: None,
+                },
+            ],
+            ..ProjectConfig::default()
+        };
+        let serialized = toml::to_string(&original).unwrap();
+        let parsed: ProjectConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.peers.len(), 2);
+        assert_eq!(parsed.peers[0].card_url, original.peers[0].card_url);
+        assert_eq!(parsed.peers[0].label, original.peers[0].label);
+        assert_eq!(parsed.peers[1].card_url, original.peers[1].card_url);
+        assert!(parsed.peers[1].label.is_none());
     }
 
     #[test]
