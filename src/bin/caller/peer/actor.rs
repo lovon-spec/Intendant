@@ -156,12 +156,33 @@ impl PeerActor {
     }
 
     /// Main command/event pump while the transport is connected.
+    ///
+    /// Exits with `StreamEnded` on either:
+    ///
+    /// 1. `events_in_rx.recv()` returns `None` — all senders
+    ///    dropped. This happens during explicit disconnect when
+    ///    the transport drops its `events_tx`.
+    /// 2. `PeerEvent::Disconnected` arrives on the stream —
+    ///    emitted by the transport's drain task when the
+    ///    underlying connection closes while the transport struct
+    ///    still holds its `events_tx` clone (the normal wire-lost
+    ///    case). We still fan the event out to observers before
+    ///    exiting so the log and broadcast see the disconnect
+    ///    narrative, then trip `StreamEnded` so the outer run
+    ///    loop transitions to Reconnecting.
     async fn main_loop(&mut self) -> MainLoopExit {
         loop {
             tokio::select! {
                 maybe_event = self.events_in_rx.recv() => {
                     match maybe_event {
-                        Some(event) => self.handle_event(event).await,
+                        Some(event) => {
+                            let is_disconnect =
+                                matches!(event, PeerEvent::Disconnected { .. });
+                            self.handle_event(event).await;
+                            if is_disconnect {
+                                return MainLoopExit::StreamEnded;
+                            }
+                        }
                         None => return MainLoopExit::StreamEnded,
                     }
                 }

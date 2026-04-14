@@ -95,6 +95,7 @@ pub mod event;
 pub mod handle;
 pub mod id;
 pub mod traits;
+pub mod transport;
 pub mod upcast;
 
 pub use card::{
