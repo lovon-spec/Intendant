@@ -3,7 +3,7 @@
 //! These types were extracted from `tui/app.rs` and `control.rs` so that non-TUI
 //! modules no longer need to reach into `tui::` for shared vocabulary.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Agent loop phases
@@ -102,7 +102,16 @@ impl Verbosity {
 // ---------------------------------------------------------------------------
 
 /// Events sent to connected control socket clients, web gateway, and MCP.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Also deserialized by `crate::peer::upcast::OutboundEventUpcaster`
+/// when reading a peer Intendant's `/ws` stream. `Unknown` is the
+/// forward-compat fallback — a peer running a newer build that
+/// emits an event variant we don't recognize parses to `Unknown`
+/// and is dropped by the upcaster rather than failing the whole
+/// wire parse. As with the other `#[serde(other)]` variants in the
+/// peer module, `Unknown` cannot be *serialized* at runtime; local
+/// code never constructs it, so that limitation doesn't matter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum OutboundEvent {
@@ -332,6 +341,11 @@ pub enum OutboundEvent {
         resolution_width: u32,
         resolution_height: u32,
     },
+    /// Forward-compat fallback for wire events we don't recognize.
+    /// Produced only by the deserializer; never constructed locally.
+    /// Cannot be serialized.
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------

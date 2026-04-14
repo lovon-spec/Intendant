@@ -113,7 +113,7 @@ pub use id::{PeerId, PeerKind};
 pub use traits::{
     check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures,
 };
-pub use upcast::AppEventUpcaster;
+pub use upcast::{AppEventUpcaster, WireEventUpcaster};
 
 // ---------------------------------------------------------------------------
 // Errors

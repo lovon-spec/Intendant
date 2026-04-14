@@ -52,6 +52,118 @@ use crate::peer::{
     LogLevel, MessageContent, MessageId, MessageRole, ModelUsage, PeerEvent, PeerStatus,
     SessionInfo, UsageSnapshot,
 };
+use crate::types::OutboundEvent;
+
+// ---------------------------------------------------------------------------
+// Shared stateless helpers
+// ---------------------------------------------------------------------------
+//
+// Both upcasters consume the same peer vocabulary, so the small
+// translation primitives (log level mapping, approval decision
+// parsing, status phase mapping, etc.) live at module scope as
+// `pub(crate)` functions. Factoring them out is the main defense
+// against drift: if one upcaster starts interpreting "warn" or
+// "waiting_approval" differently from the other, a parity test
+// fires and points at the exact helper that needs fixing.
+
+pub(crate) fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+pub(crate) fn log_event(level: LogLevel, source: &str, message: String) -> PeerEvent {
+    PeerEvent::Log {
+        level,
+        source: source.to_string(),
+        message,
+        ts: now_rfc3339(),
+    }
+}
+
+/// Map Intendant's internal multi-source `LogLevel` to the peer
+/// module's 5-level vocabulary. Source-specific variants
+/// (Model/Agent/SubAgent) collapse to `Info` because the peer Log
+/// event has a separate `source` field that carries the
+/// differentiation.
+pub(crate) fn upcast_log_level(level: &crate::types::LogLevel) -> LogLevel {
+    use crate::types::LogLevel as L;
+    match level {
+        L::Debug => LogLevel::Debug,
+        L::Detail => LogLevel::Debug,
+        L::Info | L::Model | L::Agent | L::SubAgent => LogLevel::Info,
+        L::Warn => LogLevel::Warn,
+        L::Error => LogLevel::Error,
+    }
+}
+
+/// Map a wire-format log level string (as produced by
+/// `OutboundEvent::LogEntry` and `OutboundEvent::PresenceLog`) to
+/// the peer vocabulary. Same mapping table as `upcast_log_level`
+/// but keyed on strings instead of the typed enum. Kept aligned
+/// with `upcast_log_level` by the parity tests.
+pub(crate) fn wire_log_level(s: &str) -> LogLevel {
+    match s {
+        "trace" => LogLevel::Trace,
+        "debug" | "detail" => LogLevel::Debug,
+        "info" | "model" | "agent" | "subagent" => LogLevel::Info,
+        "warn" | "warning" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    }
+}
+
+/// Map Intendant's internal `ActionCategory` to a free-form string
+/// for `ApprovalRequest.category`. Lowercase snake_case to match
+/// the convention other autonomous daemons (OpenClaw) use for
+/// category tags.
+pub(crate) fn action_category_wire(cat: &crate::autonomy::ActionCategory) -> String {
+    use crate::autonomy::ActionCategory as C;
+    match cat {
+        C::FileRead => "file_read",
+        C::FileWrite => "file_write",
+        C::FileDelete => "file_delete",
+        C::CommandExec => "command_exec",
+        C::NetworkRequest => "network_request",
+        C::Destructive => "destructive",
+        C::HumanInput => "human_input",
+        C::LiveAudioSpawn => "live_audio_spawn",
+        C::DisplayControl => "display_control",
+    }
+    .to_string()
+}
+
+/// Map the action string on `ApprovalResolved` (which is free-form
+/// from the TUI's action labels or the `ApprovalResponse` variant
+/// names) to a typed `ApprovalDecision`.
+pub(crate) fn approval_decision_from_action(action: &str) -> ApprovalDecision {
+    match action {
+        "approve" | "accept" => ApprovalDecision::Accept,
+        "approve_all" | "accept_for_session" | "approveall" => {
+            ApprovalDecision::AcceptForSession
+        }
+        "deny" | "decline" => ApprovalDecision::Decline,
+        "skip" | "cancel" => ApprovalDecision::Cancel,
+        _ => ApprovalDecision::Decline,
+    }
+}
+
+/// Map the free-form `StatusUpdate.phase` / `OutboundEvent::Status.phase`
+/// string to a typed `PeerStatus`. Unknown phases default to `Idle`
+/// rather than `Unknown` because `Idle` is the more graceful render
+/// when we're connected but don't recognize the phase label — the
+/// peer is *there*, we just don't know what it's doing.
+pub(crate) fn status_from_phase(phase: &str) -> PeerStatus {
+    match phase {
+        "idle" | "waiting_followup" | "done" => PeerStatus::Idle,
+        "working" | "thinking" | "acting" | "executing" | "running" => PeerStatus::Working,
+        "approval" | "waiting_approval" | "needs_approval" => PeerStatus::NeedsApproval,
+        "error" | "failed" => PeerStatus::Error,
+        _ => PeerStatus::Idle,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AppEventUpcaster — in-process AppEvent → PeerEvent
+// ---------------------------------------------------------------------------
 
 /// Stateful `AppEvent` → `PeerEvent` upcaster.
 pub struct AppEventUpcaster {
@@ -85,19 +197,6 @@ impl AppEventUpcaster {
     fn next_seq(&mut self) -> u64 {
         self.seq = self.seq.saturating_add(1);
         self.seq
-    }
-
-    fn now_rfc3339() -> String {
-        chrono::Utc::now().to_rfc3339()
-    }
-
-    fn log(level: LogLevel, source: &str, message: String) -> PeerEvent {
-        PeerEvent::Log {
-            level,
-            source: source.to_string(),
-            message,
-            ts: Self::now_rfc3339(),
-        }
     }
 
     /// Return the current message ID, creating a fresh seq-based one
@@ -206,7 +305,7 @@ impl AppEventUpcaster {
                     outcome: ActivityOutcome::Success,
                 }];
                 if let Some(msg) = message {
-                    out.push(Self::log(LogLevel::Info, "agent", format!("done: {msg}")));
+                    out.push(log_event(LogLevel::Info, "agent", format!("done: {msg}")));
                 }
                 out
             }
@@ -214,7 +313,7 @@ impl AppEventUpcaster {
             AppEvent::RoundComplete {
                 round,
                 turns_in_round,
-            } => vec![Self::log(
+            } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 format!("round {round} complete ({turns_in_round} turns)"),
@@ -247,7 +346,7 @@ impl AppEventUpcaster {
                     });
                 }
                 if !stderr.is_empty() {
-                    out.push(Self::log(LogLevel::Warn, "agent", stderr.clone()));
+                    out.push(log_event(LogLevel::Warn, "agent", stderr.clone()));
                 }
                 out
             }
@@ -259,7 +358,7 @@ impl AppEventUpcaster {
                         id: ActivityId(format!("subagent-{seq}")),
                         outcome: ActivityOutcome::Success,
                     },
-                    Self::log(LogLevel::Info, "subagent", formatted.clone()),
+                    log_event(LogLevel::Info, "subagent", formatted.clone()),
                 ]
             }
 
@@ -272,13 +371,13 @@ impl AppEventUpcaster {
                 text: Some(format!("{status}: {last_action}")),
             }],
 
-            AppEvent::OrchestratorLog { message, level } => vec![Self::log(
+            AppEvent::OrchestratorLog { message, level } => vec![log_event(
                 upcast_log_level(level),
                 "orchestrator",
                 message.clone(),
             )],
 
-            AppEvent::ContextManagement { turn } => vec![Self::log(
+            AppEvent::ContextManagement { turn } => vec![log_event(
                 LogLevel::Debug,
                 "context",
                 format!("context management turn {turn}"),
@@ -298,7 +397,7 @@ impl AppEventUpcaster {
                     outcome,
                 }];
                 if let Some(s) = summary {
-                    out.push(Self::log(LogLevel::Info, "task", s.clone()));
+                    out.push(log_event(LogLevel::Info, "task", s.clone()));
                 }
                 out
             }
@@ -309,7 +408,7 @@ impl AppEventUpcaster {
                     session: SessionInfo {
                         session_id: session_id.clone(),
                         label: task.clone(),
-                        started_at: Self::now_rfc3339(),
+                        started_at: now_rfc3339(),
                     },
                 }]
             }
@@ -319,7 +418,7 @@ impl AppEventUpcaster {
                 reason: reason.clone(),
             }],
 
-            AppEvent::SessionDirChanged { path } => vec![Self::log(
+            AppEvent::SessionDirChanged { path } => vec![log_event(
                 LogLevel::Info,
                 "session",
                 format!("session dir → {}", path.display()),
@@ -374,7 +473,7 @@ impl AppEventUpcaster {
                 }]
             }
 
-            AppEvent::HumanResponseSent => vec![Self::log(
+            AppEvent::HumanResponseSent => vec![log_event(
                 LogLevel::Info,
                 "human",
                 "human response sent".to_string(),
@@ -398,7 +497,7 @@ impl AppEventUpcaster {
                 display_id,
                 width,
                 height,
-            } => vec![Self::log(
+            } => vec![log_event(
                 LogLevel::Info,
                 "display",
                 format!("display {display_id} resized to {width}x{height}"),
@@ -425,13 +524,13 @@ impl AppEventUpcaster {
             AppEvent::DisplayApprovalPending {
                 display_id: _,
                 backend,
-            } => vec![Self::log(
+            } => vec![log_event(
                 LogLevel::Info,
                 "display",
                 format!("display approval pending on {backend}"),
             )],
 
-            AppEvent::UserDisplayGranted { display_id } => vec![Self::log(
+            AppEvent::UserDisplayGranted { display_id } => vec![log_event(
                 LogLevel::Info,
                 "display",
                 format!("user granted display {display_id}"),
@@ -439,7 +538,7 @@ impl AppEventUpcaster {
 
             AppEvent::UserDisplayRevoked { display_id, note } => {
                 let note_str = note.as_deref().unwrap_or("");
-                vec![Self::log(
+                vec![log_event(
                     LogLevel::Info,
                     "display",
                     format!("user revoked display {display_id}: {note_str}"),
@@ -475,13 +574,13 @@ impl AppEventUpcaster {
             AppEvent::RecordingError {
                 stream_name,
                 message,
-            } => vec![Self::log(
+            } => vec![log_event(
                 LogLevel::Error,
                 "recording",
                 format!("{stream_name}: {message}"),
             )],
 
-            AppEvent::RecordingDeleted { stream_name } => vec![Self::log(
+            AppEvent::RecordingDeleted { stream_name } => vec![log_event(
                 LogLevel::Info,
                 "recording",
                 format!("{stream_name} deleted"),
@@ -498,7 +597,7 @@ impl AppEventUpcaster {
                 reason: Some("presence_disconnected".to_string()),
             }],
 
-            AppEvent::PresenceReady => vec![Self::log(
+            AppEvent::PresenceReady => vec![log_event(
                 LogLevel::Info,
                 "presence",
                 "presence ready".to_string(),
@@ -513,13 +612,13 @@ impl AppEventUpcaster {
                     .as_ref()
                     .map(upcast_log_level)
                     .unwrap_or(LogLevel::Info);
-                vec![Self::log(lvl, "presence", message.clone())]
+                vec![log_event(lvl, "presence", message.clone())]
             }
 
             AppEvent::PresenceCheckpointReceived {
                 summary,
                 last_event_seq,
-            } => vec![Self::log(
+            } => vec![log_event(
                 LogLevel::Info,
                 "presence",
                 format!("checkpoint at seq {last_event_seq}: {summary}"),
@@ -529,9 +628,9 @@ impl AppEventUpcaster {
                 text,
                 seq: _,
                 tool_context: _,
-            } => vec![Self::log(LogLevel::Info, "voice", text.clone())],
+            } => vec![log_event(LogLevel::Info, "voice", text.clone())],
 
-            AppEvent::VoiceDiagnostic { kind, detail } => vec![Self::log(
+            AppEvent::VoiceDiagnostic { kind, detail } => vec![log_event(
                 LogLevel::Warn,
                 "voice",
                 format!("{kind}: {detail}"),
@@ -647,7 +746,7 @@ impl AppEventUpcaster {
                 vec![PeerEvent::StatusChanged { status }]
             }
 
-            AppEvent::ExternalAgentChanged { agent } => vec![Self::log(
+            AppEvent::ExternalAgentChanged { agent } => vec![log_event(
                 LogLevel::Info,
                 "config",
                 format!(
@@ -657,27 +756,27 @@ impl AppEventUpcaster {
             )],
 
             // ---- Budget / safety ----
-            AppEvent::BudgetWarning { pct, remaining } => vec![Self::log(
+            AppEvent::BudgetWarning { pct, remaining } => vec![log_event(
                 LogLevel::Warn,
                 "budget",
                 format!("budget warning: {pct:.1}% remaining={remaining}"),
             )],
 
-            AppEvent::BudgetExhausted { remaining } => vec![Self::log(
+            AppEvent::BudgetExhausted { remaining } => vec![log_event(
                 LogLevel::Warn,
                 "budget",
                 format!("budget exhausted, remaining={remaining}"),
             )],
 
-            AppEvent::SafetyCapReached => vec![Self::log(
+            AppEvent::SafetyCapReached => vec![log_event(
                 LogLevel::Warn,
                 "safety",
                 "safety cap reached".to_string(),
             )],
 
-            AppEvent::LoopError(msg) => vec![Self::log(LogLevel::Error, "agent", msg.clone())],
+            AppEvent::LoopError(msg) => vec![log_event(LogLevel::Error, "agent", msg.clone())],
 
-            AppEvent::JsonExtracted { preview } => vec![Self::log(
+            AppEvent::JsonExtracted { preview } => vec![log_event(
                 LogLevel::Debug,
                 "agent",
                 format!("json: {preview}"),
@@ -698,7 +797,7 @@ impl AppEventUpcaster {
                     "error" => LogLevel::Error,
                     _ => LogLevel::Info,
                 };
-                vec![Self::log(log_level, source, content.clone())]
+                vec![log_event(log_level, source, content.clone())]
             }
 
             // ---- Terminal ----
@@ -709,70 +808,612 @@ impl AppEventUpcaster {
     }
 }
 
-/// Map Intendant's internal multi-source `LogLevel` to the peer
-/// module's 5-level vocabulary. Source-specific variants
-/// (Model/Agent/SubAgent) collapse to `Info` because the peer Log
-/// event has a separate `source` field that carries the differentiation.
-fn upcast_log_level(level: &crate::types::LogLevel) -> LogLevel {
-    use crate::types::LogLevel as L;
-    match level {
-        L::Debug => LogLevel::Debug,
-        L::Detail => LogLevel::Debug,
-        L::Info | L::Model | L::Agent | L::SubAgent => LogLevel::Info,
-        L::Warn => LogLevel::Warn,
-        L::Error => LogLevel::Error,
+// ---------------------------------------------------------------------------
+// WireEventUpcaster — OutboundEvent → PeerEvent
+// ---------------------------------------------------------------------------
+//
+// Used by `IntendantWsTransport` to map a peer Intendant's `/ws`
+// wire stream into the `PeerEvent` vocabulary. Operates on typed
+// [`OutboundEvent`] (derived Deserialize + `#[serde(other)] Unknown`
+// for forward-compat) rather than raw JSON — the transport parses
+// frames through serde, then feeds them here.
+//
+// Drift-prevention strategy: every AppEvent variant that passes
+// through `app_event_to_outbound()` should produce the same
+// `Vec<PeerEvent>` whether you route it through `AppEventUpcaster`
+// directly or through the wire (`app_event_to_outbound()` +
+// `WireEventUpcaster`). The parity tests at the bottom of this
+// module enforce that invariant; intentional information loss is
+// marked explicitly in each case with a brief rationale.
+
+/// Stateful `OutboundEvent` → `PeerEvent` upcaster for wire-format
+/// input (from a peer Intendant's `/ws`).
+pub struct WireEventUpcaster {
+    seq: u64,
+    /// Streaming message ID, same pattern as `AppEventUpcaster`.
+    /// The wire format preserves streaming delta semantics, so
+    /// we need the same state machine.
+    current_message_id: Option<MessageId>,
+}
+
+impl Default for WireEventUpcaster {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// Map Intendant's internal `ActionCategory` to a free-form string
-/// for `ApprovalRequest.category`. Lowercase snake_case to match the
-/// convention other autonomous daemons (OpenClaw) use for category tags.
-fn action_category_wire(cat: &crate::autonomy::ActionCategory) -> String {
-    use crate::autonomy::ActionCategory as C;
-    match cat {
-        C::FileRead => "file_read",
-        C::FileWrite => "file_write",
-        C::FileDelete => "file_delete",
-        C::CommandExec => "command_exec",
-        C::NetworkRequest => "network_request",
-        C::Destructive => "destructive",
-        C::HumanInput => "human_input",
-        C::LiveAudioSpawn => "live_audio_spawn",
-        C::DisplayControl => "display_control",
-    }
-    .to_string()
-}
-
-/// Map the action string on `ApprovalResolved` to a typed
-/// `ApprovalDecision`. The string names come from `ApprovalResponse`
-/// variant names and the TUI's action labels (approve / deny / skip /
-/// approve_all) which the event loop emits without normalization.
-fn approval_decision_from_action(action: &str) -> ApprovalDecision {
-    match action {
-        "approve" | "accept" => ApprovalDecision::Accept,
-        "approve_all" | "accept_for_session" | "approveall" => {
-            ApprovalDecision::AcceptForSession
+impl WireEventUpcaster {
+    pub fn new() -> Self {
+        Self {
+            seq: 0,
+            current_message_id: None,
         }
-        "deny" | "decline" => ApprovalDecision::Decline,
-        "skip" | "cancel" => ApprovalDecision::Cancel,
-        _ => ApprovalDecision::Decline,
     }
-}
 
-/// Map the free-form `StatusUpdate.phase` string to a typed `PeerStatus`.
-/// The phase vocabulary isn't formally documented anywhere — values in
-/// the wild include `idle`, `thinking`, `acting`, `executing`,
-/// `waiting_approval`, `waiting_followup`, `done`, `failed`. Unknown
-/// phases default to `Idle` rather than `Unknown` because `Idle` is
-/// the more graceful render when we're not sure — the peer is
-/// connected, we just don't recognize its phase label.
-fn status_from_phase(phase: &str) -> PeerStatus {
-    match phase {
-        "idle" | "waiting_followup" | "done" => PeerStatus::Idle,
-        "working" | "thinking" | "acting" | "executing" | "running" => PeerStatus::Working,
-        "approval" | "waiting_approval" | "needs_approval" => PeerStatus::NeedsApproval,
-        "error" | "failed" => PeerStatus::Error,
-        _ => PeerStatus::Idle,
+    fn next_seq(&mut self) -> u64 {
+        self.seq = self.seq.saturating_add(1);
+        self.seq
+    }
+
+    fn current_or_new_message_id(&mut self) -> MessageId {
+        if let Some(id) = &self.current_message_id {
+            return id.clone();
+        }
+        let seq = self.next_seq();
+        let id = MessageId(format!("msg-seq-{seq}"));
+        self.current_message_id = Some(id.clone());
+        id
+    }
+
+    /// Map a wire-format [`OutboundEvent`] to zero or more
+    /// [`PeerEvent`]s.
+    pub fn upcast(&mut self, event: &OutboundEvent) -> Vec<PeerEvent> {
+        match event {
+            // ---- Forward-compat + dropped metric streams ----
+            OutboundEvent::Unknown | OutboundEvent::DisplayMetrics { .. } => vec![],
+
+            // ---- Turn lifecycle ----
+            OutboundEvent::TurnStarted { turn, .. } => {
+                self.current_message_id = Some(MessageId(format!("msg-turn-{turn}")));
+                vec![PeerEvent::ActivityStarted {
+                    id: ActivityId(format!("turn-{turn}")),
+                    kind: ActivityKind::ModelTurn,
+                    label: format!("turn {turn}"),
+                }]
+            }
+
+            OutboundEvent::ModelResponseDelta { text } => {
+                let id = self.current_or_new_message_id();
+                vec![PeerEvent::Message {
+                    id,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text { text: text.clone() },
+                    partial: true,
+                }]
+            }
+
+            // OutboundEvent::ModelResponse does NOT carry usage on the
+            // wire — usage travels as a separate OutboundEvent::Usage /
+            // UsageUpdate. That's the documented information-split: the
+            // `AppEvent → AppEventUpcaster` path emits Message + Usage
+            // from one ModelResponse, while the wire path emits
+            // Message from this variant and relies on a sibling
+            // OutboundEvent::Usage to carry the tokens. The parity
+            // test `model_response_usage_accounting_drift` documents
+            // this gap explicitly.
+            OutboundEvent::ModelResponse {
+                turn,
+                summary,
+                reasoning_summary,
+                source: _,
+            } => {
+                let msg_id = self.current_or_new_message_id();
+                let mut out = vec![PeerEvent::Message {
+                    id: msg_id,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text {
+                        text: summary.clone(),
+                    },
+                    partial: false,
+                }];
+                if let Some(reasoning_text) = reasoning_summary {
+                    out.push(PeerEvent::Message {
+                        id: MessageId(format!("reasoning-turn-{turn}")),
+                        role: MessageRole::Assistant,
+                        content: MessageContent::Reasoning {
+                            text: reasoning_text.clone(),
+                        },
+                        partial: false,
+                    });
+                }
+                self.current_message_id = None;
+                out
+            }
+
+            OutboundEvent::ModelSummary {
+                turn,
+                summary,
+                reasoning_summary,
+            } => {
+                // Same shape as ModelResponse but without a source
+                // override. Emitted by some paths as a distilled
+                // summary rather than a full response. Maps to the
+                // same Message + Reasoning shape.
+                let msg_id = MessageId(format!("summary-turn-{turn}"));
+                let mut out = vec![PeerEvent::Message {
+                    id: msg_id,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text {
+                        text: summary.clone(),
+                    },
+                    partial: false,
+                }];
+                if let Some(reasoning_text) = reasoning_summary {
+                    out.push(PeerEvent::Message {
+                        id: MessageId(format!("summary-reasoning-turn-{turn}")),
+                        role: MessageRole::Assistant,
+                        content: MessageContent::Reasoning {
+                            text: reasoning_text.clone(),
+                        },
+                        partial: false,
+                    });
+                }
+                out
+            }
+
+            OutboundEvent::DoneSignal { message } => {
+                self.current_message_id = None;
+                let seq = self.next_seq();
+                let mut out = vec![PeerEvent::ActivityCompleted {
+                    id: ActivityId(format!("done-{seq}")),
+                    outcome: ActivityOutcome::Success,
+                }];
+                if let Some(msg) = message {
+                    out.push(log_event(LogLevel::Info, "agent", format!("done: {msg}")));
+                }
+                out
+            }
+
+            OutboundEvent::RoundComplete {
+                round,
+                turns_in_round,
+            } => vec![log_event(
+                LogLevel::Info,
+                "agent",
+                format!("round {round} complete ({turns_in_round} turns)"),
+            )],
+
+            // ---- Sub-agent / tool execution ----
+            OutboundEvent::AgentStarted {
+                turn,
+                commands_preview,
+                source,
+            } => {
+                let label = source.clone().unwrap_or_else(|| "agent".to_string());
+                vec![PeerEvent::ActivityStarted {
+                    id: ActivityId(format!("agent-{turn}")),
+                    kind: ActivityKind::ToolCall,
+                    label: format!("{label}: {commands_preview}"),
+                }]
+            }
+
+            OutboundEvent::AgentOutput {
+                stdout,
+                stderr,
+                source: _,
+            } => {
+                let mut out = vec![];
+                if !stdout.is_empty() {
+                    out.push(PeerEvent::ActivityProgress {
+                        id: ActivityId("agent-latest".into()),
+                        text: Some(stdout.clone()),
+                    });
+                }
+                if !stderr.is_empty() {
+                    out.push(log_event(LogLevel::Warn, "agent", stderr.clone()));
+                }
+                out
+            }
+
+            OutboundEvent::SubAgentResult { summary } => {
+                let seq = self.next_seq();
+                vec![
+                    PeerEvent::ActivityCompleted {
+                        id: ActivityId(format!("subagent-{seq}")),
+                        outcome: ActivityOutcome::Success,
+                    },
+                    log_event(LogLevel::Info, "subagent", summary.clone()),
+                ]
+            }
+
+            // OutboundEvent::OrchestratorProgress only carries `status`
+            // — the wire format loses the `turn` and `last_action`
+            // fields that AppEvent carries. The parity test flags
+            // this as intentional loss.
+            OutboundEvent::OrchestratorProgress { status } => {
+                vec![PeerEvent::ActivityProgress {
+                    id: ActivityId("orchestrator".into()),
+                    text: Some(status.clone()),
+                }]
+            }
+
+            OutboundEvent::ContextManagement { turn } => vec![log_event(
+                LogLevel::Debug,
+                "context",
+                format!("context management turn {turn}"),
+            )],
+
+            OutboundEvent::TaskComplete { reason, summary } => {
+                let seq = self.next_seq();
+                let outcome = match reason.as_str() {
+                    "success" | "done" | "completed" => ActivityOutcome::Success,
+                    "cancelled" | "canceled" => ActivityOutcome::Cancelled,
+                    other => ActivityOutcome::Failed {
+                        message: other.to_string(),
+                    },
+                };
+                let mut out = vec![PeerEvent::ActivityCompleted {
+                    id: ActivityId(format!("task-{seq}")),
+                    outcome,
+                }];
+                if let Some(s) = summary {
+                    out.push(log_event(LogLevel::Info, "task", s.clone()));
+                }
+                out
+            }
+
+            // ---- Session lifecycle ----
+            OutboundEvent::SessionStarted { session_id, task } => {
+                vec![PeerEvent::SessionStarted {
+                    session: SessionInfo {
+                        session_id: session_id.clone(),
+                        label: task.clone(),
+                        started_at: now_rfc3339(),
+                    },
+                }]
+            }
+
+            OutboundEvent::SessionEnded { session_id, reason } => {
+                vec![PeerEvent::SessionEnded {
+                    session_id: session_id.clone(),
+                    reason: reason.clone(),
+                }]
+            }
+
+            // ---- Approval flow ----
+            //
+            // OutboundEvent::ApprovalRequired drops the ActionCategory
+            // field from AppEvent (wire format only carries `command`,
+            // not category). We default to "command_exec" which is
+            // the overwhelmingly common case. Parity test documents
+            // this as intentional loss — non-command-exec categories
+            // (file_write, destructive, etc.) lose their specific
+            // category name on the wire path.
+            OutboundEvent::ApprovalRequired { id, command } => {
+                vec![PeerEvent::ApprovalRequested {
+                    request: ApprovalRequest {
+                        request_id: id.to_string(),
+                        category: "command_exec".to_string(),
+                        preview: command.clone(),
+                        auto_resolvable: false,
+                    },
+                }]
+            }
+
+            OutboundEvent::ApprovalResolved { id, action } => {
+                vec![PeerEvent::ApprovalResolved {
+                    request_id: id.to_string(),
+                    decision: approval_decision_from_action(action),
+                }]
+            }
+
+            OutboundEvent::AutoApproved { preview } => {
+                let seq = self.next_seq();
+                vec![
+                    PeerEvent::ApprovalRequested {
+                        request: ApprovalRequest {
+                            request_id: format!("auto-{seq}"),
+                            category: "auto".to_string(),
+                            preview: preview.clone(),
+                            auto_resolvable: true,
+                        },
+                    },
+                    PeerEvent::ApprovalResolved {
+                        request_id: format!("auto-{seq}"),
+                        decision: ApprovalDecision::Accept,
+                    },
+                ]
+            }
+
+            OutboundEvent::AskHuman { question } => {
+                let seq = self.next_seq();
+                vec![PeerEvent::ApprovalRequested {
+                    request: ApprovalRequest {
+                        request_id: format!("human-{seq}"),
+                        category: "human_question".to_string(),
+                        preview: question.clone(),
+                        auto_resolvable: false,
+                    },
+                }]
+            }
+
+            OutboundEvent::HumanResponseSent => vec![log_event(
+                LogLevel::Info,
+                "human",
+                "human response sent".to_string(),
+            )],
+
+            // ---- Display capability ----
+            OutboundEvent::DisplayReady {
+                display_id,
+                width,
+                height,
+            } => vec![PeerEvent::CapabilityEngaged {
+                capability: Capability::Display,
+                detail: serde_json::json!({
+                    "display_id": display_id,
+                    "width": width,
+                    "height": height,
+                }),
+            }],
+
+            OutboundEvent::DisplayResize {
+                display_id,
+                width,
+                height,
+            } => vec![log_event(
+                LogLevel::Info,
+                "display",
+                format!("display {display_id} resized to {width}x{height}"),
+            )],
+
+            OutboundEvent::DisplayTaken { display_id } => vec![PeerEvent::CapabilityEngaged {
+                capability: Capability::Display,
+                detail: serde_json::json!({ "display_id": display_id, "state": "taken" }),
+            }],
+
+            OutboundEvent::DisplayReleased { display_id: _, note } => {
+                vec![PeerEvent::CapabilityReleased {
+                    capability: Capability::Display,
+                    reason: note.clone(),
+                }]
+            }
+
+            OutboundEvent::DisplayCaptureLost {
+                display_id: _,
+                reason,
+            } => vec![PeerEvent::CapabilityReleased {
+                capability: Capability::Display,
+                reason: Some(format!("capture_lost: {reason}")),
+            }],
+
+            OutboundEvent::DisplayApprovalPending {
+                display_id: _,
+                backend,
+            } => vec![log_event(
+                LogLevel::Info,
+                "display",
+                format!("display approval pending on {backend}"),
+            )],
+
+            // OutboundEvent::UserDisplayGranted has NO fields on the
+            // wire — AppEvent has `display_id: u32` but that's dropped
+            // in app_event_to_outbound. Parity test documents this.
+            OutboundEvent::UserDisplayGranted => vec![log_event(
+                LogLevel::Info,
+                "display",
+                "user granted display".to_string(),
+            )],
+
+            OutboundEvent::UserDisplayRevoked { display_id, note } => {
+                let note_str = note.as_deref().unwrap_or("");
+                vec![log_event(
+                    LogLevel::Info,
+                    "display",
+                    format!("user revoked display {display_id}: {note_str}"),
+                )]
+            }
+
+            OutboundEvent::DebugScreenReady { display_id } => {
+                vec![PeerEvent::CapabilityEngaged {
+                    capability: Capability::Display,
+                    detail: serde_json::json!({
+                        "display_id": display_id,
+                        "kind": "debug_screen",
+                    }),
+                }]
+            }
+
+            OutboundEvent::DebugScreenTornDown { display_id: _ } => {
+                vec![PeerEvent::CapabilityReleased {
+                    capability: Capability::Display,
+                    reason: Some("debug_screen_torn_down".to_string()),
+                }]
+            }
+
+            // ---- Recording capability ----
+            OutboundEvent::RecordingStarted { stream_name } => {
+                vec![PeerEvent::CapabilityEngaged {
+                    capability: Capability::Recording,
+                    detail: serde_json::json!({ "stream": stream_name }),
+                }]
+            }
+
+            OutboundEvent::RecordingStopped { stream_name } => {
+                vec![PeerEvent::CapabilityReleased {
+                    capability: Capability::Recording,
+                    reason: Some(format!("stopped: {stream_name}")),
+                }]
+            }
+
+            OutboundEvent::RecordingError {
+                stream_name,
+                message,
+            } => vec![log_event(
+                LogLevel::Error,
+                "recording",
+                format!("{stream_name}: {message}"),
+            )],
+
+            OutboundEvent::RecordingDeleted { stream_name } => vec![log_event(
+                LogLevel::Info,
+                "recording",
+                format!("{stream_name} deleted"),
+            )],
+
+            // ---- Presence (wire side has only PresenceLog, no
+            // Connected/Disconnected — those are presence lifecycle
+            // events that don't make it past app_event_to_outbound) ----
+            OutboundEvent::PresenceLog { message, level } => {
+                let lvl = level
+                    .as_deref()
+                    .map(wire_log_level)
+                    .unwrap_or(LogLevel::Info);
+                vec![log_event(lvl, "presence", message.clone())]
+            }
+
+            OutboundEvent::UserTranscript { text, seq: _ } => {
+                let seq = self.next_seq();
+                vec![PeerEvent::Message {
+                    id: MessageId(format!("user-transcript-{seq}")),
+                    role: MessageRole::User,
+                    content: MessageContent::Text { text: text.clone() },
+                    partial: false,
+                }]
+            }
+
+            // ---- Usage accounting ----
+            OutboundEvent::PresenceUsageUpdate {
+                total_tokens: _,
+                context_window: _,
+                usage_pct: _,
+                provider: _,
+                model: _,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            } => vec![PeerEvent::Usage {
+                snapshot: UsageSnapshot {
+                    tokens_in: *prompt_tokens,
+                    tokens_out: *completion_tokens,
+                    tokens_cached: *cached_tokens,
+                    cost_usd: None,
+                    by_model: vec![],
+                },
+            }],
+
+            OutboundEvent::LiveUsageUpdate {
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                total_tokens: _,
+                thinking_tokens: _,
+            } => vec![PeerEvent::Usage {
+                snapshot: UsageSnapshot {
+                    tokens_in: *input_tokens,
+                    tokens_out: *output_tokens,
+                    tokens_cached: *cached_tokens,
+                    cost_usd: None,
+                    by_model: vec![ModelUsage {
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        tokens_in: *input_tokens,
+                        tokens_out: *output_tokens,
+                        cost_usd: None,
+                    }],
+                },
+            }],
+
+            OutboundEvent::Usage { main, presence: _ }
+            | OutboundEvent::UsageUpdate { main, presence: _ } => vec![PeerEvent::Usage {
+                snapshot: UsageSnapshot {
+                    tokens_in: main.prompt_tokens,
+                    tokens_out: main.completion_tokens,
+                    tokens_cached: main.cached_tokens,
+                    cost_usd: None,
+                    by_model: vec![ModelUsage {
+                        provider: main.provider.clone(),
+                        model: main.model.clone(),
+                        tokens_in: main.prompt_tokens,
+                        tokens_out: main.completion_tokens,
+                        cost_usd: None,
+                    }],
+                },
+            }],
+
+            // ---- Status ----
+            OutboundEvent::Status { phase, .. } => {
+                let status = status_from_phase(phase);
+                vec![PeerEvent::StatusChanged { status }]
+            }
+
+            OutboundEvent::ExternalAgentChanged { agent } => vec![log_event(
+                LogLevel::Info,
+                "config",
+                format!(
+                    "external agent changed → {}",
+                    agent.as_deref().unwrap_or("none")
+                ),
+            )],
+
+            // ---- Budget / safety ----
+            OutboundEvent::BudgetWarning { pct, remaining } => vec![log_event(
+                LogLevel::Warn,
+                "budget",
+                format!("budget warning: {pct:.1}% remaining={remaining}"),
+            )],
+
+            OutboundEvent::BudgetExhausted { remaining } => vec![log_event(
+                LogLevel::Warn,
+                "budget",
+                format!("budget exhausted, remaining={remaining}"),
+            )],
+
+            OutboundEvent::SafetyCapReached => vec![log_event(
+                LogLevel::Warn,
+                "safety",
+                "safety cap reached".to_string(),
+            )],
+
+            OutboundEvent::LoopError { message } => {
+                vec![log_event(LogLevel::Error, "agent", message.clone())]
+            }
+
+            // ---- Log passthrough ----
+            OutboundEvent::LogEntry {
+                level,
+                source,
+                content,
+                turn: _,
+            } => {
+                vec![log_event(wire_log_level(level), source, content.clone())]
+            }
+
+            // ---- CommandResult: control-plane meta-event ----
+            //
+            // CommandResult is the ack for a ControlMsg — "the Approve
+            // action succeeded", "the SetAutonomy call failed with
+            // 'bad level'", etc. It has no direct AppEvent ancestor
+            // (it's synthesized by control_plane.rs, not the agent
+            // loop). For federation, it surfaces as an info/error
+            // log so an observer sees what the peer's control plane
+            // is doing.
+            OutboundEvent::CommandResult {
+                action,
+                ok,
+                message,
+                data: _,
+            } => {
+                let level = if *ok { LogLevel::Info } else { LogLevel::Warn };
+                vec![log_event(
+                    level,
+                    "control",
+                    format!("{action}: {message}"),
+                )]
+            }
+        }
     }
 }
 
@@ -1138,5 +1779,488 @@ mod tests {
             }
             _ => panic!("expected Log"),
         }
+    }
+
+    // ===================================================================
+    // WireEventUpcaster tests — OutboundEvent → PeerEvent
+    // ===================================================================
+
+    /// `OutboundEvent` forward-compat: an unknown wire tag
+    /// deserializes to `OutboundEvent::Unknown` and the upcaster
+    /// drops it silently. This is the guardrail that lets us
+    /// evolve the wire protocol without breaking older peers.
+    #[test]
+    fn outbound_unknown_variant_deserializes_and_drops() {
+        let json = r#"{"event":"holographic_projection_started","intensity":"high"}"#;
+        let parsed: OutboundEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(parsed, OutboundEvent::Unknown));
+        let out = WireEventUpcaster::new().upcast(&parsed);
+        assert!(out.is_empty());
+    }
+
+    /// Wire-format `TurnStarted` seeds current_message_id and emits
+    /// ActivityStarted, same as the AppEvent path.
+    #[test]
+    fn wire_turn_started_emits_activity_started() {
+        let mut u = WireEventUpcaster::new();
+        let out = u.upcast(&OutboundEvent::TurnStarted {
+            turn: 3,
+            budget_pct: 0.5,
+        });
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            PeerEvent::ActivityStarted {
+                kind: ActivityKind::ModelTurn,
+                ..
+            }
+        ));
+    }
+
+    /// Wire-format streaming deltas share an id with the final
+    /// ModelResponse within the same turn. Same state machine
+    /// as the AppEvent path — the parity is *mechanical*, not
+    /// coincidental, because both upcasters use the same turn-id
+    /// scheme when seeded by `TurnStarted`.
+    #[test]
+    fn wire_streaming_deltas_share_id_with_final_response() {
+        let mut u = WireEventUpcaster::new();
+        let _ = u.upcast(&OutboundEvent::TurnStarted {
+            turn: 5,
+            budget_pct: 0.5,
+        });
+        let delta = u.upcast(&OutboundEvent::ModelResponseDelta {
+            text: "Hel".into(),
+        });
+        let final_ = u.upcast(&OutboundEvent::ModelResponse {
+            turn: 5,
+            summary: "Hello".into(),
+            reasoning_summary: None,
+            source: None,
+        });
+        let delta_id = match &delta[0] {
+            PeerEvent::Message { id, partial, .. } => {
+                assert!(*partial);
+                id.clone()
+            }
+            _ => panic!("expected delta Message"),
+        };
+        let final_id = match &final_[0] {
+            PeerEvent::Message { id, partial, .. } => {
+                assert!(!partial);
+                id.clone()
+            }
+            _ => panic!("expected final Message"),
+        };
+        assert_eq!(delta_id, final_id);
+    }
+
+    /// Wire-format `Status` maps phase strings to `PeerStatus` via
+    /// the shared `status_from_phase` helper (so it's impossible
+    /// for wire and app paths to diverge on phase interpretation).
+    #[test]
+    fn wire_status_phase_mapping() {
+        let mut u = WireEventUpcaster::new();
+        let out = u.upcast(&OutboundEvent::Status {
+            turn: 1,
+            phase: "thinking".into(),
+            autonomy: "medium".into(),
+            session_id: "s".into(),
+            task: "t".into(),
+            external_agent: None,
+        });
+        assert!(matches!(
+            &out[0],
+            PeerEvent::StatusChanged {
+                status: PeerStatus::Working,
+            }
+        ));
+    }
+
+    /// Wire-format `CommandResult` — control-plane ack event that
+    /// has no AppEvent ancestor — surfaces as a log.
+    #[test]
+    fn wire_command_result_logs() {
+        let mut u = WireEventUpcaster::new();
+        let ok = u.upcast(&OutboundEvent::CommandResult {
+            action: "approve".into(),
+            ok: true,
+            message: "resolved".into(),
+            data: None,
+        });
+        match &ok[0] {
+            PeerEvent::Log {
+                level,
+                source,
+                message,
+                ..
+            } => {
+                assert_eq!(*level, LogLevel::Info);
+                assert_eq!(source, "control");
+                assert!(message.contains("approve"));
+            }
+            _ => panic!("expected Log"),
+        }
+        let fail = u.upcast(&OutboundEvent::CommandResult {
+            action: "deny".into(),
+            ok: false,
+            message: "bad id".into(),
+            data: None,
+        });
+        match &fail[0] {
+            PeerEvent::Log { level, .. } => assert_eq!(*level, LogLevel::Warn),
+            _ => panic!("expected Log"),
+        }
+    }
+
+    // ===================================================================
+    // Parity tests — AppEvent → AppEventUpcaster ≡
+    //                AppEvent → app_event_to_outbound → WireEventUpcaster
+    // ===================================================================
+    //
+    // The drift guard for the two upcasters. For every AppEvent
+    // variant where `app_event_to_outbound` returns `Some(..)` AND
+    // the wire projection preserves enough information for the
+    // mapping to be lossless, both paths must produce structurally
+    // equivalent `Vec<PeerEvent>`. Intentional information loss is
+    // marked with its own test and documented — those are expected
+    // drift, not parity bugs.
+
+    /// Normalize a list of PeerEvents into JSON with timestamp fields
+    /// replaced by a constant. Timestamps (`ts`, `started_at`) are
+    /// generated at upcast time via `chrono::Utc::now()` so two
+    /// otherwise-equivalent calls will differ on them — the
+    /// normalization is what makes structural parity checkable.
+    fn normalize(events: &[PeerEvent]) -> Vec<serde_json::Value> {
+        fn strip_timestamps(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(obj) => {
+                    for key in ["ts", "started_at"] {
+                        if obj.contains_key(key) {
+                            obj.insert(
+                                key.to_string(),
+                                serde_json::Value::String("NORMALIZED".into()),
+                            );
+                        }
+                    }
+                    for (_, child) in obj.iter_mut() {
+                        strip_timestamps(child);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for child in arr.iter_mut() {
+                        strip_timestamps(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        events
+            .iter()
+            .map(|e| {
+                let mut v = serde_json::to_value(e).unwrap();
+                strip_timestamps(&mut v);
+                v
+            })
+            .collect()
+    }
+
+    /// Run an AppEvent through both paths and assert the normalized
+    /// outputs match. Fresh upcasters ensure seq counters start at
+    /// zero on both sides so synthesized IDs line up.
+    fn assert_parity(app_event: AppEvent) {
+        let mut app_upcaster = AppEventUpcaster::new();
+        let mut wire_upcaster = WireEventUpcaster::new();
+
+        let path_a = app_upcaster.upcast(&app_event);
+
+        let outbound = crate::event::app_event_to_outbound(&app_event).unwrap_or_else(|| {
+            panic!(
+                "app_event_to_outbound returned None for {:?} — not eligible for parity check",
+                app_event
+            )
+        });
+        let path_b = wire_upcaster.upcast(&outbound);
+
+        let a = normalize(&path_a);
+        let b = normalize(&path_b);
+
+        assert_eq!(
+            a, b,
+            "parity failure for {app_event:?}\npath A (app) = {a:#?}\npath B (wire) = {b:#?}"
+        );
+    }
+
+    #[test]
+    fn parity_turn_started() {
+        assert_parity(AppEvent::TurnStarted {
+            turn: 7,
+            budget_pct: 0.5,
+            remaining: 100,
+        });
+    }
+
+    #[test]
+    fn parity_session_started() {
+        assert_parity(AppEvent::SessionStarted {
+            session_id: "sess-99".into(),
+            task: Some("research".into()),
+        });
+    }
+
+    #[test]
+    fn parity_session_ended() {
+        assert_parity(AppEvent::SessionEnded {
+            session_id: "sess-99".into(),
+            reason: "done".into(),
+        });
+    }
+
+    #[test]
+    fn parity_display_ready() {
+        assert_parity(AppEvent::DisplayReady {
+            display_id: 1,
+            width: 1920,
+            height: 1080,
+        });
+    }
+
+    #[test]
+    fn parity_display_released() {
+        assert_parity(AppEvent::DisplayReleased {
+            display_id: 1,
+            note: Some("user revoked".into()),
+        });
+    }
+
+    #[test]
+    fn parity_display_capture_lost() {
+        assert_parity(AppEvent::DisplayCaptureLost {
+            display_id: 1,
+            reason: "backend_crashed".into(),
+        });
+    }
+
+    #[test]
+    fn parity_recording_started() {
+        assert_parity(AppEvent::RecordingStarted {
+            stream_name: "display-1".into(),
+        });
+    }
+
+    #[test]
+    fn parity_recording_stopped() {
+        assert_parity(AppEvent::RecordingStopped {
+            stream_name: "display-1".into(),
+        });
+    }
+
+    #[test]
+    fn parity_recording_error() {
+        assert_parity(AppEvent::RecordingError {
+            stream_name: "display-1".into(),
+            message: "encoder lost".into(),
+        });
+    }
+
+    #[test]
+    fn parity_round_complete() {
+        assert_parity(AppEvent::RoundComplete {
+            round: 3,
+            turns_in_round: 7,
+        });
+    }
+
+    #[test]
+    fn parity_human_response_sent() {
+        assert_parity(AppEvent::HumanResponseSent);
+    }
+
+    #[test]
+    fn parity_safety_cap_reached() {
+        assert_parity(AppEvent::SafetyCapReached);
+    }
+
+    #[test]
+    fn parity_context_management() {
+        assert_parity(AppEvent::ContextManagement { turn: 5 });
+    }
+
+    #[test]
+    fn parity_budget_warning() {
+        assert_parity(AppEvent::BudgetWarning {
+            pct: 12.5,
+            remaining: 1000,
+        });
+    }
+
+    #[test]
+    fn parity_budget_exhausted() {
+        assert_parity(AppEvent::BudgetExhausted { remaining: 0 });
+    }
+
+    #[test]
+    fn parity_external_agent_changed() {
+        assert_parity(AppEvent::ExternalAgentChanged {
+            agent: Some("codex".into()),
+        });
+    }
+
+    #[test]
+    fn parity_log_entry() {
+        assert_parity(AppEvent::LogEntry {
+            level: "warn".into(),
+            source: "presence".into(),
+            content: "something funny".into(),
+            turn: Some(3),
+        });
+    }
+
+    #[test]
+    fn parity_loop_error() {
+        assert_parity(AppEvent::LoopError("kaboom".to_string()));
+    }
+
+    // -------------------------------------------------------------------
+    // Documented drift — intentional information loss in the wire path.
+    // These cases are NOT bugs; they're the wire protocol's documented
+    // lossy projections. Each test captures the specific loss so a
+    // future refactor that accidentally widens the drift trips one of
+    // them.
+    // -------------------------------------------------------------------
+
+    /// `ModelResponse` emits Message + Usage on the app path, but on
+    /// the wire path usage travels separately as `OutboundEvent::Usage`.
+    /// Parity holds only on the Message prefix; Usage is verified
+    /// separately to belong to the main-path output.
+    #[test]
+    fn drift_model_response_usage_is_separated_on_wire() {
+        let app_event = AppEvent::ModelResponse {
+            turn: 1,
+            content: "Hello world".into(),
+            usage: crate::provider::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+                cached_tokens: 2,
+            },
+            reasoning: None,
+            source: None,
+        };
+        let mut app_upcaster = AppEventUpcaster::new();
+        let path_a = app_upcaster.upcast(&app_event);
+        // Path A: Message + Usage (2 events).
+        assert_eq!(path_a.len(), 2);
+        assert!(matches!(&path_a[0], PeerEvent::Message { .. }));
+        assert!(matches!(&path_a[1], PeerEvent::Usage { .. }));
+
+        let outbound =
+            crate::event::app_event_to_outbound(&app_event).expect("ModelResponse maps");
+        let mut wire_upcaster = WireEventUpcaster::new();
+        let path_b = wire_upcaster.upcast(&outbound);
+        // Path B: just Message — usage arrives in a separate event.
+        assert_eq!(path_b.len(), 1);
+        assert!(matches!(&path_b[0], PeerEvent::Message { .. }));
+        // The Message content should still agree between the two.
+        let a_msg = normalize(&path_a[..1]);
+        let b_msg = normalize(&path_b[..1]);
+        assert_eq!(
+            a_msg, b_msg,
+            "Message half of ModelResponse must agree across paths"
+        );
+    }
+
+    /// `ApprovalRequired` loses its `ActionCategory` field on the wire
+    /// — the wire format only carries `id` + `command`. The wire
+    /// path fills in `"command_exec"` as the default category. Path A
+    /// preserves the actual category (e.g. "file_delete").
+    #[test]
+    fn drift_approval_required_category_is_dropped_on_wire() {
+        let app_event = AppEvent::ApprovalRequired {
+            id: 42,
+            command_preview: "rm -rf /tmp/foo".into(),
+            category: crate::autonomy::ActionCategory::FileDelete,
+        };
+        let mut app_upcaster = AppEventUpcaster::new();
+        let path_a = app_upcaster.upcast(&app_event);
+        let category_a = match &path_a[0] {
+            PeerEvent::ApprovalRequested { request } => request.category.clone(),
+            _ => panic!("expected ApprovalRequested"),
+        };
+        assert_eq!(category_a, "file_delete");
+
+        let outbound =
+            crate::event::app_event_to_outbound(&app_event).expect("ApprovalRequired maps");
+        let mut wire_upcaster = WireEventUpcaster::new();
+        let path_b = wire_upcaster.upcast(&outbound);
+        let category_b = match &path_b[0] {
+            PeerEvent::ApprovalRequested { request } => request.category.clone(),
+            _ => panic!("expected ApprovalRequested"),
+        };
+        assert_eq!(
+            category_b, "command_exec",
+            "wire path uses default category because ActionCategory isn't on the wire"
+        );
+    }
+
+    /// `UserDisplayGranted` loses its `display_id` field on the wire
+    /// — `OutboundEvent::UserDisplayGranted` has no fields at all.
+    #[test]
+    fn drift_user_display_granted_loses_display_id_on_wire() {
+        let app_event = AppEvent::UserDisplayGranted { display_id: 99 };
+        let mut app_upcaster = AppEventUpcaster::new();
+        let path_a = app_upcaster.upcast(&app_event);
+        let msg_a = match &path_a[0] {
+            PeerEvent::Log { message, .. } => message.clone(),
+            _ => panic!("expected Log"),
+        };
+        assert!(
+            msg_a.contains("99"),
+            "app path preserves display_id in log: {msg_a}"
+        );
+
+        let outbound =
+            crate::event::app_event_to_outbound(&app_event).expect("UserDisplayGranted maps");
+        let mut wire_upcaster = WireEventUpcaster::new();
+        let path_b = wire_upcaster.upcast(&outbound);
+        let msg_b = match &path_b[0] {
+            PeerEvent::Log { message, .. } => message.clone(),
+            _ => panic!("expected Log"),
+        };
+        assert!(
+            !msg_b.contains("99"),
+            "wire path cannot include display_id because wire variant has no fields: {msg_b}"
+        );
+    }
+
+    /// `OrchestratorProgress` loses `turn` and `last_action` on the
+    /// wire — the wire format only carries `status`.
+    #[test]
+    fn drift_orchestrator_progress_loses_turn_and_last_action() {
+        let app_event = AppEvent::OrchestratorProgress {
+            turn: 5,
+            status: "analyzing".into(),
+            last_action: "parsed response".into(),
+        };
+        let mut app_upcaster = AppEventUpcaster::new();
+        let path_a = app_upcaster.upcast(&app_event);
+        let text_a = match &path_a[0] {
+            PeerEvent::ActivityProgress { text, .. } => text.clone().unwrap_or_default(),
+            _ => panic!("expected ActivityProgress"),
+        };
+        assert!(text_a.contains("analyzing") && text_a.contains("parsed response"));
+
+        let outbound = crate::event::app_event_to_outbound(&app_event)
+            .expect("OrchestratorProgress maps");
+        let mut wire_upcaster = WireEventUpcaster::new();
+        let path_b = wire_upcaster.upcast(&outbound);
+        let text_b = match &path_b[0] {
+            PeerEvent::ActivityProgress { text, .. } => text.clone().unwrap_or_default(),
+            _ => panic!("expected ActivityProgress"),
+        };
+        assert_eq!(
+            text_b, "analyzing",
+            "wire path has only `status`, loses `last_action`"
+        );
     }
 }
