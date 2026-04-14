@@ -1,4 +1,5 @@
 mod agent_runner;
+mod approval;
 mod autonomy;
 mod computer_use;
 mod control;
@@ -17,6 +18,7 @@ mod live_audio;
 mod live_audio_types;
 mod mcp;
 mod mcp_client;
+mod peer;
 mod platform;
 mod presence;
 mod project;

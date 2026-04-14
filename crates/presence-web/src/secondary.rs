@@ -7,9 +7,10 @@
 //! interleave activity, aggregate stats, etc. Secondaries never send
 //! anything except an initial `presence_connect` for bootstrap state.
 //!
-//! Each secondary is keyed by a `host_id` (derived from the daemon's
-//! `host_label` in `/config`) so the JS side can route events back to
-//! per-host DOM elements without a protocol change.
+//! Each secondary is keyed by a `host_id` — the JS layer derives it
+//! from the remote's Agent Card at `/.well-known/agent-card.json`
+//! (typically the card's `label` field) so the JS side can route
+//! events back to per-host DOM elements without a protocol change.
 
 use std::cell::RefCell;
 use std::rc::Rc;

@@ -164,7 +164,16 @@ pub struct VoiceDebugState {
     pub last_voice_log: String,
 }
 
-/// Configuration sent to the web frontend via `/config`.
+/// Voice + WebRTC runtime config sent to the web frontend via `/config`.
+///
+/// Scoped to *runtime config only* — the voice provider, the active
+/// model, audio sample rates, and WebRTC ICE servers. Identity-shaped
+/// fields (host label, version, git sha) moved out of `/config` and
+/// into the Agent Card served at `/.well-known/agent-card.json`: see
+/// [`crate::peer::AgentCard`] and [`crate::peer::AgentCard::local_intendant`].
+/// That's the single source of truth for who this daemon is and what
+/// it can do, and keeping `/config` narrow makes it less likely that
+/// future runtime config additions re-blur the boundary.
 #[derive(Clone, Debug, Serialize)]
 pub struct WebGatewayConfig {
     pub provider: String,
@@ -185,22 +194,6 @@ pub struct WebGatewayConfig {
     /// config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webrtc_tcp_port: Option<u16>,
-    /// Stable identity label for this daemon. Resolved at startup from
-    /// the `host_label` file in the LAN cert dir (written by `intendant
-    /// lan setup --name …`) or falls back to the system hostname. Used
-    /// by the multi-host dashboard to tag events with their source.
-    #[serde(default)]
-    pub host_label: String,
-    /// Cargo package version (from `CARGO_PKG_VERSION`). Human-readable.
-    #[serde(default)]
-    pub version: String,
-    /// Short git commit SHA the binary was built from (from the
-    /// `INTENDANT_GIT_SHA` env var emitted by build.rs). The multi-host
-    /// dashboard compares this against each secondary's sha and shows
-    /// a yellow warning dot when they don't match, so version skew
-    /// across daemons is visible instead of silently causing confusion.
-    #[serde(default)]
-    pub git_sha: String,
 }
 
 impl Default for WebGatewayConfig {
@@ -213,16 +206,15 @@ impl Default for WebGatewayConfig {
             transcription_enabled: false,
             ice_servers: Vec::new(),
             webrtc_tcp_port: None,
-            host_label: String::new(),
-            version: String::new(),
-            git_sha: String::new(),
         }
     }
 }
 
 /// Spawn the web gateway HTTP/WebSocket server.
 ///
-/// - `GET /config` returns a JSON `WebGatewayConfig`.
+/// - `GET /config` returns a JSON `WebGatewayConfig` (voice/runtime only).
+/// - `GET /.well-known/agent-card.json` returns a JSON `AgentCard` with
+///   this daemon's identity, capabilities, transports, and auth scheme.
 /// - `GET /` (and any other path) returns the web TUI page.
 /// - WebSocket connections are bridged to the EventBus (inbound control
 ///   messages) and broadcast channel (outbound events), mirroring the
@@ -1165,6 +1157,18 @@ pub fn spawn_web_gateway(
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
+    // Build the local Agent Card from live runtime state so
+    // `/.well-known/agent-card.json` can serve it. The transport URL
+    // comes from [`resolve_advertise_url`], which replaces a wildcard
+    // bind address (0.0.0.0 / ::) with the resolved host label so
+    // remote peers get a dialable URL. A specific bind address is
+    // used as-is. LAN-aware URL resolution (nginx mTLS proxy URL,
+    // Tailscale) is a separate layer and lands in a later pass.
+    let transport_url = resolve_advertise_url(listener.local_addr().ok());
+    let agent_card = build_local_agent_card(transport_url);
+    let agent_card_json =
+        serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
+
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
     let ice_config = crate::display::IceConfig {
         ice_servers: config.ice_servers.clone(),
@@ -1368,6 +1372,7 @@ pub fn spawn_web_gateway(
             let bus = bus.clone();
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
+            let agent_card_json = agent_card_json.clone();
             let ice_config = ice_config.clone();
             let tcp_peer_registry = Arc::clone(&tcp_peer_registry);
             let tcp_advertised_port = tcp_advertised_port;
@@ -3728,6 +3733,12 @@ pub fn spawn_web_gateway(
                             ("application/javascript", WASM_WEB_JS.to_string(), "no-cache, must-revalidate")
                         } else if request_line.contains("/audio-processor.js") {
                             ("application/javascript", AUDIO_PROCESSOR_JS.to_string(), "no-cache")
+                        } else if request_line.contains("/.well-known/agent-card.json") {
+                            // Canonical peer identity + capability surface.
+                            // Served alongside /config so the browser and
+                            // federated peers can discover who this daemon
+                            // is without parsing the voice-runtime config.
+                            ("application/json", agent_card_json.clone(), "no-cache")
                         } else if request_line.contains("/config") {
                             ("application/json", config_json.clone(), "no-cache")
                         } else {
@@ -3736,10 +3747,10 @@ pub fn spawn_web_gateway(
                         };
 
                         // CORS: allow the multi-host dashboard to
-                        // `fetch()` /config on this daemon from a page
-                        // served by a sibling daemon (cross-origin).
-                        // `*` works because our fetches don't send
-                        // credentials (see fetchRemoteHostLabel).
+                        // `fetch()` /config and /.well-known/agent-card.json
+                        // on this daemon from a page served by a sibling
+                        // daemon (cross-origin). `*` works because our
+                        // fetches don't send credentials.
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: {}\r\n\
@@ -3766,8 +3777,10 @@ pub fn spawn_web_gateway(
 /// Build a `WebGatewayConfig` from the presence config's live fields,
 /// falling back to environment variable detection.
 ///
-/// Stamps the resolved host label on the returned config so every path
-/// (including the three call sites in `main.rs`) gets it automatically.
+/// Returns voice/runtime fields only. Daemon identity (host label,
+/// version, git sha) lives on the Agent Card at
+/// `/.well-known/agent-card.json` and is assembled at gateway spawn
+/// time via [`build_local_agent_card`].
 pub fn build_config(
     live_provider: Option<&str>,
     live_model: Option<&str>,
@@ -3781,10 +3794,80 @@ pub fn build_config(
         ice_config.ice_servers,
     );
     cfg.webrtc_tcp_port = ice_config.tcp_port;
-    cfg.host_label = crate::lan::resolve_host_label();
-    cfg.version = env!("CARGO_PKG_VERSION").to_string();
-    cfg.git_sha = env!("INTENDANT_GIT_SHA").to_string();
     cfg
+}
+
+/// Resolve the WebSocket URL to advertise in the Agent Card for
+/// this daemon.
+///
+/// When the listener is bound to a wildcard address (0.0.0.0 or ::),
+/// a remote peer cannot dial that URL — wildcards name "every
+/// interface I'm listening on", not a reachable endpoint. In that
+/// case we substitute [`crate::lan::resolve_host_label`] as the
+/// hostname, which gives a real label (system hostname or
+/// `intendant lan setup --name …`) that resolves via mDNS on a
+/// trusted LAN.
+///
+/// When the listener has a specific bind address (127.0.0.1, or a
+/// real LAN IP the operator chose explicitly), that address is used
+/// as-is — we trust the operator knows why they picked it.
+///
+/// If `local_addr` is `None` (shouldn't happen in practice; the
+/// listener is always bound by the time spawn is called), we fall
+/// back to `ws://localhost:0/ws` rather than panicking. The card
+/// is still valid JSON; the transport URL just won't work until
+/// the next daemon restart.
+pub(crate) fn resolve_advertise_url(
+    local_addr: Option<std::net::SocketAddr>,
+) -> String {
+    use std::net::IpAddr;
+    let (host, port) = match local_addr {
+        Some(addr) => {
+            let port = addr.port();
+            match addr.ip() {
+                IpAddr::V4(v4) if v4.is_unspecified() => {
+                    (crate::lan::resolve_host_label(), port)
+                }
+                IpAddr::V6(v6) if v6.is_unspecified() => {
+                    (crate::lan::resolve_host_label(), port)
+                }
+                IpAddr::V6(v6) => (format!("[{v6}]"), port),
+                ip => (ip.to_string(), port),
+            }
+        }
+        None => ("localhost".to_string(), 0),
+    };
+    format!("ws://{host}:{port}/ws")
+}
+
+/// Assemble the [`crate::peer::AgentCard`] for this daemon from live
+/// runtime state.
+///
+/// Called once per `spawn_web_gateway` invocation, right after the
+/// config is serialized — the result is cached as `agent_card_json`
+/// and cloned into each per-connection handler, matching the pattern
+/// used for `/config`.
+///
+/// Capabilities are intentionally conservative in phase 1:
+/// `ComputerUse` and `Knowledge` are always-on subsystems; the
+/// display/voice/phone/recording capabilities are gated on runtime
+/// configuration that isn't plumbed through here yet. Those become
+/// additive as each subsystem teaches itself to advertise.
+///
+/// `transport_url` is the URL other peers should use to connect back
+/// on the native Intendant WebSocket transport. Phase 1 uses the
+/// listener's bound address; LAN-aware URL resolution (nginx mTLS
+/// proxy, Tailscale) comes in a later pass.
+pub fn build_local_agent_card(transport_url: String) -> crate::peer::AgentCard {
+    use crate::peer::{AuthScheme, Capability};
+    crate::peer::AgentCard::local_intendant(
+        crate::lan::resolve_host_label(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        Some(env!("INTENDANT_GIT_SHA").to_string()),
+        transport_url,
+        vec![Capability::ComputerUse, Capability::Knowledge],
+        AuthScheme::None,
+    )
 }
 
 fn build_config_inner(
@@ -3867,6 +3950,77 @@ mod tests {
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
+    }
+
+    /// A specific bind address is preserved verbatim in the
+    /// advertised URL. The operator chose it; we trust them.
+    #[test]
+    fn advertise_url_preserves_specific_bind_address() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let specific = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8765);
+        assert_eq!(
+            resolve_advertise_url(Some(specific)),
+            "ws://127.0.0.1:8765/ws"
+        );
+        let lan_ip = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
+        assert_eq!(
+            resolve_advertise_url(Some(lan_ip)),
+            "ws://192.168.1.42:8765/ws"
+        );
+    }
+
+    /// A wildcard bind (0.0.0.0) is replaced with the resolved host
+    /// label, because 0.0.0.0 isn't a dialable address from a
+    /// remote peer. This is the guard against the production case
+    /// where main.rs binds to 0.0.0.0:8765 and the previous
+    /// implementation was handing out `ws://0.0.0.0:8765/ws` in the
+    /// Agent Card — an unusable URL that the transport-url-is-the-
+    /// listener-addr assumption let slip through localhost-only
+    /// tests.
+    #[test]
+    fn advertise_url_replaces_ipv4_wildcard_with_host_label() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
+        let url = resolve_advertise_url(Some(wildcard));
+        assert!(
+            !url.contains("0.0.0.0"),
+            "wildcard must be replaced: got {url}"
+        );
+        assert!(url.starts_with("ws://"), "scheme preserved: {url}");
+        assert!(url.ends_with(":8765/ws"), "port preserved: {url}");
+        let host = url
+            .strip_prefix("ws://")
+            .and_then(|rest| rest.strip_suffix(":8765/ws"))
+            .expect("url has expected prefix/suffix");
+        assert!(
+            !host.is_empty(),
+            "host must resolve to something non-empty: {url}"
+        );
+    }
+
+    /// Same guard for IPv6 wildcards (::), which have the same
+    /// unreachability problem as 0.0.0.0.
+    #[test]
+    fn advertise_url_replaces_ipv6_wildcard_with_host_label() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let wildcard = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 8765);
+        let url = resolve_advertise_url(Some(wildcard));
+        assert!(
+            !url.contains("::"),
+            "ipv6 wildcard must be replaced: got {url}"
+        );
+        assert!(url.ends_with(":8765/ws"));
+    }
+
+    /// IPv6 specific addresses are bracketed in the URL per RFC 3986
+    /// so a literal address like `::1` doesn't collide with the
+    /// `:port` separator.
+    #[test]
+    fn advertise_url_brackets_specific_ipv6_address() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let specific = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8765);
+        let url = resolve_advertise_url(Some(specific));
+        assert!(url.contains("[::1]"), "ipv6 literal must be bracketed: {url}");
     }
 
     #[test]
@@ -4235,6 +4389,189 @@ mod tests {
         assert!(response_str.contains("200 OK"));
         assert!(response_str.contains("application/json"));
         assert!(response_str.contains("\"provider\":\"openai\""));
+
+        handle.abort();
+    }
+
+    /// `/config` is scoped to voice/runtime config only after the
+    /// AgentCard split. Identity fields (host_label, version, git_sha)
+    /// moved to /.well-known/agent-card.json. This test enforces the
+    /// boundary so a future code change can't reintroduce drift
+    /// between the two by sneaking identity fields back into
+    /// WebGatewayConfig.
+    #[tokio::test]
+    async fn test_config_endpoint_has_no_identity_fields() {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None, None, None, None, None,
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+        )
+        .await;
+
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(response_str.contains("200 OK"));
+
+        // Extract the JSON body (after the header terminator).
+        let body = response_str
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("body after headers");
+        let parsed: serde_json::Value =
+            serde_json::from_str(body).expect("body is JSON");
+        let obj = parsed.as_object().expect("body is an object");
+
+        assert!(obj.contains_key("provider"), "should still have runtime fields");
+        assert!(obj.contains_key("model"));
+        assert!(
+            !obj.contains_key("host_label"),
+            "host_label must live on the agent card, not /config: {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("version"),
+            "version must live on the agent card, not /config: {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("git_sha"),
+            "git_sha must live on the agent card, not /config: {obj:?}"
+        );
+
+        handle.abort();
+    }
+
+    /// `/.well-known/agent-card.json` reflects live daemon state and
+    /// deserializes into an [`crate::peer::AgentCard`] with the
+    /// expected shape. This is the server-side guardrail the user
+    /// asked for — if someone breaks the assembly in
+    /// `build_local_agent_card`, the endpoint round-trip fails here
+    /// before anyone hits it in the browser.
+    #[tokio::test]
+    async fn test_agent_card_endpoint_reflects_live_state() {
+        use crate::peer::{AgentCard, AuthScheme, Capability, TransportSpec};
+
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None, None, None, None, None,
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+        )
+        .await;
+
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.contains("200 OK"),
+            "agent card endpoint should return 200: {response_str}"
+        );
+        assert!(response_str.contains("application/json"));
+
+        let body = response_str
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("body after headers");
+        let card: AgentCard =
+            serde_json::from_str(body).expect("body deserializes as AgentCard");
+
+        // Identity fields must be populated from live state.
+        assert_eq!(
+            card.id.kind(),
+            Some(crate::peer::PeerKind::Intendant),
+            "local daemon must identify as Intendant kind: id = {:?}",
+            card.id
+        );
+        assert!(
+            card.id.as_str().starts_with("intendant:"),
+            "PeerId must have intendant prefix: {}",
+            card.id.as_str()
+        );
+        assert!(
+            !card.label.is_empty(),
+            "label must be resolved from lan::resolve_host_label"
+        );
+        assert_eq!(
+            card.version,
+            env!("CARGO_PKG_VERSION"),
+            "version must come from CARGO_PKG_VERSION"
+        );
+        assert_eq!(
+            card.git_sha.as_deref(),
+            Some(env!("INTENDANT_GIT_SHA")),
+            "git_sha must come from INTENDANT_GIT_SHA"
+        );
+
+        // Transports must advertise at least the native Intendant WS
+        // transport, with a URL that points back at this listener.
+        assert_eq!(card.transports.len(), 1, "expected one transport");
+        let expected_url_prefix = format!("ws://127.0.0.1:{port}");
+        match &card.transports[0] {
+            TransportSpec::IntendantWs { url } => {
+                assert!(
+                    url.starts_with(&expected_url_prefix) && url.ends_with("/ws"),
+                    "transport URL {url} should start with {expected_url_prefix} and end with /ws"
+                );
+            }
+            other => panic!("expected IntendantWs transport, got {other:?}"),
+        }
+
+        // Phase 1 conservative capability set.
+        assert!(
+            card.capabilities.contains(&Capability::ComputerUse),
+            "card should advertise ComputerUse capability: {:?}",
+            card.capabilities
+        );
+        assert!(
+            card.capabilities.contains(&Capability::Knowledge),
+            "card should advertise Knowledge capability: {:?}",
+            card.capabilities
+        );
+
+        // Auth defaults to None in phase 1 (trust the network layer).
+        assert!(
+            matches!(card.auth, AuthScheme::None),
+            "expected AuthScheme::None in phase 1, got {:?}",
+            card.auth
+        );
 
         handle.abort();
     }

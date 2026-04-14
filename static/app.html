@@ -3525,8 +3525,22 @@ let termInitialized = false;
 let termBuffer = [];
 
 // Multi-host: stable identity of the daemon serving this dashboard.
-// Resolved from /config at startup. Used to tag activity entries and
-// drive the Settings "Daemons" panel.
+// Resolved from the Agent Card at startup.
+//
+// `selfPeerId` is the routing key — the full PeerId string from
+// `card.id` (e.g. "intendant:nicks-mac"). Used as the host_id value
+// stored on daemon entries, as the cache key in `hostStatsCache`,
+// and as the self check in every "is this the self entry?" routing
+// site. Two peers sharing a label stay distinct because the
+// PeerId's kind prefix plus the server-assigned label uniqueness
+// make it a stable identifier, and a renamed daemon keeps the same
+// id-format stability.
+//
+// `selfHostLabel` is the display name — the short human-readable
+// label from `card.label`. Used only in UI strings (status bar,
+// dropdown options, row labels). Can change across restarts
+// without affecting routing because the id is the stable key.
+let selfPeerId = 'local';
 let selfHostLabel = 'local';
 let selfGitSha = '';
 let selfVersion = '';
@@ -3547,13 +3561,14 @@ const SESSIONS_FILTER_IDLE_KEY = 'intendant_sessions_filter_idle';
 let activeHostFilter = localStorage.getItem(HOST_FILTER_KEY) || '';
 
 // Multi-host: latest `update_usage` payload per host_id. Primary's
-// payload is stored under selfHostLabel (replaces any earlier 'local'
-// entry once /config resolves). Secondaries store under their own
-// host_id. The Stats host picker reads from this cache on switch so
-// you can inspect any daemon's usage without round-tripping the WS.
+// payload is stored under selfPeerId (replaces any earlier 'local'
+// entry once the Agent Card resolves). Secondaries store under their
+// own host_id (also a PeerId). The Stats host picker reads from this
+// cache on switch so you can inspect any daemon's usage without
+// round-tripping the WS.
 const hostStatsCache = new Map();
 
-// Current Stats tab host selection. Empty string or selfHostLabel → self.
+// Current Stats tab host selection. Empty string or selfPeerId → self.
 let activeStatsHost = '';
 
 // Multi-host: list of configured secondary daemons. Each entry:
@@ -4290,25 +4305,37 @@ async function main() {
   window.__presenceWeb = app;
   app.connect_server(wsUrl);
 
-  // Fetch config for initial provider/model + voice setup
+  // Fetch runtime config (/config) and identity (agent card) in
+  // parallel. /config is voice/WebRTC-scoped now; identity lives on
+  // the Agent Card at /.well-known/agent-card.json — served by every
+  // Intendant daemon as its canonical "who am I" surface. We tolerate
+  // either fetch failing independently so a misconfigured daemon
+  // still gets partial UI rather than a blank dashboard.
   try {
-    const cfg = await fetch('/config').then(r => r.json());
+    const [cfg, card] = await Promise.all([
+      fetch('/config').then(r => r.json()).catch(() => ({})),
+      fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
+    ]);
     gatewayConfig = cfg;
     if (cfg.provider) document.getElementById('sb-provider').textContent = cfg.provider;
     if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
-    // Stable host identity: shown in the status bar so the user always
-    // knows which daemon the dashboard is primarily talking to. Served
-    // from `host_label` (written by `intendant lan setup --name …` or
-    // falls back to the system hostname).
-    if (cfg.host_label) {
-      selfHostLabel = cfg.host_label;
+    if (card && card.id && card.label) {
+      // Stable host identity: shown in the status bar so the user
+      // always knows which daemon the dashboard is primarily talking
+      // to. The card's `label` is the display name; `id` is the full
+      // PeerId (e.g. "intendant:nicks-mac") used as the routing key
+      // throughout the dashboard so two peers with the same label
+      // stay distinct and a renamed daemon keeps the same routing
+      // stability.
+      selfPeerId = card.id;
+      selfHostLabel = card.label;
       const el = document.getElementById('sb-host-label');
-      if (el) el.textContent = cfg.host_label;
+      if (el) el.textContent = card.label;
+      // Version + git SHA are used by the Daemons panel to flag
+      // version skew across multi-host connections.
+      selfVersion = card.version || '';
+      selfGitSha = card.git_sha || '';
     }
-    // Version + git SHA are used by the Daemons panel to flag
-    // version skew across multi-host connections.
-    selfGitSha = cfg.git_sha || '';
-    selfVersion = cfg.version || '';
   } catch {}
 
   // Initialize multi-host state now that self-label is resolved and the
@@ -4459,7 +4486,7 @@ function processCommands(cmds) {
         // rendering path when the picker is on self (or unset) — when
         // the user is viewing a secondary's stats, primary updates
         // silently refresh the cache without stomping the view.
-        hostStatsCache.set(selfHostLabel, c);
+        hostStatsCache.set(selfPeerId, c);
         if (isStatsShowingSelf()) renderUsageTab(c);
         updateTickerFromUsage(c);
         break;
@@ -4521,8 +4548,8 @@ function renderLogEntry(c) {
 
   // Multi-host: tag entry with its source host so the host filter
   // dropdown can hide entries from other hosts. Primary entries get
-  // `selfHostLabel` injected by the caller path in processCommands.
-  const hostId = c.host_id || selfHostLabel;
+  // `selfPeerId` injected by the caller path in processCommands.
+  const hostId = c.host_id || selfPeerId;
   entry.dataset.hostId = hostId;
   if (activeHostFilter && activeHostFilter !== hostId) {
     entry.classList.add('hidden-by-filter');
@@ -8471,17 +8498,21 @@ function baseToWsUrl(baseUrl) {
   return null;
 }
 
-// Fetch the remote daemon's /config to learn its real host_label and
-// version (used for skew detection). Uses default credentials mode so
-// the CORS handshake stays in the simple lane — the server can answer
-// with `Access-Control-Allow-Origin: *` instead of echoing the origin.
-async function fetchRemoteConfig(baseUrl) {
-  const url = baseUrl.trim().replace(/\/$/, '') + '/config';
+// Fetch the remote daemon's Agent Card to learn its identity, version,
+// and capabilities. Used both when adding a new daemon and when
+// refreshing on reconnect so the skew-detection dot reflects what's
+// actually running. Default credentials mode keeps the CORS handshake
+// in the simple lane — the server answers with
+// `Access-Control-Allow-Origin: *` instead of echoing the origin.
+async function fetchRemoteAgentCard(baseUrl) {
+  const url = baseUrl.trim().replace(/\/$/, '') + '/.well-known/agent-card.json';
   const r = await fetch(url);
   if (!r.ok) throw new Error(`fetch ${url} → ${r.status}`);
-  const cfg = await r.json();
-  if (!cfg.host_label) throw new Error('remote /config missing host_label');
-  return cfg;
+  const card = await r.json();
+  if (!card.label || !card.id) {
+    throw new Error('remote agent card missing id/label');
+  }
+  return card;
 }
 
 function renderDaemonsList() {
@@ -8490,8 +8521,9 @@ function renderDaemonsList() {
 
   const rows = [];
   // Self entry first — always present, can't be removed.
+  // host_id is the stable PeerId routing key; label is the display name.
   rows.push(renderDaemonRow({
-    host_id: selfHostLabel,
+    host_id: selfPeerId,
     label: selfHostLabel,
     url: location.origin,
     connected: true,
@@ -8643,9 +8675,9 @@ async function addDaemon() {
 
   setDaemonsStatus('Connecting...', '');
 
-  let cfg;
+  let card;
   try {
-    cfg = await fetchRemoteConfig(baseUrl);
+    card = await fetchRemoteAgentCard(baseUrl);
   } catch (e) {
     const hint = baseUrl.startsWith('https://')
       ? 'Is the mTLS client cert for this daemon installed in this browser?'
@@ -8654,19 +8686,25 @@ async function addDaemon() {
     return;
   }
 
-  const hostLabel = cfg.host_label;
-  if (hostLabel === selfHostLabel || daemons.some(d => d.host_id === hostLabel)) {
+  // Routing key = card.id (stable PeerId, includes kind prefix).
+  // Display = card.label (short human-readable name, can change
+  // across daemon restarts without breaking routing). Uniqueness
+  // check compares the ids, not the labels, so two peers with the
+  // same label stay distinct in the registry.
+  const peerId = card.id;
+  const hostLabel = card.label;
+  if (peerId === selfPeerId || daemons.some(d => d.host_id === peerId)) {
     setDaemonsStatus(`Daemon '${hostLabel}' is already in the list`, 'error');
     return;
   }
 
   const entry = {
-    host_id: hostLabel,
+    host_id: peerId,
     label: userLabel || hostLabel,
     url: baseUrl,
     connected: false,
-    version: cfg.version || '',
-    git_sha: cfg.git_sha || '',
+    version: card.version || '',
+    git_sha: card.git_sha || '',
   };
   daemons.push(entry);
   saveDaemonsToStorage();
@@ -8725,15 +8763,15 @@ function handleSecondaryState(hostId, connected) {
   d.connected = connected;
   renderDaemonsList();
 
-  // On (re)connect, refresh the remote's /config so the version
+  // On (re)connect, refresh the remote's agent card so the version
   // string and skew dot reflect what's actually running right now.
   // Without this, rebuilding the remote daemon fixes skew but the
   // dashboard still shows yellow until you re-add it manually.
   if (connected && !wasConnected) {
-    fetchRemoteConfig(d.url)
-      .then(cfg => {
-        d.version = cfg.version || '';
-        d.git_sha = cfg.git_sha || '';
+    fetchRemoteAgentCard(d.url)
+      .then(card => {
+        d.version = card.version || '';
+        d.git_sha = card.git_sha || '';
         renderDaemonsList();
       })
       .catch(() => { /* silently leave old version on failure */ });
@@ -8807,7 +8845,7 @@ function refreshHostFilterOptions() {
     return;
   }
 
-  const seen = new Set([selfHostLabel, ...daemons.map(d => d.host_id)]);
+  const seen = new Set([selfPeerId, ...daemons.map(d => d.host_id)]);
   sel.innerHTML = '';
   const all = document.createElement('option');
   all.value = '';
@@ -8836,7 +8874,7 @@ function applyHostFilter() {
   const stream = document.getElementById('log-stream');
   if (!stream) return;
   for (const entry of stream.querySelectorAll('.log-entry')) {
-    const hostId = entry.dataset.hostId || selfHostLabel;
+    const hostId = entry.dataset.hostId || selfPeerId;
     entry.classList.toggle(
       'hidden-by-filter',
       !!activeHostFilter && activeHostFilter !== hostId,
@@ -8853,7 +8891,7 @@ function applyHostFilter() {
 // is instant from cache.
 
 function isStatsShowingSelf() {
-  return !activeStatsHost || activeStatsHost === selfHostLabel;
+  return !activeStatsHost || activeStatsHost === selfPeerId;
 }
 
 function refreshStatsHostPicker() {
@@ -8906,7 +8944,7 @@ function switchStatsHost(hostId) {
 // a display pipeline event stream, not an HTTP fetch, and the
 // secondary WS forwards them but we don't have per-host DOM targets.
 function renderStatsForActiveHost() {
-  const key = activeStatsHost || selfHostLabel;
+  const key = activeStatsHost || selfPeerId;
   const cached = hostStatsCache.get(key);
   if (cached) {
     renderUsageTab(cached);
@@ -9149,7 +9187,7 @@ let allSessionsUsageLoaded = false;
 
 // Per-host cache of the last `/api/sessions` response so switching
 // between hosts in the Stats picker is instant after first fetch.
-// Keyed by host_id; the primary is cached under selfHostLabel.
+// Keyed by host_id; the primary is cached under selfPeerId.
 const sessionsListCache = new Map();
 
 // Load and render the "All Sessions" + "Disk Usage" cards for a
@@ -9158,9 +9196,9 @@ const sessionsListCache = new Map();
 // means the browser needs CORS on the remote's /api/sessions (we set
 // `Access-Control-Allow-Origin: *` on that endpoint in web_gateway.rs)
 // and, for HTTPS primaries, the remote must also be HTTPS because of
-// mixed content. Those are the same rules as for /config on add.
+// mixed content. Same rules as fetching the remote's agent card on add.
 function loadAllSessionsUsage(hostId) {
-  hostId = hostId || selfHostLabel;
+  hostId = hostId || selfPeerId;
   const cached = sessionsListCache.get(hostId);
   if (cached) {
     renderAllSessionsUsage(cached);
@@ -9169,7 +9207,7 @@ function loadAllSessionsUsage(hostId) {
   }
 
   let baseUrl = '';
-  if (hostId !== selfHostLabel) {
+  if (hostId !== selfPeerId) {
     const d = daemons.find(x => x.host_id === hostId);
     if (!d) return;
     baseUrl = d.url.replace(/\/$/, '');
@@ -9183,7 +9221,7 @@ function loadAllSessionsUsage(hostId) {
       // Only render if the user is still viewing this host. A slow
       // fetch that finishes after the user switched away would
       // otherwise stomp the current view.
-      const currentHost = activeStatsHost || selfHostLabel;
+      const currentHost = activeStatsHost || selfPeerId;
       if (currentHost === hostId) {
         renderAllSessionsUsage(sessions);
         renderDiskUsage(sessions);

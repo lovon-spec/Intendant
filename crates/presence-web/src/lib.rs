@@ -66,9 +66,12 @@ pub struct PresenceWeb {
     callbacks: Rc<Callbacks>,
     server: RefCell<server::ServerConnection>,
     /// Read-only WebSocket connections to secondary daemons for the
-    /// multi-host dashboard, keyed by the daemon's `host_id` (its
-    /// `host_label` from `/config`). Each connection forwards received
-    /// messages to JS via `on_secondary_event` for host-scoped rendering.
+    /// multi-host dashboard, keyed by the daemon's `host_id`. JS
+    /// derives the host_id from the remote's Agent Card (fetched from
+    /// `/.well-known/agent-card.json`) and passes it in via
+    /// `add_secondary_host`. Each connection forwards received
+    /// messages to JS via `on_secondary_event` for host-scoped
+    /// rendering.
     secondary_conns: RefCell<std::collections::HashMap<String, secondary::SecondaryConnection>>,
     /// Per-host dashboard state for each secondary. Events from
     /// secondaries are fed through their matching `AppState::handle_message`
