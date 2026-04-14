@@ -27,6 +27,46 @@
 use crate::peer::id::PeerId;
 use serde::{Deserialize, Serialize};
 
+impl AgentCard {
+    /// Construct an `AgentCard` for the local Intendant daemon from
+    /// resolved runtime state. Centralizes the "this is me" assembly
+    /// so `web_gateway::spawn_web_gateway` doesn't reinvent the
+    /// shape of the card at its only call site.
+    ///
+    /// `label` should come from [`crate::lan::resolve_host_label`],
+    /// `version` from `env!("CARGO_PKG_VERSION")`, and `git_sha` from
+    /// `env!("INTENDANT_GIT_SHA")` (wrapped in `Some` — it's a
+    /// build-time constant in Intendant). `transport_url` is the URL
+    /// peers should connect to for the native Intendant WebSocket
+    /// transport (e.g. `ws://127.0.0.1:8765/ws`). `capabilities` is
+    /// the set of services this daemon actually exposes at runtime —
+    /// compute it from feature flags and configured subsystems, not
+    /// as a static maximum.
+    ///
+    /// Auth defaults to [`AuthScheme::None`] (trust-the-network) unless
+    /// the caller opts into a stricter scheme; the LAN mTLS case is
+    /// handled at the nginx proxy layer above the gateway and doesn't
+    /// need a runtime flag here yet.
+    pub fn local_intendant(
+        label: String,
+        version: String,
+        git_sha: Option<String>,
+        transport_url: String,
+        capabilities: Vec<Capability>,
+        auth: AuthScheme,
+    ) -> Self {
+        Self {
+            id: PeerId::new(crate::peer::id::PeerKind::Intendant, &label),
+            label,
+            version,
+            git_sha,
+            transports: vec![TransportSpec::IntendantWs { url: transport_url }],
+            capabilities,
+            auth,
+        }
+    }
+}
+
 /// Identity + capability + transport descriptor for one peer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentCard {

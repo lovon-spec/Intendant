@@ -4290,25 +4290,33 @@ async function main() {
   window.__presenceWeb = app;
   app.connect_server(wsUrl);
 
-  // Fetch config for initial provider/model + voice setup
+  // Fetch runtime config (/config) and identity (agent card) in
+  // parallel. /config is voice/WebRTC-scoped now; identity lives on
+  // the Agent Card at /.well-known/agent-card.json — served by every
+  // Intendant daemon as its canonical "who am I" surface. We tolerate
+  // either fetch failing independently so a misconfigured daemon
+  // still gets partial UI rather than a blank dashboard.
   try {
-    const cfg = await fetch('/config').then(r => r.json());
+    const [cfg, card] = await Promise.all([
+      fetch('/config').then(r => r.json()).catch(() => ({})),
+      fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
+    ]);
     gatewayConfig = cfg;
     if (cfg.provider) document.getElementById('sb-provider').textContent = cfg.provider;
     if (cfg.model) document.getElementById('sb-model').textContent = cfg.model;
-    // Stable host identity: shown in the status bar so the user always
-    // knows which daemon the dashboard is primarily talking to. Served
-    // from `host_label` (written by `intendant lan setup --name …` or
-    // falls back to the system hostname).
-    if (cfg.host_label) {
-      selfHostLabel = cfg.host_label;
+    if (card && card.label) {
+      // Stable host identity: shown in the status bar so the user
+      // always knows which daemon the dashboard is primarily talking
+      // to. The card's `label` is the display name; `id` is the full
+      // PeerId (e.g. "intendant:nicks-mac") used by the registry layer.
+      selfHostLabel = card.label;
       const el = document.getElementById('sb-host-label');
-      if (el) el.textContent = cfg.host_label;
+      if (el) el.textContent = card.label;
+      // Version + git SHA are used by the Daemons panel to flag
+      // version skew across multi-host connections.
+      selfVersion = card.version || '';
+      selfGitSha = card.git_sha || '';
     }
-    // Version + git SHA are used by the Daemons panel to flag
-    // version skew across multi-host connections.
-    selfGitSha = cfg.git_sha || '';
-    selfVersion = cfg.version || '';
   } catch {}
 
   // Initialize multi-host state now that self-label is resolved and the
@@ -8471,17 +8479,21 @@ function baseToWsUrl(baseUrl) {
   return null;
 }
 
-// Fetch the remote daemon's /config to learn its real host_label and
-// version (used for skew detection). Uses default credentials mode so
-// the CORS handshake stays in the simple lane — the server can answer
-// with `Access-Control-Allow-Origin: *` instead of echoing the origin.
-async function fetchRemoteConfig(baseUrl) {
-  const url = baseUrl.trim().replace(/\/$/, '') + '/config';
+// Fetch the remote daemon's Agent Card to learn its identity, version,
+// and capabilities. Used both when adding a new daemon and when
+// refreshing on reconnect so the skew-detection dot reflects what's
+// actually running. Default credentials mode keeps the CORS handshake
+// in the simple lane — the server answers with
+// `Access-Control-Allow-Origin: *` instead of echoing the origin.
+async function fetchRemoteAgentCard(baseUrl) {
+  const url = baseUrl.trim().replace(/\/$/, '') + '/.well-known/agent-card.json';
   const r = await fetch(url);
   if (!r.ok) throw new Error(`fetch ${url} → ${r.status}`);
-  const cfg = await r.json();
-  if (!cfg.host_label) throw new Error('remote /config missing host_label');
-  return cfg;
+  const card = await r.json();
+  if (!card.label || !card.id) {
+    throw new Error('remote agent card missing id/label');
+  }
+  return card;
 }
 
 function renderDaemonsList() {
@@ -8643,9 +8655,9 @@ async function addDaemon() {
 
   setDaemonsStatus('Connecting...', '');
 
-  let cfg;
+  let card;
   try {
-    cfg = await fetchRemoteConfig(baseUrl);
+    card = await fetchRemoteAgentCard(baseUrl);
   } catch (e) {
     const hint = baseUrl.startsWith('https://')
       ? 'Is the mTLS client cert for this daemon installed in this browser?'
@@ -8654,7 +8666,7 @@ async function addDaemon() {
     return;
   }
 
-  const hostLabel = cfg.host_label;
+  const hostLabel = card.label;
   if (hostLabel === selfHostLabel || daemons.some(d => d.host_id === hostLabel)) {
     setDaemonsStatus(`Daemon '${hostLabel}' is already in the list`, 'error');
     return;
@@ -8665,8 +8677,8 @@ async function addDaemon() {
     label: userLabel || hostLabel,
     url: baseUrl,
     connected: false,
-    version: cfg.version || '',
-    git_sha: cfg.git_sha || '',
+    version: card.version || '',
+    git_sha: card.git_sha || '',
   };
   daemons.push(entry);
   saveDaemonsToStorage();
@@ -8725,15 +8737,15 @@ function handleSecondaryState(hostId, connected) {
   d.connected = connected;
   renderDaemonsList();
 
-  // On (re)connect, refresh the remote's /config so the version
+  // On (re)connect, refresh the remote's agent card so the version
   // string and skew dot reflect what's actually running right now.
   // Without this, rebuilding the remote daemon fixes skew but the
   // dashboard still shows yellow until you re-add it manually.
   if (connected && !wasConnected) {
-    fetchRemoteConfig(d.url)
-      .then(cfg => {
-        d.version = cfg.version || '';
-        d.git_sha = cfg.git_sha || '';
+    fetchRemoteAgentCard(d.url)
+      .then(card => {
+        d.version = card.version || '';
+        d.git_sha = card.git_sha || '';
         renderDaemonsList();
       })
       .catch(() => { /* silently leave old version on failure */ });
@@ -9158,7 +9170,7 @@ const sessionsListCache = new Map();
 // means the browser needs CORS on the remote's /api/sessions (we set
 // `Access-Control-Allow-Origin: *` on that endpoint in web_gateway.rs)
 // and, for HTTPS primaries, the remote must also be HTTPS because of
-// mixed content. Those are the same rules as for /config on add.
+// mixed content. Same rules as fetching the remote's agent card on add.
 function loadAllSessionsUsage(hostId) {
   hostId = hostId || selfHostLabel;
   const cached = sessionsListCache.get(hostId);
