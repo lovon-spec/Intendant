@@ -99,6 +99,7 @@ pub mod card;
 pub mod event;
 pub mod handle;
 pub mod id;
+pub mod log_writer;
 pub mod registry;
 pub mod traits;
 pub mod transport;
@@ -117,6 +118,7 @@ pub use handle::{
     EVENTS_CAPACITY,
 };
 pub use id::{PeerId, PeerKind};
+pub use log_writer::{spawn_peer_log_writer, LOG_CHANNEL_CAPACITY};
 pub use registry::PeerRegistry;
 pub use traits::{
     check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures,
