@@ -95,6 +95,7 @@ pub mod event;
 pub mod handle;
 pub mod id;
 pub mod traits;
+pub mod upcast;
 
 pub use card::{
     AgentCard, AuthScheme, Capability, McpTransportKind, OpenClawRole, TransportSpec,
@@ -112,6 +113,7 @@ pub use id::{PeerId, PeerKind};
 pub use traits::{
     check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures,
 };
+pub use upcast::AppEventUpcaster;
 
 // ---------------------------------------------------------------------------
 // Errors
