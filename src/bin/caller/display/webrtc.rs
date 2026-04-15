@@ -38,6 +38,7 @@ use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{MediaAdded, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{DatagramRecv, Protocol, Receive};
+use str0m::net::TcpType;
 use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig, RtcError};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -509,7 +510,20 @@ impl WebRtcPeer {
             tcp_conn_rx = Some(rx);
             let fake_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tcp_port);
             tcp_fake_local = Some(fake_local);
-            match Candidate::host(fake_local, "tcp") {
+            // RFC 6544 requires TCP ICE candidates to carry a `tcptype`
+            // attribute. `Candidate::host(addr, "tcp")` doesn't set it,
+            // and browsers drop TCP candidates that lack it — that was
+            // the reason the reporter's Firefox never opened a TCP
+            // connection despite our advertising the loopback address.
+            // The builder lets us set `tcptype: passive`, which means
+            // "the remote actively opens the TCP connection to us" and
+            // is the correct role for a server-side host candidate.
+            match Candidate::builder()
+                .tcp()
+                .host(fake_local)
+                .tcptype(TcpType::Passive)
+                .build()
+            {
                 Ok(c) => {
                     rtc.add_local_candidate(c);
                 }
@@ -532,6 +546,12 @@ impl WebRtcPeer {
             .accept_offer(offer)
             .map_err(|e| CallerError::WebRtc(format!("accept offer: {e}")))?;
         let answer_sdp = answer.to_sdp_string();
+        // Dump every a=candidate line from the answer so we can see exactly
+        // what str0m emitted — this is the fastest way to diagnose
+        // "browser never tries to connect to the TCP candidate" symptoms.
+        for line in answer_sdp.lines().filter(|l| l.starts_with("a=candidate:")) {
+            eprintln!("[display/webrtc] peer {peer_id}: answer {line}");
+        }
 
         // --- Spawn the driver --------------------------------------------
         let (encoded_frame_tx, encoded_frame_rx) =
