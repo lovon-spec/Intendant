@@ -150,11 +150,17 @@ impl TcpPeerRegistry {
             "first frame is not a STUN binding request with USERNAME".to_string()
         })?;
 
-        // USERNAME format for ICE is "remote_ufrag:local_ufrag". The local
-        // side is us; that's what we demux on.
+        // Per RFC 8445 §7.2.2, the STUN USERNAME attribute for an ICE
+        // connectivity check sent from A to B is formatted as
+        // `<B_ufrag>:<A_ufrag>` — target peer's ufrag first, sender's
+        // ufrag second. When a browser → server request arrives at the
+        // server, the FIRST segment is the server's ufrag (us, the
+        // demux key) and the second is the browser's ufrag (which we
+        // don't care about here). Getting this backwards makes every
+        // incoming TCP connection fail routing lookup.
         let local_ufrag = username
             .split_once(':')
-            .map(|(_, local)| local.to_string())
+            .map(|(target, _sender)| target.to_string())
             .ok_or_else(|| format!("bad USERNAME format: {username:?}"))?;
 
         let tx = {
