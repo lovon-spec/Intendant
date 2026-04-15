@@ -1,0 +1,98 @@
+//! Tee the controller's stderr and stdout to a session-scoped
+//! `daemon.log` file while still mirroring output to the original
+//! terminal.
+//!
+//! Used by the "Download session report" button in Settings → Debug:
+//! the generated zip contains `daemon.log` so controller output
+//! (eprintln!, panics, tracing) travels with the rest of the session
+//! artifacts when a tester sends a bundle back to the dev.
+//!
+//! Callers must only invoke [`install`] once per process, and only
+//! when the controller does NOT own a real interactive TTY (ratatui
+//! writes escape sequences to stdout, so redirecting it through a
+//! pipe would break the interactive TUI).
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io;
+#[cfg(unix)]
+use std::os::fd::{IntoRawFd, RawFd};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::thread;
+
+#[cfg(unix)]
+pub fn install(path: &Path) -> io::Result<()> {
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let file_fd_stderr = file.into_raw_fd();
+    let file_fd_stdout = unsafe { libc::dup(file_fd_stderr) };
+    if file_fd_stdout < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    tee_fd(libc::STDERR_FILENO, file_fd_stderr)?;
+    tee_fd(libc::STDOUT_FILENO, file_fd_stdout)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn install(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tee_fd(target_fd: RawFd, file_fd: RawFd) -> io::Result<()> {
+    // Preserve a handle to the original terminal so the background
+    // thread can still mirror output there.
+    let orig_fd = unsafe { libc::dup(target_fd) };
+    if orig_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut pipe_fds = [0i32; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } < 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(orig_fd);
+        }
+        return Err(err);
+    }
+    let pipe_read = pipe_fds[0];
+    let pipe_write = pipe_fds[1];
+
+    if unsafe { libc::dup2(pipe_write, target_fd) } < 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+            libc::close(orig_fd);
+        }
+        return Err(err);
+    }
+    unsafe {
+        libc::close(pipe_write);
+    }
+
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n =
+                unsafe { libc::read(pipe_read, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let len = n as usize;
+            unsafe {
+                let _ = libc::write(orig_fd, buf.as_ptr() as *const _, len);
+                let _ = libc::write(file_fd, buf.as_ptr() as *const _, len);
+            }
+        }
+        unsafe {
+            libc::close(pipe_read);
+        }
+    });
+
+    Ok(())
+}

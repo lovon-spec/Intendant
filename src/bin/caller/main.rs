@@ -5,6 +5,7 @@ mod computer_use;
 mod control;
 mod control_plane;
 mod conversation;
+mod daemon_log_tee;
 mod debug;
 mod display;
 mod error;
@@ -6363,6 +6364,31 @@ async fn main() -> Result<(), CallerError> {
             Arc::new(Mutex::new(log))
         }
     };
+
+    // Tee controller stderr/stdout into {session_dir}/daemon.log so the
+    // "Download session report" button in Settings → Debug can include
+    // controller-side output (eprintln!, panics, tracing) in the zip
+    // alongside session.jsonl and turn files. Skipped when the
+    // controller owns the real interactive TTY, because ratatui writes
+    // escape sequences to stdout and cannot tolerate a pipe.
+    {
+        let will_use_web = !flags.no_web && !flags.mcp && !flags.json_output;
+        let owns_real_tty = !will_use_web
+            && !flags.no_tui
+            && !flags.mcp
+            && io::stdin().is_terminal()
+            && io::stdout().is_terminal();
+        if !owns_real_tty {
+            let daemon_log_path = log_dir.join("daemon.log");
+            if let Err(e) = daemon_log_tee::install(&daemon_log_path) {
+                eprintln!(
+                    "daemon_log_tee: could not tee stderr/stdout to {}: {}",
+                    daemon_log_path.display(),
+                    e
+                );
+            }
+        }
+    }
 
     // Create shared frame registry for video frame storage.
     let frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>> =
