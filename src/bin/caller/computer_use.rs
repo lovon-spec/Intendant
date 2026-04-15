@@ -295,7 +295,15 @@ pub async fn execute_actions(
     action_counter: &mut u64,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
 ) -> Vec<CuActionResult> {
-    match backend {
+    // Virtual displays are always Xvfb (X11), so use X11 tooling for them
+    // regardless of the host's detected backend. This lets an agent running
+    // on a Wayland host capture its own Xvfb virtual displays with `import`.
+    let effective_backend = match target {
+        DisplayTarget::Virtual { .. } if backend == DisplayBackend::Wayland => DisplayBackend::X11,
+        _ => backend,
+    };
+
+    match effective_backend {
         DisplayBackend::Wayland => {
             if let Some(session) = lookup_display_session(session_registry, &target).await {
                 return execute_via_session(&session, actions, screenshot_dir, action_counter).await;
@@ -303,7 +311,7 @@ pub async fn execute_actions(
             return vec![CuActionResult {
                 success: false,
                 screenshot: None,
-                error: Some("No display session for Wayland target".to_string()),
+                error: Some(no_wayland_session_message(&target)),
             }];
         }
         DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
@@ -314,7 +322,7 @@ pub async fn execute_actions(
 
     for action in actions {
         let result =
-            execute_single(action, &display, backend, screenshot_dir, action_counter).await;
+            execute_single(action, &display, effective_backend, screenshot_dir, action_counter).await;
         if let Some(ref s) = result.screenshot {
             last_screenshot = Some(s.clone());
         }
@@ -326,7 +334,7 @@ pub async fn execute_actions(
         .last()
         .is_some_and(|a| !matches!(a, CuAction::Screenshot));
     if needs_auto_screenshot {
-        let auto = take_screenshot(&display, backend, screenshot_dir, action_counter).await;
+        let auto = take_screenshot(&display, effective_backend, screenshot_dir, action_counter).await;
         match auto {
             Ok(s) => {
                 last_screenshot = Some(s.clone());
@@ -837,6 +845,37 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 
 // ── Wayland: DisplaySession routing ─────────────────────────────────────────
 
+/// Build an actionable error for the "no Wayland session" failure path.
+/// The previous message ("No display session for Wayland target") left callers
+/// with no hint about what's wrong or how to recover, which caused external
+/// agents to retry the same call indefinitely.
+fn no_wayland_session_message(target: &DisplayTarget) -> String {
+    let granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
+    match target {
+        DisplayTarget::UserSession => {
+            if granted {
+                "No active display capture session on Wayland. The screen-sharing \
+                 portal dialog is either pending approval on the physical display \
+                 or was denied. Approve the dialog to enable capture, or target a \
+                 virtual Xvfb display (e.g. display_target=\":99\") instead."
+                    .to_string()
+            } else {
+                "No active display capture session on Wayland. User display access \
+                 has not been granted — call grant_user_display first, then approve \
+                 the screen-sharing portal dialog on the physical display. \
+                 Alternatively, target a virtual Xvfb display (e.g. \
+                 display_target=\":99\")."
+                    .to_string()
+            }
+        }
+        DisplayTarget::Virtual { id } => format!(
+            "No virtual display :{id} is active. Start one with \
+             `Xvfb :{id} -screen 0 1920x1080x24 &` before taking a screenshot, \
+             or target the user session with display_target=\"user_session\"."
+        ),
+    }
+}
+
 /// Look up the `DisplaySession` for the given target from the shared registry.
 async fn lookup_display_session(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
@@ -1320,6 +1359,26 @@ mod tests {
     fn scroll_direction_xdotool() {
         assert_eq!(ScrollDirection::Up.xdotool_button(), "4");
         assert_eq!(ScrollDirection::Down.xdotool_button(), "5");
+    }
+
+    #[test]
+    fn no_wayland_session_message_virtual_target_suggests_xvfb() {
+        let msg = no_wayland_session_message(&DisplayTarget::Virtual { id: 99 });
+        assert!(msg.contains(":99"), "message should mention display number: {}", msg);
+        assert!(msg.contains("Xvfb"), "message should suggest Xvfb: {}", msg);
+    }
+
+    #[test]
+    fn no_wayland_session_message_user_session_mentions_portal() {
+        // Clear env first so the test is deterministic.
+        std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+        let msg = no_wayland_session_message(&DisplayTarget::UserSession);
+        assert!(msg.contains("grant_user_display"), "ungranted message: {}", msg);
+
+        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+        let msg = no_wayland_session_message(&DisplayTarget::UserSession);
+        assert!(msg.contains("portal"), "granted message should mention portal: {}", msg);
+        std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
     }
 
     #[test]

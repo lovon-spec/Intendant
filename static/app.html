@@ -3349,11 +3349,24 @@ html, body {
         <!-- Debug pane: read-only diagnostics -->
         <div class="subtab-pane" id="settings-pane-debug">
           <div class="settings-pane-body">
-            <div id="settings-env-overrides" class="hidden" style="margin:0 0 16px;padding:12px;background:var(--mantle);border-radius:6px">
+            <fieldset class="settings-group">
+              <legend>Session Report</legend>
+              <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
+                Downloads a zip of this session's logs (session.jsonl, turn
+                files, daemon stderr/stdout) for sharing with the dev.
+              </p>
+              <a id="download-session-report-btn"
+                 href="/api/session/current/report"
+                 download
+                 style="display:inline-block;padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);font-weight:600;font-size:13px;text-decoration:none">
+                Download session report
+              </a>
+            </fieldset>
+            <div id="settings-env-overrides" class="hidden" style="margin:16px 0 0;padding:12px;background:var(--mantle);border-radius:6px">
               <h4 style="margin:0 0 8px;color:var(--peach);font-size:13px">Environment Variable Overrides</h4>
               <div id="settings-env-list" style="font-size:12px;color:var(--subtext0)"></div>
             </div>
-            <p id="debug-empty" style="color:var(--subtext0);font-size:12px">
+            <p id="debug-empty" style="color:var(--subtext0);font-size:12px;margin-top:16px">
               No debug overrides active. Set environment variables before launching <code style="color:var(--blue)">intendant --web</code> to see them here.
             </p>
           </div>

@@ -340,6 +340,64 @@ fn asset_version_hash() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Build a zip containing the current session's text artifacts for the
+/// Settings → "Download session report" feature. Includes session.jsonl,
+/// session_meta.json, transcript.jsonl, summary.json, daemon.log,
+/// panic.log, and everything under `turns/`. Excludes `frames/` and
+/// `recordings/` since those can be hundreds of megabytes and are not
+/// needed to diagnose controller-side bugs.
+fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+
+    let buf = Cursor::new(Vec::<u8>::new());
+    let mut zip = zip::ZipWriter::new(buf);
+    let options =
+        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    const FLAT_FILES: &[&str] = &[
+        "session.jsonl",
+        "session_meta.json",
+        "transcript.jsonl",
+        "summary.json",
+        "daemon.log",
+        "panic.log",
+    ];
+
+    for name in FLAT_FILES {
+        let path = session_dir.join(name);
+        if path.is_file() {
+            let data = std::fs::read(&path)?;
+            zip.start_file(*name, options)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            zip.write_all(&data)?;
+        }
+    }
+
+    let turns_dir = session_dir.join("turns");
+    if turns_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&turns_dir) {
+            let mut files: Vec<PathBuf> =
+                entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+            files.sort();
+            for path in files {
+                if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                    let zip_name = format!("turns/{}", fname);
+                    let data = std::fs::read(&path)?;
+                    zip.start_file(&zip_name, options)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    zip.write_all(&data)?;
+                }
+            }
+        }
+    }
+
+    let cursor = zip
+        .finish()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    Ok(cursor.into_inner())
+}
+
 /// Parse a raw HTTP request blob for the `Host:` header and return its
 /// hostname portion as an `IpAddr` if it's a literal IP (v4 or v6).
 ///
@@ -3606,6 +3664,67 @@ pub fn spawn_web_gateway(
                                     body.len(), body
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                        } else if rest_parts.len() >= 2 && rest_parts[1] == "report" {
+                            // GET /api/session/{id}/report — download a zip of
+                            // the current session's text artifacts for sharing
+                            // with the dev. Pass id="current" to target the
+                            // live daemon's own session via WebQueryCtx.
+                            use tokio::io::AsyncWriteExt;
+                            let session_id = rest_parts[0];
+                            let resolved_dir: Option<PathBuf> = if session_id == "current" {
+                                query_ctx.as_ref().map(|ctx| ctx.log_dir.clone())
+                            } else {
+                                resolve_session_dir(session_id)
+                            };
+                            match resolved_dir {
+                                Some(dir) => match build_session_report_zip(&dir) {
+                                    Ok(bytes) => {
+                                        let fname = dir
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "session".to_string());
+                                        let header = format!(
+                                            "HTTP/1.1 200 OK\r\n\
+                                             Content-Type: application/zip\r\n\
+                                             Content-Length: {}\r\n\
+                                             Content-Disposition: attachment; filename=\"intendant-session-{}.zip\"\r\n\
+                                             Cache-Control: no-cache\r\n\
+                                             Connection: close\r\n\
+                                             \r\n",
+                                            bytes.len(),
+                                            fname
+                                        );
+                                        let _ = stream.write_all(header.as_bytes()).await;
+                                        let _ = stream.write_all(&bytes).await;
+                                    }
+                                    Err(e) => {
+                                        let body = format!("Failed to build report: {}", e);
+                                        let response = format!(
+                                            "HTTP/1.1 500 Internal Server Error\r\n\
+                                             Content-Type: text/plain\r\n\
+                                             Content-Length: {}\r\n\
+                                             Connection: close\r\n\
+                                             \r\n\
+                                             {}",
+                                            body.len(), body
+                                        );
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                    }
+                                },
+                                None => {
+                                    let body = "Session not found";
+                                    let response = format!(
+                                        "HTTP/1.1 404 Not Found\r\n\
+                                         Content-Type: text/plain\r\n\
+                                         Content-Length: {}\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {}",
+                                        body.len(), body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                }
                             }
                         } else if rest_parts.len() >= 2 && rest_parts[1] == "frames" {
                             // Session frame sub-routes: /api/session/{id}/frames[/{filename}]
