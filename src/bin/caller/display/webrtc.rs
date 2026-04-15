@@ -398,7 +398,7 @@ impl WebRtcPeer {
         codec_mime: &str,
         _ice_config: &IceConfig,
         tcp_peer_registry: Option<Arc<TcpPeerRegistry>>,
-        tcp_advertised_port: Option<u16>,
+        tcp_advertised_addr: Option<SocketAddr>,
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
@@ -473,54 +473,60 @@ impl WebRtcPeer {
             ));
         }
 
-        // --- ICE-TCP candidate (single loopback, tunnel-friendly) ---------
+        // --- ICE-TCP candidate (Host-header derived, pair-friendly) ------
         //
-        // We advertise exactly ONE TCP candidate: `127.0.0.1:<http_port>`.
-        // This looks wrong at first glance — loopback candidates are
-        // traditionally same-host-only — but it's the only addressing
-        // that actually reaches a tunneled server from the browser's
-        // side. In every topology where the browser can't reach the
-        // agent directly (NAT'd VMs, SSH tunnels, corporate firewalls,
-        // port-forward setups), the browser reaches us via *its own*
-        // `localhost:<same_port>` that's been mapped to us by the
-        // tunneling layer. Advertising `127.0.0.1:<port>` means the
-        // browser attempts a TCP connection to its own localhost on the
-        // same port it already uses for the dashboard — which the
-        // tunnel forwards back to us. No interface TCP candidates are
-        // emitted: on a same-LAN non-NAT topology UDP host candidates
-        // already work, so TCP is the fallback that only matters when
-        // UDP can't reach.
+        // Earlier iterations tried to advertise `127.0.0.1:<http_port>` as
+        // the TCP candidate, hoping the browser's own loopback would be
+        // mapped back to us via port-forward / SSH tunnel. Firefox (and
+        // Chrome, confirmed experimentally via getStats) silently *filter*
+        // remote loopback candidates from candidate-pair formation as an
+        // anti-rebinding mitigation — the candidate shows up in the remote
+        // list but never pairs, ICE stalls, nothing works.
         //
-        // On the server side, we "lie" to str0m about where the
-        // inbound TCP connection arrived: we pass
-        // `destination = 127.0.0.1:<port>` to `handle_input` even
-        // though the kernel-level `local_addr()` is the VM's real
-        // interface IP. str0m matches the lied-about destination to
-        // its one advertised local candidate and forms a clean pair;
-        // the data still flows because the TCP stream is bidirectional
-        // — we own the write half directly, no kernel routing needed.
+        // So instead the web gateway parses the `Host:` header from the
+        // browser's WebSocket handshake (the one address we KNOW the
+        // browser thinks reaches us) and hands us the resulting
+        // `SocketAddr` as `tcp_advertised_addr`. If it's a non-loopback
+        // IP we advertise exactly that — the browser will happily form a
+        // pair because the IP matches what it's already using for HTTP
+        // and isn't loopback so the filter doesn't trigger.
+        //
+        // Users accessing via `http://localhost:...` still get `None`
+        // here (Host header is `localhost`, which doesn't parse as an IP
+        // — or parses as loopback which we also reject): they don't get
+        // a TCP path at all. Their workaround is to bind the port-forward
+        // on a non-loopback interface and connect via the LAN IP. There's
+        // no clever ICE trick that gets around Firefox's loopback filter
+        // for that case.
+        //
+        // On the server side we "lie" to str0m about the inbound
+        // destination: regardless of what `stream.local_addr()` says
+        // (typically the VM's internal interface IP behind the NAT), we
+        // pass `destination = tcp_advertised_addr` to `handle_input`.
+        // str0m matches the lied-about destination to its single local
+        // TCP candidate and forms a clean pair; data still flows because
+        // the TCP stream is bidirectional and we own the write half
+        // directly, no kernel routing involved.
         let mut peer_registration = None;
         let mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>> = None;
         let mut tcp_fake_local: Option<SocketAddr> = None;
-        if let (Some(registry), Some(tcp_port)) =
-            (tcp_peer_registry.as_ref(), tcp_advertised_port)
-        {
+        if let (Some(registry), Some(advertised)) = (
+            tcp_peer_registry.as_ref(),
+            tcp_advertised_addr.filter(|a| !a.ip().is_loopback() && !a.ip().is_unspecified()),
+        ) {
             let (registration, rx) = registry.register(local_ufrag.clone());
             peer_registration = Some(registration);
             tcp_conn_rx = Some(rx);
-            let fake_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tcp_port);
-            tcp_fake_local = Some(fake_local);
+            tcp_fake_local = Some(advertised);
             // RFC 6544 requires TCP ICE candidates to carry a `tcptype`
             // attribute. `Candidate::host(addr, "tcp")` doesn't set it,
-            // and browsers drop TCP candidates that lack it — that was
-            // the reason the reporter's Firefox never opened a TCP
-            // connection despite our advertising the loopback address.
-            // The builder lets us set `tcptype: passive`, which means
-            // "the remote actively opens the TCP connection to us" and
-            // is the correct role for a server-side host candidate.
+            // and browsers drop TCP candidates that lack it. The builder
+            // lets us set `tcptype: passive` — "the remote actively opens
+            // the TCP connection to us", the correct role for a
+            // server-side host candidate.
             match Candidate::builder()
                 .tcp()
-                .host(fake_local)
+                .host(advertised)
                 .tcptype(TcpType::Passive)
                 .build()
             {
@@ -529,12 +535,20 @@ impl WebRtcPeer {
                 }
                 Err(e) => {
                     eprintln!(
-                        "[display/webrtc] failed to add TCP host candidate {fake_local}: {e}"
+                        "[display/webrtc] failed to add TCP host candidate {advertised}: {e}"
                     );
                 }
             }
             eprintln!(
-                "[display/webrtc] peer {peer_id}: ICE-TCP enabled on {fake_local} for ufrag {local_ufrag}"
+                "[display/webrtc] peer {peer_id}: ICE-TCP enabled on {advertised} for ufrag {local_ufrag}"
+            );
+        } else if tcp_peer_registry.is_some() {
+            // Registry available but no suitable advertised address — the
+            // browser connected via hostname/loopback so we have no
+            // non-loopback IP to advertise. Log once so operators can
+            // spot the "why does TCP never kick in" case.
+            eprintln!(
+                "[display/webrtc] peer {peer_id}: no ICE-TCP candidate advertised (no non-loopback Host header)"
             );
         }
 

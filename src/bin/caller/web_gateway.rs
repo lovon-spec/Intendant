@@ -340,6 +340,115 @@ fn asset_version_hash() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Parse a raw HTTP request blob for the `Host:` header and return its
+/// hostname portion as an `IpAddr` if it's a literal IP (v4 or v6).
+///
+/// We need the address the browser is using to reach us — and the Host
+/// header is the one piece of the HTTP handshake that actually contains
+/// that. Loopback and unspecified addresses are rejected because they
+/// don't survive Firefox's remote-candidate filter and wouldn't pair
+/// anyway. Hostnames (like `localhost` or `dashboard.internal`) return
+/// `None` — there's no ICE-TCP candidate we can usefully emit for those.
+fn extract_host_header_ip(headers: &str) -> Option<std::net::IpAddr> {
+    for line in headers.lines() {
+        // Look for the Host: header line, case-insensitive. `strip_prefix`
+        // returning None means "this isn't the Host line" — we must
+        // continue the loop, not propagate with `?`.
+        let Some(rest) = line
+            .strip_prefix("Host: ")
+            .or_else(|| line.strip_prefix("host: "))
+            .or_else(|| line.strip_prefix("HOST: "))
+        else {
+            continue;
+        };
+        // `rest` is `host[:port]` where host can be:
+        //   - IPv4 literal: 192.0.2.1
+        //   - Bracketed IPv6 literal: [2001:db8::1]
+        //   - Hostname: example.com
+        let host_part = if let Some(inner) = rest.strip_prefix('[') {
+            // IPv6 literal in brackets; chop at the closing bracket.
+            match inner.split(']').next() {
+                Some(s) => s,
+                None => return None,
+            }
+        } else if let Some(colon) = rest.find(':') {
+            &rest[..colon]
+        } else {
+            rest
+        };
+        let trimmed = host_part.trim();
+        let ip = trimmed.parse::<std::net::IpAddr>().ok()?;
+        if ip.is_loopback() || ip.is_unspecified() {
+            return None;
+        }
+        return Some(ip);
+    }
+    None
+}
+
+#[cfg(test)]
+mod host_header_tests {
+    use super::extract_host_header_ip;
+    use std::net::IpAddr;
+
+    #[test]
+    fn ipv4_with_port() {
+        let headers = "GET / HTTP/1.1\r\nHost: 192.168.1.10:8765\r\n\r\n";
+        assert_eq!(
+            extract_host_header_ip(headers),
+            Some("192.168.1.10".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn ipv6_bracketed() {
+        let headers = "GET / HTTP/1.1\r\nHost: [2001:db8::1]:8765\r\n\r\n";
+        assert_eq!(
+            extract_host_header_ip(headers),
+            Some("2001:db8::1".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn hostname_returns_none() {
+        let headers = "GET / HTTP/1.1\r\nHost: dashboard.internal:8765\r\n\r\n";
+        assert_eq!(extract_host_header_ip(headers), None);
+    }
+
+    #[test]
+    fn localhost_literal_returns_none() {
+        let headers = "GET / HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        assert_eq!(extract_host_header_ip(headers), None);
+    }
+
+    #[test]
+    fn loopback_ipv4_literal_returns_none() {
+        let headers = "GET / HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n";
+        assert_eq!(extract_host_header_ip(headers), None);
+    }
+
+    #[test]
+    fn loopback_ipv6_literal_returns_none() {
+        let headers = "GET / HTTP/1.1\r\nHost: [::1]:8765\r\n\r\n";
+        assert_eq!(extract_host_header_ip(headers), None);
+    }
+
+    #[test]
+    fn no_host_header() {
+        let headers = "GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(extract_host_header_ip(headers), None);
+    }
+
+    #[test]
+    fn case_insensitive_header_name() {
+        let headers = "GET / HTTP/1.1\r\nhost: 10.0.0.5:8765\r\n\r\n";
+        assert_eq!(
+            extract_host_header_ip(headers),
+            Some("10.0.0.5".parse::<IpAddr>().unwrap())
+        );
+    }
+}
+
 /// List session directories from `~/.intendant/logs/`, returning JSON metadata
 /// for each session (newest first, capped at 100).
 /// Return session detail: replayed log entries + metadata for a single session.
@@ -1473,6 +1582,21 @@ pub fn spawn_web_gateway(
                     .lines()
                     .any(|l| l.to_lowercase().contains("upgrade: websocket"));
 
+                // Parse the `Host:` header to learn what address the
+                // browser thinks reaches us. We use this later as the IP
+                // for ICE-TCP host candidates: Firefox refuses to pair
+                // remote loopback candidates, so we need a non-loopback
+                // address the browser can actually connect to. The only
+                // one we know for sure the browser can reach is whatever
+                // it just used to reach us for HTTP — which is exactly
+                // what the Host header contains. If the user accessed
+                // via a hostname (`localhost`, `myserver.local`) rather
+                // than a literal IP, we get None here and skip the TCP
+                // candidate entirely; those users can still use UDP if
+                // their topology allows it.
+                let browser_host_ip: Option<std::net::IpAddr> =
+                    extract_host_header_ip(&header_text);
+
                 if is_websocket {
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
@@ -2565,12 +2689,27 @@ pub fn spawn_web_gateway(
                                             if let Some(ref sr) = session_registry_inbound {
                                                 if let Some(session) = sr.read().await.get(display_id) {
                                                     let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
+                                                    // Combine the Host-header IP with the
+                                                    // port we want to advertise (HTTP port
+                                                    // for Phase 3 multiplex, or standalone
+                                                    // Phase 2 port) to form the single TCP
+                                                    // candidate the peer will emit. None
+                                                    // if either piece is missing (typically
+                                                    // because the browser connected via
+                                                    // hostname).
+                                                    let tcp_advertised_addr: Option<std::net::SocketAddr> =
+                                                        match (browser_host_ip, tcp_advertised_port) {
+                                                            (Some(ip), Some(port)) => {
+                                                                Some(std::net::SocketAddr::new(ip, port))
+                                                            }
+                                                            _ => None,
+                                                        };
                                                     match session.handle_offer(
                                                         peer_id,
                                                         &sdp,
                                                         &ice_config,
                                                         Some(Arc::clone(&tcp_peer_registry)),
-                                                        tcp_advertised_port,
+                                                        tcp_advertised_addr,
                                                         ice_tx,
                                                     ).await {
                                                         Ok(answer_sdp) => {

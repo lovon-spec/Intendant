@@ -904,7 +904,7 @@ impl DisplaySession {
         sdp: &str,
         ice_config: &IceConfig,
         tcp_peer_registry: Option<Arc<self::webrtc::TcpPeerRegistry>>,
-        tcp_advertised_port: Option<u16>,
+        tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
         // Serialize codec selection + encoder startup.
@@ -989,7 +989,7 @@ impl DisplaySession {
             codec_mime,
             ice_config,
             tcp_peer_registry,
-            tcp_advertised_port,
+            tcp_advertised_addr,
             input_handler,
             clipboard_handler,
             ice_tx,
