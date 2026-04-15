@@ -203,6 +203,11 @@ cargo test --test e2e test_voice -- --nocapture           # Tier 3: needs Xvfb +
 - No `unsafe` code
 - Tests: inline `#[cfg(test)]` modules only
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
+- When adding a new system / `-sys` crate dependency, update **both**
+  `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh`
+  (`check_core` or an appropriate check function) in the same commit.
+  Silent missing deps break fresh-machine setups with cryptic `pkg-config`
+  errors long after the crate was added.
 
 ### Platform Support
 

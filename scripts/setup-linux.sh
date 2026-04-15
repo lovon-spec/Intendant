@@ -106,6 +106,9 @@ APT_PACKAGES=(
     # Rust build dep for vpx-encode (ffi-generate needs libclang)
     libclang-dev
 
+    # Rust build dep for openssl-sys (pkg-config finds libssl + headers)
+    libssl-dev
+
     # PNG encoding/decoding (libpng)
     libpng-dev
 

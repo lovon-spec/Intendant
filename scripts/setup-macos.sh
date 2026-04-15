@@ -76,6 +76,17 @@ check_core() {
         all_ok=false
     fi
 
+    # OpenSSL (build-time dep for the openssl-sys crate). Homebrew's
+    # openssl@3 provides pkg-config metadata that openssl-sys finds at
+    # build time — without it, cargo fails with
+    # "Could not find openssl via pkg-config".
+    if brew list --formula 2>/dev/null | grep -q '^openssl@3$'; then
+        ok "openssl@3 (Homebrew)"
+    else
+        miss "openssl@3" "brew install openssl@3"
+        all_ok=false
+    fi
+
     $all_ok
 }
 
