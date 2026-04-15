@@ -2,17 +2,14 @@
 //!
 //! Speaks Intendant's own `/ws` wire contract — the HTTP+WebSocket
 //! surface exposed by `web_gateway::spawn_web_gateway`. On the
-//! inbound side, frames are typed [`OutboundEvent`] values (the wire
-//! projection of `AppEvent`) which this transport deserializes via
-//! serde and translates to [`PeerEvent`] through
-//! [`WireEventUpcaster`]. On the outbound side, phase 1 is **read-only**:
-//! the transport advertises [`TransportFeatures`] with every
-//! outbound op disabled, and `send` rejects with
-//! `PeerError::UnsupportedCapability` for any operation. This is
-//! not a TODO — it's an honest declaration of current capability.
-//! Full send support (ControlMsg encoding for approvals, input,
-//! and settings) lands in a follow-up commit once the drain path
-//! has settled into production.
+//! inbound side, frames are typed [`OutboundEvent`] values (the
+//! wire projection of `AppEvent`) which this transport deserializes
+//! via serde and translates to [`PeerEvent`] through
+//! [`WireEventUpcaster`]. On the outbound side, [`PeerOp`] values
+//! are encoded as [`ControlMsg`] JSON and written to the same
+//! WebSocket — Intendant's WS handler already accepts `ControlMsg`
+//! frames from the browser and the test suite, so the transport
+//! is just another client speaking the same protocol.
 //!
 //! ## Connection lifecycle
 //!
@@ -26,8 +23,36 @@
 //! 2. **WebSocket attach** — `tokio_tungstenite::connect_async` to
 //!    the peer's `/ws` endpoint. The read half moves into a spawned
 //!    drain task that deserializes frames and pushes upcast
-//!    `PeerEvent`s to the actor's channel. The write half is
-//!    retained on the transport struct for future send support.
+//!    `PeerEvent`s to the actor's channel. The write half stays on
+//!    the transport struct and is driven by `send`.
+//!
+//! ## Outbound operation mapping
+//!
+//! Intendant's `/ws` control surface is fire-and-forget: a control
+//! message produces side effects and subsequent events through the
+//! broadcast channel, but does not echo a request/response id. So
+//! `send` returns a synthetic `MessageId` / `TaskId` for
+//! operations that expect one — the real correlation happens
+//! through subsequent `ActivityStarted` / `Message` events the
+//! drain path surfaces back on the peer's event stream.
+//!
+//! - [`PeerOp::SendMessage`] → [`ControlMsg::FollowUp`] (continues an
+//!   existing conversation — the main "say something to the peer's
+//!   agent" verb). Returns a synthetic `MessageId`.
+//! - [`PeerOp::DelegateTask`] → [`ControlMsg::StartTask`] (kicks off
+//!   a fresh agent task). `PeerTask::instructions` maps to
+//!   `task`; the orchestration/direct/reference-frame/display-target
+//!   flags default to absent. Returns a synthetic `TaskId`.
+//! - [`PeerOp::ResolveApproval`] → [`ControlMsg::Approve`] /
+//!   `ApproveAll` / `Deny` / `Skip` based on
+//!   [`ApprovalDecision`]. Requires `request_id` to parse as `u64`
+//!   — Intendant's approval ids are numeric; non-numeric ids
+//!   return a typed error rather than silently failing.
+//! - `CancelTask`, `QueryTaskStatus`, `InvokeCapability` are
+//!   rejected up front via `check_feature` because Intendant's
+//!   native control plane has no wire primitive for them. These
+//!   come in through other transport adapters (OpenClaw's node
+//!   `invoke`, A2A's task queries) when those land.
 //!
 //! ## Disconnection signaling
 //!
@@ -40,8 +65,11 @@
 //! its own clone of the sender, which would make `disconnect` and
 //! reconnect semantics much trickier.
 
+use crate::event::ControlMsg;
 use crate::peer::card::{AgentCard, TransportSpec};
-use crate::peer::event::PeerEvent;
+use crate::peer::event::{
+    ApprovalDecision, MessageContent, MessageId, PeerEvent, TaskId,
+};
 use crate::peer::traits::{
     check_feature, PeerOp, PeerOpAck, PeerTransport, TransportFeatures,
 };
@@ -50,6 +78,7 @@ use crate::peer::PeerError;
 use crate::types::OutboundEvent;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -68,6 +97,14 @@ pub struct IntendantWsTransport {
     ws_write: Option<WsSink>,
     reader_handle: Option<JoinHandle<()>>,
     card: Option<AgentCard>,
+    /// Monotonic counter for synthetic `MessageId`/`TaskId` values
+    /// returned from `send`. Intendant's `/ws` control plane is
+    /// fire-and-forget — no wire-level id echoes back — so the
+    /// transport fabricates an id so callers have something
+    /// unique to log. Real correlation with subsequent activity
+    /// events happens through the drain path's `ActivityStarted`
+    /// / `Message` emissions.
+    out_seq: AtomicU64,
 }
 
 impl IntendantWsTransport {
@@ -78,7 +115,26 @@ impl IntendantWsTransport {
             ws_write: None,
             reader_handle: None,
             card: None,
+            out_seq: AtomicU64::new(0),
         }
+    }
+
+    fn next_out_seq(&self) -> u64 {
+        self.out_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    async fn write_control_msg(&mut self, ctrl: &ControlMsg) -> Result<(), PeerError> {
+        let json = serde_json::to_string(ctrl)
+            .map_err(|e| PeerError::Transport(format!("serialize ControlMsg: {e}")))?;
+        let write = self
+            .ws_write
+            .as_mut()
+            .ok_or(PeerError::NotConnected)?;
+        write
+            .send(Message::Text(json.into()))
+            .await
+            .map_err(|e| PeerError::Transport(format!("ws send: {e}")))?;
+        Ok(())
     }
 
     fn ws_url(&self) -> Result<&str, PeerError> {
@@ -135,6 +191,49 @@ impl IntendantWsTransport {
         let handle = tokio::spawn(drain_ws(read, events_tx));
         Ok((write, handle))
     }
+}
+
+/// Extract the text payload from a [`MessageContent`] for use as
+/// the body of [`ControlMsg::FollowUp`] or [`ControlMsg::StartTask`].
+/// Intendant's native control plane carries text-shaped message
+/// input only; image / multi-part / unknown content types are
+/// rejected with a typed error rather than silently dropping the
+/// payload.
+fn message_text(content: &MessageContent) -> Result<String, PeerError> {
+    match content {
+        MessageContent::Text { text } | MessageContent::Reasoning { text } => {
+            Ok(text.clone())
+        }
+        MessageContent::Image { .. } => Err(PeerError::Transport(
+            "IntendantWsTransport: image message content is not supported \
+             — Intendant's ControlMsg::FollowUp / StartTask carry text only"
+                .into(),
+        )),
+        MessageContent::Parts { .. } => Err(PeerError::Transport(
+            "IntendantWsTransport: multi-part message content is not \
+             supported — flatten to text before calling send_message"
+                .into(),
+        )),
+        MessageContent::Unknown => Err(PeerError::Transport(
+            "IntendantWsTransport: unknown message content variant cannot \
+             be sent — forward-compat fallback has no outbound semantics"
+                .into(),
+        )),
+    }
+}
+
+/// Parse a peer approval `request_id` string as the `u64` Intendant's
+/// native control plane expects. Non-numeric ids (e.g. ones coming
+/// from a non-Intendant peer that uses string ids) return a typed
+/// error so the caller sees the mismatch rather than the transport
+/// silently dropping the resolution.
+fn parse_request_id(id: &str) -> Result<u64, PeerError> {
+    id.parse::<u64>().map_err(|_| {
+        PeerError::Transport(format!(
+            "ResolveApproval request_id '{id}' is not a u64 — Intendant \
+             peers use numeric approval ids"
+        ))
+    })
 }
 
 /// Drain the WebSocket read half: parse each text frame as
@@ -202,23 +301,24 @@ impl PeerTransport for IntendantWsTransport {
         &self.spec
     }
 
-    /// Phase 1 is read-only. The drain path is fully implemented;
-    /// outbound PeerOp support (send_message, resolve_approval,
-    /// etc.) lands in a follow-up once the drain path has settled.
-    /// Every outbound feature flag is `false` here so the
-    /// [`crate::peer::handle::PeerHandle`] layer rejects sends up
-    /// front with a clear [`PeerError::UnsupportedCapability`]
-    /// rather than accepting commands that would silently fail.
+    /// Outbound support now covers the three core verbs Intendant's
+    /// native control plane exposes: `send_message` (FollowUp),
+    /// `task_delegation` (StartTask), and `resolve_approval`
+    /// (Approve/ApproveAll/Deny/Skip). `task_cancel`,
+    /// `task_query`, and `invoke_capability` stay `false` because
+    /// the wire has no primitive for them — those verbs belong to
+    /// future transport adapters (OpenClaw's `node.invoke`, A2A's
+    /// task lifecycle) and are rejected up front by `check_feature`.
     fn features(&self) -> TransportFeatures {
         TransportFeatures {
             bidirectional: true,
             streaming_events: true,
-            send_message: false,
-            task_delegation: false,
+            send_message: true,
+            task_delegation: true,
             task_cancel: false,
             task_query: false,
             invoke_capability: false,
-            resolve_approval: false,
+            resolve_approval: true,
         }
     }
 
@@ -260,21 +360,71 @@ impl PeerTransport for IntendantWsTransport {
     }
 
     async fn send(&mut self, op: PeerOp) -> Result<PeerOpAck, PeerError> {
-        // Phase 1: read-only transport. check_feature rejects every
-        // op because features() advertises no outbound support.
         check_feature(&self.features(), &op)?;
-        // Unreachable at runtime — check_feature returns Err on all
-        // ops until the feature flags flip on. Kept for future
-        // expansion: when send support lands, this arm becomes a
-        // match on PeerOp with ControlMsg encoding.
-        Err(PeerError::UnsupportedCapability(op.name().to_string()))
+        if self.ws_write.is_none() {
+            return Err(PeerError::NotConnected);
+        }
+
+        match op {
+            PeerOp::SendMessage { message } => {
+                let text = message_text(&message.content)?;
+                self.write_control_msg(&ControlMsg::FollowUp {
+                    text,
+                    direct: None,
+                })
+                .await?;
+                let seq = self.next_out_seq();
+                Ok(PeerOpAck::MessageId(MessageId(format!("msg-out-{seq}"))))
+            }
+            PeerOp::DelegateTask { task } => {
+                self.write_control_msg(&ControlMsg::StartTask {
+                    task: task.instructions,
+                    orchestrate: None,
+                    direct: None,
+                    reference_frame_ids: Vec::new(),
+                    display_target: None,
+                    attachments: Vec::new(),
+                })
+                .await?;
+                let seq = self.next_out_seq();
+                Ok(PeerOpAck::TaskId(TaskId(format!("task-out-{seq}"))))
+            }
+            PeerOp::ResolveApproval {
+                request_id,
+                decision,
+            } => {
+                let id = parse_request_id(&request_id)?;
+                let ctrl = match decision {
+                    ApprovalDecision::Accept => ControlMsg::Approve { id },
+                    ApprovalDecision::AcceptForSession => {
+                        ControlMsg::ApproveAll { id }
+                    }
+                    ApprovalDecision::Decline => ControlMsg::Deny { id },
+                    ApprovalDecision::Cancel => ControlMsg::Skip { id },
+                };
+                self.write_control_msg(&ctrl).await?;
+                Ok(PeerOpAck::Ok)
+            }
+            // check_feature rejects the other variants before they
+            // reach this match. The arm is unreachable in practice
+            // but kept to keep the match exhaustive without a
+            // wildcard — the compile error when a new PeerOp lands
+            // is the prompt to decide how to route it.
+            PeerOp::CancelTask { .. }
+            | PeerOp::QueryTaskStatus { .. }
+            | PeerOp::InvokeCapability { .. } => {
+                Err(PeerError::UnsupportedCapability(op.name().to_string()))
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventBus;
+    use crate::event::{AppEvent, EventBus};
+    use crate::peer::event::{MessageContent, MessageRole, PeerMessage};
+    use crate::peer::traits::PeerTask;
     use crate::web_gateway::{spawn_web_gateway, ActiveSessionState, WebGatewayConfig};
     use tokio::sync::{broadcast, mpsc};
 
@@ -282,7 +432,20 @@ mod tests {
     /// the port + gateway handle. Tests connect the transport to
     /// this as if it were a remote peer.
     async fn spawn_test_peer() -> (u16, tokio::task::JoinHandle<()>) {
+        let (port, handle, _) = spawn_test_peer_with_bus().await;
+        (port, handle)
+    }
+
+    /// Variant that also returns an EventBus receiver so tests can
+    /// verify control messages land on the bus (the outbound-path
+    /// tests all need this).
+    async fn spawn_test_peer_with_bus() -> (
+        u16,
+        tokio::task::JoinHandle<()>,
+        broadcast::Receiver<AppEvent>,
+    ) {
         let bus = EventBus::new();
+        let bus_rx = bus.subscribe();
         let (broadcast_tx, _) = broadcast::channel::<String>(64);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -300,7 +463,35 @@ mod tests {
             None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
-        (port, handle)
+        (port, handle, bus_rx)
+    }
+
+    /// Read events from a bus receiver until the predicate matches
+    /// or a short timeout elapses. Returns the matched event or
+    /// `None` on timeout. The WS handler may emit unrelated
+    /// background events (presence logging, session init) between
+    /// the moment the transport's send lands and the matching
+    /// `ControlCommand` — the predicate filter keeps tests robust
+    /// against that noise.
+    async fn wait_for_event<F>(
+        rx: &mut broadcast::Receiver<AppEvent>,
+        pred: F,
+    ) -> Option<AppEvent>
+    where
+        F: Fn(&AppEvent) -> bool,
+    {
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(event)) => {
+                    if pred(&event) {
+                        return Some(event);
+                    }
+                }
+                Ok(Err(_)) => return None,
+                Err(_) => return None,
+            }
+        }
+        None
     }
 
     /// Connect the transport to a test peer, fetch its card, verify
@@ -345,17 +536,269 @@ mod tests {
         gateway.abort();
     }
 
-    /// Phase 1 transport is read-only. All send ops return
-    /// `UnsupportedCapability` so the handle layer can fail fast.
+    /// Features advertise the three outbound verbs Intendant's
+    /// native control plane supports (send_message, task_delegation,
+    /// resolve_approval) and keep the peer-specific verbs
+    /// (task_cancel/query/invoke_capability) off because the wire
+    /// has no primitive for them. This is the invariant guard — if
+    /// anyone flips a feature flag on without adding a matching
+    /// arm to `send`, the mismatch shows up here or in a parity
+    /// test rather than silent broken behavior at runtime.
+    #[test]
+    fn features_advertise_three_outbound_verbs() {
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(1);
+        let transport =
+            IntendantWsTransport::new("ws://127.0.0.1:0/ws".to_string(), tx);
+        let features = transport.features();
+        assert!(features.bidirectional);
+        assert!(features.streaming_events);
+        assert!(features.send_message);
+        assert!(features.task_delegation);
+        assert!(features.resolve_approval);
+        assert!(!features.task_cancel, "no wire primitive for cancel");
+        assert!(!features.task_query, "no wire primitive for task query");
+        assert!(
+            !features.invoke_capability,
+            "no wire primitive for capability invoke"
+        );
+    }
+
+    /// `send_message` writes a `ControlMsg::FollowUp` to the peer's
+    /// `/ws` and returns a synthetic `MessageId`. The follow-up
+    /// text lands on the peer's EventBus as
+    /// `AppEvent::ControlCommand(FollowUp { text })`.
     #[tokio::test]
-    async fn send_is_unsupported_in_phase_one() {
+    async fn send_message_writes_followup_control_msg() {
+        let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut transport = IntendantWsTransport::new(url, tx);
+        let _ = transport.connect().await.unwrap();
+
+        let ack = transport
+            .send(PeerOp::SendMessage {
+                message: PeerMessage {
+                    session: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text {
+                        text: "hello from peer".into(),
+                    },
+                },
+            })
+            .await
+            .expect("send_message succeeds");
+        match ack {
+            PeerOpAck::MessageId(id) => {
+                assert!(
+                    id.0.starts_with("msg-out-"),
+                    "synthetic id shape: {}",
+                    id.0
+                );
+            }
+            other => panic!("expected MessageId ack, got {other:?}"),
+        }
+
+        let event = wait_for_event(&mut bus_rx, |e| {
+            matches!(e, AppEvent::ControlCommand(ControlMsg::FollowUp { text, .. }) if text == "hello from peer")
+        })
+        .await;
+        assert!(
+            event.is_some(),
+            "follow-up ControlMsg did not land on the bus"
+        );
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
+    }
+
+    /// `delegate_task` writes a `ControlMsg::StartTask`, with the
+    /// task instructions ending up in the `task` field. Orchestrate
+    /// and other flags default to absent.
+    #[tokio::test]
+    async fn delegate_task_writes_start_task_control_msg() {
+        let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut transport = IntendantWsTransport::new(url, tx);
+        let _ = transport.connect().await.unwrap();
+
+        let ack = transport
+            .send(PeerOp::DelegateTask {
+                task: PeerTask {
+                    instructions: "research the federation protocol".into(),
+                    context: serde_json::Value::Null,
+                    client_correlation_id: None,
+                },
+            })
+            .await
+            .expect("delegate_task succeeds");
+        assert!(matches!(ack, PeerOpAck::TaskId(_)));
+
+        let event = wait_for_event(&mut bus_rx, |e| {
+            matches!(
+                e,
+                AppEvent::ControlCommand(ControlMsg::StartTask { task, .. })
+                if task == "research the federation protocol"
+            )
+        })
+        .await;
+        assert!(event.is_some(), "StartTask did not land on the bus");
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
+    }
+
+    /// Each `ApprovalDecision` variant maps to a distinct
+    /// `ControlMsg` on the wire. Drives all four through the
+    /// transport and verifies each one lands on the bus.
+    #[tokio::test]
+    async fn resolve_approval_maps_each_decision_to_its_control_msg() {
+        let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut transport = IntendantWsTransport::new(url, tx);
+        let _ = transport.connect().await.unwrap();
+
+        // Accept → Approve { id }
+        transport
+            .send(PeerOp::ResolveApproval {
+                request_id: "1".into(),
+                decision: ApprovalDecision::Accept,
+            })
+            .await
+            .unwrap();
+        assert!(wait_for_event(&mut bus_rx, |e| matches!(
+            e,
+            AppEvent::ControlCommand(ControlMsg::Approve { id: 1 })
+        ))
+        .await
+        .is_some());
+
+        // AcceptForSession → ApproveAll { id }
+        transport
+            .send(PeerOp::ResolveApproval {
+                request_id: "2".into(),
+                decision: ApprovalDecision::AcceptForSession,
+            })
+            .await
+            .unwrap();
+        assert!(wait_for_event(&mut bus_rx, |e| matches!(
+            e,
+            AppEvent::ControlCommand(ControlMsg::ApproveAll { id: 2 })
+        ))
+        .await
+        .is_some());
+
+        // Decline → Deny { id }
+        transport
+            .send(PeerOp::ResolveApproval {
+                request_id: "3".into(),
+                decision: ApprovalDecision::Decline,
+            })
+            .await
+            .unwrap();
+        assert!(wait_for_event(&mut bus_rx, |e| matches!(
+            e,
+            AppEvent::ControlCommand(ControlMsg::Deny { id: 3 })
+        ))
+        .await
+        .is_some());
+
+        // Cancel → Skip { id }
+        transport
+            .send(PeerOp::ResolveApproval {
+                request_id: "4".into(),
+                decision: ApprovalDecision::Cancel,
+            })
+            .await
+            .unwrap();
+        assert!(wait_for_event(&mut bus_rx, |e| matches!(
+            e,
+            AppEvent::ControlCommand(ControlMsg::Skip { id: 4 })
+        ))
+        .await
+        .is_some());
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
+    }
+
+    /// `send_message` rejects non-text message content with a
+    /// typed Transport error rather than silently swallowing the
+    /// payload. Guards against a future refactor that starts
+    /// mapping `MessageContent::Image` → something wrong.
+    #[tokio::test]
+    async fn send_message_rejects_image_content() {
         let (port, gateway) = spawn_test_peer().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
         let mut transport = IntendantWsTransport::new(url, tx);
         let _ = transport.connect().await.unwrap();
 
-        use crate::peer::event::{MessageContent, MessageRole, PeerMessage};
+        let result = transport
+            .send(PeerOp::SendMessage {
+                message: PeerMessage {
+                    session: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Image {
+                        mime_type: "image/png".into(),
+                        base64: "aGVsbG8=".into(),
+                    },
+                },
+            })
+            .await;
+        match result {
+            Err(PeerError::Transport(msg)) => {
+                assert!(msg.contains("image"), "error mentions image: {msg}");
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
+    }
+
+    /// `resolve_approval` with a non-numeric `request_id` returns a
+    /// typed Transport error rather than silently dropping the
+    /// resolution. Intendant's approval ids are `u64`; a peer
+    /// request_id that's a string from a non-Intendant source
+    /// can't be mapped through without data loss.
+    #[tokio::test]
+    async fn resolve_approval_rejects_non_numeric_request_id() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut transport = IntendantWsTransport::new(url, tx);
+        let _ = transport.connect().await.unwrap();
+
+        let result = transport
+            .send(PeerOp::ResolveApproval {
+                request_id: "openclaw-approval-abc".into(),
+                decision: ApprovalDecision::Accept,
+            })
+            .await;
+        match result {
+            Err(PeerError::Transport(msg)) => {
+                assert!(msg.contains("not a u64"), "error mentions u64: {msg}");
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
+    }
+
+    /// `send` returns `NotConnected` when called before `connect`.
+    /// Guards against the transport silently accepting commands
+    /// that have no wire to land on.
+    #[tokio::test]
+    async fn send_before_connect_returns_not_connected() {
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(1);
+        let mut transport = IntendantWsTransport::new(
+            "ws://127.0.0.1:1/ws".to_string(),
+            tx,
+        );
+
         let result = transport
             .send(PeerOp::SendMessage {
                 message: PeerMessage {
@@ -367,36 +810,7 @@ mod tests {
                 },
             })
             .await;
-        match result {
-            Err(PeerError::UnsupportedCapability(op)) => {
-                assert_eq!(op, "send_message");
-            }
-            other => panic!("expected UnsupportedCapability, got {other:?}"),
-        }
-
-        transport.disconnect().await.unwrap();
-        gateway.abort();
-    }
-
-    /// Features advertise the phase 1 read-only posture: streaming
-    /// events yes, outbound ops no. This test is the invariant
-    /// guard — if anyone flips a feature flag on without
-    /// implementing the corresponding send arm, the mismatch shows
-    /// up as a test discrepancy rather than silent broken behavior.
-    #[test]
-    fn phase_one_features_are_read_only() {
-        let (tx, _rx) = mpsc::channel::<PeerEvent>(1);
-        let transport =
-            IntendantWsTransport::new("ws://127.0.0.1:0/ws".to_string(), tx);
-        let features = transport.features();
-        assert!(features.bidirectional);
-        assert!(features.streaming_events);
-        assert!(!features.send_message);
-        assert!(!features.task_delegation);
-        assert!(!features.task_cancel);
-        assert!(!features.task_query);
-        assert!(!features.invoke_capability);
-        assert!(!features.resolve_approval);
+        assert!(matches!(result, Err(PeerError::NotConnected)));
     }
 
     /// Forward-compat: a peer sending an event variant we don't
