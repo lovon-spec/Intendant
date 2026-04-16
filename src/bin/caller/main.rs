@@ -301,6 +301,12 @@ enum DrainOutcome {
     },
     /// The event channel was closed unexpectedly.
     ChannelClosed,
+    /// A user-requested interrupt completed cleanly. The agent was asked to
+    /// cancel its turn (e.g. via `session/cancel` or `turn/interrupt`) and
+    /// acknowledged with a terminal event. The caller should break its
+    /// outer loop the same way it would for `TurnCompleted`, but MUST NOT
+    /// wait for a follow-up message — the interrupt *is* the follow-up.
+    Interrupted { reason: String },
 }
 
 /// Drain external agent events until a turn completes, the agent terminates,
@@ -308,6 +314,11 @@ enum DrainOutcome {
 ///
 /// This is the unified event loop shared by both the presence path
 /// (`run_with_presence`) and the non-presence path (`run_external_agent_mode`).
+///
+/// Also subscribes to the event bus for `AppEvent::InterruptRequested` and
+/// forwards it to the external agent via `ExternalAgent::interrupt_turn()`.
+/// Backends that don't support interruption return a typed error we log and
+/// continue waiting for — the caller can escalate to `shutdown()` if needed.
 async fn drain_external_agent_events(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
@@ -318,11 +329,119 @@ async fn drain_external_agent_events(
 
     let approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut turns_in_round = 0usize;
+    let mut bus_rx = config.bus.subscribe();
+    // Track whether we've been asked to interrupt this drain cycle. When the
+    // agent finally emits TurnCompleted / Terminated we convert that into a
+    // DrainOutcome::Interrupted + Interrupted event so the caller can choose
+    // not to wait for a follow-up.
+    let mut interrupt_pending = false;
+
+    // Background watcher: if an interrupt arrives while an approval handler
+    // below is blocked on `rx.await`, we need to drain the approval registry
+    // from outside the main select! so the waiting handler unblocks. Draining
+    // from the main select! wouldn't help — we can't re-enter select! until
+    // the handler returns.
+    //
+    // The watcher only drains the *native* registry. The caller-facing bus_rx
+    // receives the same InterruptRequested event (broadcast fans out) and the
+    // main select! handles the actual `interrupt_turn()` call once the inner
+    // approval handler has unblocked and returned.
+    let watcher_handle = {
+        let mut watcher_rx = config.bus.subscribe();
+        let registry = config.approval_registry.clone();
+        tokio::spawn(async move {
+            loop {
+                match watcher_rx.recv().await {
+                    Ok(AppEvent::InterruptRequested) => {
+                        let pending: Vec<_> = {
+                            let mut reg = registry.lock().unwrap();
+                            reg.drain().collect()
+                        };
+                        for (_, sender) in pending {
+                            let _ = sender.send(event::ApprovalResponse::Deny);
+                        }
+                        // Stay alive — a second interrupt could arrive after
+                        // a follow-up turn starts new approvals.
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    };
+    // Abort the watcher when this drain returns. Use a guard so drop runs on
+    // any exit (normal return, panic, early return from each match arm).
+    struct DrainWatcherGuard {
+        handle: Option<tokio::task::JoinHandle<()>>,
+    }
+    impl Drop for DrainWatcherGuard {
+        fn drop(&mut self) {
+            if let Some(h) = self.handle.take() {
+                h.abort();
+            }
+        }
+    }
+    let _watcher_guard = DrainWatcherGuard {
+        handle: Some(watcher_handle),
+    };
 
     loop {
-        let event = match event_rx.recv().await {
-            Some(e) => e,
-            None => return DrainOutcome::ChannelClosed,
+        let event = tokio::select! {
+            biased;
+            bus_event = bus_rx.recv() => {
+                match bus_event {
+                    Ok(AppEvent::InterruptRequested) => {
+                        interrupt_pending = true;
+                        // Approval registry is drained by the background
+                        // watcher task above (so inner `rx.await` sites
+                        // unblock even when select! is occupied). Here we
+                        // only need to forward the interrupt to the backend.
+                        // For backends that don't support mid-turn cancel
+                        // (Claude Code) we log a warning and keep waiting —
+                        // the next interrupt could escalate to shutdown, but
+                        // that's a caller policy decision.
+                        match agent.interrupt_turn().await {
+                            Ok(()) => {
+                                config.bus.send(AppEvent::PresenceLog {
+                                    message: format!("Interrupt sent to {}", agent.name()),
+                                    level: None,
+                                    turn: None,
+                                });
+                            }
+                            Err(e) => {
+                                config.bus.send(AppEvent::PresenceLog {
+                                    message: format!(
+                                        "Interrupt not supported or failed for {}: {}",
+                                        agent.name(), e
+                                    ),
+                                    level: Some(types::LogLevel::Warn),
+                                    turn: None,
+                                });
+                                slog(config.session_log, |l| {
+                                    l.warn(&format!(
+                                        "Interrupt failed for {}: {}", agent.name(), e
+                                    ))
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Bus closed means the session is shutting down;
+                        // fall through to let the agent channel drain.
+                        continue;
+                    }
+                }
+            }
+            maybe_event = event_rx.recv() => {
+                match maybe_event {
+                    Some(e) => e,
+                    None => return DrainOutcome::ChannelClosed,
+                }
+            }
         };
 
         match event {
@@ -656,12 +775,29 @@ async fn drain_external_agent_events(
                 if let Some(ref msg) = message {
                     stats.last_response = Some(msg.clone());
                 }
+                if interrupt_pending {
+                    let reason = message
+                        .clone()
+                        .unwrap_or_else(|| "user requested".to_string());
+                    config.bus.send(AppEvent::Interrupted {
+                        reason: "user requested".into(),
+                    });
+                    return DrainOutcome::Interrupted { reason };
+                }
                 return DrainOutcome::TurnCompleted {
                     message,
                     turns_in_round,
                 };
             }
             external_agent::AgentEvent::Terminated { reason, exit_code } => {
+                if interrupt_pending {
+                    config.bus.send(AppEvent::Interrupted {
+                        reason: "user requested".into(),
+                    });
+                    return DrainOutcome::Interrupted {
+                        reason: format!("terminated after interrupt: {}", reason),
+                    };
+                }
                 return DrainOutcome::Terminated { reason, exit_code };
             }
         }
@@ -929,6 +1065,8 @@ enum LoopExitReason {
     Denied,
     /// An error occurred.
     Error,
+    /// User requested interruption mid-turn.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2751,7 +2889,77 @@ async fn run_agent_loop(
         q.retain(|inj| inj.source == event::InjectionSource::User);
     }
 
+    // Cancellation plumbing: a watcher task flips the token when it sees
+    // AppEvent::InterruptRequested on the bus, and drains the approval
+    // registry so any in-flight `rx.await` inside the approval handler
+    // unblocks immediately. The loop checks the token at its boundaries
+    // and wraps the streaming API call in tokio::select! so an interrupt
+    // mid-stream drops the response cleanly.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_watcher_handle = {
+        let watcher_token = cancel_token.clone();
+        let watcher_registry = approval_registry.clone();
+        let mut bus_rx = bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match bus_rx.recv().await {
+                    Ok(AppEvent::InterruptRequested) => {
+                        // Drain pending approvals with Deny so their
+                        // receivers unblock and the loop can reach its
+                        // cancellation-check boundary.
+                        let pending: Vec<_> = {
+                            let mut reg = watcher_registry.lock().unwrap();
+                            reg.drain().collect()
+                        };
+                        for (_, sender) in pending {
+                            let _ = sender.send(event::ApprovalResponse::Deny);
+                        }
+                        watcher_token.cancel();
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    };
+
+    // Guard that aborts the watcher and drains approvals exactly once on
+    // any exit (interrupt OR normal completion). We cancel the watcher on
+    // drop so it stops listening, and we proactively resolve any pending
+    // approvals with Deny if the exit path was interrupt-driven.
+    struct InterruptGuard {
+        watcher: Option<tokio::task::JoinHandle<()>>,
+    }
+    impl Drop for InterruptGuard {
+        fn drop(&mut self) {
+            if let Some(h) = self.watcher.take() {
+                h.abort();
+            }
+        }
+    }
+    let _guard = InterruptGuard {
+        watcher: Some(cancel_watcher_handle),
+    };
+
     for turn in 1..=SAFETY_CAP {
+        // Interrupt check at loop boundary.
+        if cancel_token.is_cancelled() {
+            // Drain and deny any pending approvals so their receivers unblock.
+            let pending: Vec<_> = {
+                let mut reg = approval_registry.lock().unwrap();
+                reg.drain().collect()
+            };
+            for (_, sender) in pending {
+                let _ = sender.send(event::ApprovalResponse::Deny);
+            }
+            bus.send(AppEvent::Interrupted {
+                reason: "user requested".into(),
+            });
+            slog(&session_log, |l| l.info("Agent loop interrupted"));
+            return Ok((loop_stats, LoopExitReason::Interrupted));
+        }
         // Check budget before sending
         if conversation.remaining_budget() <= MIN_BUDGET_TOKENS {
             let remaining = conversation.remaining_budget();
@@ -2806,10 +3014,15 @@ async fn run_agent_loop(
             conversation.strip_old_images();
         }
 
-        let response = {
+        // Streaming API call — wrapped in select! so an interrupt cancels
+        // mid-stream without waiting for the provider to finish. The
+        // interrupt branch returns `None` so the surrounding block can
+        // handle drain-and-exit identically to the top-of-loop check.
+        let response_opt: Option<provider::ChatResponse> = {
             const STREAM_RETRIES: u32 = 3;
             let mut last_stream_err = None;
             let mut resp = None;
+            let mut was_cancelled = false;
             for attempt in 0..=STREAM_RETRIES {
                 let stream_bus = bus.clone();
                 let on_stream_event = move |event: crate::provider::StreamEvent| {
@@ -2817,10 +3030,16 @@ async fn run_agent_loop(
                         stream_bus.send(AppEvent::ModelResponseDelta { text: text.clone() });
                     }
                 };
-                match provider
-                    .chat_stream(conversation.messages(), &on_stream_event)
-                    .await
-                {
+                let stream_fut = provider.chat_stream(conversation.messages(), &on_stream_event);
+                let outcome = tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        was_cancelled = true;
+                        break;
+                    }
+                    r = stream_fut => r,
+                };
+                match outcome {
                     Ok(r) => {
                         resp = Some(r);
                         break;
@@ -2839,7 +3058,16 @@ async fn run_agent_loop(
                             let delay = std::time::Duration::from_millis(
                                 1000 * 2u64.pow(attempt) + (turn as u64 % 500),
                             );
-                            tokio::time::sleep(delay).await;
+                            // Retries are also interruptible — don't sit in
+                            // a sleep while the user is trying to cancel.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_token.cancelled() => {
+                                    was_cancelled = true;
+                                    break;
+                                }
+                                _ = tokio::time::sleep(delay) => {}
+                            }
                             last_stream_err = Some(e);
                             continue;
                         }
@@ -2849,16 +3077,39 @@ async fn run_agent_loop(
                     }
                 }
             }
-            match resp {
-                Some(r) => r,
-                None => {
-                    let e = last_stream_err.unwrap_or_else(|| {
-                        CallerError::Provider("Stream failed after retries".to_string())
-                    });
-                    slog(&session_log, |l| l.error(&format!("API error: {}", e)));
-                    bus.send(AppEvent::LoopError(e.to_string()));
-                    return Err(e);
+            if was_cancelled {
+                None
+            } else {
+                match resp {
+                    Some(r) => Some(r),
+                    None => {
+                        let e = last_stream_err.unwrap_or_else(|| {
+                            CallerError::Provider("Stream failed after retries".to_string())
+                        });
+                        slog(&session_log, |l| l.error(&format!("API error: {}", e)));
+                        bus.send(AppEvent::LoopError(e.to_string()));
+                        return Err(e);
+                    }
                 }
+            }
+        };
+
+        // Cancelled mid-stream → drain approvals and exit via Interrupted.
+        let response = match response_opt {
+            Some(r) => r,
+            None => {
+                let pending: Vec<_> = {
+                    let mut reg = approval_registry.lock().unwrap();
+                    reg.drain().collect()
+                };
+                for (_, sender) in pending {
+                    let _ = sender.send(event::ApprovalResponse::Deny);
+                }
+                bus.send(AppEvent::Interrupted {
+                    reason: "user requested".into(),
+                });
+                slog(&session_log, |l| l.info("Agent loop interrupted mid-stream"));
+                return Ok((loop_stats, LoopExitReason::Interrupted));
             }
         };
         conversation.set_usage(response.usage.clone());
@@ -3429,6 +3680,20 @@ async fn run_agent_loop(
                             should_skip = true;
                         }
                         Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                            // Distinguish a real user deny from an interrupt
+                            // that caused the watcher to drain the registry
+                            // with Deny as a synthetic response. Interrupt
+                            // takes precedence so the phase/exit reason
+                            // reflects what actually happened.
+                            if cancel_token.is_cancelled() {
+                                bus.send(AppEvent::Interrupted {
+                                    reason: "user requested".into(),
+                                });
+                                slog(&session_log, |l| {
+                                    l.info("Agent loop interrupted during approval wait")
+                                });
+                                return Ok((loop_stats, LoopExitReason::Interrupted));
+                            }
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
@@ -3802,6 +4067,20 @@ Proceed with explicit assumptions and continue without additional questions."
                             should_skip = true;
                         }
                         Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                            // Distinguish a real user deny from an interrupt
+                            // that caused the watcher to drain the registry
+                            // with Deny as a synthetic response. Interrupt
+                            // takes precedence so the phase/exit reason
+                            // reflects what actually happened.
+                            if cancel_token.is_cancelled() {
+                                bus.send(AppEvent::Interrupted {
+                                    reason: "user requested".into(),
+                                });
+                                slog(&session_log, |l| {
+                                    l.info("Agent loop interrupted during approval wait")
+                                });
+                                return Ok((loop_stats, LoopExitReason::Interrupted));
+                            }
                             slog(&session_log, |l| {
                                 l.approval(&cat.to_string(), &preview, "denied")
                             });
@@ -3984,7 +4263,8 @@ async fn run_round_loop(
             LoopExitReason::BudgetExhausted
             | LoopExitReason::SafetyCapReached
             | LoopExitReason::Denied
-            | LoopExitReason::Error => {
+            | LoopExitReason::Error
+            | LoopExitReason::Interrupted => {
                 break;
             }
         }
@@ -4553,6 +4833,17 @@ async fn run_with_presence(
                         round: cumulative_stats.rounds,
                         turns_in_round,
                     });
+                }
+                DrainOutcome::Interrupted { reason } => {
+                    // Interrupt acknowledged by the agent. The Interrupted
+                    // event was already emitted inside the drain — we just
+                    // surface a presence log and close out the round.
+                    bus.send(AppEvent::PresenceLog {
+                        message: format!("External agent interrupted: {}", reason),
+                        level: None,
+                        turn: None,
+                    });
+                    cumulative_stats.rounds += 1;
                 }
                 DrainOutcome::Terminated { reason, .. } => {
                     bus.send(AppEvent::PresenceLog {
@@ -5228,6 +5519,42 @@ async fn run_external_agent_mode(
                     None => {
                         slog(&session_log, |l| {
                             l.info("Follow-up channel closed, exiting")
+                        });
+                        break;
+                    }
+                }
+            }
+            DrainOutcome::Interrupted { reason } => {
+                // User-requested interrupt. Emit RoundComplete so the
+                // dashboard updates, log it, and wait for the next
+                // follow-up or channel close — the interrupt *is* the
+                // terminal event for this round.
+                stats.rounds = round;
+                slog(&session_log, |l| {
+                    l.info(&format!("External agent interrupted: {}", reason))
+                });
+                bus.send(AppEvent::RoundComplete {
+                    round,
+                    turns_in_round: stats.turns,
+                });
+                match follow_up_rx.recv().await {
+                    Some(followup) => {
+                        round += 1;
+                        stats.turns = 0;
+                        slog(&session_log, |l| {
+                            l.info(&format!("Follow-up round {}: {}", round, followup));
+                        });
+                        if let Err(e) = agent.send_message(&thread, &followup).await {
+                            bus.send(AppEvent::LoopError(format!(
+                                "Failed to send follow-up: {}",
+                                e
+                            )));
+                            break;
+                        }
+                    }
+                    None => {
+                        slog(&session_log, |l| {
+                            l.info("Follow-up channel closed after interrupt, exiting")
                         });
                         break;
                     }

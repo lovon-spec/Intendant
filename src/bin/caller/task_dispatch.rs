@@ -159,6 +159,13 @@ impl Dispatcher {
                 self.warn_drop(bus, "FollowUp", &text);
             }
 
+            ControlMsg::Interrupt { expected_turn: _ } => {
+                // Re-emit as AppEvent::InterruptRequested so agent loops can subscribe
+                // and cancel their own work. The dispatcher itself doesn't hold loop
+                // handles — loops register interest via the bus.
+                bus.send(AppEvent::InterruptRequested);
+            }
+
             _ => {
                 // Not a task-dispatch command — ignore.
             }
@@ -393,5 +400,43 @@ mod tests {
         bus.send(AppEvent::ControlCommand(ControlMsg::Status));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(task_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn interrupt_emits_interrupt_requested() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Interrupt {
+            expected_turn: None,
+        }));
+
+        // Drain events until we see an InterruptRequested, or time out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_interrupt_requested = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::InterruptRequested)) => {
+                    saw_interrupt_requested = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_interrupt_requested,
+            "expected AppEvent::InterruptRequested to be emitted"
+        );
     }
 }

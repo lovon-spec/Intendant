@@ -474,7 +474,8 @@ async fn start_task_with_state(
         | Phase::RunningAgent
         | Phase::Orchestrating
         | Phase::WaitingApproval
-        | Phase::WaitingHuman => {
+        | Phase::WaitingHuman
+        | Phase::Interrupting => {
             return Err(format!(
                 "agent is currently in '{}' phase",
                 phase_to_str(&s.phase)
@@ -499,7 +500,7 @@ async fn start_task_with_state(
                 // No follow-up channel — treat as fresh start
             }
         }
-        Phase::Idle | Phase::Done => {}
+        Phase::Idle | Phase::Done | Phase::Interrupted => {}
     }
 
     let launcher = s
@@ -1737,6 +1738,12 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "delete_recording", true, format!("Deleting {}", stream_name), None);
             None
         }
+        ControlMsg::Interrupt { expected_turn: _ } => {
+            // Re-broadcast as an AppEvent so the dispatcher / agent loops pick it up.
+            bus.send(AppEvent::InterruptRequested);
+            emit_control_result(control_tx, "interrupt", true, "Interrupt requested".to_string(), None);
+            Some(RESOURCE_STATUS_URI)
+        }
     }
 }
 
@@ -1752,6 +1759,8 @@ fn phase_to_str(phase: &Phase) -> &'static str {
         Phase::WaitingFollowUp => "waiting_follow_up",
         Phase::Idle => "idle",
         Phase::Done => "done",
+        Phase::Interrupting => "interrupting",
+        Phase::Interrupted => "interrupted",
     }
 }
 
@@ -2209,6 +2218,16 @@ pub fn spawn_event_listener(
                     }
                     AppEvent::DisplayApprovalPending { display_id, backend } => {
                         s.push_log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
+                    }
+                    AppEvent::InterruptRequested => {
+                        s.set_phase(Phase::Interrupting);
+                        s.push_log(LogLevel::Info, "Interrupt requested".to_string());
+                        resource_changed = Some("intendant://status");
+                    }
+                    AppEvent::Interrupted { ref reason } => {
+                        s.set_phase(Phase::Interrupted);
+                        s.push_log(LogLevel::Info, format!("Interrupted: {}", reason));
+                        resource_changed = Some("intendant://status");
                     }
                 }
             }
@@ -4627,6 +4646,8 @@ mod tests {
         assert_eq!(phase_to_str(&Phase::WaitingFollowUp), "waiting_follow_up");
         assert_eq!(phase_to_str(&Phase::Idle), "idle");
         assert_eq!(phase_to_str(&Phase::Done), "done");
+        assert_eq!(phase_to_str(&Phase::Interrupting), "interrupting");
+        assert_eq!(phase_to_str(&Phase::Interrupted), "interrupted");
     }
 
     #[test]

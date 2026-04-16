@@ -400,6 +400,16 @@ export class PresenceWeb {
         return ret;
     }
     /**
+     * Request interruption of the current agent turn. Sends ControlMsg::Interrupt
+     * via the WebSocket; the backend dispatcher broadcasts InterruptRequested
+     * and agent loops cancel their work.
+     * @returns {any}
+     */
+    send_interrupt() {
+        const ret = wasm.presenceweb_send_interrupt(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * @param {string} key
      * @param {boolean} ctrl
      * @param {boolean} alt

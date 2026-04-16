@@ -708,4 +708,30 @@ mod tests {
         assert_eq!(req["tool_name"], "Bash");
         assert_eq!(req["input"]["command"], "rm -rf /");
     }
+
+    #[tokio::test]
+    async fn interrupt_turn_returns_default_unsupported_error() {
+        // Claude Code's JSONL protocol has no documented mid-turn cancel
+        // today. We keep the trait default so the caller sees a typed error
+        // and can log/escalate without triggering unsafe shutdowns.
+        use crate::external_agent::ExternalAgent;
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            vec![],
+            None,
+        );
+        let err = agent.interrupt_turn().await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("interruption not supported"),
+                    "expected 'interruption not supported' error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
 }

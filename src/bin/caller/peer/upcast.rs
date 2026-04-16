@@ -919,6 +919,18 @@ impl AppEventUpcaster {
             AppEvent::Quit => vec![PeerEvent::Disconnected {
                 reason: "quit".to_string(),
             }],
+
+            // ---- Interruption ----
+            AppEvent::InterruptRequested => vec![log_event(
+                LogLevel::Info,
+                "agent",
+                "interrupt requested".to_string(),
+            )],
+            AppEvent::Interrupted { reason } => vec![log_event(
+                LogLevel::Info,
+                "agent",
+                format!("interrupted: {reason}"),
+            )],
         }
     }
 }
@@ -1608,6 +1620,18 @@ impl WireEventUpcaster {
                     format!("{action}: {message}"),
                 )]
             }
+
+            // ---- Interruption ----
+            OutboundEvent::InterruptRequested => vec![log_event(
+                LogLevel::Info,
+                "agent",
+                "interrupt requested".to_string(),
+            )],
+            OutboundEvent::Interrupted { reason } => vec![log_event(
+                LogLevel::Info,
+                "agent",
+                format!("interrupted: {reason}"),
+            )],
         }
     }
 }

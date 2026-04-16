@@ -135,6 +135,12 @@ pub enum AppEvent {
         reason: String,
         summary: Option<String>,
     },
+    /// User requested interruption; broadcast to agent loops so they can cancel.
+    InterruptRequested,
+    /// The agent turn was interrupted. Emitted by the loop once cancellation completes.
+    Interrupted {
+        reason: String,
+    },
     SessionStarted {
         session_id: String,
         task: Option<String>,
@@ -573,6 +579,13 @@ pub enum ControlMsg {
     DeleteRecording {
         stream_name: String,
     },
+    /// Request interruption of the current agent turn.
+    Interrupt {
+        /// Optional precondition: only interrupt if this turn id is active.
+        /// When None, interrupts whatever is currently running.
+        #[serde(default)]
+        expected_turn: Option<u64>,
+    },
 }
 
 /// The event bus sender. Cloneable for use in multiple tasks.
@@ -651,6 +664,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::TaskComplete { reason, summary } => Some(OutboundEvent::TaskComplete {
             reason: reason.clone(),
             summary: summary.clone(),
+        }),
+        AppEvent::InterruptRequested => Some(OutboundEvent::InterruptRequested),
+        AppEvent::Interrupted { reason } => Some(OutboundEvent::Interrupted {
+            reason: reason.clone(),
         }),
         AppEvent::SessionStarted { session_id, task } => {
             Some(OutboundEvent::SessionStarted {
@@ -977,6 +994,12 @@ fn write_event_to_session_log(
         }
         AppEvent::TaskComplete { reason, summary } => {
             log.task_complete(reason, summary.as_deref());
+        }
+        AppEvent::InterruptRequested => {
+            log.info("Interrupt requested");
+        }
+        AppEvent::Interrupted { reason } => {
+            log.info(&format!("Interrupted: {}", reason));
         }
         AppEvent::SessionStarted { session_id, task } => {
             log.session_started(session_id, task.as_deref());

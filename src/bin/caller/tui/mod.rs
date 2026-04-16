@@ -270,6 +270,8 @@ mod tests {
             app::Phase::WaitingFollowUp,
             app::Phase::Idle,
             app::Phase::Done,
+            app::Phase::Interrupting,
+            app::Phase::Interrupted,
         ];
 
         for phase in phases {

@@ -1414,6 +1414,10 @@ impl App {
             | ControlMsg::StartRecording { .. }
             | ControlMsg::StopRecording { .. }
             | ControlMsg::DeleteRecording { .. } => {}
+            ControlMsg::Interrupt { .. } => {
+                // Dispatcher re-emits as AppEvent::InterruptRequested; TUI
+                // reacts to that event rather than the raw ControlMsg.
+            }
         }
     }
 
@@ -2120,6 +2124,28 @@ impl App {
             }
             AppEvent::DisplayApprovalPending { display_id, backend } => {
                 self.log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
+            }
+            AppEvent::InterruptRequested => {
+                self.current_phase = Phase::Interrupting;
+                self.log(LogLevel::Info, "Interrupt requested".to_string());
+                derived.push(AppEvent::StatusUpdate {
+                    turn: self.turn,
+                    phase: format!("{:?}", self.current_phase).to_lowercase(),
+                    autonomy: self.autonomy_display.clone(),
+                    session_id: self.session_id.clone(),
+                    task: self.task_description.clone(),
+                });
+            }
+            AppEvent::Interrupted { ref reason } => {
+                self.current_phase = Phase::Interrupted;
+                self.log(LogLevel::Info, format!("Interrupted: {}", reason));
+                derived.push(AppEvent::StatusUpdate {
+                    turn: self.turn,
+                    phase: format!("{:?}", self.current_phase).to_lowercase(),
+                    autonomy: self.autonomy_display.clone(),
+                    session_id: self.session_id.clone(),
+                    task: self.task_description.clone(),
+                });
             }
         }
 

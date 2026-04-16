@@ -868,6 +868,26 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 message: "Safety cap reached (500 turns)".to_string(),
             })
         }
+        AppEvent::InterruptRequested => {
+            let new_phase = "interrupting".to_string();
+            let changed = *last_phase != new_phase;
+            *last_phase = new_phase.clone();
+            if changed {
+                Some(PresenceEvent::PhaseChanged { phase: new_phase })
+            } else {
+                None
+            }
+        }
+        AppEvent::Interrupted { .. } => {
+            let new_phase = "interrupted".to_string();
+            let changed = *last_phase != new_phase;
+            *last_phase = new_phase.clone();
+            if changed {
+                Some(PresenceEvent::PhaseChanged { phase: new_phase })
+            } else {
+                None
+            }
+        }
         // Display lifecycle events — not pushed to presence (avoids unnecessary
         // inference calls). Display state is available via check_status when the
         // model needs it for routing decisions.

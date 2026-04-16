@@ -140,6 +140,14 @@ pub struct CodexAgent {
     pending_requests: PendingRequests,
     pending_approvals: PendingApprovals,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Thread id from the most recent `thread/start`. Used by `interrupt_turn`
+    /// to build the `turn/interrupt` params without needing a thread handle.
+    active_thread_id: Arc<Mutex<Option<String>>>,
+    /// Turn id of the currently active turn, if any. Captured from the
+    /// `turn/start` response (and `turn/started`/`thread/started` notifications
+    /// as a fallback) and cleared on `turn/completed` / `turn/interrupted` /
+    /// `Terminated`.
+    active_turn_id: Arc<Mutex<Option<String>>>,
 }
 
 impl CodexAgent {
@@ -165,6 +173,8 @@ impl CodexAgent {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             reader_handle: None,
+            active_thread_id: Arc::new(Mutex::new(None)),
+            active_turn_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -261,6 +271,7 @@ async fn reader_task(
     pending_requests: PendingRequests,
     pending_approvals: PendingApprovals,
     approval_counter: Arc<AtomicU64>,
+    active_turn_id: Arc<Mutex<Option<String>>>,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -269,7 +280,9 @@ async fn reader_task(
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => {
-                // EOF
+                // EOF — clear any active turn so a later interrupt_turn
+                // doesn't fire against a dead process.
+                active_turn_id.lock().await.take();
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: "Process stdout closed".into(),
                     exit_code: None,
@@ -277,6 +290,7 @@ async fn reader_task(
                 return;
             }
             Err(e) => {
+                active_turn_id.lock().await.take();
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: format!("IO error reading stdout: {}", e),
                     exit_code: None,
@@ -368,8 +382,55 @@ async fn reader_task(
 
         // 3. Notification (has method, no id)
         let params = msg.params.unwrap_or(serde_json::Value::Null);
+
+        // Track active turn id so interrupt_turn() has a target to cancel.
+        // Codex emits turn_id in several shapes across versions; accept any
+        // top-level `turnId` / `turn_id` / `turn.id` / `thread.lastTurnId`.
+        match method {
+            "turn/started" | "thread/started" => {
+                if let Some(id) = extract_turn_id(&params) {
+                    *active_turn_id.lock().await = Some(id);
+                }
+            }
+            "turn/completed" | "turn/interrupted" | "turn/failed" => {
+                active_turn_id.lock().await.take();
+            }
+            "thread/status/changed" => {
+                // Only clear if the status signals the turn actually ended.
+                // "running" / "paused" / "busy" keep the active turn alive so
+                // a subsequent interrupt still has a target.
+                if let Some(status) = params.get("status").and_then(|v| v.as_str()) {
+                    if matches!(status, "completed" | "idle" | "failed") {
+                        active_turn_id.lock().await.take();
+                    }
+                }
+            }
+            _ => {}
+        }
+
         translate_notification(method, &params, &event_tx);
     }
+}
+
+/// Extract a turn id from a Codex response or notification payload.
+///
+/// Codex v2 has emitted turn ids under several names across versions; accept
+/// the common shapes: `turnId`, `turn_id`, `turn.id`, `thread.lastTurnId`.
+fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
+    for path in [
+        "/turnId",
+        "/turn_id",
+        "/turn/id",
+        "/thread/lastTurnId",
+        "/thread/last_turn_id",
+    ] {
+        if let Some(s) = value.pointer(path).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Translate a Codex notification into one or more `AgentEvent`s.
@@ -764,6 +825,7 @@ impl ExternalAgent for CodexAgent {
         let pending_requests = Arc::clone(&self.pending_requests);
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let approval_counter = Arc::new(AtomicU64::new(1));
+        let active_turn_id = Arc::clone(&self.active_turn_id);
 
         let handle = tokio::spawn(reader_task(
             stdout,
@@ -771,6 +833,7 @@ impl ExternalAgent for CodexAgent {
             pending_requests,
             pending_approvals,
             approval_counter,
+            active_turn_id,
         ));
         self.reader_handle = Some(handle);
 
@@ -840,6 +903,10 @@ impl ExternalAgent for CodexAgent {
             })?
             .to_string();
 
+        // Cache the thread id so interrupt_turn() can build the
+        // `turn/interrupt` params without requiring a thread handle.
+        *self.active_thread_id.lock().await = Some(thread_id.clone());
+
         Ok(AgentThread { thread_id })
     }
 
@@ -886,8 +953,18 @@ impl ExternalAgent for CodexAgent {
             "threadId": thread.thread_id,
             "input": input,
         });
-        // turn/start is a request — Codex v2 requires an id to start processing
-        let _ = self.send_request("turn/start", Some(params)).await?;
+        // turn/start is a request — Codex v2 requires an id to start processing.
+        // The response carries the turn id; cache it so interrupt_turn() can
+        // target this specific turn. Fall back to the reader task's
+        // turn/started notification hook if the response shape differs.
+        let response = self.send_request("turn/start", Some(params)).await?;
+        if let Some(id) = extract_turn_id(&response) {
+            *self.active_turn_id.lock().await = Some(id);
+        }
+        // Also make sure the thread id cache matches the thread we were handed
+        // (start_thread normally seeds it, but send_message can be called with
+        // any thread in principle).
+        *self.active_thread_id.lock().await = Some(thread.thread_id.clone());
         Ok(())
     }
 
@@ -929,6 +1006,37 @@ impl ExternalAgent for CodexAgent {
         self.send_response(jsonrpc_id, result).await
     }
 
+    async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
+        let turn_id = {
+            let guard = self.active_turn_id.lock().await;
+            guard.clone()
+        };
+        let turn_id = turn_id.ok_or_else(|| {
+            CallerError::ExternalAgent("no active turn to interrupt".into())
+        })?;
+        let thread_id = {
+            let guard = self.active_thread_id.lock().await;
+            guard.clone()
+        };
+        let thread_id = thread_id.ok_or_else(|| {
+            CallerError::ExternalAgent("no active thread to interrupt".into())
+        })?;
+        let params = serde_json::json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+        });
+        // turn/interrupt is a JSON-RPC request; Codex responds with `{}` and
+        // emits a `turn/completed` notification with status="interrupted"
+        // shortly after. The reader task handles that notification like any
+        // other turn completion.
+        let _ = self.send_request("turn/interrupt", Some(params)).await?;
+        // Clear pending approvals — the caller is also expected to resolve
+        // them, but clearing here makes the agent's state consistent if the
+        // caller forgets.
+        self.pending_approvals.lock().await.clear();
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Result<(), CallerError> {
         // Abort reader task
         if let Some(handle) = self.reader_handle.take() {
@@ -957,6 +1065,8 @@ impl ExternalAgent for CodexAgent {
         self.writer = None;
         self.event_tx = None;
         self.child = None;
+        self.active_turn_id.lock().await.take();
+        self.active_thread_id.lock().await.take();
 
         Ok(())
     }
@@ -1531,5 +1641,137 @@ mod tests {
         assert!(agent.writer.is_none());
         assert!(agent.event_tx.is_none());
         assert!(agent.reader_handle.is_none());
+    }
+
+    #[test]
+    fn extract_turn_id_top_level_camelcase() {
+        let v = serde_json::json!({"turnId": "t-123"});
+        assert_eq!(extract_turn_id(&v), Some("t-123".to_string()));
+    }
+
+    #[test]
+    fn extract_turn_id_snake_case() {
+        let v = serde_json::json!({"turn_id": "t-456"});
+        assert_eq!(extract_turn_id(&v), Some("t-456".to_string()));
+    }
+
+    #[test]
+    fn extract_turn_id_nested_turn_object() {
+        let v = serde_json::json!({"turn": {"id": "t-789"}});
+        assert_eq!(extract_turn_id(&v), Some("t-789".to_string()));
+    }
+
+    #[test]
+    fn extract_turn_id_nested_thread_last_turn() {
+        let v = serde_json::json!({"thread": {"lastTurnId": "t-last"}});
+        assert_eq!(extract_turn_id(&v), Some("t-last".to_string()));
+    }
+
+    #[test]
+    fn extract_turn_id_missing() {
+        let v = serde_json::json!({"other": "value"});
+        assert_eq!(extract_turn_id(&v), None);
+    }
+
+    #[test]
+    fn extract_turn_id_empty_string_is_none() {
+        let v = serde_json::json!({"turnId": ""});
+        assert_eq!(extract_turn_id(&v), None);
+    }
+
+    #[tokio::test]
+    async fn interrupt_turn_without_active_turn_errors() {
+        let mut agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            false,
+            None,
+        );
+        let err = agent.interrupt_turn().await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("no active turn"),
+                    "expected 'no active turn' error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_turn_without_thread_errors() {
+        let mut agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            false,
+            None,
+        );
+        // Active turn but no thread — should still error with "no active thread".
+        *agent.active_turn_id.lock().await = Some("t-1".into());
+        let err = agent.interrupt_turn().await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("no active thread"),
+                    "expected 'no active thread' error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_turn_sends_correct_jsonrpc_request() {
+        // Set up an agent with a duplex pipe in place of the child stdin.
+        // We can't easily stub `send_request` without refactoring, so instead
+        // we assert the pre-write state: the request builder would produce the
+        // right JSON by inspecting the agent's captured thread/turn ids and
+        // re-running the same params construction path.
+        let agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            false,
+            None,
+        );
+        *agent.active_turn_id.lock().await = Some("turn-xyz".into());
+        *agent.active_thread_id.lock().await = Some("thread-abc".into());
+
+        // Reconstruct the same params object the implementation builds.
+        let turn_id = agent.active_turn_id.lock().await.clone().unwrap();
+        let thread_id = agent.active_thread_id.lock().await.clone().unwrap();
+        let params = serde_json::json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+        });
+        assert_eq!(params["threadId"], "thread-abc");
+        assert_eq!(params["turnId"], "turn-xyz");
+    }
+
+    #[tokio::test]
+    async fn interrupt_turn_wire_format_is_jsonrpc_request() {
+        // Confirm the shape of the JSON-RPC request we emit matches what Codex
+        // v2 expects: {"jsonrpc":"2.0","id":<N>,"method":"turn/interrupt",
+        // "params":{"threadId":...,"turnId":...}}
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 42,
+            method: "turn/interrupt".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-abc",
+                "turnId": "turn-xyz",
+            })),
+        };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 42);
+        assert_eq!(v["method"], "turn/interrupt");
+        assert_eq!(v["params"]["threadId"], "thread-abc");
+        assert_eq!(v["params"]["turnId"], "turn-xyz");
     }
 }

@@ -47,6 +47,14 @@ struct JsonRpcRequest {
 }
 
 #[derive(Serialize)]
+struct JsonRpcNotification {
+    jsonrpc: String,
+    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
 struct JsonRpcResponse {
     jsonrpc: String,
     id: u64,
@@ -114,6 +122,10 @@ pub struct GeminiAgent {
     pending_requests: PendingRequests,
     pending_approvals: PendingApprovals,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Active ACP session id captured from the most recent `session/new`
+    /// response. Used by `interrupt_turn` to build the `session/cancel`
+    /// notification without needing a thread handle.
+    session_id: Option<String>,
 }
 
 fn home_gemini_settings_path() -> Option<std::path::PathBuf> {
@@ -187,6 +199,7 @@ impl GeminiAgent {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             reader_handle: None,
+            session_id: None,
         }
     }
 
@@ -237,6 +250,30 @@ impl GeminiAgent {
             result,
         };
         let line = serde_json::to_string(&response)?;
+        let shared = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
+        let mut writer = shared.lock().await;
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    /// Send a JSON-RPC notification (no response expected). Used for ACP
+    /// methods like `session/cancel` that are fire-and-forget.
+    async fn send_notification(
+        &mut self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), CallerError> {
+        let notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params,
+        };
+        let line = serde_json::to_string(&notification)?;
         let shared = self
             .writer
             .as_ref()
@@ -902,6 +939,9 @@ impl ExternalAgent for GeminiAgent {
             })?
             .to_string();
 
+        // Cache for interrupt_turn — the trait method doesn't take a thread.
+        self.session_id = Some(session_id.clone());
+
         Ok(AgentThread {
             thread_id: session_id,
         })
@@ -1066,6 +1106,25 @@ impl ExternalAgent for GeminiAgent {
         self.send_response(jsonrpc_id, outcome).await
     }
 
+    async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
+        let session_id = self
+            .session_id
+            .as_ref()
+            .ok_or_else(|| CallerError::ExternalAgent("no active session".into()))?
+            .clone();
+        let params = serde_json::json!({ "sessionId": session_id });
+        // ACP `session/cancel` is a notification (no response). The agent
+        // MUST respond to the pending `session/prompt` request with
+        // `StopReason::Cancelled` after receiving it — the existing
+        // pending-request path surfaces that as TurnCompleted regardless of
+        // the stop reason string, so no special-case handling is needed.
+        self.send_notification("session/cancel", Some(params)).await?;
+        // Clear pending approval mappings — any outstanding approval
+        // requests will be abandoned by the agent anyway.
+        self.pending_approvals.lock().await.clear();
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Result<(), CallerError> {
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
@@ -1082,6 +1141,7 @@ impl ExternalAgent for GeminiAgent {
         self.writer = None;
         self.event_tx = None;
         self.child = None;
+        self.session_id = None;
 
         Ok(())
     }
@@ -1437,5 +1497,38 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown action");
         assert_eq!(title, "unknown action");
+    }
+
+    #[tokio::test]
+    async fn interrupt_turn_without_session_errors() {
+        let mut agent = GeminiAgent::new("gemini".into(), None, None);
+        let err = agent.interrupt_turn().await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("no active session"),
+                    "expected 'no active session' error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interrupt_turn_wire_format_is_notification() {
+        // ACP `session/cancel` must be a notification (no `id` field) and
+        // carry `{"sessionId": ...}` as its params.
+        let notif = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/cancel".to_string(),
+            params: Some(serde_json::json!({"sessionId": "sess-xyz"})),
+        };
+        let json = serde_json::to_string(&notif).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "session/cancel");
+        assert!(v.get("id").is_none(), "notification must not have an id");
+        assert_eq!(v["params"]["sessionId"], "sess-xyz");
     }
 }

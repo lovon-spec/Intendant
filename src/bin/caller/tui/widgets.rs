@@ -147,7 +147,10 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App, view: &ViewState)
 
 /// Render the action panel (2 lines).
 pub fn render_action_panel(f: &mut Frame, area: Rect, app: &App) {
-    let spinner = if app.current_phase != Phase::Done && app.current_phase != Phase::Idle {
+    let spinner = if app.current_phase != Phase::Done
+        && app.current_phase != Phase::Idle
+        && app.current_phase != Phase::Interrupted
+    {
         let idx = app.tick_count % theme::SPINNER_FRAMES.len();
         theme::SPINNER_FRAMES[idx]
     } else {
@@ -163,6 +166,8 @@ pub fn render_action_panel(f: &mut Frame, area: Rect, app: &App) {
         Phase::WaitingFollowUp => ("Awaiting follow-up...".to_string(), "waiting"),
         Phase::Idle => ("Idle".to_string(), "done"),
         Phase::Done => ("Done".to_string(), "done"),
+        Phase::Interrupting => ("Interrupting...".to_string(), "waiting"),
+        Phase::Interrupted => ("Interrupted".to_string(), "done"),
     };
 
     let style = theme::action_style_for_phase(phase_key);

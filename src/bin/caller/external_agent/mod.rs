@@ -229,6 +229,22 @@ pub trait ExternalAgent: Send + Sync {
         decision: ApprovalDecision,
     ) -> Result<(), CallerError>;
 
+    /// Request interruption of the current turn. Default implementation is a no-op
+    /// for backends that don't support mid-turn interruption.
+    ///
+    /// Backends that implement this should:
+    /// - Send their protocol-specific cancel/interrupt message
+    /// - Clean up any pending approval state
+    /// - Let the reader task emit a final TurnCompleted or Terminated event
+    ///
+    /// This is a best-effort — if the backend can't cleanly interrupt, it may
+    /// return an error or the caller may need to escalate to `shutdown()`.
+    async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
+        Err(CallerError::ExternalAgent(
+            "interruption not supported by this backend".into(),
+        ))
+    }
+
     /// Shut down the agent process.
     async fn shutdown(&mut self) -> Result<(), CallerError>;
 }

@@ -526,9 +526,9 @@ impl AppState {
             }
         }
 
-        // Follow-up panel for idle/done phases
+        // Follow-up panel for idle/done/interrupted phases
         let np = phase.replace('_', "");
-        if np == "waitingfollowup" || np == "idle" || np == "done" {
+        if np == "waitingfollowup" || np == "idle" || np == "done" || np == "interrupted" {
             cmds.push(UiCommand::ShowFollowUp);
         }
 
@@ -787,6 +787,29 @@ impl AppState {
                     _ => format!("Task complete: {}", reason),
                 };
                 cmds.extend(self.add_log("info", &text, None, "worker"));
+                cmds.push(UiCommand::ShowFollowUp);
+            }
+
+            "interrupt_requested" => {
+                // Log entry only — the `status` event carrying phase="interrupting"
+                // drives the UI state transition. Keeping the log entry visible at
+                // normal verbosity so users see their click was received.
+                cmds.extend(self.add_log("info", "Interrupt requested", None, "system"));
+            }
+
+            "interrupted" => {
+                let reason = msg["reason"].as_str().unwrap_or("user requested").to_string();
+                self.phase = "interrupted".to_string();
+                self.pending_approval_id = None;
+
+                cmds.push(UiCommand::HideAllPanels);
+                cmds.push(UiCommand::SetPhase { phase: "interrupted".into() });
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!("Agent interrupted: {}", reason),
+                    None,
+                    "system",
+                ));
                 cmds.push(UiCommand::ShowFollowUp);
             }
 
@@ -1895,5 +1918,77 @@ mod tests {
         let cmds = s.handle_log_replay(&entries);
         assert!(s.changed_files.contains_key("src/lib.rs"));
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::FileChanged { .. })));
+    }
+
+    #[test]
+    fn handle_event_interrupt_requested_logs() {
+        let mut s = AppState::new();
+        let msg = json!({"event": "interrupt_requested"});
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. } if content == "Interrupt requested"
+        )));
+    }
+
+    #[test]
+    fn handle_event_interrupted_transitions_phase_and_logs() {
+        let mut s = AppState::new();
+        s.phase = "running".to_string();
+        let msg = json!({"event": "interrupted", "reason": "test"});
+        let cmds = s.handle_message(&msg);
+        assert_eq!(s.phase, "interrupted");
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SetPhase { phase } if phase == "interrupted"
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if content == "Agent interrupted: test" && level == "warn"
+        )));
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowFollowUp)));
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::HideAllPanels)));
+    }
+
+    #[test]
+    fn handle_event_interrupted_default_reason() {
+        let mut s = AppState::new();
+        let msg = json!({"event": "interrupted"});
+        let cmds = s.handle_message(&msg);
+        assert_eq!(s.phase, "interrupted");
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. }
+                if content == "Agent interrupted: user requested"
+        )));
+    }
+
+    #[test]
+    fn handle_state_snapshot_interrupted_shows_follow_up() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "t": "state_snapshot",
+            "state": { "turn": 2, "budget_pct": 10.0, "phase": "interrupted" },
+        });
+        let cmds = s.handle_message(&msg);
+        assert_eq!(s.phase, "interrupted");
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowFollowUp)));
+    }
+
+    #[test]
+    fn status_event_with_interrupting_phase() {
+        let mut s = AppState::new();
+        // Interrupting is a transient phase — backend emits it via the `status`
+        // event while cancellation is in flight. The handler already threads
+        // arbitrary phase strings through, so no special handling is needed
+        // beyond verifying the state transition works.
+        let msg = json!({"event": "status", "phase": "interrupting"});
+        let cmds = s.handle_message(&msg);
+        assert_eq!(s.phase, "interrupting");
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SetPhase { phase } if phase == "interrupting"
+        )));
     }
 }

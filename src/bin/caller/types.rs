@@ -20,6 +20,10 @@ pub enum Phase {
     WaitingFollowUp,
     Idle,
     Done,
+    /// Transient state while an interrupt is being processed.
+    Interrupting,
+    /// The turn was interrupted by the user.
+    Interrupted,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +350,10 @@ pub enum OutboundEvent {
         kind: String,
         lines_added: u32,
         lines_removed: u32,
+    },
+    InterruptRequested,
+    Interrupted {
+        reason: String,
     },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
