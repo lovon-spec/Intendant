@@ -111,6 +111,12 @@ fn pick_next_display_stream_name(recordings_dir: &Path, display_id: u32) -> Stri
 /// check, the outer code emits `RecordingStarted` for a process that's already
 /// dead and the user gets an empty/unplayable mp4.
 ///
+/// Uses sleep + `try_wait` rather than `child.wait()` because tokio's
+/// `wait()` synchronously drops `self.stdin` (to prevent deadlocks) the
+/// moment it's called — which would close our image2pipe stdin pipe before
+/// the caller ever feeds a frame, making every frame-fed recording die
+/// with `Error opening input: End of file`.
+///
 /// Returns Ok if ffmpeg is still running after the grace window, Err with a
 /// tail of `ffmpeg.log` if it already exited.
 async fn verify_ffmpeg_started(
@@ -118,24 +124,33 @@ async fn verify_ffmpeg_started(
     log_path: &Path,
     context: &str,
 ) -> Result<(), String> {
-    tokio::select! {
-        wait_result = child.wait() => {
-            let status = match wait_result {
-                Ok(s) => format!("exit {}", s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())),
-                Err(e) => format!("wait error: {}", e),
-            };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    match child.try_wait() {
+        Ok(None) => Ok(()),
+        Ok(Some(status)) => {
             let log = std::fs::read_to_string(log_path).unwrap_or_default();
             let tail_lines: Vec<&str> = log.lines().rev().take(10).collect();
             let tail: Vec<&str> = tail_lines.into_iter().rev().collect();
             let tail = tail.join(" | ");
+            let status = format!(
+                "exit {}",
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string())
+            );
             Err(format!(
                 "ffmpeg ({}) exited immediately ({}): {}",
                 context,
                 status,
-                if tail.is_empty() { "no stderr captured".to_string() } else { tail }
+                if tail.is_empty() {
+                    "no stderr captured".to_string()
+                } else {
+                    tail
+                }
             ))
         }
-        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => Ok(()),
+        Err(e) => Err(format!("ffmpeg ({}): try_wait failed: {}", context, e)),
     }
 }
 
@@ -670,36 +685,44 @@ fn parse_segment_csv(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
 }
 
 /// Convert a raw display frame into a JPEG for piping into ffmpeg.
-/// Handles both RGBA and BGRA input and strips any stride padding.
+///
+/// Writes RGB (not RGBA): the `image` crate's JPEG encoder does not support
+/// the `Rgba8` color type, so carrying the alpha channel through would make
+/// `write_to` fail with "does not support color type Rgba8". JPEG is opaque
+/// anyway, so the alpha byte is simply dropped during conversion.
+///
+/// Handles both source orderings (BGRA from Wayland/X11, RGBA from other
+/// backends) and strips any stride row padding.
 fn frame_to_jpeg(frame: &crate::display::Frame) -> Option<Vec<u8>> {
-    let row_bytes = frame.width as usize * 4;
+    let w = frame.width as usize;
+    let h = frame.height as usize;
     let stride = frame.stride as usize;
-    let rgba_data = match frame.format {
-        crate::display::FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
-        crate::display::FrameFormat::Rgba => {
-            let mut tight = Vec::with_capacity(row_bytes * frame.height as usize);
-            for row in 0..frame.height as usize {
-                let start = row * stride;
-                tight.extend_from_slice(&frame.data[start..start + row_bytes]);
-            }
-            tight
-        }
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    match frame.format {
         crate::display::FrameFormat::Bgra => {
-            let mut tight = Vec::with_capacity(row_bytes * frame.height as usize);
-            for row in 0..frame.height as usize {
-                let start = row * stride;
-                for col in 0..frame.width as usize {
-                    let px = start + col * 4;
-                    tight.push(frame.data[px + 2]); // R
-                    tight.push(frame.data[px + 1]); // G
-                    tight.push(frame.data[px]); // B
-                    tight.push(frame.data[px + 3]); // A
+            for row in 0..h {
+                let row_start = row * stride;
+                for col in 0..w {
+                    let px = row_start + col * 4;
+                    rgb.push(frame.data[px + 2]); // R
+                    rgb.push(frame.data[px + 1]); // G
+                    rgb.push(frame.data[px]);     // B
                 }
             }
-            tight
         }
-    };
-    let img = image::RgbaImage::from_raw(frame.width, frame.height, rgba_data)?;
+        crate::display::FrameFormat::Rgba => {
+            for row in 0..h {
+                let row_start = row * stride;
+                for col in 0..w {
+                    let px = row_start + col * 4;
+                    rgb.push(frame.data[px]);     // R
+                    rgb.push(frame.data[px + 1]); // G
+                    rgb.push(frame.data[px + 2]); // B
+                }
+            }
+        }
+    }
+    let img = image::RgbImage::from_raw(frame.width, frame.height, rgb)?;
     let mut buf = std::io::Cursor::new(Vec::new());
     img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
     Some(buf.into_inner())
