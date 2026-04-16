@@ -681,8 +681,14 @@ fn translate_session_update(update: &SessionUpdate) -> Vec<AgentEvent> {
                 }
             }
         }
-        SessionUpdate::AgentThoughtChunk(_) => {
-            // Reasoning — skip for now
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            if let ContentBlock::Text(text) = &chunk.content {
+                if !text.text.is_empty() {
+                    events.push(AgentEvent::Reasoning {
+                        text: text.text.clone(),
+                    });
+                }
+            }
         }
         _ => {
             // Plan, AvailableCommandsUpdate, CurrentModeUpdate, etc. — not mapped
@@ -1107,6 +1113,20 @@ mod tests {
         match &events[0] {
             AgentEvent::MessageDelta { text } => assert_eq!(text, "hello world"),
             _ => panic!("expected MessageDelta, got {:?}", events[0]),
+        }
+    }
+
+    #[test]
+    fn translate_agent_thought_chunk() {
+        use agent_client_protocol_schema::{ContentChunk, TextContent};
+        let update = SessionUpdate::AgentThoughtChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new("Step 1: analyze the page layout"))),
+        );
+        let events = translate_session_update(&update);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::Reasoning { text } => assert_eq!(text, "Step 1: analyze the page layout"),
+            _ => panic!("expected Reasoning, got {:?}", events[0]),
         }
     }
 
