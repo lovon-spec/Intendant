@@ -37,6 +37,7 @@ export const presenceweb_send_follow_up: (a: number, b: number, c: number, d: nu
 export const presenceweb_send_frame: (a: number, b: number, c: number, d: number, e: number) => void;
 export const presenceweb_send_frame_context: (a: number, b: number, c: number) => void;
 export const presenceweb_send_human_response: (a: number, b: number, c: number) => any;
+export const presenceweb_send_interrupt: (a: number) => any;
 export const presenceweb_send_key: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const presenceweb_send_live_usage: (a: number, b: bigint, c: bigint, d: bigint, e: bigint, f: bigint) => void;
 export const presenceweb_send_make_active: (a: number) => number;

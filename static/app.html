@@ -520,6 +520,21 @@ html, body {
 .verbosity-select:focus,
 .host-filter-select:focus { outline: none; border-color: var(--blue); }
 
+/* Stop button — interrupt the current agent turn. Lives in the Activity
+   toolbar and is shown only while a turn is in flight. */
+.stop-btn {
+  background: var(--red);
+  color: var(--base);
+  border: none;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.stop-btn:hover { background: #e06c75; }
+.stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* ── Phase Banner ── */
 .phase-banner {
   display: flex;
@@ -2836,6 +2851,7 @@ html, body {
               <span class="spinner" id="phase-spinner"></span>
               <span class="phase-text" id="phase-text">Idle</span>
             </div>
+            <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
             <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
               <option value="normal" selected>Normal</option>
               <option value="verbose">Verbose</option>
@@ -4910,15 +4926,21 @@ function setPhase(phase) {
     waiting: 'Waiting for Input', waitingapproval: 'Waiting for Approval',
     waitinghuman: 'Waiting for Response', waitingfollowup: 'Waiting for Follow-up',
     orchestrating: 'Orchestrating', done: 'Done',
+    interrupting: 'Interrupting...', interrupted: 'Interrupted',
   };
   const cat = np.startsWith('waiting') ? 'waiting' : np.startsWith('running') ? 'running' :
-    np === 'orchestrating' ? 'thinking' : np;
+    np === 'orchestrating' ? 'thinking' :
+    np === 'interrupting' ? 'waiting' :
+    np === 'interrupted' ? 'done' : np;
   banner.classList.add('phase-' + cat);
   text.textContent = labels[np] || labels[phase] || phase;
 
-  if (phase === 'idle' || phase === 'done') {
+  if (phase === 'idle' || phase === 'done' || phase === 'interrupted') {
     if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
-    document.getElementById('phase-spinner').textContent = phase === 'done' ? '\u2713' : '';
+    const spinnerEl = document.getElementById('phase-spinner');
+    spinnerEl.textContent = phase === 'done' ? '\u2713'
+      : phase === 'interrupted' ? '\u25A0'
+      : '';
   } else if (!spinnerInterval) {
     const el = document.getElementById('phase-spinner');
     spinnerInterval = setInterval(() => {
@@ -4926,6 +4948,7 @@ function setPhase(phase) {
       el.textContent = SPINNER_FRAMES[spinnerIdx];
     }, 80);
   }
+  updateStopButtonVisibility(phase);
 }
 
 function showApproval(id, command, category) {
@@ -10403,6 +10426,44 @@ window.sendFollowUp = function() {
   app.send_server_action(msg);
   input.value = '';
 };
+
+// Request interruption of the current agent turn. Disables the button and
+// flips the label to "Interrupting..." until the phase leaves `interrupting`
+// — updateStopButtonVisibility resets the label when it hides/re-enables.
+window.sendInterrupt = function() {
+  if (!app) return;
+  const btn = document.getElementById('stop-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '\u23F9 Interrupting...';
+  }
+  processCommands(app.send_interrupt());
+};
+
+// Show/hide the Stop button based on phase.
+// Hide on: idle, done, waiting_followup, interrupted, "" (empty/initial)
+// Show on: thinking, running, running_agent, orchestrating, waiting_approval,
+//          waiting_human, interrupting
+function updateStopButtonVisibility(phase) {
+  const btn = document.getElementById('stop-btn');
+  if (!btn) return;
+  const activePhases = new Set([
+    'thinking', 'running', 'running_agent', 'orchestrating',
+    'waiting_approval', 'waiting_human', 'interrupting',
+  ]);
+  const key = (phase || '').toLowerCase();
+  const show = activePhases.has(key);
+  btn.style.display = show ? '' : 'none';
+  // Only `interrupting` should show the disabled "Interrupting..." label.
+  // Every other phase (active or hidden) resets the button to its default.
+  if (key === 'interrupting') {
+    btn.disabled = true;
+    btn.innerHTML = '\u23F9 Interrupting...';
+  } else {
+    btn.disabled = false;
+    btn.innerHTML = '\u23F9 Stop';
+  }
+}
 
 // ── Display metrics (per-display sections) ──
 const displayMetricsIds = new Set();

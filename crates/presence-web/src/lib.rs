@@ -1119,6 +1119,16 @@ impl PresenceWeb {
         to_js(&cmds)
     }
 
+    /// Request interruption of the current agent turn. Sends ControlMsg::Interrupt
+    /// via the WebSocket; the backend dispatcher broadcasts InterruptRequested
+    /// and agent loops cancel their work.
+    #[wasm_bindgen]
+    pub fn send_interrupt(&self) -> JsValue {
+        let msg = serde_json::json!({"action": "interrupt"});
+        self.server.borrow().send_json(&msg);
+        to_js(&Vec::<app_state::UiCommand>::new())
+    }
+
     /// Get pending approval ID (for keyboard shortcut routing).
     #[wasm_bindgen]
     pub fn pending_approval_id(&self) -> JsValue {

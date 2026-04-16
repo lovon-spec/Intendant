@@ -159,6 +159,12 @@ export class PresenceWeb {
      * Send a human response (askHuman).
      */
     send_human_response(text: string): any;
+    /**
+     * Request interruption of the current agent turn. Sends ControlMsg::Interrupt
+     * via the WebSocket; the backend dispatcher broadcasts InterruptRequested
+     * and agent loops cancel their work.
+     */
+    send_interrupt(): any;
     send_key(key: string, ctrl: boolean, alt: boolean, shift: boolean): void;
     /**
      * Send live model usage to the server for tracking/broadcast.
@@ -365,6 +371,7 @@ export interface InitOutput {
     readonly presenceweb_send_frame: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_send_frame_context: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_human_response: (a: number, b: number, c: number) => any;
+    readonly presenceweb_send_interrupt: (a: number) => any;
     readonly presenceweb_send_key: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly presenceweb_send_live_usage: (a: number, b: bigint, c: bigint, d: bigint, e: bigint, f: bigint) => void;
     readonly presenceweb_send_make_active: (a: number) => number;
