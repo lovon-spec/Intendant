@@ -20,6 +20,8 @@ pub struct RecordingGuard {
     stream_name: String,
     segments_dir: PathBuf,
     started_at: chrono::DateTime<chrono::Utc>,
+    /// Background bridge task (frame-fed path only). Aborted on drop.
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RecordingGuard {
@@ -51,6 +53,9 @@ impl RecordingGuard {
 
 impl Drop for RecordingGuard {
     fn drop(&mut self) {
+        if let Some(handle) = self.bridge_task.take() {
+            handle.abort();
+        }
         // Drop stdin first so ffmpeg sees EOF and can finalize
         self.stdin.take();
         // Send SIGINT for graceful shutdown — ffmpeg finalizes the MP4 moov atom.
@@ -309,6 +314,7 @@ pub async fn start_display_recording(
         stream_name,
         segments_dir,
         started_at: chrono::Utc::now(),
+        bridge_task: None,
     })
 }
 
@@ -387,6 +393,7 @@ pub async fn start_frame_recording(
         stream_name: stream_name.to_string(),
         segments_dir,
         started_at: chrono::Utc::now(),
+        bridge_task: None,
     })
 }
 
@@ -728,40 +735,45 @@ fn frame_to_jpeg(frame: &crate::display::Frame) -> Option<Vec<u8>> {
     Some(buf.into_inner())
 }
 
-/// Spawn the bridge task that pumps JPEG-encoded frames from a
-/// `DisplaySession` broadcast into an active frame-fed recording.
+/// Spawn the bridge task that feeds frames into a frame-fed recording.
+///
+/// Ticks at the configured recording framerate and polls the session's
+/// `latest_frame` on each tick, mirroring how the WebRTC encoder bridge
+/// keeps a steady cadence even when the Wayland capture backend delivers
+/// new frames slowly (0.1 fps on idle desktops). Without this, the
+/// recording would contain only the handful of frames that happened to
+/// arrive during the recording window via the broadcast channel.
+///
+/// Returns the `JoinHandle` so the caller can store it in the
+/// `RecordingGuard` for abort-on-drop.
 fn spawn_frame_bridge(
     registry: std::sync::Arc<tokio::sync::RwLock<RecordingRegistry>>,
     session: std::sync::Arc<crate::display::DisplaySession>,
     stream_name: String,
-) {
-    let mut frame_rx = session.subscribe_frames();
+    fps: u32,
+) -> tokio::task::JoinHandle<()> {
+    let interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 67 });
     tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            match frame_rx.recv().await {
-                Ok(frame) => {
-                    let jpeg_data = tokio::task::spawn_blocking({
-                        let frame = frame.clone();
-                        move || frame_to_jpeg(&frame)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-
-                    if let Some(jpeg) = jpeg_data {
-                        let mut r = registry.write().await;
-                        let _ = r.feed_frame(&stream_name, &jpeg).await;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("[recording] lagged {} frames for {}", n, stream_name);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
-                }
+            tick.tick().await;
+            let Some(frame) = session.latest_frame().await else {
+                continue;
+            };
+            let jpeg = tokio::task::spawn_blocking({
+                let frame = frame.clone();
+                move || frame_to_jpeg(&frame)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(jpeg) = jpeg {
+                let mut r = registry.write().await;
+                let _ = r.feed_frame(&stream_name, &jpeg).await;
             }
         }
-    });
+    })
 }
 
 /// Start a display recording, preferring the frame-fed path when a
@@ -789,9 +801,21 @@ async fn start_display_auto(
 
     let mut reg = registry.write().await;
     if let Some(session) = display_session {
+        let fps = reg.config.framerate;
         let stream_name = reg.start_display_frame_fed(display_id).await?;
         drop(reg);
-        spawn_frame_bridge(registry.clone(), session, stream_name.clone());
+        let handle = spawn_frame_bridge(
+            registry.clone(),
+            session,
+            stream_name.clone(),
+            fps,
+        );
+        let mut reg = registry.write().await;
+        if let Some(guard) = reg.recordings.get_mut(&stream_name) {
+            guard.bridge_task = Some(handle);
+        } else {
+            handle.abort();
+        }
         Ok(stream_name)
     } else {
         reg.start_display(display_id, fallback_width, fallback_height)
