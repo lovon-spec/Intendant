@@ -88,6 +88,57 @@ pub fn is_ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Pick the next unused stream-name slot for a display recording.
+/// Probes the filesystem for existing `display_<id>` / `display_<id>_N` dirs
+/// and returns the first unused name.
+fn pick_next_display_stream_name(recordings_dir: &Path, display_id: u32) -> String {
+    let base = format!("display_{}", display_id);
+    if !recordings_dir.join(&base).exists() {
+        return base;
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{}_{}", base, n);
+        if !recordings_dir.join(&candidate).exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// After `ffmpeg` is spawned, give it a short grace window to fail fast.
+/// x11grab errors out within <100ms on a misconfigured display; without this
+/// check, the outer code emits `RecordingStarted` for a process that's already
+/// dead and the user gets an empty/unplayable mp4.
+///
+/// Returns Ok if ffmpeg is still running after the grace window, Err with a
+/// tail of `ffmpeg.log` if it already exited.
+async fn verify_ffmpeg_started(
+    child: &mut Child,
+    log_path: &Path,
+    context: &str,
+) -> Result<(), String> {
+    tokio::select! {
+        wait_result = child.wait() => {
+            let status = match wait_result {
+                Ok(s) => format!("exit {}", s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())),
+                Err(e) => format!("wait error: {}", e),
+            };
+            let log = std::fs::read_to_string(log_path).unwrap_or_default();
+            let tail_lines: Vec<&str> = log.lines().rev().take(10).collect();
+            let tail: Vec<&str> = tail_lines.into_iter().rev().collect();
+            let tail = tail.join(" | ");
+            Err(format!(
+                "ffmpeg ({}) exited immediately ({}): {}",
+                context,
+                status,
+                if tail.is_empty() { "no stderr captured".to_string() } else { tail }
+            ))
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => Ok(()),
+    }
+}
+
 /// Start recording a display via ffmpeg.
 /// Uses x11grab on Linux, avfoundation on macOS.
 pub async fn start_display_recording(
@@ -97,21 +148,8 @@ pub async fn start_display_recording(
     config: &RecordingConfig,
     session_dir: &Path,
 ) -> Result<RecordingGuard, String> {
-    // Generate unique stream name: display_0, display_0_2, display_0_3, etc.
-    let base_name = format!("display_{}", display_id);
     let recordings_dir = session_dir.join("recordings");
-    let stream_name = if recordings_dir.join(&base_name).exists() {
-        let mut n = 2u32;
-        loop {
-            let candidate = format!("{}_{}", base_name, n);
-            if !recordings_dir.join(&candidate).exists() {
-                break candidate;
-            }
-            n += 1;
-        }
-    } else {
-        base_name
-    };
+    let stream_name = pick_next_display_stream_name(&recordings_dir, display_id);
     let segments_dir = recordings_dir.join(&stream_name);
     std::fs::create_dir_all(&segments_dir)
         .map_err(|e| format!("Failed to create recordings dir: {}", e))?;
@@ -203,6 +241,15 @@ pub async fn start_display_recording(
         .spawn()
         .map_err(|e| format!("Failed to spawn ffmpeg for display recording: {}", e))?;
 
+    // Guard against fail-fast errors: x11grab on a Wayland-only session, or
+    // avfoundation without Screen Recording permission, exits within ~50ms.
+    verify_ffmpeg_started(
+        &mut child,
+        &segments_dir.join("ffmpeg.log"),
+        if cfg!(target_os = "macos") { "screencapture feeder" } else { "x11grab" },
+    )
+    .await?;
+
     if use_screencapture_feeder {
         if let Some(stdin) = child.stdin.take() {
             let frame_interval = std::time::Duration::from_millis(
@@ -279,6 +326,7 @@ pub async fn start_frame_recording(
         .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
     let keyframe_expr = format!("expr:gte(t,n_forced*{})", config.segment_duration_secs);
+    let log_path = segments_dir.join("ffmpeg.log");
     let mut child = tokio::process::Command::new("ffmpeg")
         .args([
             "-f", "image2pipe",
@@ -302,10 +350,18 @@ pub async fn start_frame_recording(
         .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(
+            std::fs::File::create(&log_path)
+                .map(std::process::Stdio::from)
+                .unwrap_or_else(|_| std::process::Stdio::null()),
+        )
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("Failed to spawn ffmpeg for frame recording: {}", e))?;
+
+    // Catch startup-time failures (missing libx264, bad args, etc.) before we
+    // hand out a RecordingGuard that will quietly produce empty segments.
+    verify_ffmpeg_started(&mut child, &log_path, "image2pipe").await?;
 
     // Take stdin out of the child before moving it into the guard
     let stdin = child.stdin.take();
@@ -388,6 +444,24 @@ impl RecordingRegistry {
     ) -> Result<String, String> {
         let stream_name = self.start_display(display_id, width, height).await?;
         self.external_streams.insert(stream_name.clone());
+        Ok(stream_name)
+    }
+
+    /// Start a frame-fed display recording with an auto-unique stream name.
+    ///
+    /// Use this when a `DisplaySession` already exists for the display — the
+    /// caller is responsible for driving frames into the recording via
+    /// `feed_frame` (typically from a bridge task subscribed to the session's
+    /// frame broadcast).  This path is required on Wayland, where the capture
+    /// backend is PipeWire/portal and `x11grab` cannot see the user's desktop.
+    pub async fn start_display_frame_fed(
+        &mut self,
+        display_id: u32,
+    ) -> Result<String, String> {
+        let recordings_dir = self.session_dir.join("recordings");
+        let stream_name = pick_next_display_stream_name(&recordings_dir, display_id);
+        let guard = start_frame_recording(&stream_name, &self.config, &self.session_dir).await?;
+        self.recordings.insert(stream_name.clone(), guard);
         Ok(stream_name)
     }
 
@@ -595,6 +669,113 @@ fn parse_segment_csv(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
     segments
 }
 
+/// Convert a raw display frame into a JPEG for piping into ffmpeg.
+/// Handles both RGBA and BGRA input and strips any stride padding.
+fn frame_to_jpeg(frame: &crate::display::Frame) -> Option<Vec<u8>> {
+    let row_bytes = frame.width as usize * 4;
+    let stride = frame.stride as usize;
+    let rgba_data = match frame.format {
+        crate::display::FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
+        crate::display::FrameFormat::Rgba => {
+            let mut tight = Vec::with_capacity(row_bytes * frame.height as usize);
+            for row in 0..frame.height as usize {
+                let start = row * stride;
+                tight.extend_from_slice(&frame.data[start..start + row_bytes]);
+            }
+            tight
+        }
+        crate::display::FrameFormat::Bgra => {
+            let mut tight = Vec::with_capacity(row_bytes * frame.height as usize);
+            for row in 0..frame.height as usize {
+                let start = row * stride;
+                for col in 0..frame.width as usize {
+                    let px = start + col * 4;
+                    tight.push(frame.data[px + 2]); // R
+                    tight.push(frame.data[px + 1]); // G
+                    tight.push(frame.data[px]); // B
+                    tight.push(frame.data[px + 3]); // A
+                }
+            }
+            tight
+        }
+    };
+    let img = image::RgbaImage::from_raw(frame.width, frame.height, rgba_data)?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+    Some(buf.into_inner())
+}
+
+/// Spawn the bridge task that pumps JPEG-encoded frames from a
+/// `DisplaySession` broadcast into an active frame-fed recording.
+fn spawn_frame_bridge(
+    registry: std::sync::Arc<tokio::sync::RwLock<RecordingRegistry>>,
+    session: std::sync::Arc<crate::display::DisplaySession>,
+    stream_name: String,
+) {
+    let mut frame_rx = session.subscribe_frames();
+    tokio::spawn(async move {
+        loop {
+            match frame_rx.recv().await {
+                Ok(frame) => {
+                    let jpeg_data = tokio::task::spawn_blocking({
+                        let frame = frame.clone();
+                        move || frame_to_jpeg(&frame)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+
+                    if let Some(jpeg) = jpeg_data {
+                        let mut r = registry.write().await;
+                        let _ = r.feed_frame(&stream_name, &jpeg).await;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("[recording] lagged {} frames for {}", n, stream_name);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Start a display recording, preferring the frame-fed path when a
+/// `DisplaySession` exists for the display.  Falls back to the legacy
+/// x11grab/avfoundation path otherwise.  This is the single entry point used
+/// by both the DisplayReady auto-start path and the manual `StartRecording`
+/// ControlMsg path — so manual recording on Wayland sessions goes through
+/// PipeWire (via the session's frame broadcast) instead of trying `x11grab`,
+/// which cannot see a Wayland compositor.
+async fn start_display_auto(
+    registry: &std::sync::Arc<tokio::sync::RwLock<RecordingRegistry>>,
+    session_registry: Option<&crate::display::SharedSessionRegistry>,
+    display_id: u32,
+    fallback_width: u32,
+    fallback_height: u32,
+) -> Result<String, String> {
+    if !is_ffmpeg_available() {
+        return Err("ffmpeg not installed".to_string());
+    }
+
+    let display_session = match session_registry {
+        Some(sr) => sr.read().await.get(display_id),
+        None => None,
+    };
+
+    let mut reg = registry.write().await;
+    if let Some(session) = display_session {
+        let stream_name = reg.start_display_frame_fed(display_id).await?;
+        drop(reg);
+        spawn_frame_bridge(registry.clone(), session, stream_name.clone());
+        Ok(stream_name)
+    } else {
+        reg.start_display(display_id, fallback_width, fallback_height)
+            .await
+    }
+}
+
 /// Spawn a background task that listens for DisplayReady events and starts
 /// display recording automatically.
 ///
@@ -617,165 +798,64 @@ pub fn spawn_recording_listener(
                     height,
                     ..
                 }) => {
-                    let mut reg = registry.write().await;
-                    if !reg.is_enabled() {
+                    // Auto-recording is opt-in; if disabled in config, skip.
+                    if !registry.read().await.is_enabled() {
                         continue;
                     }
-                    if !is_ffmpeg_available() {
-                        bus.send(AppEvent::RecordingError {
-                            stream_name: format!("display_{}", display_id),
-                            message: "ffmpeg not installed — display recording disabled".to_string(),
-                        });
-                        continue;
-                    }
-
-                    // Check if a DisplaySession exists for frame-fed recording
-                    let display_session = if let Some(ref sr) = session_registry {
-                        sr.read().await.get(display_id)
-                    } else {
-                        None
-                    };
-
-                    if let Some(session) = display_session {
-                        // Frame-fed recording via DisplaySession broadcast
-                        let stream_name = format!("display_{}", display_id);
-                        match reg.start_stream(&stream_name).await {
-                            Ok(()) => {
-                                let sn = stream_name.clone();
-                                let reg_clone = registry.clone();
-                                let mut frame_rx = session.subscribe_frames();
-
-                                // Bridge task: subscribe to raw frames, JPEG-encode,
-                                // feed into the recording pipeline.
-                                tokio::spawn(async move {
-                                    loop {
-                                        match frame_rx.recv().await {
-                                            Ok(frame) => {
-                                                let jpeg_data = tokio::task::spawn_blocking({
-                                                    let frame = frame.clone();
-                                                    move || {
-                                                        // Convert BGRA/RGBA to tightly-packed RGBA for image crate.
-                                                        // Strip row padding if stride > width * 4.
-                                                        let row_bytes = frame.width as usize * 4;
-                                                        let stride = frame.stride as usize;
-                                                        let rgba_data = match frame.format {
-                                                            crate::display::FrameFormat::Rgba
-                                                                if stride == row_bytes =>
-                                                            {
-                                                                frame.data.clone()
-                                                            }
-                                                            crate::display::FrameFormat::Rgba => {
-                                                                let mut tight = Vec::with_capacity(
-                                                                    row_bytes * frame.height as usize,
-                                                                );
-                                                                for row in 0..frame.height as usize {
-                                                                    let start = row * stride;
-                                                                    tight.extend_from_slice(
-                                                                        &frame.data[start..start + row_bytes],
-                                                                    );
-                                                                }
-                                                                tight
-                                                            }
-                                                            crate::display::FrameFormat::Bgra => {
-                                                                let mut tight = Vec::with_capacity(
-                                                                    row_bytes * frame.height as usize,
-                                                                );
-                                                                for row in 0..frame.height as usize {
-                                                                    let start = row * stride;
-                                                                    for col in 0..frame.width as usize {
-                                                                        let px = start + col * 4;
-                                                                        tight.push(frame.data[px + 2]); // R
-                                                                        tight.push(frame.data[px + 1]); // G
-                                                                        tight.push(frame.data[px]);      // B
-                                                                        tight.push(frame.data[px + 3]); // A
-                                                                    }
-                                                                }
-                                                                tight
-                                                            }
-                                                        };
-                                                        let img = image::RgbaImage::from_raw(
-                                                            frame.width,
-                                                            frame.height,
-                                                            rgba_data,
-                                                        );
-                                                        if let Some(img) = img {
-                                                            let mut buf = std::io::Cursor::new(Vec::new());
-                                                            if img.write_to(&mut buf, image::ImageFormat::Jpeg).is_ok() {
-                                                                Some(buf.into_inner())
-                                                            } else {
-                                                                None
-                                                            }
-                                                        } else {
-                                                            None
-                                                        }
-                                                    }
-                                                }).await.ok().flatten();
-
-                                                if let Some(jpeg) = jpeg_data {
-                                                    let mut r = reg_clone.write().await;
-                                                    let _ = r.feed_frame(&sn, &jpeg).await;
-                                                }
-                                            }
-                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                                eprintln!(
-                                                    "[recording] lagged {} frames for {}",
-                                                    n, sn
-                                                );
-                                            }
-                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                });
-                                bus.send(AppEvent::RecordingStarted { stream_name });
-                            }
-                            Err(e) => {
-                                bus.send(AppEvent::RecordingError {
-                                    stream_name: format!("display_{}", display_id),
-                                    message: e,
-                                });
-                            }
+                    match start_display_auto(
+                        &registry,
+                        session_registry.as_ref(),
+                        display_id,
+                        width,
+                        height,
+                    )
+                    .await
+                    {
+                        Ok(stream_name) => {
+                            bus.send(AppEvent::RecordingStarted { stream_name });
                         }
-                    } else {
-                        // No DisplaySession — use legacy x11grab/avfoundation path
-                        match reg.start_display(display_id, width, height).await {
-                            Ok(stream_name) => {
-                                bus.send(AppEvent::RecordingStarted { stream_name });
-                            }
-                            Err(e) => {
-                                bus.send(AppEvent::RecordingError {
-                                    stream_name: format!("display_{}", display_id),
-                                    message: e,
-                                });
-                            }
+                        Err(e) => {
+                            bus.send(AppEvent::RecordingError {
+                                stream_name: format!("display_{}", display_id),
+                                message: e,
+                            });
                         }
                     }
                 }
                 Ok(AppEvent::ControlCommand(
                     crate::event::ControlMsg::StartRecording { stream_name },
                 )) => {
-                    let mut reg = registry.write().await;
-                    if reg.is_recording(&stream_name) {
-                        continue;
-                    }
-                    if !is_ffmpeg_available() {
-                        bus.send(AppEvent::RecordingError {
-                            stream_name,
-                            message: "ffmpeg not installed".to_string(),
+                    // Already recording this display (including any renamed slot
+                    // like `display_0_2`) — drop the duplicate request.
+                    {
+                        let reg = registry.read().await;
+                        let active = reg.active_streams();
+                        let already = active.iter().any(|s| {
+                            *s == stream_name || s.starts_with(&format!("{}_", stream_name))
                         });
-                        continue;
-                    }
-                    // Parse display_id from stream name "display_N"
-                    if let Some(id_str) = stream_name.strip_prefix("display_") {
-                        if let Ok(id) = id_str.parse::<u32>() {
-                            // Query actual display resolution
-                            let (w, h) = super::query_display_resolution(id);
-                            match reg.start_display(id, w, h).await {
-                                Ok(name) => bus.send(AppEvent::RecordingStarted { stream_name: name }),
-                                Err(e) => bus.send(AppEvent::RecordingError { stream_name, message: e }),
-                            }
+                        if already {
+                            continue;
                         }
+                    }
+                    // Only display_N streams are startable via ControlMsg.
+                    let Some(id_str) = stream_name.strip_prefix("display_") else {
+                        continue;
+                    };
+                    let Ok(display_id) = id_str.parse::<u32>() else {
+                        continue;
+                    };
+                    let (w, h) = super::query_display_resolution(display_id);
+                    match start_display_auto(
+                        &registry,
+                        session_registry.as_ref(),
+                        display_id,
+                        w,
+                        h,
+                    )
+                    .await
+                    {
+                        Ok(name) => bus.send(AppEvent::RecordingStarted { stream_name: name }),
+                        Err(e) => bus.send(AppEvent::RecordingError { stream_name, message: e }),
                     }
                 }
                 Ok(AppEvent::ControlCommand(
@@ -978,5 +1058,25 @@ max_retention_hours = 48
         let tmp = tempfile::tempdir().unwrap();
         let reg = RecordingRegistry::new(tmp.path(), RecordingConfig::default());
         assert!(!reg.is_recording("display_99"));
+    }
+
+    #[test]
+    fn pick_next_display_stream_name_returns_base_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = pick_next_display_stream_name(tmp.path(), 0);
+        assert_eq!(name, "display_0");
+    }
+
+    #[test]
+    fn pick_next_display_stream_name_increments_past_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("display_0")).unwrap();
+        assert_eq!(pick_next_display_stream_name(tmp.path(), 0), "display_0_2");
+
+        std::fs::create_dir_all(tmp.path().join("display_0_2")).unwrap();
+        assert_eq!(pick_next_display_stream_name(tmp.path(), 0), "display_0_3");
+
+        // Unrelated display still starts from base.
+        assert_eq!(pick_next_display_stream_name(tmp.path(), 1), "display_1");
     }
 }
