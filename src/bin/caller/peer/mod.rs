@@ -108,13 +108,13 @@ pub use event::{
     PeerStatus, SessionInfo, TaggedPeerEvent, TaskId, TaskUpdate, UsageSnapshot,
 };
 pub use handle::{
-    spawn_peer, ConnectionState, PeerHandle, BROADCAST_CAPACITY, COMMANDS_CAPACITY,
-    EVENTS_CAPACITY,
+    spawn_peer, ConnectionState, PeerHandle, PeerSnapshot, BROADCAST_CAPACITY,
+    COMMANDS_CAPACITY, EVENTS_CAPACITY,
 };
 pub use coordinator::{Coordinator, CoordinatorError, RoutedTask, TaskRequest};
 pub use id::{PeerId, PeerKind};
 pub use log_writer::{spawn_peer_log_writer, LOG_CHANNEL_CAPACITY};
-pub use registry::PeerRegistry;
+pub use registry::{PeerRegistry, RegistryEvent, REGISTRY_BROADCAST_CAPACITY};
 pub use traits::{
     check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures,
 };

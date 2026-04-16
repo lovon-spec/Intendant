@@ -341,6 +341,25 @@ pub enum OutboundEvent {
         resolution_width: u32,
         resolution_height: u32,
     },
+    // --- Peer registry push events ---
+    //
+    // Emitted by the gateway translator that subscribes to
+    // `PeerRegistry::subscribe()` and converts each `RegistryEvent`
+    // into the corresponding wire shape. The dashboard uses these to
+    // update peer rows in-place without polling `GET /api/peers`.
+    /// A peer was added to the registry.
+    PeerAdded {
+        peer: crate::peer::PeerSnapshot,
+    },
+    /// A peer was removed from the registry. Carries only the id;
+    /// the browser drops the matching row from its local list.
+    PeerRemoved { id: String },
+    /// A peer's connection state, status, or card changed. Carries a
+    /// fresh snapshot reflecting the new values; the browser replaces
+    /// the matching row.
+    PeerStateChanged {
+        peer: crate::peer::PeerSnapshot,
+    },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
     /// Cannot be serialized.

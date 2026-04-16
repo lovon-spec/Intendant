@@ -1474,6 +1474,48 @@ pub fn spawn_web_gateway(
         });
     }
 
+    // Peer registry → dashboard push translator.
+    //
+    // When the registry is wired (the daemon was started with
+    // federation enabled), subscribe to its [`RegistryEvent`] stream
+    // and translate each event into the matching wire-format
+    // [`OutboundEvent`] variant, broadcast over the same channel as
+    // every other dashboard event. The browser's existing primary
+    // WebSocket pipeline picks them up and updates peer rows in-place
+    // without polling `GET /api/peers`.
+    //
+    // Lagged events are skipped on purpose: the dashboard's recovery
+    // path is to re-fetch `/api/peers`, which always returns ground
+    // truth. Closed receiver = registry was dropped, exit cleanly.
+    if let Some(reg) = peer_registry.as_ref() {
+        let mut reg_rx = reg.subscribe();
+        let push_tx = broadcast_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match reg_rx.recv().await {
+                    Ok(event) => {
+                        let outbound = match event {
+                            crate::peer::RegistryEvent::PeerAdded(snap) => {
+                                crate::types::OutboundEvent::PeerAdded { peer: snap }
+                            }
+                            crate::peer::RegistryEvent::PeerRemoved(id) => {
+                                crate::types::OutboundEvent::PeerRemoved {
+                                    id: id.as_str().to_string(),
+                                }
+                            }
+                            crate::peer::RegistryEvent::PeerStateChanged(snap) => {
+                                crate::types::OutboundEvent::PeerStateChanged { peer: snap }
+                            }
+                        };
+                        crate::control::broadcast_event(&push_tx, &outbound);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     let app_html = Arc::new(
         APP_HTML
             .replace(
@@ -4125,37 +4167,15 @@ pub fn build_config(
 // /api/peers helpers
 // ---------------------------------------------------------------------------
 
-/// JSON shape for a single entry in `GET /api/peers`. Flattens the
-/// bits of the peer's Agent Card and live connection state that the
-/// dashboard Daemons panel renders. Includes the native WS
-/// transport URL so the browser can open a secondary WASM
-/// connection for live event streaming (the `/api/peers` state is
-/// a snapshot; live events still flow through the WASM path).
-#[derive(Serialize)]
-struct PeerListEntry {
-    id: String,
-    label: String,
-    version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    git_sha: Option<String>,
-    connection_state: crate::peer::ConnectionState,
-    status: crate::peer::PeerStatus,
-    /// The native Intendant WebSocket URL from the peer's card, if
-    /// any. The browser uses this to open a secondary WASM
-    /// connection for live event streaming (log entries, status
-    /// badges, etc.).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ws_url: Option<String>,
-    /// Human-readable capability names from the peer's card. The
-    /// dashboard renders these as badges so the user can see at a
-    /// glance what each peer can do. Kebab-case strings matching
-    /// the serde representation of `Capability`.
-    capabilities: Vec<serde_json::Value>,
-}
-
+/// Wrapper for the `GET /api/peers` JSON body.
+///
+/// Each entry is a [`crate::peer::PeerSnapshot`] — the same type the
+/// registry's push events carry. One snapshot type means the dashboard
+/// applies API entries and pushed deltas the same way; no parallel
+/// schemas to drift apart.
 #[derive(Serialize)]
 struct PeerListResponse {
-    peers: Vec<PeerListEntry>,
+    peers: Vec<crate::peer::PeerSnapshot>,
 }
 
 #[derive(Deserialize)]
@@ -4172,42 +4192,14 @@ struct RemovePeerRequest {
 /// snapshot of the registry's handles and reads their current
 /// watch-backed connection/status values. Handles are cloneable so
 /// no lock is held across the serialization.
+///
+/// Each snapshot is built via [`crate::peer::PeerHandle::snapshot`], the
+/// same constructor used by the registry's push event stream. The
+/// dashboard applies an API entry and a pushed snapshot identically.
 fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
     let handles = registry.list();
-    let entries: Vec<PeerListEntry> = handles
-        .iter()
-        .map(|h| {
-            let card = h.card_snapshot();
-            // Extract the native WS URL from the first IntendantWs
-            // transport spec so the browser can open a secondary
-            // connection without re-fetching the card.
-            let ws_url = card
-                .transports
-                .iter()
-                .find_map(|t| match t {
-                    crate::peer::TransportSpec::IntendantWs { url } => {
-                        Some(url.clone())
-                    }
-                    _ => None,
-                });
-            let capabilities: Vec<serde_json::Value> = card
-                .capabilities
-                .iter()
-                .filter_map(|c| serde_json::to_value(c).ok())
-                .collect();
-            PeerListEntry {
-                id: h.id().as_str().to_string(),
-                label: card.label.clone(),
-                version: card.version.clone(),
-                git_sha: card.git_sha.clone(),
-                connection_state: h.connection_state(),
-                status: h.status(),
-                ws_url,
-                capabilities,
-            }
-        })
-        .collect();
-    serde_json::to_string(&PeerListResponse { peers: entries })
+    let peers: Vec<crate::peer::PeerSnapshot> = handles.iter().map(|h| h.snapshot()).collect();
+    serde_json::to_string(&PeerListResponse { peers })
         .unwrap_or_else(|_| "{\"peers\":[]}".to_string())
 }
 

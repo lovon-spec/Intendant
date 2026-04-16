@@ -169,6 +169,39 @@ impl PeerHandle {
         self.inner.features
     }
 
+    /// Serializable snapshot of this peer's externally-visible state at
+    /// call time. Cheap: reads the watch channels (no lock contention,
+    /// no cross-task communication) and clones the card. Safe to call
+    /// concurrently with peer state changes; the snapshot reflects
+    /// whatever values were observable at call time.
+    ///
+    /// Used by both `GET /api/peers` (one snapshot per registry entry)
+    /// and the dashboard push event stream emitted by [`PeerRegistry`]
+    /// (one snapshot per state change). One type, two surfaces; the
+    /// browser handler treats either source identically.
+    pub fn snapshot(&self) -> PeerSnapshot {
+        let card = self.card_snapshot();
+        let ws_url = card.transports.iter().find_map(|t| match t {
+            crate::peer::card::TransportSpec::IntendantWs { url } => Some(url.clone()),
+            _ => None,
+        });
+        let capabilities: Vec<serde_json::Value> = card
+            .capabilities
+            .iter()
+            .filter_map(|c| serde_json::to_value(c).ok())
+            .collect();
+        PeerSnapshot {
+            id: self.id().as_str().to_string(),
+            label: card.label.clone(),
+            version: card.version.clone(),
+            git_sha: card.git_sha.clone(),
+            connection_state: self.connection_state(),
+            status: self.status(),
+            ws_url,
+            capabilities,
+        }
+    }
+
     /// Subscribe to the peer's event stream. Fan-out is lossy for
     /// lagging subscribers — [`TaggedPeerEvent`]s land on the session
     /// log via the registry's durable sink, so missed broadcast
@@ -330,6 +363,46 @@ impl PeerHandle {
             .map_err(|_| PeerError::NotConnected)?;
         rx.await.map_err(|_| PeerError::NotConnected)?
     }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot
+// ---------------------------------------------------------------------------
+
+/// Serializable snapshot of one peer's externally-visible state.
+///
+/// Built from a [`PeerHandle`] via [`PeerHandle::snapshot`]. Used by:
+/// - `GET /api/peers` as the canonical list payload the dashboard reads
+///   at startup and after add/remove operations.
+/// - Dashboard push events emitted by [`crate::peer::registry::PeerRegistry`]
+///   so the browser updates rows in-place without re-fetching the full
+///   list.
+///
+/// `Deserialize` is derived only because `OutboundEvent` round-trips
+/// through serde and embeds this type — local Rust code constructs
+/// snapshots from a handle, never from JSON. The dashboard deserializes
+/// at the JS layer.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PeerSnapshot {
+    pub id: String,
+    pub label: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_sha: Option<String>,
+    pub connection_state: ConnectionState,
+    pub status: PeerStatus,
+    /// Native Intendant WebSocket URL from the peer's card, if any.
+    /// The browser uses this to open a secondary WASM connection for
+    /// live event streaming (the `/api/peers` payload is a state
+    /// snapshot; live per-peer events still flow through the WASM path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ws_url: Option<String>,
+    /// Capability list serialized to opaque JSON values so the dashboard
+    /// renders badges without the snapshot type having to re-derive
+    /// the full Capability schema. Each element matches the wire format
+    /// of [`crate::peer::card::Capability`] (`{kind: "computer-use"}` for
+    /// built-in variants, `{kind: "custom", name: "..."}` for `Custom`).
+    pub capabilities: Vec<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------

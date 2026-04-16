@@ -114,6 +114,23 @@ pub enum UiCommand {
     SetConnected {
         connected: bool,
     },
+    /// A peer was added to the registry. `peer` is the
+    /// `PeerSnapshot` JSON unchanged from the wire — JS treats it
+    /// the same shape as a `/api/peers` list entry.
+    PeerAdded {
+        peer: serde_json::Value,
+    },
+    /// A peer was removed from the registry. JS drops the matching
+    /// row from the daemons list.
+    PeerRemoved {
+        id: String,
+    },
+    /// A peer's connection state, status, or card changed. `peer`
+    /// is the fresh `PeerSnapshot` JSON; JS replaces the matching
+    /// row in-place.
+    PeerStateChanged {
+        peer: serde_json::Value,
+    },
 }
 
 // ── Pricing ────────────────────────────────────────────────────────
@@ -978,6 +995,30 @@ impl AppState {
                 let content = msg["content"].as_str().unwrap_or("");
                 let turn = msg["turn"].as_u64();
                 cmds.extend(self.add_log(level, content, turn, source));
+            }
+
+            // ---- Peer registry push events ----
+            //
+            // Forwarded as opaque JSON: the WASM layer doesn't interpret
+            // the snapshot — it hands it to JS, which treats it as the
+            // same shape as a `/api/peers` list entry (one update path
+            // for both surfaces).
+            "peer_added" => {
+                cmds.push(UiCommand::PeerAdded {
+                    peer: msg["peer"].clone(),
+                });
+            }
+
+            "peer_removed" => {
+                cmds.push(UiCommand::PeerRemoved {
+                    id: msg["id"].as_str().unwrap_or("").to_string(),
+                });
+            }
+
+            "peer_state_changed" => {
+                cmds.push(UiCommand::PeerStateChanged {
+                    peer: msg["peer"].clone(),
+                });
             }
 
             _ => {

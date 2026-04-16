@@ -433,6 +433,48 @@ html, body {
   color: var(--red);
   border-color: var(--red);
 }
+.daemon-row .state-pill {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 10px;
+  color: var(--overlay1);
+  background: var(--surface1);
+  padding: 1px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.daemon-row .status-chip {
+  font-size: 10px;
+  color: var(--subtext0);
+  background: var(--surface1);
+  padding: 1px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.daemon-row .status-chip.needs-approval {
+  color: var(--yellow);
+}
+.daemon-row .status-chip.error {
+  color: var(--red);
+}
+.daemon-row .caps {
+  display: flex;
+  gap: 3px;
+  flex-shrink: 0;
+}
+.daemon-row .cap-badge {
+  font-size: 10px;
+  color: var(--subtext0);
+  background: var(--surface1);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.daemon-row .cap-overflow {
+  font-size: 10px;
+  color: var(--overlay1);
+  background: var(--surface0);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
 .daemon-add-row {
   display: flex;
   gap: 8px;
@@ -4518,6 +4560,13 @@ function processCommands(cmds) {
       case 'set_connected':
         document.getElementById('sb-conn').className = c.connected ? 'conn-dot ok' : 'conn-dot err';
         break;
+      // Peer registry push events. The peer payload is a `PeerSnapshot`
+      // (same shape `refreshPeersFromApi` builds entries from), so we
+      // funnel through the shared upsert/remove helpers — one code path
+      // applies API entries and pushed deltas identically.
+      case 'peer_added': upsertDaemonFromSnapshot(c.peer); break;
+      case 'peer_state_changed': upsertDaemonFromSnapshot(c.peer); break;
+      case 'peer_removed': removeDaemonById(c.id); break;
     }
   }
 }
@@ -8511,6 +8560,58 @@ function wsUrlToBaseUrl(wsUrl) {
 /// peer state: called from initDaemons(), after addDaemon(), after
 /// removeDaemon(), and on reconnect. No localStorage fallback —
 /// the server-side PeerRegistry owns the peer list now.
+// Build a local daemon entry from a server-side `PeerSnapshot`. The
+// snapshot shape is the same whether it arrives via `GET /api/peers`
+// (full list) or via a pushed `peer_added` / `peer_state_changed`
+// event, so this is the single construction point for both surfaces.
+function snapshotToDaemonEntry(p) {
+  return {
+    host_id: p.id,
+    label: p.label,
+    url: wsUrlToBaseUrl(p.ws_url) || '',
+    connected: p.connection_state && p.connection_state.state === 'connected',
+    version: p.version || '',
+    git_sha: p.git_sha || '',
+    ws_url: p.ws_url || '',
+    capabilities: p.capabilities || [],
+    server_connection_state: p.connection_state,
+    server_status: p.status,
+  };
+}
+
+// Apply a pushed PeerSnapshot to the local daemons list — replace the
+// matching entry, or insert a new one. New entries also open a WASM
+// secondary connection so per-peer live events flow without waiting
+// for the next /api/peers refresh.
+function upsertDaemonFromSnapshot(snap) {
+  if (!snap || !snap.id) return;
+  const entry = snapshotToDaemonEntry(snap);
+  const idx = daemons.findIndex(d => d.host_id === entry.host_id);
+  if (idx >= 0) {
+    daemons[idx] = entry;
+  } else {
+    daemons.push(entry);
+    if (entry.ws_url && app && app.add_secondary_host) {
+      app.add_secondary_host(entry.host_id, entry.label, entry.ws_url);
+    }
+  }
+  renderDaemonsList();
+}
+
+// Drop a peer from the local daemons list and tear down its WASM
+// secondary connection. Tolerates unknown ids (a `peer_removed` may
+// arrive after `refreshPeersFromApi` has already pruned the entry).
+function removeDaemonById(id) {
+  if (!id) return;
+  const idx = daemons.findIndex(d => d.host_id === id);
+  if (idx < 0) return;
+  daemons.splice(idx, 1);
+  if (app && app.remove_secondary_host) {
+    app.remove_secondary_host(id);
+  }
+  renderDaemonsList();
+}
+
 async function refreshPeersFromApi() {
   try {
     const resp = await fetch('/api/peers');
@@ -8518,22 +8619,10 @@ async function refreshPeersFromApi() {
     const data = await resp.json();
     if (!data.peers || !Array.isArray(data.peers)) return;
 
-    // Build the new daemon entries from the API response. Each
-    // peer entry from the server includes ws_url (from the card's
-    // transport spec) so we can open WASM secondary connections
-    // without re-fetching the card.
-    const newDaemons = data.peers.map(p => ({
-      host_id: p.id,
-      label: p.label,
-      url: wsUrlToBaseUrl(p.ws_url) || '',
-      connected: p.connection_state && p.connection_state.state === 'connected',
-      version: p.version || '',
-      git_sha: p.git_sha || '',
-      ws_url: p.ws_url || '',
-      capabilities: p.capabilities || [],
-      server_connection_state: p.connection_state,
-      server_status: p.status,
-    }));
+    // Build the new daemon entries from the API response via the
+    // shared snapshotToDaemonEntry helper so the full-list path and
+    // the push-event path stay identical.
+    const newDaemons = data.peers.map(snapshotToDaemonEntry);
 
     // Diff against the current daemons list to figure out which
     // WASM connections to add, remove, or leave alone. Stable
@@ -8670,6 +8759,63 @@ function updateHostsAggregateDot() {
   }
 }
 
+// Render the human-readable text for one Capability JSON value as it
+// arrives in the /api/peers response. Built-in variants serialize as
+// {kind: "computer-use"}; Custom serializes as {kind: "custom", name: "..."}.
+function capabilityLabel(cap) {
+  if (!cap || typeof cap !== 'object') return String(cap || '');
+  if (cap.kind === 'custom') return cap.name || 'custom';
+  return cap.kind || '';
+}
+
+// Subdued pill showing the server-side ConnectionState. Suppressed when
+// the state is `connected`, since the conn-dot already paints that.
+// Reconnecting carries an attempt counter that matters operationally
+// ("attempt 3" tells you whether the peer is in a tight retry loop).
+function renderStatePill(connState) {
+  if (!connState || !connState.state) return '';
+  const state = connState.state;
+  if (state === 'connected') return '';
+  const label = state === 'reconnecting' && typeof connState.attempt === 'number'
+    ? `${state} · attempt ${connState.attempt}`
+    : state;
+  return `<span class="state-pill" title="connection state: ${escapeHtml(label)}">${escapeHtml(label)}</span>`;
+}
+
+// Subdued chip showing the peer's PeerStatus. Hidden in the steady-state
+// values (`idle`, `working`) so the chip doesn't compete with the label
+// for attention; only `needs_approval` and `error` surface visibly.
+function renderStatusChip(status) {
+  if (!status) return '';
+  if (status === 'needs_approval') {
+    return `<span class="status-chip needs-approval" title="peer needs approval">needs approval</span>`;
+  }
+  if (status === 'error') {
+    return `<span class="status-chip error" title="peer is in error state">error</span>`;
+  }
+  return '';
+}
+
+// Render up to MAX_CAP_BADGES capability chips with a "+N" overflow
+// indicator. The cap keeps a peer with many capabilities from pushing
+// the row's url and version off the right side of the panel.
+const MAX_CAP_BADGES = 4;
+function renderCapBadges(caps) {
+  if (!Array.isArray(caps) || caps.length === 0) return '';
+  const visible = caps.slice(0, MAX_CAP_BADGES);
+  const overflow = caps.length - visible.length;
+  const chips = visible
+    .map(c => {
+      const label = capabilityLabel(c);
+      return `<span class="cap-badge" title="${escapeHtml(label)}">${escapeHtml(label)}</span>`;
+    })
+    .join('');
+  const more = overflow > 0
+    ? `<span class="cap-overflow" title="${overflow} more capability${overflow === 1 ? '' : 'ies'}">+${overflow}</span>`
+    : '';
+  return `<div class="caps">${chips}${more}</div>`;
+}
+
 function renderDaemonRow(d, isSelf) {
   // Dot colors:
   //   green → connected + version matches self (or is self)
@@ -8694,11 +8840,21 @@ function renderDaemonRow(d, isSelf) {
   const versionText = d.git_sha
     ? `${escapeHtml(d.version || '?')} · ${escapeHtml(d.git_sha)}`
     : '';
+  // State pill and status chip are server-side fields; the self entry
+  // is constructed inline in renderDaemonsList without them, so skip
+  // for self. Capability badges render whenever the field is present
+  // (so if the self entry ever gains them, no further change needed).
+  const statePill = isSelf ? '' : renderStatePill(d.server_connection_state);
+  const statusChip = isSelf ? '' : renderStatusChip(d.server_status);
+  const capBadges = renderCapBadges(d.capabilities);
   return `
     <div class="daemon-row${isSelf ? ' self' : ''}">
       <span class="conn-dot ${dotClass}" title="${escapeHtml(dotTitle)}"></span>
       <span class="label">${escapeHtml(d.label || d.host_id)}${selfMark}</span>
+      ${statePill}
+      ${statusChip}
       <span class="url" title="${escapeHtml(d.url)}">${escapeHtml(d.url)}</span>
+      ${capBadges}
       <span class="version" title="version · git SHA">${versionText}</span>
       ${removeBtn}
     </div>

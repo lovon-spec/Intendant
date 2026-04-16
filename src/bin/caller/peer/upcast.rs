@@ -1018,7 +1018,16 @@ impl WireEventUpcaster {
     pub fn upcast(&mut self, event: &OutboundEvent) -> Vec<PeerEvent> {
         match event {
             // ---- Forward-compat + dropped metric streams ----
-            OutboundEvent::Unknown | OutboundEvent::DisplayMetrics { .. } => vec![],
+            //
+            // PeerAdded / PeerRemoved / PeerStateChanged are dashboard
+            // control-plane events emitted by the local registry's
+            // translator, not peer-originated activity, so they are
+            // intentionally absent from the peer event vocabulary.
+            OutboundEvent::Unknown
+            | OutboundEvent::DisplayMetrics { .. }
+            | OutboundEvent::PeerAdded { .. }
+            | OutboundEvent::PeerRemoved { .. }
+            | OutboundEvent::PeerStateChanged { .. } => vec![],
 
             // ---- Turn lifecycle ----
             OutboundEvent::TurnStarted { turn, .. } => {
