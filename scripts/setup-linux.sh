@@ -102,6 +102,7 @@ APT_PACKAGES=(
     pkg-config
     git
     curl
+    mold
 
     # Rust build dep for vpx-encode (ffi-generate needs libclang)
     libclang-dev
