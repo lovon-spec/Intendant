@@ -75,6 +75,12 @@ pub struct DisplayInfo {
 /// Returns a list of `DisplayInfo` with the primary display at index 0 (id=0).
 /// On single-monitor setups this returns exactly one entry.  If enumeration
 /// fails, returns a single fallback entry with default resolution.
+///
+/// Note: on Wayland, platform enumeration cannot know the true capture
+/// resolution before a portal session is opened — it returns a placeholder.
+/// Callers that have access to the live session registry should prefer
+/// [`enumerate_displays_with_sessions`], which patches each entry with the
+/// session's actual stream resolution.
 pub async fn enumerate_displays() -> Vec<DisplayInfo> {
     let displays = enumerate_displays_platform().await;
     if displays.is_empty() {
@@ -97,6 +103,33 @@ pub async fn enumerate_displays() -> Vec<DisplayInfo> {
     } else {
         displays
     }
+}
+
+/// Enumerate displays and overlay each entry with the live resolution from
+/// its active capture session, when one exists.
+///
+/// This exists because [`enumerate_displays`] cannot see the session registry
+/// and therefore cannot report the true resolution on Wayland, where the
+/// portal grants a stream at whatever size it likes (often a downscale of the
+/// compositor resolution). Agents calling `list_displays` need the true
+/// capture size so their click coordinates match the screenshot they receive.
+pub async fn enumerate_displays_with_sessions(
+    registry: &Option<SharedSessionRegistry>,
+) -> Vec<DisplayInfo> {
+    let mut displays = enumerate_displays().await;
+    if let Some(reg) = registry.as_ref() {
+        let reg = reg.read().await;
+        for d in &mut displays {
+            if let Some(session) = reg.get(d.id) {
+                let (w, h) = session.resolution();
+                if w > 0 && h > 0 {
+                    d.width = w;
+                    d.height = h;
+                }
+            }
+        }
+    }
+    displays
 }
 
 /// Platform-specific display enumeration.

@@ -368,6 +368,12 @@ pub async fn execute_actions(
 /// Get the logical display size for the main display. Cached after first call.
 /// Used to map CU model coordinates (which are in a normalized 1024-wide space)
 /// to actual logical points for cliclick/xdotool.
+///
+/// This is a platform-agnostic *fallback* used when no active capture session
+/// is available for the target display. Prefer [`target_pixel_size`] for any
+/// code path that knows which `DisplayTarget` is being driven — it returns the
+/// true stream/display resolution from the live session registry, which on
+/// Wayland is the only way to get the portal-granted stream size.
 pub fn logical_display_size() -> (u32, u32) {
     use std::sync::OnceLock;
     static SIZE: OnceLock<(u32, u32)> = OnceLock::new();
@@ -389,6 +395,49 @@ pub fn logical_display_size() -> (u32, u32) {
         // Fallback: assume 1:1 mapping
         (1024, 768)
     })
+}
+
+/// Resolve the reference pixel size for denormalizing 0-1000 model coordinates.
+///
+/// Returns the resolution that 0-1000 model coordinates should be scaled
+/// against so that the resulting pixel clicks land where the model intended.
+/// Preference order:
+///
+/// 1. **Active capture session** for the target (`session.resolution()`) —
+///    this matches the screenshot the model is actually looking at, and on
+///    Wayland it is the *only* correct reference because the portal's
+///    pointer injection accepts coordinates in stream-pixel space, which is
+///    whatever the portal granted (often not the compositor resolution).
+/// 2. **Platform display enumeration** (xrandr / x11rb on Linux,
+///    CoreGraphics on macOS) — used when no session has been created yet.
+/// 3. **`logical_display_size()` fallback** — last resort, only correct on
+///    macOS.
+pub async fn target_pixel_size(
+    target: DisplayTarget,
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+) -> (u32, u32) {
+    if let Some(session) = lookup_display_session(session_registry, &target).await {
+        let (w, h) = session.resolution();
+        if w > 0 && h > 0 {
+            return (w, h);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let display_id = match target {
+            DisplayTarget::UserSession => 0,
+            DisplayTarget::Virtual { id } => id,
+        };
+        let displays = crate::display::x11::enumerate_displays().await;
+        if let Some(d) = displays.iter().find(|d| d.id == display_id) {
+            if d.width > 0 && d.height > 0 {
+                return (d.width, d.height);
+            }
+        }
+    }
+
+    logical_display_size()
 }
 
 /// Screenshots are resized to logical display size before sending to the model,

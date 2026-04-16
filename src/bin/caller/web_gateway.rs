@@ -3810,7 +3810,9 @@ pub fn spawn_web_gateway(
                     } else if request_line.contains("/api/displays") {
                         // Display enumeration endpoint
                         use tokio::io::AsyncWriteExt;
-                        let displays = crate::display::enumerate_displays().await;
+                        let displays =
+                            crate::display::enumerate_displays_with_sessions(&session_registry)
+                                .await;
                         let body = serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\

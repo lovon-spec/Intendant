@@ -1661,7 +1661,9 @@ async fn handle_control_command_mcp(
             Some(RESOURCE_LOGS_URI)
         }
         ControlMsg::ListDisplays => {
-            let displays = crate::display::enumerate_displays().await;
+            let session_registry = state.read().await.session_registry.clone();
+            let displays =
+                crate::display::enumerate_displays_with_sessions(&session_registry).await;
             let json = serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string());
             emit_control_result(control_tx, "list_displays", true, json, None);
             None
@@ -3390,7 +3392,9 @@ impl IntendantServer {
 
     #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
     async fn list_displays(&self) -> String {
-        let displays = crate::display::enumerate_displays().await;
+        let session_registry = self.state.read().await.session_registry.clone();
+        let displays =
+            crate::display::enumerate_displays_with_sessions(&session_registry).await;
         serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string())
     }
 
@@ -3472,14 +3476,6 @@ impl IntendantServer {
         }
 
         let target = resolve_display_target(params.display_target.as_deref());
-
-        // Denormalize 0-1000 grid coordinates to pixel coordinates
-        if params.coordinate_space.as_deref() == Some("normalized_1000") {
-            let (sw, sh) = crate::computer_use::logical_display_size();
-            for action in &mut actions {
-                denormalize_action(action, sw, sh);
-            }
-        }
         let backend = DisplayBackend::detect();
 
         let state = self.state.read().await;
@@ -3487,6 +3483,19 @@ impl IntendantServer {
             .unwrap_or_else(|| state.log_dir.join("screenshots"));
         let session_registry = state.session_registry.clone();
         drop(state);
+
+        // Denormalize 0-1000 grid coordinates to pixel coordinates.
+        // Reference size comes from the live capture session when one exists
+        // (required on Wayland, where the portal grants an arbitrary stream
+        // size that the model's screenshot is in). Falls back to platform
+        // enumeration / logical_display_size when no session is active.
+        if params.coordinate_space.as_deref() == Some("normalized_1000") {
+            let (sw, sh) =
+                crate::computer_use::target_pixel_size(target, &session_registry).await;
+            for action in &mut actions {
+                denormalize_action(action, sw, sh);
+            }
+        }
 
         let _ = std::fs::create_dir_all(&screenshot_dir);
         let mut counter = self.state.read().await.screenshot_counter
