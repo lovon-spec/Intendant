@@ -3447,6 +3447,7 @@ impl IntendantServer {
             &screenshot_dir,
             &mut counter,
             &session_registry,
+            None,
         ).await;
 
         if let Some(result) = results.first() {
@@ -3489,13 +3490,20 @@ impl IntendantServer {
         // (required on Wayland, where the portal grants an arbitrary stream
         // size that the model's screenshot is in). Falls back to platform
         // enumeration / logical_display_size when no session is active.
-        if params.coordinate_space.as_deref() == Some("normalized_1000") {
-            let (sw, sh) =
+        //
+        // The snapshot is also forwarded to execute_via_session so it uses
+        // the same divisor for re-normalization — this prevents a TOCTOU
+        // race if the portal stream resizes between the two reads.
+        let denorm_ref = if params.coordinate_space.as_deref() == Some("normalized_1000") {
+            let size =
                 crate::computer_use::target_pixel_size(target, &session_registry).await;
             for action in &mut actions {
-                denormalize_action(action, sw, sh);
+                denormalize_action(action, size.0, size.1);
             }
-        }
+            Some(size)
+        } else {
+            None
+        };
 
         let _ = std::fs::create_dir_all(&screenshot_dir);
         let mut counter = self.state.read().await.screenshot_counter
@@ -3507,6 +3515,7 @@ impl IntendantServer {
             &screenshot_dir,
             &mut counter,
             &session_registry,
+            denorm_ref,
         ).await;
 
         // Format results with action details (type, coordinates) for debugging.

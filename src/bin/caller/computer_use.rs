@@ -294,6 +294,7 @@ pub async fn execute_actions(
     screenshot_dir: &Path,
     action_counter: &mut u64,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
+    denorm_ref: Option<(u32, u32)>,
 ) -> Vec<CuActionResult> {
     // Virtual displays are always Xvfb (X11), so use X11 tooling for them
     // regardless of the host's detected backend. This lets an agent running
@@ -306,7 +307,7 @@ pub async fn execute_actions(
     match effective_backend {
         DisplayBackend::Wayland => {
             if let Some(session) = lookup_display_session(session_registry, &target).await {
-                return execute_via_session(&session, actions, screenshot_dir, action_counter).await;
+                return execute_via_session(&session, actions, screenshot_dir, action_counter, denorm_ref).await;
             }
             return vec![CuActionResult {
                 success: false,
@@ -943,13 +944,22 @@ async fn lookup_display_session(
 /// Converts CU pixel coordinates to normalised 0.0..1.0 coordinates expected by
 /// `InputEvent`, and maps `CuAction` variants to sequences of `InputEvent`
 /// injections.
+///
+/// `denorm_ref` is the resolution that was used to denormalize 0-1000 model
+/// coordinates into pixel space (from [`target_pixel_size`]).  When provided,
+/// we use it instead of a live `session.resolution()` read so the
+/// divide-then-multiply round-trip is immune to portal stream resizes.
+/// `inject_input` still reads the *current* resolution — that's correct because
+/// the portal's `notify_pointer_motion_absolute` expects coordinates in the
+/// live stream space.
 async fn execute_via_session(
     session: &crate::display::DisplaySession,
     actions: &[CuAction],
     screenshot_dir: &std::path::Path,
     action_counter: &mut u64,
+    denorm_ref: Option<(u32, u32)>,
 ) -> Vec<CuActionResult> {
-    let (width, height) = session.resolution();
+    let (width, height) = denorm_ref.unwrap_or_else(|| session.resolution());
     let mut results = Vec::with_capacity(actions.len());
     let mut needs_auto_screenshot = false;
 

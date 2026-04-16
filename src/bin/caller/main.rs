@@ -6058,6 +6058,7 @@ async fn run_cu_task(
                     log_dir,
                     &mut cu_counter,
                     &None,
+                    None,
                 )
                 .await;
 
@@ -6147,6 +6148,7 @@ async fn execute_cu_calls(
             log_dir,
             counter,
             &None,
+            None,
         ).await;
 
         // Find the last screenshot from results
