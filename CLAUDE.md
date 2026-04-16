@@ -234,6 +234,18 @@ supported platforms — never panic or silently do nothing.
 - **WASM build**: `wasm-pack` (`cargo install wasm-pack`)
 - **Full setup**: `./scripts/setup-linux.sh` (Debian/Ubuntu) or `./scripts/setup-macos.sh` (macOS)
 
+## Multi-Agent Development
+
+Multiple AI agents run concurrently on this machine, each in an isolated git
+worktree. The main repo (`/home/user/projects/intendant`) is the shared merge
+target — **never build or run intendant from the main worktree**. Always build
+and launch from your own worktree's `target/release/intendant`.
+
+Each running intendant instance binds its own web port (printed at startup).
+Port discovery is automatic — the dashboard finds all running instances. Note
+your port so the user can access your instance. Don't kill intendant processes
+you didn't spawn; they belong to other agents.
+
 ## CI/CD
 
 None configured. Run `cargo test --bins` and `cargo clippy` locally before committing.
