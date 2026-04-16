@@ -390,6 +390,14 @@ pub enum AppEvent {
         snapshot: crate::display::DisplayMetricsSnapshot,
     },
 
+    /// A file in the project directory was created, modified, or deleted.
+    FileChanged {
+        path: String,
+        kind: crate::file_watcher::FileChangeKind,
+        lines_added: u32,
+        lines_removed: u32,
+    },
+
     // TUI internal
     Tick,
     #[allow(dead_code)]
@@ -864,6 +872,18 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 backend: backend.to_string(),
             })
         }
+        AppEvent::FileChanged { path, kind, lines_added, lines_removed } => {
+            let kind_str = serde_json::to_value(kind)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "modified".to_string());
+            Some(OutboundEvent::FileChanged {
+                path: path.clone(),
+                kind: kind_str,
+                lines_added: *lines_added,
+                lines_removed: *lines_removed,
+            })
+        }
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -1096,6 +1116,15 @@ fn write_event_to_session_log(
             if let Some(ref r) = reasoning {
                 log.reasoning_content(Some(r.as_str()), None);
             }
+        }
+
+        // File watcher
+        AppEvent::FileChanged { path, kind, lines_added, lines_removed } => {
+            let kind_str = serde_json::to_value(kind)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "modified".to_string());
+            log.info(&format!("file_{}: {} (+{}/-{})", kind_str, path, lines_added, lines_removed));
         }
 
         // ---- Events already logged inline by the agent loop or web_gateway ----

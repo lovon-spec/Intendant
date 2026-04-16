@@ -341,6 +341,12 @@ pub enum OutboundEvent {
         resolution_width: u32,
         resolution_height: u32,
     },
+    FileChanged {
+        path: String,
+        kind: String,
+        lines_added: u32,
+        lines_removed: u32,
+    },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
     /// Cannot be serialized.

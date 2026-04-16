@@ -4,7 +4,7 @@ use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
@@ -126,6 +126,8 @@ pub struct ActiveSessionState {
     pub session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
     pub recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
     pub session_registry: Option<crate::display::SharedSessionRegistry>,
+    pub snapshot_dir: Option<PathBuf>,
+    pub project_root_for_changes: Option<PathBuf>,
 }
 
 impl ActiveSessionState {
@@ -136,6 +138,8 @@ impl ActiveSessionState {
             session_log: None,
             recording_registry: None,
             session_registry: None,
+            snapshot_dir: None,
+            project_root_for_changes: None,
         }))
     }
 }
@@ -862,6 +866,176 @@ fn list_sessions() -> String {
     serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Handle `/api/session/current/changes[/{path}]` requests.
+///
+/// - No path suffix: list all changed files (baseline vs current).
+/// - With path suffix: return unified diff for a single file.
+fn handle_changes_request(
+    request_line: &str,
+    snapshot_dir: Option<&Path>,
+    project_root: Option<&Path>,
+) -> String {
+    let (snapshot_dir, project_root) = match (snapshot_dir, project_root) {
+        (Some(s), Some(p)) => (s, p),
+        _ => {
+            return serde_json::json!({"error": "file watcher not active"}).to_string();
+        }
+    };
+
+    let baseline_dir = snapshot_dir.join("baseline");
+    if !baseline_dir.exists() {
+        return serde_json::json!([]).to_string();
+    }
+
+    // Extract the path after /api/session/current/changes
+    let file_path = request_line
+        .split("/api/session/current/changes")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("")
+        .trim_start_matches('/');
+
+    if file_path.is_empty() {
+        // List all changed files.
+        handle_changes_list(&baseline_dir, project_root)
+    } else {
+        // Single-file diff.
+        handle_changes_file_diff(file_path, &baseline_dir, project_root)
+    }
+}
+
+/// List all files that have changed since the session baseline.
+fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
+    let mut changes = Vec::new();
+    let mut stack = vec![baseline_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel = match path.strip_prefix(baseline_dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let rel_str = rel.to_string_lossy().to_string();
+            let current_path = project_root.join(rel);
+
+            let baseline = std::fs::read_to_string(&path).unwrap_or_default();
+            if current_path.exists() {
+                let current = match std::fs::read_to_string(&current_path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if baseline == current {
+                    continue; // no change
+                }
+                let (lines_added, lines_removed) = {
+                    let diff = similar::TextDiff::from_lines(baseline.as_str(), current.as_str());
+                    let mut added = 0u32;
+                    let mut removed = 0u32;
+                    for change in diff.iter_all_changes() {
+                        match change.tag() {
+                            similar::ChangeTag::Insert => added += 1,
+                            similar::ChangeTag::Delete => removed += 1,
+                            similar::ChangeTag::Equal => {}
+                        }
+                    }
+                    (added, removed)
+                };
+                let kind = if baseline.is_empty() { "created" } else { "modified" };
+                changes.push(serde_json::json!({
+                    "path": rel_str,
+                    "kind": kind,
+                    "lines_added": lines_added,
+                    "lines_removed": lines_removed,
+                }));
+            } else {
+                // File was deleted.
+                let lines_removed = baseline.lines().count() as u32;
+                changes.push(serde_json::json!({
+                    "path": rel_str,
+                    "kind": "deleted",
+                    "lines_added": 0,
+                    "lines_removed": lines_removed,
+                }));
+            }
+        }
+    }
+    serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Return a unified diff for a single file.
+fn handle_changes_file_diff(
+    file_path: &str,
+    baseline_dir: &Path,
+    project_root: &Path,
+) -> String {
+    // Reject path traversal.
+    let rel = Path::new(file_path);
+    for component in rel.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return serde_json::json!({"error": "invalid path"}).to_string();
+        }
+    }
+
+    let baseline_path = baseline_dir.join(rel);
+    let current_path = project_root.join(rel);
+
+    // Verify resolved paths stay within their roots.
+    if let (Ok(resolved_baseline), Ok(resolved_root)) = (
+        baseline_path.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_path.clone())),
+        baseline_dir.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_dir.to_path_buf())),
+    ) {
+        if !resolved_baseline.starts_with(&resolved_root) {
+            return serde_json::json!({"error": "invalid path"}).to_string();
+        }
+    }
+    if let (Ok(resolved_current), Ok(resolved_root)) = (
+        current_path.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(current_path.clone())),
+        project_root.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(project_root.to_path_buf())),
+    ) {
+        if !resolved_current.starts_with(&resolved_root) {
+            return serde_json::json!({"error": "invalid path"}).to_string();
+        }
+    }
+
+    let baseline = std::fs::read_to_string(&baseline_path).unwrap_or_default();
+    let current = if current_path.exists() {
+        std::fs::read_to_string(&current_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let diff = crate::file_watcher::compute_unified_diff(&baseline, &current, file_path);
+    let (lines_added, lines_removed) = {
+        let text_diff = similar::TextDiff::from_lines(baseline.as_str(), current.as_str());
+        let mut added = 0u32;
+        let mut removed = 0u32;
+        for change in text_diff.iter_all_changes() {
+            match change.tag() {
+                similar::ChangeTag::Insert => added += 1,
+                similar::ChangeTag::Delete => removed += 1,
+                similar::ChangeTag::Equal => {}
+            }
+        }
+        (added, removed)
+    };
+
+    serde_json::json!({
+        "path": file_path,
+        "diff": diff,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+    })
+    .to_string()
+}
+
 /// Delete session data: entire session, media, recordings, frames, or turns.
 /// Returns a JSON result with `ok` and `bytes_freed`.
 fn delete_session_data(session_id: &str, target: &str) -> String {
@@ -1532,6 +1706,8 @@ pub fn spawn_web_gateway(
                 let session_log = session_snap.session_log.clone();
                 let recording_registry = session_snap.recording_registry.clone();
                 let session_registry = session_snap.session_registry.clone();
+                let snapshot_dir = session_snap.snapshot_dir.clone();
+                let project_root_for_changes = session_snap.project_root_for_changes.clone();
                 drop(session_snap);
                 // Peek at the first bytes to detect (in order):
                 //  1. ICE-TCP STUN-framed traffic (RFC 4571 length prefix
@@ -3487,6 +3663,28 @@ pub fn spawn_web_gateway(
                              Content-Length: {}\r\n\
                              Access-Control-Allow-Origin: *\r\n\
                              Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET") && request_line.contains("/api/session/current/changes") {
+                        // File change tracking endpoints:
+                        //   GET /api/session/current/changes        — list all changed files
+                        //   GET /api/session/current/changes/{path} — unified diff for one file
+                        use tokio::io::AsyncWriteExt;
+                        let body = handle_changes_request(
+                            &request_line,
+                            snapshot_dir.as_deref(),
+                            project_root_for_changes.as_deref(),
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
                              Connection: close\r\n\
                              \r\n\
                              {}",

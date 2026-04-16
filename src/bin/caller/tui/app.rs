@@ -2086,7 +2086,8 @@ impl App {
             AppEvent::ApprovalResolved { .. }
             | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
             | AppEvent::DisplayMetrics { .. } | AppEvent::DisplayResize { .. }
-            | AppEvent::ExternalAgentChanged { .. } => {
+            | AppEvent::ExternalAgentChanged { .. }
+            | AppEvent::FileChanged { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }

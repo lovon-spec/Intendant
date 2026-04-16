@@ -271,7 +271,8 @@ impl AppEventUpcaster {
             | AppEvent::Resize(_, _)
             | AppEvent::Tick
             | AppEvent::ControlCommand(_)
-            | AppEvent::DisplayMetrics { .. } => vec![],
+            | AppEvent::DisplayMetrics { .. }
+            | AppEvent::FileChanged { .. } => vec![],
 
             // ---- Turn lifecycle ----
             AppEvent::TurnStarted { turn, .. } => {
@@ -1018,7 +1019,9 @@ impl WireEventUpcaster {
     pub fn upcast(&mut self, event: &OutboundEvent) -> Vec<PeerEvent> {
         match event {
             // ---- Forward-compat + dropped metric streams ----
-            OutboundEvent::Unknown | OutboundEvent::DisplayMetrics { .. } => vec![],
+            OutboundEvent::Unknown
+            | OutboundEvent::DisplayMetrics { .. }
+            | OutboundEvent::FileChanged { .. } => vec![],
 
             // ---- Turn lifecycle ----
             OutboundEvent::TurnStarted { turn, .. } => {
