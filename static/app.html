@@ -577,6 +577,53 @@ html, body {
 .stop-btn:hover { background: #e06c75; }
 .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* ── Global Task Bar ──
+   Primary control surface hoisted above the tab bar so the task input
+   and live phase indicator are visible from every tab. */
+.global-task-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  flex-shrink: 0;
+}
+.global-task-bar .phase-banner { min-width: 160px; }
+.global-task-input {
+  flex: 1;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+.global-task-input:focus { outline: none; border-color: var(--blue); }
+.global-direct-toggle {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--overlay0);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.global-direct-toggle input { margin: 0; accent-color: var(--blue); }
+.global-send-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.global-send-btn:hover { background: rgba(166, 227, 161, 0.1); }
+
 /* ── Phase Banner ── */
 .phase-banner {
   display: flex;
@@ -2963,6 +3010,18 @@ html, body {
     </div>
   </div>
 
+  <!-- Global Task Bar — always visible across tabs -->
+  <div class="global-task-bar">
+    <div class="phase-banner phase-idle" id="phase-banner">
+      <span class="spinner" id="phase-spinner"></span>
+      <span class="phase-text" id="phase-text">Idle</span>
+    </div>
+    <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
+    <input id="activity-task-input" class="global-task-input" placeholder="Enter task..." />
+    <label class="global-direct-toggle" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" />Direct</label>
+    <button class="global-send-btn" onclick="submitActivityTask()">Send</button>
+  </div>
+
   <!-- Tab Bar -->
   <nav class="tab-bar">
     <button class="tab-btn active" data-tab="activity">Activity<span class="badge" id="badge-activity"></span></button>
@@ -2989,11 +3048,6 @@ html, body {
       <div class="subtab-panes">
         <div class="subtab-pane active" id="activity-log-pane">
           <div class="activity-toolbar">
-            <div class="phase-banner phase-idle" id="phase-banner">
-              <span class="spinner" id="phase-spinner"></span>
-              <span class="phase-text" id="phase-text">Idle</span>
-            </div>
-            <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
             <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
               <option value="normal" selected>Normal</option>
               <option value="verbose">Verbose</option>
@@ -3010,13 +3064,6 @@ html, body {
             <span class="pending-attachments-count" id="pending-attachments-count">0</span>
             <div id="pending-attachments-list" style="display:flex;gap:4px;flex-wrap:wrap"></div>
             <button class="pending-attachments-clear" id="pending-attachments-clear" title="Remove all attachments">Clear</button>
-          </div>
-
-          <!-- Task Input -->
-          <div style="display:flex;gap:4px;padding:4px 8px;border-bottom:1px solid var(--surface1);align-items:center">
-            <input id="activity-task-input" placeholder="Enter task..." style="flex:1;padding:4px 8px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);font-size:12px" />
-            <label style="display:flex;align-items:center;gap:3px;font-size:11px;color:var(--overlay0);cursor:pointer;white-space:nowrap" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" style="margin:0;accent-color:var(--blue)" />Direct</label>
-            <button onclick="submitActivityTask()" style="padding:4px 12px;border:1px solid var(--green);border-radius:4px;background:transparent;color:var(--green);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">Send</button>
           </div>
 
           <!-- Display Strip (shown when displays are active) -->
