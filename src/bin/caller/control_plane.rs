@@ -34,10 +34,28 @@ pub struct CodexRuntimeConfig {
 
 pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
 
+/// Runtime Gemini configuration, mirror of `CodexRuntimeConfig`. All of
+/// these map to Gemini CLI flags and are applied when the agent process is
+/// spawned — there's no mid-session way to flip them, so a change here
+/// forces the daemon loop to tear down the persistent agent.
+#[derive(Debug, Clone)]
+pub struct GeminiRuntimeConfig {
+    pub model: Option<String>,
+    pub approval_mode: String,
+    pub sandbox: bool,
+    pub extensions: Vec<String>,
+    pub allowed_mcp_servers: Vec<String>,
+    pub include_directories: Vec<String>,
+    pub debug: bool,
+}
+
+pub type SharedGeminiConfig = Arc<RwLock<GeminiRuntimeConfig>>;
+
 pub struct ControlPlaneState {
     pub autonomy: SharedAutonomy,
     pub external_agent: Arc<RwLock<Option<external_agent::AgentBackend>>>,
     pub codex_config: SharedCodexConfig,
+    pub gemini_config: SharedGeminiConfig,
     pub bus: EventBus,
     /// Project root for `intendant.toml` writes. When set, changes to
     /// `external_agent` (from any frontend) also persist to the config
@@ -257,8 +275,180 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
+        ControlMsg::SetGeminiModel { model } => {
+            // Treat empty/whitespace as "clear the override", matching the
+            // dashboard input semantics for the Codex-model field.
+            let normalized: Option<String> = model
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            {
+                let mut guard = state.gemini_config.write().await;
+                guard.model = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_gemini_field(root, |cfg| {
+                    cfg.model = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist gemini.model to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
+                model: normalized.clone(),
+                model_cleared: normalized.is_none(),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetGeminiApprovalMode { mode } => {
+            let normalized = crate::project::normalize_gemini_approval_mode(mode);
+            {
+                let mut guard = state.gemini_config.write().await;
+                guard.approval_mode = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_gemini_field(root, |cfg| {
+                    cfg.approval_mode = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist gemini.approval_mode to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
+                approval_mode: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetGeminiSandbox { enabled } => {
+            {
+                let mut guard = state.gemini_config.write().await;
+                guard.sandbox = *enabled;
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_gemini_field(root, |cfg| {
+                    cfg.sandbox = *enabled;
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist gemini.sandbox to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
+                sandbox: Some(*enabled),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetGeminiExtensions { extensions } => {
+            let normalized = normalize_name_list(extensions);
+            {
+                let mut guard = state.gemini_config.write().await;
+                guard.extensions = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_gemini_field(root, |cfg| {
+                    cfg.extensions = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist gemini.extensions to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
+                extensions: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetGeminiAllowedMcpServers { servers } => {
+            let normalized = normalize_name_list(servers);
+            {
+                let mut guard = state.gemini_config.write().await;
+                guard.allowed_mcp_servers = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_gemini_field(root, |cfg| {
+                    cfg.allowed_mcp_servers = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist gemini.allowed_mcp_servers to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
+                allowed_mcp_servers: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetGeminiIncludeDirectories { directories } => {
+            // Reuse writable-roots normalizer — same "drop empty / dedupe,
+            // preserve order" policy applies.
+            let normalized = normalize_writable_roots(directories);
+            {
+                let mut guard = state.gemini_config.write().await;
+                guard.include_directories = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_gemini_field(root, |cfg| {
+                    cfg.include_directories = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist gemini.include_directories to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
+                include_directories: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetGeminiDebug { enabled } => {
+            {
+                let mut guard = state.gemini_config.write().await;
+                guard.debug = *enabled;
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_gemini_field(root, |cfg| {
+                    cfg.debug = *enabled;
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist gemini.debug to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
+                debug: Some(*enabled),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::GeminiThreadAction { op, params } => {
+            // Rebroadcast for the daemon-side watcher, same pattern as
+            // CodexThreadAction. The watcher dispatches `/new` (agent
+            // teardown) or returns an "unsupported" result.
+            state.bus.send(AppEvent::GeminiThreadActionRequested {
+                action: op.clone(),
+                params: params.clone(),
+            });
+        }
         _ => {} // Other control messages don't update shared state
     }
+}
+
+/// Normalize a list of names (extension IDs, MCP server names, etc.): trim
+/// whitespace, drop empty entries, dedupe while preserving order.
+fn normalize_name_list(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let s = trimmed.to_string();
+        if !out.iter().any(|existing| existing == &s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// Drop blank entries and duplicates (case-preserving but order-preserving)
@@ -323,6 +513,46 @@ where
     proj.save_config()
 }
 
+/// Sibling of `persist_codex_field` for the `[agent.gemini_cli]` section.
+fn persist_gemini_field<F>(
+    project_root: &std::path::Path,
+    mutate: F,
+) -> Result<(), crate::error::CallerError>
+where
+    F: FnOnce(&mut crate::project::GeminiCliConfig),
+{
+    let mut proj = crate::project::Project::from_root(project_root.to_path_buf())?;
+    mutate(&mut proj.config.agent.gemini_cli);
+    proj.save_config()
+}
+
+/// Delta describing which Gemini config fields changed. Mirrors
+/// `CodexConfigDelta`; `Option::None` across the board means "no change".
+#[derive(Debug, Default)]
+struct GeminiConfigDelta {
+    model: Option<String>,
+    model_cleared: bool,
+    approval_mode: Option<String>,
+    sandbox: Option<bool>,
+    extensions: Option<Vec<String>>,
+    allowed_mcp_servers: Option<Vec<String>>,
+    include_directories: Option<Vec<String>>,
+    debug: Option<bool>,
+}
+
+fn gemini_config_changed_event(delta: GeminiConfigDelta) -> AppEvent {
+    AppEvent::GeminiConfigChanged {
+        model: delta.model,
+        model_cleared: delta.model_cleared,
+        approval_mode: delta.approval_mode,
+        sandbox: delta.sandbox,
+        extensions: delta.extensions,
+        allowed_mcp_servers: delta.allowed_mcp_servers,
+        include_directories: delta.include_directories,
+        debug: delta.debug,
+    }
+}
+
 /// Re-read intendant.toml, update `[agent] default_backend`, and save
 /// it back. Re-reading (instead of caching a mutable ProjectConfig) is
 /// the simplest way to avoid races with other writers to the TOML.
@@ -353,6 +583,18 @@ mod tests {
         }))
     }
 
+    fn test_gemini_config() -> SharedGeminiConfig {
+        Arc::new(RwLock::new(GeminiRuntimeConfig {
+            model: None,
+            approval_mode: "default".to_string(),
+            sandbox: false,
+            extensions: Vec::new(),
+            allowed_mcp_servers: Vec::new(),
+            include_directories: Vec::new(),
+            debug: false,
+        }))
+    }
+
     #[tokio::test]
     async fn set_autonomy_updates_shared_state() {
         let bus = EventBus::new();
@@ -365,6 +607,7 @@ mod tests {
                 autonomy: autonomy.clone(),
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -398,6 +641,7 @@ mod tests {
                 autonomy: autonomy.clone(),
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -442,6 +686,7 @@ mod tests {
                 autonomy: autonomy.clone(),
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -472,6 +717,7 @@ mod tests {
                 autonomy: autonomy.clone(),
                 external_agent: external_agent.clone(),
                 codex_config: test_codex_config(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -502,6 +748,7 @@ mod tests {
                 autonomy,
                 external_agent,
                 codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -538,6 +785,7 @@ mod tests {
                 autonomy,
                 external_agent,
                 codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -565,6 +813,7 @@ mod tests {
                 autonomy,
                 external_agent,
                 codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -599,6 +848,7 @@ mod tests {
                 autonomy,
                 external_agent,
                 codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -633,6 +883,7 @@ mod tests {
                 autonomy,
                 external_agent,
                 codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -669,6 +920,7 @@ mod tests {
                 autonomy,
                 external_agent,
                 codex_config,
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -711,6 +963,7 @@ mod tests {
                 autonomy,
                 external_agent,
                 codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
                 bus: bus.clone(),
                 project_root: None,
             },
@@ -728,6 +981,181 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let got = codex_config.read().await.writable_roots.clone();
         assert_eq!(got, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+
+        handle.abort();
+    }
+
+    // ── Gemini control-plane handlers ─────────────────────────────────
+
+    #[tokio::test]
+    async fn set_gemini_model_updates_shared_state_and_clears_on_blank() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let gemini_config = test_gemini_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: test_codex_config(),
+                gemini_config: gemini_config.clone(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiModel {
+            model: Some("gemini-2.5-pro".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            gemini_config.read().await.model.as_deref(),
+            Some("gemini-2.5-pro")
+        );
+
+        // Whitespace → clear override.
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiModel {
+            model: Some("   ".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(gemini_config.read().await.model.is_none());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_gemini_approval_mode_normalizes_unknown_back_to_default() {
+        let bus = EventBus::new();
+        let gemini_config = test_gemini_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy: crate::autonomy::shared_autonomy(AutonomyState::default()),
+                external_agent: Arc::new(RwLock::new(None)),
+                codex_config: test_codex_config(),
+                gemini_config: gemini_config.clone(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiApprovalMode {
+            mode: "yolo".to_string(),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(gemini_config.read().await.approval_mode, "yolo");
+
+        // Unknown → default (safe fallback — don't silently leave yolo).
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiApprovalMode {
+            mode: "banana".to_string(),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(gemini_config.read().await.approval_mode, "default");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_gemini_sandbox_toggles() {
+        let bus = EventBus::new();
+        let gemini_config = test_gemini_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy: crate::autonomy::shared_autonomy(AutonomyState::default()),
+                external_agent: Arc::new(RwLock::new(None)),
+                codex_config: test_codex_config(),
+                gemini_config: gemini_config.clone(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiSandbox {
+            enabled: true,
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(gemini_config.read().await.sandbox);
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiSandbox {
+            enabled: false,
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!gemini_config.read().await.sandbox);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_gemini_extensions_dedupes_and_drops_blanks() {
+        let bus = EventBus::new();
+        let gemini_config = test_gemini_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy: crate::autonomy::shared_autonomy(AutonomyState::default()),
+                external_agent: Arc::new(RwLock::new(None)),
+                codex_config: test_codex_config(),
+                gemini_config: gemini_config.clone(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiExtensions {
+            extensions: vec![
+                "web".into(),
+                "  ".into(),
+                "web".into(),
+                "fs".into(),
+                "".into(),
+            ],
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            gemini_config.read().await.extensions,
+            vec!["web".to_string(), "fs".to_string()]
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_thread_action_rebroadcasts_as_requested_event() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy: crate::autonomy::shared_autonomy(AutonomyState::default()),
+                external_agent: Arc::new(RwLock::new(None)),
+                codex_config: test_codex_config(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::GeminiThreadAction {
+            op: "new".to_string(),
+            params: serde_json::Value::Null,
+        }));
+
+        let mut found = false;
+        for _ in 0..10 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(AppEvent::GeminiThreadActionRequested { action, .. })) => {
+                    assert_eq!(action, "new");
+                    found = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(found, "expected GeminiThreadActionRequested on bus");
 
         handle.abort();
     }

@@ -3234,8 +3234,94 @@ html, body {
                 </div>
               </fieldset>
             </div>
+            <div id="control-gemini-section" style="display:none">
+              <fieldset class="control-group">
+                <legend>Session actions</legend>
+                <div class="control-actions-row">
+                  <button class="control-action-btn" data-gemini-action="new" title="Tear down the Gemini process so the next task starts a fresh session (/new)">New session</button>
+                </div>
+                <div class="control-hint">
+                  Gemini latches every knob below at process spawn. <strong>New session</strong> forces a restart with the current settings even if nothing has changed. Other slash commands (<code>/compact</code>, <code>/chat</code>, <code>/memory</code>) aren't exposed over ACP — start a new session instead when context gets crowded.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Approval mode</legend>
+                <div class="control-row">
+                  <label for="control-gemini-approval">Mode</label>
+                  <select id="control-gemini-approval">
+                    <option value="default" selected>default</option>
+                    <option value="auto_edit">auto_edit</option>
+                    <option value="yolo">yolo</option>
+                    <option value="plan">plan</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>default</strong>: prompt for every tool call. <strong>auto_edit</strong>: auto-approve edits, prompt for exec. <strong>yolo</strong>: auto-approve everything. <strong>plan</strong>: read-only (no writes or exec).
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Sandbox</legend>
+                <div class="control-row">
+                  <label for="control-gemini-sandbox">Enabled</label>
+                  <input type="checkbox" id="control-gemini-sandbox">
+                  <span class="control-current" id="control-gemini-sandbox-status">off</span>
+                </div>
+                <div class="control-hint">
+                  Maps to <code>gemini --sandbox</code>. Constrains shell execution and file writes. Leave off when you need the same environment as your terminal.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Model</legend>
+                <div class="control-row">
+                  <label for="control-gemini-model">Override</label>
+                  <input type="text" id="control-gemini-model" placeholder="e.g. gemini-2.5-pro (leave empty for Gemini default)">
+                </div>
+                <div class="control-hint">Sent as <code>gemini --model</code>. Empty = let Gemini CLI pick its configured default.</div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Extensions</legend>
+                <div class="control-row">
+                  <label for="control-gemini-extensions">Enabled extensions</label>
+                  <textarea id="control-gemini-extensions" rows="3" placeholder="one-extension-name-per-line&#10;(leave empty for all)" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  Passed as <code>gemini --extensions=a,b,c</code>. Empty = use all installed extensions (Gemini's default). List installed ones with <code>gemini extensions list</code>.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>MCP server allowlist</legend>
+                <div class="control-row">
+                  <label for="control-gemini-mcp">Allowed servers</label>
+                  <textarea id="control-gemini-mcp" rows="3" placeholder="one-mcp-server-per-line&#10;(leave empty for all)" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  Maps to <code>gemini --allowed-mcp-server-names</code>. If you set an allowlist, include <code>intendant</code> or the Intendant MCP tools (take_screenshot, etc.) won't be reachable. Empty = all servers allowed.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Workspace</legend>
+                <div class="control-row">
+                  <label for="control-gemini-include-dirs">Extra include paths</label>
+                  <textarea id="control-gemini-include-dirs" rows="3" placeholder="/absolute/path/one&#10;/absolute/path/two" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  One absolute path per line. Maps to <code>gemini --include-directories</code>. Blank lines and duplicates are dropped. Press <kbd>Ctrl/&#8984;+Enter</kbd> or click away to save.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Debug</legend>
+                <div class="control-row">
+                  <label for="control-gemini-debug">DevTools</label>
+                  <input type="checkbox" id="control-gemini-debug">
+                  <span class="control-current" id="control-gemini-debug-status">off</span>
+                </div>
+                <div class="control-hint">
+                  Maps to <code>gemini --debug</code>. Opens Gemini's Chromium DevTools console. Mostly useful for tracking down Gemini CLI itself.
+                </div>
+              </fieldset>
+            </div>
             <div id="control-no-backend" class="control-disabled-overlay" style="display:none">
-              No Codex backend selected. Switch to Codex in Settings &rarr; Agent to configure these knobs.
+              No external agent selected. Pick Codex, Claude Code, or Gemini in Settings &rarr; Agent to configure backend-specific knobs.
             </div>
           </div>
         </div>
@@ -4944,6 +5030,12 @@ function processCommands(cmds) {
       case 'codex_thread_action_result':
         handleCodexThreadActionResult(c);
         break;
+      case 'gemini_config_changed':
+        applyGeminiConfigChanged(c);
+        break;
+      case 'gemini_thread_action_result':
+        handleGeminiThreadActionResult(c);
+        break;
       // Peer registry push events. The peer payload is a `PeerSnapshot`
       // (same shape `refreshPeersFromApi` builds entries from), so we
       // funnel through the shared upsert/remove helpers — one code path
@@ -5029,6 +5121,15 @@ let controlCodexConfig = {
   network_access: false,
   writable_roots: [],
 };
+let controlGeminiConfig = {
+  model: '',
+  approval_mode: 'default',
+  sandbox: false,
+  extensions: [],
+  allowed_mcp_servers: [],
+  include_directories: [],
+  debug: false,
+};
 let controlCurrentBackend = null;
 let controlBackendActive = false;
 const controlAppliesBaseText = 'changes apply on next task';
@@ -5048,6 +5149,19 @@ async function refreshControlPane() {
       network_access: !!d.codex_network_access,
       writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
     };
+    controlGeminiConfig = {
+      model: d.gemini_model || '',
+      approval_mode: d.gemini_approval_mode || 'default',
+      sandbox: !!d.gemini_sandbox,
+      extensions: Array.isArray(d.gemini_extensions) ? d.gemini_extensions : [],
+      allowed_mcp_servers: Array.isArray(d.gemini_allowed_mcp_servers)
+        ? d.gemini_allowed_mcp_servers
+        : [],
+      include_directories: Array.isArray(d.gemini_include_directories)
+        ? d.gemini_include_directories
+        : [],
+      debug: !!d.gemini_debug,
+    };
     renderControlPane();
   } catch (e) {
     console.warn('Failed to load control-pane config:', e);
@@ -5056,42 +5170,65 @@ async function refreshControlPane() {
 
 function renderControlPane() {
   const badge = document.getElementById('control-backend-badge');
-  const section = document.getElementById('control-codex-section');
+  const codexSection = document.getElementById('control-codex-section');
+  const geminiSection = document.getElementById('control-gemini-section');
   const emptyMsg = document.getElementById('control-no-backend');
   const isCodex = controlCurrentBackend === 'codex';
+  const isGemini = controlCurrentBackend === 'gemini';
   if (badge) badge.textContent = controlCurrentBackend || 'none';
-  if (section) section.style.display = isCodex ? '' : 'none';
-  if (emptyMsg) emptyMsg.style.display = isCodex ? 'none' : '';
-  if (!isCodex) return;
+  if (codexSection) codexSection.style.display = isCodex ? '' : 'none';
+  if (geminiSection) geminiSection.style.display = isGemini ? '' : 'none';
+  if (emptyMsg) emptyMsg.style.display = (isCodex || isGemini) ? 'none' : '';
   const $ = id => document.getElementById(id);
-  const sandboxSel = $('control-codex-sandbox');
-  const approvalSel = $('control-codex-approval');
-  const modelInp = $('control-codex-model');
-  const reasoningSel = $('control-codex-reasoning');
-  const webSearch = $('control-codex-web-search');
-  const webSearchStatus = $('control-codex-web-search-status');
-  const networkCb = $('control-codex-network');
-  const networkStatus = $('control-codex-network-status');
-  const networkRow = $('control-codex-network-row');
-  const networkHint = $('control-codex-network-hint');
-  const rootsTA = $('control-codex-writable-roots');
-  if (sandboxSel) sandboxSel.value = controlCodexConfig.sandbox;
-  if (approvalSel) approvalSel.value = controlCodexConfig.approval_policy;
-  if (modelInp) modelInp.value = controlCodexConfig.model || '';
-  if (reasoningSel) reasoningSel.value = controlCodexConfig.reasoning_effort || '';
-  if (webSearch) webSearch.checked = !!controlCodexConfig.web_search;
-  if (webSearchStatus) webSearchStatus.textContent = controlCodexConfig.web_search ? 'on' : 'off';
-  if (networkCb) networkCb.checked = !!controlCodexConfig.network_access;
-  if (networkStatus) networkStatus.textContent = controlCodexConfig.network_access ? 'on' : 'off';
-  // Network access only matters inside workspace-write. Grey out + annotate
-  // otherwise so the toggle doesn't look like it's silently doing nothing.
-  const netApplies = controlCodexConfig.sandbox === 'workspace-write';
-  if (networkCb) networkCb.disabled = !netApplies;
-  if (networkRow) networkRow.style.opacity = netApplies ? '' : '0.55';
-  if (networkHint) {
-    networkHint.style.color = netApplies ? '' : 'var(--overlay0)';
+  if (isCodex) {
+    const sandboxSel = $('control-codex-sandbox');
+    const approvalSel = $('control-codex-approval');
+    const modelInp = $('control-codex-model');
+    const reasoningSel = $('control-codex-reasoning');
+    const webSearch = $('control-codex-web-search');
+    const webSearchStatus = $('control-codex-web-search-status');
+    const networkCb = $('control-codex-network');
+    const networkStatus = $('control-codex-network-status');
+    const networkRow = $('control-codex-network-row');
+    const networkHint = $('control-codex-network-hint');
+    const rootsTA = $('control-codex-writable-roots');
+    if (sandboxSel) sandboxSel.value = controlCodexConfig.sandbox;
+    if (approvalSel) approvalSel.value = controlCodexConfig.approval_policy;
+    if (modelInp) modelInp.value = controlCodexConfig.model || '';
+    if (reasoningSel) reasoningSel.value = controlCodexConfig.reasoning_effort || '';
+    if (webSearch) webSearch.checked = !!controlCodexConfig.web_search;
+    if (webSearchStatus) webSearchStatus.textContent = controlCodexConfig.web_search ? 'on' : 'off';
+    if (networkCb) networkCb.checked = !!controlCodexConfig.network_access;
+    if (networkStatus) networkStatus.textContent = controlCodexConfig.network_access ? 'on' : 'off';
+    // Network access only matters inside workspace-write. Grey out + annotate
+    // otherwise so the toggle doesn't look like it's silently doing nothing.
+    const netApplies = controlCodexConfig.sandbox === 'workspace-write';
+    if (networkCb) networkCb.disabled = !netApplies;
+    if (networkRow) networkRow.style.opacity = netApplies ? '' : '0.55';
+    if (networkHint) {
+      networkHint.style.color = netApplies ? '' : 'var(--overlay0)';
+    }
+    if (rootsTA) rootsTA.value = (controlCodexConfig.writable_roots || []).join('\n');
+  } else if (isGemini) {
+    const approvalSel = $('control-gemini-approval');
+    const sandboxCb = $('control-gemini-sandbox');
+    const sandboxStatus = $('control-gemini-sandbox-status');
+    const modelInp = $('control-gemini-model');
+    const extensionsTA = $('control-gemini-extensions');
+    const mcpTA = $('control-gemini-mcp');
+    const includeDirsTA = $('control-gemini-include-dirs');
+    const debugCb = $('control-gemini-debug');
+    const debugStatus = $('control-gemini-debug-status');
+    if (approvalSel) approvalSel.value = controlGeminiConfig.approval_mode;
+    if (sandboxCb) sandboxCb.checked = !!controlGeminiConfig.sandbox;
+    if (sandboxStatus) sandboxStatus.textContent = controlGeminiConfig.sandbox ? 'on' : 'off';
+    if (modelInp) modelInp.value = controlGeminiConfig.model || '';
+    if (extensionsTA) extensionsTA.value = (controlGeminiConfig.extensions || []).join('\n');
+    if (mcpTA) mcpTA.value = (controlGeminiConfig.allowed_mcp_servers || []).join('\n');
+    if (includeDirsTA) includeDirsTA.value = (controlGeminiConfig.include_directories || []).join('\n');
+    if (debugCb) debugCb.checked = !!controlGeminiConfig.debug;
+    if (debugStatus) debugStatus.textContent = controlGeminiConfig.debug ? 'on' : 'off';
   }
-  if (rootsTA) rootsTA.value = (controlCodexConfig.writable_roots || []).join('\n');
   updateControlAppliesNote();
 }
 
@@ -5181,6 +5318,108 @@ function onControlWritableRootsCommit(ev) {
   dispatchControlMsg({ action: 'set_codex_writable_roots', roots: deduped });
 }
 
+// ── Gemini control-pane handlers ──
+
+function parseListFromTextarea(val) {
+  const deduped = [];
+  for (const raw of (val || '').split('\n')) {
+    const s = raw.trim();
+    if (s && !deduped.includes(s)) deduped.push(s);
+  }
+  return deduped;
+}
+
+function onControlGeminiApprovalChange(ev) {
+  const mode = ev.target.value;
+  if (mode === controlGeminiConfig.approval_mode) return;
+  controlGeminiConfig.approval_mode = mode;
+  dispatchControlMsg({ action: 'set_gemini_approval_mode', mode });
+}
+
+function onControlGeminiSandboxChange(ev) {
+  const enabled = ev.target.checked;
+  controlGeminiConfig.sandbox = enabled;
+  const status = document.getElementById('control-gemini-sandbox-status');
+  if (status) status.textContent = enabled ? 'on' : 'off';
+  dispatchControlMsg({ action: 'set_gemini_sandbox', enabled });
+}
+
+function onControlGeminiModelCommit(ev) {
+  const model = ev.target.value.trim();
+  const current = (controlGeminiConfig.model || '').trim();
+  if (model === current) return;
+  controlGeminiConfig.model = model;
+  dispatchControlMsg({ action: 'set_gemini_model', model: model || null });
+}
+
+function onControlGeminiExtensionsCommit(ev) {
+  const parsed = parseListFromTextarea(ev.target.value);
+  const prev = controlGeminiConfig.extensions || [];
+  if (parsed.length === prev.length && parsed.every((v, i) => v === prev[i])) return;
+  controlGeminiConfig.extensions = parsed;
+  dispatchControlMsg({ action: 'set_gemini_extensions', extensions: parsed });
+}
+
+function onControlGeminiMcpCommit(ev) {
+  const parsed = parseListFromTextarea(ev.target.value);
+  const prev = controlGeminiConfig.allowed_mcp_servers || [];
+  if (parsed.length === prev.length && parsed.every((v, i) => v === prev[i])) return;
+  controlGeminiConfig.allowed_mcp_servers = parsed;
+  dispatchControlMsg({ action: 'set_gemini_allowed_mcp_servers', servers: parsed });
+}
+
+function onControlGeminiIncludeDirsCommit(ev) {
+  const parsed = parseListFromTextarea(ev.target.value);
+  const prev = controlGeminiConfig.include_directories || [];
+  if (parsed.length === prev.length && parsed.every((v, i) => v === prev[i])) return;
+  controlGeminiConfig.include_directories = parsed;
+  dispatchControlMsg({ action: 'set_gemini_include_directories', directories: parsed });
+}
+
+function onControlGeminiDebugChange(ev) {
+  const enabled = ev.target.checked;
+  controlGeminiConfig.debug = enabled;
+  const status = document.getElementById('control-gemini-debug-status');
+  if (status) status.textContent = enabled ? 'on' : 'off';
+  dispatchControlMsg({ action: 'set_gemini_debug', enabled });
+}
+
+// Mirror of applyCodexConfigChanged for Gemini — keeps the pane in sync
+// with server-confirmed writes and pushes from other browsers.
+function applyGeminiConfigChanged(evt) {
+  if (evt.model !== undefined && evt.model !== null) {
+    controlGeminiConfig.model = evt.model;
+  } else if (evt.model_cleared) {
+    controlGeminiConfig.model = '';
+  }
+  if (typeof evt.approval_mode === 'string') controlGeminiConfig.approval_mode = evt.approval_mode;
+  if (typeof evt.sandbox === 'boolean') controlGeminiConfig.sandbox = evt.sandbox;
+  if (Array.isArray(evt.extensions)) controlGeminiConfig.extensions = evt.extensions;
+  if (Array.isArray(evt.allowed_mcp_servers)) controlGeminiConfig.allowed_mcp_servers = evt.allowed_mcp_servers;
+  if (Array.isArray(evt.include_directories)) controlGeminiConfig.include_directories = evt.include_directories;
+  if (typeof evt.debug === 'boolean') controlGeminiConfig.debug = evt.debug;
+  renderControlPane();
+}
+
+function handleGeminiThreadActionResult(evt) {
+  releaseActionPending(evt.action);
+  showControlToast(
+    evt.success ? 'success' : 'error',
+    evt.success
+      ? `/${evt.action}: ${evt.message}`
+      : `/${evt.action} failed: ${evt.message}`
+  );
+}
+
+function onControlGeminiActionBtnClick(ev) {
+  const btn = ev.currentTarget;
+  if (btn.classList.contains('pending') || btn.disabled) return;
+  const op = btn.dataset.geminiAction;
+  if (!op) return;
+  markActionPending(op);
+  dispatchControlMsg({ action: 'gemini_thread_action', op, params: {} });
+}
+
 // Apply a CodexConfigChanged event from the server, keeping the pane in
 // sync with toggles from other browsers (and our own server-confirmed write).
 function applyCodexConfigChanged(evt) {
@@ -5227,21 +5466,32 @@ function showControlToast(kind, text) {
 }
 
 function markActionPending(op) {
-  const btn = document.querySelector(`.control-action-btn[data-codex-action="${op}"]`);
-  if (btn) btn.classList.add('pending');
-  // Safety: if no result arrives in 10s, release the button ourselves.
+  // Codex + Gemini share the "new" op name. We mark whichever section is
+  // currently visible — the one that was just clicked. querySelectorAll
+  // finds both, then `offsetParent` filters to the visible one.
+  const btns = Array.from(document.querySelectorAll(
+    `.control-action-btn[data-codex-action="${op}"], .control-action-btn[data-gemini-action="${op}"]`
+  )).filter(el => el.offsetParent !== null);
+  btns.forEach(btn => btn.classList.add('pending'));
+  // Safety: if no result arrives in 10s, release the button(s) ourselves.
   const timeoutHandle = setTimeout(() => {
     controlPendingActions.delete(op);
-    if (btn) btn.classList.remove('pending');
+    btns.forEach(btn => btn.classList.remove('pending'));
   }, 10000);
-  controlPendingActions.set(op, { timeoutHandle, btnEl: btn });
+  controlPendingActions.set(op, { timeoutHandle, btnEls: btns });
 }
 
 function releaseActionPending(op) {
   const entry = controlPendingActions.get(op);
   if (!entry) return;
   clearTimeout(entry.timeoutHandle);
-  if (entry.btnEl) entry.btnEl.classList.remove('pending');
+  // `btnEls` is the new field (plural, set by markActionPending); fall back
+  // to `btnEl` for any stale in-flight entry from older builds.
+  if (Array.isArray(entry.btnEls)) {
+    entry.btnEls.forEach(btn => btn.classList.remove('pending'));
+  } else if (entry.btnEl) {
+    entry.btnEl.classList.remove('pending');
+  }
   controlPendingActions.delete(op);
 }
 
@@ -5333,6 +5583,46 @@ function wireControlPaneListeners() {
   }
   document.querySelectorAll('.control-action-btn[data-codex-action]').forEach(btn => {
     btn.addEventListener('click', onControlActionBtnClick);
+  });
+
+  // ── Gemini listeners ──
+  const geminiApprovalSel = $('control-gemini-approval');
+  const geminiSandboxCb = $('control-gemini-sandbox');
+  const geminiModelInp = $('control-gemini-model');
+  const geminiExtensionsTA = $('control-gemini-extensions');
+  const geminiMcpTA = $('control-gemini-mcp');
+  const geminiIncludeDirsTA = $('control-gemini-include-dirs');
+  const geminiDebugCb = $('control-gemini-debug');
+  if (geminiApprovalSel) geminiApprovalSel.addEventListener('change', onControlGeminiApprovalChange);
+  if (geminiSandboxCb) geminiSandboxCb.addEventListener('change', onControlGeminiSandboxChange);
+  if (geminiDebugCb) geminiDebugCb.addEventListener('change', onControlGeminiDebugChange);
+  if (geminiModelInp) {
+    geminiModelInp.addEventListener('change', onControlGeminiModelCommit);
+    geminiModelInp.addEventListener('blur', onControlGeminiModelCommit);
+    geminiModelInp.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        onControlGeminiModelCommit(ev);
+      }
+    });
+  }
+  // Textareas commit on blur or Ctrl/Cmd+Enter — same UX as Codex writable-roots.
+  const wireTextarea = (el, handler) => {
+    if (!el) return;
+    el.addEventListener('change', handler);
+    el.addEventListener('blur', handler);
+    el.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        handler(ev);
+      }
+    });
+  };
+  wireTextarea(geminiExtensionsTA, onControlGeminiExtensionsCommit);
+  wireTextarea(geminiMcpTA, onControlGeminiMcpCommit);
+  wireTextarea(geminiIncludeDirsTA, onControlGeminiIncludeDirsCommit);
+  document.querySelectorAll('.control-action-btn[data-gemini-action]').forEach(btn => {
+    btn.addEventListener('click', onControlGeminiActionBtnClick);
   });
 }
 

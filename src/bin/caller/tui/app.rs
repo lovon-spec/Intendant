@@ -1234,6 +1234,79 @@ impl App {
                     format!("Codex thread action: {}", op),
                 );
             }
+            ControlMsg::SetGeminiModel { ref model } => {
+                let label = model
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("<default>");
+                self.log(
+                    LogLevel::Info,
+                    format!("Gemini model → {} (applies on next task)", label),
+                );
+            }
+            ControlMsg::SetGeminiApprovalMode { ref mode } => {
+                self.log(
+                    LogLevel::Info,
+                    format!("Gemini approval mode → {} (applies on next task)", mode),
+                );
+            }
+            ControlMsg::SetGeminiSandbox { enabled } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Gemini sandbox {} (applies on next task)",
+                        if enabled { "ON" } else { "OFF" }
+                    ),
+                );
+            }
+            ControlMsg::SetGeminiExtensions { ref extensions } => {
+                let summary = if extensions.is_empty() {
+                    "<all>".to_string()
+                } else {
+                    format!("{} entry/entries", extensions.len())
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!("Gemini extensions → {} (applies on next task)", summary),
+                );
+            }
+            ControlMsg::SetGeminiAllowedMcpServers { ref servers } => {
+                let summary = if servers.is_empty() {
+                    "<all>".to_string()
+                } else {
+                    format!("{} entry/entries", servers.len())
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!("Gemini MCP allowlist → {} (applies on next task)", summary),
+                );
+            }
+            ControlMsg::SetGeminiIncludeDirectories { ref directories } => {
+                let summary = if directories.is_empty() {
+                    "<project root only>".to_string()
+                } else {
+                    format!("{} path(s)", directories.len())
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!("Gemini include-directories → {} (applies on next task)", summary),
+                );
+            }
+            ControlMsg::SetGeminiDebug { enabled } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Gemini debug {} (applies on next task)",
+                        if enabled { "ON" } else { "OFF" }
+                    ),
+                );
+            }
+            ControlMsg::GeminiThreadAction { ref op, .. } => {
+                self.log(
+                    LogLevel::Info,
+                    format!("Gemini thread action: {}", op),
+                );
+            }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
                     "quiet" => Some(Verbosity::Quiet),
@@ -2068,6 +2141,9 @@ impl App {
             | AppEvent::CodexConfigChanged { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::CodexThreadActionResult { .. }
+            | AppEvent::GeminiConfigChanged { .. }
+            | AppEvent::GeminiThreadActionRequested { .. }
+            | AppEvent::GeminiThreadActionResult { .. }
             | AppEvent::FileChanged { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.

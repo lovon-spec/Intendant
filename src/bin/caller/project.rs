@@ -279,13 +279,61 @@ pub struct GeminiCliConfig {
     /// Command to run Gemini CLI. Default: "gemini".
     #[serde(default = "default_gemini_cli_command")]
     pub command: String,
-    /// Model to use (e.g. "gemini-2.5-pro").
+    /// Model to use (e.g. "gemini-2.5-pro", "gemini-2.5-flash").
     #[serde(default)]
     pub model: Option<String>,
+    /// Approval mode matching `gemini --approval-mode`: "default" (prompt
+    /// for every tool), "auto_edit" (auto-approve edits, prompt for exec),
+    /// "yolo" (auto-approve everything), "plan" (read-only, no writes).
+    #[serde(default = "default_gemini_approval_mode")]
+    pub approval_mode: String,
+    /// Whether to pass `--sandbox` when spawning Gemini.
+    #[serde(default)]
+    pub sandbox: bool,
+    /// List of extension names to enable (passed as `--extensions`). Empty
+    /// means "use all installed extensions" — Gemini's default.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Allowlist of MCP server names (from Gemini's config) this session
+    /// may use. Passed as `--allowed-mcp-server-names`. Empty means "all".
+    /// Note: Intendant always merges its own `intendant` entry into
+    /// `$HOME/.gemini/settings.json`; if you set an allowlist here, remember
+    /// to include `intendant` or the Intendant MCP tools won't be reachable.
+    #[serde(default)]
+    pub allowed_mcp_servers: Vec<String>,
+    /// Extra directories that Gemini should treat as workspace roots.
+    /// Passed as `--include-directories`. Absolute paths only.
+    #[serde(default)]
+    pub include_directories: Vec<String>,
+    /// Open Gemini's DevTools console alongside the session. Maps to
+    /// `--debug`. Mostly useful for tracking down Gemini CLI bugs.
+    #[serde(default)]
+    pub debug: bool,
 }
 
 fn default_gemini_cli_command() -> String {
     "gemini".to_string()
+}
+
+fn default_gemini_approval_mode() -> String {
+    "default".to_string()
+}
+
+/// Valid Gemini approval modes, in UI order. Matches
+/// `gemini --approval-mode <MODE>` exactly; the string flows through the
+/// stack unchanged and is passed verbatim as a CLI arg.
+pub const GEMINI_APPROVAL_MODES: &[&str] = &["default", "auto_edit", "yolo", "plan"];
+
+/// Normalize a user-supplied Gemini approval mode. Unknown or empty values
+/// fall back to `"default"` so a config typo can't silently escalate to
+/// `yolo`.
+pub fn normalize_gemini_approval_mode(input: &str) -> String {
+    let trimmed = input.trim();
+    if GEMINI_APPROVAL_MODES.iter().any(|m| *m == trimmed) {
+        trimmed.to_string()
+    } else {
+        default_gemini_approval_mode()
+    }
 }
 
 impl Default for GeminiCliConfig {
@@ -293,6 +341,12 @@ impl Default for GeminiCliConfig {
         Self {
             command: default_gemini_cli_command(),
             model: None,
+            approval_mode: default_gemini_approval_mode(),
+            sandbox: false,
+            extensions: Vec::new(),
+            allowed_mcp_servers: Vec::new(),
+            include_directories: Vec::new(),
+            debug: false,
         }
     }
 }

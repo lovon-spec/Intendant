@@ -1204,6 +1204,105 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetGeminiModel { model } => {
+            let label = model
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("<default>");
+            emit_control_result(
+                control_tx,
+                "set_gemini_model",
+                true,
+                format!("Gemini model set to {} (applies on next task)", label),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetGeminiApprovalMode { mode } => {
+            emit_control_result(
+                control_tx,
+                "set_gemini_approval_mode",
+                true,
+                format!("Gemini approval mode set to {} (applies on next task)", mode),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetGeminiSandbox { enabled } => {
+            emit_control_result(
+                control_tx,
+                "set_gemini_sandbox",
+                true,
+                format!(
+                    "Gemini sandbox {} (applies on next task)",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetGeminiExtensions { extensions } => {
+            emit_control_result(
+                control_tx,
+                "set_gemini_extensions",
+                true,
+                format!(
+                    "Gemini extensions set to {} entry/entries (applies on next task)",
+                    extensions.len()
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetGeminiAllowedMcpServers { servers } => {
+            emit_control_result(
+                control_tx,
+                "set_gemini_allowed_mcp_servers",
+                true,
+                format!(
+                    "Gemini MCP allowlist set to {} entry/entries (applies on next task)",
+                    servers.len()
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetGeminiIncludeDirectories { directories } => {
+            emit_control_result(
+                control_tx,
+                "set_gemini_include_directories",
+                true,
+                format!(
+                    "Gemini include-directories set to {} path(s) (applies on next task)",
+                    directories.len()
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetGeminiDebug { enabled } => {
+            emit_control_result(
+                control_tx,
+                "set_gemini_debug",
+                true,
+                format!(
+                    "Gemini debug {} (applies on next task)",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::GeminiThreadAction { op, .. } => {
+            emit_control_result(
+                control_tx,
+                "gemini_thread_action",
+                true,
+                format!("Gemini thread action dispatched: /{}", op),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetVerbosity { level } => {
             let parsed = match level.to_lowercase().as_str() {
                 "quiet" => Some(Verbosity::Quiet),
@@ -1918,7 +2017,7 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::CodexConfigChanged { .. } | AppEvent::CodexThreadActionRequested { .. } | AppEvent::CodexThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::CodexConfigChanged { .. } | AppEvent::CodexThreadActionRequested { .. } | AppEvent::CodexThreadActionResult { .. } | AppEvent::GeminiConfigChanged { .. } | AppEvent::GeminiThreadActionRequested { .. } | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::Tick => {
                         // Detect stuck phases — warn every 30s after 120s
                         if matches!(

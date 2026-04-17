@@ -194,6 +194,22 @@ fn codex_runtime_config_equal(
         && a.writable_roots == b.writable_roots
 }
 
+/// Structural equality for `GeminiRuntimeConfig`. Every field here is a
+/// command-line arg Gemini latches at process spawn, so any drift forces a
+/// teardown + respawn on the next task.
+fn gemini_runtime_config_equal(
+    a: &control_plane::GeminiRuntimeConfig,
+    b: &control_plane::GeminiRuntimeConfig,
+) -> bool {
+    a.model == b.model
+        && a.approval_mode == b.approval_mode
+        && a.sandbox == b.sandbox
+        && a.extensions == b.extensions
+        && a.allowed_mcp_servers == b.allowed_mcp_servers
+        && a.include_directories == b.include_directories
+        && a.debug == b.debug
+}
+
 /// Extract file paths from a unified-diff header. Reads `+++ b/<path>` lines
 /// (git-style), with `--- a/<path>` used as a fallback for pure-delete diffs
 /// where the `+++` side is `/dev/null`. Deduplicates while preserving order.
@@ -299,15 +315,30 @@ async fn create_external_agent(
         }
         AgentBackend::GeminiCli => {
             let cfg = &project.config.agent.gemini_cli;
+            let approval_mode = project::normalize_gemini_approval_mode(&cfg.approval_mode);
+            let launch = external_agent::gemini::GeminiLaunchConfig {
+                model: cfg.model.clone(),
+                approval_mode: approval_mode.clone(),
+                sandbox: cfg.sandbox,
+                extensions: cfg.extensions.clone(),
+                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                include_directories: cfg.include_directories.clone(),
+                debug: cfg.debug,
+            };
             let agent = Box::new(external_agent::gemini::GeminiAgent::new(
                 cfg.command.clone(),
-                cfg.model.clone(),
+                launch,
                 web_port,
             ));
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
-                approval_policy: String::new(),
+                // `AgentConfig.approval_policy` is Codex's `-a` flag; for
+                // Gemini we reuse the field as the ACP approval hint so the
+                // sandbox/prompt layer can adjust if needed. Storing the
+                // normalized Gemini approval mode keeps the two backends
+                // schema-compatible at the trait level.
+                approval_policy: approval_mode,
                 sandbox: String::new(),
                 reasoning_effort: None,
                 web_search: false,
@@ -4701,6 +4732,7 @@ async fn run_with_presence(
     agent_backend_override: Option<external_agent::AgentBackend>,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
+    shared_gemini_config: control_plane::SharedGeminiConfig,
     web_port: Option<u16>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Try to create presence provider. Degrade to silent mode on failure so
@@ -4892,6 +4924,11 @@ async fn run_with_presence(
     // `shared_codex_config` when a new task arrives, we tear the agent down
     // and build a fresh one. Only meaningful when the backend is Codex.
     let mut persistent_codex_config: Option<control_plane::CodexRuntimeConfig> = None;
+    // Same idea for Gemini, but even more strict: Gemini latches every knob
+    // at process spawn (not at session/new), so a changed --approval-mode
+    // or --sandbox flag forces a kill + respawn of the gemini CLI process
+    // on the next task. Only meaningful when the backend is GeminiCli.
+    let mut persistent_gemini_config: Option<control_plane::GeminiRuntimeConfig> = None;
 
     // Side channel for thread actions (Codex slash commands) dispatched from
     // the dashboard / MCP between tasks. We subscribe to the bus here (not
@@ -4908,6 +4945,13 @@ async fn run_with_presence(
             op: String,
             params: serde_json::Value,
         },
+        /// Gemini thread action — carried separately from Codex's so we can
+        /// pick the right result event (`GeminiThreadActionResult` vs
+        /// `CodexThreadActionResult`) downstream.
+        GeminiThreadAction {
+            op: String,
+            params: serde_json::Value,
+        },
         Done,
     }
 
@@ -4921,6 +4965,9 @@ async fn run_with_presence(
             msg = outer_bus_rx.recv() => match msg {
                 Ok(AppEvent::CodexThreadActionRequested { action, params }) => {
                     OuterSignal::ThreadAction { op: action, params }
+                }
+                Ok(AppEvent::GeminiThreadActionRequested { action, params }) => {
+                    OuterSignal::GeminiThreadAction { op: action, params }
                 }
                 // Any other bus event: skip, keep selecting. Lagged /
                 // Closed also fall through — task_rx close is the
@@ -4960,6 +5007,39 @@ async fn run_with_presence(
                     ))
                 });
                 bus.send(AppEvent::CodexThreadActionResult {
+                    action: op,
+                    success,
+                    message,
+                });
+                continue;
+            }
+            OuterSignal::GeminiThreadAction { op, params: _ } => {
+                // Gemini currently has only one daemon-side action: `/new`.
+                // The CLI doesn't expose mid-session RPCs via ACP that map
+                // to Codex's /compact, /fork, /undo — if that changes we'll
+                // extend the trait's `thread_action` for Gemini.
+                let result = if op == "new" {
+                    persistent_agent = None;
+                    persistent_thread = None;
+                    persistent_event_rx = None;
+                    persistent_gemini_config = None;
+                    Ok("agent torn down; next task will spawn a fresh Gemini process".to_string())
+                } else {
+                    Err(format!("gemini thread action /{} not supported", op))
+                };
+                let (success, message) = match result {
+                    Ok(msg) => (true, msg),
+                    Err(e) => (false, e),
+                };
+                slog(&session_log, |l| {
+                    l.info(&format!(
+                        "Gemini thread action /{}: {} — {}",
+                        op,
+                        if success { "ok" } else { "FAILED" },
+                        message
+                    ))
+                });
+                bus.send(AppEvent::GeminiThreadActionResult {
                     action: op,
                     success,
                     message,
@@ -5084,33 +5164,49 @@ async fn run_with_presence(
 
         // Re-read the agent backend each task: the web UI may have changed it.
         let agent_backend = shared_external_agent.read().await.clone();
-        // Snapshot the current Codex runtime config too. Codex locks sandbox,
-        // approval policy, and model at thread/start — so a toggle in the UI
-        // takes effect on the NEXT task by forcing an agent rebuild here.
+        // Snapshot the current Codex + Gemini runtime configs. Both backends
+        // latch their per-session config at spawn/thread-start — a toggle in
+        // the UI takes effect on the NEXT task by forcing an agent rebuild.
         let current_codex_config = shared_codex_config.read().await.clone();
+        let current_gemini_config = shared_gemini_config.read().await.clone();
 
         // Teardown conditions:
         //  - backend changed (any agent)
         //  - backend is Codex and any of the Codex-locked fields differ
+        //  - backend is Gemini and any of the Gemini-locked fields differ
         let codex_config_changed = matches!(
             agent_backend,
             Some(external_agent::AgentBackend::Codex)
         ) && persistent_codex_config
             .as_ref()
             .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
+        let gemini_config_changed = matches!(
+            agent_backend,
+            Some(external_agent::AgentBackend::GeminiCli)
+        ) && persistent_gemini_config
+            .as_ref()
+            .is_some_and(|prev| !gemini_runtime_config_equal(prev, &current_gemini_config));
 
         if persistent_agent.is_some()
-            && (agent_backend != persistent_agent_backend || codex_config_changed)
+            && (agent_backend != persistent_agent_backend
+                || codex_config_changed
+                || gemini_config_changed)
         {
             if codex_config_changed {
                 slog(&session_log, |l| {
                     l.info("Codex config changed; rebuilding agent for next task")
                 });
             }
+            if gemini_config_changed {
+                slog(&session_log, |l| {
+                    l.info("Gemini config changed; rebuilding agent for next task")
+                });
+            }
             persistent_agent = None;
             persistent_thread = None;
             persistent_event_rx = None;
             persistent_codex_config = None;
+            persistent_gemini_config = None;
         }
 
         if let Some(ref backend) = agent_backend {
@@ -5145,6 +5241,16 @@ async fn run_with_presence(
                     cx.network_access = current_codex_config.network_access;
                     cx.writable_roots = current_codex_config.writable_roots.clone();
                 }
+                if matches!(backend, external_agent::AgentBackend::GeminiCli) {
+                    let gm = &mut proj.config.agent.gemini_cli;
+                    gm.model = current_gemini_config.model.clone();
+                    gm.approval_mode = current_gemini_config.approval_mode.clone();
+                    gm.sandbox = current_gemini_config.sandbox;
+                    gm.extensions = current_gemini_config.extensions.clone();
+                    gm.allowed_mcp_servers = current_gemini_config.allowed_mcp_servers.clone();
+                    gm.include_directories = current_gemini_config.include_directories.clone();
+                    gm.debug = current_gemini_config.debug;
+                }
                 let (agent, thread, event_rx) =
                     match create_external_agent(backend, &proj, &session_log, web_port).await {
                         Ok(result) => result,
@@ -5170,6 +5276,12 @@ async fn run_with_presence(
                 persistent_codex_config =
                     if matches!(agent_backend, Some(external_agent::AgentBackend::Codex)) {
                         Some(current_codex_config.clone())
+                    } else {
+                        None
+                    };
+                persistent_gemini_config =
+                    if matches!(agent_backend, Some(external_agent::AgentBackend::GeminiCli)) {
+                        Some(current_gemini_config.clone())
                     } else {
                         None
                     };
@@ -8042,12 +8154,25 @@ async fn main() -> Result<(), CallerError> {
                 writable_roots: cfg.writable_roots.clone(),
             }))
         };
+        let shared_gemini_config: control_plane::SharedGeminiConfig = {
+            let cfg = &project.config.agent.gemini_cli;
+            Arc::new(tokio::sync::RwLock::new(control_plane::GeminiRuntimeConfig {
+                model: cfg.model.clone(),
+                approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                sandbox: cfg.sandbox,
+                extensions: cfg.extensions.clone(),
+                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                include_directories: cfg.include_directories.clone(),
+                debug: cfg.debug,
+            }))
+        };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
+                gemini_config: shared_gemini_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -8092,6 +8217,7 @@ async fn main() -> Result<(), CallerError> {
             let agent_backend_for_presence = agent_backend.clone();
             let shared_external_agent_for_presence = shared_external_agent.clone();
             let shared_codex_config_for_presence = shared_codex_config.clone();
+            let shared_gemini_config_for_presence = shared_gemini_config.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
                     task,
@@ -8115,6 +8241,7 @@ async fn main() -> Result<(), CallerError> {
                     agent_backend_for_presence,
                     shared_external_agent_for_presence,
                     shared_codex_config_for_presence,
+                    shared_gemini_config_for_presence,
                     if use_web { Some(web_port) } else { None },
                 )
                 .await;
@@ -8561,12 +8688,25 @@ async fn main() -> Result<(), CallerError> {
                 writable_roots: cfg.writable_roots.clone(),
             }))
         };
+        let shared_gemini_config: control_plane::SharedGeminiConfig = {
+            let cfg = &project.config.agent.gemini_cli;
+            Arc::new(tokio::sync::RwLock::new(control_plane::GeminiRuntimeConfig {
+                model: cfg.model.clone(),
+                approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                sandbox: cfg.sandbox,
+                extensions: cfg.extensions.clone(),
+                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                include_directories: cfg.include_directories.clone(),
+                debug: cfg.debug,
+            }))
+        };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
                 codex_config: shared_codex_config.clone(),
+                gemini_config: shared_gemini_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },

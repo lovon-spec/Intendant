@@ -1155,6 +1155,21 @@ pub struct SettingsPayload {
     pub codex_network_access: bool,
     #[serde(default)]
     pub codex_writable_roots: Vec<String>,
+    // Gemini runtime config (persisted to `[agent.gemini_cli]`). Mirrors
+    // the Codex fields above for the Activity → Control sub-tab.
+    #[serde(default)]
+    pub gemini_model: Option<String>,
+    pub gemini_approval_mode: String,
+    #[serde(default)]
+    pub gemini_sandbox: bool,
+    #[serde(default)]
+    pub gemini_extensions: Vec<String>,
+    #[serde(default)]
+    pub gemini_allowed_mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub gemini_include_directories: Vec<String>,
+    #[serde(default)]
+    pub gemini_debug: bool,
     // Env var overrides (read-only, shown in UI)
     #[serde(default)]
     pub env_overrides: std::collections::HashMap<String, String>,
@@ -1207,6 +1222,15 @@ fn settings_payload_from_config(
         codex_web_search: config.agent.codex.web_search,
         codex_network_access: config.agent.codex.network_access,
         codex_writable_roots: config.agent.codex.writable_roots.clone(),
+        gemini_model: config.agent.gemini_cli.model.clone(),
+        gemini_approval_mode: crate::project::normalize_gemini_approval_mode(
+            &config.agent.gemini_cli.approval_mode,
+        ),
+        gemini_sandbox: config.agent.gemini_cli.sandbox,
+        gemini_extensions: config.agent.gemini_cli.extensions.clone(),
+        gemini_allowed_mcp_servers: config.agent.gemini_cli.allowed_mcp_servers.clone(),
+        gemini_include_directories: config.agent.gemini_cli.include_directories.clone(),
+        gemini_debug: config.agent.gemini_cli.debug,
         env_overrides,
     }
 }

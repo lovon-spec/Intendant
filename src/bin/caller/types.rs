@@ -249,6 +249,35 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         writable_roots: Option<Vec<String>>,
     },
+    /// Mirror of `CodexConfigChanged` for the Gemini CLI backend. Fields
+    /// omitted (or `Option::None`) mean "no change since the last emission".
+    /// See `ControlMsg::SetGemini*` variants for the write side.
+    GeminiConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sandbox: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extensions: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_mcp_servers: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        include_directories: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        debug: Option<bool>,
+    },
+    /// Result of a Gemini thread action (currently just `"new"`). Mirror
+    /// of `CodexThreadActionResult` so the dashboard can reuse its toast
+    /// path.
+    GeminiThreadActionResult {
+        action: String,
+        success: bool,
+        message: String,
+    },
     Usage {
         main: crate::frontend::ModelUsageSnapshot,
         #[serde(skip_serializing_if = "Option::is_none")]

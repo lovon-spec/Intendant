@@ -108,6 +108,19 @@ type SharedWriter = Arc<Mutex<BufWriter<ChildStdin>>>;
 pub struct GeminiAgent {
     command: String,
     model: Option<String>,
+    /// Approval mode to pass as `--approval-mode`. One of `default`,
+    /// `auto_edit`, `yolo`, `plan` (see `project::GEMINI_APPROVAL_MODES`).
+    approval_mode: String,
+    /// Whether to pass `--sandbox` to Gemini.
+    sandbox: bool,
+    /// Extension names to enable via `--extensions`. Empty = use all.
+    extensions: Vec<String>,
+    /// MCP server name allowlist via `--allowed-mcp-server-names`. Empty = all.
+    allowed_mcp_servers: Vec<String>,
+    /// Extra workspace dirs via `--include-directories`.
+    include_directories: Vec<String>,
+    /// Whether to pass `--debug` (Gemini's DevTools console). Off by default.
+    debug: bool,
     web_port: Option<u16>,
     prompt_sent: bool,
     config_working_dir: Option<std::path::PathBuf>,
@@ -183,11 +196,49 @@ fn restore_home_gemini_settings(prior: &mut Option<Option<serde_json::Value>>) {
     let _ = write_settings_json(&path, &settings);
 }
 
+/// Per-session Gemini CLI configuration. Mirrors the fields we pass as
+/// command-line args when spawning the agent process (everything except
+/// `command` and `web_port`, which are lifecycle concerns, not knobs).
+#[derive(Debug, Clone)]
+pub struct GeminiLaunchConfig {
+    pub model: Option<String>,
+    pub approval_mode: String,
+    pub sandbox: bool,
+    pub extensions: Vec<String>,
+    pub allowed_mcp_servers: Vec<String>,
+    pub include_directories: Vec<String>,
+    pub debug: bool,
+}
+
+impl Default for GeminiLaunchConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            approval_mode: "default".into(),
+            sandbox: false,
+            extensions: Vec::new(),
+            allowed_mcp_servers: Vec::new(),
+            include_directories: Vec::new(),
+            debug: false,
+        }
+    }
+}
+
 impl GeminiAgent {
-    pub fn new(command: String, model: Option<String>, web_port: Option<u16>) -> Self {
+    pub fn new(
+        command: String,
+        launch: GeminiLaunchConfig,
+        web_port: Option<u16>,
+    ) -> Self {
         Self {
             command,
-            model,
+            model: launch.model,
+            approval_mode: launch.approval_mode,
+            sandbox: launch.sandbox,
+            extensions: launch.extensions,
+            allowed_mcp_servers: launch.allowed_mcp_servers,
+            include_directories: launch.include_directories,
+            debug: launch.debug,
             web_port,
             prompt_sent: false,
             config_working_dir: None,
@@ -816,9 +867,42 @@ impl ExternalAgent for GeminiAgent {
         }
         self.config_working_dir = Some(config.working_dir.clone());
 
-        // Spawn the gemini CLI process in ACP mode
+        // Spawn the gemini CLI process in ACP mode, plus every config
+        // knob the user has flipped. Gemini latches these at process start
+        // (no equivalent of `thread/start` to re-set them later), so the
+        // daemon loop handles reactive config changes by tearing the whole
+        // agent down and calling `initialize()` again with fresh args.
+        let mut args: Vec<String> = vec!["--acp".into()];
+        if let Some(ref m) = self.model {
+            args.push("--model".into());
+            args.push(m.clone());
+        }
+        // `default` is the Gemini CLI default; passing the flag explicitly
+        // makes no difference but bloats `ps`. Skip it.
+        if self.approval_mode != "default" {
+            args.push("--approval-mode".into());
+            args.push(self.approval_mode.clone());
+        }
+        if self.sandbox {
+            args.push("--sandbox".into());
+        }
+        if !self.extensions.is_empty() {
+            args.push("--extensions".into());
+            args.push(self.extensions.join(","));
+        }
+        if !self.allowed_mcp_servers.is_empty() {
+            args.push("--allowed-mcp-server-names".into());
+            args.push(self.allowed_mcp_servers.join(","));
+        }
+        if !self.include_directories.is_empty() {
+            args.push("--include-directories".into());
+            args.push(self.include_directories.join(","));
+        }
+        if self.debug {
+            args.push("--debug".into());
+        }
         let mut child = Command::new(&self.command)
-            .args(["--acp"])
+            .args(&args)
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1170,9 +1254,15 @@ mod tests {
 
     #[test]
     fn gemini_agent_new_defaults() {
-        let agent = GeminiAgent::new("gemini".into(), None, None);
+        let agent = GeminiAgent::new("gemini".into(), GeminiLaunchConfig::default(), None);
         assert_eq!(agent.command, "gemini");
         assert!(agent.model.is_none());
+        assert_eq!(agent.approval_mode, "default");
+        assert!(!agent.sandbox);
+        assert!(agent.extensions.is_empty());
+        assert!(agent.allowed_mcp_servers.is_empty());
+        assert!(agent.include_directories.is_empty());
+        assert!(!agent.debug);
         assert!(agent.web_port.is_none());
         assert!(!agent.prompt_sent);
         assert!(agent.child.is_none());
@@ -1180,13 +1270,24 @@ mod tests {
 
     #[test]
     fn gemini_agent_new_with_options() {
-        let agent = GeminiAgent::new(
-            "npx".into(),
-            Some("gemini-2.5-pro".into()),
-            Some(8765),
-        );
+        let launch = GeminiLaunchConfig {
+            model: Some("gemini-2.5-pro".into()),
+            approval_mode: "yolo".into(),
+            sandbox: true,
+            extensions: vec!["ext1".into(), "ext2".into()],
+            allowed_mcp_servers: vec!["intendant".into()],
+            include_directories: vec!["/tmp/workspace".into()],
+            debug: true,
+        };
+        let agent = GeminiAgent::new("npx".into(), launch, Some(8765));
         assert_eq!(agent.command, "npx");
         assert_eq!(agent.model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(agent.approval_mode, "yolo");
+        assert!(agent.sandbox);
+        assert_eq!(agent.extensions, vec!["ext1".to_string(), "ext2".to_string()]);
+        assert_eq!(agent.allowed_mcp_servers, vec!["intendant".to_string()]);
+        assert_eq!(agent.include_directories, vec!["/tmp/workspace".to_string()]);
+        assert!(agent.debug);
         assert_eq!(agent.web_port, Some(8765));
     }
 
@@ -1501,7 +1602,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_turn_without_session_errors() {
-        let mut agent = GeminiAgent::new("gemini".into(), None, None);
+        let mut agent = GeminiAgent::new("gemini".into(), GeminiLaunchConfig::default(), None);
         let err = agent.interrupt_turn().await.unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {

@@ -169,6 +169,34 @@ pub enum UiCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         writable_roots: Option<Vec<String>>,
     },
+    /// Mirror of `CodexThreadActionResult` for Gemini's session actions.
+    /// Currently only `"new"` is valid; shape matches for future growth.
+    GeminiThreadActionResult {
+        action: String,
+        success: bool,
+        message: String,
+    },
+    /// Mirror of `CodexConfigChanged` for Gemini CLI. Fields omitted (or
+    /// `None`) mean "no change". `model_cleared` has the same semantics as
+    /// on the Codex variant.
+    GeminiConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sandbox: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extensions: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_mcp_servers: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        include_directories: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        debug: Option<bool>,
+    },
 }
 
 // ── File change tracking ──────────────────────────────────────────
@@ -971,6 +999,69 @@ impl AppState {
                 });
             }
 
+            "gemini_thread_action_result" => {
+                let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let success = msg.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                let message = msg.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                cmds.push(UiCommand::GeminiThreadActionResult {
+                    action: action.clone(),
+                    success,
+                    message: message.clone(),
+                });
+                let level = if success { "info" } else { "warn" };
+                let line = if success {
+                    format!("Gemini /{}: {}", action, message)
+                } else {
+                    format!("Gemini /{}: FAILED — {}", action, message)
+                };
+                cmds.extend(self.add_log(level, &line, None, "server"));
+            }
+
+            "gemini_config_changed" => {
+                let model = msg.get("model").and_then(|v| v.as_str()).map(String::from);
+                let model_cleared = msg
+                    .get("model_cleared")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let approval_mode = msg
+                    .get("approval_mode")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let sandbox = msg.get("sandbox").and_then(|v| v.as_bool());
+                let extensions = msg.get("extensions").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
+                let allowed_mcp_servers = msg
+                    .get("allowed_mcp_servers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+                let include_directories = msg
+                    .get("include_directories")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+                let debug = msg.get("debug").and_then(|v| v.as_bool());
+                cmds.push(UiCommand::GeminiConfigChanged {
+                    model,
+                    model_cleared,
+                    approval_mode,
+                    sandbox,
+                    extensions,
+                    allowed_mcp_servers,
+                    include_directories,
+                    debug,
+                });
+            }
+
             "usage" | "usage_update" => {
                 if let Some(main) = msg.get("main") {
                     if let Ok(u) = serde_json::from_value::<UsageSnapshot>(main.clone()) {
@@ -1737,6 +1828,88 @@ mod tests {
             }
         ));
         assert!(matched, "expected toggles-only CodexConfigChanged, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_gemini_config_changed_full() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "gemini_config_changed",
+            "model": "gemini-2.5-pro",
+            "approval_mode": "auto_edit",
+            "sandbox": true,
+            "extensions": ["web", "fs"],
+            "allowed_mcp_servers": ["intendant"],
+            "include_directories": ["/tmp/extra"],
+            "debug": false
+        });
+        let cmds = s.handle_message(&msg);
+        let matched = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::GeminiConfigChanged {
+                model: Some(m),
+                model_cleared: false,
+                approval_mode: Some(am),
+                sandbox: Some(true),
+                extensions: Some(exts),
+                allowed_mcp_servers: Some(servers),
+                include_directories: Some(dirs),
+                debug: Some(false),
+            } if m == "gemini-2.5-pro"
+                && am == "auto_edit"
+                && exts.len() == 2
+                && servers == &vec!["intendant".to_string()]
+                && dirs == &vec!["/tmp/extra".to_string()]
+        ));
+        assert!(matched, "expected full GeminiConfigChanged, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_gemini_config_changed_model_cleared() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "gemini_config_changed",
+            "model_cleared": true
+        });
+        let cmds = s.handle_message(&msg);
+        let matched = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::GeminiConfigChanged {
+                model: None,
+                model_cleared: true,
+                approval_mode: None,
+                sandbox: None,
+                extensions: None,
+                allowed_mcp_servers: None,
+                include_directories: None,
+                debug: None,
+            }
+        ));
+        assert!(matched, "expected model-cleared GeminiConfigChanged, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_gemini_thread_action_result_success() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "gemini_thread_action_result",
+            "action": "new",
+            "success": true,
+            "message": "agent torn down; next task will spawn a fresh Gemini process"
+        });
+        let cmds = s.handle_message(&msg);
+        let saw_result = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::GeminiThreadActionResult { action, success: true, message }
+                if action == "new"
+                    && message == "agent torn down; next task will spawn a fresh Gemini process"
+        ));
+        assert!(saw_result, "expected GeminiThreadActionResult, got {:?}", cmds);
+        let saw_log = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. } if content.starts_with("Gemini /new:")
+        ));
+        assert!(saw_log, "expected Gemini log entry, got {:?}", cmds);
     }
 
     #[test]
