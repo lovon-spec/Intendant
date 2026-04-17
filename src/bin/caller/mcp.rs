@@ -1102,6 +1102,42 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetCodexSandbox { mode } => {
+            // Shared state + persistence is handled by the control plane;
+            // MCP only surfaces acknowledgement to the caller.
+            emit_control_result(
+                control_tx,
+                "set_codex_sandbox",
+                true,
+                format!("Codex sandbox set to {} (applies on next task)", mode),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexApprovalPolicy { policy } => {
+            emit_control_result(
+                control_tx,
+                "set_codex_approval_policy",
+                true,
+                format!("Codex approval policy set to {} (applies on next task)", policy),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexModel { model } => {
+            let label = model
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("<default>");
+            emit_control_result(
+                control_tx,
+                "set_codex_model",
+                true,
+                format!("Codex model set to {} (applies on next task)", label),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetVerbosity { level } => {
             let parsed = match level.to_lowercase().as_str() {
                 "quiet" => Some(Verbosity::Quiet),
@@ -1816,7 +1852,7 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::CodexConfigChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::Tick => {
                         // Detect stuck phases — warn every 30s after 120s
                         if matches!(

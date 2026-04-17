@@ -1141,6 +1141,12 @@ pub struct SettingsPayload {
     // Values: "codex" | "claude-code" | "gemini" | None (internal agent).
     #[serde(default)]
     pub external_agent: Option<String>,
+    // Codex runtime config (persisted to `[agent.codex]`). Mirrored here so
+    // the Activity → Control sub-tab can load in one fetch.
+    pub codex_sandbox: String,
+    pub codex_approval_policy: String,
+    #[serde(default)]
+    pub codex_model: Option<String>,
     // Env var overrides (read-only, shown in UI)
     #[serde(default)]
     pub env_overrides: std::collections::HashMap<String, String>,
@@ -1182,6 +1188,11 @@ fn settings_payload_from_config(
         live_audio_enabled: config.live_audio.enabled,
         live_audio_timeout_secs: config.live_audio.default_timeout_secs,
         external_agent: config.agent.default_backend.clone(),
+        codex_sandbox: crate::project::normalize_sandbox_mode(&config.agent.codex.sandbox),
+        codex_approval_policy: crate::project::normalize_approval_policy(
+            &config.agent.codex.approval_policy,
+        ),
+        codex_model: config.agent.codex.model.clone(),
         env_overrides,
     }
 }

@@ -218,6 +218,19 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
     },
+    CodexConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sandbox: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_policy: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// True when the message is "clear the model override" (the dashboard
+        /// uses an empty input to mean that). Distinguishes from "no change
+        /// to model" (which omits the field entirely).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_cleared: bool,
+    },
     Usage {
         main: crate::frontend::ModelUsageSnapshot,
         #[serde(skip_serializing_if = "Option::is_none")]

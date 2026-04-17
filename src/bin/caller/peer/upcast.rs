@@ -870,6 +870,35 @@ impl AppEventUpcaster {
                 ),
             )],
 
+            AppEvent::CodexConfigChanged {
+                sandbox,
+                approval_policy,
+                model,
+                model_cleared,
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = sandbox {
+                    parts.push(format!("sandbox={v}"));
+                }
+                if let Some(v) = approval_policy {
+                    parts.push(format!("approval_policy={v}"));
+                }
+                if let Some(v) = model {
+                    parts.push(format!("model={v}"));
+                } else if *model_cleared {
+                    parts.push("model=<default>".to_string());
+                }
+                if parts.is_empty() {
+                    vec![]
+                } else {
+                    vec![log_event(
+                        LogLevel::Info,
+                        "config",
+                        format!("codex config: {}", parts.join(", ")),
+                    )]
+                }
+            }
+
             // ---- Budget / safety ----
             AppEvent::BudgetWarning { pct, remaining } => vec![log_event(
                 LogLevel::Warn,
@@ -1573,6 +1602,35 @@ impl WireEventUpcaster {
                     agent.as_deref().unwrap_or("none")
                 ),
             )],
+
+            OutboundEvent::CodexConfigChanged {
+                sandbox,
+                approval_policy,
+                model,
+                model_cleared,
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = sandbox {
+                    parts.push(format!("sandbox={v}"));
+                }
+                if let Some(v) = approval_policy {
+                    parts.push(format!("approval_policy={v}"));
+                }
+                if let Some(v) = model {
+                    parts.push(format!("model={v}"));
+                } else if *model_cleared {
+                    parts.push("model=<default>".to_string());
+                }
+                if parts.is_empty() {
+                    vec![]
+                } else {
+                    vec![log_event(
+                        LogLevel::Info,
+                        "config",
+                        format!("codex config: {}", parts.join(", ")),
+                    )]
+                }
+            }
 
             // ---- Budget / safety ----
             OutboundEvent::BudgetWarning { pct, remaining } => vec![log_event(

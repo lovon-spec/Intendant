@@ -623,10 +623,41 @@ impl SessionLog {
     }
 
     /// Write content to a turn-specific file and return its relative path.
+    ///
+    /// Overwrites existing content. Use [`append_turn_file`] for streams
+    /// like stdout/stderr that accumulate multiple writes within one turn.
+    ///
+    /// [`append_turn_file`]: Self::append_turn_file
     fn write_turn_file(&self, suffix: &str, content: &str) -> Option<String> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
         if fs::write(&path, content).is_ok() {
+            Some(relative)
+        } else {
+            None
+        }
+    }
+
+    /// Append content to a turn-specific file and return its relative path.
+    ///
+    /// If the file already has content, writes a blank-line separator first
+    /// so successive entries remain visually distinct when read back. Returns
+    /// `None` if the OS write fails — the caller should then drop the `file`
+    /// reference from the session-log event so downstream readers don't chase
+    /// a phantom path.
+    fn append_turn_file(&self, suffix: &str, content: &str) -> Option<String> {
+        let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
+        let path = self.dir.join(&relative);
+        let already_has_content = fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
+        if already_has_content {
+            let _ = file.write_all(b"\n");
+        }
+        if file.write_all(content.as_bytes()).is_ok() {
             Some(relative)
         } else {
             None
@@ -1611,7 +1642,11 @@ impl SessionLog {
         source: Option<&str>,
     ) {
         self.summary_builder.total_tokens += total_tokens;
-        let file = self.write_turn_file("model.txt", content);
+        // Codex fires multiple `model_response` events per turn (one per
+        // assistant message in the same turn). Appending keeps the full
+        // sequence; truncating would leave only the last chunk on disk
+        // while session.jsonl's event stream references all of them.
+        let file = self.append_turn_file("model.txt", content);
         let preview: String = content.chars().take(200).collect();
         let mut data = serde_json::json!({
             "tokens": {
@@ -1676,14 +1711,18 @@ impl SessionLog {
     }
 
     /// Log agent runtime output. Written to per-turn files.
+    ///
+    /// A single turn may run many commands, each producing its own output
+    /// chunk; we append so the file reflects the full turn history rather
+    /// than only the last chunk.
     pub fn agent_output(&mut self, stdout: &str, stderr: &str, source: Option<&str>) {
         let file = if !stdout.is_empty() {
-            self.write_turn_file("stdout.txt", stdout)
+            self.append_turn_file("stdout.txt", stdout)
         } else {
             None
         };
         let file2 = if !stderr.is_empty() {
-            self.write_turn_file("stderr.txt", stderr)
+            self.append_turn_file("stderr.txt", stderr)
         } else {
             None
         };
@@ -1718,7 +1757,7 @@ impl SessionLog {
 
     /// Log reasoning content from the model (full reasoning, not just summary).
     pub fn reasoning_content(&mut self, summary: Option<&str>, full_content: Option<&str>) {
-        let file = full_content.and_then(|c| self.write_turn_file("reasoning.txt", c));
+        let file = full_content.and_then(|c| self.append_turn_file("reasoning.txt", c));
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: Some(self.current_turn),
@@ -2628,6 +2667,38 @@ pub fn recent_entries(log_dir: &std::path::Path, count: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_turn_file_accumulates_with_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        // Move past turn 0 so the file suffix stabilises.
+        log.turn_start(1, 0.0, 0);
+        log.agent_output("first\n", "", None);
+        log.agent_output("second\n", "", None);
+        let turn_file = log_dir.join("turns/turn_001_stdout.txt");
+        let body = fs::read_to_string(&turn_file).unwrap();
+        assert!(body.contains("first"), "missing first write: {}", body);
+        assert!(body.contains("second"), "missing second write: {}", body);
+        // Separator: the two entries are distinct.
+        assert!(
+            body.find("first").unwrap() < body.find("second").unwrap(),
+            "second entry must come after first"
+        );
+    }
+
+    #[test]
+    fn append_turn_file_skips_separator_on_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(2, 0.0, 0);
+        log.agent_output("only\n", "", None);
+        let body = fs::read_to_string(log_dir.join("turns/turn_002_stdout.txt")).unwrap();
+        // No leading blank line before the first chunk.
+        assert!(!body.starts_with('\n'), "unexpected leading newline: {:?}", body);
+    }
 
     #[test]
     fn open_creates_directory_structure() {

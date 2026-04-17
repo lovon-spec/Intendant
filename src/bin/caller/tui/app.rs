@@ -1163,6 +1163,28 @@ impl App {
                     format!("External agent set to {} (takes effect on next task)", label),
                 );
             }
+            ControlMsg::SetCodexSandbox { ref mode } => {
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex sandbox → {} (applies on next task)", mode),
+                );
+            }
+            ControlMsg::SetCodexApprovalPolicy { ref policy } => {
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex approval policy → {} (applies on next task)", policy),
+                );
+            }
+            ControlMsg::SetCodexModel { ref model } => {
+                let label = model
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("<default>");
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex model → {} (applies on next task)", label),
+                );
+            }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
                     "quiet" => Some(Verbosity::Quiet),
@@ -1667,17 +1689,10 @@ impl App {
             }
             AppEvent::PresenceLog { message, level, turn } => {
                 let lvl = level.unwrap_or(LogLevel::Info);
-                let is_debug = lvl == LogLevel::Debug;
-                // Persist debug-level presence logs (tool_request, tool_response, etc.) to session log
-                if is_debug {
-                    if let Some(ref sl) = self.session_log {
-                        if let Ok(mut log) = sl.lock() {
-                            log.debug(&message);
-                        }
-                    }
-                }
-                // Local-only: OutboundEvent::PresenceLog already reaches
-                // external consumers.
+                // Persistence to session.jsonl happens in
+                // event.rs::spawn_session_log_writer via log.presence_log(...).
+                // Writing here too would double the entry (as `event=debug`
+                // alongside `event=presence_log`).
                 self.log_local_only(lvl, message, LogSource::Presence, turn);
             }
             AppEvent::HumanQuestionDetected { question } => {
@@ -2001,6 +2016,7 @@ impl App {
             | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
             | AppEvent::DisplayMetrics { .. } | AppEvent::DisplayResize { .. }
             | AppEvent::ExternalAgentChanged { .. }
+            | AppEvent::CodexConfigChanged { .. }
             | AppEvent::FileChanged { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.

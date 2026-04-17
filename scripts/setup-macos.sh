@@ -76,6 +76,15 @@ check_core() {
         all_ok=false
     fi
 
+    # ripgrep — used by external agents (Codex, Claude Code) for code
+    # search. Missing `rg` causes agents to fall back to slower paths.
+    if has_cmd rg; then
+        ok "ripgrep"
+    else
+        miss "ripgrep" "brew install ripgrep"
+        all_ok=false
+    fi
+
     # OpenSSL (build-time dep for the openssl-sys crate). Homebrew's
     # openssl@3 provides pkg-config metadata that openssl-sys finds at
     # build time — without it, cargo fails with

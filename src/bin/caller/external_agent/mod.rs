@@ -174,7 +174,10 @@ pub struct AgentConfig {
     pub model: Option<String>,
     pub working_dir: PathBuf,
     pub approval_policy: String,
-    pub sandbox: bool,
+    /// Sandbox mode for Codex: `"read-only"`, `"workspace-write"`, or
+    /// `"danger-full-access"`. Ignored by backends that don't model a
+    /// sandbox (pass `String::new()` for those).
+    pub sandbox: String,
     /// Web gateway port for MCP-over-HTTP config generation.
     pub web_port: Option<u16>,
 }

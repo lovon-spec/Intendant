@@ -148,6 +148,40 @@ fn default_codex_sandbox() -> String {
     "workspace-write".to_string()
 }
 
+/// Valid Codex sandbox modes, in the order we present them in the UI.
+/// Matches `codex --sandbox <MODE>` exactly — the string flows through the
+/// stack unchanged and is sent verbatim to `thread/start`.
+pub const CODEX_SANDBOX_MODES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
+
+/// Valid Codex approval policies, in the order we present them.
+/// Matches `codex --ask-for-approval <POLICY>`.
+/// `"on-failure"` is deprecated upstream so we leave it out of the UI set.
+pub const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never"];
+
+/// Normalize a user-supplied sandbox value to one of `CODEX_SANDBOX_MODES`.
+/// Unknown or empty values fall back to the safest real policy
+/// (`workspace-write`) so a config typo can't silently escalate privileges.
+pub fn normalize_sandbox_mode(input: &str) -> String {
+    let trimmed = input.trim();
+    if CODEX_SANDBOX_MODES.iter().any(|m| *m == trimmed) {
+        trimmed.to_string()
+    } else {
+        default_codex_sandbox()
+    }
+}
+
+/// Normalize a user-supplied approval policy to one of
+/// `CODEX_APPROVAL_POLICIES`. Unknown values fall back to `on-request`
+/// (the project default) rather than silently disabling approvals.
+pub fn normalize_approval_policy(input: &str) -> String {
+    let trimmed = input.trim();
+    if CODEX_APPROVAL_POLICIES.iter().any(|p| *p == trimmed) {
+        trimmed.to_string()
+    } else {
+        default_codex_approval_policy()
+    }
+}
+
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {

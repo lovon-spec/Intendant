@@ -104,6 +104,11 @@ APT_PACKAGES=(
     curl
     mold
 
+    # ripgrep — used by external agents (Codex, Claude Code) for code search.
+    # Missing `rg` causes agents to fall back to slower paths (targeted reads
+    # or recursive greps) and wastes a tool-call probing for it.
+    ripgrep
+
     # Rust build dep for vpx-encode (ffi-generate needs libclang)
     libclang-dev
 

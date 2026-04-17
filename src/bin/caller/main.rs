@@ -173,6 +173,59 @@ fn resolve_agent_backend_from_config(
     })
 }
 
+/// Structural equality for `CodexRuntimeConfig`. The struct itself doesn't
+/// derive `PartialEq` because it's a public API surface and we don't want to
+/// commit to field-by-field equality semantics for external callers; inside
+/// the daemon loop we just need to detect drift across tasks, so we compare
+/// the three Codex-locked fields explicitly.
+fn codex_runtime_config_equal(
+    a: &control_plane::CodexRuntimeConfig,
+    b: &control_plane::CodexRuntimeConfig,
+) -> bool {
+    a.sandbox == b.sandbox && a.approval_policy == b.approval_policy && a.model == b.model
+}
+
+/// Extract file paths from a unified-diff header. Reads `+++ b/<path>` lines
+/// (git-style), with `--- a/<path>` used as a fallback for pure-delete diffs
+/// where the `+++` side is `/dev/null`. Deduplicates while preserving order.
+///
+/// Used when the external agent's own `files_changed` list is empty, which
+/// has been observed for Codex's `turn/diff/updated` notifications in
+/// practice — the wire protocol carries the paths only inside the diff body.
+fn parse_diff_file_paths(unified_diff: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in unified_diff.lines() {
+        let path = if let Some(rest) = line.strip_prefix("+++ ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            rest
+        } else {
+            continue;
+        };
+        // Drop optional tab-separated timestamp/metadata, trim whitespace.
+        let path = path.split('\t').next().unwrap_or(path).trim();
+        if path == "/dev/null" {
+            continue;
+        }
+        // Strip exactly one git-style `a/` or `b/` prefix. Codex sometimes
+        // produces `b//home/...` (double slash) for absolute paths; that
+        // becomes `/home/...` after the single-prefix strip, which is
+        // exactly what we want.
+        let path = path
+            .strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path);
+        if path.is_empty() {
+            continue;
+        }
+        let owned = path.to_string();
+        if !out.iter().any(|p| p == &owned) {
+            out.push(owned);
+        }
+    }
+    out
+}
+
 /// Resolve external agent backend from shared state (written by the web UI),
 /// falling back to the project config default.
 async fn resolve_agent_backend(
@@ -205,18 +258,19 @@ async fn create_external_agent(
     {
         AgentBackend::Codex => {
             let cfg = &project.config.agent.codex;
+            let sandbox_mode = project::normalize_sandbox_mode(&cfg.sandbox);
             let agent = Box::new(external_agent::codex::CodexAgent::new(
                 cfg.command.clone(),
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
-                cfg.sandbox != "danger-full-access",
+                sandbox_mode.clone(),
                 web_port,
             ));
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
                 approval_policy: cfg.approval_policy.clone(),
-                sandbox: cfg.sandbox != "danger-full-access",
+                sandbox: sandbox_mode,
                 web_port,
             };
             (agent, config)
@@ -232,7 +286,7 @@ async fn create_external_agent(
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
                 approval_policy: String::new(),
-                sandbox: false,
+                sandbox: String::new(),
                 web_port,
             };
             (agent, config)
@@ -250,7 +304,7 @@ async fn create_external_agent(
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
                 approval_policy: cfg.permission_mode.clone(),
-                sandbox: false,
+                sandbox: String::new(),
                 web_port,
             };
             (agent, config)
@@ -335,6 +389,12 @@ async fn drain_external_agent_events(
     // DrainOutcome::Interrupted + Interrupted event so the caller can choose
     // not to wait for a follow-up.
     let mut interrupt_pending = false;
+    // Last `DiffUpdated` content hash we wrote to the session log. Codex
+    // re-fires `turn/diff/updated` on every internal state change (patch
+    // apply, exec, approval, turn recompute), so within one drain we commonly
+    // see 2-4 identical emissions per real file write. We dedupe on the
+    // unified-diff bytes: if nothing changed, don't spam session.jsonl.
+    let mut last_diff_hash: Option<u64> = None;
 
     // Background watcher: if an interrupt arrives while an approval handler
     // below is blocked on `rx.await`, we need to drain the approval registry
@@ -763,13 +823,42 @@ async fn drain_external_agent_events(
                 files_changed,
                 unified_diff,
             } => {
-                slog(config.session_log, |l| {
-                    l.info(&format!(
-                        "External agent diff: {} files changed\n{}",
-                        files_changed.len(),
-                        unified_diff
-                    ));
-                });
+                let hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    unified_diff.hash(&mut h);
+                    h.finish()
+                };
+                if last_diff_hash == Some(hash) {
+                    // Identical to the previous emission — skip.
+                } else {
+                    last_diff_hash = Some(hash);
+                    // Prefer the file paths from the unified diff header
+                    // (`+++ b/<path>`) because `files_changed` from Codex is
+                    // frequently empty in practice. Fall back to the agent's
+                    // own list if parsing the diff yields nothing.
+                    let parsed_files = parse_diff_file_paths(&unified_diff);
+                    let files = if parsed_files.is_empty() {
+                        files_changed
+                    } else {
+                        parsed_files
+                    };
+                    let header = if files.is_empty() {
+                        "External agent diff".to_string()
+                    } else if files.len() == 1 {
+                        format!("External agent diff: {}", files[0])
+                    } else {
+                        format!(
+                            "External agent diff: {} files ({})",
+                            files.len(),
+                            files.join(", ")
+                        )
+                    };
+                    slog(config.session_log, |l| {
+                        l.info(&format!("{}\n{}", header, unified_diff));
+                    });
+                }
             }
             external_agent::AgentEvent::TurnCompleted { message } => {
                 if let Some(ref msg) = message {
@@ -820,15 +909,16 @@ struct DaemonConfig {
 /// Daemon loop shared by the TUI post-exit path and the headless web-gateway path.
 ///
 /// Waits for `StartTask` and `SetExternalAgent` control messages from the web
-/// UI, spawning agent tasks in the background. Exits on Ctrl+C or bus close.
+/// UI, spawning agent tasks in the background. Exits when the bus closes.
+///
+/// Ctrl+C is handled by the global signal handler installed in `main`, which
+/// writes `mark_interrupted` to the session meta and calls `exit(130)` — we
+/// deliberately do not also listen for it here because racing two handlers
+/// risked the loop `break`ing before the meta update ran.
 async fn run_daemon_loop(config: DaemonConfig) {
     let mut event_rx = config.bus.subscribe();
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("Shutting down.");
-                break;
-            }
             event = event_rx.recv() => {
                 match event {
                     Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask {
@@ -1996,6 +2086,71 @@ fn normalize_command_batch(json_str: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_diff_file_paths_new_file() {
+        let diff = "\
+diff --git a/foo.rs b/foo.rs
+new file mode 100644
+index 0000000..abc
+--- /dev/null
++++ b/foo.rs
+@@ -0,0 +1,2 @@
++hello
++world
+";
+        let files = parse_diff_file_paths(diff);
+        assert_eq!(files, vec!["foo.rs".to_string()]);
+    }
+
+    #[test]
+    fn parse_diff_file_paths_absolute_with_double_slash() {
+        // Codex in practice writes `b//home/user/...` for absolute paths.
+        // The stripped form must preserve the leading `/`.
+        let diff = "\
+diff --git a//home/user/proj/x.py b//home/user/proj/x.py
+new file mode 100644
+--- /dev/null
++++ b//home/user/proj/x.py
+@@ -0,0 +1 @@
++pass
+";
+        let files = parse_diff_file_paths(diff);
+        assert_eq!(files, vec!["/home/user/proj/x.py".to_string()]);
+    }
+
+    #[test]
+    fn parse_diff_file_paths_deleted_file() {
+        // Pure deletion: `+++ /dev/null`, so we must pick up the `a/` side.
+        let diff = "\
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+--- a/gone.txt
++++ /dev/null
+@@ -1,1 +0,0 @@
+-removed line
+";
+        let files = parse_diff_file_paths(diff);
+        assert_eq!(files, vec!["gone.txt".to_string()]);
+    }
+
+    #[test]
+    fn parse_diff_file_paths_multiple_and_dedup() {
+        let diff = "\
+--- a/one.rs
++++ b/one.rs
+@@ -1 +1 @@
+-a
++b
+--- a/two.rs
++++ b/two.rs
+@@ -1 +1 @@
+-x
++y
+";
+        let files = parse_diff_file_paths(diff);
+        assert_eq!(files, vec!["one.rs".to_string(), "two.rs".to_string()]);
+    }
 
     #[test]
     fn extract_json_from_json_fence() {
@@ -4515,6 +4670,7 @@ async fn run_with_presence(
     session_registry: display::SharedSessionRegistry,
     agent_backend_override: Option<external_agent::AgentBackend>,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
+    shared_codex_config: control_plane::SharedCodexConfig,
     web_port: Option<u16>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Try to create presence provider. Degrade to silent mode on failure so
@@ -4700,6 +4856,12 @@ async fn run_with_presence(
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
+    // Track the Codex runtime config the persistent agent was born with.
+    // Codex locks sandbox / approval policy / model at `thread/start`, so
+    // these can't change mid-thread — if any field differs from the current
+    // `shared_codex_config` when a new task arrives, we tear the agent down
+    // and build a fresh one. Only meaningful when the backend is Codex.
+    let mut persistent_codex_config: Option<control_plane::CodexRuntimeConfig> = None;
 
     while let Some(envelope) = task_rx.recv().await {
         // Backend-side dispatch log: emitted at task acceptance, replacing the
@@ -4819,12 +4981,33 @@ async fn run_with_presence(
 
         // Re-read the agent backend each task: the web UI may have changed it.
         let agent_backend = shared_external_agent.read().await.clone();
+        // Snapshot the current Codex runtime config too. Codex locks sandbox,
+        // approval policy, and model at thread/start — so a toggle in the UI
+        // takes effect on the NEXT task by forcing an agent rebuild here.
+        let current_codex_config = shared_codex_config.read().await.clone();
 
-        // If the backend changed since the persistent agent was created, tear it down.
-        if agent_backend != persistent_agent_backend && persistent_agent.is_some() {
+        // Teardown conditions:
+        //  - backend changed (any agent)
+        //  - backend is Codex and any of the Codex-locked fields differ
+        let codex_config_changed = matches!(
+            agent_backend,
+            Some(external_agent::AgentBackend::Codex)
+        ) && persistent_codex_config
+            .as_ref()
+            .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
+
+        if persistent_agent.is_some()
+            && (agent_backend != persistent_agent_backend || codex_config_changed)
+        {
+            if codex_config_changed {
+                slog(&session_log, |l| {
+                    l.info("Codex config changed; rebuilding agent for next task")
+                });
+            }
             persistent_agent = None;
             persistent_thread = None;
             persistent_event_rx = None;
+            persistent_codex_config = None;
         }
 
         if let Some(ref backend) = agent_backend {
@@ -4832,7 +5015,7 @@ async fn run_with_presence(
             // The external agent manages its own conversation; we keep the
             // agent + thread alive across tasks dispatched by presence.
             if persistent_agent.is_none() {
-                let proj = match Project::from_root(project_root.clone()) {
+                let mut proj = match Project::from_root(project_root.clone()) {
                     Ok(p) => p,
                     Err(e) => {
                         bus.send(AppEvent::PresenceLog {
@@ -4843,6 +5026,18 @@ async fn run_with_presence(
                         continue;
                     }
                 };
+                // Apply the live runtime config on top of what was loaded
+                // from TOML. The control plane writes TOML synchronously on
+                // each change, so normally the two agree — but there's no
+                // ordering guarantee between the save and the next
+                // `from_root`, and `shared_codex_config` is always the
+                // authoritative "what the user just chose" source.
+                if matches!(backend, external_agent::AgentBackend::Codex) {
+                    proj.config.agent.codex.sandbox = current_codex_config.sandbox.clone();
+                    proj.config.agent.codex.approval_policy =
+                        current_codex_config.approval_policy.clone();
+                    proj.config.agent.codex.model = current_codex_config.model.clone();
+                }
                 let (agent, thread, event_rx) =
                     match create_external_agent(backend, &proj, &session_log, web_port).await {
                         Ok(result) => result,
@@ -4863,6 +5058,14 @@ async fn run_with_presence(
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
                 persistent_agent_backend = agent_backend.clone();
+                // Remember the Codex config this agent was spawned with so
+                // we can detect drift at the next task and rebuild.
+                persistent_codex_config =
+                    if matches!(agent_backend, Some(external_agent::AgentBackend::Codex)) {
+                        Some(current_codex_config.clone())
+                    } else {
+                        None
+                    };
             }
 
             // Send the task as a new turn in the existing thread, with any
@@ -6884,9 +7087,12 @@ async fn main() -> Result<(), CallerError> {
         project.config.transcription.enabled = true;
     }
 
-    // Install SIGTERM handler to mark session as interrupted before exit.
+    // Install signal handler to mark session as interrupted before exit.
     // Rust's Drop trait does not run when the process is killed by a signal,
-    // so we need an explicit handler to update session_meta.json.
+    // so we need an explicit handler to update session_meta.json. We catch
+    // both SIGTERM (external shutdown) and SIGINT (Ctrl+C in terminal or at
+    // the `run_daemon_loop` prompt after TUI quit) so the session doesn't
+    // linger as `"status": "running"` in ~/.intendant/logs/ forever.
     {
         let signal_session_log = session_log.clone();
         tokio::spawn(async move {
@@ -6895,7 +7101,12 @@ async fn main() -> Result<(), CallerError> {
                 use tokio::signal::unix::{signal, SignalKind};
                 let mut sigterm =
                     signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-                sigterm.recv().await;
+                let mut sigint =
+                    signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = sigint.recv() => {}
+                }
                 if let Ok(mut log) = signal_session_log.lock() {
                     log.mark_interrupted();
                 }
@@ -7707,11 +7918,23 @@ async fn main() -> Result<(), CallerError> {
         // Seeded with the resolved CLI/config value; updated by SetExternalAgent ControlMsg.
         let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
             Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
+        // Live Codex config — seeded from TOML, updated by SetCodex* ControlMsgs.
+        // The daemon loop reads this at the start of each task so a Control-tab
+        // toggle takes effect on the next task without needing a restart.
+        let shared_codex_config: control_plane::SharedCodexConfig = {
+            let cfg = &project.config.agent.codex;
+            Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
+                sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                model: cfg.model.clone(),
+            }))
+        };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
+                codex_config: shared_codex_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },
@@ -7755,6 +7978,7 @@ async fn main() -> Result<(), CallerError> {
 
             let agent_backend_for_presence = agent_backend.clone();
             let shared_external_agent_for_presence = shared_external_agent.clone();
+            let shared_codex_config_for_presence = shared_codex_config.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
                     task,
@@ -7777,6 +8001,7 @@ async fn main() -> Result<(), CallerError> {
                     session_registry.clone(),
                     agent_backend_for_presence,
                     shared_external_agent_for_presence,
+                    shared_codex_config_for_presence,
                     if use_web { Some(web_port) } else { None },
                 )
                 .await;
@@ -8209,11 +8434,20 @@ async fn main() -> Result<(), CallerError> {
         // Shared state for dynamic external agent selection from the web UI (headless mode).
         let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
             Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
+        let shared_codex_config: control_plane::SharedCodexConfig = {
+            let cfg = &project.config.agent.codex;
+            Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
+                sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                model: cfg.model.clone(),
+            }))
+        };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
             control_plane::ControlPlaneState {
                 autonomy: autonomy.clone(),
                 external_agent: shared_external_agent.clone(),
+                codex_config: shared_codex_config.clone(),
                 bus: bus.clone(),
                 project_root: Some(project.root.clone()),
             },

@@ -137,6 +137,20 @@ pub enum UiCommand {
     PeerStateChanged {
         peer: serde_json::Value,
     },
+    /// Codex runtime config changed. Fields not included were not changed.
+    /// `model_cleared` distinguishes "no change to model" (model=None,
+    /// model_cleared=false) from "model override removed" (model=None,
+    /// model_cleared=true) so the Control sub-tab can zero the input.
+    CodexConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sandbox: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_policy: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_cleared: bool,
+    },
 }
 
 // ── File change tracking ──────────────────────────────────────────
@@ -871,6 +885,25 @@ impl AppState {
                 });
             }
 
+            "codex_config_changed" => {
+                let sandbox = msg.get("sandbox").and_then(|v| v.as_str()).map(String::from);
+                let approval_policy = msg
+                    .get("approval_policy")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let model = msg.get("model").and_then(|v| v.as_str()).map(String::from);
+                let model_cleared = msg
+                    .get("model_cleared")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                cmds.push(UiCommand::CodexConfigChanged {
+                    sandbox,
+                    approval_policy,
+                    model,
+                    model_cleared,
+                });
+            }
+
             "usage" | "usage_update" => {
                 if let Some(main) = msg.get("main") {
                     if let Ok(u) = serde_json::from_value::<UsageSnapshot>(main.clone()) {
@@ -1471,6 +1504,48 @@ mod tests {
         assert!(s.pending_approval_id.is_none());
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowFollowUp)));
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::HideAllPanels)));
+    }
+
+    #[test]
+    fn handle_codex_config_changed_full() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "codex_config_changed",
+            "sandbox": "danger-full-access",
+            "approval_policy": "never",
+            "model": "gpt-5"
+        });
+        let cmds = s.handle_message(&msg);
+        let matched = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::CodexConfigChanged {
+                sandbox: Some(s),
+                approval_policy: Some(p),
+                model: Some(m),
+                model_cleared: false,
+            } if s == "danger-full-access" && p == "never" && m == "gpt-5"
+        ));
+        assert!(matched, "expected full CodexConfigChanged command, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_codex_config_changed_model_cleared() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "codex_config_changed",
+            "model_cleared": true
+        });
+        let cmds = s.handle_message(&msg);
+        let matched = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::CodexConfigChanged {
+                sandbox: None,
+                approval_policy: None,
+                model: None,
+                model_cleared: true,
+            }
+        ));
+        assert!(matched, "expected model-cleared CodexConfigChanged, got {:?}", cmds);
     }
 
     #[test]

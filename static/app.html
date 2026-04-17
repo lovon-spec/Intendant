@@ -1548,6 +1548,105 @@ html, body {
   margin-left: 4px;
 }
 
+/* ── Control sub-tab ── */
+.control-pane-body {
+  padding: 16px 20px;
+  max-width: 640px;
+  overflow-y: auto;
+  flex: 1;
+}
+.control-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--subtext1);
+}
+.control-backend-badge {
+  padding: 2px 8px;
+  background: var(--surface1);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+}
+.control-applies-note {
+  flex: 1;
+  text-align: right;
+  color: var(--overlay1);
+  font-style: italic;
+  font-size: 11px;
+}
+.control-applies-note.pending {
+  color: var(--yellow);
+  font-weight: 600;
+  font-style: normal;
+}
+.control-group {
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+}
+.control-group legend {
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+.control-row label {
+  min-width: 120px;
+  font-size: 13px;
+  color: var(--subtext1);
+}
+.control-row input[type="text"],
+.control-row select {
+  flex: 1;
+  padding: 4px 8px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  color: var(--text);
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+.control-row input[type="text"]:focus,
+.control-row select:focus {
+  outline: 1px solid var(--blue);
+}
+.control-row .control-current {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--overlay1);
+  min-width: 80px;
+  text-align: right;
+}
+.control-hint {
+  font-size: 11px;
+  color: var(--overlay1);
+  padding: 2px 0 0 132px;
+  line-height: 1.5;
+}
+.control-hint strong {
+  color: var(--subtext1);
+  font-weight: 600;
+}
+.control-disabled-overlay {
+  color: var(--overlay0);
+  text-align: center;
+  padding: 40px;
+  font-size: 13px;
+}
+
 .terminal-container {
   flex: 1;
   position: relative;
@@ -2885,6 +2984,7 @@ html, body {
         <button class="subtab-btn" data-activity-tab="changes">
           Changes <span class="badge" id="badge-changes" style="display:none"></span>
         </button>
+        <button class="subtab-btn" data-activity-tab="control">Control</button>
       </div>
       <div class="subtab-panes">
         <div class="subtab-pane active" id="activity-log-pane">
@@ -2978,6 +3078,56 @@ html, body {
             <div class="changes-diff-viewer" id="changes-diff-viewer">
               <div class="changes-diff-header" id="changes-diff-header">Select a file to view changes</div>
               <pre class="changes-diff-content" id="changes-diff-content"></pre>
+            </div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="activity-control-pane">
+          <div class="control-pane-body">
+            <div class="control-header">
+              <span>Backend:</span>
+              <span class="control-backend-badge" id="control-backend-badge">none</span>
+              <span class="control-applies-note" id="control-applies-note">changes apply on next task</span>
+            </div>
+            <div id="control-codex-section">
+              <fieldset class="control-group">
+                <legend>Sandbox</legend>
+                <div class="control-row">
+                  <label for="control-codex-sandbox">Mode</label>
+                  <select id="control-codex-sandbox">
+                    <option value="read-only">read-only</option>
+                    <option value="workspace-write" selected>workspace-write</option>
+                    <option value="danger-full-access">danger-full-access</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>workspace-write</strong> blocks listener sockets / pipes and outbound network. Prefer <strong>danger-full-access</strong> only when a task genuinely needs live app automation (UNO, D-Bus) or arbitrary network.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Approval policy</legend>
+                <div class="control-row">
+                  <label for="control-codex-approval">Policy</label>
+                  <select id="control-codex-approval">
+                    <option value="untrusted">untrusted</option>
+                    <option value="on-request" selected>on-request</option>
+                    <option value="never">never</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>untrusted</strong>: only run known-safe commands without approval. <strong>on-request</strong>: model asks when it wants to. <strong>never</strong>: execute without asking (only with an external sandbox).
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Model</legend>
+                <div class="control-row">
+                  <label for="control-codex-model">Override</label>
+                  <input type="text" id="control-codex-model" placeholder="e.g. gpt-5 (leave empty for Codex default)">
+                </div>
+                <div class="control-hint">Sent as <code>model</code> in <code>thread/start</code>. Empty = let Codex pick its configured default.</div>
+              </fieldset>
+            </div>
+            <div id="control-no-backend" class="control-disabled-overlay" style="display:none">
+              No Codex backend selected. Switch to Codex in Settings &rarr; Agent to configure these knobs.
             </div>
           </div>
         </div>
@@ -4680,6 +4830,9 @@ function processCommands(cmds) {
       case 'file_changed':
         onFileChanged(c.path, c.kind, c.lines_added, c.lines_removed);
         break;
+      case 'codex_config_changed':
+        applyCodexConfigChanged(c);
+        break;
       // Peer registry push events. The peer payload is a `PeerSnapshot`
       // (same shape `refreshPeersFromApi` builds entries from), so we
       // funnel through the shared upsert/remove helpers — one code path
@@ -4748,6 +4901,142 @@ async function selectChangesFile(path) {
   }
 }
 window.selectChangesFile = selectChangesFile;
+
+// ── Control sub-tab ──
+//
+// Reads the live Codex runtime config from `/api/settings` and dispatches
+// `SetCodex*` control messages on change. The backend's control plane
+// persists to `intendant.toml` and broadcasts `CodexConfigChanged` back to
+// all connected dashboards, so two browsers stay in sync.
+
+let controlCodexConfig = { sandbox: null, approval_policy: null, model: null };
+let controlCurrentBackend = null;
+let controlBackendActive = false;
+const controlAppliesBaseText = 'changes apply on next task';
+
+async function refreshControlPane() {
+  try {
+    const resp = await fetch('/api/settings');
+    if (!resp.ok) throw new Error(resp.statusText);
+    const d = await resp.json();
+    controlCurrentBackend = normalizeAgentId(d.external_agent);
+    controlCodexConfig = {
+      sandbox: d.codex_sandbox || 'workspace-write',
+      approval_policy: d.codex_approval_policy || 'on-request',
+      model: d.codex_model || '',
+    };
+    renderControlPane();
+  } catch (e) {
+    console.warn('Failed to load control-pane config:', e);
+  }
+}
+
+function renderControlPane() {
+  const badge = document.getElementById('control-backend-badge');
+  const section = document.getElementById('control-codex-section');
+  const emptyMsg = document.getElementById('control-no-backend');
+  const isCodex = controlCurrentBackend === 'codex';
+  if (badge) badge.textContent = controlCurrentBackend || 'none';
+  if (section) section.style.display = isCodex ? '' : 'none';
+  if (emptyMsg) emptyMsg.style.display = isCodex ? 'none' : '';
+  if (!isCodex) return;
+  const sandboxSel = document.getElementById('control-codex-sandbox');
+  const approvalSel = document.getElementById('control-codex-approval');
+  const modelInp = document.getElementById('control-codex-model');
+  if (sandboxSel) sandboxSel.value = controlCodexConfig.sandbox;
+  if (approvalSel) approvalSel.value = controlCodexConfig.approval_policy;
+  if (modelInp) modelInp.value = controlCodexConfig.model || '';
+  updateControlAppliesNote();
+}
+
+function updateControlAppliesNote() {
+  const note = document.getElementById('control-applies-note');
+  if (!note) return;
+  if (controlBackendActive) {
+    note.textContent = 'task running — changes apply on next task';
+    note.classList.add('pending');
+  } else {
+    note.textContent = controlAppliesBaseText;
+    note.classList.remove('pending');
+  }
+}
+
+function dispatchControlMsg(payload) {
+  if (app && app.send_server_action) {
+    app.send_server_action(payload);
+  } else {
+    console.warn('control pane: no app connection, dropped', payload);
+  }
+}
+
+function onControlSandboxChange(ev) {
+  const mode = ev.target.value;
+  if (mode === controlCodexConfig.sandbox) return;
+  controlCodexConfig.sandbox = mode;
+  dispatchControlMsg({ action: 'set_codex_sandbox', mode });
+}
+
+function onControlApprovalChange(ev) {
+  const policy = ev.target.value;
+  if (policy === controlCodexConfig.approval_policy) return;
+  controlCodexConfig.approval_policy = policy;
+  dispatchControlMsg({ action: 'set_codex_approval_policy', policy });
+}
+
+function onControlModelCommit(ev) {
+  const model = ev.target.value.trim();
+  const current = (controlCodexConfig.model || '').trim();
+  if (model === current) return;
+  controlCodexConfig.model = model;
+  dispatchControlMsg({ action: 'set_codex_model', model: model || null });
+}
+
+// Apply a CodexConfigChanged event from the server, keeping the pane in
+// sync with toggles from other browsers (and our own server-confirmed write).
+function applyCodexConfigChanged(evt) {
+  if (evt.sandbox) controlCodexConfig.sandbox = evt.sandbox;
+  if (evt.approval_policy) controlCodexConfig.approval_policy = evt.approval_policy;
+  if (evt.model !== undefined && evt.model !== null) {
+    controlCodexConfig.model = evt.model;
+  } else if (evt.model_cleared) {
+    controlCodexConfig.model = '';
+  }
+  const sandboxSel = document.getElementById('control-codex-sandbox');
+  const approvalSel = document.getElementById('control-codex-approval');
+  const modelInp = document.getElementById('control-codex-model');
+  if (sandboxSel && evt.sandbox) sandboxSel.value = evt.sandbox;
+  if (approvalSel && evt.approval_policy) approvalSel.value = evt.approval_policy;
+  if (modelInp && (evt.model !== undefined || evt.model_cleared)) {
+    modelInp.value = controlCodexConfig.model || '';
+  }
+}
+
+function wireControlPaneListeners() {
+  const sandboxSel = document.getElementById('control-codex-sandbox');
+  const approvalSel = document.getElementById('control-codex-approval');
+  const modelInp = document.getElementById('control-codex-model');
+  if (sandboxSel) sandboxSel.addEventListener('change', onControlSandboxChange);
+  if (approvalSel) approvalSel.addEventListener('change', onControlApprovalChange);
+  // Commit model on blur or Enter so every keystroke doesn't ping the server.
+  if (modelInp) {
+    modelInp.addEventListener('change', onControlModelCommit);
+    modelInp.addEventListener('blur', onControlModelCommit);
+    modelInp.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        onControlModelCommit(ev);
+      }
+    });
+  }
+}
+
+// Wire up once at DOM ready. switchActivitySubtab('control') will
+// refreshControlPane() to populate values on first open.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', wireControlPaneListeners);
+} else {
+  wireControlPaneListeners();
+}
 
 function renderDiffLines(diffText) {
   if (!diffText) return '<span class="changes-empty">No changes</span>';
@@ -4940,6 +5229,12 @@ function updateStatusBar(d) {
     if (sel) {
       sel.value = shortId || '';
     }
+    // Keep the Control sub-tab in sync: backend badge + show/hide Codex
+    // config knobs based on whether Codex is the active backend.
+    if (controlCurrentBackend !== shortId) {
+      controlCurrentBackend = shortId;
+      renderControlPane();
+    }
   }
 }
 
@@ -4999,6 +5294,13 @@ function setPhase(phase) {
     }, 80);
   }
   updateStopButtonVisibility(phase);
+  // Control sub-tab: highlight the "applies on next task" note while a
+  // task is running so the user knows their toggle is queued, not live.
+  const phaseIsActive = !(phase === 'idle' || phase === 'done' || phase === 'interrupted');
+  if (phaseIsActive !== controlBackendActive) {
+    controlBackendActive = phaseIsActive;
+    updateControlAppliesNote();
+  }
 }
 
 function showApproval(id, command, category) {
@@ -8519,7 +8821,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // (verbosity, direct-mode, host filter, sessions filters).
 
 const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'settings'];
-const VALID_ACTIVITY_SUBTABS = ['log', 'changes'];
+const VALID_ACTIVITY_SUBTABS = ['log', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
 
@@ -8645,9 +8947,13 @@ function switchActivitySubtab(name) {
   });
   document.getElementById('activity-log-pane').classList.toggle('active', name === 'log');
   document.getElementById('activity-changes-pane').classList.toggle('active', name === 'changes');
+  document.getElementById('activity-control-pane').classList.toggle('active', name === 'control');
   if (name === 'changes') {
     const badge = document.getElementById('badge-changes');
     if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
+  }
+  if (name === 'control') {
+    refreshControlPane();
   }
 }
 

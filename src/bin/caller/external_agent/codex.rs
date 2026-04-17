@@ -19,6 +19,44 @@ use super::{
 // Display tools system prompt
 // ---------------------------------------------------------------------------
 
+/// Guidance about the sandbox Codex is running under, appended to the first
+/// user message alongside [`DISPLAY_TOOLS_PROMPT`]. The string is dynamic so
+/// the model sees the actual sandbox for this session, not a baked-in default.
+///
+/// Steered by a concrete failure mode: under `workspace-write`, Codex tried
+/// to drive LibreOffice via a UNO socket, then via a named pipe — both are
+/// listener binds the sandbox blocks. A line up front about "pure-Python
+/// libraries before daemon processes" would have short-circuited that.
+pub(super) fn sandbox_hint(sandbox_mode: &str) -> String {
+    let body = match sandbox_mode {
+        "read-only" => "\
+You are running under Codex's `read-only` sandbox. You CANNOT modify any \
+file on disk. Use read/search tools only and return findings to the user — \
+do not attempt edits, shell side-effects, or spawning daemons.",
+        "danger-full-access" => "\
+You are running under Codex's `danger-full-access` sandbox. No filesystem \
+or network restrictions apply — the user has explicitly opted in. Still \
+prefer the least-invasive approach that gets the task done.",
+        // Default: treat anything else as workspace-write (Intendant's
+        // project config uses that as the default).
+        _ => "\
+You are running under Codex's `workspace-write` sandbox. Writes are allowed \
+inside the project root and `/tmp`; outbound network is blocked unless \
+`sandbox_workspace_write.network_access = true` in the config; inbound \
+listener binds (sockets AND named pipes) are blocked regardless. \
+\n\n\
+Implication: when a task needs a document, data file, or archive, prefer a \
+pure-Python library that writes the file directly (e.g. `python-pptx` or \
+`odfpy` for presentations, `openpyxl` for spreadsheets, `zipfile`/`tarfile` \
+for archives, or hand-rolled XML+zip packaging) over automating a desktop \
+application through UNO / D-Bus / AppleScript — those need a listener the \
+sandbox blocks. If the user explicitly asked for live automation, say the \
+sandbox prevents it and ask whether to switch to `danger-full-access` \
+before retrying.",
+    };
+    format!("\n\n## Environment\n\n{}\n", body)
+}
+
 pub(super) const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
 ## Intendant MCP Tools\n\
 \n\
@@ -128,7 +166,9 @@ pub struct CodexAgent {
     command: String,
     model: Option<String>,
     approval_policy: String,
-    sandbox: bool,
+    /// Sandbox mode sent verbatim to Codex `thread/start`. One of
+    /// `"read-only"`, `"workspace-write"`, `"danger-full-access"`.
+    sandbox: String,
     web_port: Option<u16>,
     prompt_sent: bool,
     /// Working directory where .codex/config.toml was written (for cleanup).
@@ -155,7 +195,7 @@ impl CodexAgent {
         command: String,
         model: Option<String>,
         approval_policy: String,
-        sandbox: bool,
+        sandbox: String,
         web_port: Option<u16>,
     ) -> Self {
         Self {
@@ -615,18 +655,7 @@ fn translate_notification(
                 .unwrap_or("completed");
             let status = match status_str {
                 "failed" => {
-                    let message = match item.get("error") {
-                        Some(serde_json::Value::String(s)) => s.clone(),
-                        Some(serde_json::Value::Object(obj)) => {
-                            // MCP error: {"message": "...", "code": ...}
-                            obj.get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown error")
-                                .to_string()
-                        }
-                        Some(other) => other.to_string(),
-                        None => "unknown error".to_string(),
-                    };
+                    let message = extract_failure_message(item);
                     ToolCompletionStatus::Failed { message }
                 }
                 "cancelled" => ToolCompletionStatus::Cancelled,
@@ -691,6 +720,57 @@ fn translate_notification(
         other => {
             eprintln!("[codex] unknown notification method: {:?} params: {}", other, serde_json::to_string(params).unwrap_or_default());
         }
+    }
+}
+
+/// Build a failure message for a Codex `item/completed` item with
+/// `status: "failed"`. Codex fills `error` for MCP tool faults and internal
+/// failures, but for `commandExecution` items that ran to completion with a
+/// non-zero exit it omits `error` — the diagnostic sits in `aggregatedOutput`
+/// and `exitCode` instead. Prefer the structured `error` when present, else
+/// synthesize something informative so downstream logs don't read
+/// "unknown error" next to a real Python traceback.
+fn extract_failure_message(item: &serde_json::Value) -> String {
+    if let Some(err) = item.get("error") {
+        match err {
+            serde_json::Value::String(s) if !s.is_empty() => return s.clone(),
+            serde_json::Value::Object(obj) => {
+                if let Some(s) = obj.get("message").and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        return s.to_string();
+                    }
+                }
+            }
+            serde_json::Value::Null => {}
+            other => return other.to_string(),
+        }
+    }
+
+    let exit_code = item
+        .get("exitCode")
+        .and_then(|v| v.as_i64())
+        .or_else(|| item.get("exit_code").and_then(|v| v.as_i64()));
+    let output_tail = item
+        .get("aggregatedOutput")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            let trimmed = s.trim_end();
+            const MAX: usize = 400;
+            if trimmed.chars().count() > MAX {
+                let start = trimmed.chars().count() - MAX;
+                let tail: String = trimmed.chars().skip(start).collect();
+                format!("…{}", tail)
+            } else {
+                trimmed.to_string()
+            }
+        })
+        .filter(|s| !s.is_empty());
+
+    match (exit_code, output_tail) {
+        (Some(code), Some(tail)) => format!("command exited {}: {}", code, tail),
+        (Some(code), None) => format!("command exited {}", code),
+        (None, Some(tail)) => tail,
+        (None, None) => "unknown error".to_string(),
     }
 }
 
@@ -879,14 +959,14 @@ impl ExternalAgent for CodexAgent {
             "approvalPolicy".into(),
             serde_json::Value::String(self.approval_policy.clone()),
         );
-        let sandbox_value = if self.sandbox {
-            "workspace-write"
-        } else {
-            "danger-full-access"
-        };
+        // Codex accepts `read-only`, `workspace-write`, or
+        // `danger-full-access`. Pass the configured value through verbatim
+        // so all three modes reach Codex's enforcer unchanged; the config
+        // layer is responsible for validation (see `normalize_sandbox_mode`
+        // in project.rs).
         params.insert(
             "sandbox".into(),
-            serde_json::Value::String(sandbox_value.into()),
+            serde_json::Value::String(self.sandbox.clone()),
         );
 
         let result = self
@@ -924,9 +1004,18 @@ impl ExternalAgent for CodexAgent {
         message: &str,
         images: &[AgentImageAttachment],
     ) -> Result<(), CallerError> {
-        let augmented = if self.web_port.is_some() && !self.prompt_sent {
+        let augmented = if !self.prompt_sent {
             self.prompt_sent = true;
-            format!("{}{}", message, DISPLAY_TOOLS_PROMPT)
+            // Sandbox hint is cheap (~400 chars) and steers the model away
+            // from approaches that the current sandbox will silently reject
+            // (e.g. listener binds under workspace-write). Attach on every
+            // new thread, whether or not the MCP display tools are wired.
+            let sandbox = sandbox_hint(&self.sandbox);
+            if self.web_port.is_some() {
+                format!("{}{}{}", message, sandbox, DISPLAY_TOOLS_PROMPT)
+            } else {
+                format!("{}{}", message, sandbox)
+            }
         } else {
             message.to_string()
         };
@@ -1325,6 +1414,102 @@ mod tests {
     }
 
     #[test]
+    fn translate_item_completed_failed_nonzero_exit() {
+        // commandExecution that ran to completion with exit != 0: Codex omits
+        // `error`, carries the diagnostic in aggregatedOutput + exitCode.
+        // We must surface a real message, not "unknown error".
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "item-1",
+                "type": "commandExecution",
+                "status": "failed",
+                "exitCode": 1,
+                "aggregatedOutput": "Traceback (most recent call last):\n  File \"<string>\", line 1\nModuleNotFoundError: No module named 'odf'\n"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        // First the output delta, then the ToolCompleted with a real reason.
+        let _ = rx.try_recv().unwrap(); // ToolOutputDelta
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolCompleted { status: ToolCompletionStatus::Failed { message }, .. } => {
+                assert!(message.contains("exited 1"), "message should carry exit code: {}", message);
+                assert!(message.contains("ModuleNotFoundError"), "message should carry output tail: {}", message);
+            }
+            other => panic!("expected Failed with detailed message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_completed_failed_output_only() {
+        // aggregatedOutput without exitCode still beats "unknown error".
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "item-2",
+                "type": "commandExecution",
+                "status": "failed",
+                "aggregatedOutput": "RuntimeError: could not connect to pipe\n"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        let _ = rx.try_recv().unwrap();
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolCompleted { status: ToolCompletionStatus::Failed { message }, .. } => {
+                assert!(message.contains("could not connect to pipe"), "got: {}", message);
+                assert!(!message.contains("unknown error"), "should not fall through to unknown: {}", message);
+            }
+            other => panic!("expected Failed with output tail, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_completed_failed_truly_empty_falls_back() {
+        // Only when we have literally nothing do we say "unknown error".
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {"id": "item-3", "type": "mcpToolCall", "status": "failed"}
+        });
+        translate_notification("item/completed", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolCompleted { status: ToolCompletionStatus::Failed { message }, .. } => {
+                assert_eq!(message, "unknown error");
+            }
+            other => panic!("expected Failed with unknown error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sandbox_hint_mentions_mode_and_steers_writeable() {
+        let ws = sandbox_hint("workspace-write");
+        assert!(ws.contains("workspace-write"), "missing mode: {}", ws);
+        assert!(
+            ws.contains("python-pptx") || ws.contains("pure-Python"),
+            "workspace-write hint should steer toward library-first path, got: {}",
+            ws,
+        );
+        assert!(ws.contains("listener"), "should warn about listener binds: {}", ws);
+
+        let ro = sandbox_hint("read-only");
+        assert!(ro.contains("read-only"), "missing mode: {}", ro);
+        assert!(ro.contains("CANNOT modify"), "read-only hint should be explicit: {}", ro);
+
+        let danger = sandbox_hint("danger-full-access");
+        assert!(danger.contains("danger-full-access"), "missing mode: {}", danger);
+    }
+
+    #[test]
+    fn sandbox_hint_unknown_mode_falls_back_to_workspace_write() {
+        // Defensive: if a new sandbox mode is added upstream and we haven't
+        // updated here, we don't lie to the model about what's possible.
+        let hint = sandbox_hint("some-new-mode");
+        assert!(hint.contains("workspace-write"), "unknown mode must fall back to the safest real policy: {}", hint);
+    }
+
+    #[test]
     fn translate_item_completed_cancelled() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
@@ -1630,13 +1815,13 @@ mod tests {
             "codex".into(),
             Some("o4-mini".into()),
             "on-request".into(),
-            true,
+            "workspace-write".into(),
             None,
         );
         assert_eq!(agent.command, "codex");
         assert_eq!(agent.model, Some("o4-mini".into()));
         assert_eq!(agent.approval_policy, "on-request");
-        assert!(agent.sandbox);
+        assert_eq!(agent.sandbox, "workspace-write");
         assert!(agent.child.is_none());
         assert!(agent.writer.is_none());
         assert!(agent.event_tx.is_none());
@@ -1685,7 +1870,7 @@ mod tests {
             "codex".into(),
             None,
             "on-request".into(),
-            false,
+            "danger-full-access".into(),
             None,
         );
         let err = agent.interrupt_turn().await.unwrap_err();
@@ -1707,7 +1892,7 @@ mod tests {
             "codex".into(),
             None,
             "on-request".into(),
-            false,
+            "danger-full-access".into(),
             None,
         );
         // Active turn but no thread — should still error with "no active thread".
@@ -1736,7 +1921,7 @@ mod tests {
             "codex".into(),
             None,
             "on-request".into(),
-            false,
+            "danger-full-access".into(),
             None,
         );
         *agent.active_turn_id.lock().await = Some("turn-xyz".into());

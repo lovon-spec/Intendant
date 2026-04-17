@@ -379,6 +379,23 @@ pub enum AppEvent {
         agent: Option<String>,
     },
 
+    /// Emitted when one or more fields of the Codex runtime configuration
+    /// change (sandbox mode, approval policy, model override). Fields not
+    /// included in the event are unchanged from the previous state.
+    /// Broadcast by the control plane; consumed by the dashboard's
+    /// Control sub-tab to refresh its displayed values.
+    ///
+    /// `model_cleared` distinguishes "unchanged" (None, false) from
+    /// "explicitly set to empty / use Codex default" (None, true) —
+    /// `Option<Option<String>>` would have been cleaner but doesn't
+    /// round-trip through our JSON serialisation as obviously.
+    CodexConfigChanged {
+        sandbox: Option<String>,
+        approval_policy: Option<String>,
+        model: Option<String>,
+        model_cleared: bool,
+    },
+
     /// Log entry broadcast to external consumers (web UI, control socket).
     /// Emitted by the TUI's `log_sourced` for events without their own
     /// `OutboundEvent` variant, and by backend code (e.g.
@@ -446,6 +463,26 @@ pub enum ControlMsg {
     SetExternalAgent {
         #[serde(default)]
         agent: Option<String>,
+    },
+    /// Set the Codex sandbox mode. Applies to the NEXT task because Codex
+    /// locks the sandbox at `thread/start`. Valid values match
+    /// `codex --sandbox <MODE>`: `"read-only"`, `"workspace-write"`,
+    /// `"danger-full-access"`.
+    SetCodexSandbox {
+        mode: String,
+    },
+    /// Set the Codex approval policy. Applies to the NEXT task. Valid
+    /// values match `codex --ask-for-approval <POLICY>`: `"untrusted"`,
+    /// `"on-request"`, `"never"`.
+    SetCodexApprovalPolicy {
+        policy: String,
+    },
+    /// Set the Codex model override. `None` (or a JSON null / missing) lets
+    /// Codex pick its default; otherwise the string is passed as `-m <MODEL>`
+    /// equivalent via `thread/start` params. Applies to the NEXT task.
+    SetCodexModel {
+        #[serde(default)]
+        model: Option<String>,
     },
     SetVerbosity {
         level: String,
@@ -837,6 +874,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         }),
         AppEvent::ExternalAgentChanged { agent } => Some(OutboundEvent::ExternalAgentChanged {
             agent: agent.clone(),
+        }),
+        AppEvent::CodexConfigChanged {
+            sandbox,
+            approval_policy,
+            model,
+            model_cleared,
+        } => Some(OutboundEvent::CodexConfigChanged {
+            sandbox: sandbox.clone(),
+            approval_policy: approval_policy.clone(),
+            model: model.clone(),
+            model_cleared: *model_cleared,
         }),
         AppEvent::LogEntry {
             level,
