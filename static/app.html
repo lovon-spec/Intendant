@@ -5648,8 +5648,11 @@ function setPhase(phase) {
   }
   updateStopButtonVisibility(phase);
   // Control sub-tab: highlight the "applies on next task" note while a
-  // task is running so the user knows their toggle is queued, not live.
-  const phaseIsActive = !(phase === 'idle' || phase === 'done' || phase === 'interrupted');
+  // task is genuinely active so the user knows their toggle is queued,
+  // not live. Must match the Stop button's allowlist exactly — any
+  // denylist here would misclassify `waiting` / `waiting_followup` /
+  // similar between-task states as "running".
+  const phaseIsActive = isAgentActivePhase(phase);
   if (phaseIsActive !== controlBackendActive) {
     controlBackendActive = phaseIsActive;
     updateControlAppliesNote();
@@ -11308,15 +11311,24 @@ window.sendInterrupt = function() {
 // Hide on: idle, done, waiting_followup, interrupted, "" (empty/initial)
 // Show on: thinking, running, running_agent, orchestrating, waiting_approval,
 //          waiting_human, interrupting
+// Phases that mean "the agent is actively doing something the user might
+// want to interrupt". Shared between the Stop button and the Control-tab
+// "task running" indicator so they stay in sync. Explicit allowlist; a
+// denylist would wrongly include `waiting` / `waiting_followup` / `idle`-
+// adjacent states that happen between tasks.
+const AGENT_ACTIVE_PHASES = new Set([
+  'thinking', 'running', 'running_agent', 'orchestrating',
+  'waiting_approval', 'waiting_human', 'interrupting',
+]);
+function isAgentActivePhase(phase) {
+  return AGENT_ACTIVE_PHASES.has((phase || '').toLowerCase());
+}
+
 function updateStopButtonVisibility(phase) {
   const btn = document.getElementById('stop-btn');
   if (!btn) return;
-  const activePhases = new Set([
-    'thinking', 'running', 'running_agent', 'orchestrating',
-    'waiting_approval', 'waiting_human', 'interrupting',
-  ]);
   const key = (phase || '').toLowerCase();
-  const show = activePhases.has(key);
+  const show = isAgentActivePhase(key);
   btn.style.display = show ? '' : 'none';
   // Only `interrupting` should show the disabled "Interrupting..." label.
   // Every other phase (active or hidden) resets the button to its default.
