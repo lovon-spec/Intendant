@@ -10325,15 +10325,26 @@ function renderDaemonsList() {
   });
 
   // Wire per-peer message send: button click + Enter in the input
-  // both call sendPeerMessage with the row's host_id.
+  // both call sendPeerMessage with the row's host_id. Task button
+  // delegates a fresh task via the same input — distinct endpoint,
+  // distinct ControlMsg on the wire (FollowUp vs StartTask).
   el.querySelectorAll('.daemon-msg-send').forEach(btn => {
     btn.addEventListener('click', () => sendPeerMessage(btn.dataset.hostId));
+  });
+  el.querySelectorAll('.daemon-task-send').forEach(btn => {
+    btn.addEventListener('click', () => sendPeerTask(btn.dataset.hostId));
   });
   el.querySelectorAll('.daemon-msg-input').forEach(input => {
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
-        sendPeerMessage(input.dataset.hostId);
+        // Shift-Enter starts a task; plain Enter sends a message.
+        // Mirrors the visual order of the two buttons (Send, Task).
+        if (e.shiftKey) {
+          sendPeerTask(input.dataset.hostId);
+        } else {
+          sendPeerMessage(input.dataset.hostId);
+        }
       }
     });
   });
@@ -10511,8 +10522,9 @@ function renderDaemonRow(d, isSelf) {
     ? ''
     : `<div class="daemon-controls" id="daemon-controls-${escapeHtml(d.host_id)}" style="display:none">
          <div class="daemon-msg-row">
-           <input class="daemon-msg-input" type="text" placeholder="Send a message to ${peerLabel}…" data-host-id="${escapeHtml(d.host_id)}">
-           <button class="daemon-msg-send" data-host-id="${escapeHtml(d.host_id)}">Send</button>
+           <input class="daemon-msg-input" type="text" placeholder="Send a message or task to ${peerLabel}…" data-host-id="${escapeHtml(d.host_id)}">
+           <button class="daemon-msg-send" data-host-id="${escapeHtml(d.host_id)}" title="Send as a follow-up message in the peer's current conversation">Send</button>
+           <button class="daemon-task-send" data-host-id="${escapeHtml(d.host_id)}" title="Start a new task on the peer with these instructions">Task</button>
          </div>
          <div class="daemon-msg-status" data-host-id="${escapeHtml(d.host_id)}"></div>
        </div>`;
@@ -10656,38 +10668,53 @@ async function resolvePeerApproval(hostId, approvalId, decision) {
   }
 }
 
-async function sendPeerMessage(hostId) {
+// Shared submission helper for the two outbound op verbs that drive
+// off the same input: message (FollowUp) and task (StartTask). Differ
+// in HTTP path, request body shape, response field name, and the
+// label shown in the success status — everything else is identical.
+async function submitPeerInput(hostId, kind) {
   if (!hostId) return;
   const input = document.querySelector(
     `.daemon-msg-input[data-host-id="${CSS.escape(hostId)}"]`
   );
-  const sendBtn = document.querySelector(
-    `.daemon-msg-send[data-host-id="${CSS.escape(hostId)}"]`
+  const buttons = document.querySelectorAll(
+    `[data-host-id="${CSS.escape(hostId)}"].daemon-msg-send, [data-host-id="${CSS.escape(hostId)}"].daemon-task-send`
   );
   const statusEl = document.querySelector(
     `.daemon-msg-status[data-host-id="${CSS.escape(hostId)}"]`
   );
-  if (!input || !sendBtn) return;
+  if (!input) return;
 
   const text = input.value.trim();
   if (!text) {
     if (statusEl) {
-      statusEl.textContent = 'Message is empty.';
+      statusEl.textContent = kind === 'task' ? 'Task instructions empty.' : 'Message is empty.';
       statusEl.className = 'daemon-msg-status error';
     }
     return;
   }
 
-  sendBtn.disabled = true;
+  // Disable both buttons during the in-flight POST. Re-enabling them
+  // both on completion is the simplest correct behavior — disabling
+  // only the clicked button leaves the other one usable in a way that
+  // could double-submit.
+  buttons.forEach(b => b.disabled = true);
   if (statusEl) {
-    statusEl.textContent = 'Sending…';
+    statusEl.textContent = kind === 'task' ? 'Starting task…' : 'Sending…';
     statusEl.className = 'daemon-msg-status';
   }
+
+  const url = kind === 'task'
+    ? `/api/peers/${hostId}/task`
+    : `/api/peers/${hostId}/message`;
+  const body = kind === 'task'
+    ? JSON.stringify({ instructions: text })
+    : JSON.stringify({ text });
   try {
-    const resp = await fetch(`/api/peers/${hostId}/message`, {
+    const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body,
     });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -10697,7 +10724,11 @@ async function sendPeerMessage(hostId) {
       }
     } else {
       if (statusEl) {
-        statusEl.textContent = `Sent (id ${result.message_id || '?'}).`;
+        const id = kind === 'task'
+          ? (result.task_id || '?')
+          : (result.message_id || '?');
+        const verb = kind === 'task' ? 'Task started' : 'Sent';
+        statusEl.textContent = `${verb} (id ${id}).`;
         statusEl.className = 'daemon-msg-status ok';
       }
       input.value = '';
@@ -10708,9 +10739,12 @@ async function sendPeerMessage(hostId) {
       statusEl.className = 'daemon-msg-status error';
     }
   } finally {
-    sendBtn.disabled = false;
+    buttons.forEach(b => b.disabled = false);
   }
 }
+
+function sendPeerMessage(hostId) { return submitPeerInput(hostId, 'message'); }
+function sendPeerTask(hostId)    { return submitPeerInput(hostId, 'task'); }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
