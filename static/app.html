@@ -547,6 +547,62 @@ html, body {
 }
 .daemon-msg-status.error { color: var(--red); }
 .daemon-msg-status.ok { color: var(--green); }
+/* Per-peer approvals — surfaced from the peer's secondary event
+   stream when an `approval_required` event arrives. Each row gets
+   approve / deny / skip buttons that POST to /api/peers/{id}/approval. */
+.daemon-approvals-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid var(--surface1);
+  padding-top: 6px;
+}
+.daemon-approvals-empty {
+  display: none; /* present so the section can sit empty when needed */
+}
+.daemon-approval-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.daemon-approval-id {
+  color: var(--overlay1);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  flex-shrink: 0;
+}
+.daemon-approval-cmd {
+  flex: 1;
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  background: var(--base);
+  padding: 2px 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.daemon-approval-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.daemon-approval-actions button {
+  padding: 2px 8px;
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--subtext0);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+.daemon-approval-actions button.approve { color: var(--green); border-color: var(--green); }
+.daemon-approval-actions button.deny    { color: var(--red);   border-color: var(--red); }
+.daemon-approval-actions button.skip    { color: var(--yellow); border-color: var(--yellow); }
+.daemon-approval-actions button:hover   { background: var(--surface1); }
+.daemon-approval-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
 .daemon-add-row {
   display: flex;
   gap: 8px;
@@ -4329,6 +4385,13 @@ let daemons = [];
 // expand state needs to survive those re-renders — otherwise the panel
 // collapses every time a peer's status updates, which is broken UX.
 const expandedDaemons = new Set();
+
+// Per-peer pending approvals: host_id → Map<approval_id_str, {command, category}>.
+// Populated when a secondary peer emits an `approval_required` event;
+// drained when the user resolves the approval (POST /api/peers/{id}/
+// approval) or when the peer emits `approval_resolved`. Survives
+// dashboard re-renders the same way `expandedDaemons` does.
+const peerPendingApprovals = new Map();
 
 // (Storage key constants are declared earlier, above activeHostFilter,
 // to avoid a temporal-dead-zone reference error.)
@@ -10150,8 +10213,10 @@ function removeDaemonById(id) {
     app.remove_secondary_host(id);
   }
   // Drop the expanded-state record so it doesn't get reapplied
-  // against a row that no longer exists.
+  // against a row that no longer exists. Same for any pending
+  // approvals — once the peer is gone there's nothing to resolve.
   expandedDaemons.delete(id);
+  peerPendingApprovals.delete(id);
   renderDaemonsList();
 }
 
@@ -10278,6 +10343,11 @@ function renderDaemonsList() {
   // event triggered re-render). Without this the panel collapses on
   // every state change, which would feel broken.
   expandedDaemons.forEach(hostId => applyDaemonExpandedState(hostId, true));
+
+  // Reapply pending-approval rendering for the same reason. The
+  // controls panel's HTML was just regenerated, so any approvals
+  // section we previously inserted is gone — rebuild it.
+  peerPendingApprovals.forEach((_, hostId) => renderPeerApprovals(hostId));
 
   // Toggle host-badge visibility in the Activity tab. Single-host
   // setups stay visually clean; multi-host setups see the badges.
@@ -10487,6 +10557,105 @@ function applyDaemonExpandedState(hostId, expanded) {
 // and the server-side parser splits on the literal `:` to recover
 // the kind prefix; URL-encoding `:` as `%3A` would break the lookup
 // because the registry keys on the un-encoded id.
+// ── Per-peer pending approvals ──
+//
+// Approval requests arrive over each peer's secondary WebSocket as
+// `approval_required` events. They're surfaced inline in the peer's
+// controls panel with approve / deny / skip buttons that POST to
+// /api/peers/{id}/approval. Buttons map to the four-way ApprovalDecision
+// vocabulary (accept / accept_for_session / decline / cancel) — the
+// dashboard surfaces three of them today; AcceptForSession can be added
+// when there's a use case. Wire-level encoding is in
+// peer::transport::intendant (ResolveApproval → ControlMsg::Approve|Deny|Skip).
+
+function addPendingApproval(hostId, approvalId, command, category) {
+  let m = peerPendingApprovals.get(hostId);
+  if (!m) { m = new Map(); peerPendingApprovals.set(hostId, m); }
+  m.set(String(approvalId), { command: command || '', category: category || '' });
+  renderPeerApprovals(hostId);
+}
+
+function removePendingApproval(hostId, approvalId) {
+  const m = peerPendingApprovals.get(hostId);
+  if (!m) return;
+  m.delete(String(approvalId));
+  if (m.size === 0) peerPendingApprovals.delete(hostId);
+  renderPeerApprovals(hostId);
+}
+
+// Render the approvals section inside a peer's controls panel. Called
+// when an approval is added/removed and at the tail of renderDaemonsList
+// so the section survives the full row re-renders that happen on every
+// push event.
+function renderPeerApprovals(hostId) {
+  const panel = document.getElementById(`daemon-controls-${hostId}`);
+  if (!panel) return;
+  let section = panel.querySelector('.daemon-approvals-section');
+  const pending = peerPendingApprovals.get(hostId);
+  if (!pending || pending.size === 0) {
+    if (section) section.remove();
+    return;
+  }
+  if (!section) {
+    section = document.createElement('div');
+    section.className = 'daemon-approvals-section';
+    panel.insertBefore(section, panel.firstChild);
+  }
+  const rows = [];
+  for (const [approvalId, { command }] of pending.entries()) {
+    rows.push(`
+      <div class="daemon-approval-row" data-approval-id="${escapeHtml(approvalId)}">
+        <span class="daemon-approval-id" title="approval id">#${escapeHtml(approvalId)}</span>
+        <span class="daemon-approval-cmd" title="${escapeHtml(command)}">${escapeHtml(command)}</span>
+        <div class="daemon-approval-actions">
+          <button class="approve" data-host-id="${escapeHtml(hostId)}" data-approval-id="${escapeHtml(approvalId)}" data-decision="accept">Approve</button>
+          <button class="deny"    data-host-id="${escapeHtml(hostId)}" data-approval-id="${escapeHtml(approvalId)}" data-decision="decline">Deny</button>
+          <button class="skip"    data-host-id="${escapeHtml(hostId)}" data-approval-id="${escapeHtml(approvalId)}" data-decision="cancel">Skip</button>
+        </div>
+      </div>
+    `);
+  }
+  section.innerHTML = rows.join('');
+  // Wire approve/deny/skip buttons. Event delegation would also work,
+  // but binding each row keeps the data-flow obvious and matches the
+  // pattern used by the message-send wiring above.
+  section.querySelectorAll('button[data-decision]').forEach(btn => {
+    btn.addEventListener('click', () =>
+      resolvePeerApproval(btn.dataset.hostId, btn.dataset.approvalId, btn.dataset.decision)
+    );
+  });
+}
+
+async function resolvePeerApproval(hostId, approvalId, decision) {
+  if (!hostId || !approvalId || !decision) return;
+  // Disable all buttons in the row to prevent double-click while
+  // the POST is in flight. Re-enable on failure so the user can retry.
+  const row = document.querySelector(
+    `#daemon-controls-${hostId} .daemon-approval-row[data-approval-id="${CSS.escape(approvalId)}"]`
+  );
+  if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    const resp = await fetch(`/api/peers/${hostId}/approval`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: approvalId, decision }),
+    });
+    if (resp.ok) {
+      // Optimistic removal. The peer will eventually emit
+      // `approval_resolved` over the secondary stream which would
+      // also remove it; doing it here keeps the UI snappy.
+      removePendingApproval(hostId, approvalId);
+    } else {
+      const result = await resp.json().catch(() => ({}));
+      console.error(`approval failed for ${hostId}#${approvalId}: ${result.error || resp.status}`);
+      if (row) row.querySelectorAll('button').forEach(b => b.disabled = false);
+    }
+  } catch (e) {
+    console.error(`approval error for ${hostId}#${approvalId}: ${e.message}`);
+    if (row) row.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
+}
+
 async function sendPeerMessage(hostId) {
   if (!hostId) return;
   const input = document.querySelector(
@@ -10688,6 +10857,18 @@ function handleSecondaryState(hostId, connected) {
 // state and are deliberately dropped.
 function handleSecondaryEvent(hostId, msg) {
   if (!app || !app.handle_secondary_message) return;
+
+  // Inspect the raw event before WASM processing for fields that the
+  // UiCommand layer flattens away. `approval_resolved` carries the
+  // resolved approval id, but the UiCommand it produces is the
+  // payload-less HideApproval — which can't tell us *which* approval
+  // was resolved. Drop the matching pending entry here so an external
+  // resolution (peer auto-approved, sibling dashboard resolved it)
+  // doesn't leave a stale row in our pending list.
+  if (msg && typeof msg === 'object' && msg.event === 'approval_resolved') {
+    if (msg.id != null) removePendingApproval(hostId, msg.id);
+  }
+
   let cmds = app.handle_secondary_message(hostId, msg);
   if (!cmds || !Array.isArray(cmds)) return;
   for (const c of cmds) {
@@ -10710,12 +10891,24 @@ function handleSecondaryEvent(hostId, msg) {
         hostStatsCache.set(hostId, c);
         if (activeStatsHost === hostId) renderUsageTab(c);
         break;
+      case 'show_approval':
+        // Surface the approval in this peer's controls panel. The
+        // global approval surface (`hidePanel('approval-panel')` etc)
+        // is reserved for the local agent's approvals — secondaries
+        // route to the per-peer panel instead.
+        addPendingApproval(hostId, c.id, c.command, c.category);
+        break;
+      case 'hide_approval':
+        // Payload-less. Don't drain the entire pending list — the
+        // raw `approval_resolved` tap above (or the optimistic POST
+        // path) handles individual removals. Suppressed here.
+        break;
       case 'clear_logs':
         // Explicitly ignored: clearing the whole stream when a
         // secondary resets would delete primary history too.
         break;
       default:
-        // Everything else (status_bar, approvals, displays, recordings,
+        // Everything else (status_bar, displays, recordings,
         // phase, badges, terminal data) is intentionally dropped —
         // those tabs are primary-scoped in phase 1.
         break;
