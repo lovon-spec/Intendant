@@ -1469,27 +1469,6 @@ impl AppState {
                     "fs",
                 ));
             }
-            "conversation_rolled_back" => {
-                let round_id = msg["round_id"].as_u64().unwrap_or(0);
-                let turns_removed = msg["turns_removed"].as_u64().unwrap_or(0);
-                let backend = msg["backend"].as_str().unwrap_or("?");
-                let method = msg["method"].as_str().unwrap_or("?");
-                // Don't trigger HistoryChanged here — the file-side
-                // rollback (which usually runs alongside) already
-                // fires `rolled_back`, and a second refetch would be
-                // redundant. Conversation-only rollbacks are rare and
-                // don't change the timeline.
-                cmds.extend(self.add_log(
-                    "info",
-                    &format!(
-                        "Conversation rolled back to round {} via {} ({} turns removed, backend: {})",
-                        round_id, method, turns_removed, backend
-                    ),
-                    None,
-                    "agent",
-                ));
-            }
-
             // ---- Peer registry push events ----
             //
             // Forwarded as opaque JSON: the WASM layer doesn't interpret
@@ -2797,11 +2776,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_event_conversation_rolled_back_logs_but_does_not_refetch() {
+    fn handle_event_conversation_rolled_back_does_not_refetch() {
         let mut s = AppState::new();
         let msg = json!({
             "event": "conversation_rolled_back",
-            "round_id": 7,
+            "round_id": "round-7",
             "turns_removed": 4,
             "backend": "native",
             "method": "truncated",
@@ -2809,15 +2788,6 @@ mod tests {
         let cmds = s.handle_message(&msg);
         // No HistoryChanged — the file timeline isn't affected.
         assert!(!cmds.iter().any(|c| matches!(c, UiCommand::HistoryChanged)));
-        // A log entry mentions the round + backend + method.
-        assert!(cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::AddLogEntry { content, .. }
-                if content.contains("round 7")
-                    && content.contains("truncated")
-                    && content.contains("native")
-                    && content.contains("4 turns")
-        )));
     }
 
     #[test]
