@@ -135,6 +135,44 @@ pub enum UiCommand {
     PeerStateChanged {
         peer: serde_json::Value,
     },
+    /// A log line emitted by a federated peer's PeerEvent stream.
+    /// Same shape as AddLogEntry but `host_id`-tagged so JS routes it
+    /// to the per-peer log surface instead of the local stream.
+    /// Replaces the secondary AppState's per-host `add_log_entry +
+    /// JS-side host_id mutation` pattern with a typed first-class field.
+    PeerLog {
+        host_id: String,
+        ts: String,
+        level: String,
+        source: String,
+        content: String,
+    },
+    /// A peer reported a usage snapshot. The `snapshot` is the
+    /// PeerEvent::Usage payload JSON unchanged — JS treats it the
+    /// same shape it gets from /api/peers usage queries (token counts,
+    /// cost, optional per-model breakdown). Cached + conditionally
+    /// rendered into the Stats host picker.
+    PeerUsage {
+        host_id: String,
+        snapshot: serde_json::Value,
+    },
+    /// A peer is asking for approval. JS adds it to the per-peer
+    /// pending-approvals list rendered in the Daemons row's controls
+    /// panel. Replaces slice 4's secondary `show_approval` interception.
+    PeerApprovalRequested {
+        host_id: String,
+        id: String,
+        command: String,
+        category: String,
+    },
+    /// A peer's approval got resolved (locally by us via
+    /// /api/peers/{id}/approval, by the peer's own auto-approval, or
+    /// by another dashboard session). JS drops the matching pending
+    /// entry. Replaces slice 4's raw `approval_resolved` tap.
+    PeerApprovalResolved {
+        host_id: String,
+        id: String,
+    },
     /// A Codex thread action (/compact, /fork, /undo, /review, /init,
     /// /memory-reset, /new) finished. `success` + `message` drive a
     /// dashboard toast and the Activity log entry.
@@ -1333,6 +1371,22 @@ impl AppState {
                 });
             }
 
+            // ---- Per-peer event stream (phase B) ----
+            //
+            // Wraps a peer's PeerEvent for per-host rendering. The
+            // WASM layer can't `use crate::peer::PeerEvent` from
+            // intendant's binary (cross-crate boundary), so dispatch
+            // happens on the inner JSON's `event` discriminator. Each
+            // emitted UiCommand carries the peer's id as a typed
+            // first-class field (vs. the legacy `c.host_id = hostId`
+            // mutation hack the secondary path uses) so JS routes
+            // straightforwardly per-host.
+            "peer_event_forwarded" => {
+                let host_id = msg["peer_id"].as_str().unwrap_or("").to_string();
+                let payload = &msg["payload"];
+                cmds.extend(render_peer_event(&host_id, payload));
+            }
+
             _ => {
                 // Unknown events at debug level
                 let text = format!("[{}] {}", event, serde_json::to_string(msg).unwrap_or_default());
@@ -1547,6 +1601,253 @@ impl AppState {
 // It is re-exported here so the existing call sites below don't need to
 // qualify `presence_core::` at every use.
 pub use presence_core::{format_agent_output, FormattedOutput};
+
+/// Translate one peer-emitted [`crate::peer::PeerEvent`] (in JSON form
+/// — WASM can't import the type across the crate boundary) into zero
+/// or more [`UiCommand`]s tagged with the originating peer's id.
+///
+/// Most variants render as host-tagged log entries via `UiCommand::PeerLog`
+/// — the lean PeerEvent vocabulary doesn't carry the source-level richness
+/// AppEvent does, so log entries pull `level` and `source` either from
+/// the event's own fields (Log) or from synthetic mappings (ActivityKind
+/// → source, MessageRole → level, etc.). The four variants that get
+/// typed UiCommands of their own (`PeerUsage`, `PeerApprovalRequested`,
+/// `PeerApprovalResolved`) feed dedicated dashboard surfaces (Stats
+/// host picker, per-peer pending approvals).
+///
+/// Variants intentionally dropped:
+/// - `connected`/`disconnected`/`status_changed` are already covered by
+///   the registry's `PeerAdded`/`PeerRemoved`/`PeerStateChanged` push
+///   events — surfacing them again here would duplicate.
+/// - `task_update` has no per-peer task list yet to render into.
+pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCommand> {
+    let event = payload["event"].as_str().unwrap_or("");
+    let now = current_time_str();
+    let host = host_id.to_string();
+    match event {
+        // Connection lifecycle covered by PeerStateChanged.
+        "connected" | "disconnected" | "status_changed" => vec![],
+
+        "log" => {
+            let ts = payload["ts"].as_str().unwrap_or(&now).to_string();
+            let level = payload["level"].as_str().unwrap_or("info").to_string();
+            let source = payload["source"].as_str().unwrap_or("peer").to_string();
+            let content = payload["message"].as_str().unwrap_or("").to_string();
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts,
+                level,
+                source,
+                content,
+            }]
+        }
+
+        "approval_requested" => {
+            let req = &payload["request"];
+            let id = req["request_id"].as_str().unwrap_or("").to_string();
+            let command = req["preview"].as_str().unwrap_or("").to_string();
+            let category = req["category"].as_str().unwrap_or("").to_string();
+            vec![UiCommand::PeerApprovalRequested {
+                host_id: host,
+                id,
+                command,
+                category,
+            }]
+        }
+
+        "approval_resolved" => {
+            let id = payload["request_id"].as_str().unwrap_or("").to_string();
+            vec![UiCommand::PeerApprovalResolved { host_id: host, id }]
+        }
+
+        "usage" => {
+            let snapshot = payload["snapshot"].clone();
+            vec![UiCommand::PeerUsage {
+                host_id: host,
+                snapshot,
+            }]
+        }
+
+        "activity_started" => {
+            // Synthetic source from kind so the per-peer log threads
+            // multi-turn activities under a meaningful column.
+            let kind = payload["kind"].as_str().unwrap_or("activity");
+            let label = payload["label"].as_str().unwrap_or("").to_string();
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts: now,
+                level: "info".to_string(),
+                source: peer_activity_source(kind).to_string(),
+                content: label,
+            }]
+        }
+
+        "activity_progress" => {
+            let text = payload["text"].as_str().unwrap_or("");
+            if text.is_empty() {
+                // Heartbeat per PeerEvent::ActivityProgress docs — drop.
+                return vec![];
+            }
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts: now,
+                level: "info".to_string(),
+                source: "activity".to_string(),
+                content: text.to_string(),
+            }]
+        }
+
+        "activity_completed" => {
+            // Render the outcome compactly. Failed/Cancelled get a
+            // warn level so they stand out in the per-peer log.
+            let outcome = &payload["outcome"];
+            let status = outcome["status"].as_str().unwrap_or("");
+            let (level, content) = match status {
+                "success" => ("info", "Activity completed".to_string()),
+                "failed" => (
+                    "warn",
+                    format!(
+                        "Activity failed: {}",
+                        outcome["message"].as_str().unwrap_or("(no message)")
+                    ),
+                ),
+                "cancelled" => ("warn", "Activity cancelled".to_string()),
+                "suspended" => (
+                    "warn",
+                    format!(
+                        "Activity suspended: {}",
+                        outcome["reason"].as_str().unwrap_or("(no reason)")
+                    ),
+                ),
+                _ => ("info", format!("Activity ended ({status})")),
+            };
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts: now,
+                level: level.to_string(),
+                source: "activity".to_string(),
+                content,
+            }]
+        }
+
+        "message" => {
+            // Surface text/reasoning content as log entries; non-text
+            // content (image, parts) collapses to a placeholder for
+            // now since the per-peer log can't render them inline.
+            let role = payload["role"].as_str().unwrap_or("assistant");
+            let content_obj = &payload["content"];
+            let ctype = content_obj["type"].as_str().unwrap_or("");
+            let text = match ctype {
+                "text" | "reasoning" => content_obj["text"].as_str().unwrap_or("").to_string(),
+                "image" => "(image attachment)".to_string(),
+                "parts" => "(multi-part content)".to_string(),
+                _ => return vec![],
+            };
+            if text.is_empty() {
+                return vec![];
+            }
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts: now,
+                level: peer_message_level(role).to_string(),
+                source: peer_message_source(role).to_string(),
+                content: text,
+            }]
+        }
+
+        "capability_engaged" | "capability_released" => {
+            let cap = payload["capability"].clone();
+            let cap_label = cap["kind"].as_str().unwrap_or("capability").to_string();
+            let verb = if event == "capability_engaged" {
+                "engaged"
+            } else {
+                "released"
+            };
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts: now,
+                level: "detail".to_string(),
+                source: "capability".to_string(),
+                content: format!("{cap_label} {verb}"),
+            }]
+        }
+
+        "session_started" => {
+            let session = &payload["session"];
+            let label = session["label"].as_str().unwrap_or("");
+            let session_id = session["session_id"].as_str().unwrap_or("");
+            let content = if label.is_empty() {
+                format!("Session started: {session_id}")
+            } else {
+                format!("Session started: {label} ({session_id})")
+            };
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts: now,
+                level: "info".to_string(),
+                source: "session".to_string(),
+                content,
+            }]
+        }
+
+        "session_ended" => {
+            let session_id = payload["session_id"].as_str().unwrap_or("");
+            let reason = payload["reason"].as_str().unwrap_or("");
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts: now,
+                level: "info".to_string(),
+                source: "session".to_string(),
+                content: format!("Session ended ({reason}): {session_id}"),
+            }]
+        }
+
+        // task_update: not surfaced per-peer yet (no task list UI).
+        "task_update" => vec![],
+
+        // Unknown / forward-compat: render as a debug log so the user
+        // can see something arrived rather than dropping silently.
+        other => vec![UiCommand::PeerLog {
+            host_id: host,
+            ts: now,
+            level: "debug".to_string(),
+            source: "peer".to_string(),
+            content: format!("[{other}] {}", payload),
+        }],
+    }
+}
+
+/// Map a `PeerEvent::ActivityKind` wire string to a per-peer log
+/// source label so the activity column groups consistently in the UI.
+fn peer_activity_source(kind: &str) -> &'static str {
+    match kind {
+        "model_turn" => "model",
+        "tool_call" => "tool",
+        "sub_agent" => "sub-agent",
+        "delegated_task" => "task",
+        _ => "activity",
+    }
+}
+
+fn peer_message_level(role: &str) -> &'static str {
+    match role {
+        "assistant" => "model",
+        "user" => "info",
+        "system" => "info",
+        "tool" => "info",
+        _ => "info",
+    }
+}
+
+fn peer_message_source(role: &str) -> &'static str {
+    match role {
+        "assistant" => "model",
+        "user" => "user",
+        "system" => "system",
+        "tool" => "tool",
+        _ => "peer",
+    }
+}
 
 /// Format a number with commas (e.g. 1234567 → "1,234,567").
 fn format_number(n: u64) -> String {
@@ -2594,5 +2895,188 @@ mod tests {
             c,
             UiCommand::SetPhase { phase } if phase == "interrupting"
         )));
+    }
+
+    // ── render_peer_event tests ────────────────────────────────────
+
+    /// `peer_event_forwarded` carrying a `log` PeerEvent renders as a
+    /// host-tagged PeerLog with level/source/content pulled straight
+    /// from the inner payload.
+    #[test]
+    fn peer_event_forwarded_log_renders_host_tagged_peer_log() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "log",
+                "level": "info",
+                "source": "agent",
+                "message": "hello from alpha",
+                "ts": "2026-04-18T12:00:00Z",
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        let log = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerLog {
+                host_id,
+                level,
+                source,
+                content,
+                ts,
+            } => Some((host_id, level, source, content, ts)),
+            _ => None,
+        });
+        let (host_id, level, source, content, ts) = log.expect("PeerLog emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!(level, "info");
+        assert_eq!(source, "agent");
+        assert_eq!(content, "hello from alpha");
+        assert_eq!(ts, "2026-04-18T12:00:00Z");
+    }
+
+    /// `approval_requested` renders as a PeerApprovalRequested
+    /// targeting the originating peer's id, with the request
+    /// preview/category surfaced for the dashboard's per-peer
+    /// pending-approvals list.
+    #[test]
+    fn peer_event_forwarded_approval_requested_targets_peer() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:beta",
+            "payload": {
+                "event": "approval_requested",
+                "request": {
+                    "request_id": "42",
+                    "category": "command",
+                    "preview": "rm -rf /tmp/foo",
+                    "auto_resolvable": false,
+                },
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        let req = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerApprovalRequested {
+                host_id,
+                id,
+                command,
+                category,
+            } => Some((host_id, id, command, category)),
+            _ => None,
+        });
+        let (host_id, id, command, category) = req.expect("PeerApprovalRequested emitted");
+        assert_eq!(host_id, "intendant:beta");
+        assert_eq!(id, "42");
+        assert_eq!(command, "rm -rf /tmp/foo");
+        assert_eq!(category, "command");
+    }
+
+    /// `approval_resolved` renders as a PeerApprovalResolved that JS
+    /// uses to drop the matching pending entry from its list.
+    #[test]
+    fn peer_event_forwarded_approval_resolved_targets_peer() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:beta",
+            "payload": {
+                "event": "approval_resolved",
+                "request_id": "42",
+                "decision": "accept",
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::PeerApprovalResolved { host_id, id }
+                if host_id == "intendant:beta" && id == "42"
+        )));
+    }
+
+    /// `usage` renders as a PeerUsage carrying the snapshot JSON
+    /// untouched — the dashboard caches it under the peer's id and
+    /// re-renders the Stats panel when that peer is selected.
+    #[test]
+    fn peer_event_forwarded_usage_carries_snapshot() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "usage",
+                "snapshot": {
+                    "tokens_in": 1234,
+                    "tokens_out": 567,
+                    "tokens_cached": 100,
+                    "cost_usd": 0.04,
+                },
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        let usage = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerUsage { host_id, snapshot } => Some((host_id, snapshot)),
+            _ => None,
+        });
+        let (host_id, snapshot) = usage.expect("PeerUsage emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!(snapshot["tokens_in"], 1234);
+        assert_eq!(snapshot["tokens_out"], 567);
+    }
+
+    /// `connected` / `disconnected` / `status_changed` PeerEvents are
+    /// dropped because the registry's PeerStateChanged push event
+    /// already covers them — surfacing again would duplicate.
+    #[test]
+    fn peer_event_forwarded_connection_events_are_dropped() {
+        let mut s = AppState::new();
+        for inner in [
+            json!({"event": "connected", "card": {}}),
+            json!({"event": "disconnected", "reason": "test"}),
+            json!({"event": "status_changed", "status": "working"}),
+        ] {
+            let msg = json!({
+                "event": "peer_event_forwarded",
+                "peer_id": "intendant:x",
+                "payload": inner,
+            });
+            let cmds = s.handle_message(&msg);
+            assert!(
+                !cmds.iter().any(|c| matches!(c,
+                    UiCommand::PeerLog { .. }
+                    | UiCommand::PeerApprovalRequested { .. }
+                    | UiCommand::PeerApprovalResolved { .. }
+                    | UiCommand::PeerUsage { .. }
+                )),
+                "expected no peer-* UiCommand for connection lifecycle event"
+            );
+        }
+    }
+
+    /// `activity_completed` with a failure outcome renders as a warn-
+    /// level log so it stands out in the per-peer activity stream.
+    #[test]
+    fn peer_event_forwarded_activity_failure_warns() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "activity_completed",
+                "id": "act-1",
+                "outcome": {"status": "failed", "message": "boom"},
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        let log = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerLog { host_id, level, content, .. } => {
+                Some((host_id, level, content))
+            }
+            _ => None,
+        });
+        let (host_id, level, content) = log.expect("PeerLog emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!(level, "warn");
+        assert!(content.contains("boom"), "expected boom in {content}");
     }
 }

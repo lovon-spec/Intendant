@@ -5346,6 +5346,38 @@ function processCommands(cmds) {
       case 'peer_added': upsertDaemonFromSnapshot(c.peer); break;
       case 'peer_state_changed': upsertDaemonFromSnapshot(c.peer); break;
       case 'peer_removed': removeDaemonById(c.id); break;
+      // Per-peer event stream (phase B of the secondary migration).
+      // Each command carries `host_id` as a typed field so we route
+      // straight to the per-peer surfaces without the legacy
+      // `c.host_id = hostId` mutation hack from the secondary path.
+      case 'peer_log':
+        renderLogEntry({
+          cmd: 'add_log_entry',
+          host_id: c.host_id,
+          ts: c.ts,
+          level: c.level,
+          source: c.source,
+          content: c.content,
+        });
+        break;
+      case 'peer_usage':
+        // The snapshot is a UsageSnapshot from PeerEvent::Usage —
+        // not in the same shape as UiCommand::UpdateUsage, so we
+        // can't drop it into hostStatsCache directly. For now,
+        // cache the raw snapshot under the host id; a future Stats
+        // tab pass will consume the lean shape directly.
+        hostStatsCache.set(c.host_id, { _peerSnapshot: c.snapshot });
+        if (activeStatsHost === c.host_id) {
+          // No live render yet — Stats tab still expects the legacy
+          // UpdateUsage shape. Tracked as a follow-up.
+        }
+        break;
+      case 'peer_approval_requested':
+        addPendingApproval(c.host_id, c.id, c.command, c.category);
+        break;
+      case 'peer_approval_resolved':
+        removePendingApproval(c.host_id, c.id);
+        break;
     }
   }
 }
@@ -10891,18 +10923,6 @@ function handleSecondaryState(hostId, connected) {
 // state and are deliberately dropped.
 function handleSecondaryEvent(hostId, msg) {
   if (!app || !app.handle_secondary_message) return;
-
-  // Inspect the raw event before WASM processing for fields that the
-  // UiCommand layer flattens away. `approval_resolved` carries the
-  // resolved approval id, but the UiCommand it produces is the
-  // payload-less HideApproval — which can't tell us *which* approval
-  // was resolved. Drop the matching pending entry here so an external
-  // resolution (peer auto-approved, sibling dashboard resolved it)
-  // doesn't leave a stale row in our pending list.
-  if (msg && typeof msg === 'object' && msg.event === 'approval_resolved') {
-    if (msg.id != null) removePendingApproval(hostId, msg.id);
-  }
-
   let cmds = app.handle_secondary_message(hostId, msg);
   if (!cmds || !Array.isArray(cmds)) return;
   for (const c of cmds) {
@@ -10911,6 +10931,12 @@ function handleSecondaryEvent(hostId, msg) {
       case 'add_log_entry':
         // Tag with the source host so the Activity badge and filter
         // see it as belonging to the secondary.
+        //
+        // TODO (phase B cleanup): the new push path emits PeerLog
+        // commands that already carry host_id and produce equivalent
+        // log entries. Once we stop opening WASM secondary connections,
+        // this case (and the entire handleSecondaryEvent function) can
+        // go away.
         c.host_id = hostId;
         renderLogEntry(c);
         break;
@@ -10925,18 +10951,12 @@ function handleSecondaryEvent(hostId, msg) {
         hostStatsCache.set(hostId, c);
         if (activeStatsHost === hostId) renderUsageTab(c);
         break;
-      case 'show_approval':
-        // Surface the approval in this peer's controls panel. The
-        // global approval surface (`hidePanel('approval-panel')` etc)
-        // is reserved for the local agent's approvals — secondaries
-        // route to the per-peer panel instead.
-        addPendingApproval(hostId, c.id, c.command, c.category);
-        break;
-      case 'hide_approval':
-        // Payload-less. Don't drain the entire pending list — the
-        // raw `approval_resolved` tap above (or the optimistic POST
-        // path) handles individual removals. Suppressed here.
-        break;
+      // show_approval / hide_approval / approval_resolved (raw):
+      // intentionally dropped here. Per-peer approvals now arrive
+      // through the new push path as PeerApprovalRequested /
+      // PeerApprovalResolved UiCommands handled in processCommands.
+      // Keeping the secondary path emitting them too would
+      // double-render.
       case 'clear_logs':
         // Explicitly ignored: clearing the whole stream when a
         // secondary resets would delete primary history too.

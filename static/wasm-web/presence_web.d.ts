@@ -427,9 +427,9 @@ export interface InitOutput {
     readonly wasmpresence_phase: (a: number) => [number, number];
     readonly wasmpresence_set_state: (a: number, b: any) => void;
     readonly wasmpresence_update_from_event: (a: number, b: any) => any;
-    readonly wasm_bindgen__closure__destroy__h9201fdb305dc6b9a: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h920351fd893a14bb: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hb9e56f235e147e64: (a: number, b: number) => void;
+    readonly wasm_bindgen__closure__destroy__h4473cb2a2a923a88: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h5670f985d4d92ec7: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h5974ec181d3c6728: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
