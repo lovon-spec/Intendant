@@ -4420,10 +4420,17 @@ pub fn spawn_web_gateway(
                         // `/api/peers` directly would walk into the
                         // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
                         // for path segments.
-                        let path = request_line
+                        let path_token = request_line
                             .split_whitespace()
                             .nth(1)
                             .unwrap_or("");
+                        // Split path from query string. `/api/peers/eligible
+                        // ?capability=display` needs the query stripped before
+                        // we extract subpath segments.
+                        let (path, query_str) = match path_token.find('?') {
+                            Some(i) => (&path_token[..i], &path_token[i + 1..]),
+                            None => (path_token, ""),
+                        };
                         let subpath = path
                             .strip_prefix("/api/peers")
                             .unwrap_or("")
@@ -4460,6 +4467,20 @@ pub fn spawn_web_gateway(
                                 } else {
                                     peers_remove(registry, &body_text).await
                                 }
+                            }
+                            Some(registry)
+                                if segments == ["eligible"]
+                                    && request_line.starts_with("GET") =>
+                            {
+                                // GET /api/peers/eligible?capability=display
+                                // — list peers that satisfy all listed
+                                // capabilities. The `eligible` segment is
+                                // a reserved sub-path on /api/peers; an
+                                // actual peer with that bare id would be
+                                // shadowed here, but PeerId values always
+                                // carry a `<kind>:` prefix so that's not
+                                // a real collision.
+                                peers_eligible(registry, query_str)
                             }
                             Some(registry)
                                 if segments.len() == 2
@@ -4519,6 +4540,60 @@ pub fn spawn_web_gateway(
                              Cache-Control: no-cache\r\n\
                              Access-Control-Allow-Origin: *\r\n\
                              Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+                             Access-Control-Allow-Headers: Content-Type\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {body}",
+                            body.len(),
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains(" /api/coordinator/route") {
+                        // POST /api/coordinator/route — capability-based
+                        // task routing through the Coordinator primitive.
+                        // Body shape: {"required_capabilities": ["display",
+                        // ...], "task": {"instructions": "...", "context":
+                        // ..., "client_correlation_id": "..."}}.
+                        // Response: {"peer_id": "...", "task_id": "..."}
+                        // on success, structured error otherwise.
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+                        let (status, body) = match peer_registry.as_ref() {
+                            None => (
+                                503,
+                                serde_json::json!({
+                                    "error": "peer registry not configured"
+                                })
+                                .to_string(),
+                            ),
+                            Some(_) if !request_line.starts_with("POST") => (
+                                405,
+                                serde_json::json!({
+                                    "error": "method not allowed"
+                                })
+                                .to_string(),
+                            ),
+                            Some(registry) => {
+                                let body_text =
+                                    read_request_body(&mut stream, &header_text).await;
+                                coordinator_route(registry, &body_text).await
+                            }
+                        };
+                        let reason = match status {
+                            200 => "OK",
+                            400 => "Bad Request",
+                            404 => "Not Found",
+                            405 => "Method Not Allowed",
+                            500 => "Internal Server Error",
+                            502 => "Bad Gateway",
+                            503 => "Service Unavailable",
+                            _ => "Error",
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Access-Control-Allow-Methods: POST, OPTIONS\r\n\
                              Access-Control-Allow-Headers: Content-Type\r\n\
                              Connection: close\r\n\
                              \r\n\
@@ -5061,6 +5136,192 @@ async fn peers_resolve_approval(
     match handle.resolve_approval(&req.request_id, req.decision).await {
         Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
         Err(e) => peer_error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator endpoints — capability-based discovery + delegation
+// ---------------------------------------------------------------------------
+
+/// Parse `?capability=display&capability=custom:foo` into a typed
+/// `Vec<Capability>` plus a list of unknown strings (for diagnostics).
+/// Empty input returns `(vec![], vec![])` — empty-required-capabilities
+/// matches every peer, which the handler rejects upstream.
+fn parse_capability_query(query: &str) -> (Vec<crate::peer::Capability>, Vec<String>) {
+    let mut caps = Vec::new();
+    let mut unknown = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        if k != "capability" {
+            continue;
+        }
+        match crate::peer::Capability::from_query_string(v) {
+            Some(cap) => caps.push(cap),
+            None => unknown.push(v.to_string()),
+        }
+    }
+    (caps, unknown)
+}
+
+/// Handle `GET /api/peers/eligible?capability=...`. Returns the
+/// connected peers whose Agent Card advertises every requested
+/// capability. Each entry is a [`crate::peer::PeerSnapshot`] —
+/// same shape as `/api/peers` so the dashboard can reuse rendering.
+fn peers_eligible(
+    registry: &crate::peer::PeerRegistry,
+    query_str: &str,
+) -> (u16, String) {
+    let (caps, unknown) = parse_capability_query(query_str);
+    if !unknown.is_empty() {
+        return (
+            400,
+            serde_json::json!({
+                "error": format!(
+                    "unrecognized capability values: {}",
+                    unknown.join(", ")
+                ),
+                "hint": "use kebab-case kind names (display, computer-use, ...) or `custom:<name>`"
+            })
+            .to_string(),
+        );
+    }
+    if caps.is_empty() {
+        return (
+            400,
+            serde_json::json!({
+                "error": "at least one ?capability=... is required"
+            })
+            .to_string(),
+        );
+    }
+    let coordinator = crate::peer::Coordinator::new(registry.clone());
+    let peers: Vec<crate::peer::PeerSnapshot> = coordinator
+        .eligible_peers(&caps)
+        .iter()
+        .map(|h| h.snapshot())
+        .collect();
+    let body = serde_json::json!({ "peers": peers }).to_string();
+    (200, body)
+}
+
+/// JSON body shape for `POST /api/coordinator/route`.
+#[derive(Deserialize)]
+struct CoordinatorRouteRequest {
+    /// Capabilities the executing peer must advertise. Each string is
+    /// parsed via `Capability::from_query_string` for consistency with
+    /// the eligible endpoint's URL query (kebab-case + `custom:<name>`).
+    required_capabilities: Vec<String>,
+    /// Wire-level task payload routed to the winning peer.
+    task: CoordinatorRouteTask,
+}
+
+#[derive(Deserialize)]
+struct CoordinatorRouteTask {
+    instructions: String,
+    #[serde(default)]
+    context: serde_json::Value,
+    #[serde(default)]
+    client_correlation_id: Option<String>,
+}
+
+/// Handle `POST /api/coordinator/route`. Routes the task to a
+/// connected peer that satisfies all required capabilities,
+/// returning the assigned task id on success or a structured error
+/// on no-route / delegation failure.
+async fn coordinator_route(
+    registry: &crate::peer::PeerRegistry,
+    body_text: &str,
+) -> (u16, String) {
+    let req: CoordinatorRouteRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")})
+                    .to_string(),
+            );
+        }
+    };
+
+    // Translate the wire capability strings into typed Capability
+    // values. Same parser as the eligible endpoint — keeps the URL
+    // and JSON surfaces consistent.
+    let mut caps = Vec::with_capacity(req.required_capabilities.len());
+    let mut unknown = Vec::new();
+    for s in &req.required_capabilities {
+        match crate::peer::Capability::from_query_string(s) {
+            Some(c) => caps.push(c),
+            None => unknown.push(s.clone()),
+        }
+    }
+    if !unknown.is_empty() {
+        return (
+            400,
+            serde_json::json!({
+                "error": format!(
+                    "unrecognized capability values: {}",
+                    unknown.join(", ")
+                ),
+                "hint": "use kebab-case kind names (display, computer-use, ...) or `custom:<name>`"
+            })
+            .to_string(),
+        );
+    }
+    if caps.is_empty() {
+        return (
+            400,
+            serde_json::json!({
+                "error": "required_capabilities must not be empty"
+            })
+            .to_string(),
+        );
+    }
+
+    let task = crate::peer::PeerTask {
+        instructions: req.task.instructions,
+        context: req.task.context,
+        client_correlation_id: req.task.client_correlation_id,
+    };
+    let coordinator = crate::peer::Coordinator::new(registry.clone());
+    let request = crate::peer::TaskRequest {
+        required_capabilities: caps,
+        task,
+    };
+    match coordinator.route_task(request).await {
+        Ok(routed) => (
+            200,
+            serde_json::json!({
+                "peer_id": routed.peer_id.as_str(),
+                "task_id": routed.task_id.0,
+            })
+            .to_string(),
+        ),
+        Err(crate::peer::CoordinatorError::NoRoute {
+            required,
+            considered,
+        }) => (
+            404,
+            serde_json::json!({
+                "error": "no route",
+                "required_capabilities": required
+                    .iter()
+                    .map(|c| format!("{c:?}"))
+                    .collect::<Vec<_>>(),
+                "considered": considered.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            })
+            .to_string(),
+        ),
+        Err(crate::peer::CoordinatorError::DelegationFailed { peer, error }) => (
+            502,
+            serde_json::json!({
+                "error": format!("delegation to {peer} failed: {error}"),
+                "peer_id": peer.as_str(),
+            })
+            .to_string(),
+        ),
     }
 }
 
@@ -6083,6 +6344,246 @@ mod tests {
             resp_body.contains("bogus"),
             "404 body should name the unknown op: {resp_body}"
         );
+        handle.abort();
+    }
+
+    // -----------------------------------------------------------------
+    // Coordinator endpoints — capability discovery + delegation
+    // -----------------------------------------------------------------
+
+    /// `GET /api/peers/eligible` returns 503 with no registry,
+    /// matching the rest of /api/peers.
+    #[tokio::test]
+    async fn test_api_peers_eligible_returns_503_without_registry() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        let resp = http_request(
+            port,
+            "GET /api/peers/eligible?capability=display HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("503"), "expected 503, got: {resp}");
+        handle.abort();
+    }
+
+    /// Missing `?capability=...` query param returns 400 with a
+    /// hint that at least one is required.
+    #[tokio::test]
+    async fn test_api_peers_eligible_requires_capability_param() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let resp = http_request(
+            port,
+            "GET /api/peers/eligible HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("400"), "expected 400, got: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            resp_body.contains("capability"),
+            "400 body should mention capability: {resp_body}"
+        );
+        handle.abort();
+    }
+
+    /// Unknown capability strings return 400 with the offending
+    /// values surfaced (not silently dropped, which would let an
+    /// /api/peers/eligible?capability=typo through and return all
+    /// peers).
+    #[tokio::test]
+    async fn test_api_peers_eligible_rejects_unknown_capability() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let resp = http_request(
+            port,
+            "GET /api/peers/eligible?capability=display&capability=nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("400"), "expected 400, got: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            resp_body.contains("nope"),
+            "400 body should name the unknown capability: {resp_body}"
+        );
+        handle.abort();
+    }
+
+    /// With one connected peer that advertises both ComputerUse and
+    /// Knowledge (the test fixture's defaults), `?capability=computer-use`
+    /// returns the peer; `?capability=display` returns an empty list
+    /// (the fixture doesn't advertise Display).
+    #[tokio::test]
+    async fn test_api_peers_eligible_returns_matching_peers() {
+        let (dash_port, peer_id, target_handle, dash_handle) =
+            setup_peer_op_test().await;
+
+        // Hits: the test peer's card advertises ComputerUse.
+        let resp = http_request(
+            dash_port,
+            "GET /api/peers/eligible?capability=computer-use HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "expected 200, got: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        let peers = parsed["peers"].as_array().expect("peers array");
+        assert_eq!(peers.len(), 1, "expected one matching peer");
+        assert_eq!(peers[0]["id"].as_str().unwrap(), peer_id);
+
+        // Misses: the fixture doesn't advertise Display.
+        let resp = http_request(
+            dash_port,
+            "GET /api/peers/eligible?capability=display HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "expected 200, got: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["peers"].as_array().unwrap().len(), 0);
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// `POST /api/coordinator/route` with required_capabilities the
+    /// connected peer satisfies returns 200 + peer_id + task_id.
+    /// Wire encoding to ControlMsg::StartTask is covered by
+    /// peer::transport::intendant::tests.
+    #[tokio::test]
+    async fn test_api_coordinator_route_returns_200() {
+        let (dash_port, peer_id, target_handle, dash_handle) =
+            setup_peer_op_test().await;
+
+        let body = serde_json::json!({
+            "required_capabilities": ["computer-use"],
+            "task": {
+                "instructions": "do the thing",
+                "context": {"file": "src/main.rs"},
+            },
+        })
+        .to_string();
+        let req = format!(
+            "POST /api/coordinator/route HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("200 OK"), "expected 200, got: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        assert_eq!(
+            parsed["peer_id"].as_str().expect("peer_id present"),
+            peer_id
+        );
+        assert!(
+            parsed["task_id"].as_str().is_some(),
+            "task_id should be present in response: {resp_body}"
+        );
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// Routing a capability no connected peer satisfies returns 404
+    /// with the considered peer ids surfaced for diagnostics.
+    #[tokio::test]
+    async fn test_api_coordinator_route_no_match_returns_404() {
+        let (dash_port, peer_id, target_handle, dash_handle) =
+            setup_peer_op_test().await;
+
+        let body = serde_json::json!({
+            "required_capabilities": ["display"],
+            "task": {"instructions": "needs a display"},
+        })
+        .to_string();
+        let req = format!(
+            "POST /api/coordinator/route HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("404"), "expected 404, got: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(resp_body).unwrap();
+        assert_eq!(parsed["error"].as_str().unwrap(), "no route");
+        let considered = parsed["considered"].as_array().expect("considered array");
+        assert!(
+            considered.iter().any(|v| v.as_str() == Some(&peer_id)),
+            "considered list should include the peer that didn't match"
+        );
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// Bad JSON body returns 400.
+    #[tokio::test]
+    async fn test_api_coordinator_route_invalid_body_returns_400() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let body = "not json";
+        let req = format!(
+            "POST /api/coordinator/route HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(port, &req).await;
+        assert!(resp.contains("400"), "expected 400, got: {resp}");
+        handle.abort();
+    }
+
+    /// Empty `required_capabilities` returns 400 — would otherwise
+    /// match every peer and route to the first lexicographically,
+    /// which is almost never what the caller meant.
+    #[tokio::test]
+    async fn test_api_coordinator_route_rejects_empty_capabilities() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let body = serde_json::json!({
+            "required_capabilities": [],
+            "task": {"instructions": "anything"},
+        })
+        .to_string();
+        let req = format!(
+            "POST /api/coordinator/route HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(port, &req).await;
+        assert!(resp.contains("400"), "expected 400, got: {resp}");
+        let resp_body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            resp_body.contains("required_capabilities"),
+            "400 body should mention required_capabilities: {resp_body}"
+        );
+        handle.abort();
+    }
+
+    /// GET on the route endpoint returns 405 — only POST is allowed.
+    #[tokio::test]
+    async fn test_api_coordinator_route_get_returns_405() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
+
+        let resp = http_request(
+            port,
+            "GET /api/coordinator/route HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("405"), "expected 405, got: {resp}");
         handle.abort();
     }
 

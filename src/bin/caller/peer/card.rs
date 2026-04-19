@@ -300,6 +300,40 @@ pub enum Capability {
     Unknown,
 }
 
+impl Capability {
+    /// Parse a `Capability` from a URL-friendly string.
+    ///
+    /// Accepts the kebab-case kind names that match the JSON wire
+    /// format (`"display"`, `"computer-use"`, `"task-delegation"`,
+    /// etc.) plus a `"custom:<name>"` form for the `Custom` variant.
+    /// Returns `None` for unrecognized values so callers can return
+    /// a clean 400 instead of silently routing through `Unknown`
+    /// (which would never match any real peer's advertised list).
+    ///
+    /// Used by the `/api/peers/eligible?capability=...` and
+    /// `/api/coordinator/route` endpoints to keep the URL/JSON
+    /// surface free of nested object syntax.
+    pub fn from_query_string(s: &str) -> Option<Self> {
+        if let Some(rest) = s.strip_prefix("custom:") {
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(Self::Custom(rest.to_string()));
+        }
+        match s {
+            "display" => Some(Self::Display),
+            "voice" => Some(Self::Voice),
+            "phone" => Some(Self::Phone),
+            "computer-use" => Some(Self::ComputerUse),
+            "knowledge" => Some(Self::Knowledge),
+            "recording" => Some(Self::Recording),
+            "task-delegation" => Some(Self::TaskDelegation),
+            "message-relay" => Some(Self::MessageRelay),
+            _ => None,
+        }
+    }
+}
+
 /// How a peer authenticates inbound connections.
 ///
 /// Each transport understands the `AuthScheme`s relevant to it. The
@@ -552,5 +586,48 @@ mod tests {
             let wire = serde_json::to_string(&r).unwrap();
             assert_eq!(wire, format!("\"{}\"", r.as_str()));
         }
+    }
+
+    /// Capability::from_query_string round-trips kebab-case kinds and
+    /// parses `"custom:<name>"` into the Custom variant. Unrecognized
+    /// strings return None so the API surface can return a clean 400.
+    #[test]
+    fn capability_from_query_string_parses_kinds() {
+        assert_eq!(Capability::from_query_string("display"), Some(Capability::Display));
+        assert_eq!(Capability::from_query_string("voice"), Some(Capability::Voice));
+        assert_eq!(Capability::from_query_string("phone"), Some(Capability::Phone));
+        assert_eq!(
+            Capability::from_query_string("computer-use"),
+            Some(Capability::ComputerUse)
+        );
+        assert_eq!(Capability::from_query_string("knowledge"), Some(Capability::Knowledge));
+        assert_eq!(Capability::from_query_string("recording"), Some(Capability::Recording));
+        assert_eq!(
+            Capability::from_query_string("task-delegation"),
+            Some(Capability::TaskDelegation)
+        );
+        assert_eq!(
+            Capability::from_query_string("message-relay"),
+            Some(Capability::MessageRelay)
+        );
+    }
+
+    #[test]
+    fn capability_from_query_string_parses_custom() {
+        assert_eq!(
+            Capability::from_query_string("custom:vortex-audio"),
+            Some(Capability::Custom("vortex-audio".to_string()))
+        );
+        // Empty custom name rejected — would otherwise let `?capability=custom:`
+        // through and produce a Custom("") that matches nothing useful.
+        assert_eq!(Capability::from_query_string("custom:"), None);
+    }
+
+    #[test]
+    fn capability_from_query_string_rejects_unknown() {
+        assert_eq!(Capability::from_query_string("unknown"), None);
+        assert_eq!(Capability::from_query_string(""), None);
+        // snake_case is not the wire format — only kebab-case is accepted.
+        assert_eq!(Capability::from_query_string("computer_use"), None);
     }
 }
