@@ -641,6 +641,92 @@ html, body {
 }
 .daemons-status.error { color: var(--red); }
 .daemons-status.ok { color: var(--green); }
+/* Coordinator panel — sibling of the Daemons panel. Two stacked
+   sub-sections: "Find eligible peers" (GET /api/peers/eligible) and
+   "Route a task" (POST /api/coordinator/route). Looks like a
+   per-peer .daemon-controls panel but lives at the panel level
+   rather than inside a daemon entry, since routing is global. */
+.coord-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+}
+.coord-section-label {
+  font-size: 11px;
+  color: var(--subtext0);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+.coord-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.coord-row input {
+  flex: 1;
+  padding: 4px 8px;
+  background: var(--base);
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 12px;
+  min-width: 0;
+}
+.coord-row input:focus { outline: none; border-color: var(--blue); }
+.coord-row button {
+  padding: 4px 12px;
+  background: var(--blue);
+  color: var(--base);
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.coord-row button:hover { background: var(--sapphire); }
+.coord-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+.coord-textarea {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--base);
+  border: 1px solid var(--surface2);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.coord-textarea:focus { outline: none; border-color: var(--blue); }
+.coord-route-hint {
+  flex: 1;
+  font-size: 11px;
+  color: var(--overlay1);
+}
+.coord-result {
+  font-size: 11px;
+  color: var(--subtext0);
+  min-height: 14px;
+}
+.coord-result.error { color: var(--red); }
+.coord-result.ok { color: var(--green); }
+.coord-result .coord-peer {
+  display: block;
+  padding: 3px 0;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+.coord-result .coord-peer-id { color: var(--text); }
+.coord-result .coord-considered {
+  color: var(--overlay1);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  margin-left: 8px;
+}
 .settings-row input[type="password"] {
   flex: 1;
   padding: 6px 10px;
@@ -4254,6 +4340,35 @@ html, body {
                 <button id="daemon-add-btn" type="button">Add</button>
               </div>
               <span id="daemons-status" class="daemons-status"></span>
+            </fieldset>
+
+            <fieldset class="settings-group">
+              <legend>Coordinator</legend>
+              <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
+                Capability-based discovery and task routing across all connected peers. Capabilities are kebab-case (<code style="color:var(--blue)">display</code>, <code style="color:var(--blue)">computer-use</code>, <code style="color:var(--blue)">task-delegation</code>, …) plus <code style="color:var(--blue)">custom:&lt;name&gt;</code>. Separate multiple with commas or spaces.
+              </p>
+
+              <div class="coord-section">
+                <div class="coord-section-label">Find eligible peers</div>
+                <div class="coord-row">
+                  <input id="coord-eligible-caps" type="text" placeholder="display, computer-use" autocomplete="off">
+                  <button id="coord-eligible-btn" type="button">Find</button>
+                </div>
+                <div id="coord-eligible-result" class="coord-result"></div>
+              </div>
+
+              <div class="coord-section">
+                <div class="coord-section-label">Route a task</div>
+                <div class="coord-row">
+                  <input id="coord-route-caps" type="text" placeholder="display, computer-use" autocomplete="off">
+                </div>
+                <textarea id="coord-route-instructions" class="coord-textarea" placeholder="Instructions for the chosen peer…" rows="3"></textarea>
+                <div class="coord-row">
+                  <button id="coord-route-btn" type="button">Route</button>
+                  <span class="coord-route-hint">Routes to the lexicographically-first peer that satisfies all required capabilities. Cmd/Ctrl+Enter in the textarea also fires.</span>
+                </div>
+                <div id="coord-route-result" class="coord-result"></div>
+              </div>
             </fieldset>
           </div>
         </div>
@@ -11165,6 +11280,137 @@ async function removeDaemon(hostId) {
   setDaemonsStatus(`Removed ${hostId}`, '');
 }
 
+// Parse a capability list string ("display, computer-use, custom:foo")
+// into the array form the coordinator endpoints expect. Whitespace and
+// commas are both separators; empty entries are dropped.
+function parseCapabilityList(text) {
+  return String(text || '')
+    .split(/[\s,]+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+}
+
+// Find the connected peers that satisfy all listed capabilities.
+// GET /api/peers/eligible?capability=display&capability=computer-use
+// returns {peers: [PeerSnapshot]} on 200; 400 on missing/unknown
+// capability with {error, hint?}.
+async function findEligiblePeers() {
+  const input = document.getElementById('coord-eligible-caps');
+  const btn = document.getElementById('coord-eligible-btn');
+  const out = document.getElementById('coord-eligible-result');
+  if (!input || !out) return;
+
+  const caps = parseCapabilityList(input.value);
+  if (caps.length === 0) {
+    out.textContent = 'Enter at least one capability.';
+    out.className = 'coord-result error';
+    return;
+  }
+
+  btn.disabled = true;
+  out.textContent = 'Searching…';
+  out.className = 'coord-result';
+  const query = caps.map(c => `capability=${encodeURIComponent(c)}`).join('&');
+  try {
+    const resp = await fetch(`/api/peers/eligible?${query}`);
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const msg = result.error || `HTTP ${resp.status}`;
+      const hint = result.hint ? ` (${result.hint})` : '';
+      out.textContent = `Failed: ${msg}${hint}`;
+      out.className = 'coord-result error';
+      return;
+    }
+    const peers = Array.isArray(result.peers) ? result.peers : [];
+    if (peers.length === 0) {
+      out.textContent = `No connected peer satisfies: ${caps.join(', ')}.`;
+      out.className = 'coord-result';
+      return;
+    }
+    out.className = 'coord-result ok';
+    out.innerHTML =
+      `<div>Found ${peers.length} eligible peer${peers.length === 1 ? '' : 's'}:</div>` +
+      peers
+        .map(p => {
+          const id = escapeHtml(p.host_id || p.id || '');
+          const label = escapeHtml(p.label || p.host_id || p.id || '');
+          return `<span class="coord-peer"><span class="coord-peer-id">${label}</span> <span class="coord-considered">${id}</span></span>`;
+        })
+        .join('');
+  } catch (e) {
+    out.textContent = `Error: ${e.message}`;
+    out.className = 'coord-result error';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Delegate a task to whichever connected peer satisfies all required
+// capabilities. POST /api/coordinator/route returns {peer_id, task_id}
+// on 200; 404 on no-route with {error, considered: [peer_id]}; 502 on
+// delegation failure with {error, peer_id}.
+async function routeTask() {
+  const capsInput = document.getElementById('coord-route-caps');
+  const instrInput = document.getElementById('coord-route-instructions');
+  const btn = document.getElementById('coord-route-btn');
+  const out = document.getElementById('coord-route-result');
+  if (!capsInput || !instrInput || !out) return;
+
+  const caps = parseCapabilityList(capsInput.value);
+  const instructions = instrInput.value.trim();
+  if (caps.length === 0) {
+    out.textContent = 'Enter at least one required capability.';
+    out.className = 'coord-result error';
+    return;
+  }
+  if (!instructions) {
+    out.textContent = 'Enter task instructions.';
+    out.className = 'coord-result error';
+    return;
+  }
+
+  btn.disabled = true;
+  out.textContent = 'Routing…';
+  out.className = 'coord-result';
+  try {
+    const resp = await fetch('/api/coordinator/route', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        required_capabilities: caps,
+        task: { instructions },
+      }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      out.className = 'coord-result ok';
+      out.innerHTML =
+        `Routed to <span class="coord-peer-id">${escapeHtml(result.peer_id || '?')}</span> ` +
+        `(task id <span class="coord-peer-id">${escapeHtml(result.task_id || '?')}</span>).`;
+      instrInput.value = '';
+    } else if (resp.status === 404 && Array.isArray(result.considered)) {
+      out.className = 'coord-result error';
+      const considered = result.considered;
+      out.innerHTML =
+        `No connected peer satisfies all required capabilities.` +
+        (considered.length === 0
+          ? ` (No peers connected.)`
+          : `<div>Considered:${considered
+              .map(p => `<span class="coord-considered">${escapeHtml(p)}</span>`)
+              .join('')}</div>`);
+    } else {
+      const msg = result.error || `HTTP ${resp.status}`;
+      out.textContent = `Failed: ${msg}`;
+      out.className = 'coord-result error';
+    }
+  } catch (e) {
+    out.textContent = `Error: ${e.message}`;
+    out.className = 'coord-result error';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function initDaemons() {
   // Hydrate the peer list from the server-side PeerRegistry via
   // GET /api/peers. The server already loaded [[peer]] sections
@@ -11184,6 +11430,27 @@ async function initDaemons() {
   });
   document.getElementById('daemon-add-label').addEventListener('keydown', e => {
     if (e.key === 'Enter') addDaemon();
+  });
+
+  // Wire the Coordinator panel. Sibling of the daemon-add wiring above:
+  // both belong to the Network settings pane and are wired here so the
+  // listeners attach exactly once after the DOM is ready.
+  document.getElementById('coord-eligible-btn').addEventListener('click', findEligiblePeers);
+  document.getElementById('coord-eligible-caps').addEventListener('keydown', e => {
+    if (e.key === 'Enter') findEligiblePeers();
+  });
+  document.getElementById('coord-route-btn').addEventListener('click', routeTask);
+  document.getElementById('coord-route-caps').addEventListener('keydown', e => {
+    if (e.key === 'Enter') routeTask();
+  });
+  // Cmd/Ctrl+Enter in the multi-line instructions textarea fires Route
+  // — plain Enter is reserved for newlines so the user can format the
+  // instructions across multiple lines.
+  document.getElementById('coord-route-instructions').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      routeTask();
+    }
   });
 }
 
