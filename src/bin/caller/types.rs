@@ -411,6 +411,15 @@ pub enum OutboundEvent {
         lines_added: u32,
         lines_removed: u32,
     },
+    /// A user-uploaded file is available for attachment. Mirror of the
+    /// `AppEvent::UploadReady` emitted after `POST /api/upload` finishes.
+    UploadReady {
+        descriptor: crate::upload_store::UploadDescriptor,
+    },
+    /// An uploaded file was removed from the store.
+    UploadDeleted {
+        id: String,
+    },
     /// A new per-round file snapshot was recorded.
     SnapshotCreated {
         round_id: u64,

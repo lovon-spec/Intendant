@@ -2149,6 +2149,8 @@ impl App {
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionResult { .. }
             | AppEvent::FileChanged { .. }
+            | AppEvent::UploadReady { .. }
+            | AppEvent::UploadDeleted { .. }
             | AppEvent::SnapshotCreated { .. }
             | AppEvent::RolledBack { .. }
             | AppEvent::Redone { .. }

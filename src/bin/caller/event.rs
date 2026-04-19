@@ -532,6 +532,21 @@ pub enum AppEvent {
         lines_removed: u32,
     },
 
+    /// A user-uploaded file was committed to the upload store. Emitted by
+    /// the `POST /api/upload` handler after the bytes land on disk. The
+    /// dashboard keeps a list of these to let the user attach one or more
+    /// to the next task (as `"upload:<id>"` strings in
+    /// `ControlMsg::StartTask.attachments`).
+    UploadReady {
+        descriptor: crate::upload_store::UploadDescriptor,
+    },
+    /// A previously-uploaded file was deleted from the store. Mirror of
+    /// `UploadReady`.
+    UploadDeleted {
+        /// Descriptor id (stable across browsers).
+        id: String,
+    },
+
     // ---- File snapshot history (per-round) ----
     /// A new per-round snapshot was recorded.
     SnapshotCreated {
@@ -1242,6 +1257,14 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 display_id: *display_id,
                 backend: backend.to_string(),
             })
+        }
+        AppEvent::UploadReady { descriptor } => {
+            Some(OutboundEvent::UploadReady {
+                descriptor: descriptor.clone(),
+            })
+        }
+        AppEvent::UploadDeleted { id } => {
+            Some(OutboundEvent::UploadDeleted { id: id.clone() })
         }
         AppEvent::FileChanged { path, kind, lines_added, lines_removed } => {
             let kind_str = serde_json::to_value(kind)

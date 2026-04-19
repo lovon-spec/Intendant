@@ -28,6 +28,9 @@ portable-pty = "0.8"
 dotenvy = "0.15"
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
+# Used by upload_store for atomic-rename of streamed uploads into the final
+# store location, and by tests elsewhere as a dev-dep.
+tempfile = "3"
 async-trait = "0.1"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -69,4 +72,3 @@ shiguredo_video_toolbox = "2026.1"
 split-debuginfo = "unpacked"
 
 [dev-dependencies]
-tempfile = "3"

@@ -739,6 +739,35 @@ html, body {
   white-space: nowrap;
 }
 .global-direct-toggle input { margin: 0; accent-color: var(--blue); }
+.global-upload-dest {
+  padding: 3px 6px;
+  font-size: 11px;
+  background: var(--surface0);
+  color: var(--text);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.global-upload-dest:focus { outline: 1px solid var(--blue); }
+.global-attach-btn {
+  padding: 3px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.global-attach-btn:hover { background: var(--surface1); }
+.global-attach-btn.drag-hover {
+  border-color: var(--blue);
+  background: rgba(137, 180, 250, 0.18);
+}
+.global-attach-btn.uploading {
+  opacity: 0.6;
+  cursor: progress;
+}
 .global-send-btn {
   padding: 4px 12px;
   border: 1px solid var(--green);
@@ -3355,6 +3384,15 @@ html, body {
     </div>
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <input id="activity-task-input" class="global-task-input" placeholder="Enter task..." />
+    <!-- File upload: hidden input triggered by the Attach button. `multiple`
+         lets the user pick several at once; we fire one POST /api/upload
+         per file so progress is independent per attachment. -->
+    <input type="file" id="upload-file-input" multiple style="display:none" />
+    <select id="upload-destination" class="global-upload-dest" title="Where uploaded files land. Workspace puts them under the project's workspace_files/ for the agent to reference across turns; Task drops them in the session's uploads/ and cleans up on session end.">
+      <option value="workspace" selected>Workspace</option>
+      <option value="task">Task</option>
+    </select>
+    <button id="upload-attach-btn" class="global-attach-btn" title="Attach file(s). Saved to the workspace or task scope picked in the dropdown. Images are attached to the next task as images; other files get a stage-and-point message prelude the agent can follow with its file-read tool.">&#x1F4CE;</button>
     <label class="global-direct-toggle" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" />Direct</label>
     <button id="activity-submit-btn" class="global-send-btn" onclick="submitActivityOrSteer()" title="Start a new task or send a follow-up.">Send</button>
   </div>
@@ -5385,6 +5423,12 @@ function processCommands(cmds) {
         break;
       case 'file_changed':
         onFileChanged(c.path, c.kind, c.lines_added, c.lines_removed);
+        break;
+      case 'upload_ready':
+        onUploadReady(c.descriptor);
+        break;
+      case 'upload_deleted':
+        onUploadDeleted(c.id);
         break;
       case 'history_changed':
         // Session history changed (snapshot / rollback / redo / prune).
@@ -8657,6 +8701,144 @@ function clearPendingAttachments() {
   renderPendingAttachments();
 }
 
+// ── File upload ───────────────────────────────────────────────────────
+//
+// Flow: user clicks Attach (or drops files on the task input) → we stream
+// each file to POST /api/upload → the server replies with an
+// UploadDescriptor, broadcasts UploadReady to all connected browsers →
+// every browser's `onUploadReady` drops a chip into pendingAttachments.
+// Submitting a task maps the chip's `frameId` (of the form "upload:<id>")
+// directly into the `attachments` array — the server's `resolve_attachments`
+// understands the prefix.
+
+// Cap mirrors UPLOAD_MAX_BYTES on the server. Front-end check is UX only
+// (the server bails with 413 even if the browser lies); nicer to catch it
+// before the network round-trip.
+const UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
+
+/// Short human-readable file-size string, matches the server's formatter.
+function humanBytes(n) {
+  if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+async function uploadOneFile(file, destination) {
+  if (file.size > UPLOAD_MAX_BYTES) {
+    logErrorToActivity(`File too large (${humanBytes(file.size)}): ${file.name}. Cap is ${humanBytes(UPLOAD_MAX_BYTES)}.`);
+    return null;
+  }
+  const mime = file.type || 'application/octet-stream';
+  const q = `destination=${encodeURIComponent(destination)}&name=${encodeURIComponent(file.name || 'upload.bin')}`;
+  try {
+    const resp = await fetch(`/api/upload?${q}`, {
+      method: 'POST',
+      headers: { 'Content-Type': mime },
+      body: file,
+    });
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      logErrorToActivity(`Upload failed (${file.name}): ${json.error || resp.statusText}`);
+      return null;
+    }
+    // We do NOT add to pendingAttachments here — the server's UploadReady
+    // broadcast arrives a moment later via WS and onUploadReady handles it.
+    // Going through the broadcast means a second browser open to the same
+    // daemon sees the new attachment too.
+    return json;
+  } catch (e) {
+    logErrorToActivity(`Upload failed (${file.name}): ${e}`);
+    return null;
+  }
+}
+
+function logErrorToActivity(text) {
+  // Best-effort — if the helper isn't available yet, use console.
+  if (typeof renderLogEntry === 'function') {
+    try {
+      renderLogEntry({ ts: '', level: 'warn', source: 'upload', content: text });
+      return;
+    } catch (_) { /* fall through */ }
+  }
+  console.warn('[upload]', text);
+}
+
+async function triggerUploadFlow(files) {
+  if (!files || files.length === 0) return;
+  const dest = document.getElementById('upload-destination')?.value === 'task'
+    ? 'task'
+    : 'workspace';
+  const btn = document.getElementById('upload-attach-btn');
+  if (btn) btn.classList.add('uploading');
+  // Fire uploads sequentially to avoid hammering the gateway — it's a
+  // hand-rolled server, not multiplexed. Can parallelise later if it
+  // becomes a bottleneck.
+  for (const f of files) {
+    await uploadOneFile(f, dest);
+  }
+  if (btn) btn.classList.remove('uploading');
+}
+
+function onUploadReady(descriptor) {
+  if (!descriptor || !descriptor.id) return;
+  const frameId = `upload:${descriptor.id}`;
+  // Thumbnail for images, a paperclip + name label for files.
+  const isImage = typeof descriptor.mime === 'string' && descriptor.mime.startsWith('image/');
+  const dataUrl = isImage ? `/api/uploads/${encodeURIComponent(descriptor.id)}/raw` : null;
+  addPendingAttachment({
+    frameId,
+    stream: 'upload',
+    note: `${descriptor.name} (${humanBytes(descriptor.size || 0)}, ${descriptor.destination})`,
+    dataUrl,
+    uploadId: descriptor.id,
+    uploadName: descriptor.name,
+    uploadMime: descriptor.mime,
+    uploadDestination: descriptor.destination,
+  });
+}
+
+function onUploadDeleted(id) {
+  if (!id) return;
+  removePendingAttachment(`upload:${id}`);
+}
+
+function wireUploadControls() {
+  const btn = document.getElementById('upload-attach-btn');
+  const input = document.getElementById('upload-file-input');
+  const taskInput = document.getElementById('activity-task-input');
+  if (!btn || !input) return;
+  btn.addEventListener('click', () => input.click());
+  input.addEventListener('change', (ev) => {
+    const files = Array.from(ev.target.files || []);
+    triggerUploadFlow(files);
+    // Reset so selecting the same file twice in a row re-fires `change`.
+    ev.target.value = '';
+  });
+  // Drag-and-drop on the task input AND the Attach button for a larger hit
+  // target. The whole page would be nicer but has more false positives
+  // (dragging text, other apps' files onto the tab).
+  const dropTargets = [btn];
+  if (taskInput) dropTargets.push(taskInput);
+  for (const el of dropTargets) {
+    el.addEventListener('dragenter', (e) => { e.preventDefault(); btn.classList.add('drag-hover'); });
+    el.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+    el.addEventListener('dragleave', () => { btn.classList.remove('drag-hover'); });
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      btn.classList.remove('drag-hover');
+      const files = Array.from(e.dataTransfer?.files || []);
+      triggerUploadFlow(files);
+    });
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', wireUploadControls);
+} else {
+  wireUploadControls();
+}
+
 function renderPendingAttachments() {
   const bar = document.getElementById('pending-attachments-bar');
   const list = document.getElementById('pending-attachments-list');
@@ -8690,7 +8872,14 @@ function renderPendingAttachments() {
       chip.appendChild(img);
     }
     const label = document.createElement('span');
-    label.textContent = att.frameId.length > 24 ? '…' + att.frameId.slice(-22) : att.frameId;
+    // Upload chips get a paperclip + filename; frame chips keep the ID
+    // (it's already short — `ann-*`, `clip-*`, `display_*`).
+    if (att.uploadName) {
+      const name = att.uploadName;
+      label.textContent = '📎 ' + (name.length > 24 ? name.slice(0, 22) + '…' : name);
+    } else {
+      label.textContent = att.frameId.length > 24 ? '…' + att.frameId.slice(-22) : att.frameId;
+    }
     chip.appendChild(label);
     const x = document.createElement('button');
     x.className = 'chip-remove';

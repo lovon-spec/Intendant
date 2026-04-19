@@ -118,6 +118,16 @@ pub enum UiCommand {
         lines_added: u64,
         lines_removed: u64,
     },
+    /// A user-uploaded file was committed to the session's upload store
+    /// (via `POST /api/upload`). The dashboard adds it to the "pending
+    /// attachments" panel under the task input.
+    UploadReady {
+        descriptor: serde_json::Value,
+    },
+    /// An upload was removed from the store (by this or another browser).
+    UploadDeleted {
+        id: String,
+    },
     /// A peer was added to the registry. `peer` is the
     /// `PeerSnapshot` JSON unchanged from the wire — JS treats it
     /// the same shape as a `/api/peers` list entry.
@@ -1386,6 +1396,49 @@ impl AppState {
                 });
             }
 
+            // ---- Upload store events ----
+            //
+            // Server broadcasts one `upload_ready` after `POST /api/upload`
+            // finishes, and `upload_deleted` after `DELETE /api/uploads/<id>`.
+            // We pass the full descriptor through to JS so it can render the
+            // pending-attachments row without round-tripping to the
+            // `/api/uploads` list endpoint.
+            "upload_ready" => {
+                let descriptor = msg
+                    .get("descriptor")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let name = descriptor
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(upload)");
+                let dest = descriptor
+                    .get("destination")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("task");
+                cmds.extend(self.add_log(
+                    "detail",
+                    &format!("upload ready: {} ({})", name, dest),
+                    None,
+                    "fs",
+                ));
+                cmds.push(UiCommand::UploadReady { descriptor });
+            }
+            "upload_deleted" => {
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                cmds.extend(self.add_log(
+                    "detail",
+                    &format!("upload deleted: {}", id),
+                    None,
+                    "fs",
+                ));
+                cmds.push(UiCommand::UploadDeleted { id });
+            }
+
             // ---- Session history events (rollback / redo / prune) ----
             //
             // The authoritative timeline lives on the server. These events
@@ -2041,6 +2094,44 @@ mod tests {
             }
         ));
         assert!(matched, "expected toggles-only CodexConfigChanged, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_upload_ready_carries_descriptor_through() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "upload_ready",
+            "descriptor": {
+                "id": "abc-123",
+                "name": "report.pdf",
+                "mime": "application/pdf",
+                "size": 4096,
+                "path": "/tmp/x/report.pdf",
+                "destination": "task",
+                "session_id": "sess-1",
+                "created_at": 1_700_000_000
+            }
+        });
+        let cmds = s.handle_message(&msg);
+        let matched = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UploadReady { descriptor } if
+                descriptor.get("id").and_then(|v| v.as_str()) == Some("abc-123") &&
+                descriptor.get("name").and_then(|v| v.as_str()) == Some("report.pdf")
+        ));
+        assert!(matched, "expected UploadReady with descriptor, got {:?}", cmds);
+    }
+
+    #[test]
+    fn handle_upload_deleted_emits_command() {
+        let mut s = AppState::new();
+        let msg = json!({"event": "upload_deleted", "id": "gone-1"});
+        let cmds = s.handle_message(&msg);
+        let matched = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UploadDeleted { id } if id == "gone-1"
+        ));
+        assert!(matched, "expected UploadDeleted, got {:?}", cmds);
     }
 
     #[test]

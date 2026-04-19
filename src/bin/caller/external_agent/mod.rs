@@ -44,6 +44,93 @@ impl AgentImageAttachment {
     }
 }
 
+/// One non-image file attached to a user message.
+///
+/// None of the three backends (Codex, Gemini, Claude Code) expose a native
+/// "document" content block as of now, so we stage the file at a stable
+/// path inside (or near) the workspace and lean on the agent's existing
+/// file-read tools. The accompanying user message gets a short prelude
+/// pointing at the path — see `format_file_attachments_prelude`.
+#[derive(Debug, Clone)]
+pub struct AgentFileAttachment {
+    /// Path on disk where the file lives. Should be inside (or reachable
+    /// from) the agent's workspace so its file-read tool can open it.
+    pub local_path: PathBuf,
+    /// Original filename for display in the message prelude.
+    pub name: String,
+    /// MIME type for reporting / potential native block use later.
+    pub mime_type: String,
+    /// Size in bytes (helpful for the prelude line and for the model to
+    /// decide whether to read the full file or stream).
+    pub size: u64,
+}
+
+/// One attachment of arbitrary kind. The dashboard produces these via the
+/// Attach modal and the agent loop's `resolve_attachments` maps a mixed
+/// list of `frame:<id>` / `upload:<id>` ids into this shape before
+/// handing off to the backend's `send_message_with_attachments`.
+#[derive(Debug, Clone)]
+pub enum AgentAttachment {
+    Image(AgentImageAttachment),
+    File(AgentFileAttachment),
+}
+
+impl AgentAttachment {
+    /// Images flow through each backend's native image path; files need
+    /// the "stage + point" workaround. Exposed as a method so call sites
+    /// reading a heterogeneous `&[AgentAttachment]` can split into two
+    /// buckets cleanly.
+    pub fn is_image(&self) -> bool {
+        matches!(self, AgentAttachment::Image(_))
+    }
+}
+
+/// Build the short prelude that precedes a user's message when the task
+/// carries one or more non-image file attachments. Tells the model what
+/// files are available and where to find them, without pretending the
+/// backend has a real "document" content block.
+///
+/// Empty string when there are no file attachments — callers can
+/// concatenate unconditionally.
+pub fn format_file_attachments_prelude(files: &[&AgentFileAttachment]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "The user attached the following file(s). Read them with your file \
+         tools when relevant; paths are absolute.\n\n",
+    );
+    for f in files {
+        // Humanised size: "123 B" / "1.2 KB" / "4.3 MB". Nothing fancy —
+        // just avoids showing raw byte counts for multi-MB PDFs.
+        let size = human_bytes(f.size);
+        out.push_str(&format!(
+            "- `{}` ({}, {}) — path: {}\n",
+            f.name,
+            f.mime_type,
+            size,
+            f.local_path.display(),
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    if n >= GB {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{} B", n)
+    }
+}
+
 /// Identifies which external agent backend is in use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -234,6 +321,43 @@ pub trait ExternalAgent: Send + Sync {
     ) -> Result<(), CallerError> {
         let _ = images;
         self.send_message(thread, message).await
+    }
+
+    /// Send a user message with a heterogeneous list of attachments
+    /// (images + files). Default implementation routes images through
+    /// `send_message_with_images` and prepends a prelude describing any
+    /// file attachments at stable paths. Backends that grow a native
+    /// "document" content block later can override this to pass files
+    /// through the wire protocol instead of staging + pointing.
+    async fn send_message_with_attachments(
+        &mut self,
+        thread: &AgentThread,
+        message: &str,
+        attachments: &[AgentAttachment],
+    ) -> Result<(), CallerError> {
+        let images: Vec<AgentImageAttachment> = attachments
+            .iter()
+            .filter_map(|a| match a {
+                AgentAttachment::Image(img) => Some(img.clone()),
+                AgentAttachment::File(_) => None,
+            })
+            .collect();
+        let files: Vec<&AgentFileAttachment> = attachments
+            .iter()
+            .filter_map(|a| match a {
+                AgentAttachment::File(f) => Some(f),
+                AgentAttachment::Image(_) => None,
+            })
+            .collect();
+        let prelude = format_file_attachments_prelude(&files);
+        // Prelude comes BEFORE the user's message so the model reads the
+        // attachment list first, then the actual instruction.
+        let augmented = if prelude.is_empty() {
+            message.to_string()
+        } else {
+            format!("{}{}", prelude, message)
+        };
+        self.send_message_with_images(thread, &augmented, &images).await
     }
 
     /// Respond to an approval request from the agent.

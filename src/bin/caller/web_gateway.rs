@@ -1075,6 +1075,183 @@ async fn read_post_body(
     full
 }
 
+// ---------------------------------------------------------------------------
+// File upload endpoints
+// ---------------------------------------------------------------------------
+
+/// Hard cap on individual uploaded file size. Prevents a rogue or mistaken
+/// upload (e.g. someone dragging a multi-GB video file) from OOMing the
+/// daemon or filling the session dir. Plumbed through the streaming reader
+/// so we bail before reading the full body.
+///
+/// Picked to cover common real uploads (PDFs, CSVs, source archives,
+/// annotated screenshots) without accepting arbitrary blobs. Can be made
+/// configurable later via `[upload] max_size_mb` in intendant.toml.
+const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// Stream the body of an HTTP request into a fresh tempfile, honouring
+/// `Content-Length` and bailing out early if the body exceeds `max_bytes`.
+///
+/// Returns `(tempfile, size)` on success. Designed so the caller can then
+/// commit the tempfile into the upload store via
+/// [`crate::upload_store::commit_upload`], which atomically renames it
+/// into place.
+///
+/// This is the binary counterpart to `read_post_body` — same peek-then-
+/// stream pattern, but sinks to disk instead of a UTF-8 `String`.
+async fn stream_body_to_tempfile(
+    header_text: &str,
+    stream: &mut tokio::net::TcpStream,
+    max_bytes: usize,
+) -> Result<(tempfile::NamedTempFile, usize), String> {
+    use std::io::Write;
+    use tokio::io::AsyncReadExt;
+
+    let content_length: usize = header_text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or_else(|| "missing or invalid Content-Length".to_string())?;
+    if content_length == 0 {
+        return Err("empty body".to_string());
+    }
+    if content_length > max_bytes {
+        return Err(format!(
+            "body too large: {} bytes (cap is {})",
+            content_length, max_bytes
+        ));
+    }
+
+    let peeked_body = header_text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or("")
+        .as_bytes();
+    let mut tmp = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("create tempfile: {e}"))?;
+
+    // Write whatever body bytes we already have from the peek. These come
+    // back through the same header_text split, so they're the leading
+    // content_length bytes — truncate defensively in case the peek read
+    // slightly more than the body.
+    let peeked_n = peeked_body.len().min(content_length);
+    tmp.write_all(&peeked_body[..peeked_n])
+        .map_err(|e| format!("write tempfile: {e}"))?;
+    let mut written = peeked_n;
+
+    // Pull the rest from the socket in 64 KB chunks. The cap bails early;
+    // the final total is asserted to equal Content-Length so we don't store
+    // a truncated file.
+    let mut buf = vec![0u8; 64 * 1024];
+    while written < content_length {
+        let want = (content_length - written).min(buf.len());
+        match stream.read(&mut buf[..want]).await {
+            Ok(0) => {
+                return Err(format!(
+                    "connection closed mid-upload at {} / {} bytes",
+                    written, content_length
+                ));
+            }
+            Ok(n) => {
+                tmp.as_file_mut()
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("write tempfile: {e}"))?;
+                written += n;
+            }
+            Err(e) => return Err(format!("socket read: {e}")),
+        }
+    }
+    tmp.as_file_mut()
+        .flush()
+        .map_err(|e| format!("flush tempfile: {e}"))?;
+    Ok((tmp, written))
+}
+
+/// Parse a query-string value by key out of a full `request_line`
+/// (e.g. `POST /api/upload?name=foo.pdf&destination=task HTTP/1.1`).
+/// Returns the URL-decoded value, or `None` if the key isn't present.
+fn query_param<'a>(request_line: &'a str, key: &str) -> Option<String> {
+    let path_and_q = request_line.split_whitespace().nth(1)?;
+    let query = path_and_q.splitn(2, '?').nth(1)?;
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next()?;
+        let v = it.next().unwrap_or("");
+        if k == key {
+            return Some(url_decode(v));
+        }
+    }
+    None
+}
+
+/// Minimal `application/x-www-form-urlencoded` decoder: `%HH` → byte,
+/// `+` → space. Good enough for filenames/destinations on the upload
+/// path; we don't invite the full urlencoding crate just for this.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let h = &bytes[i + 1..i + 3];
+                match std::str::from_utf8(h)
+                    .ok()
+                    .and_then(|hs| u8::from_str_radix(hs, 16).ok())
+                {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extract the `Content-Type` request header value, or a generic default.
+fn content_type_header(header_text: &str) -> String {
+    header_text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-type:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+/// Build an HTTP response for an upload endpoint error.
+fn upload_error_response(status: &str, message: &str) -> String {
+    let body = serde_json::json!({"error": message}).to_string();
+    format!(
+        "HTTP/1.1 {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        status,
+        body.len(),
+        body
+    )
+}
+
 /// Check whether it is safe to mutate the project tree (rollback/redo) right
 /// now. Returns `Ok(())` if idle, or an `(status_code, body_json)` pair to
 /// send back as-is.
@@ -3960,6 +4137,263 @@ pub fn spawn_web_gateway(
                              {}",
                             body.len(), body
                         );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST") && request_line.contains(" /api/upload") {
+                        // POST /api/upload?name=<fn>&destination=task|workspace
+                        //   Content-Type: <mime>
+                        //   <raw bytes>
+                        //
+                        // Streams the body into a tempfile, commits it into
+                        // the upload store (per-session `uploads/` or
+                        // per-project `workspace_files/`), and broadcasts
+                        // UploadReady so all connected browsers see it.
+                        use tokio::io::AsyncWriteExt;
+                        let response = 'upload: {
+                            let Some(ref slog) = session_log else {
+                                break 'upload upload_error_response(
+                                    "400 Bad Request",
+                                    "no active session",
+                                );
+                            };
+                            let Some(ref root) = project_root_for_changes else {
+                                break 'upload upload_error_response(
+                                    "400 Bad Request",
+                                    "no project root",
+                                );
+                            };
+
+                            let name = query_param(&request_line, "name")
+                                .unwrap_or_else(|| "upload.bin".to_string());
+                            let destination = query_param(&request_line, "destination")
+                                .as_deref()
+                                .and_then(crate::upload_store::UploadDestination::from_str)
+                                .unwrap_or(crate::upload_store::UploadDestination::Task);
+                            let mime = content_type_header(&header_text);
+
+                            match stream_body_to_tempfile(
+                                &header_text,
+                                &mut stream,
+                                UPLOAD_MAX_BYTES,
+                            )
+                            .await
+                            {
+                                Err(e) => {
+                                    let status = if e.contains("too large") {
+                                        "413 Payload Too Large"
+                                    } else {
+                                        "400 Bad Request"
+                                    };
+                                    break 'upload upload_error_response(status, &e);
+                                }
+                                Ok((tmp, size)) => {
+                                    let (session_dir, session_id) = {
+                                        match slog.lock() {
+                                            Ok(l) => (
+                                                l.dir().to_path_buf(),
+                                                l.session_id().to_string(),
+                                            ),
+                                            Err(_) => {
+                                                break 'upload upload_error_response(
+                                                    "500 Internal Server Error",
+                                                    "session log lock poisoned",
+                                                );
+                                            }
+                                        }
+                                    };
+                                    match crate::upload_store::commit_upload(
+                                        tmp,
+                                        &name,
+                                        &mime,
+                                        size as u64,
+                                        destination,
+                                        &session_dir,
+                                        &session_id,
+                                        root,
+                                    ) {
+                                        Ok(descriptor) => {
+                                            bus.send(crate::event::AppEvent::UploadReady {
+                                                descriptor: descriptor.clone(),
+                                            });
+                                            let body = serde_json::to_string(&descriptor)
+                                                .unwrap_or_else(|_| "{}".to_string());
+                                            format!(
+                                                "HTTP/1.1 200 OK\r\n\
+                                                 Content-Type: application/json\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Cache-Control: no-cache\r\n\
+                                                 Access-Control-Allow-Origin: *\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n\
+                                                 {}",
+                                                body.len(),
+                                                body
+                                            )
+                                        }
+                                        Err(e) => upload_error_response(
+                                            "500 Internal Server Error",
+                                            &format!("commit upload: {e}"),
+                                        ),
+                                    }
+                                }
+                            }
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET") && request_line.contains(" /api/uploads") {
+                        // GET /api/uploads              — list uploads for the current session
+                        // GET /api/uploads/<id>/raw     — stream bytes of one upload
+                        use tokio::io::AsyncWriteExt;
+                        let response = 'get_upload: {
+                            let Some(ref slog) = session_log else {
+                                break 'get_upload upload_error_response(
+                                    "404 Not Found",
+                                    "no active session",
+                                );
+                            };
+                            let Some(ref root) = project_root_for_changes else {
+                                break 'get_upload upload_error_response(
+                                    "404 Not Found",
+                                    "no project root",
+                                );
+                            };
+                            let session_dir = match slog.lock() {
+                                Ok(l) => l.dir().to_path_buf(),
+                                Err(_) => {
+                                    break 'get_upload upload_error_response(
+                                        "500 Internal Server Error",
+                                        "session log lock poisoned",
+                                    );
+                                }
+                            };
+                            // Path after /api/uploads
+                            let path_and_q = request_line
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or("");
+                            let path = path_and_q.splitn(2, '?').next().unwrap_or("");
+                            let suffix = path.trim_start_matches("/api/uploads").trim_matches('/');
+                            if suffix.is_empty() {
+                                let uploads = crate::upload_store::list_uploads(&session_dir, root);
+                                let body = serde_json::to_string(&uploads)
+                                    .unwrap_or_else(|_| "[]".to_string());
+                                format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                )
+                            } else if let Some(id) = suffix.strip_suffix("/raw") {
+                                // GET raw bytes for one upload.
+                                match crate::upload_store::find_upload(id, &session_dir, root) {
+                                    None => upload_error_response(
+                                        "404 Not Found",
+                                        "upload not found",
+                                    ),
+                                    Some(d) => {
+                                        match std::fs::read(&d.path) {
+                                            Ok(bytes) => {
+                                                let header = format!(
+                                                    "HTTP/1.1 200 OK\r\n\
+                                                     Content-Type: {}\r\n\
+                                                     Content-Length: {}\r\n\
+                                                     Content-Disposition: inline; filename=\"{}\"\r\n\
+                                                     Cache-Control: no-cache\r\n\
+                                                     Access-Control-Allow-Origin: *\r\n\
+                                                     Connection: close\r\n\
+                                                     \r\n",
+                                                    d.mime,
+                                                    bytes.len(),
+                                                    d.name.replace('"', ""),
+                                                );
+                                                let _ = stream.write_all(header.as_bytes()).await;
+                                                let _ = stream.write_all(&bytes).await;
+                                                // Skip the trailing write_all below.
+                                                break 'get_upload String::new();
+                                            }
+                                            Err(e) => upload_error_response(
+                                                "500 Internal Server Error",
+                                                &format!("read upload: {e}"),
+                                            ),
+                                        }
+                                    }
+                                }
+                            } else {
+                                upload_error_response(
+                                    "404 Not Found",
+                                    "unknown upload route",
+                                )
+                            }
+                        };
+                        if !response.is_empty() {
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        }
+                    } else if request_line.starts_with("DELETE") && request_line.contains(" /api/uploads/") {
+                        // DELETE /api/uploads/<id> — remove the file + sidecar.
+                        use tokio::io::AsyncWriteExt;
+                        let response = 'del_upload: {
+                            let Some(ref slog) = session_log else {
+                                break 'del_upload upload_error_response(
+                                    "404 Not Found",
+                                    "no active session",
+                                );
+                            };
+                            let Some(ref root) = project_root_for_changes else {
+                                break 'del_upload upload_error_response(
+                                    "404 Not Found",
+                                    "no project root",
+                                );
+                            };
+                            let session_dir = match slog.lock() {
+                                Ok(l) => l.dir().to_path_buf(),
+                                Err(_) => {
+                                    break 'del_upload upload_error_response(
+                                        "500 Internal Server Error",
+                                        "session log lock poisoned",
+                                    );
+                                }
+                            };
+                            let path_and_q = request_line
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or("");
+                            let path = path_and_q.splitn(2, '?').next().unwrap_or("");
+                            let id = path.trim_start_matches("/api/uploads/").trim_matches('/');
+                            if id.is_empty() {
+                                break 'del_upload upload_error_response(
+                                    "400 Bad Request",
+                                    "missing upload id",
+                                );
+                            }
+                            match crate::upload_store::delete_upload(id, &session_dir, root) {
+                                Ok(_) => {
+                                    bus.send(crate::event::AppEvent::UploadDeleted {
+                                        id: id.to_string(),
+                                    });
+                                    let body = serde_json::json!({"ok": true}).to_string();
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\n\
+                                         Content-Type: application/json\r\n\
+                                         Content-Length: {}\r\n\
+                                         Cache-Control: no-cache\r\n\
+                                         Access-Control-Allow-Origin: *\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {}",
+                                        body.len(),
+                                        body
+                                    )
+                                }
+                                Err(e) => upload_error_response(
+                                    "500 Internal Server Error",
+                                    &format!("delete: {e}"),
+                                ),
+                            }
+                        };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("GET") && request_line.contains("/api/session/current/changes") {
                         // File change tracking endpoints:

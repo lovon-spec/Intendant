@@ -41,6 +41,7 @@ mod tools;
 mod transcription;
 mod tui;
 mod types;
+mod upload_store;
 mod user_mode;
 mod vision;
 mod app_state_pricing;
@@ -5538,12 +5539,24 @@ async fn run_with_presence(
             let send_result = if envelope.attachment_frame_ids.is_empty() {
                 agent.send_message(thread, &merged_text).await
             } else {
-                let attachments = resolve_frame_attachments(
+                // Mixed attachments: frame ids (auto-prefixed "frame:" or bare)
+                // and upload ids (always "upload:<id>"). Grab the session dir
+                // from the live session log so upload lookups work after a
+                // session rotation.
+                let session_dir = session_log
+                    .lock()
+                    .ok()
+                    .map(|l| l.dir().to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let attachments = resolve_attachments(
                     &envelope.attachment_frame_ids,
                     &frame_registry,
-                ).await;
+                    &session_dir,
+                    &project.root,
+                )
+                .await;
                 agent
-                    .send_message_with_images(thread, &merged_text, &attachments)
+                    .send_message_with_attachments(thread, &merged_text, &attachments)
                     .await
             };
             if let Err(e) = send_result {
@@ -6496,6 +6509,89 @@ async fn resolve_frame_attachments(
         ));
     }
     atts
+}
+
+/// Resolve a mixed list of attachment identifiers (frames from the live
+/// frame registry, uploads from the on-disk store) into the unified
+/// `AgentAttachment` shape the backends consume.
+///
+/// Identifier convention:
+/// - `"frame:<id>"` or plain `<id>` — a frame registry entry. Plain ids
+///   remain supported for backward compatibility with the existing
+///   dashboard path that submits frame ids directly.
+/// - `"upload:<id>"` — an upload store descriptor. Images load base64
+///   inline (for Gemini ACP); files pass through as `AgentAttachment::File`
+///   and the backend's default handling prepends a prelude pointing at the
+///   on-disk path.
+///
+/// Order is preserved from the input list so the prelude reads the files
+/// in the order the user selected them.
+async fn resolve_attachments(
+    ids: &[String],
+    registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+    session_dir: &std::path::Path,
+    project_root: &std::path::Path,
+) -> Vec<external_agent::AgentAttachment> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<external_agent::AgentAttachment> = Vec::with_capacity(ids.len());
+    let reg = registry.read().await;
+    for raw in ids {
+        if let Some(upload_id) = raw.strip_prefix("upload:") {
+            let Some(d) = upload_store::find_upload(upload_id, session_dir, project_root)
+            else {
+                continue;
+            };
+            if d.is_image() {
+                // Load the bytes eagerly so Gemini ACP can base64-encode
+                // inline. Codex prefers the path.
+                let (base64, mime) = match std::fs::read(&d.path) {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        (
+                            base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            d.mime.clone(),
+                        )
+                    }
+                    Err(_) => continue,
+                };
+                out.push(external_agent::AgentAttachment::Image(
+                    external_agent::AgentImageAttachment::from_frame_path(
+                        d.path.clone(),
+                        base64,
+                        mime,
+                    ),
+                ));
+            } else {
+                out.push(external_agent::AgentAttachment::File(
+                    external_agent::AgentFileAttachment {
+                        local_path: d.path.clone(),
+                        name: d.name.clone(),
+                        mime_type: d.mime.clone(),
+                        size: d.size,
+                    },
+                ));
+            }
+            continue;
+        }
+        // Frame resolution: accept both "frame:<id>" and bare ids for
+        // backward compatibility with dashboards that predate the upload
+        // feature.
+        let fid = raw.strip_prefix("frame:").unwrap_or(raw);
+        let Ok(data) = reg.read_hq(fid) else { continue };
+        use base64::Engine;
+        let base64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let path = reg.path_for(fid);
+        out.push(external_agent::AgentAttachment::Image(
+            external_agent::AgentImageAttachment::from_frame_path(
+                path,
+                base64,
+                "image/jpeg".to_string(),
+            ),
+        ));
+    }
+    out
 }
 
 /// Auto-attach the latest display frame(s) from the frame registry.
