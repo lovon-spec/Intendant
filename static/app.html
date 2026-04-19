@@ -1882,6 +1882,68 @@ html, body {
   justify-content: space-between;
 }
 
+/* ── Rollback modal ──
+   Local modal pattern for rollback confirmation with files/conversation
+   checkboxes. Uses Catppuccin Mocha theme variables so it follows the
+   rest of the dashboard. Escape key closes it (see global keydown handler). */
+.modal-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+}
+.modal-dialog {
+  background: var(--base);
+  border: 1px solid var(--surface1);
+  border-radius: 8px;
+  padding: 24px;
+  min-width: 420px;
+  max-width: 560px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+.modal-dialog h3 {
+  margin: 0 0 12px;
+  color: var(--text);
+}
+.modal-description { color: var(--subtext0); margin-bottom: 12px; }
+.modal-checkbox {
+  display: block;
+  padding: 10px 8px;
+  border: 1px solid var(--surface0);
+  border-radius: 4px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.modal-checkbox:hover { background: var(--surface0); }
+.modal-checkbox input { margin-right: 8px; vertical-align: middle; }
+.modal-checkbox span { color: var(--text); font-weight: 600; }
+.modal-checkbox small { display: block; color: var(--subtext0); margin-left: 24px; margin-top: 4px; }
+.modal-warning {
+  background: var(--surface0);
+  color: var(--yellow);
+  border-left: 3px solid var(--yellow);
+  padding: 8px 12px;
+  margin: 12px 0;
+  font-size: 12px;
+  border-radius: 2px;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+.modal-cancel, .modal-confirm {
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: none;
+  cursor: pointer;
+  font-weight: 600;
+}
+.modal-cancel { background: var(--surface1); color: var(--text); }
+.modal-confirm { background: var(--red); color: var(--base); }
+.modal-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* ── Control sub-tab ── */
 .control-pane-body {
   padding: 16px 20px;
@@ -4245,6 +4307,34 @@ html, body {
   </div>
 </div>
 
+<!-- Rollback confirmation modal.
+     Opened by the timeline strip (Changes sub-tab) with two checkboxes
+     so the user can pick whether to revert files, the conversation, or
+     both. Wired up in the Timeline section below. -->
+<div id="rollback-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog">
+    <h3>Roll back to round <span id="rollback-round-label"></span></h3>
+    <p class="modal-description">
+      Choose what to revert:
+    </p>
+    <label class="modal-checkbox">
+      <input type="checkbox" id="rollback-files" checked>
+      <span>Revert files</span>
+      <small>Restore all changed files to their state at this round</small>
+    </label>
+    <label class="modal-checkbox">
+      <input type="checkbox" id="rollback-conversation">
+      <span>Revert conversation</span>
+      <small>Truncate the agent's memory to this round. For Claude Code and Gemini, this resets the session (loses all context).</small>
+    </label>
+    <div class="modal-warning" id="rollback-warning" style="display:none"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeRollbackModal()">Cancel</button>
+      <button class="modal-confirm" id="rollback-confirm-btn" onclick="confirmRollback()">Roll back</button>
+    </div>
+  </div>
+</div>
+
 <!-- Voice Overlay -->
 <div class="voice-overlay" id="voiceOverlay" draggable="false">
   <div class="voice-drag-handle" id="voiceDragHandle"></div>
@@ -5583,61 +5673,115 @@ function renderTimeline() {
   }
 }
 
-async function doRollback(roundId) {
+// Clicking a round in the timeline strip routes here, which opens the
+// rollback modal rather than immediately POSTing. The modal lets the user
+// pick whether to revert files, the conversation, or both — the actual
+// request is built and sent in confirmRollback() below.
+let pendingRollbackRoundId = null;
+
+function doRollback(roundId) {
   if (!Number.isFinite(roundId)) return;
-  // Offer the user three choices: files only (classic), conversation only,
-  // or both. confirm() is the only stock browser dialog; we stack two of
-  // them so no extra chrome is needed.
-  const msg = `Roll back to round #${roundId}?\n\nOK = revert files only (classic).\nCancel = open more options.`;
-  const simple = confirm(msg);
-  let revertFiles = true;
-  let revertConversation = false;
-  if (!simple) {
-    const extra = prompt(
-      `Advanced rollback for round #${roundId}:\n` +
-      `  files = revert files only\n` +
-      `  convo = revert conversation only\n` +
-      `  both  = revert files AND conversation\n` +
-      `  (cancel = abort)`,
-      'both'
-    );
-    if (extra == null) return;
-    const choice = extra.trim().toLowerCase();
-    if (choice === 'files') {
-      revertFiles = true;
-      revertConversation = false;
-    } else if (choice === 'convo' || choice === 'conversation') {
-      revertFiles = false;
-      revertConversation = true;
-    } else if (choice === 'both') {
-      revertFiles = true;
-      revertConversation = true;
-    } else {
-      alert(`Unrecognized choice "${extra}" — rollback aborted.`);
-      return;
-    }
+  openRollbackModal(roundId, `#${roundId}`);
+}
+window.doRollback = doRollback;
+
+function openRollbackModal(roundId, roundLabel) {
+  pendingRollbackRoundId = roundId;
+  const labelEl = document.getElementById('rollback-round-label');
+  if (labelEl) {
+    // Accept either a pre-formatted label or fall back to a short id.
+    const fallback = typeof roundId === 'string' ? roundId.substring(0, 8) : String(roundId);
+    labelEl.textContent = roundLabel || fallback;
   }
+  const filesBox = document.getElementById('rollback-files');
+  const convBox = document.getElementById('rollback-conversation');
+  if (filesBox) filesBox.checked = true;
+  if (convBox) convBox.checked = false;
+  updateRollbackWarning();
+  const modal = document.getElementById('rollback-modal');
+  if (modal) modal.style.display = 'flex';
+}
+window.openRollbackModal = openRollbackModal;
+
+function closeRollbackModal() {
+  pendingRollbackRoundId = null;
+  const modal = document.getElementById('rollback-modal');
+  if (modal) modal.style.display = 'none';
+}
+window.closeRollbackModal = closeRollbackModal;
+
+function updateRollbackWarning() {
+  const filesEl = document.getElementById('rollback-files');
+  const convEl = document.getElementById('rollback-conversation');
+  const warn = document.getElementById('rollback-warning');
+  const btn = document.getElementById('rollback-confirm-btn');
+  if (!filesEl || !convEl || !warn || !btn) return;
+  const files = filesEl.checked;
+  const conv = convEl.checked;
+  if (!files && !conv) {
+    warn.textContent = 'Select at least one option to roll back.';
+    warn.style.display = '';
+    btn.disabled = true;
+  } else if (conv && !files) {
+    warn.innerHTML = '\u26A0 Reverting conversation without files: the agent will forget what it did, but the file changes remain. Agent may hallucinate about code state.';
+    warn.style.display = '';
+    btn.disabled = false;
+  } else if (files && !conv) {
+    warn.innerHTML = '\u26A0 Reverting files without conversation: the agent thinks changes are still applied but they\'re gone. May cause confusion on next turn.';
+    warn.style.display = '';
+    btn.disabled = false;
+  } else {
+    warn.style.display = 'none';
+    btn.disabled = false;
+  }
+}
+window.updateRollbackWarning = updateRollbackWarning;
+
+// Wire the live warning/disable logic to the checkboxes. The elements live
+// in the static modal markup above, so we can bind once at script load.
+{
+  const filesEl = document.getElementById('rollback-files');
+  const convEl = document.getElementById('rollback-conversation');
+  if (filesEl) filesEl.addEventListener('change', updateRollbackWarning);
+  if (convEl) convEl.addEventListener('change', updateRollbackWarning);
+}
+
+async function confirmRollback() {
+  if (pendingRollbackRoundId === null || pendingRollbackRoundId === undefined) return;
+  const roundId = pendingRollbackRoundId;
+  const revertFiles = document.getElementById('rollback-files').checked;
+  const revertConv = document.getElementById('rollback-conversation').checked;
+  closeRollbackModal();
   try {
-    const r = await fetch('/api/session/current/rollback', {
+    const resp = await fetch('/api/session/current/rollback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         round_id: roundId,
         revert_files: revertFiles,
-        revert_conversation: revertConversation,
+        revert_conversation: revertConv,
       }),
     });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      alert(`Rollback failed: ${err.error || r.statusText}`);
-      return;
+    if (!resp.ok) {
+      // Prefer the structured {error} shape the server already uses for
+      // this endpoint; fall back to raw text for unexpected error bodies.
+      let errMsg = resp.statusText;
+      try {
+        const j = await resp.clone().json();
+        if (j && j.error) errMsg = j.error;
+      } catch (_) {
+        const t = await resp.text().catch(() => '');
+        if (t) errMsg = t;
+      }
+      alert(`Rollback failed: ${errMsg}`);
     }
-    // The `rolled_back` / `conversation_rolled_back` WS events refresh the UI.
+    // Success: backend emits `rolled_back` / `conversation_rolled_back`
+    // events, the WASM layer raises HistoryChanged, and the UI refreshes.
   } catch (e) {
-    alert(`Rollback error: ${e.message || e}`);
+    alert(`Rollback failed: ${e.message || e}`);
   }
 }
-window.doRollback = doRollback;
+window.confirmRollback = confirmRollback;
 
 async function doRedo() {
   try {
@@ -12715,6 +12859,20 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && displayPickerVisible) hideDisplayPicker();
+});
+
+// Rollback modal: Escape closes, click on the backdrop (outside the
+// dialog) also closes — follows the same dismissal pattern as the
+// display picker so keyboard flows feel consistent.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const modal = document.getElementById('rollback-modal');
+  if (modal && modal.style.display !== 'none') {
+    closeRollbackModal();
+  }
+});
+document.getElementById('rollback-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'rollback-modal') closeRollbackModal();
 });
 
 // Enter to submit
