@@ -1562,6 +1562,10 @@ impl App {
                 // Dispatcher re-emits as AppEvent::InterruptRequested; TUI
                 // reacts to that event rather than the raw ControlMsg.
             }
+            ControlMsg::Steer { .. } => {
+                // Dispatcher re-emits as AppEvent::SteerRequested; TUI
+                // reacts to that (via the log path in `handle_event`).
+            }
         }
     }
 
@@ -2293,6 +2297,42 @@ impl App {
                     session_id: self.session_id.clone(),
                     task: self.task_description.clone(),
                 });
+            }
+            AppEvent::SteerRequested { ref text, ref id } => {
+                let preview: String = text.chars().take(80).collect();
+                let suffix = if text.chars().count() > 80 { "..." } else { "" };
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", id)
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!("Steer requested{}: {}{}", id_part, preview, suffix),
+                );
+            }
+            AppEvent::SteerQueued { ref id, ref reason } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", id)
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!("Steer queued{}: {}", id_part, reason),
+                );
+            }
+            AppEvent::SteerDelivered { ref id, mid_turn } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", id)
+                };
+                let mode = if mid_turn { "mid-turn" } else { "follow-up" };
+                self.log(
+                    LogLevel::Info,
+                    format!("Steer delivered{} ({})", id_part, mode),
+                );
             }
         }
 

@@ -1339,6 +1339,38 @@ impl ExternalAgent for CodexAgent {
         Ok(())
     }
 
+    async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
+        // Mirror `interrupt_turn`'s precondition checks so the error
+        // messages are consistent: "no active turn to steer" /
+        // "no active thread to steer" both map to typed ExternalAgent
+        // errors that `drain_external_agent_events` can fall back on.
+        let turn_id = {
+            let guard = self.active_turn_id.lock().await;
+            guard.clone()
+        };
+        let turn_id = turn_id.ok_or_else(|| {
+            CallerError::ExternalAgent("no active turn to steer".into())
+        })?;
+        let thread_id = {
+            let guard = self.active_thread_id.lock().await;
+            guard.clone()
+        };
+        let thread_id = thread_id.ok_or_else(|| {
+            CallerError::ExternalAgent("no active thread to steer".into())
+        })?;
+        let params = serde_json::json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": text}],
+            "expectedTurnId": turn_id,
+        });
+        // `turn/steer` is a JSON-RPC request; Codex replies with
+        // `{"turnId": "..."}` on success. We don't care about the returned
+        // id — the active turn id hasn't changed, and the active_turn_id
+        // cache is still valid for the next interrupt/steer call.
+        let _ = self.send_request("turn/steer", Some(params)).await?;
+        Ok(())
+    }
+
     async fn thread_action(
         &mut self,
         op: &str,
@@ -2179,6 +2211,89 @@ mod tests {
         assert_eq!(v["method"], "turn/interrupt");
         assert_eq!(v["params"]["threadId"], "thread-abc");
         assert_eq!(v["params"]["turnId"], "turn-xyz");
+    }
+
+    // ── Mid-turn steering (`turn/steer`) ──
+    //
+    // Steering injects user text into the currently running turn without
+    // cancelling it. Same pattern as `interrupt_turn` — precondition checks
+    // for active turn/thread ids, then a JSON-RPC request with the steering
+    // params. The response carries a turnId we intentionally discard.
+
+    #[tokio::test]
+    async fn steer_turn_without_active_turn_errors() {
+        let mut agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            "danger-full-access".into(),
+            None,
+        );
+        let err = agent.steer_turn("redirect to test coverage").await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("no active turn"),
+                    "expected 'no active turn' error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn steer_turn_without_thread_errors() {
+        let mut agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            "danger-full-access".into(),
+            None,
+        );
+        *agent.active_turn_id.lock().await = Some("t-1".into());
+        let err = agent.steer_turn("please stop").await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("no active thread"),
+                    "expected 'no active thread' error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn steer_turn_wire_format_is_jsonrpc_request() {
+        // Verify the params shape matches the spec: threadId + expectedTurnId
+        // for the precondition, and input as a singleton content array of
+        // type="text". Frozen format — changes here should update the
+        // Codex compat docs too.
+        let text = "please check tests/e2e/ first";
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "input": [{"type": "text", "text": text}],
+            "expectedTurnId": "turn-xyz",
+        });
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 99,
+            method: "turn/steer".to_string(),
+            params: Some(params),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 99);
+        assert_eq!(v["method"], "turn/steer");
+        assert_eq!(v["params"]["threadId"], "thread-abc");
+        assert_eq!(v["params"]["expectedTurnId"], "turn-xyz");
+        let input = v["params"]["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], text);
     }
 
     // ── Thread actions (compact / fork / undo / review / memory-reset) ──

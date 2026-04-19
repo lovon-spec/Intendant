@@ -399,6 +399,10 @@ struct DrainConfig<'a> {
     /// When true and no `json_approval` slot is set, auto-deny approval
     /// requests (headless mode with no interactive input).
     headless: bool,
+    /// Shared context-injection queue. Fallback target when the backend
+    /// does not support mid-turn steering — queued items are drained on
+    /// the next turn's follow-up message path.
+    context_injection: &'a event::ContextInjectionQueue,
 }
 
 /// Result of draining one batch of external agent events.
@@ -543,6 +547,48 @@ async fn drain_external_agent_events(
                                     l.warn(&format!(
                                         "Interrupt failed for {}: {}", agent.name(), e
                                     ))
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(AppEvent::SteerRequested { text, id }) => {
+                        // Try native mid-turn steering first. On success the
+                        // backend injects the text into the active turn and
+                        // we're done. On failure (unsupported or no active
+                        // turn), fall back to queuing onto context_injection
+                        // — the drain-between-turns path in
+                        // `run_external_agent_mode` / `run_with_presence`
+                        // will flush it as a follow-up prefix on the next
+                        // user message and emit SteerDelivered at that point.
+                        match agent.steer_turn(&text).await {
+                            Ok(()) => {
+                                slog(config.session_log, |l| {
+                                    l.info(&format!(
+                                        "Steer delivered mid-turn to {}",
+                                        agent.name()
+                                    ))
+                                });
+                                config.bus.send(AppEvent::SteerDelivered {
+                                    id,
+                                    mid_turn: true,
+                                });
+                            }
+                            Err(e) => {
+                                let reason = format!(
+                                    "{} doesn't support mid-turn steering ({}); queued as follow-up",
+                                    agent.name(), e
+                                );
+                                if let Ok(mut q) = config.context_injection.lock() {
+                                    q.push(event::ContextInjection::text_with_steer_id(
+                                        text.clone(),
+                                        id.clone(),
+                                    ));
+                                }
+                                slog(config.session_log, |l| l.info(&reason));
+                                config.bus.send(AppEvent::SteerQueued {
+                                    id,
+                                    reason,
                                 });
                             }
                         }
@@ -954,6 +1000,60 @@ async fn drain_external_agent_events(
     }
 }
 
+/// Drain queued steer items from `context_injection` and merge them into a
+/// follow-up user message bound for an external agent.
+///
+/// Only drains items whose `steer_id` is `Some(_)` — those are the entries
+/// that the steer fallback path pushed. Other queue sources (display
+/// takeover, presence annotations) are left in place for the native
+/// drain-between-turns path used by the internal agent loop.
+///
+/// For each drained item, emits `AppEvent::SteerDelivered { mid_turn: false }`
+/// so the dashboard can retire its pending-steer UI row. The returned
+/// string interleaves queued steers (prefixed with `[User]`) above the
+/// caller's `followup` text — the result is sent as a single external agent
+/// message so the agent sees both in the same turn's input.
+///
+/// When `followup` is empty the return is `None`, meaning "nothing to send"
+/// — this lets callers avoid an empty `send_message` when the follow-up
+/// was purely a delivery of queued steers (the external agent loop does
+/// not distinguish "steer only" from "user message", so we skip the send
+/// and wait for the next follow-up).
+fn drain_steer_queue_as_followup(
+    context_injection: &event::ContextInjectionQueue,
+    followup: &str,
+    bus: &EventBus,
+) -> Option<String> {
+    let mut prefix_lines: Vec<String> = Vec::new();
+    if let Ok(mut q) = context_injection.lock() {
+        // Partition: keep non-steer entries, pull out steer entries.
+        let mut kept = Vec::with_capacity(q.len());
+        for inj in q.drain(..) {
+            if inj.steer_id.is_some() {
+                prefix_lines.push(format!("[User] {}", inj.text));
+                let id = inj.steer_id.clone().unwrap_or_default();
+                bus.send(AppEvent::SteerDelivered {
+                    id,
+                    mid_turn: false,
+                });
+            } else {
+                kept.push(inj);
+            }
+        }
+        *q = kept;
+    }
+    if prefix_lines.is_empty() && followup.is_empty() {
+        return None;
+    }
+    if prefix_lines.is_empty() {
+        Some(followup.to_string())
+    } else if followup.is_empty() {
+        Some(prefix_lines.join("\n"))
+    } else {
+        Some(format!("{}\n{}", prefix_lines.join("\n"), followup))
+    }
+}
+
 /// Configuration for `run_daemon_loop`.
 struct DaemonConfig {
     bus: EventBus,
@@ -1122,7 +1222,9 @@ async fn run_daemon_loop(config: DaemonConfig) {
                                     backend, new_task.clone(), new_project,
                                     bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
                                     new_log_dir, follow_up_rx, None,
-                                    event::ApprovalRegistry::default(), true, web_port_for_spawn,
+                                    event::ApprovalRegistry::default(),
+                                    event::ContextInjectionQueue::default(),
+                                    true, web_port_for_spawn,
                                     attachment_images.clone(),
                                 ).await
                             } else {
@@ -3065,6 +3167,105 @@ Also: {"source": "bare"}"#;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].2, "OK");
     }
+
+    // ── Steer fallback plumbing ──
+    //
+    // The full `drain_external_agent_events` loop is integration-heavy
+    // (needs a backend + event channel); we unit-test the smaller helpers
+    // that encapsulate the fallback policy. The end-to-end flow is covered
+    // indirectly by the dispatcher / Codex tests.
+
+    #[tokio::test]
+    async fn drain_steer_queue_as_followup_prefixes_single_queued_item() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let queue = event::ContextInjectionQueue::default();
+        queue
+            .lock()
+            .unwrap()
+            .push(event::ContextInjection::text_with_steer_id(
+                "switch to Python".into(),
+                "steer-1".into(),
+            ));
+
+        let merged =
+            drain_steer_queue_as_followup(&queue, "original follow-up", &bus)
+                .expect("should produce a message");
+
+        assert_eq!(merged, "[User] switch to Python\noriginal follow-up");
+        // Queue drained.
+        assert!(queue.lock().unwrap().is_empty());
+
+        // SteerDelivered emitted for the drained item.
+        let ev = rx.try_recv().expect("SteerDelivered event");
+        match ev {
+            AppEvent::SteerDelivered { id, mid_turn } => {
+                assert_eq!(id, "steer-1");
+                assert!(!mid_turn, "queued fallback should report mid_turn=false");
+            }
+            other => panic!("expected SteerDelivered, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_steer_queue_as_followup_ignores_non_steer_entries() {
+        // A ContextInjection without a steer_id (e.g. from display
+        // takeover) must be left alone — the native agent loop still owns
+        // draining those.
+        let bus = EventBus::new();
+        let queue = event::ContextInjectionQueue::default();
+        queue
+            .lock()
+            .unwrap()
+            .push(event::ContextInjection::text("display grant".into()));
+
+        let merged =
+            drain_steer_queue_as_followup(&queue, "follow-up", &bus)
+                .expect("should produce a message");
+        assert_eq!(merged, "follow-up");
+        assert_eq!(queue.lock().unwrap().len(), 1, "non-steer entry preserved");
+    }
+
+    #[tokio::test]
+    async fn drain_steer_queue_as_followup_no_queue_no_followup_is_none() {
+        // Empty queue + empty followup => Some(None) (caller will skip the
+        // send). Verifies the "steer only + empty follow-up" degenerate
+        // case doesn't produce an empty agent message.
+        let bus = EventBus::new();
+        let queue = event::ContextInjectionQueue::default();
+        assert!(drain_steer_queue_as_followup(&queue, "", &bus).is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_steer_queue_as_followup_combines_multiple_items() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let queue = event::ContextInjectionQueue::default();
+        {
+            let mut q = queue.lock().unwrap();
+            q.push(event::ContextInjection::text_with_steer_id(
+                "first".into(),
+                "s1".into(),
+            ));
+            q.push(event::ContextInjection::text_with_steer_id(
+                "second".into(),
+                "s2".into(),
+            ));
+        }
+
+        let merged =
+            drain_steer_queue_as_followup(&queue, "main", &bus).expect("merged");
+        assert_eq!(merged, "[User] first\n[User] second\nmain");
+
+        let mut delivered_ids: Vec<String> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::SteerDelivered { id, mid_turn } = ev {
+                assert!(!mid_turn);
+                delivered_ids.push(id);
+            }
+        }
+        assert_eq!(delivered_ids, vec!["s1".to_string(), "s2".to_string()]);
+    }
 }
 
 const PROGRESS_INTERVAL: usize = 5;
@@ -3111,10 +3312,22 @@ async fn run_agent_loop(
     // unblocks immediately. The loop checks the token at its boundaries
     // and wraps the streaming API call in tokio::select! so an interrupt
     // mid-stream drops the response cleanly.
+    //
+    // The same watcher also handles AppEvent::SteerRequested: it pushes
+    // the steer text onto the shared `context_injection` queue (tagged as
+    // a user injection so it survives inter-task drains) and emits
+    // `SteerDelivered { mid_turn: true }`. The native agent loop drains
+    // `context_injection` at the top of every turn, so queued steers land
+    // on the next iteration's user message — from the user's perspective
+    // that's mid-turn (no follow-up required from them). We keep the
+    // watcher alive across multiple steers — unlike the interrupt branch
+    // which exits after cancelling.
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cancel_watcher_handle = {
         let watcher_token = cancel_token.clone();
         let watcher_registry = approval_registry.clone();
+        let watcher_injection = context_injection.clone();
+        let watcher_bus = bus.clone();
         let mut bus_rx = bus.subscribe();
         tokio::spawn(async move {
             loop {
@@ -3132,6 +3345,26 @@ async fn run_agent_loop(
                         }
                         watcher_token.cancel();
                         break;
+                    }
+                    Ok(AppEvent::SteerRequested { text, id }) => {
+                        // Queue the steer for the next turn's drain. The
+                        // native loop has no separate "mid-turn inject"
+                        // hook — model calls are atomic — so this is as
+                        // close to mid-turn as the native path gets.
+                        // Frontends see `mid_turn: true` because they did
+                        // not have to send a follow-up themselves.
+                        if let Ok(mut q) = watcher_injection.lock() {
+                            q.push(
+                                event::ContextInjection::text_with_steer_id(
+                                    text,
+                                    id.clone(),
+                                ),
+                            );
+                        }
+                        watcher_bus.send(AppEvent::SteerDelivered {
+                            id,
+                            mid_turn: true,
+                        });
                     }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -3190,16 +3423,19 @@ async fn run_agent_loop(
             break;
         }
 
-        // Drain context injection queue (display takeover messages, presence interjections, etc.)
+        // Drain context injection queue (display takeover messages, presence
+        // interjections, steer fallbacks, etc.). Steer entries (tagged with
+        // `steer_id`) are surfaced as `[User]` so the model reads them as
+        // user direction; everything else uses the `[System]` prefix it has
+        // always used.
         if let Ok(mut q) = context_injection.lock() {
             for inj in q.drain(..) {
+                let prefix = if inj.steer_id.is_some() { "User" } else { "System" };
+                let text = format!("[{}] {}", prefix, inj.text);
                 if inj.images.is_empty() {
-                    conversation.add_user(format!("[System] {}", inj.text));
+                    conversation.add_user(text.clone());
                 } else {
-                    conversation.add_user_with_images(
-                        format!("[System] {}", inj.text),
-                        inj.images,
-                    );
+                    conversation.add_user_with_images(text.clone(), inj.images);
                 }
                 slog(&session_log, |l| l.info(&format!("Context injected: {}", inj.text)));
             }
@@ -5290,17 +5526,24 @@ async fn run_with_presence(
             // Send the task as a new turn in the existing thread, with any
             // user-attached frames passed as image inputs (Codex `LocalImage`,
             // Gemini ACP `Image` content block).
+            //
+            // Merge in any steer items queued by the fallback path (backend
+            // returned Err from `steer_turn`). They prepend as `[User]`
+            // lines so the agent sees them in the same turn's input.
             let agent = persistent_agent.as_mut().unwrap();
             let thread = persistent_thread.as_ref().unwrap();
+            let merged_text =
+                drain_steer_queue_as_followup(&context_injection, &task_text, &bus)
+                    .unwrap_or_else(|| task_text.clone());
             let send_result = if envelope.attachment_frame_ids.is_empty() {
-                agent.send_message(thread, &task_text).await
+                agent.send_message(thread, &merged_text).await
             } else {
                 let attachments = resolve_frame_attachments(
                     &envelope.attachment_frame_ids,
                     &frame_registry,
                 ).await;
                 agent
-                    .send_message_with_images(thread, &task_text, &attachments)
+                    .send_message_with_images(thread, &merged_text, &attachments)
                     .await
             };
             if let Err(e) = send_result {
@@ -5323,6 +5566,7 @@ async fn run_with_presence(
                 agent_source: Some(backend.to_string()),
                 suppress_agent_started: true,
                 headless: false,
+                context_injection: &context_injection,
             };
             match drain_external_agent_events(agent, event_rx, &drain_config, &mut cumulative_stats).await {
                 DrainOutcome::TurnCompleted { message, turns_in_round } => {
@@ -5916,6 +6160,7 @@ async fn run_direct_mode(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_external_agent_mode(
     backend: external_agent::AgentBackend,
     task: String,
@@ -5927,6 +6172,7 @@ async fn run_external_agent_mode(
     mut follow_up_rx: FollowUpReceiver,
     json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
+    context_injection: event::ContextInjectionQueue,
     headless: bool,
     web_port: Option<u16>,
     attachment_images: Vec<conversation::ImageData>,
@@ -5979,6 +6225,7 @@ async fn run_external_agent_mode(
         agent_source: None,
         suppress_agent_started: false,
         headless,
+        context_injection: &context_injection,
     };
 
     loop {
@@ -6005,10 +6252,16 @@ async fn run_external_agent_mode(
                     Some(followup) => {
                         round += 1;
                         stats.turns = 0;
+                        let merged = drain_steer_queue_as_followup(
+                            &context_injection,
+                            &followup,
+                            &bus,
+                        )
+                        .unwrap_or(followup);
                         slog(&session_log, |l| {
-                            l.info(&format!("Follow-up round {}: {}", round, followup));
+                            l.info(&format!("Follow-up round {}: {}", round, merged));
                         });
-                        if let Err(e) = agent.send_message(&thread, &followup).await {
+                        if let Err(e) = agent.send_message(&thread, &merged).await {
                             bus.send(AppEvent::LoopError(format!(
                                 "Failed to send follow-up: {}",
                                 e
@@ -6041,10 +6294,16 @@ async fn run_external_agent_mode(
                     Some(followup) => {
                         round += 1;
                         stats.turns = 0;
+                        let merged = drain_steer_queue_as_followup(
+                            &context_injection,
+                            &followup,
+                            &bus,
+                        )
+                        .unwrap_or(followup);
                         slog(&session_log, |l| {
-                            l.info(&format!("Follow-up round {}: {}", round, followup));
+                            l.info(&format!("Follow-up round {}: {}", round, merged));
                         });
-                        if let Err(e) = agent.send_message(&thread, &followup).await {
+                        if let Err(e) = agent.send_message(&thread, &merged).await {
                             bus.send(AppEvent::LoopError(format!(
                                 "Failed to send follow-up: {}",
                                 e
@@ -7707,6 +7966,7 @@ async fn main() -> Result<(), CallerError> {
                             follow_up_rx,
                             None,
                             approval_registry,
+                            event::ContextInjectionQueue::default(),
                             false,
                             web_port_for_agent,
                             vec![],
@@ -8314,6 +8574,7 @@ async fn main() -> Result<(), CallerError> {
                         follow_up_rx,
                         None,
                         approval_registry_clone,
+                        context_injection_clone.clone(),
                         false, // not headless — TUI handles approval
                         web_port_for_agent,
                         vec![],
@@ -8736,6 +8997,7 @@ async fn main() -> Result<(), CallerError> {
                 follow_up_rx,
                 json_approval_slot,
                 event::ApprovalRegistry::default(),
+                event::ContextInjectionQueue::default(),
                 true, // headless mode
                 web_port_for_agent,
                 vec![],

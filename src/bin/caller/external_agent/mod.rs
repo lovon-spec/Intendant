@@ -259,6 +259,24 @@ pub trait ExternalAgent: Send + Sync {
         ))
     }
 
+    /// Inject user text into the currently running turn without interrupting
+    /// it. Backends that support native mid-turn steering (Codex via
+    /// `turn/steer`) override this; the default returns a typed error so the
+    /// caller can fall back to queuing the text onto `context_injection` and
+    /// delivering it at the start of the next turn.
+    ///
+    /// The error message is load-bearing: `drain_external_agent_events`
+    /// distinguishes "native steer failed" from "native steer unsupported"
+    /// only via the error's short string form. We intentionally don't model
+    /// the distinction in the type system because every backend eventually
+    /// gains native support, at which point the fallback path is vestigial.
+    async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
+        let _ = text;
+        Err(CallerError::ExternalAgent(
+            "mid-turn steering not supported by this backend".into(),
+        ))
+    }
+
     /// Dispatch a backend-specific thread action (Codex: compact, fork,
     /// rollback, review, memory-reset; other backends currently reject).
     /// Returns a short human-readable status message on success.

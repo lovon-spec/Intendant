@@ -166,6 +166,18 @@ impl Dispatcher {
                 bus.send(AppEvent::InterruptRequested);
             }
 
+            ControlMsg::Steer { text, id } => {
+                // Re-emit as AppEvent::SteerRequested so agent loops can
+                // subscribe and either inject the text into the active turn
+                // (native mid-turn steering) or queue it onto
+                // `context_injection` for the next turn. `id` defaults to
+                // "" so downstream consumers never have to handle an Option.
+                bus.send(AppEvent::SteerRequested {
+                    text,
+                    id: id.unwrap_or_default(),
+                });
+            }
+
             _ => {
                 // Not a task-dispatch command — ignore.
             }
@@ -438,5 +450,80 @@ mod tests {
             saw_interrupt_requested,
             "expected AppEvent::InterruptRequested to be emitted"
         );
+    }
+
+    #[tokio::test]
+    async fn steer_emits_steer_requested_with_id() {
+        // The dispatcher re-emits `ControlMsg::Steer` as
+        // `AppEvent::SteerRequested`, defaulting a missing id to "" so
+        // downstream consumers never have to handle an Option.
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            text: "use SQLite instead".into(),
+            id: Some("s1".into()),
+        }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut seen: Option<(String, String)> = None;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SteerRequested { text, id })) => {
+                    seen = Some((text, id));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        let (text, id) = seen.expect("expected AppEvent::SteerRequested");
+        assert_eq!(text, "use SQLite instead");
+        assert_eq!(id, "s1");
+    }
+
+    #[tokio::test]
+    async fn steer_without_id_defaults_to_empty_string() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            text: "never mind".into(),
+            id: None,
+        }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut seen_id: Option<String> = None;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SteerRequested { id, .. })) => {
+                    seen_id = Some(id);
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(seen_id.as_deref(), Some(""));
     }
 }
