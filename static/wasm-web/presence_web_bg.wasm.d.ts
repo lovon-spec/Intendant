@@ -45,6 +45,7 @@ export const presenceweb_send_presence_checkpoint: (a: number, b: number, c: num
 export const presenceweb_send_raw: (a: number, b: number, c: number) => number;
 export const presenceweb_send_resize: (a: number, b: number, c: number) => void;
 export const presenceweb_send_server_action: (a: number, b: any) => void;
+export const presenceweb_send_steer: (a: number, b: number, c: number) => any;
 export const presenceweb_send_text: (a: number, b: number, c: number) => void;
 export const presenceweb_send_text_passive: (a: number, b: number, c: number) => void;
 export const presenceweb_send_tool_request: (a: number, b: number, c: number, d: any, e: any) => void;

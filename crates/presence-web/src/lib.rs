@@ -1129,6 +1129,29 @@ impl PresenceWeb {
         to_js(&Vec::<app_state::UiCommand>::new())
     }
 
+    /// Inject a user message into the currently running turn. Sends
+    /// ControlMsg::Steer via the WebSocket with a client-generated id so
+    /// the backend can echo it back on SteerRequested/SteerQueued/
+    /// SteerDelivered events and the UI can correlate delivery state.
+    ///
+    /// Returns the generated id as a JsValue string so the caller can
+    /// attach it to the pending-steer row in the activity log.
+    #[wasm_bindgen]
+    pub fn send_steer(&self, text: &str) -> JsValue {
+        // No uuid crate in this target — use timestamp + a monotonically
+        // incrementing counter so two rapid sends collide neither on the
+        // same ms nor on the same counter value.
+        let mut counter = self.tool_request_counter.borrow_mut();
+        *counter = counter.wrapping_add(1);
+        let seq = *counter;
+        drop(counter);
+        let ts = js_sys::Date::now() as u64;
+        let id = format!("steer-{}-{}", ts, seq);
+        let msg = serde_json::json!({"action": "steer", "text": text, "id": &id});
+        self.server.borrow().send_json(&msg);
+        JsValue::from_str(&id)
+    }
+
     /// Get pending approval ID (for keyboard shortcut routing).
     #[wasm_bindgen]
     pub fn pending_approval_id(&self) -> JsValue {

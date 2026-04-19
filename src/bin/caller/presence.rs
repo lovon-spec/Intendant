@@ -707,6 +707,7 @@ pub async fn handle_tool_query(
                         text: format!("[Presence] {}", msg),
                         images,
                         source: crate::event::InjectionSource::User,
+                        steer_id: None,
                     });
                 }
             }
@@ -954,7 +955,13 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SnapshotCreated { .. }
         | AppEvent::RolledBack { .. }
         | AppEvent::Redone { .. }
-        | AppEvent::HistoryPruned { .. } => None,
+        | AppEvent::HistoryPruned { .. }
+        // Mid-turn steering telemetry is UI-facing — presence doesn't
+        // narrate these (the worker's next model response will reflect
+        // the effect of the steer, which we already surface).
+        | AppEvent::SteerRequested { .. }
+        | AppEvent::SteerQueued { .. }
+        | AppEvent::SteerDelivered { .. } => None,
     }
 }
 

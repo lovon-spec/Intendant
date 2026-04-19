@@ -1945,6 +1945,17 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "interrupt", true, "Interrupt requested".to_string(), None);
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::Steer { text, id } => {
+            // Mid-turn steering from an MCP client. Re-broadcast as an
+            // `AppEvent::SteerRequested` so the running agent loop (if any)
+            // decides whether to call `steer_turn` or fall back to queuing.
+            bus.send(AppEvent::SteerRequested {
+                text,
+                id: id.unwrap_or_default(),
+            });
+            emit_control_result(control_tx, "steer", true, "Steer requested".to_string(), None);
+            Some(RESOURCE_STATUS_URI)
+        }
     }
 }
 
@@ -2433,6 +2444,45 @@ pub fn spawn_event_listener(
                         s.set_phase(Phase::Interrupted);
                         s.push_log(LogLevel::Info, format!("Interrupted: {}", reason));
                         resource_changed = Some("intendant://status");
+                    }
+                    AppEvent::SteerRequested { ref text, ref id } => {
+                        let preview: String = text.chars().take(80).collect();
+                        let suffix = if text.chars().count() > 80 { "..." } else { "" };
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Steer requested{}: {}{}", id_part, preview, suffix),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
+                    AppEvent::SteerQueued { ref id, ref reason } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Steer queued{}: {}", id_part, reason),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
+                    AppEvent::SteerDelivered { ref id, mid_turn } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        let mode = if mid_turn { "mid-turn" } else { "follow-up" };
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Steer delivered{} ({})", id_part, mode),
+                        );
+                        resource_changed = Some("intendant://logs");
                     }
                 }
             }

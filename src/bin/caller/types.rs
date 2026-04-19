@@ -434,6 +434,25 @@ pub enum OutboundEvent {
     Interrupted {
         reason: String,
     },
+    /// Mid-turn steering was requested by a user; surfaced so external
+    /// consumers (dashboard) can show a pending steer row or toast.
+    SteerRequested {
+        text: String,
+        id: String,
+    },
+    /// The active backend doesn't support mid-turn steering and the steer
+    /// text was queued for the next turn instead. Paired with a later
+    /// `SteerDelivered { mid_turn: false }` once the queue drains.
+    SteerQueued {
+        id: String,
+        reason: String,
+    },
+    /// Steer reached the agent — either mid-turn (native `turn/steer`) or
+    /// as a follow-up injection at turn boundary.
+    SteerDelivered {
+        id: String,
+        mid_turn: bool,
+    },
     // --- Peer registry push events ---
     //
     // Emitted by the gateway translator that subscribes to

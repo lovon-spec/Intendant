@@ -2859,6 +2859,7 @@ pub fn spawn_web_gateway(
                                                                             data: data_b64.to_string(),
                                                                         }],
                                                                         source: crate::event::InjectionSource::User,
+                                                                        steer_id: None,
                                                                     });
                                                                     injected_to_queue = true;
                                                                 }
@@ -2983,6 +2984,7 @@ pub fn spawn_web_gateway(
                                                                     text: label,
                                                                     images,
                                                                     source: crate::event::InjectionSource::User,
+                                                                    steer_id: None,
                                                                 });
                                                                 injected = true;
                                                             }

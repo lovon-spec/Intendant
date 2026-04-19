@@ -199,6 +199,19 @@ pub enum UiCommand {
     /// history_pruned). The JS layer re-fetches `/api/session/current/history`
     /// and re-renders the Timeline UI in the Changes sub-tab.
     HistoryChanged,
+    /// Status update for an in-flight mid-turn steer. Emitted when the
+    /// browser sends a steer (pending), when the backend reports it
+    /// queued, or when the backend reports it delivered. The JS layer
+    /// maintains an "in-flight steers" strip above the activity log and
+    /// updates the row keyed by `id`. `status` is one of
+    /// `"pending"` | `"queued"` | `"delivered"`.
+    SteerStatusUpdate {
+        id: String,
+        text: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 // ── File change tracking ──────────────────────────────────────────
@@ -209,6 +222,31 @@ pub struct FileChangeEntry {
     pub kind: String,
     pub lines_added: u64,
     pub lines_removed: u64,
+}
+
+// ── Steer tracking ────────────────────────────────────────────────
+
+/// Delivery state for an in-flight mid-turn steer message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SteerStatus {
+    /// Sent by the browser, awaiting backend acknowledgement.
+    Pending,
+    /// Backend acknowledged but can't deliver mid-turn — message
+    /// is queued and will be delivered at the next turn boundary.
+    Queued,
+    /// Agent actually received the message (mid-turn or on boundary).
+    Delivered,
+}
+
+/// A mid-turn steer message awaiting or undergoing delivery.
+/// Keyed in `AppState::queued_steers` by the client-generated id.
+#[derive(Debug, Clone)]
+pub struct QueuedSteer {
+    pub text: String,
+    pub status: SteerStatus,
+    /// Backend-supplied reason for queuing (e.g. "agent does not
+    /// support mid-turn steering"). Filled in when SteerQueued arrives.
+    pub reason: Option<String>,
 }
 
 // ── Pricing ────────────────────────────────────────────────────────
@@ -435,6 +473,13 @@ pub struct AppState {
 
     /// Tracks files changed during this session for the Changes sub-tab.
     pub changed_files: std::collections::HashMap<String, FileChangeEntry>,
+
+    /// In-flight mid-turn steer messages keyed by client-generated id.
+    /// Populated when the browser sees `steer_requested`, updated on
+    /// `steer_queued`, and removed on `steer_delivered`. The UI renders
+    /// the remaining entries as a strip above the activity log so the
+    /// user can see which interjections are still pending.
+    pub queued_steers: std::collections::HashMap<String, QueuedSteer>,
 }
 
 impl AppState {
@@ -460,6 +505,7 @@ impl AppState {
             known_displays: Vec::new(),
             known_recordings: Vec::new(),
             changed_files: std::collections::HashMap::new(),
+            queued_steers: std::collections::HashMap::new(),
         }
     }
 
@@ -882,6 +928,96 @@ impl AppState {
                     None,
                     "system",
                 ));
+            }
+
+            // ---- Mid-turn steering (interjection) ----
+            //
+            // The browser submits a steer by calling `send_steer(text)` in
+            // WASM, which sends `{action: "steer", text, id}` to the
+            // server. The backend dispatcher echoes three events back:
+            //
+            //   steer_requested  → we saw the request (matches what we sent)
+            //   steer_queued     → backend can't deliver mid-turn, queued for turn boundary
+            //   steer_delivered  → agent actually received it (mid_turn or as follow-up)
+            //
+            // For each event we update `queued_steers[id]` and emit a
+            // `SteerStatusUpdate` UiCommand so the JS layer can refresh
+            // the in-flight steer strip without reparsing raw WS messages.
+            "steer_requested" => {
+                let text = msg["text"].as_str().unwrap_or("").to_string();
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                self.queued_steers.insert(
+                    id.clone(),
+                    QueuedSteer {
+                        text: text.clone(),
+                        status: SteerStatus::Pending,
+                        reason: None,
+                    },
+                );
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("\u{23F3} Steer sent: {}", truncate(&text, 80)),
+                    None,
+                    "user",
+                ));
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "pending".into(),
+                    reason: None,
+                });
+            }
+
+            "steer_queued" => {
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                if let Some(q) = self.queued_steers.get_mut(&id) {
+                    q.status = SteerStatus::Queued;
+                    q.reason = Some(reason.clone());
+                }
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!("\u{23F0} Steer queued: {}", reason),
+                    None,
+                    "user",
+                ));
+                // Prefer the stored text so late/out-of-order queue
+                // events still render the original message in the strip.
+                let text = self
+                    .queued_steers
+                    .get(&id)
+                    .map(|q| q.text.clone())
+                    .unwrap_or_default();
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "queued".into(),
+                    reason: Some(reason),
+                });
+            }
+
+            "steer_delivered" => {
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                let mid_turn = msg["mid_turn"].as_bool().unwrap_or(false);
+                let entry = self.queued_steers.remove(&id);
+                let text = entry.as_ref().map(|q| q.text.clone()).unwrap_or_default();
+                let where_ = if mid_turn { "mid-turn" } else { "as follow-up" };
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!(
+                        "\u{2713} Steer delivered ({}): {}",
+                        where_,
+                        truncate(&text, 80)
+                    ),
+                    None,
+                    "user",
+                ));
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "delivered".into(),
+                    reason: None,
+                });
             }
 
             "round_complete" => {
@@ -1548,6 +1684,17 @@ impl AppState {
 // qualify `presence_core::` at every use.
 pub use presence_core::{format_agent_output, FormattedOutput};
 
+/// Truncate a string to `max` characters, appending an ellipsis if truncated.
+/// Char-boundary safe so we never split in the middle of a UTF-8 codepoint.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{}\u{2026}", cut)
+    }
+}
+
 /// Format a number with commas (e.g. 1234567 → "1,234,567").
 fn format_number(n: u64) -> String {
     let s = n.to_string();
@@ -1622,6 +1769,21 @@ mod tests {
         assert_eq!(format_number(999), "999");
         assert_eq!(format_number(1000), "1,000");
         assert_eq!(format_number(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn truncate_short_and_long() {
+        // Short strings pass through unchanged
+        assert_eq!(truncate("abc", 80), "abc");
+        // Long strings get an ellipsis — exactly max chars + the \u{2026}
+        let long = "a".repeat(100);
+        let t = truncate(&long, 80);
+        assert_eq!(t.chars().count(), 81);
+        assert!(t.ends_with('\u{2026}'));
+        // UTF-8 safety: truncating mid-multibyte-char must not panic
+        // and must respect char boundaries, not byte boundaries.
+        let utf8 = "αβγδε".to_string();
+        assert_eq!(truncate(&utf8, 3), "αβγ\u{2026}");
     }
 
     // `format_agent_output` tests live in `presence_core::format` — it's
@@ -2594,5 +2756,164 @@ mod tests {
             c,
             UiCommand::SetPhase { phase } if phase == "interrupting"
         )));
+    }
+
+    // ── Mid-turn steering ──────────────────────────────────────────
+
+    #[test]
+    fn handle_event_steer_requested_tracks_pending() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "steer_requested",
+            "text": "please check the logs",
+            "id": "steer-123-1"
+        });
+        let cmds = s.handle_message(&msg);
+        // Entry stored as Pending
+        let entry = s.queued_steers.get("steer-123-1").expect("steer tracked");
+        assert_eq!(entry.status, SteerStatus::Pending);
+        assert_eq!(entry.text, "please check the logs");
+        assert!(entry.reason.is_none());
+        // SteerStatusUpdate command emitted with status=pending
+        let saw_update = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SteerStatusUpdate { id, status, reason, text }
+                if id == "steer-123-1"
+                    && status == "pending"
+                    && reason.is_none()
+                    && text == "please check the logs"
+        ));
+        assert!(saw_update, "expected SteerStatusUpdate, got {:?}", cmds);
+        // Log entry surfaced so the user sees their send
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "info" && content.contains("Steer sent")
+        )));
+    }
+
+    #[test]
+    fn handle_event_steer_queued_updates_status() {
+        let mut s = AppState::new();
+        // Seed with a pending steer as if steer_requested arrived first
+        s.queued_steers.insert(
+            "abc".into(),
+            QueuedSteer {
+                text: "retry the build".into(),
+                status: SteerStatus::Pending,
+                reason: None,
+            },
+        );
+        let msg = json!({
+            "event": "steer_queued",
+            "id": "abc",
+            "reason": "agent does not support mid-turn steering"
+        });
+        let cmds = s.handle_message(&msg);
+        let entry = s.queued_steers.get("abc").expect("still tracked");
+        assert_eq!(entry.status, SteerStatus::Queued);
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some("agent does not support mid-turn steering")
+        );
+        // UiCommand carries status=queued and echoes the backend reason
+        let saw_update = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SteerStatusUpdate { id, status, reason, text }
+                if id == "abc"
+                    && status == "queued"
+                    && reason.as_deref() == Some("agent does not support mid-turn steering")
+                    && text == "retry the build"
+        ));
+        assert!(saw_update, "expected queued SteerStatusUpdate, got {:?}", cmds);
+        // Queued uses warn level so the user notices the delay
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "warn" && content.contains("Steer queued")
+        )));
+    }
+
+    #[test]
+    fn handle_event_steer_delivered_removes_entry() {
+        let mut s = AppState::new();
+        s.queued_steers.insert(
+            "xyz".into(),
+            QueuedSteer {
+                text: "stop and summarize".into(),
+                status: SteerStatus::Queued,
+                reason: Some("queued by backend".into()),
+            },
+        );
+        let msg = json!({
+            "event": "steer_delivered",
+            "id": "xyz",
+            "mid_turn": true
+        });
+        let cmds = s.handle_message(&msg);
+        // Entry removed from the in-flight map
+        assert!(s.queued_steers.get("xyz").is_none());
+        let saw_update = cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SteerStatusUpdate { id, status, reason, text }
+                if id == "xyz"
+                    && status == "delivered"
+                    && reason.is_none()
+                    && text == "stop and summarize"
+        ));
+        assert!(saw_update, "expected delivered SteerStatusUpdate, got {:?}", cmds);
+        // Log contains "mid-turn" for mid_turn=true deliveries
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. }
+                if content.contains("Steer delivered")
+                    && content.contains("mid-turn")
+                    && content.contains("stop and summarize")
+        )));
+    }
+
+    #[test]
+    fn steer_delivered_followup_log_variant() {
+        // When mid_turn=false (queued delivery at turn boundary), the log
+        // line calls it out as "as follow-up" rather than mid-turn so the
+        // user understands the interjection wasn't real-time.
+        let mut s = AppState::new();
+        s.queued_steers.insert(
+            "late".into(),
+            QueuedSteer {
+                text: "boundary delivery".into(),
+                status: SteerStatus::Queued,
+                reason: None,
+            },
+        );
+        let msg = json!({
+            "event": "steer_delivered",
+            "id": "late",
+            "mid_turn": false
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. }
+                if content.contains("as follow-up")
+        )));
+    }
+
+    #[test]
+    fn steer_status_update_serializes_snake_case() {
+        // JS dispatch table uses the string form of the cmd tag, so
+        // make sure serde emits `steer_status_update` and the fields we expect.
+        let cmd = UiCommand::SteerStatusUpdate {
+            id: "s1".into(),
+            text: "hi".into(),
+            status: "pending".into(),
+            reason: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"cmd\":\"steer_status_update\""), "got: {}", json);
+        assert!(json.contains("\"id\":\"s1\""));
+        assert!(json.contains("\"status\":\"pending\""));
+        // reason omitted when None
+        assert!(!json.contains("\"reason\""));
     }
 }

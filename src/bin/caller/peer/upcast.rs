@@ -1050,6 +1050,47 @@ impl AppEventUpcaster {
                 "agent",
                 format!("interrupted: {reason}"),
             )],
+
+            // ---- Mid-turn steering ----
+            AppEvent::SteerRequested { text, id } => {
+                let preview: String = text.chars().take(80).collect();
+                let suffix = if text.chars().count() > 80 { "..." } else { "" };
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer requested{id_part}: {preview}{suffix}"),
+                )]
+            }
+            AppEvent::SteerQueued { id, reason } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer queued{id_part}: {reason}"),
+                )]
+            }
+            AppEvent::SteerDelivered { id, mid_turn } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                let mode = if *mid_turn { "mid-turn" } else { "follow-up" };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer delivered{id_part} ({mode})"),
+                )]
+            }
         }
     }
 }
@@ -1886,6 +1927,47 @@ impl WireEventUpcaster {
                 "agent",
                 format!("interrupted: {reason}"),
             )],
+
+            // ---- Mid-turn steering ----
+            OutboundEvent::SteerRequested { text, id } => {
+                let preview: String = text.chars().take(80).collect();
+                let suffix = if text.chars().count() > 80 { "..." } else { "" };
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer requested{id_part}: {preview}{suffix}"),
+                )]
+            }
+            OutboundEvent::SteerQueued { id, reason } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer queued{id_part}: {reason}"),
+                )]
+            }
+            OutboundEvent::SteerDelivered { id, mid_turn } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                let mode = if *mid_turn { "mid-turn" } else { "follow-up" };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer delivered{id_part} ({mode})"),
+                )]
+            }
         }
     }
 }
@@ -2908,6 +2990,48 @@ mod tests {
     #[test]
     fn parity_loop_error() {
         assert_parity(AppEvent::LoopError("kaboom".to_string()));
+    }
+
+    #[test]
+    fn parity_steer_requested() {
+        assert_parity(AppEvent::SteerRequested {
+            text: "look at tests/e2e/ first".into(),
+            id: "steer-42".into(),
+        });
+    }
+
+    #[test]
+    fn parity_steer_requested_empty_id() {
+        // Empty id is a valid "no correlation" sentinel; the log line
+        // should simply omit the [id] part on both paths.
+        assert_parity(AppEvent::SteerRequested {
+            text: "never mind".into(),
+            id: String::new(),
+        });
+    }
+
+    #[test]
+    fn parity_steer_queued() {
+        assert_parity(AppEvent::SteerQueued {
+            id: "steer-7".into(),
+            reason: "Claude Code doesn't support mid-turn steering".into(),
+        });
+    }
+
+    #[test]
+    fn parity_steer_delivered_mid_turn() {
+        assert_parity(AppEvent::SteerDelivered {
+            id: "steer-3".into(),
+            mid_turn: true,
+        });
+    }
+
+    #[test]
+    fn parity_steer_delivered_followup() {
+        assert_parity(AppEvent::SteerDelivered {
+            id: "steer-3".into(),
+            mid_turn: false,
+        });
     }
 
     // -------------------------------------------------------------------

@@ -186,6 +186,16 @@ export class PresenceWeb {
     send_raw(json_str: string): boolean;
     send_resize(cols: number, rows: number): void;
     send_server_action(action: any): void;
+    /**
+     * Inject a user message into the currently running turn. Sends
+     * ControlMsg::Steer via the WebSocket with a client-generated id so
+     * the backend can echo it back on SteerRequested/SteerQueued/
+     * SteerDelivered events and the UI can correlate delivery state.
+     *
+     * Returns the generated id as a JsValue string so the caller can
+     * attach it to the pending-steer row in the activity log.
+     */
+    send_steer(text: string): any;
     send_text(text: string): void;
     /**
      * Send text without ending the user turn (turn_complete: false for Gemini).
@@ -379,6 +389,7 @@ export interface InitOutput {
     readonly presenceweb_send_raw: (a: number, b: number, c: number) => number;
     readonly presenceweb_send_resize: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_server_action: (a: number, b: any) => void;
+    readonly presenceweb_send_steer: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_text: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_text_passive: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_tool_request: (a: number, b: number, c: number, d: any, e: any) => void;

@@ -34,6 +34,14 @@ pub struct ContextInjection {
     pub text: String,
     pub images: Vec<crate::conversation::ImageData>,
     pub source: InjectionSource,
+    /// When this injection was queued by a fallback steer (the backend didn't
+    /// support mid-turn steering), this carries the steer id so a
+    /// `SteerDelivered` event can be emitted with the right correlation id
+    /// when the item is eventually drained into the agent's conversation.
+    ///
+    /// `None` for non-steer injections (display take/release, presence
+    /// annotations, etc.) — those don't participate in the steer protocol.
+    pub steer_id: Option<String>,
 }
 
 impl ContextInjection {
@@ -43,6 +51,7 @@ impl ContextInjection {
             text: msg,
             images: vec![],
             source: InjectionSource::System,
+            steer_id: None,
         }
     }
 
@@ -53,6 +62,19 @@ impl ContextInjection {
             text: msg,
             images: vec![],
             source: InjectionSource::User,
+            steer_id: None,
+        }
+    }
+
+    /// Create a user injection that originated from a queued steer. The id
+    /// round-trips back out via `AppEvent::SteerDelivered` when the item is
+    /// drained so frontends can correlate their pending-steer UI.
+    pub fn text_with_steer_id(msg: String, steer_id: String) -> Self {
+        Self {
+            text: msg,
+            images: vec![],
+            source: InjectionSource::User,
+            steer_id: Some(steer_id),
         }
     }
 }
@@ -140,6 +162,39 @@ pub enum AppEvent {
     /// The agent turn was interrupted. Emitted by the loop once cancellation completes.
     Interrupted {
         reason: String,
+    },
+
+    // ---- Mid-turn steering (interjection) ----
+    /// User requested mid-turn steering. Re-emitted by the task dispatcher
+    /// from `ControlMsg::Steer`. Agent loops subscribe to this and either
+    /// call `ExternalAgent::steer_turn()` (for backends that support it) or
+    /// fall back to queuing onto `context_injection`.
+    ///
+    /// `id` is always a String (empty = no correlation). This keeps
+    /// downstream consumers simple — they never need to deal with a
+    /// missing id, and comparing `id.is_empty()` is cheap.
+    SteerRequested {
+        text: String,
+        id: String,
+    },
+    /// Mid-turn steering could not be delivered natively by the current
+    /// backend and was queued as a follow-up injection instead. Emitted
+    /// after the fallback push to `context_injection`; paired with a later
+    /// `SteerDelivered { mid_turn: false }` once the queue drains.
+    SteerQueued {
+        id: String,
+        /// Short human-readable explanation of why the queue fallback was
+        /// used (e.g. "Claude Code doesn't support mid-turn steering;
+        /// queued as follow-up").
+        reason: String,
+    },
+    /// Mid-turn steering reached the agent. `mid_turn = true` means the
+    /// backend injected it into the currently running turn (no queue
+    /// fallback); `mid_turn = false` means a queued item was drained at
+    /// turn boundary and delivered as part of the next user message.
+    SteerDelivered {
+        id: String,
+        mid_turn: bool,
     },
     SessionStarted {
         session_id: String,
@@ -794,6 +849,23 @@ pub enum ControlMsg {
         #[serde(default)]
         expected_turn: Option<u64>,
     },
+    /// Mid-turn steering: nudge the currently running agent turn with new
+    /// user text without interrupting it. Backends that support native
+    /// mid-turn steering (Codex `turn/steer`) inject the text into the
+    /// in-progress turn; backends that don't queue the text onto the
+    /// shared `context_injection` queue so it's delivered at the start of
+    /// the next turn.
+    Steer {
+        text: String,
+        /// Optional correlation id supplied by the frontend. Frontends use
+        /// it to track the lifecycle of one steer request across the
+        /// `SteerRequested` → `SteerQueued`/`SteerDelivered` events. An
+        /// empty string or missing id is treated as "no correlation" —
+        /// the backend still honors the request, but frontends that didn't
+        /// tag it can't match the delivery event back to a pending UI row.
+        #[serde(default)]
+        id: Option<String>,
+    },
 }
 
 /// The event bus sender. Cloneable for use in multiple tasks.
@@ -876,6 +948,18 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::InterruptRequested => Some(OutboundEvent::InterruptRequested),
         AppEvent::Interrupted { reason } => Some(OutboundEvent::Interrupted {
             reason: reason.clone(),
+        }),
+        AppEvent::SteerRequested { text, id } => Some(OutboundEvent::SteerRequested {
+            text: text.clone(),
+            id: id.clone(),
+        }),
+        AppEvent::SteerQueued { id, reason } => Some(OutboundEvent::SteerQueued {
+            id: id.clone(),
+            reason: reason.clone(),
+        }),
+        AppEvent::SteerDelivered { id, mid_turn } => Some(OutboundEvent::SteerDelivered {
+            id: id.clone(),
+            mid_turn: *mid_turn,
         }),
         AppEvent::SessionStarted { session_id, task } => {
             Some(OutboundEvent::SessionStarted {
@@ -1789,10 +1873,48 @@ mod tests {
             },
             ControlMsg::Usage,
             ControlMsg::Quit,
+            ControlMsg::Interrupt { expected_turn: None },
+            ControlMsg::Steer {
+                text: "use Python".to_string(),
+                id: Some("s-1".to_string()),
+            },
+            ControlMsg::Steer {
+                text: "never mind".to_string(),
+                id: None,
+            },
         ];
         for msg in msgs {
             let json = serde_json::to_string(&msg).unwrap();
             let _: ControlMsg = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn control_msg_steer_deserialize() {
+        // Wire shape: `{"action":"steer","text":"...","id":"..."}`.
+        // `id` is optional — frontends may omit it, in which case the
+        // dispatcher will treat it as "no correlation".
+        let json = r#"{"action":"steer","text":"switch to Python","id":"s-42"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::Steer { text, id } => {
+                assert_eq!(text, "switch to Python");
+                assert_eq!(id.as_deref(), Some("s-42"));
+            }
+            _ => panic!("expected Steer"),
+        }
+    }
+
+    #[test]
+    fn control_msg_steer_without_id_deserialize() {
+        let json = r#"{"action":"steer","text":"never mind"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::Steer { text, id } => {
+                assert_eq!(text, "never mind");
+                assert_eq!(id, None);
+            }
+            _ => panic!("expected Steer"),
         }
     }
 

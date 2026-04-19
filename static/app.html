@@ -751,6 +751,63 @@ html, body {
   white-space: nowrap;
 }
 .global-send-btn:hover { background: rgba(166, 227, 161, 0.1); }
+/* Steer mode — when the agent is mid-turn, the Send button becomes a
+   Steer button to signal the click will inject a mid-turn message
+   instead of starting a new task. Peach (interjection) to distinguish
+   from Send (green, starts work) and Stop (red, cancels work). */
+.global-send-btn.steer-mode {
+  background: var(--peach);
+  color: var(--base);
+  border-color: var(--peach);
+}
+.global-send-btn.steer-mode:hover {
+  background: var(--yellow);
+  border-color: var(--yellow);
+}
+
+/* ── Steer in-flight strip ──
+   Sits above the activity log; each entry is a QueuedSteer. Pending
+   (just submitted) shows an hourglass; Queued (will deliver at turn
+   boundary) uses yellow; Delivered briefly shows a green checkmark
+   before fading out. */
+.steer-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 12px 2px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+}
+.steer-strip.empty { display: none; }
+.steer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-style: italic;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-left: 3px solid var(--peach);
+  background: var(--base);
+  color: var(--text);
+  transition: opacity 180ms ease, color 180ms ease;
+}
+.steer-row.pending { opacity: 0.65; }
+.steer-row.queued { color: var(--yellow); border-left-color: var(--yellow); }
+.steer-row.delivered { color: var(--green); border-left-color: var(--green); }
+.steer-row.fading { opacity: 0; }
+.steer-icon { margin-right: 4px; flex-shrink: 0; }
+.steer-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.steer-reason {
+  color: var(--overlay1);
+  font-size: 11px;
+  font-style: normal;
+  margin-left: 4px;
+}
 
 /* ── Phase Banner ── */
 .phase-banner {
@@ -3299,7 +3356,7 @@ html, body {
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <input id="activity-task-input" class="global-task-input" placeholder="Enter task..." />
     <label class="global-direct-toggle" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" />Direct</label>
-    <button class="global-send-btn" onclick="submitActivityTask()">Send</button>
+    <button id="activity-submit-btn" class="global-send-btn" onclick="submitActivityOrSteer()" title="Start a new task or send a follow-up.">Send</button>
   </div>
 
   <!-- Tab Bar -->
@@ -3355,6 +3412,13 @@ html, body {
             <div class="activity-display-row" id="activity-display-row"></div>
           </div>
           <div class="activity-split-handle hidden" id="activity-split-handle"></div>
+
+          <!-- Steer in-flight strip: renders pending / queued mid-turn
+               messages the user injected via the always-visible task
+               input while the agent was running. Each row is keyed by
+               the client-generated steer id; rows disappear a moment
+               after the backend reports steer_delivered. -->
+          <div class="steer-strip empty" id="steer-strip"></div>
 
           <div class="log-stream" id="log-stream"></div>
           <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
@@ -5346,6 +5410,11 @@ function processCommands(cmds) {
       case 'peer_added': upsertDaemonFromSnapshot(c.peer); break;
       case 'peer_state_changed': upsertDaemonFromSnapshot(c.peer); break;
       case 'peer_removed': removeDaemonById(c.id); break;
+      // Mid-turn steer lifecycle: pending (just sent), queued (backend
+      // couldn't deliver mid-turn), delivered (agent got it).
+      case 'steer_status_update':
+        onSteerStatusUpdate(c.id, c.text, c.status, c.reason);
+        break;
     }
   }
 }
@@ -6357,6 +6426,11 @@ function setPhase(phase) {
     }, 80);
   }
   updateStopButtonVisibility(phase);
+  // Flip the submit button between "Send" (start task / follow-up) and
+  // "↗ Steer" (inject mid-turn) so the user sees which action will fire
+  // on the next click. Driven by the same active-phase allowlist as the
+  // Stop button for consistency.
+  updateSubmitButtonLabel(phase);
   // Control sub-tab: highlight the "applies on next task" note while a
   // task is genuinely active so the user knows their toggle is queued,
   // not live. Must match the Stop button's allowlist exactly — any
@@ -11497,6 +11571,114 @@ window.submitActivityTask = function() {
   }
 };
 
+// Phase-aware submit entrypoint.
+//
+// When the agent is idle / done / interrupted / waiting-follow-up, the
+// click starts a new task (the existing submitActivityTask path).
+// When the agent is actively working (thinking / running / orchestrating /
+// waiting-approval / waiting-human / interrupting), the click injects a
+// mid-turn steer via WASM's send_steer, which round-trips through the
+// backend as ControlMsg::Steer and comes back as steer_requested /
+// steer_queued / steer_delivered events.
+//
+// The submit button's label tracks the phase (Send vs ↗ Steer) so the
+// user sees which behavior will fire before clicking.
+window.submitActivityOrSteer = function() {
+  if (!app) return;
+  const input = document.getElementById('activity-task-input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  if (isAgentActivePhase(currentPhase)) {
+    // Mid-turn steer path. WASM generates the id locally and we render
+    // an optimistic pending row immediately — the backend round-trips a
+    // steer_requested echo that updates the same row by id (idempotent
+    // onSteerStatusUpdate). If the echo never arrives (server dead /
+    // WebSocket severed), the pending row remains visible as a signal
+    // that something went wrong.
+    const idJs = app.send_steer(text);
+    const id = (typeof idJs === 'string') ? idJs : String(idJs);
+    onSteerStatusUpdate(id, text, 'pending', null);
+    input.value = '';
+  } else {
+    // Normal task / follow-up path.
+    submitActivityTask();
+  }
+};
+
+// Update the submit button's label / styling based on the agent phase.
+// Called from setPhase alongside updateStopButtonVisibility so the
+// two active-state surfaces stay in sync.
+function updateSubmitButtonLabel(phase) {
+  const btn = document.getElementById('activity-submit-btn');
+  if (!btn) return;
+  const active = isAgentActivePhase(phase);
+  if (active) {
+    btn.innerHTML = '\u2197 Steer';
+    btn.classList.add('steer-mode');
+    btn.title = 'Send a mid-turn message to the agent. May be queued until the current turn ends.';
+  } else {
+    btn.textContent = 'Send';
+    btn.classList.remove('steer-mode');
+    btn.title = 'Start a new task or send a follow-up.';
+  }
+}
+
+// ── Steer in-flight strip ──
+//
+// Renders one row per QueuedSteer. The backend flow is:
+//   1. User types + clicks Steer → WASM send_steer → server ControlMsg::Steer
+//   2. Server emits steer_requested (echo) → WASM → SteerStatusUpdate(pending)
+//   3. Server emits steer_queued OR steer_delivered (possibly both)
+//   4. Delivered row fades and is removed; queued row stays until delivered.
+//
+// We stash the DOM node in a Map keyed by the steer id so a later
+// SteerStatusUpdate for the same id updates the row in place. Row
+// removal on delivered is delayed (~1.2s) so the user sees the
+// checkmark before the entry disappears.
+const steerRows = new Map(); // id -> { el, timeout }
+function onSteerStatusUpdate(id, text, status, reason) {
+  const strip = document.getElementById('steer-strip');
+  if (!strip) return;
+  let entry = steerRows.get(id);
+  if (!entry) {
+    const el = document.createElement('div');
+    el.className = 'steer-row ' + status;
+    el.dataset.steerId = id;
+    el.innerHTML =
+      '<span class="steer-icon"></span>'
+      + '<span class="steer-text"></span>'
+      + '<span class="steer-reason"></span>';
+    strip.appendChild(el);
+    entry = { el, timeout: null };
+    steerRows.set(id, entry);
+  }
+  const el = entry.el;
+  el.className = 'steer-row ' + status;
+  // Icons chosen to match the WASM-side log lines (hourglass / alarm /
+  // checkmark) so the strip and the log tell the same story.
+  const iconByStatus = { pending: '\u23F3', queued: '\u23F0', delivered: '\u2713' };
+  el.querySelector('.steer-icon').textContent = iconByStatus[status] || '';
+  el.querySelector('.steer-text').textContent = text || '';
+  el.querySelector('.steer-reason').textContent = reason ? ('— ' + reason) : '';
+  strip.classList.remove('empty');
+
+  // Clear any in-flight fade timer — a fresh status update preempts it.
+  if (entry.timeout) { clearTimeout(entry.timeout); entry.timeout = null; }
+
+  if (status === 'delivered') {
+    // Brief visual confirmation, then remove the row.
+    entry.timeout = setTimeout(() => {
+      el.classList.add('fading');
+      entry.timeout = setTimeout(() => {
+        el.remove();
+        steerRows.delete(id);
+        if (strip.childElementCount === 0) strip.classList.add('empty');
+      }, 220);
+    }, 1200);
+  }
+}
+
 function startNewSession() {
   const input = document.getElementById('new-session-input');
   if (!input) return;
@@ -12510,7 +12692,10 @@ document.querySelector('#human-input')?.addEventListener('keydown', (e) => {
   }
 });
 document.getElementById('activity-task-input')?.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); submitActivityTask(); }
+  // Enter uses the same phase-aware dispatcher as the button so keyboard
+  // users get the same Send vs Steer behavior for free — no stale code
+  // path that bypasses steering when typed instead of clicked.
+  if (e.key === 'Enter') { e.preventDefault(); submitActivityOrSteer(); }
 });
 
 // Verbosity toggle
