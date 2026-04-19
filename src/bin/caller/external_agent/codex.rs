@@ -46,7 +46,7 @@ impl CodexAgent {
             "undo" => {
                 let turns =
                     params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-                self.rollback_turns(turns).await
+                self.rollback_turns_inner(turns).await
             }
             "review" => {
                 let prompt = params
@@ -95,7 +95,12 @@ impl CodexAgent {
         Ok(format!("forked into thread {}", new_id))
     }
 
-    async fn rollback_turns(&mut self, turns: u32) -> Result<String, CallerError> {
+    /// Inner implementation of the `/undo` thread action. Returns a
+    /// human-readable status string for the dashboard toast. The
+    /// `ExternalAgent::rollback_turns` trait method (impl below) wraps
+    /// this same RPC without the status string — callers just need
+    /// to know success/failure.
+    async fn rollback_turns_inner(&mut self, turns: u32) -> Result<String, CallerError> {
         if turns == 0 {
             return Err(CallerError::ExternalAgent(
                 "rollback count must be at least 1".into(),
@@ -1379,6 +1384,19 @@ impl ExternalAgent for CodexAgent {
         CodexAgent::dispatch_thread_action(self, op, params).await
     }
 
+    /// Native implementation of conversation rollback. Reuses the
+    /// `thread/rollback` RPC under `turnsToRollback` — same as `/undo`,
+    /// just without the status string and with a guard allowing 0 to be
+    /// a no-op (the HTTP handler may issue rollback with 0 turns when
+    /// the target round is already the head).
+    async fn rollback_turns(&mut self, turns_to_drop: u32) -> Result<(), CallerError> {
+        if turns_to_drop == 0 {
+            return Ok(());
+        }
+        let _status = self.rollback_turns_inner(turns_to_drop).await?;
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Result<(), CallerError> {
         // Abort reader task
         if let Some(handle) = self.reader_handle.take() {
@@ -2371,6 +2389,34 @@ mod tests {
         match err {
             CallerError::ExternalAgent(msg) => {
                 assert!(msg.contains("at least 1"), "got: {}", msg);
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_turns_trait_zero_is_noop() {
+        // The trait method treats 0 as a no-op (HTTP handler may emit
+        // 0 turns when the target round is already the head). No RPC
+        // is dispatched so the call returns Ok without an active
+        // thread.
+        let mut agent = test_agent();
+        agent.rollback_turns(0).await.expect("0 turns should be a noop");
+    }
+
+    #[tokio::test]
+    async fn rollback_turns_trait_without_thread_errors() {
+        // Non-zero turns without an active thread surfaces the same
+        // "no active Codex thread" error as the /undo dispatcher.
+        let mut agent = test_agent();
+        let err = agent.rollback_turns(2).await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("no active Codex thread"),
+                    "expected 'no active Codex thread', got: {}",
+                    msg
+                );
             }
             other => panic!("expected ExternalAgent error, got {:?}", other),
         }

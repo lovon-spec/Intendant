@@ -292,6 +292,23 @@ pub trait ExternalAgent: Send + Sync {
         )))
     }
 
+    /// Ask the backend to drop the last `turns_to_drop` conversational
+    /// turns from the active thread. Backends that implement this
+    /// (Codex, via `thread/rollback`) override it; backends that don't
+    /// (Claude Code, Gemini) return the default error and the caller
+    /// falls back to a session reset — shut down, re-initialize, start
+    /// a new thread.
+    ///
+    /// The error message is load-bearing: the caller distinguishes
+    /// "rollback not supported" from "rollback failed" purely by type
+    /// (typed error → fall back; Ok → success).
+    async fn rollback_turns(&mut self, turns_to_drop: u32) -> Result<(), CallerError> {
+        let _ = turns_to_drop;
+        Err(CallerError::ExternalAgent(
+            "conversation rollback not supported by this backend".into(),
+        ))
+    }
+
     /// Shut down the agent process.
     async fn shutdown(&mut self) -> Result<(), CallerError>;
 }

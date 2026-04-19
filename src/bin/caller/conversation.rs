@@ -445,6 +445,36 @@ impl Conversation {
         }
     }
 
+    /// Truncate the conversation so that it retains exactly
+    /// `target_len` messages at the front. Used by the conversation
+    /// rollback flow: the file-snapshot history records
+    /// `native_message_count` at each `RoundComplete`, and rolling
+    /// back to that round drops every message appended after that
+    /// point.
+    ///
+    /// Returns the number of messages removed. Caps `target_len` at
+    /// the current length (oversized requests are treated as no-op
+    /// rather than an error — the caller shouldn't have to validate
+    /// every time).
+    ///
+    /// The system message (index 0) is always preserved — if
+    /// `target_len == 0`, we leave the system message alone and
+    /// return `messages.len() - 1`. Callers should never request
+    /// truncation below 1, but this is defensive.
+    pub fn truncate_to(&mut self, target_len: usize) -> usize {
+        let current = self.messages.len();
+        let target = target_len.max(1).min(current);
+        if target == current {
+            return 0;
+        }
+        let removed = current - target;
+        self.messages.truncate(target);
+        // Resolve any dangling tool calls at the new tail so the API
+        // doesn't reject the next request.
+        self.resolve_dangling_tool_calls();
+        removed
+    }
+
     pub fn drop_turns(&mut self, indices: &[usize]) {
         let len = self.messages.len();
         let protected_min = if len >= 2 { len - 2 } else { len };
@@ -713,6 +743,82 @@ mod tests {
         conv.add_user("u1".to_string());
         conv.summarize_turns(&[], "summary");
         assert_eq!(conv.len(), 2);
+    }
+
+    #[test]
+    fn truncate_to_drops_tail() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("u1".to_string()); // 1
+        conv.add_assistant("a1".to_string()); // 2
+        conv.add_user("u2".to_string()); // 3
+        conv.add_assistant("a2".to_string()); // 4
+
+        // Truncate to first 3 messages (keep system + u1 + a1).
+        let removed = conv.truncate_to(3);
+        assert_eq!(removed, 2);
+        assert_eq!(conv.len(), 3);
+        assert_eq!(conv.messages()[0].role, "system");
+        assert_eq!(conv.messages()[1].content, "u1");
+        assert_eq!(conv.messages()[2].content, "a1");
+    }
+
+    #[test]
+    fn truncate_to_noop_when_already_shorter() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("u1".to_string());
+
+        // Target longer than current — no-op.
+        let removed = conv.truncate_to(100);
+        assert_eq!(removed, 0);
+        assert_eq!(conv.len(), 2);
+    }
+
+    #[test]
+    fn truncate_to_preserves_system_even_when_zero_requested() {
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("u1".to_string());
+        conv.add_assistant("a1".to_string());
+
+        // Caller passes 0 — we still preserve the system message.
+        let removed = conv.truncate_to(0);
+        assert_eq!(removed, 2);
+        assert_eq!(conv.len(), 1);
+        assert_eq!(conv.messages()[0].role, "system");
+    }
+
+    #[test]
+    fn truncate_to_resolves_dangling_tool_calls() {
+        // If a truncation cuts just after an assistant message with
+        // tool_calls (leaving the tool result behind), we must inject
+        // synthetic tool results so the next API request isn't rejected.
+        let mut conv = Conversation::new("sys".to_string(), 128_000);
+        conv.add_user("do something".to_string());
+        conv.add_assistant_tool_calls(
+            "calling tool".to_string(),
+            vec![ToolCallRef {
+                id: "fc_1".to_string(),
+                call_id: "call_1".to_string(),
+                name: "exec".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            None,
+        );
+        conv.add_tool_result("call_1", "exec", "ok");
+        conv.add_assistant("done".to_string());
+        assert_eq!(conv.len(), 5);
+
+        // Truncate past the tool result — only the assistant with the
+        // dangling tool_call remains. `truncate_to` should inject a
+        // synthetic tool result so the conversation remains valid.
+        let removed = conv.truncate_to(3);
+        assert_eq!(removed, 2);
+        // System + user + assistant(tool_calls) + synthetic tool result = 4
+        assert_eq!(conv.len(), 4);
+        assert_eq!(conv.messages()[3].role, "tool");
+        assert_eq!(
+            conv.messages()[3].tool_call_id.as_deref(),
+            Some("call_1")
+        );
     }
 
     #[test]

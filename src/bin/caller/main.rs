@@ -4690,11 +4690,15 @@ async fn run_round_loop(
         // Only wait for follow-up on recoverable exits
         match exit_reason {
             LoopExitReason::DoneSignal | LoopExitReason::TaskComplete => {
-                // Emit RoundComplete event
+                // Emit RoundComplete event. Snapshot the native conversation
+                // message count so a conversation-rollback request can
+                // truncate the tail back to this point.
                 let turns_in_round = stats.turns;
+                let native_message_count = Some(conversation.messages().len() as u32);
                 bus.send(AppEvent::RoundComplete {
                     round,
                     turns_in_round,
+                    native_message_count,
                 });
 
                 // Wait for follow-up message
@@ -5188,6 +5192,16 @@ async fn run_with_presence(
             op: String,
             params: serde_json::Value,
         },
+        /// Conversation-rollback request from the web gateway. Fired
+        /// when the user POSTs `/api/session/current/rollback` with
+        /// `revert_conversation: true`. The gateway only sends this
+        /// when the agent is idle (guarded by `ensure_idle`), so
+        /// handling it between tasks is safe.
+        ConversationRollback {
+            round_id: u64,
+            target_native_message_count: Option<u32>,
+            turns_to_drop: u32,
+        },
         Done,
     }
 
@@ -5205,6 +5219,15 @@ async fn run_with_presence(
                 Ok(AppEvent::GeminiThreadActionRequested { action, params }) => {
                     OuterSignal::GeminiThreadAction { op: action, params }
                 }
+                Ok(AppEvent::ConversationRollbackRequested {
+                    round_id,
+                    target_native_message_count,
+                    turns_to_drop,
+                }) => OuterSignal::ConversationRollback {
+                    round_id,
+                    target_native_message_count,
+                    turns_to_drop,
+                },
                 // Any other bus event: skip, keep selecting. Lagged /
                 // Closed also fall through — task_rx close is the
                 // authoritative "we're done" signal.
@@ -5280,6 +5303,90 @@ async fn run_with_presence(
                     success,
                     message,
                 });
+                continue;
+            }
+            OuterSignal::ConversationRollback {
+                round_id,
+                target_native_message_count,
+                turns_to_drop,
+            } => {
+                // Three possible states:
+                //   1. External agent active (Codex / CC / Gemini)
+                //   2. Native agent active (persistent_conv is Some)
+                //   3. Neither — nothing to roll back from
+                //
+                // For external agents we try `rollback_turns` first; on
+                // the default "not supported" error we fall back to a
+                // session reset (shut down, clear persistent state; the
+                // next task will re-initialize from scratch).
+                if let Some(ref mut agent) = persistent_agent {
+                    let backend_name = agent
+                        .name()
+                        .to_ascii_lowercase()
+                        .replace(' ', "-");
+                    match agent.rollback_turns(turns_to_drop).await {
+                        Ok(()) => {
+                            bus.send(AppEvent::ConversationRolledBack {
+                                round_id,
+                                turns_removed: turns_to_drop,
+                                backend: backend_name,
+                                method: "truncated".into(),
+                            });
+                        }
+                        Err(e) => {
+                            // Fall back to a session reset: shut the
+                            // agent down, drop persistent handles, and
+                            // let the next task re-initialize. This
+                            // loses conversation context — the only
+                            // honest behavior when the protocol doesn't
+                            // expose rollback.
+                            slog(&session_log, |l| {
+                                l.warn(&format!(
+                                    "Conversation rollback via protocol failed ({}); falling back to session reset",
+                                    e
+                                ))
+                            });
+                            let _ = agent.shutdown().await;
+                            persistent_agent = None;
+                            persistent_thread = None;
+                            persistent_event_rx = None;
+                            persistent_codex_config = None;
+                            persistent_gemini_config = None;
+                            bus.send(AppEvent::ConversationRolledBack {
+                                round_id,
+                                turns_removed: turns_to_drop,
+                                backend: backend_name,
+                                method: "session-reset".into(),
+                            });
+                        }
+                    }
+                } else if let Some(ref mut conv) = persistent_conv {
+                    // Native path: truncate the messages array to the
+                    // recorded length. If the round didn't store a
+                    // native_message_count (e.g. an external-agent
+                    // round), we can't truncate meaningfully; log and
+                    // emit a 0-turn event so the dashboard clears the
+                    // pending state.
+                    let removed = match target_native_message_count {
+                        Some(n) => conv.truncate_to(n as usize),
+                        None => 0,
+                    };
+                    bus.send(AppEvent::ConversationRolledBack {
+                        round_id,
+                        turns_removed: removed as u32,
+                        backend: "native".into(),
+                        method: "truncated".into(),
+                    });
+                } else {
+                    // No conversation to revert — emit completion
+                    // anyway so the dashboard doesn't wait forever.
+                    bus.send(AppEvent::ConversationRolledBack {
+                        round_id,
+                        turns_removed: 0,
+                        backend: "native".into(),
+                        method: "truncated".into(),
+                    });
+                }
                 continue;
             }
         };
@@ -5573,9 +5680,14 @@ async fn run_with_presence(
                     cumulative_stats.turns += 1;
                     cumulative_stats.rounds += 1;
                     bus.send(AppEvent::DoneSignal { message: message.clone() });
+                    // External-agent rounds: no native conversation to snapshot.
+                    // Conversation rollback will use the backend's native
+                    // mechanism (Codex thread/rollback) or fall back to a
+                    // session reset (CC, Gemini).
                     bus.send(AppEvent::RoundComplete {
                         round: cumulative_stats.rounds,
                         turns_in_round,
+                        native_message_count: None,
                     });
                 }
                 DrainOutcome::Interrupted { reason } => {
@@ -6244,6 +6356,7 @@ async fn run_external_agent_mode(
                 bus.send(AppEvent::RoundComplete {
                     round,
                     turns_in_round,
+                    native_message_count: None,
                 });
                 slog(&session_log, |l| l.round_complete(round, turns_in_round));
 
@@ -6289,6 +6402,7 @@ async fn run_external_agent_mode(
                 bus.send(AppEvent::RoundComplete {
                     round,
                     turns_in_round: stats.turns,
+                    native_message_count: None,
                 });
                 match follow_up_rx.recv().await {
                     Some(followup) => {

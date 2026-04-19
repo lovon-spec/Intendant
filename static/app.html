@@ -5585,21 +5585,54 @@ function renderTimeline() {
 
 async function doRollback(roundId) {
   if (!Number.isFinite(roundId)) return;
-  const msg = `Roll back to round #${roundId}?\n\nFiles will be reverted to the snapshot at the end of that round. `
-    + `Later rounds are preserved and can be restored via Redo or from Abandoned branches.`;
-  if (!confirm(msg)) return;
+  // Offer the user three choices: files only (classic), conversation only,
+  // or both. confirm() is the only stock browser dialog; we stack two of
+  // them so no extra chrome is needed.
+  const msg = `Roll back to round #${roundId}?\n\nOK = revert files only (classic).\nCancel = open more options.`;
+  const simple = confirm(msg);
+  let revertFiles = true;
+  let revertConversation = false;
+  if (!simple) {
+    const extra = prompt(
+      `Advanced rollback for round #${roundId}:\n` +
+      `  files = revert files only\n` +
+      `  convo = revert conversation only\n` +
+      `  both  = revert files AND conversation\n` +
+      `  (cancel = abort)`,
+      'both'
+    );
+    if (extra == null) return;
+    const choice = extra.trim().toLowerCase();
+    if (choice === 'files') {
+      revertFiles = true;
+      revertConversation = false;
+    } else if (choice === 'convo' || choice === 'conversation') {
+      revertFiles = false;
+      revertConversation = true;
+    } else if (choice === 'both') {
+      revertFiles = true;
+      revertConversation = true;
+    } else {
+      alert(`Unrecognized choice "${extra}" — rollback aborted.`);
+      return;
+    }
+  }
   try {
     const r = await fetch('/api/session/current/rollback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ round_id: roundId }),
+      body: JSON.stringify({
+        round_id: roundId,
+        revert_files: revertFiles,
+        revert_conversation: revertConversation,
+      }),
     });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       alert(`Rollback failed: ${err.error || r.statusText}`);
       return;
     }
-    // The `rolled_back` WS event will trigger refreshHistory().
+    // The `rolled_back` / `conversation_rolled_back` WS events refresh the UI.
   } catch (e) {
     alert(`Rollback error: ${e.message || e}`);
   }

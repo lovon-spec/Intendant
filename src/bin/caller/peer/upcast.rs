@@ -278,7 +278,9 @@ impl AppEventUpcaster {
             | AppEvent::SnapshotCreated { .. }
             | AppEvent::RolledBack { .. }
             | AppEvent::Redone { .. }
-            | AppEvent::HistoryPruned { .. } => vec![],
+            | AppEvent::HistoryPruned { .. }
+            | AppEvent::ConversationRollbackRequested { .. }
+            | AppEvent::ConversationRolledBack { .. } => vec![],
 
             AppEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
                 if *success { LogLevel::Info } else { LogLevel::Warn },
@@ -412,6 +414,7 @@ impl AppEventUpcaster {
             AppEvent::RoundComplete {
                 round,
                 turns_in_round,
+                ..
             } => vec![log_event(
                 LogLevel::Info,
                 "agent",
@@ -1212,6 +1215,7 @@ impl WireEventUpcaster {
             | OutboundEvent::RolledBack { .. }
             | OutboundEvent::Redone { .. }
             | OutboundEvent::HistoryPruned { .. }
+            | OutboundEvent::ConversationRolledBack { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }
             | OutboundEvent::PeerStateChanged { .. }
@@ -2939,6 +2943,7 @@ mod tests {
         assert_parity(AppEvent::RoundComplete {
             round: 3,
             turns_in_round: 7,
+            native_message_count: None,
         });
     }
 

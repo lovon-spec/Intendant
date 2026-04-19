@@ -1114,11 +1114,31 @@ async fn handle_history_get(
     ("200 OK", body)
 }
 
-/// POST /api/session/current/rollback — body: `{"round_id": N}`.
+/// POST /api/session/current/rollback — body:
+/// ```json
+/// { "round_id": N,
+///   "revert_files": true,          // default true (backward-compat)
+///   "revert_conversation": false   // default false
+/// }
+/// ```
+///
+/// Each boolean is independent. When both are false the endpoint is a
+/// validation-only no-op (returns 400). Existing callers passing only
+/// `round_id` get a file-only revert, matching prior behavior.
+///
+/// `revert_conversation` emits an `AppEvent::ConversationRollbackRequested`
+/// on the shared bus. The active agent loop subscribes and either
+/// truncates its native `Conversation` (native path), issues
+/// `thread/rollback` (Codex), or shuts down and re-initializes
+/// (session-reset for Claude Code / Gemini). A matching
+/// `AppEvent::ConversationRolledBack` is emitted when the work
+/// completes. The HTTP response does not wait for that completion —
+/// the dashboard observes the event stream.
 async fn handle_history_rollback(
     body_text: &str,
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
+    bus: &EventBus,
 ) -> (&'static str, String) {
     let Some(fw) = file_watcher else {
         return (
@@ -1147,21 +1167,115 @@ async fn handle_history_rollback(
             );
         }
     };
-    let mut w = fw.lock().await;
-    match w.rollback(round_id) {
-        Ok(res) => (
-            "200 OK",
+    // Backward-compat: old callers pass only `round_id` and expect a
+    // file-only revert. New callers supply both flags.
+    let revert_files = parsed
+        .get("revert_files")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let revert_conversation = parsed
+        .get("revert_conversation")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !revert_files && !revert_conversation {
+        return (
+            "400 Bad Request",
             serde_json::json!({
-                "to_round_id": res.to_round_id,
-                "files_reverted": res.files_reverted,
+                "error": "at least one of revert_files / revert_conversation must be true"
             })
             .to_string(),
-        ),
-        Err(e) => (
-            "400 Bad Request",
-            serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
+        );
     }
+
+    // Resolve conversation-rollback parameters before we mutate any
+    // state so a downstream failure doesn't leave files half-reverted
+    // with no event emitted. Reading the history requires the same
+    // mutex the rollback writes use, so we briefly acquire and release.
+    let conv_params: Option<(Option<u32>, u32)> = if revert_conversation {
+        let w = fw.lock().await;
+        let hist = w.history();
+        let target_idx = hist.rounds.iter().position(|r| r.id == round_id);
+        let head_idx = hist
+            .current_head_id
+            .and_then(|hid| hist.rounds.iter().position(|r| r.id == hid));
+        match (target_idx, head_idx) {
+            (Some(t), Some(h)) => {
+                // Compute turns to drop from the head turn-count sum
+                // between (t, h]. This matches Codex's `turnsToRollback`
+                // semantics: the number of turns we want to undo.
+                let turns_to_drop: u32 = if t < h {
+                    hist.rounds[t + 1..=h]
+                        .iter()
+                        .map(|r| r.turn_count.unwrap_or(0))
+                        .sum()
+                } else {
+                    0
+                };
+                let target_msg_count = hist.rounds[t].native_message_count;
+                Some((target_msg_count, turns_to_drop))
+            }
+            (Some(_), None) => {
+                // No head — rolling back with no active position is a
+                // pure file-state restore; nothing to drop from the
+                // conversation side.
+                Some((hist.rounds[target_idx.unwrap()].native_message_count, 0))
+            }
+            _ => {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({"error": format!(
+                        "round {} not found in active history", round_id
+                    )})
+                    .to_string(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // File rollback (may fail for reasons unrelated to the conversation
+    // side; bail out before emitting the conversation event so both
+    // halves stay consistent from the user's perspective).
+    let file_result_json = if revert_files {
+        let mut w = fw.lock().await;
+        match w.rollback(round_id) {
+            Ok(res) => serde_json::json!({
+                "to_round_id": res.to_round_id,
+                "files_reverted": res.files_reverted,
+            }),
+            Err(e) => {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({"error": e.to_string()}).to_string(),
+                );
+            }
+        }
+    } else {
+        serde_json::json!({ "to_round_id": round_id, "files_reverted": 0 })
+    };
+
+    // Dispatch the conversation-rollback event; the agent loop picks it
+    // up and emits `ConversationRolledBack` when done.
+    if let Some((target_msg_count, turns_to_drop)) = conv_params {
+        bus.send(AppEvent::ConversationRollbackRequested {
+            round_id,
+            target_native_message_count: target_msg_count,
+            turns_to_drop,
+        });
+    }
+
+    (
+        "200 OK",
+        serde_json::json!({
+            "to_round_id": file_result_json["to_round_id"],
+            "files_reverted": file_result_json["files_reverted"],
+            "revert_files": revert_files,
+            "revert_conversation": revert_conversation,
+        })
+        .to_string(),
+    )
 }
 
 /// POST /api/session/current/redo — no body. Advances `current_head_id`.
@@ -4000,7 +4114,10 @@ pub fn spawn_web_gateway(
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST") && request_line.contains("/api/session/current/rollback") {
-                        // POST /api/session/current/rollback body: {"round_id": N}
+                        // POST /api/session/current/rollback body:
+                        //   {"round_id": N,
+                        //    "revert_files": bool (default true),
+                        //    "revert_conversation": bool (default false)}
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let agent_state = query_ctx
@@ -4010,6 +4127,7 @@ pub fn spawn_web_gateway(
                             &body_text,
                             file_watcher.as_ref(),
                             agent_state.as_ref(),
+                            &bus,
                         ).await;
                         let response = format!(
                             "HTTP/1.1 {}\r\n\

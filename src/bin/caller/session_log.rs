@@ -1248,6 +1248,34 @@ impl SessionLog {
         });
     }
 
+    /// Log a conversation rollback (truncated or session-reset).
+    pub fn conversation_rolled_back(
+        &mut self,
+        round_id: u64,
+        turns_removed: u32,
+        backend: &str,
+        method: &str,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "conversation_rolled_back".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Conversation rolled back to round {} via {} ({} turns removed, backend: {})",
+                round_id, method, turns_removed, backend
+            )),
+            data: Some(serde_json::json!({
+                "round_id": round_id,
+                "turns_removed": turns_removed,
+                "backend": backend,
+                "method": method,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log display ready.
     pub fn display_ready(
         &mut self,
@@ -2346,6 +2374,7 @@ pub fn session_log_entry_to_app_event(
             Some(AppEvent::RoundComplete {
                 round,
                 turns_in_round,
+                native_message_count: None,
             })
         }
         "safety_cap_reached" => Some(AppEvent::SafetyCapReached),
@@ -3580,6 +3609,7 @@ mod tests {
             AppEvent::RoundComplete {
                 round,
                 turns_in_round,
+                ..
             } => {
                 assert_eq!(round, 2);
                 assert_eq!(turns_in_round, 5);

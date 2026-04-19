@@ -1890,6 +1890,7 @@ impl App {
             AppEvent::RoundComplete {
                 round,
                 turns_in_round,
+                ..
             } => {
                 self.round = round;
                 self.current_phase = Phase::WaitingFollowUp;
@@ -2152,7 +2153,9 @@ impl App {
             | AppEvent::SnapshotCreated { .. }
             | AppEvent::RolledBack { .. }
             | AppEvent::Redone { .. }
-            | AppEvent::HistoryPruned { .. } => {
+            | AppEvent::HistoryPruned { .. }
+            | AppEvent::ConversationRollbackRequested { .. }
+            | AppEvent::ConversationRolledBack { .. } => {
                 // Derived events — just pass through to outbound broadcaster.
                 // App doesn't need to handle its own output.
             }
@@ -3209,6 +3212,7 @@ mod tests {
         let derived = app.handle_event(AppEvent::RoundComplete {
             round: 1,
             turns_in_round: 3,
+            native_message_count: None,
         });
         assert_eq!(count_log_entries(&derived), 0, "RoundComplete rebroadcast LogEntry");
 

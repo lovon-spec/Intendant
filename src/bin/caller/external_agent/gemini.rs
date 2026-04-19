@@ -1268,6 +1268,29 @@ mod tests {
         assert!(agent.child.is_none());
     }
 
+    #[tokio::test]
+    async fn rollback_turns_default_returns_not_supported() {
+        // Gemini inherits the default `rollback_turns` from the trait,
+        // which returns "not supported" — the outer loop keys on this
+        // typed error to fall back to a full session reset.
+        let mut agent = GeminiAgent::new(
+            "gemini".into(),
+            GeminiLaunchConfig::default(),
+            None,
+        );
+        let err = agent.rollback_turns(1).await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("not supported"),
+                    "expected 'not supported' in default error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
     #[test]
     fn gemini_agent_new_with_options() {
         let launch = GeminiLaunchConfig {

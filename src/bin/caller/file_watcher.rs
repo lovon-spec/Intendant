@@ -52,6 +52,19 @@ pub struct HistoryRound {
     pub files_changed: Vec<String>,
     /// FULL project state at the end of this round: path → sha256 hex.
     pub files_at_end: HashMap<String, String>,
+    /// Number of agent turns executed in this round (from `RoundComplete.turns_in_round`).
+    /// Used by conversation rollback to compute how many turns to drop
+    /// when reverting to a specific round. Optional for backward compat
+    /// with history.json files written before this field existed.
+    #[serde(default)]
+    pub turn_count: Option<u32>,
+    /// Number of messages in the native conversation at the end of this
+    /// round. When present, rolling back to this round truncates the
+    /// native `Conversation.messages` to this length. Not meaningful for
+    /// external agent backends — they use session-reset or protocol-level
+    /// rollback instead.
+    #[serde(default)]
+    pub native_message_count: Option<u32>,
 }
 
 /// A branch of rounds that was replaced by a rollback-then-new-action. Kept
@@ -386,10 +399,14 @@ impl FileWatcher {
             tokio::task::spawn(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(AppEvent::RoundComplete { round, .. }) => {
+                        Ok(AppEvent::RoundComplete { round, turns_in_round, native_message_count }) => {
                             let summary = format!("Round {}", round);
                             let mut w = shared.lock().await;
-                            if let Err(e) = w.on_round_complete(summary) {
+                            if let Err(e) = w.on_round_complete(
+                                summary,
+                                Some(turns_in_round as u32),
+                                native_message_count,
+                            ) {
                                 eprintln!("[file_watcher] round snapshot failed: {}", e);
                             }
                         }
@@ -510,7 +527,20 @@ impl FileWatcher {
     /// Called when a round finishes. Walks the project tree, writes any new
     /// content blobs into `objects/`, records a new `HistoryRound`, and
     /// persists history.
-    pub fn on_round_complete(&mut self, summary: String) -> Result<(), CallerError> {
+    ///
+    /// `turn_count` is the number of agent turns executed in this round
+    /// (carried through `AppEvent::RoundComplete.turns_in_round`).
+    /// `native_message_count` is the length of the native
+    /// `Conversation.messages` at the time of RoundComplete; only set for
+    /// rounds produced by the native agent. External-agent rounds pass
+    /// `None` here — they rely on backend-specific rollback (Codex) or
+    /// session reset (CC, Gemini) instead.
+    pub fn on_round_complete(
+        &mut self,
+        summary: String,
+        turn_count: Option<u32>,
+        native_message_count: Option<u32>,
+    ) -> Result<(), CallerError> {
         // Walk project and compute file hashes + write objects.
         let files_at_end = self.scan_and_store_objects()?;
 
@@ -544,6 +574,8 @@ impl FileWatcher {
             timestamp_unix: now_unix(),
             files_changed,
             files_at_end,
+            turn_count,
+            native_message_count,
         };
 
         // Write per-round manifest.
@@ -1140,6 +1172,52 @@ mod tests {
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// A round snapshot records `turn_count` and `native_message_count`
+    /// when they're passed in, and persists them through the
+    /// history.json round-trip so conversation rollback can look them
+    /// up after a restart.
+    #[test]
+    fn round_records_turn_count_and_message_count() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"r1").unwrap();
+
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), Some(3), Some(42)).unwrap();
+        let id = w.history.current_head_id.unwrap();
+
+        let round = w.history.rounds.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(round.turn_count, Some(3));
+        assert_eq!(round.native_message_count, Some(42));
+
+        // Persist + reload to confirm the fields survive JSON round-trip.
+        let hist_path = tmp_snap.path().join("history.json");
+        let bytes = std::fs::read(&hist_path).unwrap();
+        let parsed: History = serde_json::from_slice(&bytes).unwrap();
+        let reloaded = parsed.rounds.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(reloaded.turn_count, Some(3));
+        assert_eq!(reloaded.native_message_count, Some(42));
+    }
+
+    /// Backward-compat: a history.json produced before these fields
+    /// existed must still deserialize, with the missing fields
+    /// defaulting to `None`.
+    #[test]
+    fn history_round_missing_turn_fields_defaults_to_none() {
+        let json = r#"{
+            "id": 1,
+            "parent_id": null,
+            "summary": "R1",
+            "timestamp_unix": 0,
+            "files_changed": [],
+            "files_at_end": {}
+        }"#;
+        let round: HistoryRound = serde_json::from_str(json).unwrap();
+        assert_eq!(round.turn_count, None);
+        assert_eq!(round.native_message_count, None);
+    }
+
     /// Snapshot creates a round, files_at_end captures every file's hash,
     /// rollback restores content even when files have been mutated since.
     #[test]
@@ -1151,14 +1229,14 @@ mod tests {
         std::fs::write(root.join("b.txt"), b"round1-b").unwrap();
 
         let mut w = make_watcher(root, tmp_snap.path());
-        w.on_round_complete("R1".into()).unwrap();
+        w.on_round_complete("R1".into(), None, None).unwrap();
         let round1_id = w.history.current_head_id.unwrap();
 
         // Modify files then snapshot round 2.
         std::fs::write(root.join("a.txt"), b"round2-a").unwrap();
         std::fs::remove_file(root.join("b.txt")).unwrap();
         std::fs::write(root.join("c.txt"), b"round2-c").unwrap();
-        w.on_round_complete("R2".into()).unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
         let round2_id = w.history.current_head_id.unwrap();
         assert_ne!(round1_id, round2_id);
         assert_eq!(w.history.rounds.len(), 2);
@@ -1185,11 +1263,11 @@ mod tests {
         let root = tmp_proj.path();
         std::fs::write(root.join("a.txt"), b"r1").unwrap();
         let mut w = make_watcher(root, tmp_snap.path());
-        w.on_round_complete("R1".into()).unwrap();
+        w.on_round_complete("R1".into(), None, None).unwrap();
         let r1 = w.history.current_head_id.unwrap();
 
         std::fs::write(root.join("a.txt"), b"r2").unwrap();
-        w.on_round_complete("R2".into()).unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
         let r2 = w.history.current_head_id.unwrap();
 
         w.rollback(r1).unwrap();
@@ -1212,11 +1290,11 @@ mod tests {
         let root = tmp_proj.path();
         std::fs::write(root.join("a.txt"), b"r1").unwrap();
         let mut w = make_watcher(root, tmp_snap.path());
-        w.on_round_complete("R1".into()).unwrap();
+        w.on_round_complete("R1".into(), None, None).unwrap();
         let r1 = w.history.current_head_id.unwrap();
 
         std::fs::write(root.join("a.txt"), b"r2").unwrap();
-        w.on_round_complete("R2".into()).unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
         let r2 = w.history.current_head_id.unwrap();
 
         // Roll back; linear history still holds both rounds.
@@ -1225,7 +1303,7 @@ mod tests {
 
         // New action branches.
         std::fs::write(root.join("a.txt"), b"r2-prime").unwrap();
-        w.on_round_complete("R2'".into()).unwrap();
+        w.on_round_complete("R2'".into(), None, None).unwrap();
 
         assert_eq!(w.history.rounds.len(), 2);
         assert_eq!(w.history.abandoned_branches.len(), 1);
@@ -1248,11 +1326,11 @@ mod tests {
         let root = tmp_proj.path();
         std::fs::write(root.join("a.txt"), b"r1").unwrap();
         let mut w = make_watcher(root, tmp_snap.path());
-        w.on_round_complete("R1".into()).unwrap();
+        w.on_round_complete("R1".into(), None, None).unwrap();
         let r1 = w.history.current_head_id.unwrap();
 
         std::fs::write(root.join("a.txt"), b"branch-only-content").unwrap();
-        w.on_round_complete("R2".into()).unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
         let r2 = w.history.current_head_id.unwrap();
 
         // The "branch-only-content" hash exists in objects/.
@@ -1272,7 +1350,7 @@ mod tests {
         // Branch: roll back to r1 and create a new round. r2 goes into abandoned.
         w.rollback(r1).unwrap();
         std::fs::write(root.join("a.txt"), b"r2-new").unwrap();
-        w.on_round_complete("R2'".into()).unwrap();
+        w.on_round_complete("R2'".into(), None, None).unwrap();
         assert_eq!(w.history.abandoned_branches.len(), 1);
 
         let res = w.prune_abandoned().unwrap();
@@ -1292,7 +1370,7 @@ mod tests {
         let root = tmp_proj.path();
         std::fs::write(root.join("seed.txt"), b"seed").unwrap();
         let mut w = make_watcher(root, tmp_snap.path());
-        w.on_round_complete("R1".into()).unwrap();
+        w.on_round_complete("R1".into(), None, None).unwrap();
         let r1 = w.history.current_head_id.unwrap();
 
         // Synthesize multiple abandoned branches with distinct timestamps.
@@ -1305,6 +1383,8 @@ mod tests {
                 timestamp_unix: now,
                 files_changed: vec![],
                 files_at_end: HashMap::new(),
+                turn_count: None,
+                native_message_count: None,
             };
             w.history.abandoned_branches.push(AbandonedBranch {
                 branched_from_id: r1,

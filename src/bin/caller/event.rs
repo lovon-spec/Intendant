@@ -355,6 +355,16 @@ pub enum AppEvent {
     RoundComplete {
         round: usize,
         turns_in_round: usize,
+        /// Length of the native `Conversation.messages` at the end of this
+        /// round. Populated only when emitted from the native agent loop;
+        /// the external-agent paths emit `None` because their conversation
+        /// state lives inside the backend process (Codex thread, CC/Gemini
+        /// session) rather than in a `Conversation` struct.
+        ///
+        /// The file watcher stores this on `HistoryRound.native_message_count`
+        /// so a conversation-rollback request can truncate back to that
+        /// length when rolling back to this round.
+        native_message_count: Option<u32>,
     },
 
     /// Presence layer responded — switch to follow-up mode without logging
@@ -551,6 +561,50 @@ pub enum AppEvent {
     HistoryPruned {
         branches_removed: u32,
         bytes_freed: u64,
+    },
+
+    // ---- Conversation rollback ----
+    /// Emitted by the web gateway's rollback handler when the user
+    /// requested `revert_conversation: true`. The active agent loop
+    /// (native via `run_agent_loop` / `run_with_presence`, or the
+    /// external-agent drain) subscribes to the bus and handles this by
+    /// truncating / session-resetting its conversation state, then
+    /// emits `ConversationRolledBack` with the result.
+    ///
+    /// The handler looks up the round's stored `native_message_count`
+    /// (from `HistoryRound`) and `turn_count`; both are passed through
+    /// here so the consumer doesn't have to look them up again.
+    ConversationRollbackRequested {
+        /// The round we are rolling back to. Echoed through to the
+        /// completion event for UI correlation.
+        round_id: u64,
+        /// For the native agent: truncate `Conversation.messages` to
+        /// this length. `None` for rollbacks targeting external-agent
+        /// rounds (those fall back to backend rollback or session reset).
+        target_native_message_count: Option<u32>,
+        /// Number of turns that occurred between the current head and
+        /// the target round. Passed through to external-agent backends
+        /// that accept a `turnsToRollback` parameter (Codex).
+        turns_to_drop: u32,
+    },
+
+    /// Conversation was rolled back to a specific round.
+    ConversationRolledBack {
+        round_id: u64,
+        /// Number of messages/turns removed from the conversation.
+        /// Semantics are backend-dependent:
+        ///   - native/Codex: turns dropped from the conversation tail.
+        ///   - session-reset backends: best-effort estimate (the count
+        ///     passed in `turns_to_drop`).
+        turns_removed: u32,
+        /// Which backend performed the rollback: `"native"`, `"codex"`,
+        /// `"claude-code"`, or `"gemini"`.
+        backend: String,
+        /// How the rollback was performed: `"truncated"` for the native
+        /// agent and Codex's `thread/rollback`, or `"session-reset"` for
+        /// backends (CC, Gemini) that don't expose a protocol-level
+        /// rollback and re-initialize the session from scratch.
+        method: String,
     },
 
     // TUI internal
@@ -1005,6 +1059,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::RoundComplete {
             round,
             turns_in_round,
+            ..
         } => Some(OutboundEvent::RoundComplete {
             round: *round,
             turns_in_round: *turns_in_round,
@@ -1272,6 +1327,19 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 bytes_freed: *bytes_freed,
             })
         }
+        AppEvent::ConversationRolledBack {
+            round_id,
+            turns_removed,
+            backend,
+            method,
+        } => Some(OutboundEvent::ConversationRolledBack {
+            round_id: *round_id,
+            turns_removed: *turns_removed,
+            backend: backend.clone(),
+            method: method.clone(),
+        }),
+        // Input event for the agent loop — not broadcast to browsers.
+        AppEvent::ConversationRollbackRequested { .. } => None,
         // Terminal-only / internal events — not broadcast to external consumers
         AppEvent::Key(_)
         | AppEvent::Resize(_, _)
@@ -1387,7 +1455,7 @@ fn write_event_to_session_log(
         AppEvent::OrchestratorProgress { status, .. } => {
             log.orchestrator_progress(status);
         }
-        AppEvent::RoundComplete { round, turns_in_round } => {
+        AppEvent::RoundComplete { round, turns_in_round, .. } => {
             log.round_complete(*round, *turns_in_round);
         }
 
@@ -1531,6 +1599,18 @@ fn write_event_to_session_log(
         }
         AppEvent::HistoryPruned { branches_removed, bytes_freed } => {
             log.history_pruned(*branches_removed, *bytes_freed);
+        }
+        AppEvent::ConversationRolledBack {
+            round_id,
+            turns_removed,
+            backend,
+            method,
+        } => {
+            log.conversation_rolled_back(*round_id, *turns_removed, backend, method);
+        }
+        AppEvent::ConversationRollbackRequested { .. } => {
+            // Input event — the agent loop logs the completion
+            // (ConversationRolledBack). No point logging the request.
         }
 
         // ---- Events already logged inline by the agent loop or web_gateway ----

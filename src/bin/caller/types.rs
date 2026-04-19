@@ -430,6 +430,18 @@ pub enum OutboundEvent {
         branches_removed: u32,
         bytes_freed: u64,
     },
+    /// The agent's conversation was rolled back to a specific round.
+    /// Emitted after `POST /api/session/current/rollback` with
+    /// `revert_conversation: true`. `backend` is one of "native",
+    /// "codex", "claude-code", "gemini"; `method` is "truncated"
+    /// (native / Codex `thread/rollback`) or "session-reset"
+    /// (CC / Gemini re-init).
+    ConversationRolledBack {
+        round_id: u64,
+        turns_removed: u32,
+        backend: String,
+        method: String,
+    },
     InterruptRequested,
     Interrupted {
         reason: String,

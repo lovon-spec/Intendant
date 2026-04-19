@@ -592,6 +592,31 @@ mod tests {
         assert!(!agent.prompt_sent);
     }
 
+    #[tokio::test]
+    async fn rollback_turns_default_returns_not_supported() {
+        // Claude Code inherits the default `rollback_turns` from the
+        // trait, which returns the "not supported" typed error the
+        // outer loop keys on to fall back to a session reset.
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "auto".into(),
+            vec![],
+            None,
+        );
+        let err = agent.rollback_turns(3).await.unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("not supported"),
+                    "expected 'not supported' in default error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
     #[test]
     fn claude_code_agent_with_options() {
         let agent = ClaudeCodeAgent::new(
