@@ -108,7 +108,8 @@ pub use card::{
 pub use event::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, LogLevel,
     MessageContent, MessageId, MessagePart, MessageRole, ModelUsage, PeerEvent, PeerMessage,
-    PeerStatus, SessionInfo, TaggedPeerEvent, TaskId, TaskUpdate, UsageSnapshot,
+    PeerStatus, SessionInfo, TaggedPeerEvent, TaskId, TaskUpdate, UsageSnapshot, WebRtcSessionId,
+    WebRtcSignal,
 };
 pub use handle::{
     spawn_peer, ConnectionState, PeerHandle, PeerSnapshot, BROADCAST_CAPACITY,

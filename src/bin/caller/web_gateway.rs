@@ -3702,8 +3702,23 @@ pub fn spawn_web_gateway(
                                             }
                                         }
                                         _ => {
-                                            // Fall through to ControlMsg parsing
+                                            // Fall through to ControlMsg parsing.
+                                            // WebRtcSignal needs special handling because
+                                            // it requires session_registry / direct_tx
+                                            // access for the response leg; everything else
+                                            // gets re-broadcast as AppEvent::ControlCommand
+                                            // for the agent loop / TUI / MCP consumers.
                                             match serde_json::from_value::<ControlMsg>(json) {
+                                                Ok(ControlMsg::WebRtcSignal { display_id, session_id, signal }) => {
+                                                    handle_federated_webrtc_signal(
+                                                        display_id,
+                                                        session_id,
+                                                        signal,
+                                                        session_registry_inbound.as_ref(),
+                                                        &ice_config,
+                                                        direct_tx_inbound.clone(),
+                                                    ).await;
+                                                }
                                                 Ok(ctrl) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!("[ws] ControlMsg: {:?}",
@@ -5157,6 +5172,9 @@ pub fn spawn_web_gateway(
                                         peers_resolve_approval(registry, id, &body_text)
                                             .await
                                     }
+                                    "webrtc" => {
+                                        peers_webrtc_signal(registry, id, &body_text).await
+                                    }
                                     other => (
                                         404,
                                         serde_json::json!({
@@ -5723,6 +5741,232 @@ fn peer_handle_or_404(
             serde_json::json!({"error": format!("peer not found: {id}")}).to_string(),
         )
     })
+}
+
+/// JSON body shape for `POST /api/peers/{id}/webrtc`.
+///
+/// Single endpoint, signal-discriminated. The dashboard's per-peer
+/// `RTCPeerConnection` glue posts every leg of the signaling exchange
+/// (Offer, IceCandidate, Close) through this one path, scoped by
+/// `display_id` + `session_id`. The peer responds asynchronously
+/// via `OutboundEvent::WebRtcSignal` events that the registry
+/// forwards to the browser through the existing
+/// `OutboundEvent::PeerEventForwarded` channel.
+#[derive(Deserialize)]
+struct PeerWebRtcSignalRequest {
+    display_id: u32,
+    session_id: String,
+    signal: crate::peer::WebRtcSignal,
+}
+
+/// Handle `POST /api/peers/{id}/webrtc`. Routes a WebRTC signaling
+/// frame from the browser to the named peer over the federation
+/// transport. Returns `200 {"ok": true}` on accepted dispatch, or
+/// the standard 4xx/5xx envelope used by the other peer ops.
+///
+/// The peer's response (Answer, ICE candidates) flows back
+/// asynchronously via the registry's per-peer event forwarder —
+/// callers don't get the answer in this HTTP response, they
+/// observe it on the dashboard's primary `/ws` as a
+/// `PeerEventForwarded` whose payload is `PeerEvent::WebRtcSignal`.
+async fn peers_webrtc_signal(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+    body_text: &str,
+) -> (u16, String) {
+    let req: PeerWebRtcSignalRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")})
+                    .to_string(),
+            );
+        }
+    };
+    let peer_id = crate::peer::PeerId(id.to_string());
+    let handle = match registry.get(&peer_id) {
+        Some(h) => h,
+        None => {
+            return (
+                404,
+                serde_json::json!({"error": "peer not found"}).to_string(),
+            );
+        }
+    };
+    match handle
+        .webrtc_signal(
+            req.display_id,
+            crate::peer::WebRtcSessionId(req.session_id),
+            req.signal,
+        )
+        .await
+    {
+        Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
+        Err(crate::peer::PeerError::NotConnected) => (
+            502,
+            serde_json::json!({"error": "peer is not connected"}).to_string(),
+        ),
+        Err(crate::peer::PeerError::UnsupportedCapability(_)) => (
+            502,
+            serde_json::json!({
+                "error": "peer's transport does not support WebRTC signaling"
+            })
+            .to_string(),
+        ),
+        Err(e) => (
+            500,
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
+    }
+}
+
+/// Handle a federation-driven WebRTC signal arriving on this peer's
+/// WebSocket inside a [`crate::event::ControlMsg::WebRtcSignal`].
+///
+/// Routes the signal to the matching `DisplaySession` method and
+/// emits responses back over the connection's `direct_tx` as
+/// [`crate::types::OutboundEvent::WebRtcSignal`] frames:
+///
+/// - `Offer` → `DisplaySession::handle_offer` → emit `Answer` + drain
+///   the per-session ICE channel emitting `IceCandidate`s as they arrive.
+/// - `IceCandidate` → `DisplaySession::add_ice_candidate`. No response.
+/// - `Close` → `DisplaySession::remove_peer`. No response.
+/// - `Answer` → protocol error (this side is the offer-receiver, not
+///   the offer-sender). Logged and ignored.
+/// - `Unknown` → forward-compat fallback. Ignored.
+///
+/// Slice 3a passes `None` for both `tcp_peer_registry` and
+/// `tcp_advertised_addr`: federation media is browser-to-peer direct,
+/// not browser-to-primary, so the peer doesn't share the primary's
+/// ICE-TCP multiplex and has no `Host`-header view of the connecting
+/// browser. UDP host candidates only. Slice 3b adds primary-as-relay
+/// for the no-direct-path case.
+///
+/// `session_id` is round-tripped verbatim into the response so the
+/// browser's per-(peer, session_id) `RTCPeerConnection` map can match
+/// the answer/candidates back to the right pending session. The local
+/// [`crate::display::PeerId`] used as the `WebRtcPeer` key is derived
+/// by hashing `session_id` — same string hashes to the same u64, so
+/// later `IceCandidate` / `Close` signals route to the same peer.
+async fn handle_federated_webrtc_signal(
+    display_id: u32,
+    session_id: String,
+    signal: crate::peer::WebRtcSignal,
+    session_registry: Option<&Arc<tokio::sync::RwLock<crate::display::SessionRegistry>>>,
+    ice_config: &crate::display::IceConfig,
+    direct_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    let registry = match session_registry {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "[web_gateway] federated webrtc signal for display {display_id} \
+                 session {session_id} but no session_registry available"
+            );
+            return;
+        }
+    };
+    let session = match registry.read().await.get(display_id) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "[web_gateway] federated webrtc signal for unknown display \
+                 {display_id} (session {session_id})"
+            );
+            return;
+        }
+    };
+
+    // Stable PeerId per session_id via DefaultHasher. Same string
+    // hashes to the same u64, so subsequent IceCandidate and Close
+    // signals route to the same WebRtcPeer in the session's peer map.
+    let peer_id: crate::display::PeerId = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        session_id.hash(&mut h);
+        h.finish()
+    };
+
+    match signal {
+        crate::peer::WebRtcSignal::Offer { sdp } => {
+            let (ice_tx, mut ice_rx) =
+                tokio::sync::mpsc::channel::<(crate::display::PeerId, String)>(64);
+            let answer_result = session
+                .handle_offer(peer_id, &sdp, ice_config, None, None, ice_tx)
+                .await;
+            match answer_result {
+                Ok(answer_sdp) => {
+                    let answer = crate::types::OutboundEvent::WebRtcSignal {
+                        display_id,
+                        session_id: session_id.clone(),
+                        signal: crate::peer::WebRtcSignal::Answer {
+                            sdp: answer_sdp,
+                        },
+                    };
+                    if let Ok(s) = serde_json::to_string(&answer) {
+                        let _ = direct_tx.send(s);
+                    }
+
+                    // Drain the per-session ICE channel and forward
+                    // server-side trickle candidates as separate
+                    // WebRtcSignal frames. Task exits when the
+                    // session removes the peer (channel closes).
+                    let direct_tx_ice = direct_tx.clone();
+                    let session_id_ice = session_id;
+                    tokio::spawn(async move {
+                        while let Some((_pid, candidate_json)) = ice_rx.recv().await {
+                            let evt = crate::types::OutboundEvent::WebRtcSignal {
+                                display_id,
+                                session_id: session_id_ice.clone(),
+                                signal: crate::peer::WebRtcSignal::IceCandidate {
+                                    candidate_json,
+                                },
+                            };
+                            if let Ok(s) = serde_json::to_string(&evt) {
+                                if direct_tx_ice.send(s).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[web_gateway] federated webrtc handle_offer failed for \
+                         display {display_id} session {session_id}: {e}"
+                    );
+                }
+            }
+        }
+        crate::peer::WebRtcSignal::IceCandidate { candidate_json } => {
+            if let Err(e) = session.add_ice_candidate(peer_id, &candidate_json).await {
+                eprintln!(
+                    "[web_gateway] federated webrtc add_ice_candidate failed for \
+                     display {display_id} session {session_id}: {e}"
+                );
+            }
+        }
+        crate::peer::WebRtcSignal::Answer { .. } => {
+            // Protocol error: this side is the offer-receiver. Browsers
+            // send Offers via the primary's federation transport;
+            // peers reply with Answers via OutboundEvent::WebRtcSignal.
+            // An incoming Answer here means a confused sender — log
+            // and drop rather than silently mishandling.
+            eprintln!(
+                "[web_gateway] unexpected federated webrtc Answer received on \
+                 peer side (display {display_id} session {session_id}) — ignoring"
+            );
+        }
+        crate::peer::WebRtcSignal::Close => {
+            session.remove_peer(peer_id).await;
+        }
+        crate::peer::WebRtcSignal::Unknown => {
+            // Forward-compat fallback for signal kinds added by newer
+            // builds. Older daemons silently ignore.
+        }
+    }
 }
 
 /// Handle `POST /api/peers/{id}/message`.

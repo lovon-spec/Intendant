@@ -1225,6 +1225,26 @@ impl WireEventUpcaster {
             | OutboundEvent::PeerStateChanged { .. }
             | OutboundEvent::PeerEventForwarded { .. } => vec![],
 
+            // Peer-emitted WebRTC signaling. Upcasts 1:1 to the
+            // matching `PeerEvent::WebRtcSignal` so the per-peer event
+            // stream carries the peer's `Answer` and trickled
+            // `IceCandidate`s back to the registry, which forwards
+            // them via `PeerEventForwarded` to the browser.
+            //
+            // The wire `session_id: String` becomes the typed
+            // `WebRtcSessionId` here so federation-side consumers
+            // (registry, dashboard signaling relay) get the
+            // newtyped value without re-parsing.
+            OutboundEvent::WebRtcSignal {
+                display_id,
+                session_id,
+                signal,
+            } => vec![PeerEvent::WebRtcSignal {
+                display_id: *display_id,
+                session_id: crate::peer::WebRtcSessionId(session_id.clone()),
+                signal: signal.clone(),
+            }],
+
             OutboundEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
                 if *success { LogLevel::Info } else { LogLevel::Warn },
                 "codex-action",
@@ -3184,5 +3204,40 @@ mod tests {
             text_b, "analyzing",
             "wire path has only `status`, loses `last_action`"
         );
+    }
+
+    /// `OutboundEvent::WebRtcSignal` upcasts 1:1 to
+    /// `PeerEvent::WebRtcSignal` so federation-side consumers
+    /// (registry, dashboard) get the typed event without re-parsing
+    /// the wire-level string session_id.
+    #[test]
+    fn webrtc_signal_outbound_upcasts_to_peer_event() {
+        let mut u = WireEventUpcaster::new();
+        let out = crate::types::OutboundEvent::WebRtcSignal {
+            display_id: 42,
+            session_id: "sess-uuid".into(),
+            signal: crate::peer::WebRtcSignal::Answer {
+                sdp: "v=0\r\nm=video".into(),
+            },
+        };
+        let events = u.upcast(&out);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            PeerEvent::WebRtcSignal {
+                display_id,
+                session_id,
+                signal,
+            } => {
+                assert_eq!(*display_id, 42);
+                assert_eq!(session_id.0, "sess-uuid");
+                match signal {
+                    crate::peer::WebRtcSignal::Answer { sdp } => {
+                        assert_eq!(sdp, "v=0\r\nm=video");
+                    }
+                    other => panic!("expected Answer, got {other:?}"),
+                }
+            }
+            other => panic!("expected WebRtcSignal, got {other:?}"),
+        }
     }
 }

@@ -148,6 +148,81 @@ pub enum PeerEvent {
         /// convention (see `web_gateway::replay_jsonl_to_outbound_entries`).
         ts: String,
     },
+
+    // ---- Per-peer WebRTC signaling (display sharing) ----
+    /// One leg of a WebRTC signaling exchange between the connecting
+    /// browser and this peer. Routed by the federation transport so
+    /// the browser can establish a *direct* WebRTC media path to the
+    /// peer's display, with the primary acting as signaling middleman
+    /// only — encoded video flows browser↔peer, never through primary
+    /// (slice 3a). 3b adds a primary-relay fallback for the no-direct-
+    /// path case.
+    ///
+    /// `display_id` identifies which of the peer's displays this signal
+    /// pertains to; `session_id` is a browser-generated UUID that scopes
+    /// the WebRTC session so multiple sessions to the same display
+    /// don't collide and a stale session from a previous browser tab
+    /// doesn't interfere with a fresh one.
+    ///
+    /// In the peer→primary direction, this carries the peer's `Answer`
+    /// and trickled `IceCandidate`s. In the primary→peer direction
+    /// (via [`crate::peer::traits::PeerOp::WebRtcSignal`]), it carries
+    /// the browser's `Offer` and trickled `IceCandidate`s.
+    WebRtcSignal {
+        display_id: u32,
+        session_id: WebRtcSessionId,
+        signal: WebRtcSignal,
+    },
+}
+
+/// Browser-generated UUID identifying one WebRTC session to one peer's
+/// one display. Newtype so it doesn't get confused with `MessageId` /
+/// `TaskId` / `ActivityId` at type level.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WebRtcSessionId(pub String);
+
+impl WebRtcSessionId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WebRtcSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One leg of a WebRTC signaling exchange. Transport-neutral —
+/// transports map this onto whatever wire frame they speak (the native
+/// Intendant WebSocket transport maps to `ControlMsg::WebRtcSignal` in
+/// one direction and consumes `OutboundEvent::WebRtcSignal` via the
+/// upcaster in the other).
+///
+/// Forward-compat fallback variant `Unknown` so future signal kinds
+/// don't fail the whole event parse on older builds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WebRtcSignal {
+    /// Browser-side SDP offer. The browser is the offerer (mirrors
+    /// the local browser→daemon WebRTC flow); peer creates a
+    /// `WebRtcPeer` in response and emits an `Answer`.
+    Offer { sdp: String },
+    /// Peer-side SDP answer in response to an offer.
+    Answer { sdp: String },
+    /// Trickled ICE candidate. Either direction. The wire format is
+    /// the JSON object the browser/server already exchanges over the
+    /// local /ws path (`{"candidate": "...", "sdpMid": "...", ...}`)
+    /// passed through verbatim — no transport-layer reinterpretation.
+    IceCandidate { candidate_json: String },
+    /// Browser-side close request. Tells the peer to tear down the
+    /// `WebRtcPeer` for this session_id. Sent on tab unmount,
+    /// explicit close button, or peer-disconnect cleanup.
+    Close,
+    /// Forward-compat fallback. Unknown signal kinds parse to this
+    /// variant rather than failing; peer/browser ignore it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Operational status reported by a peer.

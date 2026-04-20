@@ -1566,6 +1566,11 @@ impl App {
                 // Dispatcher re-emits as AppEvent::SteerRequested; TUI
                 // reacts to that (via the log path in `handle_event`).
             }
+            ControlMsg::WebRtcSignal { .. } => {
+                // Federation-driven WebRTC signaling — handled by the
+                // web gateway's WS handler, not the TUI control command
+                // path. The TUI doesn't drive WebRTC sessions; no-op.
+            }
         }
     }
 

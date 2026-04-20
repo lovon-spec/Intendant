@@ -935,6 +935,25 @@ pub enum ControlMsg {
         #[serde(default)]
         id: Option<String>,
     },
+    /// Federation-driven WebRTC signaling toward this daemon. Carries the
+    /// browser's offer / trickled ICE candidates / close-request, routed
+    /// through the connecting peer's primary daemon over the federation
+    /// transport. The daemon's WS handler dispatches to its
+    /// `DisplaySession::handle_offer` (for `Offer`) or
+    /// `add_ice_candidate` (for `IceCandidate`), keying the per-session
+    /// `WebRtcPeer` by `(display_id, session_id)`.
+    ///
+    /// Distinct from the local `display_offer` / `display_ice` raw-JSON
+    /// frames the dashboard sends directly: this typed variant scopes
+    /// the federation path so peer-side dispatch can apply different
+    /// auth/lifecycle rules without reading the raw `t` discriminator.
+    /// The matching peer→connector direction comes back as
+    /// [`crate::types::OutboundEvent::WebRtcSignal`] over the same WS.
+    WebRtcSignal {
+        display_id: u32,
+        session_id: String,
+        signal: crate::peer::WebRtcSignal,
+    },
 }
 
 /// The event bus sender. Cloneable for use in multiple tasks.

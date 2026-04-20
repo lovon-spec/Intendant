@@ -1956,6 +1956,13 @@ async fn handle_control_command_mcp(
             emit_control_result(control_tx, "steer", true, "Steer requested".to_string(), None);
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::WebRtcSignal { .. } => {
+            // Federation-driven WebRTC signaling — handled by the
+            // web gateway's per-peer WS dispatcher, not the MCP
+            // control surface. MCP clients don't drive display
+            // streams; this variant is a no-op here.
+            None
+        }
     }
 }
 

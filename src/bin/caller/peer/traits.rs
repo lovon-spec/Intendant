@@ -26,7 +26,9 @@
 //! owner; there is no need to hide this behind interior mutability.
 
 use crate::peer::card::{AgentCard, TransportSpec};
-use crate::peer::event::{ApprovalDecision, MessageId, PeerMessage, TaskId, TaskUpdate};
+use crate::peer::event::{
+    ApprovalDecision, MessageId, PeerMessage, TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
+};
 use crate::peer::PeerError;
 use async_trait::async_trait;
 
@@ -70,6 +72,14 @@ pub struct TransportFeatures {
     pub invoke_capability: bool,
     /// Transport supports [`PeerOp::ResolveApproval`].
     pub resolve_approval: bool,
+    /// Transport supports relaying [`PeerOp::WebRtcSignal`] frames
+    /// (browser→peer SDP offers and ICE candidates) and emitting the
+    /// peer's [`crate::peer::event::PeerEvent::WebRtcSignal`] in the
+    /// other direction. The full federated display path needs both
+    /// directions; transports without it can't carry per-peer display
+    /// sharing and the dashboard hides the "View display" affordance
+    /// for those peers.
+    pub webrtc_signal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +102,16 @@ pub enum PeerOp {
         request_id: String,
         decision: ApprovalDecision,
     },
+    /// One leg of WebRTC signaling sent toward the peer (browser→peer
+    /// direction): SDP `Offer`, trickled `IceCandidate`, or `Close`.
+    /// The matching peer→browser direction comes back as
+    /// [`crate::peer::event::PeerEvent::WebRtcSignal`] via the
+    /// transport's event stream.
+    WebRtcSignal {
+        display_id: u32,
+        session_id: WebRtcSessionId,
+        signal: WebRtcSignal,
+    },
 }
 
 impl PeerOp {
@@ -104,6 +124,7 @@ impl PeerOp {
             Self::QueryTaskStatus { .. } => "query_task_status",
             Self::InvokeCapability { .. } => "invoke_capability",
             Self::ResolveApproval { .. } => "resolve_approval",
+            Self::WebRtcSignal { .. } => "webrtc_signal",
         }
     }
 }
@@ -177,6 +198,7 @@ pub fn check_feature(features: &TransportFeatures, op: &PeerOp) -> Result<(), Pe
         PeerOp::QueryTaskStatus { .. } => features.task_query,
         PeerOp::InvokeCapability { .. } => features.invoke_capability,
         PeerOp::ResolveApproval { .. } => features.resolve_approval,
+        PeerOp::WebRtcSignal { .. } => features.webrtc_signal,
     };
     if !supported {
         return Err(PeerError::UnsupportedCapability(op.name().to_string()));

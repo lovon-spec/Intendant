@@ -508,6 +508,24 @@ pub enum OutboundEvent {
         peer_id: String,
         payload: crate::peer::PeerEvent,
     },
+    /// One leg of a federation-driven WebRTC signaling exchange,
+    /// emitted *by* this daemon back toward a connector. Carries the
+    /// daemon's `Answer` (in response to a browser `Offer` routed via
+    /// `ControlMsg::WebRtcSignal`) or trickled `IceCandidate`s. The
+    /// connecting peer's transport ([`crate::peer::transport::IntendantWsTransport`])
+    /// upcasts this into [`crate::peer::PeerEvent::WebRtcSignal`] so
+    /// the primary's registry can forward it to the browser through
+    /// the existing `PeerEventForwarded` path.
+    ///
+    /// `session_id` is the same browser-generated UUID that came in
+    /// on the corresponding `ControlMsg::WebRtcSignal` — round-trips
+    /// verbatim so the browser's per-session `RTCPeerConnection` can
+    /// match incoming answers/candidates to the right peer connection.
+    WebRtcSignal {
+        display_id: u32,
+        session_id: String,
+        signal: crate::peer::WebRtcSignal,
+    },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
     /// Cannot be serialized.

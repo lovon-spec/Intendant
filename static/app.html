@@ -547,6 +547,64 @@ html, body {
 }
 .daemon-msg-status.error { color: var(--red); }
 .daemon-msg-status.ok { color: var(--green); }
+/* Per-peer WebRTC display (slice 3a). Single focused pane inside the
+   peer's expanded controls. Multi-pane mosaic / thumbnail strip lands
+   in a follow-up — for now one peer's display at a time. The video
+   element is muted by default (no audio in the federated display
+   path; voice is its own capability). */
+.daemon-display-view {
+  padding: 4px 12px;
+  background: var(--mauve);
+  color: var(--base);
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.daemon-display-view:hover { background: var(--lavender); }
+.peer-display-container {
+  margin-top: 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--crust);
+  padding: 6px;
+}
+.peer-display-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.peer-display-video {
+  width: 100%;
+  max-height: 480px;
+  background: black;
+  border-radius: 3px;
+  object-fit: contain;
+}
+.peer-display-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.peer-display-status {
+  flex: 1;
+  font-size: 11px;
+  color: var(--subtext0);
+}
+.peer-display-status.connected { color: var(--green); }
+.peer-display-status.error { color: var(--red); }
+.peer-display-close {
+  padding: 2px 10px;
+  background: transparent;
+  color: var(--red);
+  border: 1px solid var(--red);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+.peer-display-close:hover { background: var(--surface1); }
 /* Per-peer approvals — surfaced from the peer's secondary event
    stream when an `approval_required` event arrives. Each row gets
    approve / deny / skip buttons that POST to /api/peers/{id}/approval. */
@@ -5789,6 +5847,14 @@ function processCommands(cmds) {
       case 'peer_approval_resolved':
         removePendingApproval(c.host_id, c.id);
         break;
+      case 'peer_webrtc_signal':
+        // Per-peer WebRTC signaling: route to the matching
+        // RTCPeerConnection (keyed by host_id|display_id|session_id)
+        // so the browser can complete the offer/answer/ICE handshake
+        // and start receiving the peer's display directly. See
+        // PeerDisplayConnection / handlePeerWebRtcSignal below.
+        handlePeerWebRtcSignal(c.host_id, c.display_id, c.session_id, c.signal);
+        break;
     }
   }
 }
@@ -10965,6 +11031,10 @@ function removeDaemonById(id) {
   // approvals — once the peer is gone there's nothing to resolve.
   expandedDaemons.delete(id);
   peerPendingApprovals.delete(id);
+  // Tear down any active per-peer display: the peer is gone, the
+  // RTCPeerConnection has nowhere to send signaling, and leaving it
+  // alive would just stall on ICE failure.
+  closePeerDisplaysForHost(id).catch(() => {});
   renderDaemonsList();
 }
 
@@ -11079,6 +11149,17 @@ function renderDaemonsList() {
     });
   });
 
+  // Wire the "View display" button: lazy create on first click. The
+  // button only exists for peers whose card advertises Capability::Display.
+  el.querySelectorAll('.daemon-display-view').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const displayId = parseInt(btn.dataset.displayId || '0', 10);
+      openPeerDisplay(btn.dataset.hostId, displayId).catch(err => {
+        console.error('openPeerDisplay failed:', err);
+      });
+    });
+  });
+
   // Reapply expansion state for any rows that were open before this
   // re-render (e.g. user expanded a peer's controls, then a push
   // event triggered re-render). Without this the panel collapses on
@@ -11089,6 +11170,10 @@ function renderDaemonsList() {
   // controls panel's HTML was just regenerated, so any approvals
   // section we previously inserted is gone — rebuild it.
   peerPendingApprovals.forEach((_, hostId) => renderPeerApprovals(hostId));
+
+  // Reapply per-peer WebRTC display panes so live MediaStreams stay
+  // attached to the freshly-rendered <video> elements after re-render.
+  reapplyPeerDisplayPanes();
 
   // Toggle host-badge visibility in the Activity tab. Single-host
   // setups stay visually clean; multi-host setups see the badges.
@@ -11248,6 +11333,12 @@ function renderDaemonRow(d, isSelf) {
     ? ''
     : `<button class="expand-btn" data-host-id="${escapeHtml(d.host_id)}" title="Show peer controls">▾</button>`;
   const peerLabel = escapeHtml(d.label || d.host_id);
+  // Capability-gated "View display" button — only peers whose card
+  // advertises Capability::Display get the affordance. Slice 3a opens
+  // display_id 0 by default; multi-display picker is a follow-up.
+  const viewDisplayBtn = !isSelf && peerCanShareDisplay(d)
+    ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
+    : '';
   const controlsPanel = isSelf
     ? ''
     : `<div class="daemon-controls" id="daemon-controls-${escapeHtml(d.host_id)}" style="display:none">
@@ -11255,8 +11346,10 @@ function renderDaemonRow(d, isSelf) {
            <input class="daemon-msg-input" type="text" placeholder="Send a message or task to ${peerLabel}…" data-host-id="${escapeHtml(d.host_id)}">
            <button class="daemon-msg-send" data-host-id="${escapeHtml(d.host_id)}" title="Send as a follow-up message in the peer's current conversation">Send</button>
            <button class="daemon-task-send" data-host-id="${escapeHtml(d.host_id)}" title="Start a new task on the peer with these instructions">Task</button>
+           ${viewDisplayBtn}
          </div>
          <div class="daemon-msg-status" data-host-id="${escapeHtml(d.host_id)}"></div>
+         <div class="peer-display-container" id="peer-display-${escapeHtml(d.host_id)}" style="display:none"></div>
        </div>`;
   return `
     <div class="daemon-entry${isSelf ? ' self' : ''}">
@@ -11482,6 +11575,266 @@ async function submitPeerInput(hostId, kind) {
 
 function sendPeerMessage(hostId) { return submitPeerInput(hostId, 'message'); }
 function sendPeerTask(hostId)    { return submitPeerInput(hostId, 'task'); }
+
+// ── Per-peer WebRTC display (slice 3a) ──
+//
+// Browser opens a direct WebRTC connection to a peer's display, with
+// the primary acting as signaling middleman only — encoded video flows
+// browser↔peer, never through primary. Lazy: created on "View display"
+// click. Single focused pane per host (slice 3a scope; thumbnail strip
+// + multi-pane mosaic deferred). View-only — no input/clipboard data
+// channels yet (the local-display flow has them; federation parity is
+// a follow-up).
+//
+// Lifecycle:
+// - openPeerDisplay: generate session_id, build PeerDisplayConnection,
+//   create offer, POST to /api/peers/{id}/webrtc, await answer
+//   asynchronously via the peer_webrtc_signal UiCommand path.
+// - handlePeerWebRtcSignal: routes Answer / IceCandidate / Close to
+//   the matching connection by (host_id, display_id, session_id).
+// - closePeerDisplaysForHost: explicit close button + auto-cleanup on
+//   peer removal. Sends a Close signal to the peer so it tears down
+//   its WebRtcPeer (otherwise it'd leak until the federation transport
+//   disconnects).
+// - On daemon-list re-render (peer_state_changed etc.), the video
+//   element gets regenerated. reapplyPeerDisplayPanes finds the new
+//   element and re-attaches the live MediaStream so the stream
+//   doesn't stutter through the DOM swap.
+
+const peerDisplayConnections = new Map(); // sessionKey → PeerDisplayConnection
+
+function generateSessionId() {
+  if (window.crypto && window.crypto.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function peerCanShareDisplay(d) {
+  if (!Array.isArray(d.capabilities)) return false;
+  return d.capabilities.some(c => c && c.kind === 'display');
+}
+
+class PeerDisplayConnection {
+  constructor(hostId, displayId, sessionId) {
+    this.hostId = hostId;
+    this.displayId = displayId;
+    this.sessionId = sessionId;
+    this.pc = null;
+    this.stream = null;
+    this._pendingCandidates = [];
+    this._answerApplied = false;
+  }
+
+  sessionKey() {
+    return `${this.hostId}|${this.displayId}|${this.sessionId}`;
+  }
+
+  // Attach to the DOM. Called on initial open AND after each
+  // renderDaemonsList re-render so the live MediaStream (held on
+  // `this.stream`) stays connected to the user-visible <video>.
+  attachToDom() {
+    const container = document.getElementById(`peer-display-${this.hostId}`);
+    if (!container) return;
+    if (!container.querySelector('.peer-display-pane')) {
+      container.innerHTML = `
+        <div class="peer-display-pane" data-host-id="${escapeHtml(this.hostId)}">
+          <video class="peer-display-video" autoplay playsinline muted></video>
+          <div class="peer-display-controls">
+            <span class="peer-display-status">Connecting…</span>
+            <button class="peer-display-close" data-host-id="${escapeHtml(this.hostId)}">Close</button>
+          </div>
+        </div>`;
+      const closeBtn = container.querySelector('.peer-display-close');
+      if (closeBtn) {
+        closeBtn.addEventListener('click', () =>
+          closePeerDisplaysForHost(this.hostId)
+        );
+      }
+    }
+    container.style.display = 'block';
+    const videoEl = container.querySelector('.peer-display-video');
+    if (videoEl && this.stream) {
+      videoEl.srcObject = this.stream;
+    }
+  }
+
+  setStatus(text, kind) {
+    const container = document.getElementById(`peer-display-${this.hostId}`);
+    if (!container) return;
+    const statusEl = container.querySelector('.peer-display-status');
+    if (statusEl) {
+      statusEl.textContent = text;
+      statusEl.className = `peer-display-status ${kind || ''}`;
+    }
+  }
+
+  async connect() {
+    // Slice 3a uses an empty iceServers list — peer's UDP host
+    // candidates only. STUN/TURN plumbing for the no-direct-path
+    // case lands in 3b along with primary-as-relay.
+    this.pc = new RTCPeerConnection({ iceServers: [] });
+    this.pc.addTransceiver('video', { direction: 'recvonly' });
+
+    this.pc.ontrack = (e) => {
+      this.stream = e.streams[0];
+      const container = document.getElementById(`peer-display-${this.hostId}`);
+      const videoEl = container && container.querySelector('.peer-display-video');
+      if (videoEl) videoEl.srcObject = this.stream;
+      this.setStatus('Connected (view-only)', 'connected');
+    };
+
+    this.pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        this._sendSignal({
+          kind: 'ice_candidate',
+          candidate_json: JSON.stringify(e.candidate.toJSON()),
+        }).catch(() => {});
+      }
+    };
+
+    this.pc.onconnectionstatechange = () => {
+      if (!this.pc) return;
+      const state = this.pc.connectionState;
+      if (state === 'connected') {
+        this.setStatus('Connected (view-only)', 'connected');
+      } else if (state === 'failed') {
+        this.setStatus('Connection failed', 'error');
+      } else if (state === 'disconnected') {
+        this.setStatus('Disconnected', 'error');
+      }
+    };
+
+    try {
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+      await this._sendSignal({
+        kind: 'offer',
+        sdp: this.pc.localDescription.sdp,
+      });
+      this.setStatus('Offer sent, awaiting answer…', '');
+    } catch (err) {
+      this.setStatus(`Offer failed: ${err.message}`, 'error');
+    }
+  }
+
+  handleAnswer(sdp) {
+    if (!this.pc) return;
+    this.pc
+      .setRemoteDescription({ type: 'answer', sdp })
+      .then(() => {
+        this._answerApplied = true;
+        for (const c of this._pendingCandidates) {
+          this.pc.addIceCandidate(c).catch(() => {});
+        }
+        this._pendingCandidates = [];
+      })
+      .catch((err) => {
+        this.setStatus(`Answer failed: ${err.message}`, 'error');
+      });
+  }
+
+  handleIceCandidate(candidateJson) {
+    if (!candidateJson || !this.pc) return;
+    let candidate;
+    try {
+      candidate = JSON.parse(candidateJson);
+    } catch {
+      return;
+    }
+    if (this._answerApplied) {
+      this.pc.addIceCandidate(candidate).catch(() => {});
+    } else {
+      // Buffer candidates that arrive before the answer is applied.
+      // Mirrors the local display flow; the peer-side ICE forwarder
+      // can produce candidates as soon as handle_offer returns.
+      this._pendingCandidates.push(candidate);
+    }
+  }
+
+  async close() {
+    // Best-effort tell peer to tear down its WebRtcPeer.
+    await this._sendSignal({ kind: 'close' }).catch(() => {});
+    if (this.pc) {
+      try { this.pc.close(); } catch {}
+      this.pc = null;
+    }
+    this.stream = null;
+  }
+
+  async _sendSignal(signal) {
+    const url = `/api/peers/${this.hostId}/webrtc`;
+    const resp = await authedFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        display_id: this.displayId,
+        session_id: this.sessionId,
+        signal,
+      }),
+    });
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(
+        `webrtc signal failed (${resp.status}): ${detail.error || 'unknown'}`
+      );
+    }
+  }
+}
+
+async function openPeerDisplay(hostId, displayId) {
+  // One session per host in slice 3a — close any previous before
+  // opening a fresh one. Avoids accumulating stale RTCPeerConnections
+  // when the user clicks "View display" repeatedly.
+  await closePeerDisplaysForHost(hostId);
+  const sessionId = generateSessionId();
+  const conn = new PeerDisplayConnection(hostId, displayId, sessionId);
+  peerDisplayConnections.set(conn.sessionKey(), conn);
+  conn.attachToDom();
+  await conn.connect();
+}
+
+async function closePeerDisplaysForHost(hostId) {
+  const closes = [];
+  for (const [key, conn] of peerDisplayConnections.entries()) {
+    if (conn.hostId === hostId) {
+      closes.push(conn.close().catch(() => {}));
+      peerDisplayConnections.delete(key);
+    }
+  }
+  await Promise.all(closes);
+  const container = document.getElementById(`peer-display-${hostId}`);
+  if (container) {
+    container.innerHTML = '';
+    container.style.display = 'none';
+  }
+}
+
+function handlePeerWebRtcSignal(hostId, displayId, sessionId, signal) {
+  const sessionKey = `${hostId}|${displayId}|${sessionId}`;
+  const conn = peerDisplayConnections.get(sessionKey);
+  if (!conn) return; // late straggler or another tab's session
+  const kind = signal && signal.kind;
+  if (kind === 'answer') {
+    conn.handleAnswer(signal.sdp || '');
+  } else if (kind === 'ice_candidate') {
+    conn.handleIceCandidate(signal.candidate_json || '');
+  } else if (kind === 'close') {
+    closePeerDisplaysForHost(hostId);
+  }
+  // Other / unknown signal kinds: ignore (forward-compat).
+}
+
+// After a renderDaemonsList re-render rebuilds the controls panels
+// from scratch, walk the live PeerDisplayConnection set and re-attach
+// each one's MediaStream to the freshly-rendered <video> element.
+// The RTCPeerConnection itself stays alive across re-renders — only
+// the DOM nodes get regenerated.
+function reapplyPeerDisplayPanes() {
+  for (const conn of peerDisplayConnections.values()) {
+    conn.attachToDom();
+  }
+}
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({

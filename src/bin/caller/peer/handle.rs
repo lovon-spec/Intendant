@@ -25,7 +25,7 @@
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
     ApprovalDecision, MessageId, PeerEvent, PeerMessage, PeerStatus, TaggedPeerEvent, TaskId,
-    TaskUpdate,
+    TaskUpdate, WebRtcSessionId, WebRtcSignal,
 };
 use crate::peer::id::PeerId;
 use crate::peer::traits::{PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures};
@@ -306,6 +306,37 @@ impl PeerHandle {
             .exec(PeerOp::ResolveApproval {
                 request_id: request_id.to_string(),
                 decision,
+            })
+            .await?
+        {
+            PeerOpAck::Ok => Ok(()),
+            other => Err(PeerError::Transport(format!(
+                "expected Ok ack, got {}",
+                other.name()
+            ))),
+        }
+    }
+
+    /// Send one leg of a WebRTC signaling exchange to this peer.
+    /// Returns immediately on dispatch; the peer's response (Answer,
+    /// trickled IceCandidates) flows back asynchronously through the
+    /// per-peer event stream as [`PeerEvent::WebRtcSignal`].
+    pub async fn webrtc_signal(
+        &self,
+        display_id: u32,
+        session_id: WebRtcSessionId,
+        signal: WebRtcSignal,
+    ) -> Result<(), PeerError> {
+        if !self.features().webrtc_signal {
+            return Err(PeerError::UnsupportedCapability(
+                "webrtc_signal".into(),
+            ));
+        }
+        match self
+            .exec(PeerOp::WebRtcSignal {
+                display_id,
+                session_id,
+                signal,
             })
             .await?
         {

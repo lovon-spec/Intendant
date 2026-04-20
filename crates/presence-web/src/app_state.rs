@@ -183,6 +183,25 @@ pub enum UiCommand {
         host_id: String,
         id: String,
     },
+    /// One leg of a federation-driven WebRTC signaling exchange
+    /// arriving from a peer. JS feeds the `signal` payload to the
+    /// matching per-peer `RTCPeerConnection` keyed by
+    /// `(host_id, display_id, session_id)`:
+    ///
+    /// - `Answer` → `pc.setRemoteDescription({type:"answer", sdp})`
+    /// - `IceCandidate` → `pc.addIceCandidate(JSON.parse(candidate_json))`
+    /// - other / unknown → ignored (forward-compat)
+    ///
+    /// The `signal` field is the raw `PeerEvent::WebRtcSignal::signal`
+    /// JSON value forwarded verbatim — JS dispatches on `signal.kind`
+    /// directly so newer signal kinds added to the wire don't require
+    /// a coordinated WASM rebuild on the dashboard side.
+    PeerWebRtcSignal {
+        host_id: String,
+        display_id: u32,
+        session_id: String,
+        signal: serde_json::Value,
+    },
     /// A Codex thread action (/compact, /fork, /undo, /review, /init,
     /// /memory-reset, /new) finished. `success` + `message` drive a
     /// dashboard toast and the Activity log entry.
@@ -2029,6 +2048,36 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
         // task_update: not surfaced per-peer yet (no task list UI).
         "task_update" => vec![],
 
+        // WebRTC signaling forwarded to the per-peer RTCPeerConnection
+        // glue in JS. The `signal` payload is opaque here — JS reads
+        // its `kind` field to dispatch to setRemoteDescription /
+        // addIceCandidate / close-cleanup.
+        "webrtc_signal" => {
+            let display_id = payload["display_id"].as_u64().unwrap_or(0) as u32;
+            let session_id = payload["session_id"].as_str().unwrap_or("").to_string();
+            let signal = payload["signal"].clone();
+            if session_id.is_empty() {
+                // No session_id means we can't route to the right
+                // RTCPeerConnection; drop with a diagnostic log
+                // entry so the operator can spot the protocol drift.
+                return vec![UiCommand::PeerLog {
+                    host_id: host,
+                    ts: now,
+                    level: "warn".to_string(),
+                    source: "webrtc".to_string(),
+                    content: format!(
+                        "WebRTC signal missing session_id: {payload}"
+                    ),
+                }];
+            }
+            vec![UiCommand::PeerWebRtcSignal {
+                host_id: host,
+                display_id,
+                session_id,
+                signal,
+            }]
+        }
+
         // Unknown / forward-compat: render as a debug log so the user
         // can see something arrived rather than dropping silently.
         other => vec![UiCommand::PeerLog {
@@ -3592,5 +3641,81 @@ mod tests {
         assert_eq!(host_id, "intendant:alpha");
         assert_eq!(level, "warn");
         assert!(content.contains("boom"), "expected boom in {content}");
+    }
+
+    /// `webrtc_signal` renders as a typed `PeerWebRtcSignal` carrying
+    /// the peer's host_id, the display_id, the session_id, and the
+    /// raw signal payload — JS dispatches on `signal.kind` to feed
+    /// the matching `RTCPeerConnection`.
+    #[test]
+    fn peer_event_forwarded_webrtc_signal_targets_session() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "webrtc_signal",
+                "display_id": 0,
+                "session_id": "sess-uuid",
+                "signal": {"kind": "answer", "sdp": "v=0\r\n..."},
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        let sig = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerWebRtcSignal {
+                host_id,
+                display_id,
+                session_id,
+                signal,
+            } => Some((host_id, display_id, session_id, signal)),
+            _ => None,
+        });
+        let (host_id, display_id, session_id, signal) =
+            sig.expect("PeerWebRtcSignal emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!(*display_id, 0);
+        assert_eq!(session_id, "sess-uuid");
+        assert_eq!(signal["kind"], "answer");
+        assert_eq!(signal["sdp"], "v=0\r\n...");
+    }
+
+    /// `webrtc_signal` without a session_id can't route to any
+    /// per-peer RTCPeerConnection — it falls back to a warning log
+    /// rather than producing a malformed `PeerWebRtcSignal`.
+    #[test]
+    fn peer_event_forwarded_webrtc_signal_missing_session_falls_back_to_warn_log() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "webrtc_signal",
+                "display_id": 0,
+                "signal": {"kind": "answer", "sdp": ""},
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        // No PeerWebRtcSignal should be emitted.
+        let any_signal = cmds.iter().any(|c| {
+            matches!(c, UiCommand::PeerWebRtcSignal { .. })
+        });
+        assert!(
+            !any_signal,
+            "missing session_id must not produce a PeerWebRtcSignal"
+        );
+        // A warn-level log entry should explain the drop.
+        let warn = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerLog { level, source, content, .. }
+                if level == "warn" && source == "webrtc" =>
+            {
+                Some(content)
+            }
+            _ => None,
+        });
+        let content = warn.expect("warn log entry for missing session_id");
+        assert!(
+            content.contains("session_id"),
+            "warn log should mention session_id: {content}"
+        );
     }
 }
