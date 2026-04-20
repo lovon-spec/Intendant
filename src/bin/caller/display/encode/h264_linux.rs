@@ -151,7 +151,7 @@ impl FfmpegH264Encoder {
                 "-profile:v",
                 "constrained_baseline",
                 "-g",
-                "60", // keyframe every 2s at 30fps
+                "30", // keyframe every 1s at 30fps feed rate
                 "-bf",
                 "0", // no B-frames
                 // Output: raw H264 Annex-B to stdout
@@ -202,7 +202,7 @@ impl FfmpegH264Encoder {
                 "-tune",
                 "zerolatency",
                 "-g",
-                "60",
+                "30",
                 "-bf",
                 "0",
                 // Output: raw H264 Annex-B to stdout
@@ -304,7 +304,16 @@ impl FfmpegH264Encoder {
 }
 
 impl Encoder for FfmpegH264Encoder {
-    fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String> {
+    fn encode(
+        &mut self,
+        i420: &[u8],
+        duration_ms: u64,
+        _force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>, String> {
+        // NOTE: `force_keyframe` cannot be honored on a long-running ffmpeg
+        // stdin pipe -- there is no way to inject per-frame "emit IDR now"
+        // metadata through rawvideo.  We rely on the short GOP (`-g 30`)
+        // configured at spawn time to bound how long a fresh peer waits.
         if i420.len() < self.frame_size {
             return Err(format!(
                 "I420 buffer too small: {} < {}",

@@ -407,6 +407,12 @@ pub struct DisplaySession {
     clipboard_monitor: Arc<clipboard::ClipboardMonitor>,
     /// Handle for the clipboard forwarding task (remote -> browser).
     clipboard_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Channel used by `handle_offer` to wake the capture/encode bridge when
+    /// a new peer attaches.  The bridge responds by forcing a keyframe on
+    /// the next encoded frame (so a peer joining on an idle desktop gets a
+    /// decodable reference within ~1 tick instead of waiting for the next
+    /// GOP boundary).  `Some` after `start_encoder_pipeline()` has run.
+    keyframe_tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
 }
 
 impl DisplaySession {
@@ -430,6 +436,7 @@ impl DisplaySession {
             encoder_event_bus: Mutex::new(None),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
+            keyframe_tx: Mutex::new(None),
         }
     }
 
@@ -758,8 +765,9 @@ impl DisplaySession {
         let (efr_tx, mut efr_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
 
         // Spawn the initial encoder thread.
+        // Channel payload: (i420 buffer, arrival time, force_keyframe_flag).
         let (i420_tx, i420_rx) =
-            std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
+            std::sync::mpsc::sync_channel::<(Vec<u8>, Instant, bool)>(4);
 
         let enc_counters = Arc::clone(&self.counters);
         let encoder_shutdown = self.shutdown.clone();
@@ -769,6 +777,9 @@ impl DisplaySession {
             i420_rx, efr_tx.clone(),
             Arc::clone(&enc_counters), encoder_shutdown,
         );
+
+        let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
+        *self.keyframe_tx.lock().await = Some(kf_tx);
 
         let bridge_counters = Arc::clone(&self.counters);
         let shutdown_bridge = self.shutdown.clone();
@@ -782,19 +793,47 @@ impl DisplaySession {
             let mut enc_width = width;
             let mut enc_height = height;
             let mut i420_tx = i420_tx;
-            // Buffer holding the most recently captured (and converted) I420
-            // frame. The bridge ticks at fps and forwards this buffer to the
-            // encoder on every tick — including when no new capture has
-            // arrived. This keeps the encoder's input cadence steady even
-            // when the source desktop is idle, so its periodic GOP keyframes
-            // happen on a wallclock schedule (and so peers that join during
-            // idle periods don't sit on a black screen forever).
+            // Most recently captured (and BGRA->I420 converted) frame.
+            // `generation` is bumped each time the capture branch replaces
+            // the buffer; the tick branch compares against `last_sent_gen`
+            // to tell new content from a repeat.
             let mut latest_i420: Option<(Vec<u8>, Instant)> = None;
+            let mut generation: u64 = 0;
+            let mut last_sent_gen: Option<u64> = None;
+            // Wall-clock time of the most recent send to the encoder.
+            // Used to drive the idle heartbeat.
+            let mut last_send_at = Instant::now();
+            // Force-keyframe window opened by `handle_offer` when a new
+            // peer attaches.  During the window every tick forwards to
+            // the encoder regardless of dirty state; the very first
+            // forwarded frame carries `force_keyframe=true`.  Sized to
+            // comfortably exceed one H.264 GOP at the configured feed
+            // rate so the fallback path (ffmpeg-pipe, which ignores the
+            // force flag) still lands a natural keyframe inside it.
+            let mut burst_until: Option<Instant> = None;
+            let mut burst_first = false;
+            // Heartbeat: when the buffer hasn't changed and we aren't in
+            // a burst, send one repeat every IDLE_HEARTBEAT so the
+            // encoder's internal timebase and RTP cadence keep flowing
+            // without re-encoding the same static frame 30 times/second.
+            const IDLE_HEARTBEAT: std::time::Duration =
+                std::time::Duration::from_secs(1);
+            const PEER_JOIN_BURST: std::time::Duration =
+                std::time::Duration::from_millis(1500);
+
             let mut tick = tokio::time::interval(frame_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = shutdown_bridge.cancelled() => break,
+                    _ = kf_rx.recv() => {
+                        // Peer attached (or a PLI is being simulated).
+                        // Open/refresh the burst window.  The next tick
+                        // will forward the latest frame with
+                        // force_keyframe=true.
+                        burst_until = Some(Instant::now() + PEER_JOIN_BURST);
+                        burst_first = true;
+                    }
                     result = broadcast_rx.recv() => {
                         let frame = match result {
                             Ok(f) => f,
@@ -822,11 +861,12 @@ impl DisplaySession {
                             drop(i420_tx);
                             // Drop stale buffer: dimensions changed.
                             latest_i420 = None;
+                            last_sent_gen = None;
 
                             // Spawn a fresh encoder thread at the new
                             // dimensions, reusing the same `efr_tx`.
                             let (new_tx, new_rx) =
-                                std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(4);
+                                std::sync::mpsc::sync_channel::<(Vec<u8>, Instant, bool)>(4);
                             i420_tx = new_tx;
                             let counters_clone = Arc::clone(&bridge_counters);
                             let shutdown_clone = shutdown_bridge.clone();
@@ -847,32 +887,65 @@ impl DisplaySession {
                         }
 
                         // Convert the new BGRA capture to I420 and stash
-                        // it as the latest buffer. The tick branch will
-                        // hand it to the encoder on the next interval.
+                        // it as the latest buffer.  The tick branch will
+                        // pick it up on the next interval (or sooner if
+                        // we're in a burst).  We deliberately keep the
+                        // conversion out of the send path so the broadcast
+                        // receiver can drain quickly; libvpx/libx264 see
+                        // frames at the tick rate, decoupled from capture
+                        // jitter.
                         let arrived = Instant::now();
-                        let fd = frame.data.clone();
-                        let fw = frame.width;
-                        let fh = frame.height;
-                        let fs = frame.stride;
+                        let frame_arc = Arc::clone(&frame);
                         let i420 = tokio::task::spawn_blocking(move || {
-                            encode::bgra_to_i420(&fd, fw, fh, fs)
+                            encode::bgra_to_i420(
+                                &frame_arc.data,
+                                frame_arc.width,
+                                frame_arc.height,
+                                frame_arc.stride,
+                            )
                         }).await;
                         if let Ok(i420) = i420 {
+                            generation = generation.wrapping_add(1);
                             latest_i420 = Some((i420, arrived));
                         }
                     }
                     _ = tick.tick() => {
-                        // Re-send the latest frame (new or repeated) so the
-                        // encoder sees a steady input cadence. If we have
-                        // nothing yet (initial seconds before the first
-                        // capture), skip — the encoder thread is happy to
-                        // sit idle until input arrives.
-                        if let Some((ref i420, arrived)) = latest_i420 {
-                            if i420_tx.try_send((i420.clone(), arrived)).is_err() {
-                                bridge_counters
-                                    .encode_drops
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
+                        let Some((ref i420, arrived)) = latest_i420 else {
+                            // No capture yet -- nothing to forward.  The
+                            // encoder is happy to sit idle.
+                            continue;
+                        };
+
+                        let in_burst = burst_until
+                            .map(|t| Instant::now() < t)
+                            .unwrap_or(false);
+                        if !in_burst {
+                            burst_until = None;
+                        }
+
+                        let changed = last_sent_gen != Some(generation);
+                        let heartbeat_due = last_send_at.elapsed() >= IDLE_HEARTBEAT;
+
+                        if !(changed || heartbeat_due || in_burst) {
+                            // Nothing new and nothing overdue -- skip the
+                            // tick.  This is the main CPU win: a fully
+                            // idle desktop stops clocking the encoder
+                            // at 30fps.
+                            continue;
+                        }
+
+                        let force_kf = in_burst && burst_first;
+                        if force_kf {
+                            burst_first = false;
+                        }
+
+                        if i420_tx.try_send((i420.clone(), arrived, force_kf)).is_err() {
+                            bridge_counters
+                                .encode_drops
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            last_sent_gen = Some(generation);
+                            last_send_at = Instant::now();
                         }
                     }
                 }
@@ -1031,6 +1104,14 @@ impl DisplaySession {
         // Start clipboard monitoring (remote -> browser) if not already running.
         self.ensure_clipboard_forwarding().await;
 
+        // Wake the bridge so the next forwarded frame is a forced keyframe.
+        // Without this, a peer joining during an idle desktop would wait up
+        // to one GOP interval (and, for VP8 on static content, potentially
+        // much longer) for a decodable reference.
+        if let Some(tx) = self.keyframe_tx.lock().await.as_ref() {
+            let _ = tx.send(());
+        }
+
         Ok(answer_sdp)
     }
 
@@ -1118,7 +1199,7 @@ fn spawn_encoder_thread(
     height: u32,
     duration_ms: u64,
     codec_mime: &'static str,
-    i420_rx: std::sync::mpsc::Receiver<(Vec<u8>, Instant)>,
+    i420_rx: std::sync::mpsc::Receiver<(Vec<u8>, Instant, bool)>,
     efr_tx: mpsc::Sender<Arc<EncodedFrame>>,
     counters: Arc<DisplayMetricsCounters>,
     shutdown: CancellationToken,
@@ -1143,12 +1224,12 @@ fn spawn_encoder_thread(
         let mut frames_since_last_output: u64 = 0;
         let mut watchdog_swap_done = false;
 
-        while let Ok((i420, arrived)) = i420_rx.recv() {
+        while let Ok((i420, arrived, force_keyframe)) = i420_rx.recv() {
             if shutdown.is_cancelled() {
                 break;
             }
 
-            let produced = match encoder.encode(&i420, duration_ms) {
+            let produced = match encoder.encode(&i420, duration_ms, force_keyframe) {
                 Ok(packets) => {
                     let n = packets.len();
                     let latency_us = arrived.elapsed().as_micros() as u64;
