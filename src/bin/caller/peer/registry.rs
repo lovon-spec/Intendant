@@ -178,18 +178,30 @@ impl PeerRegistry {
             });
         }
 
-        let spec = pick_supported_transport(&card.transports).ok_or_else(|| {
-            PeerError::CardFetch(format!(
+        // Filter the card's transports to the ones this build can speak,
+        // preserving the card's preference order. The first one whose
+        // `connect()` succeeds wins (handled by `MultiTransport`).
+        let supported_specs = pick_supported_transports(&card.transports);
+        if supported_specs.is_empty() {
+            return Err(PeerError::CardFetch(format!(
                 "peer {} advertises no transport this build supports: {:?}",
                 card.id, card.transports
-            ))
-        })?;
+            )));
+        }
 
         let peer_id = card.id.clone();
         let log_sink = self.inner.log_sink.clone();
 
-        let handle = spawn_peer(peer_id.clone(), card, log_sink, |events_tx| {
-            build_transport(&spec, events_tx)
+        let handle = spawn_peer(peer_id.clone(), card, log_sink, move |events_tx| {
+            // Build one concrete transport per supported spec (each
+            // gets its own clone of `events_tx`) and wrap them in a
+            // `MultiTransport` that probes them in order on connect.
+            let candidates: Vec<Box<dyn crate::peer::traits::PeerTransport>> =
+                supported_specs
+                    .iter()
+                    .map(|spec| build_transport(spec, events_tx.clone()))
+                    .collect();
+            Box::new(crate::peer::transport::MultiTransport::new(candidates))
         });
 
         self.inner
@@ -363,15 +375,24 @@ async fn fetch_card(card_url: &str) -> Result<AgentCard, PeerError> {
         .map_err(|e| PeerError::CardFetch(format!("parse {card_url}: {e}")))
 }
 
-/// Walk the card's transports list and pick the first variant
-/// this build supports. Phase 1: only `IntendantWs`. Unknown
-/// variants (from forward-compat fallback) and unimplemented
-/// variants are skipped.
-fn pick_supported_transport(transports: &[TransportSpec]) -> Option<TransportSpec> {
+/// Filter the card's transports list to the variants this build
+/// supports, preserving the card's original preference order.
+/// Unknown variants (from forward-compat fallback) and unimplemented
+/// variants are skipped. Returns an empty `Vec` when the card
+/// advertises only transports we don't speak — the caller treats
+/// that as a hard failure.
+///
+/// Phase 1: only `IntendantWs`. As A2A / OpenClaw / MCP transports
+/// land, add their match arms here so cards advertising mixed
+/// transport lists (e.g. an Intendant peer that also exposes A2A)
+/// produce a multi-element supported set the connecting daemon can
+/// probe through.
+fn pick_supported_transports(transports: &[TransportSpec]) -> Vec<TransportSpec> {
     transports
         .iter()
-        .find(|spec| matches!(spec, TransportSpec::IntendantWs { .. }))
+        .filter(|spec| matches!(spec, TransportSpec::IntendantWs { .. }))
         .cloned()
+        .collect()
 }
 
 /// Build a concrete transport from a selected spec. Factored out
@@ -385,7 +406,7 @@ fn build_transport(
             Box::new(IntendantWsTransport::new(url.clone(), events_tx))
         }
         other => {
-            // Should be unreachable: `pick_supported_transport`
+            // Should be unreachable: `pick_supported_transports`
             // filters to variants this function knows. If we get
             // here it means somebody added a transport kind to
             // the selector without the matching constructor arm —
@@ -427,6 +448,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle)
@@ -825,11 +847,13 @@ mod tests {
         gateway.abort();
     }
 
-    /// `pick_supported_transport` skips variants this build
-    /// doesn't support, including the `Unknown` forward-compat
-    /// fallback and future transport kinds like A2A.
+    /// `pick_supported_transports` skips variants this build doesn't
+    /// support, including the `Unknown` forward-compat fallback and
+    /// future transport kinds like A2A. Preference order from the
+    /// card is preserved in the returned Vec — first-supported wins
+    /// in `MultiTransport::connect`.
     #[test]
-    fn pick_supported_transport_filters_unsupported() {
+    fn pick_supported_transports_filters_unsupported() {
         let transports = vec![
             TransportSpec::Unknown,
             TransportSpec::A2A {
@@ -839,19 +863,52 @@ mod tests {
                 url: "ws://x/ws".into(),
             },
         ];
-        let picked = pick_supported_transport(&transports).unwrap();
-        assert!(matches!(picked, TransportSpec::IntendantWs { .. }));
+        let picked = pick_supported_transports(&transports);
+        assert_eq!(picked.len(), 1);
+        assert!(matches!(picked[0], TransportSpec::IntendantWs { .. }));
     }
 
-    /// Returns None when no supported variant is in the list.
+    /// `pick_supported_transports` preserves card preference order.
+    /// A card listing two `IntendantWs` URLs (e.g. LAN preferred,
+    /// Tailscale fallback) yields a Vec in the same order, which
+    /// `MultiTransport` then probes top-down.
     #[test]
-    fn pick_supported_transport_returns_none_when_empty() {
+    fn pick_supported_transports_preserves_preference_order() {
+        let transports = vec![
+            TransportSpec::IntendantWs {
+                url: "ws://lan/ws".into(),
+            },
+            TransportSpec::A2A {
+                url: "https://x".into(),
+            },
+            TransportSpec::IntendantWs {
+                url: "ws://tail/ws".into(),
+            },
+        ];
+        let picked = pick_supported_transports(&transports);
+        assert_eq!(picked.len(), 2);
+        match (&picked[0], &picked[1]) {
+            (
+                TransportSpec::IntendantWs { url: a },
+                TransportSpec::IntendantWs { url: b },
+            ) => {
+                assert_eq!(a, "ws://lan/ws");
+                assert_eq!(b, "ws://tail/ws");
+            }
+            _ => panic!("expected two IntendantWs variants in card order"),
+        }
+    }
+
+    /// Returns an empty Vec when no supported variant is in the list.
+    /// The caller (`add_peer_with_card`) treats empty as a hard error.
+    #[test]
+    fn pick_supported_transports_returns_empty_when_no_supported() {
         let transports = vec![
             TransportSpec::Unknown,
             TransportSpec::A2A {
                 url: "https://x".into(),
             },
         ];
-        assert!(pick_supported_transport(&transports).is_none());
+        assert!(pick_supported_transports(&transports).is_empty());
     }
 }

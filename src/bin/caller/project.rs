@@ -381,6 +381,10 @@ pub struct ProjectConfig {
     pub live_audio: LiveAudioConfig,
     #[serde(default)]
     pub webrtc: WebRtcConfig,
+    /// `[server]` section in intendant.toml — daemon-level settings
+    /// for what this Intendant advertises to peers. See [`ServerConfig`].
+    #[serde(default)]
+    pub server: ServerConfig,
     /// Federated peer daemons to auto-register at startup.
     ///
     /// Each `[[peer]]` section in `intendant.toml` becomes one
@@ -393,6 +397,37 @@ pub struct ProjectConfig {
     /// not written back to `intendant.toml` automatically.
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
+}
+
+/// Daemon-level settings for what this Intendant advertises to peers.
+/// Lives under `[server]` in intendant.toml.
+///
+/// The CLI flag `--advertise-url` (repeatable) overrides the config
+/// value entirely when given — operator at the command line wins
+/// over operator at the config file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// WebSocket URLs to advertise in this daemon's Agent Card,
+    /// in preference order (most-preferred first). Each becomes
+    /// an `IntendantWs` transport entry. Empty (the default) means
+    /// "auto-detect a single URL from the listener bind address" —
+    /// the historical behavior.
+    ///
+    /// Use this when the daemon's local view of its own address
+    /// doesn't match how peers reach it: NAT'd VMs reachable via
+    /// a host port-forward, Tailscale tailnet URLs, named tunnels,
+    /// mTLS proxy URLs, dual-stack IPv4+IPv6, etc.
+    ///
+    /// Example:
+    /// ```toml
+    /// [server]
+    /// advertise = [
+    ///   "ws://192.168.1.42:8765/ws",            # LAN
+    ///   "wss://laptop.tail-abcd.ts.net:8443/ws" # Tailscale fallback
+    /// ]
+    /// ```
+    #[serde(default)]
+    pub advertise: Vec<String>,
 }
 
 /// A federated peer daemon advertised via `intendant.toml [[peer]]`.

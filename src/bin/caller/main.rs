@@ -80,6 +80,31 @@ fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
     }
 }
 
+/// Resolve the advertise-URL list passed to `spawn_web_gateway`,
+/// applying CLI > config > auto-detect precedence.
+///
+/// - If `--advertise-url` was given (one or more times), the CLI list
+///   wins entirely. The operator at the command line beats the
+///   operator at the config file.
+/// - Otherwise, if `[server.advertise]` in `intendant.toml` is non-
+///   empty, that list is used.
+/// - If both are empty, an empty `Vec` is returned, which signals
+///   `spawn_web_gateway` to fall back to its single-URL auto-detection
+///   from the listener's bind address (the historical behavior).
+///
+/// Returns owned `String`s so the caller can move the list directly
+/// into `spawn_web_gateway` without an extra clone.
+fn resolve_advertise_urls_from_flags_and_config(
+    flags: &CliFlags,
+    project: &Project,
+) -> Vec<String> {
+    if !flags.advertise_urls.is_empty() {
+        flags.advertise_urls.clone()
+    } else {
+        project.config.server.advertise.clone()
+    }
+}
+
 /// Build a peer registry for this daemon and hydrate it from the
 /// `[[peer]]` sections in `intendant.toml`.
 ///
@@ -1371,6 +1396,13 @@ struct CliFlags {
 
     /// --no-web: Disable web gateway (on by default).
     no_web: bool,
+
+    /// --advertise-url <URL>: WebSocket URL to advertise in this daemon's
+    /// Agent Card (repeatable). Each occurrence appends one URL in the
+    /// preference order they're given. When non-empty, the entire list
+    /// replaces both the `[server.advertise]` config value and the
+    /// auto-detected single URL — operator at the CLI wins.
+    advertise_urls: Vec<String>,
 }
 
 fn print_help() {
@@ -1400,6 +1432,11 @@ fn print_help() {
     println!("    --transcription       Enable user speech transcription");
     println!("    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)");
     println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code)");
+    println!("    --advertise-url <URL> WebSocket URL to advertise to peers in this daemon's");
+    println!("                          Agent Card (repeatable, preference order). Overrides");
+    println!("                          [server.advertise] in intendant.toml when given.");
+    println!("                          Example: --advertise-url ws://192.168.1.42:8765/ws");
+    println!("                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws");
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -1476,6 +1513,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         agent_backend: None,
 
         no_web: false,
+
+        advertise_urls: Vec::new(),
     };
 
     let mut task_parts = Vec::new();
@@ -1605,6 +1644,19 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 } else {
                     return Err(CallerError::Config(
                         "Missing value for --agent".to_string(),
+                    ));
+                }
+            }
+            "--advertise-url" => {
+                // Repeatable: every occurrence appends one URL in the
+                // order given. The full list replaces config + auto-
+                // detection when non-empty.
+                if i + 1 < args.len() {
+                    flags.advertise_urls.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --advertise-url".to_string(),
                     ));
                 }
             }
@@ -2666,6 +2718,8 @@ Also: {"source": "bare"}"#;
             agent_backend: None,
 
             no_web: false,
+
+            advertise_urls: Vec::new(),
         };
         assert!(!flags.verbose);
         assert!(!flags.no_tui);
@@ -2709,6 +2763,8 @@ Also: {"source": "bare"}"#;
             agent_backend: None,
 
             no_web: false,
+
+            advertise_urls: Vec::new(),
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, web_gateway::DEFAULT_PORT);
@@ -2740,6 +2796,8 @@ Also: {"source": "bare"}"#;
             agent_backend: None,
 
             no_web: false,
+
+            advertise_urls: Vec::new(),
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, 9000);
@@ -7932,6 +7990,7 @@ async fn main() -> Result<(), CallerError> {
                 &log_dir,
                 &project.config.peers,
             );
+            let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let handle = web_gateway::spawn_web_gateway(
                 web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
@@ -7944,6 +8003,7 @@ async fn main() -> Result<(), CallerError> {
                 Some(project.root.clone()),
                 mcp_http_server,
                 Some(peer_registry),
+                advertise_urls,
             );
             slog(&session_log, |l| {
                 l.info(&format!(
@@ -8471,6 +8531,7 @@ async fn main() -> Result<(), CallerError> {
             // Browser-voice SubmitTask actions go via the EventBus → dispatcher
             // path (task_tx=None triggers the fallback at web_gateway.rs),
             // keeping a single routing authority.
+            let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let handle = web_gateway::spawn_web_gateway(
                 web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
@@ -8483,6 +8544,7 @@ async fn main() -> Result<(), CallerError> {
                 Some(project.root.clone()),
                 mcp_http_server,
                 Some(peer_registry),
+                advertise_urls,
             );
             app.log(
                 types::LogLevel::Info,
@@ -8929,6 +8991,7 @@ async fn main() -> Result<(), CallerError> {
                 &log_dir,
                 &project.config.peers,
             );
+            let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let _web_handle = web_gateway::spawn_web_gateway(
                 web_listener.take().expect("web listener must exist when use_web"),
                 bus.clone(),
@@ -8941,6 +9004,7 @@ async fn main() -> Result<(), CallerError> {
                 Some(project.root.clone()),
                 mcp_http_server,
                 Some(peer_registry),
+                advertise_urls,
             );
             eprintln!(
                 "Web TUI: http://0.0.0.0:{}",

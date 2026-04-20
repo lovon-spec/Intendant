@@ -1838,18 +1838,21 @@ pub fn spawn_web_gateway(
     project_root: Option<std::path::PathBuf>,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     peer_registry: Option<crate::peer::PeerRegistry>,
+    advertise_urls: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
     // Build the local Agent Card from live runtime state so
-    // `/.well-known/agent-card.json` can serve it. The transport URL
-    // comes from [`resolve_advertise_url`], which replaces a wildcard
-    // bind address (0.0.0.0 / ::) with the resolved host label so
-    // remote peers get a dialable URL. A specific bind address is
-    // used as-is. LAN-aware URL resolution (nginx mTLS proxy URL,
-    // Tailscale) is a separate layer and lands in a later pass.
-    let transport_url = resolve_advertise_url(listener.local_addr().ok());
-    let agent_card = build_local_agent_card(transport_url);
+    // `/.well-known/agent-card.json` can serve it. The transport URLs
+    // come from [`resolve_advertise_urls`], which uses operator
+    // overrides verbatim when provided and otherwise falls back to a
+    // single auto-detected URL derived from the listener's bind
+    // address. Multiple URLs let one daemon advertise itself reachable
+    // via several paths (LAN IP, Tailscale, host port-forward, etc.)
+    // — the connecting peer probes them in order.
+    let advertise_urls =
+        resolve_advertise_urls(listener.local_addr().ok(), &advertise_urls);
+    let agent_card = build_local_agent_card(advertise_urls);
     let agent_card_json =
         serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
 
@@ -5443,29 +5446,41 @@ async fn coordinator_route(
     }
 }
 
-/// Resolve the WebSocket URL to advertise in the Agent Card for
-/// this daemon.
+/// Resolve the list of WebSocket URLs to advertise in the Agent
+/// Card for this daemon, in preference order.
 ///
-/// When the listener is bound to a wildcard address (0.0.0.0 or ::),
-/// a remote peer cannot dial that URL — wildcards name "every
-/// interface I'm listening on", not a reachable endpoint. In that
-/// case we substitute [`crate::lan::resolve_host_label`] as the
-/// hostname, which gives a real label (system hostname or
-/// `intendant lan setup --name …`) that resolves via mDNS on a
-/// trusted LAN.
+/// Resolution rules, in order:
 ///
-/// When the listener has a specific bind address (127.0.0.1, or a
-/// real LAN IP the operator chose explicitly), that address is used
-/// as-is — we trust the operator knows why they picked it.
+/// 1. If `overrides` is non-empty, use it verbatim (operator wins).
+///    This covers every topology the daemon can't auto-detect:
+///    NAT'd VMs reachable via a host port-forward, Tailscale tailnet
+///    URLs, named tunnels, mTLS proxy URLs, dual-stack IPv4+IPv6,
+///    etc. The operator who configures `--advertise-url` (CLI) or
+///    `[server.advertise]` (intendant.toml) knows how peers reach
+///    them better than we can guess.
 ///
-/// If `local_addr` is `None` (shouldn't happen in practice; the
-/// listener is always bound by the time spawn is called), we fall
-/// back to `ws://localhost:0/ws` rather than panicking. The card
-/// is still valid JSON; the transport URL just won't work until
-/// the next daemon restart.
-pub(crate) fn resolve_advertise_url(
+/// 2. Otherwise, return a single auto-detected URL derived from the
+///    listener's bind address:
+///    - Wildcard bind (`0.0.0.0` / `::`) → substitute the resolved
+///      host label ([`crate::lan::resolve_host_label`]). Best-effort
+///      mDNS resolution on a trusted LAN; fragile when the local
+///      hostname isn't unique or doesn't propagate (the case that
+///      motivates the override path above).
+///    - Specific bind address → used as-is. We trust the operator
+///      who picked a non-wildcard bind knew why.
+///
+/// 3. If `local_addr` is `None` (shouldn't happen in practice; the
+///    listener is always bound by the time spawn is called), fall
+///    back to `ws://localhost:0/ws` rather than panicking. The card
+///    is still valid; the URL just won't work until the next daemon
+///    restart.
+pub(crate) fn resolve_advertise_urls(
     local_addr: Option<std::net::SocketAddr>,
-) -> String {
+    overrides: &[String],
+) -> Vec<String> {
+    if !overrides.is_empty() {
+        return overrides.to_vec();
+    }
     use std::net::IpAddr;
     let (host, port) = match local_addr {
         Some(addr) => {
@@ -5483,7 +5498,7 @@ pub(crate) fn resolve_advertise_url(
         }
         None => ("localhost".to_string(), 0),
     };
-    format!("ws://{host}:{port}/ws")
+    vec![format!("ws://{host}:{port}/ws")]
 }
 
 /// Assemble the [`crate::peer::AgentCard`] for this daemon from live
@@ -5500,17 +5515,23 @@ pub(crate) fn resolve_advertise_url(
 /// configuration that isn't plumbed through here yet. Those become
 /// additive as each subsystem teaches itself to advertise.
 ///
-/// `transport_url` is the URL other peers should use to connect back
-/// on the native Intendant WebSocket transport. Phase 1 uses the
-/// listener's bound address; LAN-aware URL resolution (nginx mTLS
-/// proxy, Tailscale) comes in a later pass.
-pub fn build_local_agent_card(transport_url: String) -> crate::peer::AgentCard {
-    use crate::peer::{AuthScheme, Capability};
+/// `advertise_urls` is the preference-ordered list of WebSocket URLs
+/// peers should try when dialing this daemon. Each becomes a
+/// [`crate::peer::TransportSpec::IntendantWs`] entry in the card.
+/// Built by [`resolve_advertise_urls`], which merges operator
+/// overrides (`--advertise-url`, `[server.advertise]`) with auto-
+/// detected fallback. The list is non-empty by construction.
+pub fn build_local_agent_card(advertise_urls: Vec<String>) -> crate::peer::AgentCard {
+    use crate::peer::{AuthScheme, Capability, TransportSpec};
+    let transports: Vec<TransportSpec> = advertise_urls
+        .into_iter()
+        .map(|url| TransportSpec::IntendantWs { url })
+        .collect();
     crate::peer::AgentCard::local_intendant(
         crate::lan::resolve_host_label(),
         env!("CARGO_PKG_VERSION").to_string(),
         Some(env!("INTENDANT_GIT_SHA").to_string()),
-        transport_url,
+        transports,
         vec![Capability::ComputerUse, Capability::Knowledge],
         AuthScheme::None,
     )
@@ -5605,13 +5626,13 @@ mod tests {
         use std::net::{Ipv4Addr, SocketAddr};
         let specific = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8765);
         assert_eq!(
-            resolve_advertise_url(Some(specific)),
-            "ws://127.0.0.1:8765/ws"
+            resolve_advertise_urls(Some(specific), &[]),
+            vec!["ws://127.0.0.1:8765/ws".to_string()]
         );
         let lan_ip = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
         assert_eq!(
-            resolve_advertise_url(Some(lan_ip)),
-            "ws://192.168.1.42:8765/ws"
+            resolve_advertise_urls(Some(lan_ip), &[]),
+            vec!["ws://192.168.1.42:8765/ws".to_string()]
         );
     }
 
@@ -5627,7 +5648,9 @@ mod tests {
     fn advertise_url_replaces_ipv4_wildcard_with_host_label() {
         use std::net::{Ipv4Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
-        let url = resolve_advertise_url(Some(wildcard));
+        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        assert_eq!(urls.len(), 1, "auto-detect produces exactly one URL");
+        let url = &urls[0];
         assert!(
             !url.contains("0.0.0.0"),
             "wildcard must be replaced: got {url}"
@@ -5650,7 +5673,9 @@ mod tests {
     fn advertise_url_replaces_ipv6_wildcard_with_host_label() {
         use std::net::{Ipv6Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 8765);
-        let url = resolve_advertise_url(Some(wildcard));
+        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        assert_eq!(urls.len(), 1);
+        let url = &urls[0];
         assert!(
             !url.contains("::"),
             "ipv6 wildcard must be replaced: got {url}"
@@ -5665,8 +5690,42 @@ mod tests {
     fn advertise_url_brackets_specific_ipv6_address() {
         use std::net::{Ipv6Addr, SocketAddr};
         let specific = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8765);
-        let url = resolve_advertise_url(Some(specific));
-        assert!(url.contains("[::1]"), "ipv6 literal must be bracketed: {url}");
+        let urls = resolve_advertise_urls(Some(specific), &[]);
+        assert_eq!(urls.len(), 1);
+        assert!(
+            urls[0].contains("[::1]"),
+            "ipv6 literal must be bracketed: {}",
+            urls[0]
+        );
+    }
+
+    /// Operator-supplied overrides (CLI `--advertise-url` or
+    /// `[server.advertise]` in intendant.toml) replace the auto-
+    /// detected URL entirely, in the order given. The bind address
+    /// is ignored when overrides are present — the operator is
+    /// asserting "this is what peers should use" regardless of
+    /// what the daemon's own listener thinks.
+    #[test]
+    fn advertise_overrides_replace_auto_detection_in_order() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
+        let overrides = vec![
+            "ws://192.168.1.42:8765/ws".to_string(),
+            "wss://laptop.tail-abcd.ts.net:8443/ws".to_string(),
+        ];
+        let urls = resolve_advertise_urls(Some(bind), &overrides);
+        assert_eq!(urls, overrides, "overrides should pass through verbatim");
+    }
+
+    /// An empty overrides list falls back to auto-detection (the
+    /// historical behavior). The CliFlags helper passes `&[]` when
+    /// neither `--advertise-url` nor `[server.advertise]` is set.
+    #[test]
+    fn empty_overrides_fall_back_to_auto_detect() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
+        let urls = resolve_advertise_urls(Some(lan), &[]);
+        assert_eq!(urls, vec!["ws://192.168.1.42:8765/ws".to_string()]);
     }
 
     #[test]
@@ -5855,7 +5914,7 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
 
         // Give it a moment to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -5874,7 +5933,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -5917,7 +5976,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -5983,6 +6042,7 @@ mod tests {
             None,
             None,
             peer_registry,
+            Vec::new(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -6714,7 +6774,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -6758,7 +6818,7 @@ mod tests {
             ice_servers: Vec::new(),
             ..Default::default()
         };
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -6803,7 +6863,7 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, Vec::new(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -6871,7 +6931,7 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, Vec::new(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -6978,7 +7038,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7033,7 +7093,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7091,7 +7151,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new())
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -7150,7 +7210,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new())
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -7219,7 +7279,7 @@ mod tests {
         let handle = {
                 let ss = ActiveSessionState::empty();
                 ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None)
+                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new())
             };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -7294,7 +7354,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7343,7 +7403,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7396,7 +7456,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -7431,7 +7491,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -7468,7 +7528,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7523,7 +7583,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7592,7 +7652,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7689,7 +7749,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -7761,7 +7821,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None);
+        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);

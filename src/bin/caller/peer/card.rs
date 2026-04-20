@@ -36,12 +36,15 @@ impl AgentCard {
     /// `label` should come from [`crate::lan::resolve_host_label`],
     /// `version` from `env!("CARGO_PKG_VERSION")`, and `git_sha` from
     /// `env!("INTENDANT_GIT_SHA")` (wrapped in `Some` — it's a
-    /// build-time constant in Intendant). `transport_url` is the URL
-    /// peers should connect to for the native Intendant WebSocket
-    /// transport (e.g. `ws://127.0.0.1:8765/ws`). `capabilities` is
-    /// the set of services this daemon actually exposes at runtime —
-    /// compute it from feature flags and configured subsystems, not
-    /// as a static maximum.
+    /// build-time constant in Intendant). `transports` is the list of
+    /// addresses peers should try in preference order (highest-pref
+    /// first); each will become a `TransportSpec` in the card. The
+    /// list comes from `web_gateway::resolve_advertise_urls`, which
+    /// merges operator overrides (`--advertise-url`, `[server.advertise]`)
+    /// with the auto-detected listener URL. `capabilities` is the set
+    /// of services this daemon actually exposes at runtime — compute
+    /// it from feature flags and configured subsystems, not as a
+    /// static maximum.
     ///
     /// Auth defaults to [`AuthScheme::None`] (trust-the-network) unless
     /// the caller opts into a stricter scheme; the LAN mTLS case is
@@ -51,7 +54,7 @@ impl AgentCard {
         label: String,
         version: String,
         git_sha: Option<String>,
-        transport_url: String,
+        transports: Vec<TransportSpec>,
         capabilities: Vec<Capability>,
         auth: AuthScheme,
     ) -> Self {
@@ -60,7 +63,7 @@ impl AgentCard {
             label,
             version,
             git_sha,
-            transports: vec![TransportSpec::IntendantWs { url: transport_url }],
+            transports,
             capabilities,
             auth,
         }

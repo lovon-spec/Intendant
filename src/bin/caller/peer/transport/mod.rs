@@ -16,8 +16,10 @@
 //! transports as sibling modules alongside it.
 
 pub mod intendant;
+pub mod multi;
 
 pub use intendant::IntendantWsTransport;
+pub use multi::MultiTransport;
 
 /// Derive the HTTP(S) base URL for Agent Card discovery from a
 /// native Intendant WebSocket URL. `ws://` becomes `http://`,

@@ -228,6 +228,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle)
