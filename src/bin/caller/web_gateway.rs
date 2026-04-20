@@ -4931,6 +4931,15 @@ struct PeerListResponse {
 #[derive(Deserialize)]
 struct AddPeerRequest {
     card_url: String,
+    /// Optional connecting-side override for the peer's transport
+    /// URLs. When non-empty, the card's `transports` field is
+    /// replaced with one `IntendantWs` entry per URL. Lets the
+    /// operator route around topologies the advertising peer's card
+    /// doesn't know about (port-forwards, proxies, named tunnels).
+    /// `#[serde(default)]` so older clients without this field
+    /// continue to work.
+    #[serde(default)]
+    via_urls: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -4969,7 +4978,10 @@ async fn peers_add(
             );
         }
     };
-    match registry.add_peer(&req.card_url).await {
+    match registry
+        .add_peer_with_via(&req.card_url, req.via_urls)
+        .await
+    {
         Ok(peer_id) => (
             200,
             serde_json::json!({"peer_id": peer_id.as_str()}).to_string(),

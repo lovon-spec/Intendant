@@ -159,7 +159,45 @@ impl PeerRegistry {
     /// [`PeerError::Rejected`] — idempotent re-registration is a
     /// follow-up concern.
     pub async fn add_peer(&self, card_url: &str) -> Result<PeerId, PeerError> {
-        let card = fetch_card(card_url).await?;
+        self.add_peer_with_via(card_url, Vec::new()).await
+    }
+
+    /// Variant of [`add_peer`] that lets the connecting operator
+    /// override the card's transport URLs at peer-add time. When
+    /// `via_urls` is non-empty, the fetched card's `transports` field
+    /// is replaced with one [`TransportSpec::IntendantWs`] per
+    /// supplied URL, in the given preference order — the operator
+    /// is asserting "reach this peer at these URLs, ignore what its
+    /// card advertised."
+    ///
+    /// Use cases:
+    ///
+    /// - Connecting daemon knows about a port-forward / proxy / named
+    ///   tunnel that the advertising peer's card doesn't list (the
+    ///   advertising side can't always know every path peers might
+    ///   take to reach it).
+    /// - Connecting daemon is on a Tailscale tailnet that the
+    ///   advertising peer is also on, but the peer's card only lists
+    ///   its LAN URL because that's what its `--advertise-url` set up.
+    /// - Operator wants to force a specific path for testing, even
+    ///   though the card lists working alternatives.
+    ///
+    /// The card's identity (`id`, `label`, `version`, `capabilities`,
+    /// `auth`) is preserved — only `transports` is overridden. The
+    /// peer is still uniquely identified by `card.id`, so duplicate
+    /// registration still rejects with the same error.
+    pub async fn add_peer_with_via(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+    ) -> Result<PeerId, PeerError> {
+        let mut card = fetch_card(card_url).await?;
+        if !via_urls.is_empty() {
+            card.transports = via_urls
+                .into_iter()
+                .map(|url| TransportSpec::IntendantWs { url })
+                .collect();
+        }
         self.add_peer_with_card(card).await
     }
 
@@ -844,6 +882,120 @@ mod tests {
         assert!(matches!(evt_b, RegistryEvent::PeerAdded(_)));
 
         reg.remove_peer(&id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// `add_peer_with_via` overrides the card's transports with the
+    /// operator-supplied URLs. The card's identity (id, label,
+    /// capabilities, auth) is preserved — only `transports` changes.
+    /// This is the connecting-side knob for cases where the operator
+    /// knows the topology better than the advertising peer's card
+    /// does (port-forwards, proxies, named tunnels).
+    #[tokio::test]
+    async fn add_peer_with_via_replaces_card_transports() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let via_urls = vec!["ws://override.example:9999/ws".to_string()];
+        let peer_id = reg
+            .add_peer_with_via(&card_url, via_urls.clone())
+            .await
+            .expect("add_peer_with_via succeeds even when via target isn't reachable — connect happens async");
+
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+        let card = handle.card_snapshot();
+
+        // Transports replaced with the via URLs verbatim.
+        assert_eq!(card.transports.len(), 1);
+        match &card.transports[0] {
+            TransportSpec::IntendantWs { url } => {
+                assert_eq!(url, "ws://override.example:9999/ws");
+            }
+            other => panic!("expected IntendantWs, got {other:?}"),
+        }
+
+        // Identity preserved — id from the original card, label
+        // present (exact value depends on the test host's
+        // `resolve_host_label`, so just assert non-empty).
+        assert_eq!(card.id, peer_id);
+        assert!(!card.label.is_empty(), "label preserved from card");
+
+        reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// Empty `via_urls` is the no-op case — `add_peer_with_via` falls
+    /// through to the default fetch-and-store behavior, leaving the
+    /// card's transports untouched. This is what `add_peer` itself
+    /// calls under the hood.
+    #[tokio::test]
+    async fn add_peer_with_via_empty_preserves_card_transports() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let peer_id = reg
+            .add_peer_with_via(&card_url, Vec::new())
+            .await
+            .expect("add_peer_with_via with empty via succeeds");
+
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+        let card = handle.card_snapshot();
+
+        // The card's original transports survive — at least one entry
+        // and at least one is IntendantWs (the gateway's auto-detected
+        // advertise list).
+        assert!(!card.transports.is_empty(), "card has transports");
+        assert!(
+            card.transports
+                .iter()
+                .any(|t| matches!(t, TransportSpec::IntendantWs { .. })),
+            "at least one IntendantWs transport survived: {:?}",
+            card.transports
+        );
+
+        reg.remove_peer(&peer_id).await.unwrap();
+        gateway.abort();
+    }
+
+    /// Multiple via URLs all become `IntendantWs` entries in the card
+    /// in the supplied preference order. `MultiTransport` then probes
+    /// them top-down on connect (covered by separate MultiTransport
+    /// tests in `peer/transport/multi.rs`).
+    #[tokio::test]
+    async fn add_peer_with_via_multiple_urls_preserve_order() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let reg = PeerRegistry::new(log_tx);
+
+        let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+        let via_urls = vec![
+            "ws://primary.example:9001/ws".to_string(),
+            "ws://fallback.example:9002/ws".to_string(),
+        ];
+        let peer_id = reg
+            .add_peer_with_via(&card_url, via_urls.clone())
+            .await
+            .expect("add_peer_with_via succeeds");
+
+        let handle = reg.get(&peer_id).expect("peer is in registry");
+        let card = handle.card_snapshot();
+
+        assert_eq!(card.transports.len(), 2);
+        let urls: Vec<&String> = card
+            .transports
+            .iter()
+            .filter_map(|t| match t {
+                TransportSpec::IntendantWs { url } => Some(url),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls, vec![&via_urls[0], &via_urls[1]]);
+
+        reg.remove_peer(&peer_id).await.unwrap();
         gateway.abort();
     }
 
