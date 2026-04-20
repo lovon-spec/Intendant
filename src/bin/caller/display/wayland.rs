@@ -181,6 +181,30 @@ impl DisplayBackend for WaylandBackend {
             run_pipewire_capture(pw_fd, node_id, tx, shutdown_flag, width, height, shared_w, shared_h);
         });
 
+        // Wake Mutter's screencast pipeline by injecting a 1-pixel cursor
+        // wiggle (right then left). Mutter only pushes frames when it sees
+        // damage on the desktop; on a freshly-granted session with nobody
+        // touching the guest, the consumer gets the initial format frame
+        // (often blank/black) and then nothing until the user manually
+        // moves the cursor or interacts with a window. The wiggle creates
+        // immediate damage so the consumer's first delivered frame
+        // reflects the actual desktop. Best-effort — log on failure but
+        // don't fail the grant. The cursor visibly twitches once on
+        // every grant, which is acceptable as the alternative is a
+        // black dashboard until someone interacts with the guest.
+        if let Err(e) = remote_desktop
+            .notify_pointer_motion(&session, 1.0, 0.0)
+            .await
+        {
+            eprintln!("[display/wayland] initial cursor wiggle (right) failed: {e}");
+        }
+        if let Err(e) = remote_desktop
+            .notify_pointer_motion(&session, -1.0, 0.0)
+            .await
+        {
+            eprintln!("[display/wayland] initial cursor wiggle (left) failed: {e}");
+        }
+
         // Store the RemoteDesktop proxy and session handle so inject_input()
         // can call notify_* methods on the original portal session.
         *self.portal_session.lock().await = Some(PortalSession {
