@@ -1421,9 +1421,23 @@ pub fn spawn_outbound_broadcaster(
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
+                    let is_revoke_trace =
+                        matches!(&event, AppEvent::UserDisplayRevoked { .. });
+                    if is_revoke_trace {
+                        eprintln!(
+                            "[revoke-trace {}] outbound_broadcaster rx AppEvent::UserDisplayRevoked",
+                            chrono::Local::now().format("%H:%M:%S%.3f")
+                        );
+                    }
                     if let Some(outbound) = app_event_to_outbound(&event) {
                         if let Ok(json) = serde_json::to_string(&outbound) {
                             let _ = outbound_tx.send(json);
+                            if is_revoke_trace {
+                                eprintln!(
+                                    "[revoke-trace {}] outbound_broadcaster sent JSON",
+                                    chrono::Local::now().format("%H:%M:%S%.3f")
+                                );
+                            }
                         }
                     }
                 }

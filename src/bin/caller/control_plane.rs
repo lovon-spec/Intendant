@@ -455,16 +455,29 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             state.bus.send(AppEvent::UserDisplayGranted { display_id: did });
         }
         ControlMsg::RevokeUserDisplay { display_id, note } => {
+            eprintln!(
+                "[revoke-trace {}] control_plane enter RevokeUserDisplay did={:?}",
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                display_id
+            );
             let did = display_id.unwrap_or(0);
             {
                 let mut guard = state.autonomy.write().await;
                 guard.user_display_granted = false;
             }
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            eprintln!(
+                "[revoke-trace {}] control_plane sending AppEvent::UserDisplayRevoked",
+                chrono::Local::now().format("%H:%M:%S%.3f")
+            );
             state.bus.send(AppEvent::UserDisplayRevoked {
                 display_id: did,
                 note: note.clone(),
             });
+            eprintln!(
+                "[revoke-trace {}] control_plane sent AppEvent::UserDisplayRevoked",
+                chrono::Local::now().format("%H:%M:%S%.3f")
+            );
         }
         _ => {} // Other control messages don't update shared state
     }

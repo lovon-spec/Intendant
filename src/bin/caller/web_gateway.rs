@@ -3814,6 +3814,17 @@ pub fn spawn_web_gateway(
                                                     ).await;
                                                 }
                                                 Ok(ctrl) => {
+                                                    if matches!(
+                                                        ctrl,
+                                                        ControlMsg::RevokeUserDisplay { .. }
+                                                            | ControlMsg::GrantUserDisplay { .. }
+                                                    ) {
+                                                        eprintln!(
+                                                            "[revoke-trace {}] /ws rx: {:?}",
+                                                            chrono::Local::now().format("%H:%M:%S%.3f"),
+                                                            &ctrl
+                                                        );
+                                                    }
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!("[ws] ControlMsg: {:?}",
                                                             match &ctrl {
