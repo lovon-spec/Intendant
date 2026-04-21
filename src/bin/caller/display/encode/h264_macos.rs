@@ -55,8 +55,8 @@ impl VideoToolboxEncoder {
             maximize_power_efficiency: false,
             allow_frame_reordering: false,
             allow_temporal_compression: true,
-            max_key_frame_interval: Some(NonZeroU32::new(60).unwrap()), // 2s at 30fps
-            max_key_frame_interval_duration: Some(Duration::from_secs(2)),
+            max_key_frame_interval: Some(NonZeroU32::new(30).unwrap()), // 1s at 30fps
+            max_key_frame_interval_duration: Some(Duration::from_secs(1)),
             max_frame_delay_count: Some(NonZeroU32::new(1).unwrap()),
         };
 
@@ -74,7 +74,12 @@ impl VideoToolboxEncoder {
 }
 
 impl Encoder for VideoToolboxEncoder {
-    fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String> {
+    fn encode(
+        &mut self,
+        i420: &[u8],
+        duration_ms: u64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>, String> {
         let w = self.width as usize;
         let h = self.height as usize;
         let uv_w = (w + 1) / 2;
@@ -97,7 +102,7 @@ impl Encoder for VideoToolboxEncoder {
         let frame_data = FrameData::I420 { y, u, v };
 
         let options = EncodeOptions {
-            force_key_frame: self.frame_count == 0,
+            force_key_frame: force_keyframe || self.frame_count == 0,
             ..Default::default()
         };
 

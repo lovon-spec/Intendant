@@ -4,6 +4,9 @@ use super::EncodedFrame;
 pub mod h264_linux;
 #[cfg(target_os = "macos")]
 pub mod h264_macos;
+pub mod vp8;
+
+pub use vp8::Vp8Encoder;
 
 pub const MIME_TYPE_VP8: &str = "video/VP8";
 pub const MIME_TYPE_H264: &str = "video/H264";
@@ -20,7 +23,17 @@ pub trait Encoder: Send + 'static {
     /// Encode one I420 frame.  Returns zero or more encoded packets.
     ///
     /// `duration_ms` is the display duration of this frame (typically 1000/fps).
-    fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String>;
+    ///
+    /// `force_keyframe` asks the encoder to emit this frame as a keyframe.
+    /// Implementations that cannot force mid-stream (e.g. H.264 over an
+    /// already-running ffmpeg stdin pipe) may ignore the flag and rely on
+    /// their configured GOP cadence instead.
+    fn encode(
+        &mut self,
+        i420: &[u8],
+        duration_ms: u64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>, String>;
 
     /// The MIME type of the encoded output (e.g. `"video/VP8"`, `"video/H264"`).
     fn codec_mime(&self) -> &'static str;
@@ -404,65 +417,6 @@ pub struct EncodedPacket {
     pub is_keyframe: bool,
 }
 
-/// VP8 encoder wrapping `vpx-encode`.
-pub struct Vp8Encoder {
-    encoder: vpx_encode::Encoder,
-    frame_count: u64,
-    pts_offset: u64,
-}
-
-// vpx_encode::Encoder contains raw pointers from the C FFI that are not
-// marked Send.  The encoder is only ever used from a single dedicated
-// thread so sending the owning struct across threads is safe.
-unsafe impl Send for Vp8Encoder {}
-
-impl Vp8Encoder {
-    /// Create a new VP8 encoder for the given resolution and target bitrate.
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
-        let config = vpx_encode::Config {
-            width: width as _,
-            height: height as _,
-            timebase: [1, 1000],
-            bitrate: bitrate_kbps as _,
-            codec: vpx_encode::VideoCodecId::VP8,
-        };
-        let encoder = vpx_encode::Encoder::new(config).map_err(|e| format!("{e}"))?;
-        Ok(Self {
-            encoder,
-            frame_count: 0,
-            pts_offset: 0,
-        })
-    }
-}
-
-impl Encoder for Vp8Encoder {
-    fn encode(&mut self, i420: &[u8], duration_ms: u64) -> Result<Vec<EncodedPacket>, String> {
-        let pts = self.pts_offset;
-        self.pts_offset += duration_ms;
-        self.frame_count += 1;
-
-        let packets = self
-            .encoder
-            .encode(pts as i64, i420)
-            .map_err(|e| format!("{e}"))?;
-
-        let mut out = Vec::new();
-        for pkt in packets {
-            out.push(EncodedPacket {
-                data: pkt.data.to_vec(),
-                pts_ms: pkt.pts as u64,
-                duration_ms,
-                is_keyframe: pkt.key,
-            });
-        }
-        Ok(out)
-    }
-
-    fn codec_mime(&self) -> &'static str {
-        "video/VP8"
-    }
-}
-
 impl EncodedPacket {
     /// Convert to the shared `EncodedFrame` type used by the display session.
     pub fn into_encoded_frame(self) -> EncodedFrame {
@@ -581,11 +535,32 @@ a=rtpmap:97 VP8/90000\r\n";
             *b = 128;
         }
 
-        let packets = enc.encode(&i420, 33).expect("encode");
+        let packets = enc.encode(&i420, 33, false).expect("encode");
         // VP8 typically emits at least one packet for the first frame (keyframe).
         assert!(!packets.is_empty(), "expected at least one packet");
         assert!(packets[0].is_keyframe, "first frame should be keyframe");
         assert!(!packets[0].data.is_empty(), "packet data should not be empty");
+    }
+
+    #[test]
+    fn vp8_encoder_force_keyframe_on_demand() {
+        let mut enc = Vp8Encoder::new(320, 240, 500).expect("encoder creation");
+        let y_size = 320 * 240;
+        let uv_size = 160 * 120;
+        let mut i420 = vec![128u8; y_size + 2 * uv_size];
+
+        // Prime with a keyframe (the first frame is always a keyframe in VP8)
+        // then feed identical frames without forcing; expect P-frames.
+        let _ = enc.encode(&i420, 33, false).expect("encode 1");
+        let packets = enc.encode(&i420, 33, false).expect("encode 2");
+        assert!(packets.iter().all(|p| !p.is_keyframe), "identical frame without force should be a P-frame");
+
+        // Now force. Tweak one byte so libvpx produces some output; the
+        // flag should make whatever it produces a keyframe.
+        i420[0] = 200;
+        let forced = enc.encode(&i420, 33, true).expect("encode 3");
+        assert!(!forced.is_empty(), "forced encode should produce output");
+        assert!(forced.iter().any(|p| p.is_keyframe), "force_keyframe=true must produce a keyframe");
     }
 
     // -----------------------------------------------------------------------
