@@ -1487,43 +1487,31 @@ impl App {
                 // instead of double-broadcasting via self.log() + broadcast_control().
                 self.pending_derived.push(AppEvent::DisplayReleased { display_id, note });
             }
-            ControlMsg::GrantUserDisplay { display_id } => {
-                let did = display_id.unwrap_or(0);
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let autonomy = self.autonomy.clone();
-                    handle.spawn(async move {
-                        let mut state = autonomy.write().await;
-                        state.user_display_granted = true;
-                    });
-                } else if let Ok(mut state) = self.autonomy.try_write() {
-                    state.user_display_granted = true;
-                }
-                std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                self.broadcast_control(OutboundEvent::UserDisplayGranted);
-                // Emit to EventBus so spawn_user_display_listener activates display + recording.
-                // The handle_event arm for UserDisplayGranted is the canonical log source —
-                // do NOT call self.log here, that would create a duplicate broadcast.
-                self.pending_derived.push(AppEvent::UserDisplayGranted { display_id: did });
+            ControlMsg::GrantUserDisplay { .. } => {
+                // Handled by `control_plane::handle_control_msg`. The TUI
+                // used to own this path (autonomy write + env var +
+                // broadcast_control + AppEvent push) but control messages
+                // sitting behind the web-TUI render loop added perceived
+                // latency on revoke (user saw "streaming continues for
+                // ~1 minute" after toggling off). `control_plane` now owns
+                // the state mutation and emits `AppEvent::UserDisplayGranted`
+                // directly; `spawn_outbound_broadcaster` forwards the
+                // matching `OutboundEvent::UserDisplayGranted` to WS
+                // subscribers via the same `control_tx` this file's
+                // `broadcast_control` used to publish to, so the wire
+                // shape for dashboards is identical.
             }
             ControlMsg::ListDisplays => {
                 // ListDisplays is async — handled at the caller level, not in the TUI.
                 self.log(LogLevel::Info, "ListDisplays: use the control socket or web API".to_string());
             }
-            ControlMsg::RevokeUserDisplay { display_id, note } => {
-                let did = display_id.unwrap_or(0);
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let autonomy = self.autonomy.clone();
-                    handle.spawn(async move {
-                        let mut state = autonomy.write().await;
-                        state.user_display_granted = false;
-                    });
-                } else if let Ok(mut state) = self.autonomy.try_write() {
-                    state.user_display_granted = false;
-                }
-                std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-                self.broadcast_control(OutboundEvent::UserDisplayRevoked { display_id: did, note: note.clone() });
-                // The handle_event arm for UserDisplayRevoked is the canonical log source.
-                self.pending_derived.push(AppEvent::UserDisplayRevoked { display_id: did, note });
+            ControlMsg::RevokeUserDisplay { .. } => {
+                // Handled by `control_plane::handle_control_msg` — see
+                // the `GrantUserDisplay` arm above for the rationale. The
+                // TUI stays the source of truth for *logging* these
+                // events via its `AppEvent::UserDisplayRevoked` handler
+                // in `handle_event`; only the control-side write path
+                // moved.
             }
             ControlMsg::InvokeSkill {
                 skill_name,

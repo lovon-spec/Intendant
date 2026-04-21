@@ -430,6 +430,42 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 params: params.clone(),
             });
         }
+        ControlMsg::GrantUserDisplay { display_id } => {
+            // Moved out of `tui/app.rs::handle_control_command` — the TUI is
+            // now display-only and the display-control path shouldn't depend
+            // on a rendering loop running to process revokes/grants. Before
+            // this, a grant/revoke dispatched to a web-only daemon had to
+            // wait behind `tui::web::WebTui`'s render cadence (one full
+            // redraw per event loop iteration, rendered to every attached
+            // web terminal connection), which is what surfaced as the
+            // asymmetric 60-second lag on revoke that dashboard toggles
+            // experienced. Grant was hitting the same code path but usually
+            // appeared instant because the first grant typically arrives
+            // before any web terminal connects; subsequent grants after
+            // churn would have shown the same lag.
+            let did = display_id.unwrap_or(0);
+            {
+                let mut guard = state.autonomy.write().await;
+                guard.user_display_granted = true;
+            }
+            // Keep the env var in sync so subprocesses that inspect it
+            // (agent runners, etc.) observe the same state the autonomy
+            // guard reports. Matches the tui/mcp paths that set it.
+            std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+            state.bus.send(AppEvent::UserDisplayGranted { display_id: did });
+        }
+        ControlMsg::RevokeUserDisplay { display_id, note } => {
+            let did = display_id.unwrap_or(0);
+            {
+                let mut guard = state.autonomy.write().await;
+                guard.user_display_granted = false;
+            }
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            state.bus.send(AppEvent::UserDisplayRevoked {
+                display_id: did,
+                note: note.clone(),
+            });
+        }
         _ => {} // Other control messages don't update shared state
     }
 }
