@@ -3718,6 +3718,7 @@ pub fn spawn_web_gateway(
                                                         &ice_config,
                                                         Arc::clone(&tcp_peer_registry),
                                                         direct_tx_inbound.clone(),
+                                                        &bus_inbound,
                                                     ).await;
                                                 }
                                                 Ok(ctrl) => {
@@ -5174,7 +5175,7 @@ pub fn spawn_web_gateway(
                                             .await
                                     }
                                     "webrtc" => {
-                                        peers_webrtc_signal(registry, id, &body_text).await
+                                        peers_webrtc_signal(registry, id, &body_text, &bus).await
                                     }
                                     other => (
                                         404,
@@ -5774,10 +5775,24 @@ async fn peers_webrtc_signal(
     registry: &crate::peer::PeerRegistry,
     id: &str,
     body_text: &str,
+    bus: &EventBus,
 ) -> (u16, String) {
+    // Same source tag as the peer-side handler (see
+    // `handle_federated_webrtc_signal`), so filtering the session
+    // log on `source == "webrtc-peer"` catches the full signaling
+    // conversation across both primary (outbound forward) and peer
+    // (inbound handle) — the wire is the same signal, the logs say
+    // so.
+    const LOG_SOURCE: &str = "webrtc-peer";
     let req: PeerWebRtcSignalRequest = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!("rejecting webrtc signal from browser — invalid body: {e}"),
+                turn: None,
+            });
             return (
                 400,
                 serde_json::json!({"error": format!("invalid request body: {e}")})
@@ -5785,16 +5800,42 @@ async fn peers_webrtc_signal(
             );
         }
     };
+    let signal_kind = match &req.signal {
+        crate::peer::WebRtcSignal::Offer { .. } => "offer",
+        crate::peer::WebRtcSignal::Answer { .. } => "answer",
+        crate::peer::WebRtcSignal::IceCandidate { .. } => "ice_candidate",
+        crate::peer::WebRtcSignal::Close => "close",
+        crate::peer::WebRtcSignal::Unknown => "unknown",
+    };
+    bus.send(AppEvent::LogEntry {
+        level: "debug".to_string(),
+        source: LOG_SOURCE.to_string(),
+        content: format!(
+            "forwarding {signal_kind} from browser to peer={id} display={} session={}",
+            req.display_id, req.session_id
+        ),
+        turn: None,
+    });
     let peer_id = crate::peer::PeerId(id.to_string());
     let handle = match registry.get(&peer_id) {
         Some(h) => h,
         None => {
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "peer {id} not in registry — dropping {signal_kind}"
+                ),
+                turn: None,
+            });
             return (
                 404,
                 serde_json::json!({"error": "peer not found"}).to_string(),
             );
         }
     };
+    let display_id = req.display_id;
+    let session_id_str = req.session_id.clone();
     match handle
         .webrtc_signal(
             req.display_id,
@@ -5804,21 +5845,51 @@ async fn peers_webrtc_signal(
         .await
     {
         Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
-        Err(crate::peer::PeerError::NotConnected) => (
-            502,
-            serde_json::json!({"error": "peer is not connected"}).to_string(),
-        ),
-        Err(crate::peer::PeerError::UnsupportedCapability(_)) => (
-            502,
-            serde_json::json!({
-                "error": "peer's transport does not support WebRTC signaling"
-            })
-            .to_string(),
-        ),
-        Err(e) => (
-            500,
-            serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
+        Err(crate::peer::PeerError::NotConnected) => {
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "peer {id} not connected — dropping {signal_kind} (display={display_id} session={session_id_str})"
+                ),
+                turn: None,
+            });
+            (
+                502,
+                serde_json::json!({"error": "peer is not connected"}).to_string(),
+            )
+        }
+        Err(crate::peer::PeerError::UnsupportedCapability(_)) => {
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "peer {id} transport lacks webrtc_signal — dropping {signal_kind}"
+                ),
+                turn: None,
+            });
+            (
+                502,
+                serde_json::json!({
+                    "error": "peer's transport does not support WebRTC signaling"
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => {
+            bus.send(AppEvent::LogEntry {
+                level: "error".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "webrtc_signal to peer {id} failed: {e}"
+                ),
+                turn: None,
+            });
+            (
+                500,
+                serde_json::json!({"error": e.to_string()}).to_string(),
+            )
+        }
     }
 }
 
@@ -5905,24 +5976,60 @@ async fn handle_federated_webrtc_signal(
     ice_config: &crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     direct_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    bus: &EventBus,
 ) {
+    // Short tag used as the `source` on every log line this handler
+    // emits, so the operator can filter the session log to just the
+    // federated-WebRTC conversation: `grep 'source":"webrtc-peer"'`.
+    // Distinct from the local-display `display_offer` flow (which
+    // emits via different codepaths) so logs are unambiguous even
+    // when both are active.
+    const LOG_SOURCE: &str = "webrtc-peer";
+
+    // Structured signal-kind tag for log messages. The inner
+    // `WebRtcSignal` variant name would also work but `Offer`/`Answer`
+    // etc. are clearer than the enum's Debug rendering with fields.
+    let signal_kind = match &signal {
+        crate::peer::WebRtcSignal::Offer { .. } => "offer",
+        crate::peer::WebRtcSignal::Answer { .. } => "answer",
+        crate::peer::WebRtcSignal::IceCandidate { .. } => "ice_candidate",
+        crate::peer::WebRtcSignal::Close => "close",
+        crate::peer::WebRtcSignal::Unknown => "unknown",
+    };
+    bus.send(AppEvent::LogEntry {
+        level: "debug".to_string(),
+        source: LOG_SOURCE.to_string(),
+        content: format!(
+            "received {signal_kind} from connector (display={display_id} session={session_id})"
+        ),
+        turn: None,
+    });
+
     let registry = match session_registry {
         Some(r) => r,
         None => {
-            eprintln!(
-                "[web_gateway] federated webrtc signal for display {display_id} \
-                 session {session_id} but no session_registry available"
-            );
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "dropping {signal_kind}: no session_registry (display={display_id} session={session_id})"
+                ),
+                turn: None,
+            });
             return;
         }
     };
     let session = match registry.read().await.get(display_id) {
         Some(s) => s,
         None => {
-            eprintln!(
-                "[web_gateway] federated webrtc signal for unknown display \
-                 {display_id} (session {session_id})"
-            );
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "dropping {signal_kind}: unknown display {display_id} (session {session_id})"
+                ),
+                turn: None,
+            });
             return;
         }
     };
@@ -5948,12 +6055,20 @@ async fn handle_federated_webrtc_signal(
             // all collapse to `None` → UDP-only host candidates, same
             // behavior as pre-3a.2. Wrapped in a single lookup so we
             // don't block handle_offer on DNS per-session.
-            let tcp_advertised_addr = match advertise_tcp_via_url {
-                Some(url) if !url.is_empty() => {
-                    resolve_url_to_socket_addr(&url).await
-                }
+            let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
+                Some(url) if !url.is_empty() => resolve_url_to_socket_addr(url).await,
                 _ => None,
             };
+            bus.send(AppEvent::LogEntry {
+                level: "debug".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "offer resolved advertise_tcp_via_url={:?} → tcp_candidate={:?}",
+                    advertise_tcp_via_url.as_deref().unwrap_or(""),
+                    tcp_advertised_addr
+                ),
+                turn: None,
+            });
             let (ice_tx, mut ice_rx) =
                 tokio::sync::mpsc::channel::<(crate::display::PeerId, String)>(64);
             let answer_result = session
@@ -5968,6 +6083,15 @@ async fn handle_federated_webrtc_signal(
                 .await;
             match answer_result {
                 Ok(answer_sdp) => {
+                    bus.send(AppEvent::LogEntry {
+                        level: "info".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "offer handled, sending answer back to connector (display={display_id} session={session_id} answer_len={} bytes)",
+                            answer_sdp.len()
+                        ),
+                        turn: None,
+                    });
                     let answer = crate::types::OutboundEvent::WebRtcSignal {
                         display_id,
                         session_id: session_id.clone(),
@@ -5975,8 +6099,29 @@ async fn handle_federated_webrtc_signal(
                             sdp: answer_sdp,
                         },
                     };
-                    if let Ok(s) = serde_json::to_string(&answer) {
-                        let _ = direct_tx.send(s);
+                    match serde_json::to_string(&answer) {
+                        Ok(s) => {
+                            if direct_tx.send(s).is_err() {
+                                bus.send(AppEvent::LogEntry {
+                                    level: "warn".to_string(),
+                                    source: LOG_SOURCE.to_string(),
+                                    content: format!(
+                                        "failed to send answer to connector — direct_tx closed (display={display_id} session={session_id})"
+                                    ),
+                                    turn: None,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            bus.send(AppEvent::LogEntry {
+                                level: "error".to_string(),
+                                source: LOG_SOURCE.to_string(),
+                                content: format!(
+                                    "failed to serialize answer (display={display_id} session={session_id}): {e}"
+                                ),
+                                turn: None,
+                            });
+                        }
                     }
 
                     // Drain the per-session ICE channel and forward
@@ -5985,8 +6130,11 @@ async fn handle_federated_webrtc_signal(
                     // session removes the peer (channel closes).
                     let direct_tx_ice = direct_tx.clone();
                     let session_id_ice = session_id;
+                    let bus_ice = bus.clone();
                     tokio::spawn(async move {
+                        let mut count: u32 = 0;
                         while let Some((_pid, candidate_json)) = ice_rx.recv().await {
+                            count = count.saturating_add(1);
                             let evt = crate::types::OutboundEvent::WebRtcSignal {
                                 display_id,
                                 session_id: session_id_ice.clone(),
@@ -5996,26 +6144,62 @@ async fn handle_federated_webrtc_signal(
                             };
                             if let Ok(s) = serde_json::to_string(&evt) {
                                 if direct_tx_ice.send(s).is_err() {
+                                    bus_ice.send(AppEvent::LogEntry {
+                                        level: "debug".to_string(),
+                                        source: LOG_SOURCE.to_string(),
+                                        content: format!(
+                                            "ice forwarder exiting — direct_tx closed (display={display_id} session={session_id_ice}) after {count} candidates"
+                                        ),
+                                        turn: None,
+                                    });
                                     break;
                                 }
                             }
                         }
+                        bus_ice.send(AppEvent::LogEntry {
+                            level: "debug".to_string(),
+                            source: LOG_SOURCE.to_string(),
+                            content: format!(
+                                "ice forwarder finished — forwarded {count} candidates (display={display_id} session={session_id_ice})"
+                            ),
+                            turn: None,
+                        });
                     });
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[web_gateway] federated webrtc handle_offer failed for \
-                         display {display_id} session {session_id}: {e}"
-                    );
+                    bus.send(AppEvent::LogEntry {
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "handle_offer failed (display={display_id} session={session_id}): {e}"
+                        ),
+                        turn: None,
+                    });
                 }
             }
         }
         crate::peer::WebRtcSignal::IceCandidate { candidate_json } => {
-            if let Err(e) = session.add_ice_candidate(peer_id, &candidate_json).await {
-                eprintln!(
-                    "[web_gateway] federated webrtc add_ice_candidate failed for \
-                     display {display_id} session {session_id}: {e}"
-                );
+            match session.add_ice_candidate(peer_id, &candidate_json).await {
+                Ok(()) => {
+                    bus.send(AppEvent::LogEntry {
+                        level: "debug".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "applied connector ICE candidate (display={display_id} session={session_id})"
+                        ),
+                        turn: None,
+                    });
+                }
+                Err(e) => {
+                    bus.send(AppEvent::LogEntry {
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "add_ice_candidate failed (display={display_id} session={session_id}): {e}"
+                        ),
+                        turn: None,
+                    });
+                }
             }
         }
         crate::peer::WebRtcSignal::Answer { .. } => {
@@ -6024,17 +6208,39 @@ async fn handle_federated_webrtc_signal(
             // peers reply with Answers via OutboundEvent::WebRtcSignal.
             // An incoming Answer here means a confused sender — log
             // and drop rather than silently mishandling.
-            eprintln!(
-                "[web_gateway] unexpected federated webrtc Answer received on \
-                 peer side (display {display_id} session {session_id}) — ignoring"
-            );
+            bus.send(AppEvent::LogEntry {
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "unexpected Answer received on peer side (display={display_id} session={session_id}) — ignoring"
+                ),
+                turn: None,
+            });
         }
         crate::peer::WebRtcSignal::Close => {
             session.remove_peer(peer_id).await;
+            bus.send(AppEvent::LogEntry {
+                level: "debug".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "removed per-session WebRtcPeer on Close (display={display_id} session={session_id})"
+                ),
+                turn: None,
+            });
         }
         crate::peer::WebRtcSignal::Unknown => {
             // Forward-compat fallback for signal kinds added by newer
-            // builds. Older daemons silently ignore.
+            // builds. Older daemons silently ignore — but log at
+            // debug so the operator can see unknown signal arrivals
+            // when they're hunting wire-format issues.
+            bus.send(AppEvent::LogEntry {
+                level: "debug".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "ignoring unknown WebRtcSignal kind (display={display_id} session={session_id})"
+                ),
+                turn: None,
+            });
         }
     }
 }

@@ -11689,6 +11689,7 @@ class PeerDisplayConnection {
     // case lands in 3b along with primary-as-relay.
     this.pc = new RTCPeerConnection({ iceServers: [] });
     this.pc.addTransceiver('video', { direction: 'recvonly' });
+    this._log('debug', `connect: sessionKey=${this.sessionKey()} advertiseTcpViaUrl=${this.advertiseTcpViaUrl || '(none)'}`);
 
     this.pc.ontrack = (e) => {
       this.stream = e.streams[0];
@@ -11696,20 +11697,30 @@ class PeerDisplayConnection {
       const videoEl = container && container.querySelector('.peer-display-video');
       if (videoEl) videoEl.srcObject = this.stream;
       this.setStatus('Connected (view-only)', 'connected');
+      this._log('info', 'ontrack fired — video stream attached');
     };
 
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
+        this._log('debug', `local ICE candidate: ${this._describeCandidate(e.candidate)}`);
         this._sendSignal({
           kind: 'ice_candidate',
           candidate_json: JSON.stringify(e.candidate.toJSON()),
-        }).catch(() => {});
+        }).catch(err => this._log('warn', `forwarding local ICE candidate failed: ${err.message}`));
+      } else {
+        this._log('debug', 'local ICE gathering complete (null candidate)');
       }
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      if (!this.pc) return;
+      this._log('debug', `iceConnectionState=${this.pc.iceConnectionState}`);
     };
 
     this.pc.onconnectionstatechange = () => {
       if (!this.pc) return;
       const state = this.pc.connectionState;
+      this._log('debug', `connectionState=${state}`);
       if (state === 'connected') {
         this.setStatus('Connected (view-only)', 'connected');
       } else if (state === 'failed') {
@@ -11735,44 +11746,90 @@ class PeerDisplayConnection {
         offerSignal.advertise_tcp_via_url = this.advertiseTcpViaUrl;
       }
       await this._sendSignal(offerSignal);
+      this._log('info', `offer sent (sdp_len=${offerSignal.sdp.length})`);
       this.setStatus('Offer sent, awaiting answer…', '');
     } catch (err) {
+      this._log('error', `offer failed: ${err.message}`);
       this.setStatus(`Offer failed: ${err.message}`, 'error');
     }
   }
 
   handleAnswer(sdp) {
-    if (!this.pc) return;
+    if (!this.pc) {
+      this._log('warn', 'handleAnswer called but pc is null — ignored');
+      return;
+    }
+    this._log('info', `answer received (sdp_len=${sdp.length})`);
     this.pc
       .setRemoteDescription({ type: 'answer', sdp })
       .then(() => {
         this._answerApplied = true;
+        this._log('debug', `answer applied, flushing ${this._pendingCandidates.length} buffered ICE candidate(s)`);
         for (const c of this._pendingCandidates) {
-          this.pc.addIceCandidate(c).catch(() => {});
+          this.pc.addIceCandidate(c).catch(err =>
+            this._log('warn', `buffered addIceCandidate failed: ${err.message}`)
+          );
         }
         this._pendingCandidates = [];
       })
       .catch((err) => {
+        this._log('error', `setRemoteDescription(answer) failed: ${err.message}`);
         this.setStatus(`Answer failed: ${err.message}`, 'error');
       });
   }
 
   handleIceCandidate(candidateJson) {
-    if (!candidateJson || !this.pc) return;
+    if (!candidateJson || !this.pc) {
+      this._log('warn', 'handleIceCandidate called with empty payload or no pc — ignored');
+      return;
+    }
     let candidate;
     try {
       candidate = JSON.parse(candidateJson);
-    } catch {
+    } catch (err) {
+      this._log('warn', `remote ICE candidate JSON parse failed: ${err.message}`);
       return;
     }
     if (this._answerApplied) {
-      this.pc.addIceCandidate(candidate).catch(() => {});
+      this._log('debug', `remote ICE candidate: ${this._describeCandidate(candidate)}`);
+      this.pc.addIceCandidate(candidate).catch(err =>
+        this._log('warn', `addIceCandidate failed: ${err.message}`)
+      );
     } else {
       // Buffer candidates that arrive before the answer is applied.
       // Mirrors the local display flow; the peer-side ICE forwarder
       // can produce candidates as soon as handle_offer returns.
+      this._log('debug', `buffering remote ICE candidate (answer not yet applied): ${this._describeCandidate(candidate)}`);
       this._pendingCandidates.push(candidate);
     }
+  }
+
+  // Internal: scoped console logger. All diagnostic output from this
+  // connection carries `[webrtc-peer ${hostId}]` so the Safari Web
+  // Inspector filter can find everything from one peer session in
+  // one shot. Mirrors the server-side `source: "webrtc-peer"` tag
+  // so cross-side investigations match up by text.
+  _log(level, message) {
+    const prefix = `[webrtc-peer ${this.hostId}]`;
+    const fn = level === 'error' ? console.error
+             : level === 'warn'  ? console.warn
+             : level === 'info'  ? console.info
+             :                     console.debug;
+    fn(`${prefix} ${message}`);
+  }
+
+  // Internal: one-line summary of an RTCIceCandidate / candidate-JSON
+  // for logs. `candidate` is the SDP line and already carries
+  // address + port + protocol + type — extract and format so we
+  // don't dump the full JSON every tick.
+  _describeCandidate(cand) {
+    const s = cand && (cand.candidate || JSON.stringify(cand));
+    if (!s) return '(empty)';
+    // SDP candidate lines look like:
+    //   candidate:1 1 udp 2113937151 192.168.1.10 5000 typ host ...
+    const m = s.match(/candidate:\S+\s+\d+\s+(\S+)\s+\S+\s+(\S+)\s+(\d+)\s+typ\s+(\S+)/);
+    if (m) return `${m[4]} ${m[1]} ${m[2]}:${m[3]}`;
+    return s;
   }
 
   async close() {
@@ -11845,16 +11902,30 @@ async function closePeerDisplaysForHost(hostId) {
 function handlePeerWebRtcSignal(hostId, displayId, sessionId, signal) {
   const sessionKey = `${hostId}|${displayId}|${sessionId}`;
   const conn = peerDisplayConnections.get(sessionKey);
-  if (!conn) return; // late straggler or another tab's session
   const kind = signal && signal.kind;
+  if (!conn) {
+    // Late straggler (after close) or a session belonging to another
+    // dashboard tab. Silent-drop in production was fine but made
+    // "why no answer?" debugging hard — log at debug so the operator
+    // can tell "signal arrived but no session" apart from "signal
+    // never arrived at all."
+    console.debug(
+      `[webrtc-peer ${hostId}] received ${kind || '(no-kind)'} for unknown sessionKey=${sessionKey} — dropping`
+    );
+    return;
+  }
   if (kind === 'answer') {
     conn.handleAnswer(signal.sdp || '');
   } else if (kind === 'ice_candidate') {
     conn.handleIceCandidate(signal.candidate_json || '');
   } else if (kind === 'close') {
+    console.info(`[webrtc-peer ${hostId}] peer sent close — tearing down session ${sessionKey}`);
     closePeerDisplaysForHost(hostId);
+  } else {
+    console.debug(
+      `[webrtc-peer ${hostId}] received unknown signal kind=${kind} for ${sessionKey} — ignoring (forward-compat)`
+    );
   }
-  // Other / unknown signal kinds: ignore (forward-compat).
 }
 
 // After a renderDaemonsList re-render rebuilds the controls panels
