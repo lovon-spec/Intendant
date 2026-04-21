@@ -665,6 +665,32 @@ html, body {
   display: flex;
   gap: 8px;
   margin-top: 10px;
+  /* Wrap when the container is too narrow to fit URL + label + Add
+     button on one line (e.g. the default Intendant.app window width
+     before this fix: the button used to get pushed past the right
+     edge and become unclickable — the form looked complete but
+     submit was unreachable unless the user resized).
+     Combined with the `flex-basis: 100%` on the Add button below,
+     the button always lands on its own row when wrapping kicks in,
+     which is the only way to guarantee it stays within the window
+     even at the smallest reasonable width. */
+  flex-wrap: wrap;
+}
+.daemon-add-row input {
+  /* Significant min-width so the row always wraps rather than
+     crushing inputs to unusable widths. At window widths below
+     ~520px (URL input + Label input + button + gaps), the inputs
+     drop below this min-width and the row wraps — putting the
+     button on a fresh line below. */
+  min-width: 180px;
+}
+.daemon-add-row button {
+  /* Never shrink below content width (prevents degenerate case
+     where flex-shrink crushes the button to a few pixels). Combined
+     with `flex-basis: 100%` the button takes the full wrapped row
+     when flex-wrap kicks in, making it obvious and never clipped. */
+  flex-shrink: 0;
+  flex-basis: 100%;
 }
 /* Secondary add row — visible but visually subordinate. Used for the
    optional Via URL(s) field, which is a power-user knob most users
@@ -12222,6 +12248,15 @@ async function initDaemons() {
   const viaEl = document.getElementById('daemon-add-via');
   if (viaEl) {
     viaEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter') addDaemon();
+    });
+  }
+  // Optional browser-TCP-via URL row — same submit-on-Enter. Without
+  // this, Enter in the last field of the form quietly does nothing,
+  // which users keep interpreting as a broken submit path.
+  const browserViaEl = document.getElementById('daemon-add-browser-tcp-via');
+  if (browserViaEl) {
+    browserViaEl.addEventListener('keydown', e => {
       if (e.key === 'Enter') addDaemon();
     });
   }
