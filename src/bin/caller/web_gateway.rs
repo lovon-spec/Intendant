@@ -7048,7 +7048,21 @@ fn auto_detect_advertise_urls(
     }
 
     // Wildcard bind: enumerate every non-loopback routable interface.
-    let mut urls: Vec<String> = crate::lan::routable_local_addrs(false)
+    // IPv4 entries sort before IPv6 — WebRTC ICE-TCP in WebKit/WKWebView
+    // silently drops IPv6 ULA candidates (seen empirically against
+    // fdc2::/8 addresses on macOS 15), so the *first* URL in the list
+    // — which slice 3b's `maybe_rewrite_federated_answer` takes as the
+    // relay candidate verbatim — needs to be the one browsers actually
+    // dial. Within each address family we preserve `getifaddrs` order
+    // (`stable_sort_by`), so a multi-NIC host that already had a
+    // preferred primary interface keeps it.
+    let mut ips = crate::lan::routable_local_addrs(false);
+    ips.sort_by(|a, b| match (a, b) {
+        (IpAddr::V4(_), IpAddr::V6(_)) => std::cmp::Ordering::Less,
+        (IpAddr::V6(_), IpAddr::V4(_)) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    });
+    let mut urls: Vec<String> = ips
         .into_iter()
         .map(|ip| match ip {
             IpAddr::V6(v6) => format_ws_url(&format!("[{v6}]"), port),
