@@ -285,27 +285,35 @@ set_vortex_defaults() {
     fi
 }
 
-# Disable the per-user screensaver auto-activation and password prompt.
+# Disable screensaver, screen lock, and display/system sleep.
 #
-# An intendant host operates the desktop autonomously; a screensaver
-# locking the screen would interrupt the agent and (on Wayland-style
-# secure capture APIs) revoke screen-share grants. macOS's
-# ScreenCaptureKit is more forgiving than the Wayland portal, but the
-# screensaver still hides the desktop content from the captured stream.
+# An intendant host operates the desktop autonomously; a screensaver or
+# screen lock would interrupt the agent and hide the desktop from the
+# captured stream (ScreenCaptureKit keeps working, but shows the lock
+# screen, not the content). Display sleep is equally disruptive: after
+# the display turns off, macOS starts a separate lock-after-sleep timer
+# (`sysadminctl -screenLock`, default 300s), so leaving displaysleep on
+# silently re-enables the lock behavior we're trying to disable.
 #
-# Idempotent: `defaults write` overwrites and never errors on no-change.
-# Per-user only — system display/system sleep changes need `sudo pmset`
-# and are left to the user (they affect the whole machine).
+# Idempotent: `defaults write` and `pmset` overwrite and never error on
+# no-change.
 disable_screen_lock() {
     echo ""
-    info "disabling per-user screensaver auto-activation..."
+    info "disabling screensaver password prompt and idle timer (per-user)..."
     defaults write com.apple.screensaver askForPassword -int 0
+    defaults write com.apple.screensaver askForPasswordDelay -int 0
     defaults -currentHost write com.apple.screensaver idleTime -int 0
-    ok "screensaver password prompt and idle timer disabled (per-user)"
-    ok "settings apply on next screensaver activation — to apply immediately,"
-    ok "run: killall cfprefsd"
-    echo "      for full no-sleep (admin), also run:"
-    echo "         sudo pmset displaysleep 0 sleep 0"
+    ok "per-user screensaver disabled"
+
+    info "disabling display sleep and system sleep (requires sudo)..."
+    if sudo -n pmset -a displaysleep 0 sleep 0 >/dev/null 2>&1; then
+        ok "displaysleep=0 sleep=0 (system-wide)"
+    else
+        warn "could not run pmset without a password prompt — run manually:"
+        echo "         sudo pmset -a displaysleep 0 sleep 0"
+    fi
+
+    ok "to apply screensaver settings immediately: killall cfprefsd"
 }
 
 install_blackhole() {
