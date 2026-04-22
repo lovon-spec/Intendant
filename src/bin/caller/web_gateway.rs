@@ -3694,17 +3694,38 @@ pub fn spawn_web_gateway(
                                             }
                                         }
                                         Some("display_ice") => {
-                                            // Trickle ICE candidate from browser
+                                            // Trickle ICE candidate from browser. Spawn the
+                                            // handling off the ws reader loop because
+                                            // `add_ice_candidate` resolves mDNS hostnames
+                                            // (browsers obfuscate host candidates as
+                                            // `<uuid>.local`). On hosts without an mDNS
+                                            // responder — every headless VM without Avahi,
+                                            // which is the common deployment — each lookup
+                                            // blocks on the system resolver's full timeout
+                                            // (5-20s). With multiple candidates and ICE
+                                            // retries, that piles 20-30s of blocking inside
+                                            // this reader, stalling every other ws frame
+                                            // behind it including grant/revoke — the root
+                                            // cause of the "second ON takes 20+s" bug.
+                                            //
+                                            // Spawning decouples candidate processing from
+                                            // frame intake. Failed lookups still log the
+                                            // same "mdns resolve failed" diagnostic; losing
+                                            // a candidate is survivable (ICE has others),
+                                            // whereas blocking the reader is not.
                                             let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
                                             let candidate = json["candidate"].to_string();
-
-                                            if let Some(ref sr) = session_registry_inbound {
-                                                if let Some(session) = sr.read().await.get(display_id) {
-                                                    if let Err(e) = session.add_ice_candidate(peer_id, &candidate).await {
-                                                        eprintln!("[web_gateway] ICE candidate failed for display {}: {}", display_id, e);
+                                            let sr_clone = session_registry_inbound.clone();
+                                            let pid = peer_id;
+                                            tokio::spawn(async move {
+                                                if let Some(ref sr) = sr_clone {
+                                                    if let Some(session) = sr.read().await.get(display_id) {
+                                                        if let Err(e) = session.add_ice_candidate(pid, &candidate).await {
+                                                            eprintln!("[web_gateway] ICE candidate failed for display {}: {}", display_id, e);
+                                                        }
                                                     }
                                                 }
-                                            }
+                                            });
                                         }
                                         Some("terminal_open") => {
                                             // {"t":"terminal_open","host_id":"local","terminal_id":"shell-0","cols":80,"rows":24}

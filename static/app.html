@@ -14035,26 +14035,20 @@ window.cycleAutonomy = function() {
 window.toggleUserDisplay = function() {
   if (!app) return;
   if (userDisplayGranted) {
-    // Send the revoke over /ws FIRST, then tear down the display slot
-    // locally. The reverse order (slice 9715cda) caused a different
-    // latency bug: pc.close() side-effects (ICE teardown, RTCP BYE,
-    // DTLS close, queued microtasks) stall subsequent WebSocket sends
-    // in the browser for tens of seconds, so the revoke and any
-    // follow-up grant piled up unsent until the browser finally
-    // flushed. Fetches through the same browser keep working during
-    // that window, so it's specifically the ws outbound path that
-    // stalls — presumably because the browser's network stack
-    // serializes ws writes with WebRTC teardown work they share
-    // state with.
-    //
-    // Sending ws first while the main thread is still free, then
-    // tearing down locally, preserves the optimistic-UI property
-    // (pc.close still happens synchronously, user still sees the
-    // stream go dark immediately) without trading it for the stall.
-    // removeDisplaySlot is idempotent — if the server's broadcast
-    // arrives later, re-running it is a no-op.
-    app.revoke_user_display_with_id(grantedDisplayId);
+    // Tear the display slot down locally before the round-trip. The
+    // server processes the revoke instantly, but when the browser is
+    // busy decoding a live WebRTC video (toggling off the very stream
+    // it's rendering), the JS main thread is saturated and the
+    // inbound `user_display_revoked` broadcast waits behind video-
+    // render work for tens of seconds — observed as "button flips but
+    // streaming continues" on the peer's guest UI. Mirroring user
+    // intent client-side frees the main thread (pc.close() stops the
+    // decoder), and the server's subsequent broadcast becomes a
+    // confirmation of something we've already done rather than a gate
+    // on the UI response. removeDisplaySlot is idempotent — if the
+    // broadcast does arrive later, re-running it is a no-op.
     removeDisplaySlot(Number(grantedDisplayId));
+    app.revoke_user_display_with_id(grantedDisplayId);
     setUserDisplayState(false);
     return;
   }
