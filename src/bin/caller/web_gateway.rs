@@ -5179,9 +5179,11 @@ pub fn spawn_web_gateway(
                     } else if request_line.contains("/api/displays") {
                         // Display enumeration endpoint
                         use tokio::io::AsyncWriteExt;
+                        eprintln!("[TIMING {}] /api/displays ENTER", chrono::Utc::now().format("%H:%M:%S%.3f"));
                         let displays =
                             crate::display::enumerate_displays_with_sessions(&session_registry)
                                 .await;
+                        eprintln!("[TIMING {}] /api/displays enumerate returned {} displays", chrono::Utc::now().format("%H:%M:%S%.3f"), displays.len());
                         let body = serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
