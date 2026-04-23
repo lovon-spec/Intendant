@@ -585,7 +585,6 @@ struct EncoderPoolInner {
 
     /// On-demand encoders, keyed by `(codec, rid)`. Spawned on first
     /// peer that needs them, torn down when the last peer leaves.
-    /// Empty in phase 3a; phase 3b populates it.
     on_demand: RwLock<HashMap<EncoderId, OnDemandSlot>>,
 
     /// Coalesces PLI/FIR across viewers per `(codec, rid)`.
@@ -600,30 +599,53 @@ struct EncoderPoolInner {
     /// encoder's `encode()` call. Stored on the pool because every
     /// on-demand spawn needs it.
     duration_ms: u64,
+
+    /// Source resolution used for on-demand encoder spawns. Always-on
+    /// layers carry their own width/height (may be downscaled simulcast
+    /// layers), but on-demand encoders default to the source resolution
+    /// and bitrate appropriate for their codec (from `LayerSpec::single`).
+    source_width: u32,
+    source_height: u32,
+    framerate: u32,
 }
 
 impl EncoderPool {
     /// Construct a pool with the given always-on layer set, spawning
-    /// one encoder thread per layer. `fps` is the target capture rate;
-    /// `duration_ms` is derived as `1000 / fps`.
+    /// one encoder thread per layer.
     ///
-    /// Always-on layers are VP8 by convention — VP8 has the broadest
-    /// browser support and no codec-licensing complications, so it's
-    /// the safe default the pool guarantees is producing frames the
-    /// instant any peer subscribes. H.264 / VP9 / AV1 are spawned
-    /// on-demand by `subscribe` (phase 3b) when a peer needs them.
+    /// * `source_width` / `source_height` — the capture resolution. Used
+    ///   for on-demand encoder spawns (e.g. an H.264 encoder spun up
+    ///   when the first H.264-preferring peer joins runs at the source
+    ///   resolution, not at the simulcast layer size).
+    /// * `framerate` — target capture rate; `duration_ms` is derived as
+    ///   `1000 / framerate`.
+    /// * `always_on_layers` — layers to spawn encoder threads for at
+    ///   construction time. Phase 3a/3b default is a single VP8 layer
+    ///   at source resolution; phase 4 replaces this with a VP8
+    ///   simulcast stack.
     ///
-    /// Returns a pool with all encoder threads already running. The
-    /// pool's I420 broadcast is empty until the caller starts feeding
-    /// frames via [`Self::push_i420_frame`].
-    pub fn new(always_on_layers: Vec<LayerSpec>, fps: u32) -> Self {
-        let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
+    /// Always-on codec is always VP8 — it has the broadest browser
+    /// support and no codec-licensing complications, so it's the safe
+    /// default the pool guarantees is producing frames the instant any
+    /// peer subscribes. H.264 is spawned on-demand by
+    /// [`Self::subscribe`] when a peer needs it; VP9 / AV1 are not yet
+    /// wired to a backend (phase 4+).
+    ///
+    /// Returns a pool with all always-on encoder threads already
+    /// running. The pool's I420 broadcast is empty until the caller
+    /// starts feeding frames via [`Self::push_i420_frame`].
+    pub fn new(
+        source_width: u32,
+        source_height: u32,
+        framerate: u32,
+        always_on_layers: Vec<LayerSpec>,
+    ) -> Self {
+        let duration_ms = if framerate > 0 { 1000 / framerate as u64 } else { 33 };
         let (i420_tx, _) = broadcast::channel::<I420Frame>(I420_BROADCAST_CAPACITY);
 
         let mut always_on = Vec::with_capacity(always_on_layers.len());
         for layer in always_on_layers {
             // Always-on bank is VP8 (universal codec, see module docs).
-            // Phase 3b's on-demand path will use other codecs.
             let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
             let handle = spawn_encoder_thread(id, layer, &i420_tx, duration_ms);
             always_on.push(handle);
@@ -636,8 +658,18 @@ impl EncoderPool {
                 keyframe_coalescer: KeyframeCoalescer::new(),
                 i420_tx,
                 duration_ms,
+                source_width,
+                source_height,
+                framerate,
             }),
         }
+    }
+
+    /// Codecs this pool knows how to spawn an on-demand encoder for.
+    /// Currently VP8 + H.264 (the two with wired backends).
+    /// VP9 and AV1 will be added when their encoder crates are picked.
+    fn on_demand_spawnable(codec: CodecKind) -> bool {
+        matches!(codec, CodecKind::Vp8 | CodecKind::H264)
     }
 
     /// Push one I420 frame into the pool. Bridge calls this for every
@@ -664,11 +696,30 @@ impl EncoderPool {
     /// Subscribe a peer to all encoders matching its codec preferences.
     /// Returns one [`EncoderSubscription`] per matching encoder.
     ///
-    /// On-demand encoder spawning lands in phase 3b; today peers
-    /// preferring an on-demand-only codec get an empty subscription set
-    /// and the forwarder rejects with [`crate::display::forward::ForwarderError::NoCompatibleCodec`].
+    /// - **Always-on match first:** every always-on encoder whose codec
+    ///   the peer supports gets a subscription, no refcount bookkeeping
+    ///   (always-on encoders don't go away).
+    /// - **On-demand spawn next:** for every codec in the peer's
+    ///   preferences that (a) isn't already produced by an always-on
+    ///   encoder and (b) the pool knows how to spawn
+    ///   ([`Self::on_demand_spawnable`]), the pool ensures an on-demand
+    ///   encoder is running and bumps its refcount. First peer to
+    ///   subscribe spawns the encoder; subsequent peers share it.
+    ///
+    /// Peers preferring a codec the pool can't produce (e.g. VP9/AV1
+    /// until backends land) get no subscription for that codec — the
+    /// forwarder rejects with `NoCompatibleCodec` if the *whole* set
+    /// is empty.
+    ///
+    /// Every returned [`EncoderSubscription`] increments some slot's
+    /// refcount (or no-ops for always-on). Callers MUST call
+    /// [`Self::release`] with the SAME prefs when the peer disconnects
+    /// so on-demand encoders can be torn down.
     pub async fn subscribe(&self, prefs: &PeerCodecPreferences) -> Vec<EncoderSubscription> {
         let mut subs = Vec::new();
+        let mut always_on_codecs: Vec<CodecKind> = Vec::new();
+
+        // Always-on: no refcount, subscribe-only.
         for handle in &self.inner.always_on {
             if prefs.supports(handle.id.codec) {
                 subs.push(EncoderSubscription {
@@ -677,11 +728,42 @@ impl EncoderPool {
                     frames: handle.subscribe(),
                 });
             }
+            if !always_on_codecs.contains(&handle.id.codec) {
+                always_on_codecs.push(handle.id.codec);
+            }
         }
-        // Phase 3b: iterate prefs and spawn on-demand encoders for
-        // codecs that aren't in always_on and aren't already running.
-        // Increment refcount on each on_demand slot the peer subscribes
-        // to. Today: no-op.
+
+        // On-demand: for codecs the peer wants that aren't in
+        // always_on, spawn + refcount.
+        let mut on_demand = self.inner.on_demand.write().await;
+        for &codec in &prefs.supported {
+            if always_on_codecs.contains(&codec) {
+                continue;
+            }
+            if !Self::on_demand_spawnable(codec) {
+                continue;
+            }
+            // Single-layer on-demand (simulcast is phase 4, always-on only).
+            let rid = SimulcastRid::full();
+            let id = EncoderId::new(codec, rid);
+            let source_width = self.inner.source_width;
+            let source_height = self.inner.source_height;
+            let framerate = self.inner.framerate;
+            let i420_tx = &self.inner.i420_tx;
+            let duration_ms = self.inner.duration_ms;
+            let slot = on_demand.entry(id.clone()).or_insert_with(|| {
+                let layer = LayerSpec::single(codec, source_width, source_height, framerate);
+                let handle = spawn_encoder_thread(id.clone(), layer, i420_tx, duration_ms);
+                OnDemandSlot { handle, refcount: 0 }
+            });
+            slot.refcount += 1;
+            subs.push(EncoderSubscription {
+                id: slot.handle.id.clone(),
+                layer: slot.handle.layer.clone(),
+                frames: slot.handle.subscribe(),
+            });
+        }
+
         subs
     }
 
@@ -689,10 +771,47 @@ impl EncoderPool {
     /// slots; tears down encoders that hit refcount zero. Always-on
     /// slots ignore release (they live for the pool's lifetime).
     ///
-    /// Phase 3b wires this; today it's a no-op since no on-demand
-    /// encoders exist.
-    pub async fn release(&self, _prefs: &PeerCodecPreferences) {
-        // Phase 3b.
+    /// `prefs` must match what was passed to [`Self::subscribe`] so
+    /// the pool decrements the right slots. Mismatched release is a
+    /// bug — refcounts go negative at `saturating_sub` and the slot
+    /// lives forever.
+    pub async fn release(&self, prefs: &PeerCodecPreferences) {
+        let always_on_codecs: Vec<CodecKind> = self
+            .inner
+            .always_on
+            .iter()
+            .map(|h| h.id.codec)
+            .collect();
+
+        let mut on_demand = self.inner.on_demand.write().await;
+        for &codec in &prefs.supported {
+            if always_on_codecs.contains(&codec) {
+                continue;
+            }
+            if !Self::on_demand_spawnable(codec) {
+                continue;
+            }
+            let rid = SimulcastRid::full();
+            let id = EncoderId::new(codec, rid);
+            let should_remove = if let Some(slot) = on_demand.get_mut(&id) {
+                slot.refcount = slot.refcount.saturating_sub(1);
+                if slot.refcount == 0 {
+                    // Signal the encoder thread to exit. We also drop
+                    // the handle (and thus its frames broadcast sender)
+                    // by removing from the map — subscribers see Closed
+                    // on their next recv.
+                    slot.handle.shutdown.cancel();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_remove {
+                on_demand.remove(&id);
+            }
+        }
     }
 
     /// Request a keyframe from one encoder (or all layers of one codec
@@ -740,6 +859,19 @@ impl EncoderPool {
     #[cfg(test)]
     pub(crate) fn always_on(&self) -> &[EncoderHandle] {
         &self.inner.always_on
+    }
+
+    /// Test-only access to on-demand slot counts. Lets tests verify
+    /// refcount + teardown semantics without exposing the map.
+    #[cfg(test)]
+    pub(crate) async fn on_demand_refcount(
+        &self,
+        codec: CodecKind,
+        rid: SimulcastRid,
+    ) -> Option<usize> {
+        let id = EncoderId::new(codec, rid);
+        let map = self.inner.on_demand.read().await;
+        map.get(&id).map(|slot| slot.refcount)
     }
 }
 
@@ -984,23 +1116,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_subscribes_only_to_supported_codecs() {
-        // VP8-only always-on bank at a tiny resolution. Real encoder
-        // thread spawns; test exercises the subscribe routing, not the
-        // encoder runtime.
+    async fn pool_subscribes_to_always_on_codec() {
+        // VP8 always-on. Peer supporting VP8 gets one subscription from
+        // always_on (no on-demand spawn needed).
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(vec![layer], 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
 
-        // Peer that supports VP8 gets one subscription.
         let vp8_prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let subs = pool.subscribe(&vp8_prefs).await;
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].id.codec, CodecKind::Vp8);
+    }
 
-        // Peer that only supports H.264 gets zero (no on-demand spawn
-        // in phase 3a; phase 3b will spawn one and return it).
-        let h264_prefs = PeerCodecPreferences::new(vec![CodecKind::H264]);
-        let subs = pool.subscribe(&h264_prefs).await;
+    #[tokio::test]
+    async fn pool_rejects_codecs_with_no_backend() {
+        // Peer advertises VP9/AV1 only — neither has a backend yet
+        // (phase 4+). Always-on is VP8, no match; on-demand won't
+        // spawn because on_demand_spawnable rejects them. Subscription
+        // set is empty; forwarder rejects with NoCompatibleCodec.
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+
+        let unsupported_prefs =
+            PeerCodecPreferences::new(vec![CodecKind::Vp9, CodecKind::Av1]);
+        let subs = pool.subscribe(&unsupported_prefs).await;
         assert_eq!(subs.len(), 0);
     }
 
@@ -1009,7 +1148,7 @@ mod tests {
         // Empty layer set — no encoders spawned, so request_keyframe
         // consistently returns false (coalescer admits the first, but
         // no matching encoder exists).
-        let pool = EncoderPool::new(vec![], 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![]);
         let rid = SimulcastRid::full();
         // Coalescer admits first, but no encoder matches → false.
         assert!(!pool.request_keyframe(CodecKind::Vp8, Some(rid.clone())).await);
@@ -1023,7 +1162,7 @@ mod tests {
     #[tokio::test]
     async fn pool_request_keyframe_sets_encoder_flag() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(vec![layer], 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
 
         // Initial state: flag is false.
         let handle = &pool.always_on()[0];
@@ -1065,7 +1204,7 @@ mod tests {
         let frame_arc = Arc::new(frame_data);
 
         let layer = LayerSpec::single(CodecKind::Vp8, W as u32, H as u32, 30);
-        let pool = EncoderPool::new(vec![layer], 30);
+        let pool = EncoderPool::new(W as u32, H as u32, 30, vec![layer]);
 
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let mut subs = pool.subscribe(&prefs).await;
@@ -1102,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn pool_drop_shuts_down_encoders() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(vec![layer], 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let mut subs = pool.subscribe(&prefs).await;
         let mut rx = subs.remove(0).frames;
@@ -1143,5 +1282,135 @@ mod tests {
             }
             Err(_) => panic!("encoder thread did not exit within 2s of pool drop"),
         }
+    }
+
+    /// On-demand spawn works: empty always_on, peer asks for VP8 →
+    /// pool spawns a VP8 on-demand encoder, refcount = 1. Uses VP8
+    /// so the test doesn't depend on the platform's H.264 backend.
+    #[tokio::test]
+    async fn on_demand_spawns_on_first_peer() {
+        let pool = EncoderPool::new(64, 64, 30, vec![]); // no always-on
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+
+        // Nothing on-demand yet.
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full())
+                .await,
+            None
+        );
+
+        let subs = pool.subscribe(&prefs).await;
+        assert_eq!(subs.len(), 1, "on-demand spawn must return one subscription");
+        assert_eq!(subs[0].id.codec, CodecKind::Vp8);
+
+        // Refcount = 1 after first subscribe.
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full())
+                .await,
+            Some(1)
+        );
+    }
+
+    /// Second peer subscribing to the same on-demand codec bumps
+    /// refcount without spawning a new encoder.
+    #[tokio::test]
+    async fn on_demand_shares_encoder_across_peers() {
+        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+
+        let subs_a = pool.subscribe(&prefs).await;
+        let subs_b = pool.subscribe(&prefs).await;
+        assert_eq!(subs_a.len(), 1);
+        assert_eq!(subs_b.len(), 1);
+        assert_eq!(subs_a[0].id, subs_b[0].id, "same EncoderId across peers");
+
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full())
+                .await,
+            Some(2)
+        );
+    }
+
+    /// Release decrements refcount. When it hits zero, encoder is
+    /// torn down — subsequent subscribe with same codec spawns fresh.
+    #[tokio::test]
+    async fn on_demand_releases_tear_down_at_refcount_zero() {
+        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+
+        // Two peers.
+        let _subs_a = pool.subscribe(&prefs).await;
+        let _subs_b = pool.subscribe(&prefs).await;
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full())
+                .await,
+            Some(2)
+        );
+
+        // Release one: refcount drops to 1, encoder stays.
+        pool.release(&prefs).await;
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full())
+                .await,
+            Some(1)
+        );
+
+        // Release last: refcount hits 0, encoder torn down, slot
+        // removed from the map.
+        pool.release(&prefs).await;
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full())
+                .await,
+            None,
+            "slot must be removed when refcount hits 0"
+        );
+
+        // A fresh subscribe spawns a new slot at refcount 1.
+        let _subs_c = pool.subscribe(&prefs).await;
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full())
+                .await,
+            Some(1)
+        );
+    }
+
+    /// Mixed always-on + on-demand: peer supporting both codecs gets
+    /// subscriptions from each source. Always-on ignores refcount
+    /// (still tracked only for on-demand).
+    #[tokio::test]
+    async fn pool_mixes_always_on_and_on_demand_subscriptions() {
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+
+        // Peer supporting both VP8 (always-on) and H.264 (on-demand
+        // if backend available). We'd need an H.264 encoder to spawn,
+        // which is platform-dependent. So instead test the routing
+        // logic by asserting always-on VP8 works; skip real H.264
+        // construction by noting the pool still returns a subscription
+        // if on_demand_spawnable says yes. (The test doesn't send
+        // frames, so encoder-construction failures would manifest as
+        // silent broadcast close, not test failure.)
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8, CodecKind::H264]);
+        let subs = pool.subscribe(&prefs).await;
+
+        // VP8 from always-on + H.264 from on-demand = 2 subscriptions.
+        assert_eq!(subs.len(), 2, "expected VP8 always-on + H.264 on-demand");
+        let codecs: Vec<CodecKind> = subs.iter().map(|s| s.id.codec).collect();
+        assert!(codecs.contains(&CodecKind::Vp8));
+        assert!(codecs.contains(&CodecKind::H264));
+
+        // On-demand H.264 refcount = 1 (always-on VP8 isn't tracked
+        // in on_demand).
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::full())
+                .await,
+            Some(1)
+        );
+        // VP8 is in always_on, not on_demand.
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full())
+                .await,
+            None
+        );
     }
 }
