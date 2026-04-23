@@ -122,9 +122,11 @@
 use crate::display::EncodedFrame;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -154,6 +156,14 @@ pub const KEYFRAME_COALESCE_WINDOW: Duration = Duration::from_millis(50);
 /// queue rather than backpressuring the encoder, which would degrade
 /// every other viewer.
 pub const ENCODER_FRAME_BROADCAST_CAPACITY: usize = 16;
+
+/// Bounded capacity for the pool's inbound I420 broadcast. Sized to match
+/// the existing bridge → encoder sync_channel that this replaces (4
+/// frames at 30fps ≈ 130ms of buffering, enough to absorb a brief
+/// scheduler hiccup without wedging the bridge). Lossy: a slow encoder
+/// thread sees `RecvError::Lagged` and skips ahead rather than
+/// backpressuring the bridge.
+pub const I420_BROADCAST_CAPACITY: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Codec identity
@@ -356,13 +366,14 @@ impl fmt::Display for EncoderId {
 /// Handle to one running encoder inside the pool.
 ///
 /// Holding a clone of `frames` does **not** keep the encoder alive — the
-/// encoder runs as long as the pool keeps the matching slot. Cloning
-/// the broadcast sender is the standard tokio pattern for handing out
-/// per-subscriber `Receiver`s without giving subscribers shutdown
-/// authority.
-///
-/// Phase 3 fills in the actual spawning logic; today this is the type
-/// shape consumers of the pool rely on.
+/// encoder thread holds its own clone of the underlying state and exits
+/// only when (a) the pool's I420 input broadcast closes (last sender
+/// drops, typically at pool drop), or (b) the pool fires its
+/// [`shutdown`](Self::shutdown) cancellation token (per-encoder, used
+/// by on-demand teardown so other encoders keep running). Both paths
+/// are cooperative; the thread checks `shutdown.is_cancelled()` between
+/// frames so a cancellation lands within at most one `blocking_recv`
+/// wakeup (~one frame interval).
 #[derive(Clone)]
 pub struct EncoderHandle {
     pub id: EncoderId,
@@ -373,6 +384,19 @@ pub struct EncoderHandle {
     /// — intentional, because backpressuring the encoder degrades
     /// every other peer using this layer.
     pub frames: broadcast::Sender<Arc<EncodedFrame>>,
+    /// Per-encoder force-keyframe flag. [`EncoderPool::request_keyframe`]
+    /// stores `true` here; the encoder thread `swap`s it back to false
+    /// when consumed on the next frame and passes the bool to
+    /// [`crate::display::encode::Encoder::encode`]. AtomicBool keeps the
+    /// signaling lock-free between the async pool API and the std::thread
+    /// encoder loop.
+    pub force_keyframe: Arc<AtomicBool>,
+    /// Per-encoder shutdown signal. Cancelled by [`EncoderPool`] on
+    /// release/drop. Encoder thread checks between frames and breaks
+    /// cleanly on next iter. Distinct from "i420 broadcast closed" so
+    /// individual on-demand encoders can be torn down without dropping
+    /// the shared input channel.
+    pub shutdown: CancellationToken,
 }
 
 impl EncoderHandle {
@@ -382,6 +406,20 @@ impl EncoderHandle {
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<EncodedFrame>> {
         self.frames.subscribe()
     }
+}
+
+// ---------------------------------------------------------------------------
+// I420 input frame
+// ---------------------------------------------------------------------------
+
+/// One I420-converted capture frame, fed into the pool's input broadcast
+/// by the bridge. `data` is `Arc`-wrapped so multiple encoder threads
+/// each get a cheap clone (the bytes themselves aren't copied per
+/// subscriber).
+#[derive(Clone, Debug)]
+pub struct I420Frame {
+    pub data: Arc<Vec<u8>>,
+    pub arrived: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,15 +555,23 @@ impl Default for KeyframeCoalescer {
 
 /// The orchestrator. One pool per [`crate::display::DisplaySession`].
 ///
-/// **This stub establishes the type vocabulary and lifecycle contract.**
-/// The actual encoder spawning, broadcast wiring, and shutdown logic
-/// land in phase 3 of the redesign; the methods below have signatures
-/// only.
+/// Phase 3a (this commit) implements the always-on encoder spawn path —
+/// `new` actually spawns encoder threads for each always-on layer, the
+/// bridge feeds I420 frames via [`Self::push_i420_frame`], and
+/// [`Self::request_keyframe`] propagates through the coalescer to the
+/// matching encoder thread's atomic flag.
 ///
-/// The pool is intentionally `Arc`-shareable — one pool reference goes
-/// to the bridge task (which feeds I420 frames into all encoders), one
-/// to each peer's forwarder (which calls `subscribe`/`release`), and
-/// one to the WebRTC PLI handler (which calls `request_keyframe`).
+/// Phase 3b will fill in on-demand encoder spawn (refcount-driven, one
+/// per non-always-on codec subscriber) so a peer offering only H.264
+/// triggers an H.264 encoder spawn; the slot is torn down when the
+/// last H.264 peer disconnects.
+///
+/// Phase 3c wires this pool into [`crate::display::DisplaySession`],
+/// replacing the single-encoder code path in `start_encoder_pipeline`.
+///
+/// The pool is `Clone` (Arc-backed) — one reference goes to the bridge
+/// (feeds I420), one to each peer's forwarder (subscribes / releases),
+/// and one to the WebRTC PLI handler (`request_keyframe`).
 #[derive(Clone)]
 pub struct EncoderPool {
     inner: Arc<EncoderPoolInner>,
@@ -533,48 +579,95 @@ pub struct EncoderPool {
 
 struct EncoderPoolInner {
     /// Always-on encoders (constructed at pool creation, never torn
-    /// down). Today: VP8 simulcast layers. The pool builder decides
-    /// the layout; the pool itself doesn't change it at runtime.
+    /// down). Today: a single VP8 layer at the source resolution.
+    /// Phase 4 expands this into VP8 simulcast (multiple layers).
     always_on: Vec<EncoderHandle>,
 
     /// On-demand encoders, keyed by `(codec, rid)`. Spawned on first
     /// peer that needs them, torn down when the last peer leaves.
+    /// Empty in phase 3a; phase 3b populates it.
     on_demand: RwLock<HashMap<EncoderId, OnDemandSlot>>,
 
     /// Coalesces PLI/FIR across viewers per `(codec, rid)`.
     keyframe_coalescer: KeyframeCoalescer,
+
+    /// Shared I420 input broadcast. The bridge sends one frame per
+    /// tick; every running encoder subscribes once at spawn and reads
+    /// via blocking_recv from its dedicated thread.
+    i420_tx: broadcast::Sender<I420Frame>,
+
+    /// Frame duration in milliseconds (1000 / fps), passed into each
+    /// encoder's `encode()` call. Stored on the pool because every
+    /// on-demand spawn needs it.
+    duration_ms: u64,
 }
 
 impl EncoderPool {
-    /// Construct a pool with a fixed always-on encoder bank. Typically
-    /// `LayerSpec::vp8_simulcast(width, height, fps)` mapped to handles
-    /// by phase-3 spawn logic.
+    /// Construct a pool with the given always-on layer set, spawning
+    /// one encoder thread per layer. `fps` is the target capture rate;
+    /// `duration_ms` is derived as `1000 / fps`.
     ///
-    /// **Stub:** in this design pass, `always_on` is accepted but the
-    /// handles' encoder threads are not yet spawned. Phase 3 wires in
-    /// `tokio::task::spawn_blocking` + the existing `Vp8Encoder` /
-    /// `H264*Encoder` backends.
-    pub fn new(always_on: Vec<EncoderHandle>) -> Self {
+    /// Always-on layers are VP8 by convention — VP8 has the broadest
+    /// browser support and no codec-licensing complications, so it's
+    /// the safe default the pool guarantees is producing frames the
+    /// instant any peer subscribes. H.264 / VP9 / AV1 are spawned
+    /// on-demand by `subscribe` (phase 3b) when a peer needs them.
+    ///
+    /// Returns a pool with all encoder threads already running. The
+    /// pool's I420 broadcast is empty until the caller starts feeding
+    /// frames via [`Self::push_i420_frame`].
+    pub fn new(always_on_layers: Vec<LayerSpec>, fps: u32) -> Self {
+        let duration_ms = if fps > 0 { 1000 / fps as u64 } else { 33 };
+        let (i420_tx, _) = broadcast::channel::<I420Frame>(I420_BROADCAST_CAPACITY);
+
+        let mut always_on = Vec::with_capacity(always_on_layers.len());
+        for layer in always_on_layers {
+            // Always-on bank is VP8 (universal codec, see module docs).
+            // Phase 3b's on-demand path will use other codecs.
+            let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
+            let handle = spawn_encoder_thread(id, layer, &i420_tx, duration_ms);
+            always_on.push(handle);
+        }
+
         Self {
             inner: Arc::new(EncoderPoolInner {
                 always_on,
                 on_demand: RwLock::new(HashMap::new()),
                 keyframe_coalescer: KeyframeCoalescer::new(),
+                i420_tx,
+                duration_ms,
             }),
         }
     }
 
-    /// Subscribe a peer to all encoders matching its codec preferences.
-    /// Spawns on-demand encoders if this is the first peer that needs
-    /// them. Returns one [`EncoderSubscription`] per matching encoder
-    /// (multiple if simulcast — one per layer).
+    /// Push one I420 frame into the pool. Bridge calls this for every
+    /// I420 frame produced from a fresh BGRA capture (and during
+    /// idle-heartbeat ticks).
     ///
-    /// **Stub:** returns subscriptions for already-existing always-on
-    /// encoders. On-demand spawn logic is phase 3.
-    pub async fn subscribe(
-        &self,
-        prefs: &PeerCodecPreferences,
-    ) -> Vec<EncoderSubscription> {
+    /// Lossy: returns the count of currently-subscribed encoders that
+    /// will receive the frame, but if any individual encoder's
+    /// broadcast receiver lags, that encoder skips and self-recovers
+    /// at next frame. Does not backpressure the bridge — by design,
+    /// because backpressure here would stall every other encoder for
+    /// one slow one.
+    pub fn push_i420_frame(&self, data: Arc<Vec<u8>>, arrived: Instant) -> usize {
+        // broadcast::send returns the receiver count on success, or
+        // SendError if there are zero receivers (no encoders running).
+        // Both are normal: the bridge keeps feeding regardless of
+        // whether anyone is listening.
+        self.inner
+            .i420_tx
+            .send(I420Frame { data, arrived })
+            .unwrap_or(0)
+    }
+
+    /// Subscribe a peer to all encoders matching its codec preferences.
+    /// Returns one [`EncoderSubscription`] per matching encoder.
+    ///
+    /// On-demand encoder spawning lands in phase 3b; today peers
+    /// preferring an on-demand-only codec get an empty subscription set
+    /// and the forwarder rejects with [`crate::display::forward::ForwarderError::NoCompatibleCodec`].
+    pub async fn subscribe(&self, prefs: &PeerCodecPreferences) -> Vec<EncoderSubscription> {
         let mut subs = Vec::new();
         for handle in &self.inner.always_on {
             if prefs.supports(handle.id.codec) {
@@ -585,11 +678,10 @@ impl EncoderPool {
                 });
             }
         }
-        // On-demand: phase 3 wires this. Today: only always-on slots
-        // are returned; peers preferring on-demand-only codecs get an
-        // empty subscription set (forwarder will treat as "no compatible
-        // codec" — same as today's failure mode but isolated to that
-        // peer instead of locking the whole session).
+        // Phase 3b: iterate prefs and spawn on-demand encoders for
+        // codecs that aren't in always_on and aren't already running.
+        // Increment refcount on each on_demand slot the peer subscribes
+        // to. Today: no-op.
         subs
     }
 
@@ -597,22 +689,23 @@ impl EncoderPool {
     /// slots; tears down encoders that hit refcount zero. Always-on
     /// slots ignore release (they live for the pool's lifetime).
     ///
-    /// **Stub:** no-op today (no on-demand encoders to release). Phase 3
-    /// adds the refcount-and-shutdown logic.
+    /// Phase 3b wires this; today it's a no-op since no on-demand
+    /// encoders exist.
     pub async fn release(&self, _prefs: &PeerCodecPreferences) {
-        // Phase 3.
+        // Phase 3b.
     }
 
     /// Request a keyframe from one encoder (or all layers of one codec
     /// if `rid` is `None`). Coalesced — multiple callers within
     /// [`KEYFRAME_COALESCE_WINDOW`] result in one request.
     ///
+    /// Returns `true` if the request was forwarded to the encoder
+    /// (i.e. coalescer admitted it AND a matching encoder exists),
+    /// `false` if it was deduped against a recent request OR if no
+    /// encoder matched the `(codec, rid)` lookup.
+    ///
     /// Called by the per-peer forwarder when str0m signals an inbound
     /// PLI/FIR for that peer.
-    ///
-    /// **Stub:** runs the coalescer correctly but does not yet forward
-    /// the request to the encoder backend. Phase 3 wires the channel
-    /// from coalescer → encoder thread.
     pub async fn request_keyframe(
         &self,
         codec: CodecKind,
@@ -622,9 +715,164 @@ impl EncoderPool {
         // against the full layer (callers using None typically mean
         // "any layer is fine, just give me a keyframe").
         let rid = rid.unwrap_or_else(SimulcastRid::full);
-        self.inner.keyframe_coalescer.should_request(codec, &rid)
-        // Phase 3: if the above returned true, send to encoder's
-        // keyframe_tx channel.
+        if !self.inner.keyframe_coalescer.should_request(codec, &rid) {
+            return false;
+        }
+        let id = EncoderId::new(codec, rid);
+        // Always-on first.
+        for handle in &self.inner.always_on {
+            if handle.id == id {
+                handle.force_keyframe.store(true, Ordering::SeqCst);
+                return true;
+            }
+        }
+        // On-demand.
+        let on_demand = self.inner.on_demand.read().await;
+        if let Some(slot) = on_demand.get(&id) {
+            slot.handle.force_keyframe.store(true, Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+
+    /// Test-only access to the always-on handles. Lets tests verify
+    /// pool composition without exposing internals to production code.
+    #[cfg(test)]
+    pub(crate) fn always_on(&self) -> &[EncoderHandle] {
+        &self.inner.always_on
+    }
+}
+
+impl Drop for EncoderPoolInner {
+    fn drop(&mut self) {
+        // Cancel encoder shutdowns explicitly so threads exit on the
+        // next iteration even if they're blocked in blocking_recv —
+        // CancellationToken::cancel wakes any future await but for the
+        // std::thread blocking case the second signal (i420_tx drop
+        // closing the channel) is what actually wakes them. Both run:
+        // Cancel sets the flag for the loop's per-iter check, then
+        // dropping the broadcast sender below closes the channel and
+        // the recv returns Err(Closed) immediately.
+        for handle in &self.always_on {
+            handle.shutdown.cancel();
+        }
+        // try_read avoids an await in Drop. If the lock is contended
+        // we skip explicit cancellation and rely on the i420_tx-drop
+        // backstop — both paths converge on thread exit, just at
+        // different latencies.
+        if let Ok(slots) = self.on_demand.try_read() {
+            for slot in slots.values() {
+                slot.handle.shutdown.cancel();
+            }
+        }
+        // i420_tx (the one Sender) drops when this struct's fields go
+        // out of scope after this method returns. That closes the
+        // broadcast and unblocks every encoder thread's blocking_recv.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoder thread spawn
+// ---------------------------------------------------------------------------
+
+/// Spawn one encoder thread for the given layer, returning its
+/// [`EncoderHandle`]. The thread:
+///
+/// 1. Constructs the codec's encoder backend via
+///    [`super::select_codec_for_mime`].
+/// 2. Subscribes to the pool's I420 broadcast.
+/// 3. In a `blocking_recv` loop: pulls the next I420 frame, swaps the
+///    `force_keyframe` flag, calls `encoder.encode(...)`, and
+///    broadcasts each produced packet (wrapped in
+///    `Arc<EncodedFrame>`) to the per-encoder frames channel.
+/// 4. Exits when `shutdown` is cancelled OR the I420 broadcast closes
+///    (sender dropped at pool drop).
+///
+/// Encoder construction failures log + early-return — the thread exits
+/// without producing frames; subscribers see a silent broadcast (no
+/// `Lagged`, no `Closed` until pool drop) which surfaces as "the peer
+/// negotiated a codec the system can't actually produce." Phase 3b's
+/// on-demand spawn path will check the construction result before
+/// returning the handle to subscribe(), so the failure is visible at
+/// peer-add time rather than as silent black streams.
+fn spawn_encoder_thread(
+    id: EncoderId,
+    layer: LayerSpec,
+    i420_tx: &broadcast::Sender<I420Frame>,
+    duration_ms: u64,
+) -> EncoderHandle {
+    let (frames_tx, _) =
+        broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
+    let force_keyframe = Arc::new(AtomicBool::new(false));
+    let shutdown = CancellationToken::new();
+
+    let mut i420_rx = i420_tx.subscribe();
+    let frames_tx_for_thread = frames_tx.clone();
+    let force_kf_for_thread = Arc::clone(&force_keyframe);
+    let shutdown_for_thread = shutdown.clone();
+    let codec_mime = id.codec.mime();
+    let width = layer.width;
+    let height = layer.height;
+    let bitrate_kbps = layer.target_bitrate_kbps;
+    let id_for_log = id.clone();
+
+    std::thread::spawn(move || {
+        let mut encoder: Box<dyn super::Encoder> =
+            match super::select_codec_for_mime(codec_mime, width, height, bitrate_kbps) {
+                Ok((enc, _)) => enc,
+                Err(e) => {
+                    eprintln!(
+                        "[encoder/pool] {} encoder construction failed for {}x{}: {}",
+                        id_for_log, width, height, e
+                    );
+                    return;
+                }
+            };
+
+        loop {
+            if shutdown_for_thread.is_cancelled() {
+                break;
+            }
+            let frame = match i420_rx.blocking_recv() {
+                Ok(f) => f,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // Slow encoder fell behind by `n` frames; skip
+                    // ahead. Codec keyframe machinery will recover
+                    // (next force_keyframe or the encoder's natural
+                    // GOP cadence).
+                    eprintln!(
+                        "[encoder/pool] {} lagged by {} frames, skipping ahead",
+                        id_for_log, n
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+
+            let force_kf = force_kf_for_thread.swap(false, Ordering::SeqCst);
+
+            match encoder.encode(&frame.data, duration_ms, force_kf) {
+                Ok(packets) => {
+                    for pkt in packets {
+                        let ef = Arc::new(pkt.into_encoded_frame());
+                        // Lossy broadcast: returns Err only if there
+                        // are zero subscribers, which is fine.
+                        let _ = frames_tx_for_thread.send(ef);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[encoder/pool] {} encode error: {}", id_for_log, e);
+                }
+            }
+        }
+    });
+
+    EncoderHandle {
+        id,
+        layer,
+        frames: frames_tx,
+        force_keyframe,
+        shutdown,
     }
 }
 
@@ -737,14 +985,11 @@ mod tests {
 
     #[tokio::test]
     async fn pool_subscribes_only_to_supported_codecs() {
-        // Build a pool with one always-on VP8 layer.
-        let (tx, _) = broadcast::channel(ENCODER_FRAME_BROADCAST_CAPACITY);
-        let handle = EncoderHandle {
-            id: EncoderId::new(CodecKind::Vp8, SimulcastRid::full()),
-            layer: LayerSpec::single(CodecKind::Vp8, 1920, 1080, 30),
-            frames: tx,
-        };
-        let pool = EncoderPool::new(vec![handle]);
+        // VP8-only always-on bank at a tiny resolution. Real encoder
+        // thread spawns; test exercises the subscribe routing, not the
+        // encoder runtime.
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(vec![layer], 30);
 
         // Peer that supports VP8 gets one subscription.
         let vp8_prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
@@ -753,7 +998,7 @@ mod tests {
         assert_eq!(subs[0].id.codec, CodecKind::Vp8);
 
         // Peer that only supports H.264 gets zero (no on-demand spawn
-        // in this stub; phase 3 will spawn one and return it).
+        // in phase 3a; phase 3b will spawn one and return it).
         let h264_prefs = PeerCodecPreferences::new(vec![CodecKind::H264]);
         let subs = pool.subscribe(&h264_prefs).await;
         assert_eq!(subs.len(), 0);
@@ -761,13 +1006,142 @@ mod tests {
 
     #[tokio::test]
     async fn pool_request_keyframe_coalesces() {
-        let pool = EncoderPool::new(vec![]);
+        // Empty layer set — no encoders spawned, so request_keyframe
+        // consistently returns false (coalescer admits the first, but
+        // no matching encoder exists).
+        let pool = EncoderPool::new(vec![], 30);
         let rid = SimulcastRid::full();
-        // First fires.
-        assert!(pool.request_keyframe(CodecKind::Vp8, Some(rid.clone())).await);
-        // Immediate second is coalesced.
+        // Coalescer admits first, but no encoder matches → false.
         assert!(!pool.request_keyframe(CodecKind::Vp8, Some(rid.clone())).await);
-        // None-rid coalesces against full (the convention used by the impl).
-        assert!(!pool.request_keyframe(CodecKind::Vp8, None).await);
+        // Second is coalesced at the coalescer layer regardless.
+        assert!(!pool.request_keyframe(CodecKind::Vp8, Some(rid.clone())).await);
+    }
+
+    /// Keyframe request actually sets the encoder's atomic flag when
+    /// an encoder matches. Exercises the full request_keyframe →
+    /// coalescer → handle.force_keyframe path.
+    #[tokio::test]
+    async fn pool_request_keyframe_sets_encoder_flag() {
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(vec![layer], 30);
+
+        // Initial state: flag is false.
+        let handle = &pool.always_on()[0];
+        assert!(!handle.force_keyframe.load(Ordering::SeqCst));
+
+        // Fire keyframe request → flag goes true.
+        let fired = pool
+            .request_keyframe(CodecKind::Vp8, Some(SimulcastRid::full()))
+            .await;
+        assert!(fired, "request_keyframe must return true when encoder matches");
+        assert!(handle.force_keyframe.load(Ordering::SeqCst));
+
+        // Second request is coalesced (returns false) — flag stays
+        // set because we haven't encoded yet (the encoder thread would
+        // swap it back).
+        let fired2 = pool
+            .request_keyframe(CodecKind::Vp8, Some(SimulcastRid::full()))
+            .await;
+        assert!(!fired2);
+        assert!(handle.force_keyframe.load(Ordering::SeqCst));
+    }
+
+    /// End-to-end: push synthetic I420 frames through the pool and
+    /// verify encoded frames come out via `subscribe`. This is the
+    /// regression guard that phase 3a's encoder spawn actually works —
+    /// not just that the types line up.
+    #[tokio::test]
+    async fn pool_produces_encoded_frames_from_synthetic_i420() {
+        // Small frame: 64x64 black (Y=0, U=128, V=128). I420 size =
+        // W*H + 2*(W/2)*(H/2) = W*H*3/2.
+        const W: usize = 64;
+        const H: usize = 64;
+        let i420_size = W * H * 3 / 2;
+        let mut frame_data = vec![0u8; i420_size];
+        // U and V planes are chroma — 128 is neutral (achromatic).
+        for byte in &mut frame_data[W * H..] {
+            *byte = 128;
+        }
+        let frame_arc = Arc::new(frame_data);
+
+        let layer = LayerSpec::single(CodecKind::Vp8, W as u32, H as u32, 30);
+        let pool = EncoderPool::new(vec![layer], 30);
+
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let mut subs = pool.subscribe(&prefs).await;
+        assert_eq!(subs.len(), 1);
+        let mut rx = subs.remove(0).frames;
+
+        // Give the encoder thread a moment to finish construction
+        // (blocking_recv subscribes are cheap but the thread needs to
+        // reach its first recv before push_i420_frame is observed).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Push a handful of frames. VP8 should emit a keyframe packet
+        // on (or shortly after) the first frame, then P-frames on
+        // subsequent ones.
+        for _ in 0..5 {
+            pool.push_i420_frame(Arc::clone(&frame_arc), Instant::now());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Expect at least one encoded frame within 2 seconds.
+        let ef = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("encoded frame should arrive within 2s")
+            .expect("broadcast should not be closed while pool is alive");
+        assert!(!ef.data.is_empty(), "encoded frame payload must be non-empty");
+    }
+
+    /// Dropping the pool shuts down encoder threads. This is the
+    /// regression guard for the "pool drop leaks encoder threads" class
+    /// of bug — if we forget to cancel shutdown tokens or drop the
+    /// i420_tx sender, encoder threads linger forever and cause the
+    /// same class of X11 capture-thread-leak that phase 1 fixed for
+    /// the capture side.
+    #[tokio::test]
+    async fn pool_drop_shuts_down_encoders() {
+        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
+        let pool = EncoderPool::new(vec![layer], 30);
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let mut subs = pool.subscribe(&prefs).await;
+        let mut rx = subs.remove(0).frames;
+
+        // Drop the pool. The encoder thread must exit and the
+        // per-encoder broadcast must close — the subscriber sees
+        // `Closed` on its next recv.
+        drop(pool);
+
+        // The thread may still be mid-blocking_recv when drop fires.
+        // CancellationToken::cancel + i420_tx-drop together guarantee
+        // it exits, but we give it a generous window for the thread
+        // scheduler to run.
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        match result {
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                // Expected: encoder exited, sender dropped.
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                // Encoder produced output before exiting; try again.
+                let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("second recv should not time out");
+                assert!(
+                    matches!(second, Err(broadcast::error::RecvError::Closed)),
+                    "after Lagged, next recv should be Closed"
+                );
+            }
+            Ok(Ok(_frame)) => {
+                // Frame arrived before close — try again for close.
+                let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("second recv should not time out");
+                assert!(
+                    matches!(second, Err(broadcast::error::RecvError::Closed)),
+                    "after frame, next recv should be Closed"
+                );
+            }
+            Err(_) => panic!("encoder thread did not exit within 2s of pool drop"),
+        }
     }
 }
