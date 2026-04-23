@@ -188,6 +188,20 @@ impl CodecKind {
         }
     }
 
+    /// Inverse of [`Self::mime`]. Returns `None` for unrecognised wire
+    /// strings — callers that need to fail loud on unknown codecs must
+    /// handle the `None` case explicitly rather than matching on the
+    /// MIME string themselves (keeps the codec vocabulary in one place).
+    pub fn from_mime(mime: &str) -> Option<Self> {
+        match mime {
+            m if m == super::MIME_TYPE_VP8 => Some(Self::Vp8),
+            m if m == super::MIME_TYPE_H264 => Some(Self::H264),
+            "video/VP9" => Some(Self::Vp9),
+            "video/AV1" => Some(Self::Av1),
+            _ => None,
+        }
+    }
+
     /// Short string for logs. Distinct from `mime()` because logs read
     /// better with `vp8` / `h264` than `video/VP8` / `video/H264`.
     pub fn as_str(&self) -> &'static str {
@@ -631,6 +645,15 @@ mod tests {
         assert_eq!(CodecKind::H264.mime(), super::super::MIME_TYPE_H264);
         assert_eq!(CodecKind::Vp9.mime(), "video/VP9");
         assert_eq!(CodecKind::Av1.mime(), "video/AV1");
+    }
+
+    #[test]
+    fn codec_kind_from_mime_round_trips_every_kind() {
+        for k in [CodecKind::Vp8, CodecKind::H264, CodecKind::Vp9, CodecKind::Av1] {
+            assert_eq!(CodecKind::from_mime(k.mime()), Some(k));
+        }
+        assert_eq!(CodecKind::from_mime("video/HEVC"), None);
+        assert_eq!(CodecKind::from_mime(""), None);
     }
 
     #[test]

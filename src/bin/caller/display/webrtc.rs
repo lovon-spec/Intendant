@@ -43,6 +43,7 @@
 //! interfaces). This is documented in the README.
 
 use super::clipboard::ClipboardContent;
+use super::encode::pool::CodecKind;
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
 use crate::error::CallerError;
 use std::collections::HashMap;
@@ -592,10 +593,27 @@ impl WebRtcPeer {
     /// Create a new peer from an SDP offer, returning `(Self, answer_sdp)`.
     ///
     /// Steps:
-    /// 1. Build an `Rtc` configured for the negotiated `codec_mime`.
+    /// 1. Build an [`Rtc`] with each codec in `codec_set` enabled — str0m
+    ///    then negotiates from the browser's offer against those codecs.
     /// 2. Bind a per-peer UDP socket and register it as a host candidate.
     /// 3. Synchronously generate the SDP answer via `accept_offer`.
     /// 4. Spawn the driver task and return.
+    ///
+    /// ## `codec_set` contract
+    ///
+    /// Each peer gets its own [`Rtc`] (str0m does not support per-peer
+    /// codec selection inside one `Rtc`), so codec enablement is a
+    /// per-peer decision. The caller passes the codecs this peer should
+    /// be allowed to negotiate — typically the intersection of "what the
+    /// encoder pipeline can currently produce" with "what the peer's
+    /// offer advertised." An empty set is rejected up front; unknown
+    /// codecs return an explicit error so the failure point is not
+    /// buried inside str0m's accept_offer.
+    ///
+    /// Empty / no-overlap cases are surfaced to `handle_offer` as
+    /// [`CallerError::WebRtc`] errors rather than producing a silent
+    /// broken stream — matches the "no compatible codec, clean reject"
+    /// contract from the multi-viewer redesign.
     ///
     /// `ice_tx` is accepted for API parity with the previous webrtc-rs
     /// implementation but is currently unused: str0m emits its host candidates
@@ -605,7 +623,7 @@ impl WebRtcPeer {
     pub async fn new(
         peer_id: PeerId,
         offer_sdp: &str,
-        codec_mime: &str,
+        codec_set: &[CodecKind],
         _ice_config: &IceConfig,
         tcp_peer_registry: Option<Arc<TcpPeerRegistry>>,
         tcp_advertised_addr: Option<SocketAddr>,
@@ -619,22 +637,38 @@ impl WebRtcPeer {
         let ice_creds = IceCreds::new();
         let local_ufrag = ice_creds.ufrag.clone();
 
-        // --- Build the Rtc with only the negotiated codec enabled ---------
-        // The session-level codec selection has already happened in
-        // DisplaySession::handle_offer; we restrict str0m's codec set so
-        // negotiation can only resolve to that one codec.
+        // --- Build the Rtc with the per-peer codec set enabled ------------
+        // Previously the session locked one codec at the first peer's offer
+        // and every subsequent peer was pre-restricted to it. Now each peer's
+        // Rtc enables the codec set its handler chose based on this peer's
+        // own offer, so str0m's accept_offer handles SDP negotiation cleanly
+        // against the browser's actual preferences.
+        if codec_set.is_empty() {
+            return Err(CallerError::WebRtc(
+                "peer codec set is empty — caller must ensure at least one \
+                 encoder codec overlaps with the peer's offer before \
+                 constructing WebRtcPeer"
+                    .to_string(),
+            ));
+        }
         let mut config = RtcConfig::new()
             .clear_codecs()
             .set_local_ice_credentials(ice_creds);
-        config = match codec_mime {
-            super::encode::MIME_TYPE_VP8 => config.enable_vp8(true),
-            super::encode::MIME_TYPE_H264 => config.enable_h264(true),
-            other => {
-                return Err(CallerError::WebRtc(format!(
-                    "unsupported codec mime: {other}"
-                )));
-            }
-        };
+        for codec in codec_set {
+            config = match codec {
+                CodecKind::Vp8 => config.enable_vp8(true),
+                CodecKind::H264 => config.enable_h264(true),
+                // VP9 / AV1 wiring to str0m lands with phase 3 of the
+                // encoder-pool redesign. Reject explicitly so a stray
+                // caller doesn't get silent codec loss.
+                CodecKind::Vp9 | CodecKind::Av1 => {
+                    return Err(CallerError::WebRtc(format!(
+                        "codec {} not yet wired to str0m enable API",
+                        codec
+                    )));
+                }
+            };
+        }
         let mut rtc = config.build(Instant::now());
 
         // --- Bind one UDP socket per local interface -----------------------

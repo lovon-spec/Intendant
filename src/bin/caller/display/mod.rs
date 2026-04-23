@@ -1085,10 +1085,23 @@ impl DisplaySession {
                 });
             });
 
+        // Translate the session-level `codec_mime` (today: singleton because
+        // the encoder pool isn't yet wired) into the per-peer codec set
+        // WebRtcPeer::new now expects. Phase 3 will replace this singleton
+        // with the actual pool's currently-running codec set, at which point
+        // a peer offering multiple codecs gets its Rtc configured to
+        // negotiate the best overlap rather than pre-locked to the first
+        // peer's choice.
+        let codec_kind = encode::pool::CodecKind::from_mime(codec_mime)
+            .ok_or_else(|| CallerError::WebRtc(format!(
+                "unsupported session codec mime: {codec_mime}"
+            )))?;
+        let codec_set = [codec_kind];
+
         let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new(
             peer_id,
             sdp,
-            codec_mime,
+            &codec_set,
             ice_config,
             tcp_peer_registry,
             tcp_advertised_addr,
