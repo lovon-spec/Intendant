@@ -6,7 +6,7 @@
 //! This approach avoids complex FFI bindings to libva while still getting
 //! hardware acceleration when available.
 
-use super::{EncodedPacket, Encoder};
+use super::{EncodedPacket, Encoder, PayloadSpec};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +63,12 @@ pub struct FfmpegH264Encoder {
     pending_frame_nals: Vec<Nal>,
     /// Timestamp to assign to the next completed frame.
     pending_frame_pts: u64,
+    /// Cached canonical payload spec for this encoder. Attached to every
+    /// emitted packet so the WebRTC driver's `match_params` cache can
+    /// look up the peer-negotiated PT. All ffmpeg H.264 packets produced
+    /// here are Constrained Baseline, packetization-mode 1 (matches both
+    /// the h264_vaapi config and libx264 `-profile:v baseline` above).
+    payload_spec: PayloadSpec,
 }
 
 impl FfmpegH264Encoder {
@@ -263,6 +269,7 @@ impl FfmpegH264Encoder {
             reader_thread: Some(reader_thread),
             pending_frame_nals: Vec::new(),
             pending_frame_pts: 0,
+            payload_spec: PayloadSpec::h264_constrained_baseline(),
         })
     }
 
@@ -280,8 +287,15 @@ impl FfmpegH264Encoder {
 impl FfmpegH264Encoder {
     /// Build an EncodedPacket from a set of NAL units forming a complete
     /// access unit (one video frame). Wraps each NAL with an Annex-B
-    /// start code.
-    fn build_packet(nals: &[Nal], pts_ms: u64, duration_ms: u64) -> Option<EncodedPacket> {
+    /// start code. `payload_spec` is cloned in so the function stays a
+    /// free-ish associated helper (no `&self`) while each emitted packet
+    /// still carries the encoder's fmtp identity.
+    fn build_packet(
+        nals: &[Nal],
+        pts_ms: u64,
+        duration_ms: u64,
+        payload_spec: &PayloadSpec,
+    ) -> Option<EncodedPacket> {
         if nals.is_empty() {
             return None;
         }
@@ -299,6 +313,7 @@ impl FfmpegH264Encoder {
             pts_ms,
             duration_ms,
             is_keyframe,
+            payload_spec: payload_spec.clone(),
         })
     }
 }
@@ -367,6 +382,7 @@ impl Encoder for FfmpegH264Encoder {
                     &self.pending_frame_nals,
                     self.pending_frame_pts,
                     duration_ms,
+                    &self.payload_spec,
                 ) {
                     out_packets.push(pkt);
                 }
@@ -389,6 +405,10 @@ impl Encoder for FfmpegH264Encoder {
 
     fn codec_mime(&self) -> &'static str {
         "video/H264"
+    }
+
+    fn payload_spec(&self) -> &PayloadSpec {
+        &self.payload_spec
     }
 }
 

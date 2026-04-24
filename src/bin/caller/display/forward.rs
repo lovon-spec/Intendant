@@ -201,139 +201,34 @@ impl Default for LayerSelector {
 }
 
 // ---------------------------------------------------------------------------
-// Per-peer forwarder state
+// Why PerPeerForwarder lives inside the WebRtcPeer driver now
 // ---------------------------------------------------------------------------
-
-/// State owned by one peer's forwarder. Created at
-/// [`PerPeerForwarder::new`] time, mutated by the forwarder loop.
-///
-/// The fields that change over the peer's lifetime are behind
-/// synchronization primitives because (a) the forwarder loop
-/// mutates them, (b) str0m event handlers read them (e.g. the PLI
-/// handler reads `keyframe_seen` to decide whether to force a
-/// keyframe vs just forward one).
-pub struct PerPeerForwarderState {
-    pub peer_id: PeerId,
-    pub prefs: PeerCodecPreferences,
-    pub layer: LayerSelector,
-    /// Has this peer received ≥1 keyframe? False blocks P-frame
-    /// forwarding; true admits all frames.
-    pub keyframe_seen: AtomicBool,
-}
-
-impl PerPeerForwarderState {
-    pub fn new(peer_id: PeerId, prefs: PeerCodecPreferences) -> Self {
-        Self {
-            peer_id,
-            prefs,
-            layer: LayerSelector::new(),
-            keyframe_seen: AtomicBool::new(false),
-        }
-    }
-
-    /// Whether the forwarder should forward this frame given the
-    /// current `keyframe_seen` state and the frame's keyframe flag.
-    /// Used by the run loop; exposed here for testing.
-    pub fn should_forward(&self, frame: &EncodedFrame) -> bool {
-        if self.keyframe_seen.load(Ordering::Acquire) {
-            return true;
-        }
-        if frame.is_keyframe {
-            self.keyframe_seen.store(true, Ordering::Release);
-            return true;
-        }
-        false
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-peer forwarder
-// ---------------------------------------------------------------------------
-
-/// Runs one peer's forwarding loop. Owns the state and the set of
-/// encoder subscriptions; on `run`, consumes both and drives frames
-/// into the peer's str0m [`Rtc`] instance.
-///
-/// Constructed from [`EncoderPool::subscribe`]'s result, which is why
-/// the pool owns the codec-negotiation and subscription logic and the
-/// forwarder is pure plumbing: codec fit has already been checked.
-///
-/// **Stub:** `new` is wired; `run` has the loop shape in the docstring
-/// but the body is a phase-4 placeholder (no str0m calls yet).
-pub struct PerPeerForwarder {
-    state: Arc<PerPeerForwarderState>,
-    subscriptions: Vec<EncoderSubscription>,
-}
-
-impl PerPeerForwarder {
-    /// Construct a forwarder for one peer.
-    ///
-    /// Returns [`ForwarderError::NoCompatibleCodec`] if the
-    /// subscription set is empty — the peer's codec preferences
-    /// don't overlap with any encoder the pool can produce. This
-    /// should normally be caught earlier in the handshake
-    /// (`handle_offer` returns an error SDP), but the check here is
-    /// the backstop.
-    pub fn new(
-        peer_id: PeerId,
-        prefs: PeerCodecPreferences,
-        subscriptions: Vec<EncoderSubscription>,
-    ) -> Result<Self, ForwarderError> {
-        if subscriptions.is_empty() {
-            return Err(ForwarderError::NoCompatibleCodec);
-        }
-        Ok(Self {
-            state: Arc::new(PerPeerForwarderState::new(peer_id, prefs)),
-            subscriptions,
-        })
-    }
-
-    /// Handle to the forwarder's state, for PLI / TWCC callbacks from
-    /// str0m's event loop that need to mutate the forwarder
-    /// (e.g. `layer.prefer()` on bandwidth change, or reading
-    /// `keyframe_seen` to coalesce keyframe requests).
-    pub fn state(&self) -> Arc<PerPeerForwarderState> {
-        Arc::clone(&self.state)
-    }
-
-    /// Run the forward loop. Phase 4 fills in the body; the intended
-    /// structure is documented here so reviewers can evaluate the
-    /// design without reading every phase's PR:
-    ///
-    /// ```text
-    ///     loop {
-    ///         tokio::select! {
-    ///             // For each subscription, pull the next frame.
-    ///             // (Multiple subscriptions happen when a peer
-    ///             // supports multiple codecs; we pick one based on
-    ///             // the peer's negotiated codec in str0m's Rtc and
-    ///             // drop frames from the others.)
-    ///             Ok(frame) = sub_vp8_full.recv() if self.peer_wants(Vp8, Full) => {
-    ///                 if !self.state.should_forward(&frame) {
-    ///                     // Pre-keyframe P-frame; drop + ask pool for KF.
-    ///                     self.pool.request_keyframe(Vp8, Some(Full)).await;
-    ///                     continue;
-    ///                 }
-    ///                 let pt = writer.match_params(encoder_params)
-    ///                     .ok_or(ForwarderError::PayloadTypeTranslationFailed)?;
-    ///                 writer.write(pt, rtp_time, &frame.data, Some(rid))?;
-    ///             }
-    ///             // ...similar arms for other (codec, rid) subscriptions.
-    ///             _ = shutdown.cancelled() => break,
-    ///         }
-    ///     }
-    /// ```
-    ///
-    /// **Stub:** returns `Ok(())` immediately. Consumers of this type
-    /// can exercise the constructor and `state()` without pulling in
-    /// the str0m runtime.
-    pub async fn run(self) -> Result<(), ForwarderError> {
-        // Phase 4.
-        let _ = self.subscriptions;
-        let _ = self.state;
-        Ok(())
-    }
-}
+//
+// An earlier design stub had a separate `PerPeerForwarder` type with a
+// `run()` method that would loop over encoder subscriptions and write
+// via `str0m::Writer::write_sample`. That design can't work: the
+// `Rtc` instance is owned by the `WebRtcPeer` driver task
+// (`display/webrtc.rs`), and a separate forwarder task has no path to
+// call str0m's writer APIs. Moving the forwarder responsibilities
+// into the driver avoids the cross-task-Rtc-access problem entirely:
+// each peer's driver select!-loops over its pool subscriptions
+// alongside its existing command/event arms, and the pt-caching +
+// keyframe-gate logic from the stub merges into `DriverState`.
+//
+// What stays in this module:
+//
+// - [`LayerSelector`] — per-peer simulcast layer choice, wired to
+//   TWCC bandwidth events in phase 4.
+// - [`ForwarderError`] — shared vocabulary for the handful of
+//   forwarder-layer failure modes (surfaced from the driver's write
+//   path).
+// - [`codec_preferences_from_offer`] — SDP-offer → `PeerCodecPreferences`
+//   helper used by `handle_offer` before `pool.subscribe`.
+//
+// What was deleted: `PerPeerForwarder` struct, `PerPeerForwarderState`
+// struct, the `should_forward` keyframe-gate helper (now lives in the
+// driver's `keyframe_seen` check in `write_video_frame`), and the
+// placeholder `run` method that couldn't call str0m.
 
 // ---------------------------------------------------------------------------
 // Helper: derive PeerCodecPreferences from an offer SDP
@@ -389,51 +284,12 @@ mod tests {
         n
     }
 
-    #[tokio::test]
-    async fn forwarder_rejects_empty_subscription_set() {
-        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let result = PerPeerForwarder::new(peer_id(1), prefs, vec![]);
-        assert!(matches!(result, Err(ForwarderError::NoCompatibleCodec)));
-    }
-
-    #[tokio::test]
-    async fn forwarder_accepts_one_subscription() {
-        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let sub = make_subscription(CodecKind::Vp8, SimulcastRid::full());
-        let fwd = PerPeerForwarder::new(peer_id(1), prefs, vec![sub]).unwrap();
-        let state = fwd.state();
-        assert_eq!(state.peer_id, 1);
-        assert!(!state.keyframe_seen.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn keyframe_gate_blocks_pframes_until_first_keyframe() {
-        let state = PerPeerForwarderState::new(
-            peer_id(1),
-            PeerCodecPreferences::new(vec![CodecKind::Vp8]),
-        );
-
-        let pframe = EncodedFrame {
-            data: vec![0],
-            pts_ms: 0,
-            duration_ms: 33,
-            is_keyframe: false,
-        };
-        let keyframe = EncodedFrame {
-            data: vec![0],
-            pts_ms: 33,
-            duration_ms: 33,
-            is_keyframe: true,
-        };
-
-        // Pre-keyframe P-frame is rejected.
-        assert!(!state.should_forward(&pframe));
-        // Keyframe flips the gate open and is itself forwarded.
-        assert!(state.should_forward(&keyframe));
-        // All subsequent frames, keyframe or not, are forwarded.
-        assert!(state.should_forward(&pframe));
-        assert!(state.should_forward(&keyframe));
-    }
+    // PerPeerForwarder tests were deleted with the type — the
+    // keyframe-gate regression guard moves to the driver's write path
+    // (`display/webrtc.rs::write_video_frame`), where `state.keyframe_seen`
+    // now lives. Driver-side coverage is via e2e webrtc tests rather
+    // than in-unit tests because the relevant path requires a live
+    // `Rtc` instance.
 
     #[tokio::test]
     async fn layer_selector_starts_at_full() {

@@ -174,13 +174,22 @@ pub enum FrameFormat {
     Rgba,
 }
 
-/// Encoded VP8 frame -- shared across peers, each peer packetizes independently.
+/// Encoded video frame -- shared across peers, each peer packetizes independently.
+///
+/// Carries a [`encode::PayloadSpec`] so the per-peer WebRTC driver can
+/// resolve the peer-negotiated RTP payload type via `str0m::Writer::match_params`
+/// and cache the result. H.264 frames in particular need the full spec
+/// (profile-level-id + packetization-mode) because str0m discriminates
+/// parameter sets, not just codec names.
 #[derive(Clone)]
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub pts_ms: u64,
     pub duration_ms: u64,
     pub is_keyframe: bool,
+    /// Codec + fmtp identity of this frame. Set by the encoder at
+    /// construction time; propagated unchanged through the pipeline.
+    pub payload_spec: encode::PayloadSpec,
 }
 
 /// Browser input event -- carries DOM key identifiers and normalised mouse

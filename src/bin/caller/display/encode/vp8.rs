@@ -8,7 +8,7 @@
 //! light desktop activity, the second to short-circuit the wait entirely
 //! when the bridge knows a peer just attached.
 
-use super::{EncodedPacket, Encoder};
+use super::{EncodedPacket, Encoder, PayloadSpec};
 use std::ffi::c_int;
 use std::mem::MaybeUninit;
 use std::ptr;
@@ -20,6 +20,11 @@ pub struct Vp8Encoder {
     width: usize,
     height: usize,
     pts_ms: i64,
+    /// Cached canonical payload spec — VP8 has no fmtp variants, so this
+    /// is the same for every packet and every VP8 encoder instance.
+    /// Stored here so `payload_spec()` can return a reference without
+    /// constructing on each call.
+    payload_spec: PayloadSpec,
 }
 
 // `ctx` holds raw pointers from libvpx that aren't `Send`.  The encoder
@@ -93,6 +98,7 @@ impl Vp8Encoder {
             width: width as usize,
             height: height as usize,
             pts_ms: 0,
+            payload_spec: PayloadSpec::vp8(),
         })
     }
 }
@@ -174,6 +180,7 @@ impl Encoder for Vp8Encoder {
                 pts_ms: frame.pts as u64,
                 duration_ms,
                 is_keyframe: (frame.flags & VPX_FRAME_IS_KEY) != 0,
+                payload_spec: self.payload_spec.clone(),
             });
         }
         Ok(out)
@@ -181,6 +188,10 @@ impl Encoder for Vp8Encoder {
 
     fn codec_mime(&self) -> &'static str {
         "video/VP8"
+    }
+
+    fn payload_spec(&self) -> &PayloadSpec {
+        &self.payload_spec
     }
 }
 

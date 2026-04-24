@@ -13,6 +13,74 @@ pub const MIME_TYPE_VP8: &str = "video/VP8";
 pub const MIME_TYPE_H264: &str = "video/H264";
 
 // ---------------------------------------------------------------------------
+// PayloadSpec — codec identity + fmtp-equivalent parameters
+// ---------------------------------------------------------------------------
+
+/// Codec + format-params identity carried on every encoded frame, used by
+/// the WebRTC driver to resolve the peer-negotiated RTP payload type via
+/// `str0m::Writer::match_params` and cache the result.
+///
+/// Distinct from [`pool::CodecKind`] because two frames from the same
+/// codec can disagree on fmtp (e.g. H.264 Baseline vs Main with different
+/// profile-level-id, packetization-mode 0 vs 1) and str0m negotiates
+/// those independently per peer. Caching the resolved PT keyed on
+/// `PayloadSpec` (not `CodecKind`) avoids re-running `match_params` on
+/// every frame while staying correct under mixed-profile fleets.
+///
+/// `PartialEq + Eq + Hash` are derived so the driver can use it as a
+/// cache key. Fields not relevant to the codec are `None` by convention
+/// (e.g. H.264 fields are `None` for VP8 frames).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PayloadSpec {
+    /// MIME string for the codec (e.g. `"video/VP8"`, `"video/H264"`).
+    /// Using the static str interned by the encoder crate rather than an
+    /// enum so new codecs (VP9, AV1) don't require changes here —
+    /// str0m's `PayloadParams` is the source of truth for matching.
+    pub codec_mime: &'static str,
+
+    /// Sample clock rate in Hz. 90000 for all video codecs RFC 7741 /
+    /// RFC 6184 / etc. Kept as a field so audio codecs can reuse the
+    /// type if needed later.
+    pub clock_rate: u32,
+
+    /// H.264 profile-level-id from SDP fmtp (6 hex digits lowercase, e.g.
+    /// `"42e01f"`). `None` for non-H.264 codecs. Matters because str0m
+    /// discriminates H.264 parameter sets by profile.
+    pub h264_profile_level_id: Option<String>,
+
+    /// H.264 packetization-mode (0 or 1). `None` for non-H.264 codecs.
+    /// str0m's matcher checks this; mismatches fail to resolve even if
+    /// the codec name matches.
+    pub h264_packetization_mode: Option<u32>,
+}
+
+impl PayloadSpec {
+    /// VP8 has no fmtp parameters to disambiguate on; all VP8 senders /
+    /// receivers agree on the single parameter set.
+    pub fn vp8() -> Self {
+        Self {
+            codec_mime: MIME_TYPE_VP8,
+            clock_rate: 90_000,
+            h264_profile_level_id: None,
+            h264_packetization_mode: None,
+        }
+    }
+
+    /// H.264 Constrained Baseline, packetization-mode 1 — what both of
+    /// our H.264 encoder backends (VideoToolbox on macOS, libx264/VAAPI
+    /// on Linux) produce. Matches `profile_idc=0x42`, `constraint_set1=1`,
+    /// Level 3.1.
+    pub fn h264_constrained_baseline() -> Self {
+        Self {
+            codec_mime: MIME_TYPE_H264,
+            clock_rate: 90_000,
+            h264_profile_level_id: Some("42e01f".to_string()),
+            h264_packetization_mode: Some(1),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Encoder trait
 // ---------------------------------------------------------------------------
 
@@ -29,6 +97,12 @@ pub trait Encoder: Send + 'static {
     /// Implementations that cannot force mid-stream (e.g. H.264 over an
     /// already-running ffmpeg stdin pipe) may ignore the flag and rely on
     /// their configured GOP cadence instead.
+    ///
+    /// Packets emitted must carry this encoder's [`PayloadSpec`] so the
+    /// WebRTC driver can resolve the peer-negotiated payload type via
+    /// `str0m::Writer::match_params`. Encoders should `.clone()` their
+    /// cached `PayloadSpec` onto every emitted packet (cheap — small
+    /// struct with one `Option<String>`).
     fn encode(
         &mut self,
         i420: &[u8],
@@ -38,6 +112,12 @@ pub trait Encoder: Send + 'static {
 
     /// The MIME type of the encoded output (e.g. `"video/VP8"`, `"video/H264"`).
     fn codec_mime(&self) -> &'static str;
+
+    /// Canonical [`PayloadSpec`] for this encoder. Attached to every
+    /// emitted packet; also returned here for code that needs the spec
+    /// without going through encode (e.g. the pool constructing encoder
+    /// handles before the first frame is available).
+    fn payload_spec(&self) -> &PayloadSpec;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +496,11 @@ pub struct EncodedPacket {
     pub pts_ms: u64,
     pub duration_ms: u64,
     pub is_keyframe: bool,
+    /// Codec + fmtp identity for this packet's payload. Propagated to
+    /// [`EncodedFrame`] on conversion and consumed by the WebRTC driver's
+    /// `match_params` cache. Every encoder attaches its canonical
+    /// [`PayloadSpec`] here.
+    pub payload_spec: PayloadSpec,
 }
 
 impl EncodedPacket {
@@ -426,6 +511,7 @@ impl EncodedPacket {
             pts_ms: self.pts_ms,
             duration_ms: self.duration_ms,
             is_keyframe: self.is_keyframe,
+            payload_spec: self.payload_spec,
         }
     }
 }

@@ -6,7 +6,7 @@
 //! The encoder is configured for real-time, low-latency encoding with the
 //! Baseline profile (widest browser compatibility) and CAVLC entropy coding.
 
-use super::{EncodedPacket, Encoder};
+use super::{EncodedPacket, Encoder, PayloadSpec};
 use shiguredo_video_toolbox::{
     CodecConfig, EncodeOptions, EncoderConfig, FrameData, H264EncoderConfig, H264EntropyMode,
     H264Profile, PixelFormat,
@@ -27,6 +27,11 @@ pub struct VideoToolboxEncoder {
     height: u32,
     frame_count: u64,
     pts_offset: u64,
+    /// Cached canonical payload spec. VideoToolbox is configured above
+    /// for H.264 Baseline, so every emitted packet matches
+    /// [`PayloadSpec::h264_constrained_baseline`]: profile-level-id
+    /// `42e01f`, packetization-mode 1.
+    payload_spec: PayloadSpec,
 }
 
 // shiguredo_video_toolbox::Encoder contains VideoToolbox session pointers
@@ -69,6 +74,7 @@ impl VideoToolboxEncoder {
             height,
             frame_count: 0,
             pts_offset: 0,
+            payload_spec: PayloadSpec::h264_constrained_baseline(),
         })
     }
 }
@@ -130,6 +136,7 @@ impl Encoder for VideoToolboxEncoder {
                         pts_ms: pts,
                         duration_ms,
                         is_keyframe: frame.keyframe,
+                        payload_spec: self.payload_spec.clone(),
                     });
                 }
                 Ok(None) => break,
@@ -142,6 +149,10 @@ impl Encoder for VideoToolboxEncoder {
 
     fn codec_mime(&self) -> &'static str {
         "video/H264"
+    }
+
+    fn payload_spec(&self) -> &PayloadSpec {
+        &self.payload_spec
     }
 }
 

@@ -52,8 +52,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
-use str0m::format::Codec;
-use str0m::media::{MediaAdded, MediaKind, MediaTime, Mid, Pt};
+use str0m::format::{CodecSpec, FormatParams, PayloadParams};
+use str0m::media::{Frequency, MediaAdded, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{DatagramRecv, Protocol, Receive};
 use str0m::net::TcpType;
 use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig, RtcError};
@@ -914,10 +914,21 @@ impl WebRtcPeer {
 struct DriverState {
     /// Mid of the outbound video media. Set on `Event::MediaAdded`.
     video_mid: Option<Mid>,
-    /// Negotiated payload type for the video media.
-    video_pt: Option<Pt>,
-    /// Codec configured at construction (used to filter PT selection).
-    video_codec: Codec,
+    /// Per-[`crate::display::encode::PayloadSpec`] cache of resolved
+    /// payload types. First frame for a given spec calls
+    /// `writer.match_params(...)` to find the peer-negotiated PT; the
+    /// result (including `None` for "peer did not negotiate this
+    /// codec") is cached here and reused for every subsequent frame
+    /// carrying the same spec. Keyed on the full `PayloadSpec` rather
+    /// than just `CodecKind` so H.264 fmtp variants (profile-level-id
+    /// + packetization-mode) stay distinct — str0m negotiates those
+    /// independently.
+    ///
+    /// Replaces the pre-locked `video_codec` + `video_pt` fields:
+    /// under the encoder pool the peer can receive frames from
+    /// multiple codecs (VP8 always-on + H.264 on-demand, etc.) and
+    /// `match_params` is the correct resolution mechanism for each.
+    video_pt_cache: HashMap<crate::display::encode::PayloadSpec, Option<Pt>>,
     /// Map of channel label → ChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, ChannelId>,
     /// Wallclock anchor: Instant at which the first frame was emitted.
@@ -962,11 +973,9 @@ async fn driver(
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     shutdown: CancellationToken,
 ) {
-    let video_codec = first_enabled_video_codec(&rtc).unwrap_or(Codec::Vp8);
     let mut state = DriverState {
         video_mid: None,
-        video_pt: None,
-        video_codec,
+        video_pt_cache: HashMap::new(),
         channels: HashMap::new(),
         first_frame_at: None,
         keyframe_seen: false,
@@ -1365,16 +1374,13 @@ fn handle_event(
         Event::MediaAdded(MediaAdded { mid, kind, .. }) => {
             if kind == MediaKind::Video {
                 state.video_mid = Some(mid);
-                if let Some(writer) = rtc.writer(mid) {
-                    state.video_pt = writer
-                        .payload_params()
-                        .find(|p| p.spec().codec == state.video_codec)
-                        .map(|p| p.pt());
-                }
-                eprintln!(
-                    "[display/webrtc] video media added: mid={mid:?} pt={:?}",
-                    state.video_pt
-                );
+                // No longer pre-resolves a PT at MediaAdded time: PT
+                // resolution has moved to the per-frame path via the
+                // `video_pt_cache` + `writer.match_params(...)`. A
+                // peer may receive frames from multiple codecs
+                // (VP8 always-on + H.264 on-demand + …) and each
+                // `PayloadSpec` gets its own cached PT on first hit.
+                eprintln!("[display/webrtc] video media added: mid={mid:?}");
             }
         }
         Event::ChannelOpen(cid, label) => {
@@ -1418,7 +1424,7 @@ fn handle_event(
 }
 
 fn write_video_frame(rtc: &mut Rtc, state: &mut DriverState, frame: &EncodedFrame) {
-    let (Some(mid), Some(pt)) = (state.video_mid, state.video_pt) else {
+    let Some(mid) = state.video_mid else {
         return;
     };
     // Wait for a keyframe before forwarding anything: a peer that joins
@@ -1430,6 +1436,42 @@ fn write_video_frame(rtc: &mut Rtc, state: &mut DriverState, frame: &EncodedFram
         }
         state.keyframe_seen = true;
     }
+    let Some(writer) = rtc.writer(mid) else {
+        return;
+    };
+    // Resolve the peer-negotiated PT for this frame's PayloadSpec.
+    // The cache maps PayloadSpec → Option<Pt>:
+    //   - `Some(pt)`: cached hit, use this PT.
+    //   - `None`: we already asked match_params for this spec and it
+    //     didn't resolve. The peer hasn't negotiated this codec in its
+    //     SDP — happens e.g. when a peer offers VP8 but the pool also
+    //     subscribed it to H.264 and the H.264 frames arrive here.
+    //     Drop silently; str0m's negotiation is fixed so re-matching
+    //     won't suddenly work.
+    //   - absent: first frame for this spec, call match_params.
+    let pt = match state.video_pt_cache.get(&frame.payload_spec).copied() {
+        Some(Some(pt)) => pt,
+        Some(None) => return,
+        None => {
+            let resolved =
+                writer.match_params(payload_spec_to_str0m(&frame.payload_spec));
+            state
+                .video_pt_cache
+                .insert(frame.payload_spec.clone(), resolved);
+            match resolved {
+                Some(pt) => pt,
+                None => {
+                    eprintln!(
+                        "[display/webrtc] no match_params for {} — peer did not \
+                         negotiate this codec profile, frames on this spec will \
+                         be dropped",
+                        frame.payload_spec.codec_mime
+                    );
+                    return;
+                }
+            }
+        }
+    };
     let now = Instant::now();
     if state.first_frame_at.is_none() {
         state.first_frame_at = Some(now);
@@ -1437,12 +1479,51 @@ fn write_video_frame(rtc: &mut Rtc, state: &mut DriverState, frame: &EncodedFram
     let anchor = state.first_frame_at.unwrap();
     let elapsed_ms = now.duration_since(anchor).as_millis() as u64;
     let media_time = MediaTime::from_90khz(elapsed_ms.saturating_mul(90));
-    let Some(writer) = rtc.writer(mid) else {
-        return;
-    };
     if let Err(e) = writer.write(pt, now, media_time, frame.data.clone()) {
         eprintln!("[display/webrtc] writer.write failed: {e:?}");
     }
+}
+
+/// Construct a str0m [`PayloadParams`] from our abstract
+/// [`crate::display::encode::PayloadSpec`] suitable for
+/// `Writer::match_params`. The incoming `pt` field is a placeholder
+/// (match_params uses the spec for comparison, not the incoming PT),
+/// so we hand it any valid video PT — 96 is the convention for VP8.
+fn payload_spec_to_str0m(spec: &crate::display::encode::PayloadSpec) -> PayloadParams {
+    use str0m::format::Codec as StrCodec;
+    let codec = match spec.codec_mime {
+        crate::display::encode::MIME_TYPE_VP8 => StrCodec::Vp8,
+        crate::display::encode::MIME_TYPE_H264 => StrCodec::H264,
+        "video/VP9" => StrCodec::Vp9,
+        "video/AV1" => StrCodec::Av1,
+        _ => StrCodec::Unknown,
+    };
+    let mut format = FormatParams::default();
+    // H.264 fmtp fields — populated only when both sides carry the
+    // relevant values. `profile_level_id` on the str0m side is a u32
+    // (6 hex digits packed into the low 24 bits); ours is a string
+    // ("42e01f" etc) for readability. Parse on the fly.
+    if let Some(plid_str) = spec.h264_profile_level_id.as_deref() {
+        if let Ok(plid_u32) = u32::from_str_radix(plid_str, 16) {
+            format.profile_level_id = Some(plid_u32);
+        }
+    }
+    if let Some(pm) = spec.h264_packetization_mode {
+        format.packetization_mode = Some(pm as u8);
+    }
+    let clock_rate = Frequency::NINETY_KHZ;
+    let codec_spec = CodecSpec {
+        codec,
+        clock_rate,
+        channels: None,
+        format,
+    };
+    // The `pt` we pass here is a placeholder: `Writer::match_params`
+    // scores incoming `PayloadParams` against the peer's negotiated
+    // set by codec/format/etc., not by PT. Pick 96 (conventional
+    // first dynamic PT) so the return value is a valid PayloadParams
+    // even though the PT itself is unused downstream.
+    PayloadParams::new(Pt::new_with_value(96), None, codec_spec)
 }
 
 fn handle_command(rtc: &mut Rtc, state: &DriverState, cmd: Command) {
@@ -1470,15 +1551,11 @@ fn handle_command(rtc: &mut Rtc, state: &DriverState, cmd: Command) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Walk the Rtc's enabled codec list and return the first video codec.
-/// We configured exactly one codec at construction; this finds it.
-fn first_enabled_video_codec(rtc: &Rtc) -> Option<Codec> {
-    rtc.codec_config()
-        .params()
-        .iter()
-        .map(|p| p.spec().codec)
-        .find(|c| c.is_video())
-}
+// `first_enabled_video_codec` was removed as part of the 3c.0 contract
+// — codec selection happens per-frame via the `video_pt_cache` +
+// `writer.match_params(...)` path, not pre-locked at driver init.
+// The peer's Rtc can have multiple video codecs enabled (VP8 + H.264
+// + …) and each frame resolves to its own PT.
 
 /// Parse a `clipboard_set` message from a browser data channel, supporting
 /// both text and image (base64-encoded) payloads.
