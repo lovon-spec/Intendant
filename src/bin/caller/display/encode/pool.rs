@@ -328,35 +328,66 @@ pub struct LayerSpec {
     pub framerate: u32,
 }
 
+/// Minimum encoder dimension. Layers smaller than this are dropped
+/// from the simulcast set rather than included — VP8 requires
+/// even dims at minimum 16x16 (libvpx; smaller sizes work in some
+/// builds but aren't portable), and at quarter-of-source the
+/// quarter layer hits this floor for source widths/heights below
+/// ~64 px (rare but possible during a live resize transient).
+///
+/// Set to 16 to match the lowest libvpx contract dim. A layer
+/// dropped here means the simulcast set returns 1 or 2 layers
+/// instead of 3 — peers that subscribed to the dropped RID see
+/// a normal `RecvError::Closed` and resubscribe via the
+/// pool-frame-intake reconnect path.
+pub const MIN_LAYER_DIM: u32 = 16;
+
 impl LayerSpec {
-    /// Reference VP8 simulcast layout — three layers at full / half /
-    /// quarter resolution from a source resolution. Bitrates roughly
-    /// follow LiveKit's defaults (2.5 Mbps / 400 kbps / 125 kbps for
-    /// 720p source).
+    /// Reference VP8 simulcast layout — up to three layers at full /
+    /// half / quarter resolution from a source resolution. Bitrates
+    /// roughly follow LiveKit's defaults (2.5 Mbps / 400 kbps /
+    /// 125 kbps for 720p source).
+    ///
+    /// Each layer's dimensions are rounded down to the nearest even
+    /// number — VP8 requires even dims (per [`vp8::Vp8Encoder::new`]
+    /// and the same constraint enforced by [`super::downscale_i420`]),
+    /// and naked integer division produces odd dims for common
+    /// display sizes. 1366×768 is the canonical case: full 1366×768
+    /// (already even), half 683×384 (683 odd → encoder reject), quarter
+    /// 341×192 (341 odd → encoder reject). With the round-down those
+    /// become 682×384 and 340×192 — losing one column on each odd
+    /// layer, which is invisible at the encode-then-display stage.
+    ///
+    /// Layers below [`MIN_LAYER_DIM`] are dropped from the returned
+    /// vec — at small source dims (e.g. 60×48) the quarter would
+    /// be 14×10, below libvpx's portable minimum. Returning 1 or 2
+    /// layers instead of 3 is the safe degradation; the caller still
+    /// gets at least the full layer for any source ≥ MIN_LAYER_DIM.
+    /// If the source itself is below MIN_LAYER_DIM in either dim,
+    /// returns an empty vec — at that point the display pipeline
+    /// can't encode at all and the caller should fail loud at pool
+    /// construction.
     pub fn vp8_simulcast(source_w: u32, source_h: u32, framerate: u32) -> Vec<LayerSpec> {
-        vec![
-            LayerSpec {
-                rid: SimulcastRid::full(),
-                width: source_w,
-                height: source_h,
-                target_bitrate_kbps: 2500,
+        let mut out = Vec::with_capacity(3);
+        for (rid, divisor, target_bitrate_kbps) in [
+            (SimulcastRid::full(), 1, 2500),
+            (SimulcastRid::half(), 2, 400),
+            (SimulcastRid::quarter(), 4, 125),
+        ] {
+            let w = (source_w / divisor) & !1;
+            let h = (source_h / divisor) & !1;
+            if w < MIN_LAYER_DIM || h < MIN_LAYER_DIM {
+                continue;
+            }
+            out.push(LayerSpec {
+                rid,
+                width: w,
+                height: h,
+                target_bitrate_kbps,
                 framerate,
-            },
-            LayerSpec {
-                rid: SimulcastRid::half(),
-                width: source_w / 2,
-                height: source_h / 2,
-                target_bitrate_kbps: 400,
-                framerate,
-            },
-            LayerSpec {
-                rid: SimulcastRid::quarter(),
-                width: source_w / 4,
-                height: source_h / 4,
-                target_bitrate_kbps: 125,
-                framerate,
-            },
-        ]
+            });
+        }
+        out
     }
 
     /// Single-layer spec for codecs we don't simulcast (H.264 today —
@@ -2203,6 +2234,92 @@ mod tests {
         // Bitrate strictly descending — smaller layers are cheap.
         assert!(layers[0].target_bitrate_kbps > layers[1].target_bitrate_kbps);
         assert!(layers[1].target_bitrate_kbps > layers[2].target_bitrate_kbps);
+    }
+
+    /// **Phase 4a follow-up regression test (review finding).** Common
+    /// non-power-of-2 display widths produce odd half/quarter dims
+    /// from naked integer division. 1366×768 is the canonical case
+    /// (typical laptop screens, "HD-ready" TVs, many VM consoles):
+    /// - half  = 1366/2, 768/2  = 683 (odd!), 384
+    /// - quarter = 1366/4, 768/4 = 341 (odd!), 192
+    ///
+    /// Pre-fix: VP8 encoder construction rejects odd dims (vp8.rs)
+    /// AND `downscale_i420` debug-asserts even-dims-only — so once
+    /// 4b switches `DisplaySession::start` to `vp8_simulcast`,
+    /// `EncoderPool::new` would panic on always-on construction
+    /// for any 1366-wide source.
+    ///
+    /// Fix: each layer's dims are rounded down to even. 1366
+    /// becomes 1366 (already even), 683 → 682, 341 → 340. Costs
+    /// at most 1 column/row of source pixels per odd layer; the
+    /// loss is invisible at the encode-then-display stage.
+    #[test]
+    fn vp8_simulcast_normalizes_odd_layer_dims_for_1366x768() {
+        let layers = LayerSpec::vp8_simulcast(1366, 768, 30);
+        assert_eq!(layers.len(), 3, "all three layers above MIN_LAYER_DIM");
+        // Full: source already even, untouched.
+        assert_eq!((layers[0].width, layers[0].height), (1366, 768));
+        // Half: 1366/2 = 683 → 682 (round down to even). 768/2 = 384 unchanged.
+        assert_eq!((layers[1].width, layers[1].height), (682, 384));
+        // Quarter: 1366/4 = 341 → 340 (round down). 768/4 = 192 unchanged.
+        assert_eq!((layers[2].width, layers[2].height), (340, 192));
+        // All four dims even — the property that satisfies VP8 +
+        // downscale_i420 contracts.
+        for l in &layers {
+            assert_eq!(l.width % 2, 0, "{l:?} width must be even");
+            assert_eq!(l.height % 2, 0, "{l:?} height must be even");
+        }
+    }
+
+    /// Source already even on both axes — round-down should be a
+    /// no-op. Pins that we don't accidentally subtract pixels from
+    /// already-clean dims.
+    #[test]
+    fn vp8_simulcast_preserves_already_even_dims() {
+        let layers = LayerSpec::vp8_simulcast(1280, 720, 30);
+        assert_eq!(
+            [
+                (layers[0].width, layers[0].height),
+                (layers[1].width, layers[1].height),
+                (layers[2].width, layers[2].height),
+            ],
+            [(1280, 720), (640, 360), (320, 180)],
+            "even source dims must pass through divisions cleanly",
+        );
+    }
+
+    /// Source so small that quarter / half drop below MIN_LAYER_DIM
+    /// must produce a shorter list rather than an unencodable layer.
+    /// E.g. source 60×48: quarter would be 14×10, both below 16.
+    /// Half is 30×24 — also below MIN_LAYER_DIM=16 on the height
+    /// rounding? No: 24 ≥ 16 and 30 ≥ 16, so half survives.
+    /// Quarter (14×10) drops.
+    #[test]
+    fn vp8_simulcast_drops_layers_below_min_dim() {
+        // Source 60x48: quarter = 14x10 (both <16) → drop.
+        // Half = 30x24 (both ≥16) → keep.
+        // Full = 60x48 → keep.
+        let layers = LayerSpec::vp8_simulcast(60, 48, 30);
+        assert_eq!(layers.len(), 2, "quarter should be dropped");
+        assert_eq!(layers[0].rid, SimulcastRid::full());
+        assert_eq!(layers[1].rid, SimulcastRid::half());
+        for l in &layers {
+            assert!(
+                l.width >= MIN_LAYER_DIM && l.height >= MIN_LAYER_DIM,
+                "{l:?} must respect MIN_LAYER_DIM",
+            );
+        }
+
+        // Source so small even half drops: 30x24. Half = 14x12 → drop.
+        let layers = LayerSpec::vp8_simulcast(30, 24, 30);
+        assert_eq!(layers.len(), 1, "only full survives");
+        assert_eq!(layers[0].rid, SimulcastRid::full());
+
+        // Source below MIN_LAYER_DIM on either axis: empty.
+        // 14x14 (both below 16) → empty.
+        assert!(LayerSpec::vp8_simulcast(14, 14, 30).is_empty());
+        // Asymmetric: 32x10 → height < MIN_LAYER_DIM → empty.
+        assert!(LayerSpec::vp8_simulcast(32, 10, 30).is_empty());
     }
 
     #[test]
