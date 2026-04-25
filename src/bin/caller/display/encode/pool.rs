@@ -351,16 +351,17 @@ pub const MIN_LAYER_DIM: u32 = 16;
 /// Returns `Some((even_w, even_h))` for valid layer dims,
 /// `None` for dims that should drop the layer entirely.
 ///
-/// **Single source of truth.** Used by [`LayerSpec::vp8_simulcast`]
-/// (initial pool construction) and [`rescale_layer_spec`] (resize
-/// path). Centralizing the rule means a 64×64→60×48 resize drops
-/// the quarter layer the same way `vp8_simulcast(60, 48, ...)`
-/// would on a fresh pool — no inconsistency between "what dims
-/// you get on first build" and "what dims you get after a
-/// resize." Without this guarantee, the resize path could keep
-/// an unsupported tiny VP8 layer alive (e.g. 14×12 quarter on a
-/// 60×48 source) instead of closing that RID and letting the
-/// forwarder resubscribe.
+/// **Used by [`LayerSpec::vp8_simulcast`]** to filter the layers
+/// it returns. Since 4a-fix-#3 the resize path doesn't rescale
+/// old layers — it re-invokes the pool's stored
+/// [`LayerFactory`] with the new source dims, so the same
+/// `vp8_simulcast` call (and its `normalize_layer_dims` filter)
+/// runs on resize too. That guarantees a 64×64 → 60×48 resize
+/// drops the quarter layer the same way a fresh
+/// `vp8_simulcast(60, 48, ...)` would, AND the next 60×48 →
+/// 64×64 resize restores the dropped quarter (because the
+/// factory regenerates from the canonical layout, not from the
+/// previous epoch's surviving handles).
 fn normalize_layer_dims(w: u32, h: u32) -> Option<(u32, u32)> {
     let w = w & !1;
     let h = h & !1;
@@ -962,7 +963,41 @@ struct EncoderPoolInner {
     /// fan-out, so [`crate::display::DisplayMetricsSnapshot`]
     /// reflects total session throughput.
     counters: Arc<crate::display::DisplayMetricsCounters>,
+
+    /// Factory closure invoked at construction *and on every resize*
+    /// to derive the canonical always-on layer set for the current
+    /// source dimensions. Storing the factory rather than the
+    /// resulting `Vec<LayerSpec>` is what makes resize idempotent
+    /// across the round-trip: a 64×64 → 60×48 resize that drops
+    /// the quarter layer is automatically restored on the next
+    /// 60×48 → 64×64 resize, because the factory is called fresh
+    /// at each new dim and `vp8_simulcast(64, 64)` returns all
+    /// three layers again. Symmetrically, this avoids the
+    /// rounding drift that accumulates when each resize derives
+    /// from the previous epoch's already-rounded dims (e.g.
+    /// 1366×768 half = 682; resize to 1920×1080 via repeated
+    /// rescaling would yield 958, not the canonical 960).
+    layer_factory: LayerFactory,
 }
+
+/// Function that produces the always-on layer set for a given
+/// source `(width, height)`. Called by [`EncoderPool::new`] at
+/// construction and by [`EncoderPool::on_resize`] after every
+/// real-dim change, so the layer set is **always** the canonical
+/// layout for the current source dims — no derived-from-old-dims
+/// drift, no permanently-dropped layers after a shrink-then-grow
+/// cycle.
+///
+/// Common factories:
+///   - `|w, h| LayerSpec::vp8_simulcast(w, h, fps)` — production
+///     simulcast layout, 3 layers normalized to even dims and
+///     dropped below `MIN_LAYER_DIM`.
+///   - `|w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, fps)]` —
+///     single full-source VP8 layer (used by tests that exercise
+///     the on-demand path with a minimal always-on set).
+///   - `|_, _| vec![]` — no always-on, on-demand-only flows.
+pub type LayerFactory =
+    Box<dyn Fn(u32, u32) -> Vec<LayerSpec> + Send + Sync>;
 
 /// Atomic snapshot of source dimensions + resize epoch. Stored
 /// behind a `RwLock` inside [`EncoderPoolInner`] so any caller that
@@ -982,19 +1017,25 @@ struct SourceState {
 }
 
 impl EncoderPool {
-    /// Construct a pool with the given always-on layer set, spawning
-    /// one encoder thread per layer.
+    /// Construct a pool. The `layer_factory` closure is invoked
+    /// **immediately** with `(source_width, source_height)` to
+    /// produce the initial always-on layer set, and it is stored
+    /// on the pool so that [`Self::on_resize`] can re-invoke it
+    /// with the new dims to derive the canonical layout for the
+    /// new source size — see [`LayerFactory`] for why this matters.
     ///
-    /// * `source_width` / `source_height` — the capture resolution. Used
-    ///   for on-demand encoder spawns (e.g. an H.264 encoder spun up
-    ///   when the first H.264-preferring peer joins runs at the source
-    ///   resolution, not at the simulcast layer size).
-    /// * `framerate` — target capture rate; `duration_ms` is derived as
-    ///   `1000 / framerate`.
-    /// * `always_on_layers` — layers to spawn encoder threads for at
-    ///   construction time. Phase 3a/3b default is a single VP8 layer
-    ///   at source resolution; phase 4 replaces this with a VP8
-    ///   simulcast stack.
+    /// * `source_width` / `source_height` — the capture resolution.
+    ///   Used for on-demand encoder spawns (e.g. an H.264 encoder
+    ///   spun up when the first H.264-preferring peer joins runs
+    ///   at the source resolution, not at the simulcast layer size).
+    /// * `framerate` — target capture rate; `duration_ms` is derived
+    ///   as `1000 / framerate`.
+    /// * `layer_factory` — produces the always-on layer set for any
+    ///   given source dims. Production uses
+    ///   `|w, h| LayerSpec::vp8_simulcast(w, h, fps)`; tests typically
+    ///   use `|_, _| vec![]` (on-demand only) or
+    ///   `move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)]`
+    ///   (single full-source layer that tracks resize).
     ///
     /// Always-on codec is always VP8 — it has the broadest browser
     /// support and no codec-licensing complications, so it's the safe
@@ -1010,7 +1051,7 @@ impl EncoderPool {
         source_width: u32,
         source_height: u32,
         framerate: u32,
-        always_on_layers: Vec<LayerSpec>,
+        layer_factory: impl Fn(u32, u32) -> Vec<LayerSpec> + Send + Sync + 'static,
         counters: Option<Arc<crate::display::DisplayMetricsCounters>>,
     ) -> Self {
         // Every pool encoder thread bumps these counters on each
@@ -1024,8 +1065,10 @@ impl EncoderPool {
         let duration_ms = if framerate > 0 { 1000 / framerate as u64 } else { 33 };
         let (i420_tx, _) = broadcast::channel::<I420Frame>(I420_BROADCAST_CAPACITY);
 
-        let mut always_on = Vec::with_capacity(always_on_layers.len());
-        for layer in always_on_layers {
+        let layer_factory: LayerFactory = Box::new(layer_factory);
+        let initial_layers = (layer_factory)(source_width, source_height);
+        let mut always_on = Vec::with_capacity(initial_layers.len());
+        for layer in initial_layers {
             // Always-on bank is VP8 (universal codec, see module docs).
             // Use the failable constructor here and PANIC on failure —
             // always-on is the universally-available fallback path; if
@@ -1069,6 +1112,7 @@ impl EncoderPool {
                 framerate,
                 slot_gen_counter: AtomicU64::new(0),
                 counters,
+                layer_factory,
             }),
         }
     }
@@ -1213,40 +1257,23 @@ impl EncoderPool {
             for handle in &old_handles {
                 handle.shutdown.cancel();
             }
-            for old_handle in old_handles {
-                let Some(rescaled) = rescale_layer_spec(
-                    &old_handle.layer,
-                    old_width,
-                    old_height,
-                    new_width,
-                    new_height,
-                ) else {
-                    // Layer would violate MIN_LAYER_DIM (or other
-                    // portability constraint) at the new dims — drop
-                    // it from always_on. The old handle's shutdown was
-                    // already cancelled above; its encoder thread
-                    // exits and existing subscribers see RecvError::
-                    // Closed via the broadcast. The pool-frame-intake
-                    // resubscribe path treats that as a normal epoch
-                    // transition; the dropped RID just won't appear
-                    // in the next subscription set, matching what
-                    // `vp8_simulcast(new_width, new_height)` would
-                    // return for a fresh pool at the new dims.
-                    eprintln!(
-                        "[encoder/pool] on_resize: dropping always-on \
-                         layer {:?} ({}x{}) — rescale to {}x{} below \
-                         MIN_LAYER_DIM",
-                        old_handle.id,
-                        old_handle.layer.width,
-                        old_handle.layer.height,
-                        new_width,
-                        new_height,
-                    );
-                    continue;
-                };
+            // Drop every old handle. We don't iterate them as the
+            // source of new layers — instead we re-invoke the
+            // factory with new dims to get the canonical layout
+            // for the new source. This is what makes resize
+            // idempotent across round-trip (e.g. 64×64 → 60×48 →
+            // 64×64 restores any layers dropped at 60×48) and
+            // drift-free (e.g. 1366×768 → 1920×1080 produces
+            // 960×540 half, not 958×540 derived from the rounded
+            // 682×384 intermediate).
+            drop(old_handles);
+
+            let new_layers = (self.inner.layer_factory)(new_width, new_height);
+            for layer in new_layers {
+                let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
                 let new_handle = try_spawn_encoder_thread(
-                    old_handle.id.clone(),
-                    rescaled,
+                    id.clone(),
+                    layer,
                     new_width,
                     new_height,
                     &self.inner.i420_tx,
@@ -1258,7 +1285,7 @@ impl EncoderPool {
                         "on_resize: always-on respawn failed for {:?}: {} — \
                          always-on construction failure is unrecoverable by \
                          contract (see EncoderPool::new)",
-                        old_handle.id, e,
+                        id, e,
                     )
                 });
                 always_on.push(new_handle);
@@ -1821,57 +1848,6 @@ impl Drop for EncoderPoolInner {
 /// subscribers. That behavior surfaced as "the peer negotiated a
 /// codec the system can't actually produce" — which was one of the
 /// root causes the encoder-pool redesign exists to fix.
-/// Rescale a `LayerSpec` proportionally from source dimensions
-/// `(old_src_w, old_src_h)` to `(new_src_w, new_src_h)`. Preserves
-/// the layer's ratio to its source — a full-resolution layer stays
-/// at the new source dimensions, a half-resolution simulcast layer
-/// stays at half of the new source, etc.
-///
-/// Returns `None` when the rescaled layer would violate the
-/// portability floor (`MIN_LAYER_DIM`) — e.g. resizing a 64×64
-/// pool to 60×48 produces a 14×12 quarter, which VP8 can't
-/// portably encode and `downscale_i420` debug-asserts against.
-/// `on_resize` skips `None` layers, dropping them from the
-/// always-on set rather than spawning an unsupported encoder.
-///
-/// **Shared with [`LayerSpec::vp8_simulcast`] via
-/// [`normalize_layer_dims`]** so the resize path drops the same
-/// layers a fresh pool would for the new source dims — no
-/// inconsistency between "what dims you get on first build" and
-/// "what dims you get after a resize."
-///
-/// `rid`, `target_bitrate_kbps`, and `framerate` are preserved
-/// unchanged — RID identifies the layer across resize, and bitrate
-/// adaptation is TWCC's responsibility (future phase).
-fn rescale_layer_spec(
-    spec: &LayerSpec,
-    old_src_w: u32,
-    old_src_h: u32,
-    new_src_w: u32,
-    new_src_h: u32,
-) -> Option<LayerSpec> {
-    // Defensive — divide-by-zero would be a bug elsewhere (pool is
-    // constructed from real capture dimensions which are always > 0),
-    // but emit a sensible spec rather than panicking. Treats the
-    // bug case as "carry the new source dims forward" subject to
-    // the same normalization the rest of the function uses.
-    let (raw_w, raw_h) = if old_src_w == 0 || old_src_h == 0 {
-        (new_src_w, new_src_h)
-    } else {
-        let w = (spec.width as u64 * new_src_w as u64 / old_src_w as u64) as u32;
-        let h = (spec.height as u64 * new_src_h as u64 / old_src_h as u64) as u32;
-        (w, h)
-    };
-    let (w, h) = normalize_layer_dims(raw_w, raw_h)?;
-    Some(LayerSpec {
-        rid: spec.rid.clone(),
-        width: w,
-        height: h,
-        target_bitrate_kbps: spec.target_bitrate_kbps,
-        framerate: spec.framerate,
-    })
-}
-
 fn try_spawn_encoder_thread(
     id: EncoderId,
     layer: LayerSpec,
@@ -2434,8 +2410,13 @@ mod tests {
     /// encoder churn there.
     #[tokio::test]
     async fn on_resize_with_same_dimensions_is_noop() {
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         // Snapshot the single always-on handle's identity *before*
         // resize. If resize respawns anything on a same-dim call, the
@@ -2476,8 +2457,13 @@ mod tests {
     /// contract the bridge depends on.
     #[tokio::test]
     async fn on_resize_to_new_dimensions_respawns_always_on() {
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         // Grab a subscription against the old handle. After resize
         // it should return Closed on its next recv (the old handle's
@@ -2566,8 +2552,13 @@ mod tests {
     /// post-resize push relies on.
     #[tokio::test]
     async fn on_resize_leaves_pool_ready_for_push_at_new_dimensions() {
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         pool.on_resize(128, 96);
 
@@ -2591,15 +2582,27 @@ mod tests {
     /// exercise it directly.
     #[tokio::test]
     async fn on_resize_rescales_layers_proportionally() {
-        let half_layer = LayerSpec {
-            rid: SimulcastRid::half(),
-            width: 500,
-            height: 250,
-            target_bitrate_kbps: 400,
-            framerate: 30,
-        };
-        // Use vp8_simulcast-style: half-res layer on a 1000x500 source.
-        let pool = EncoderPool::new(1000, 500, 30, vec![half_layer], None);
+        // Half-of-source layer factory. The factory rule (RID +
+        // bitrate constant, dims = source/2) is what `vp8_simulcast`
+        // does for its half layer; defining it inline here pins the
+        // contract that on_resize re-derives layer dims from the
+        // factory at the new source dims, not from the previous
+        // epoch's already-rounded dims.
+        let pool = EncoderPool::new(
+            1000,
+            500,
+            30,
+            |w, h| {
+                vec![LayerSpec {
+                    rid: SimulcastRid::half(),
+                    width: (w / 2) & !1,
+                    height: (h / 2) & !1,
+                    target_bitrate_kbps: 400,
+                    framerate: 30,
+                }]
+            },
+            None,
+        );
 
         pool.on_resize(2000, 1000);
 
@@ -2628,20 +2631,27 @@ mod tests {
     /// - Resize to 60×48: full → 60×48 (ok), half → 30×24 (ok),
     ///   quarter → 14×12 (width 14 < MIN_LAYER_DIM=16) → drop.
     ///
-    /// Pre-fix: `rescale_layer_spec` only rounded to even, so
+    /// Pre-fix: the resize path rescaled old layers in place
+    /// (`rescale_layer_spec`) and only rounded to even, so
     /// `on_resize` blindly respawned a 14×12 quarter encoder.
     /// VP8 either rejected it (panic via `unwrap_or_else`) or
-    /// silently mis-encoded — both broken. Post-fix:
-    /// `rescale_layer_spec` returns `None` for sub-MIN dims and
-    /// `on_resize` skips the layer, matching the set
-    /// `vp8_simulcast(60, 48)` would return on a fresh pool.
+    /// silently mis-encoded — both broken. Post-fix: `on_resize`
+    /// re-invokes the pool's `LayerFactory` with the new dims,
+    /// so the same `vp8_simulcast` filter that drops sub-MIN
+    /// layers at construction also drops them at resize.
+    ///
+    /// Companion regression tests:
+    /// `on_resize_grow_back_restores_dropped_simulcast_layers`
+    /// (shrink-then-grow restores) and
+    /// `on_resize_avoids_rounding_drift_via_factory_regen`
+    /// (drift-free resize through odd intermediate dims).
     #[tokio::test]
     async fn on_resize_drops_simulcast_layers_below_min_dim() {
         let pool = EncoderPool::new(
             64,
             64,
             30,
-            LayerSpec::vp8_simulcast(64, 64, 30),
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
             None,
         );
 
@@ -2719,6 +2729,156 @@ mod tests {
         );
     }
 
+    /// **Phase 4a follow-up regression test #2 (review finding).**
+    /// Layers dropped on a resize-down must come back on the next
+    /// resize-up if the new dims support them.
+    ///
+    /// Pre-fix: `on_resize` derived new layers by iterating the
+    /// surviving old `always_on` Vec. Once quarter was dropped at
+    /// 60×48, it was no longer in the iteration source, so a
+    /// subsequent 60×48 → 64×64 resize produced only full+half —
+    /// quarter never came back even though `vp8_simulcast(64, 64)`
+    /// would include it for a fresh pool. Post-fix: `on_resize`
+    /// re-invokes the pool's `LayerFactory` with the new dims,
+    /// which always returns the canonical layout for those dims.
+    ///
+    /// 64×64 → 60×48 → 64×64 round-trip:
+    ///   start: full(64×64), half(32×32), quarter(16×16)
+    ///   after  60×48: full(60×48), half(30×24)              [quarter dropped]
+    ///   after  64×64: full(64×64), half(32×32), quarter(16×16)  [restored]
+    #[tokio::test]
+    async fn on_resize_grow_back_restores_dropped_simulcast_layers() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        );
+
+        // Start: 3 layers.
+        assert_eq!(pool.always_on().len(), 3, "initial pool has 3 layers");
+
+        // Shrink: quarter dropped.
+        pool.on_resize(60, 48);
+        assert_eq!(
+            pool.always_on().len(),
+            2,
+            "after 64×64 → 60×48: quarter (would be 14×12) drops"
+        );
+
+        // Grow back: quarter must return.
+        pool.on_resize(64, 64);
+        let always_on = pool.always_on();
+        assert_eq!(
+            always_on.len(),
+            3,
+            "after 60×48 → 64×64 round-trip: quarter must be restored \
+             (got {} layers, rids={:?})",
+            always_on.len(),
+            always_on.iter().map(|h| h.layer.rid.as_str()).collect::<Vec<_>>(),
+        );
+        let rids: Vec<&str> =
+            always_on.iter().map(|h| h.layer.rid.as_str()).collect();
+        assert!(rids.contains(&RID_FULL), "full present");
+        assert!(rids.contains(&RID_HALF), "half present");
+        assert!(
+            rids.contains(&RID_QUARTER),
+            "quarter restored after the round-trip — got rids={rids:?}"
+        );
+    }
+
+    /// **Phase 4a follow-up regression test #3 (review finding).**
+    /// Resize through an odd-width intermediate must not
+    /// accumulate rounding drift. The canonical
+    /// `vp8_simulcast(target_w, target_h)` layout is the truth at
+    /// every step — never derived from the previous epoch's
+    /// already-rounded dims.
+    ///
+    /// Pre-fix: `rescale_layer_spec` computed new dims as
+    /// `old_layer_w * new_src_w / old_src_w`. So on a 1366×768
+    /// pool, half started at 682×384 (rounded down from 683).
+    /// Resizing to 1920×1080 then computed
+    /// `682 * 1920 / 1366 = 958` (even, but NOT 960). After enough
+    /// resizes, the layer dims drift away from any clean fraction
+    /// of the source.
+    ///
+    /// Post-fix: factory regenerates from canonical layout.
+    /// 1366×768 → 1920×1080 produces half = 960×540, matching
+    /// `vp8_simulcast(1920, 1080).half`.
+    #[tokio::test]
+    async fn on_resize_avoids_rounding_drift_via_factory_regen() {
+        let pool = EncoderPool::new(
+            1366,
+            768,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        );
+
+        // Sanity: at 1366×768 the half layer is 682×384 (683 rounded
+        // down to even). This is the dim that the pre-fix rescaling
+        // would propagate forward.
+        let half = pool
+            .always_on()
+            .iter()
+            .find(|h| h.layer.rid == SimulcastRid::half())
+            .map(|h| h.layer.clone())
+            .expect("half layer at 1366×768");
+        assert_eq!(
+            (half.width, half.height),
+            (682, 384),
+            "1366/2 rounds down to 682",
+        );
+
+        pool.on_resize(1920, 1080);
+
+        // Post-resize half must match what `vp8_simulcast(1920, 1080)`
+        // would return for a fresh pool — 960×540, NOT 958×540
+        // (which is what the pre-fix `682 * 1920 / 1366` would yield).
+        let half_after = pool
+            .always_on()
+            .iter()
+            .find(|h| h.layer.rid == SimulcastRid::half())
+            .map(|h| h.layer.clone())
+            .expect("half layer after resize to 1920×1080");
+        assert_eq!(
+            (half_after.width, half_after.height),
+            (960, 540),
+            "post-resize half must equal vp8_simulcast(1920, 1080).half — \
+             pre-fix `rescale_layer_spec` would yield 958×540 from drift",
+        );
+
+        // Cross-check: post-resize layer set is identical (RID + dims)
+        // to a fresh `vp8_simulcast(1920, 1080)`. Any drift in any
+        // layer would surface here.
+        let actual: Vec<(String, u32, u32)> = pool
+            .always_on()
+            .iter()
+            .map(|h| {
+                (
+                    h.layer.rid.as_str().to_string(),
+                    h.layer.width,
+                    h.layer.height,
+                )
+            })
+            .collect();
+        let mut actual_sorted = actual.clone();
+        actual_sorted.sort();
+        let expected: Vec<(String, u32, u32)> =
+            LayerSpec::vp8_simulcast(1920, 1080, 30)
+                .iter()
+                .map(|l| (l.rid.as_str().to_string(), l.width, l.height))
+                .collect();
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        assert_eq!(
+            actual_sorted, expected_sorted,
+            "post-resize layer set must match fresh vp8_simulcast — \
+             actual: {actual:?}, expected: {expected:?}",
+        );
+    }
+
     /// Finding 1 fix: after on_resize cancels an encoder's shutdown
     /// token, the next wake-push must not produce an encoded frame.
     /// The thread sees shutdown at the top of the loop OR re-checks
@@ -2732,8 +2892,13 @@ mod tests {
     /// before exiting.
     #[tokio::test]
     async fn encoder_thread_exits_on_shutdown_without_emitting_frame() {
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         // Subscribe to the always-on encoder's frames.
         let mut frames_rx = {
@@ -2803,7 +2968,7 @@ mod tests {
     async fn on_resize_drops_on_demand_slots_rather_than_respawning() {
         // Construct with empty always_on so VP8 falls to on-demand,
         // giving us a VP8 slot to observe.
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (_subs, _lease) = pool
             .subscribe(&prefs)
@@ -2839,7 +3004,7 @@ mod tests {
     ///   T4: drop lease B — tears slot down
     #[tokio::test]
     async fn stale_lease_does_not_decrement_replacement_slot() {
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         let (_subs_a, lease_a) = pool.subscribe(&prefs).expect("first subscribe");
@@ -2899,7 +3064,7 @@ mod tests {
             64,
             64,
             30,
-            vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
             None,
         );
 
@@ -2969,7 +3134,7 @@ mod tests {
             64,
             64,
             30,
-            vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
             None,
         );
         let before = pool.source_gen();
@@ -3014,7 +3179,7 @@ mod tests {
     /// post-resize dimensions.
     #[tokio::test]
     async fn subscribe_after_resize_uses_new_dimensions() {
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         pool.on_resize(128, 96);
 
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
@@ -3038,8 +3203,13 @@ mod tests {
         // passed to `EncoderPool::new` — any drift between construction
         // and readback would silently bypass the bridge's safety gate
         // and feed mis-sized I420 into the encoder.
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(1280, 720, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            1280,
+            720,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
         assert_eq!(pool.dimensions(), (1280, 720));
     }
 
@@ -3047,8 +3217,13 @@ mod tests {
     async fn pool_subscribes_to_always_on_codec() {
         // VP8 always-on. Peer supporting VP8 gets one subscription from
         // always_on (no on-demand spawn needed).
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         let vp8_prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (subs, _lease) = pool.subscribe(&vp8_prefs).expect("subscribe must succeed");
@@ -3062,8 +3237,13 @@ mod tests {
         // (phase 4+). Always-on is VP8, no match; on-demand won't
         // spawn because on_demand_spawnable rejects them. Subscription
         // set is empty → subscribe returns NoCompatibleCodec.
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         let unsupported_prefs =
             PeerCodecPreferences::new(vec![CodecKind::Vp9, CodecKind::Av1]);
@@ -3079,7 +3259,7 @@ mod tests {
         // Empty layer set — no encoders spawned, so request_keyframe
         // consistently returns false (coalescer admits the first, but
         // no matching encoder exists).
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let rid = SimulcastRid::full();
         // Coalescer admits first, but no encoder matches → false.
         assert!(!pool.request_keyframe(CodecKind::Vp8, Some(rid.clone())));
@@ -3092,8 +3272,13 @@ mod tests {
     /// coalescer → handle.force_keyframe path.
     #[tokio::test]
     async fn pool_request_keyframe_sets_encoder_flag() {
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         // Initial state: flag is false.
         let handle = &pool.always_on()[0];
@@ -3124,8 +3309,13 @@ mod tests {
     async fn pool_request_keyframe_all_fires_all_active_encoders() {
         // Three always-on layers (full / half / quarter) — exercises
         // multi-encoder iteration, not just a single layer.
-        let layers = LayerSpec::vp8_simulcast(64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, layers, None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        );
 
         // Initial state: flags clear on every always-on encoder.
         {
@@ -3267,8 +3457,13 @@ mod tests {
         }
         let frame_arc = Arc::new(frame_data);
 
-        let layer = LayerSpec::single(CodecKind::Vp8, W as u32, H as u32, 30);
-        let pool = EncoderPool::new(W as u32, H as u32, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            W as u32,
+            H as u32,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (mut subs, _lease) = pool.subscribe(&prefs).expect("subscribe must succeed");
@@ -3328,14 +3523,22 @@ mod tests {
         // even though the source is SRC_W × SRC_H. This is the
         // shape the simulcast path uses — multiple layers, each
         // smaller than the source.
-        let half_layer = LayerSpec {
-            rid: SimulcastRid::half(),
-            width: HALF_W,
-            height: HALF_H,
-            target_bitrate_kbps: 400,
-            framerate: 30,
-        };
-        let pool = EncoderPool::new(SRC_W, SRC_H, 30, vec![half_layer], None);
+        // Half-of-source layer factory. The pool gets a single
+        // always-on layer at HALF_W × HALF_H derived from the
+        // construction (SRC_W, SRC_H) call.
+        let pool = EncoderPool::new(
+            SRC_W,
+            SRC_H,
+            30,
+            |_w, _h| vec![LayerSpec {
+                rid: SimulcastRid::half(),
+                width: HALF_W,
+                height: HALF_H,
+                target_bitrate_kbps: 400,
+                framerate: 30,
+            }],
+            None,
+        );
 
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (mut subs, _lease) = pool.subscribe(&prefs).expect("subscribe");
@@ -3389,7 +3592,7 @@ mod tests {
             W as u32,
             H as u32,
             30,
-            vec![layer],
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
             Some(Arc::clone(&counters)),
         );
 
@@ -3462,7 +3665,7 @@ mod tests {
             W as u32,
             H as u32,
             30,
-            vec![layer],
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
             Some(Arc::clone(&counters)),
         );
 
@@ -3523,8 +3726,13 @@ mod tests {
     /// the capture side.
     #[tokio::test]
     async fn pool_drop_shuts_down_encoders() {
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (mut subs, lease) = pool.subscribe(&prefs).expect("subscribe must succeed");
         let mut rx = subs.remove(0).frames;
@@ -3576,7 +3784,7 @@ mod tests {
     /// so the test doesn't depend on the platform's H.264 backend.
     #[tokio::test]
     async fn on_demand_spawns_on_first_peer() {
-        let pool = EncoderPool::new(64, 64, 30, vec![], None); // no always-on
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None); // no always-on
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         // Nothing on-demand yet.
@@ -3600,7 +3808,7 @@ mod tests {
     /// refcount without spawning a new encoder.
     #[tokio::test]
     async fn on_demand_shares_encoder_across_peers() {
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         let (subs_a, _lease_a) = pool.subscribe(&prefs).expect("subscribe a");
@@ -3621,7 +3829,7 @@ mod tests {
     /// `release(&prefs)` call.
     #[tokio::test]
     async fn on_demand_releases_tear_down_at_refcount_zero() {
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         // Two peers.
@@ -3673,7 +3881,7 @@ mod tests {
     ///      torn down.
     #[tokio::test]
     async fn release_on_demand_subset_decrements_only_specified_ids() {
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         let (_subs_a, mut lease_a) =
@@ -3735,7 +3943,7 @@ mod tests {
             64,
             64,
             30,
-            vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
             None,
         );
         // VP8 is always-on; no on-demand claim. Subscribe still
@@ -3758,7 +3966,7 @@ mod tests {
     /// doesn't accidentally make a hot path slower.
     #[tokio::test]
     async fn release_on_demand_subset_empty_ids_is_noop() {
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (_subs, mut lease) =
             pool.subscribe(&prefs).expect("subscribe on-demand VP8");
@@ -3785,7 +3993,7 @@ mod tests {
     /// only one ordering.
     #[tokio::test]
     async fn subscribe_race_for_same_on_demand_codec() {
-        let pool = Arc::new(EncoderPool::new(64, 64, 30, vec![], None));
+        let pool = Arc::new(EncoderPool::new(64, 64, 30, |_, _| vec![], None));
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         let pool_a = Arc::clone(&pool);
@@ -3820,7 +4028,7 @@ mod tests {
     /// over-decrementing the refcount.
     #[tokio::test]
     async fn on_demand_lease_explicit_release() {
-        let pool = EncoderPool::new(64, 64, 30, vec![], None);
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (_subs, lease) = pool.subscribe(&prefs).expect("subscribe");
         assert_eq!(
@@ -3839,8 +4047,13 @@ mod tests {
     /// (still tracked only for on-demand).
     #[tokio::test]
     async fn pool_mixes_always_on_and_on_demand_subscriptions() {
-        let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
 
         // Peer supporting both VP8 (always-on) and H.264 (on-demand).
         // H.264 on-demand spawn synchronously calls select_codec_for_mime;

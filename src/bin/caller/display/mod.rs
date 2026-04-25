@@ -552,10 +552,18 @@ impl DisplaySession {
                 width,
                 height,
                 fps,
-                vec![encode::pool::LayerSpec::single(
+                // Single full-source VP8 layer. The factory receives
+                // the (possibly resized) source dims and returns a
+                // matching layer — so a runtime resize regenerates
+                // a layer at the new dims rather than rescaling
+                // (and accumulating rounding drift on) the previous
+                // epoch's layer. Phase 4b will swap this for
+                // `LayerSpec::vp8_simulcast(w, h, fps)` to enable
+                // the multi-layer simulcast path in production.
+                move |w, h| vec![encode::pool::LayerSpec::single(
                     encode::pool::CodecKind::Vp8,
-                    width,
-                    height,
+                    w,
+                    h,
                     fps,
                 )],
                 // Pool encoders feed the same metrics counters as the
