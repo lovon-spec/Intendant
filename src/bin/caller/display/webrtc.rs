@@ -43,7 +43,9 @@
 //! interfaces). This is documented in the README.
 
 use super::clipboard::ClipboardContent;
-use super::encode::pool::CodecKind;
+use super::encode::pool::{
+    CodecKind, EncoderId, EncoderPool, EncoderSubscription, PeerCodecPreferences, PoolLease,
+};
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
 use crate::error::CallerError;
 use std::collections::HashMap;
@@ -59,7 +61,7 @@ use str0m::net::TcpType;
 use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig, RtcError};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
 /// Bound on the per-peer encoded-frame channel. Frames in excess are dropped
@@ -850,6 +852,89 @@ impl WebRtcPeer {
     /// frames are dropped (with metrics) when the driver is behind.
     pub fn encoded_frame_tx(&self) -> &mpsc::Sender<Arc<EncodedFrame>> {
         &self.encoded_frame_tx
+    }
+
+    /// Pool-mode constructor: builds the same str0m peer as
+    /// [`Self::new`] but feeds frames from the shared
+    /// [`EncoderPool`] rather than the legacy single-encoder fan-out.
+    /// Used by the env-gated `INTENDANT_DISPLAY_POOL` path
+    /// (3c.3b.3 onward); legacy callers continue to use [`Self::new`]
+    /// until the pre-pool pipeline is deleted in 3c.4.
+    ///
+    /// `codec_set` is derived from `subscriptions` rather than from
+    /// the original peer offer prefs — this is the contract that
+    /// makes the 3c.3b.1a partial-result discussion safe in the
+    /// other direction: the SDP we negotiate enables exactly the
+    /// codecs the pool can serve, so the peer can never select a
+    /// codec we'll silently drop frames for. Empty subscriptions
+    /// upstream means the offer handler should reject before
+    /// reaching here; we forward the empty case as a clean
+    /// `WebRtc("empty subscription set")` rather than silently
+    /// constructing a peer with no codecs.
+    ///
+    /// `lease` and `prefs` are handed to a per-peer `pool_frame_intake`
+    /// task that owns the lease's lifetime. On any subscription's
+    /// `RecvError::Closed` (typically: `EncoderPool::on_resize`
+    /// dropping a slot), the intake task drops the lease, calls
+    /// `pool.subscribe(prefs)` for fresh subscriptions+lease, and
+    /// resumes forwarding from the new handles. If resubscribe
+    /// returns `NoCompatibleCodec`, the intake task signals peer
+    /// shutdown via the WebRtcPeer's cancellation token — peers that
+    /// can't be served any longer are torn down rather than left in
+    /// a black-stream state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_pool_mode(
+        peer_id: PeerId,
+        offer_sdp: &str,
+        ice_config: &IceConfig,
+        tcp_peer_registry: Option<Arc<TcpPeerRegistry>>,
+        tcp_advertised_addr: Option<SocketAddr>,
+        input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
+        clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+        ice_tx: mpsc::Sender<(PeerId, String)>,
+        pool: Arc<EncoderPool>,
+        subscriptions: Vec<EncoderSubscription>,
+        lease: PoolLease,
+        prefs: PeerCodecPreferences,
+    ) -> Result<(Self, String), CallerError> {
+        if subscriptions.is_empty() {
+            return Err(CallerError::WebRtc(
+                "new_pool_mode: empty subscription set — offer handler must \
+                 reject before reaching here"
+                    .to_string(),
+            ));
+        }
+        let codec_set = codec_set_from_subscriptions(&subscriptions);
+        let (peer, answer_sdp) = Self::new(
+            peer_id,
+            offer_sdp,
+            &codec_set,
+            ice_config,
+            tcp_peer_registry,
+            tcp_advertised_addr,
+            input_handler,
+            clipboard_handler,
+            ice_tx,
+        )
+        .await?;
+
+        // Spawn the intake task. It clones the encoded_frame_tx and
+        // shutdown so it can push frames into the existing driver and
+        // exit when the peer is torn down. The task owns the lease
+        // and resubscribes as needed (see `pool_frame_intake` for
+        // the Closed-handling contract).
+        let intake_tx = peer.encoded_frame_tx.clone();
+        let intake_shutdown = peer.shutdown.clone();
+        tokio::spawn(pool_frame_intake(
+            pool,
+            prefs,
+            subscriptions,
+            lease,
+            intake_tx,
+            intake_shutdown,
+        ));
+
+        Ok((peer, answer_sdp))
     }
 
     /// Send a clipboard update to the browser via the clipboard data channel.
@@ -1674,6 +1759,187 @@ async fn resolve_mdns_in_candidate(candidate: &str) -> Result<String, String> {
     Ok(fields.join(" "))
 }
 
+// ---------------------------------------------------------------------------
+// Pool-mode helpers (3c.3b.2)
+// ---------------------------------------------------------------------------
+
+/// Distinct codecs covered by `subscriptions`, deduplicated. Used by
+/// [`WebRtcPeer::new_pool_mode`] to drive the str0m enable_*() calls
+/// from the actually-served set rather than from the original peer
+/// offer prefs — the SDP we negotiate is exactly what the pool
+/// commits to producing, so there's no path where the peer picks an
+/// unsupported codec and gets a black stream.
+///
+/// Order is preserved as encountered (CodecKind isn't `Ord`, and
+/// str0m's `enable_*()` calls are commutative — order has no
+/// observable effect on the negotiated answer). Dedup avoids
+/// calling `enable_vp8(true)` twice on a multi-layer simulcast set.
+fn codec_set_from_subscriptions(subscriptions: &[EncoderSubscription]) -> Vec<CodecKind> {
+    let mut seen: std::collections::HashSet<CodecKind> = std::collections::HashSet::new();
+    let mut codecs: Vec<CodecKind> = Vec::new();
+    for sub in subscriptions {
+        if seen.insert(sub.id.codec) {
+            codecs.push(sub.id.codec);
+        }
+    }
+    codecs
+}
+
+/// Per-peer task that bridges the [`EncoderPool`]'s per-subscription
+/// `broadcast::Receiver<Arc<EncodedFrame>>` channels to the
+/// [`WebRtcPeer`] driver's encoded-frame mpsc, and re-subscribes
+/// transparently when an encoder slot is torn down (typically by
+/// [`EncoderPool::on_resize`] or an on-demand slot's last-leaseholder
+/// exit).
+///
+/// ## Closed handling — the user-flagged 3c.3b.2 contract
+///
+/// `on_resize` advances `source_state` BEFORE swapping/cancelling
+/// encoder handles. A subscribe that hands us a brand-new
+/// subscription can therefore deliver a `Receiver` whose underlying
+/// `Sender` has already been dropped — the receiver returns
+/// `RecvError::Closed` on the very first `recv()`. This task treats
+/// that as a normal "encoder epoch transitioned" signal: drop the
+/// lease (which decrements refcounts under the generation gate, so
+/// stale claims don't decrement replacement slots), call
+/// `pool.subscribe(prefs)` again, and continue with fresh handles.
+/// The peer never sees the transition; no offer rejection, no peer
+/// teardown.
+///
+/// The escalation path: if `pool.subscribe(prefs)` itself returns
+/// `NoCompatibleCodec` (typically: peer's prefs no longer overlap
+/// anything the pool can produce), the intake signals
+/// `shutdown.cancel()` so the driver tears the peer down cleanly
+/// rather than leaving a never-decoding stream behind.
+///
+/// ## Forwarder fan-in
+///
+/// Each subscription gets its own forwarder task (one
+/// `broadcast::Receiver` → the shared `encoded_frame_tx mpsc`).
+/// Forwarder tasks share a `forwarders_shutdown` token so the intake
+/// can cancel them all atomically before resubscribing. The
+/// forwarders also share a `closed_tx mpsc` that signals back to the
+/// intake when any forwarder sees `Closed`; the intake's outer
+/// select waits on shutdown OR on this signal channel and reacts
+/// uniformly to either source.
+async fn pool_frame_intake(
+    pool: Arc<EncoderPool>,
+    prefs: PeerCodecPreferences,
+    initial_subs: Vec<EncoderSubscription>,
+    initial_lease: PoolLease,
+    encoded_frame_tx: mpsc::Sender<Arc<EncodedFrame>>,
+    shutdown: CancellationToken,
+) {
+    let mut current_lease = Some(initial_lease);
+    let mut current_subs = initial_subs;
+
+    'epoch: loop {
+        // Per-epoch forwarder set. `forwarders_shutdown` lets us cancel
+        // them all in one shot when an epoch ends.
+        let forwarders_shutdown = CancellationToken::new();
+        let (closed_tx, mut closed_rx) = mpsc::channel::<EncoderId>(8);
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        for sub in current_subs.drain(..) {
+            let id = sub.id.clone();
+            let mut rx = sub.frames;
+            let frame_tx = encoded_frame_tx.clone();
+            let closed_tx = closed_tx.clone();
+            let fwd_shutdown = forwarders_shutdown.clone();
+            handles.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = fwd_shutdown.cancelled() => break,
+                        res = rx.recv() => match res {
+                            Ok(frame) => {
+                                // Driver's mpsc is bounded; if it's
+                                // closed (driver shut down), exit
+                                // this forwarder. The intake's
+                                // shutdown branch handles peer
+                                // teardown so we don't need to
+                                // forward this signal upward.
+                                if frame_tx.send(frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                // Encoder torn down. Notify the
+                                // intake; it'll resubscribe with
+                                // fresh handles (or escalate to peer
+                                // shutdown if that fails).
+                                let _ = closed_tx.send(id.clone()).await;
+                                break;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                // Slow consumer; broadcast skipped
+                                // ahead. Codec keyframe machinery
+                                // (request_keyframe / GOP) recovers.
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        // Drop our own clone of `closed_tx` so when ALL forwarders
+        // exit (e.g. every subscription closed simultaneously),
+        // `closed_rx.recv()` returns `None` and we still hit the
+        // resubscribe path via the same select arm.
+        drop(closed_tx);
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                // Peer is going away. Cancel forwarders, drain
+                // their handles, drop the lease, exit.
+                forwarders_shutdown.cancel();
+                for h in handles {
+                    let _ = h.await;
+                }
+                drop(current_lease.take());
+                return;
+            }
+            _ = closed_rx.recv() => {
+                // Some(EncoderId): one forwarder reported Closed.
+                // None: every forwarder exited (all subs closed at
+                // once). Either way: tear this epoch down and
+                // resubscribe.
+                forwarders_shutdown.cancel();
+                for h in handles {
+                    let _ = h.await;
+                }
+                // Drop the old lease BEFORE resubscribing so its
+                // generation-gated release runs before subscribe
+                // potentially observes the slot map. The generation
+                // gate makes the order strictly safe (stale leases
+                // can't decrement replacement slots), but dropping
+                // first keeps the refcount accounting easier to
+                // reason about.
+                drop(current_lease.take());
+
+                match pool.subscribe(&prefs) {
+                    Ok((subs, lease)) => {
+                        current_subs = subs;
+                        current_lease = Some(lease);
+                        continue 'epoch;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[display/webrtc/pool-intake] resubscribe \
+                             after Closed failed ({e:?}): no compatible \
+                             codec; signalling peer shutdown"
+                        );
+                        // No path forward for this peer — escalate
+                        // to peer teardown rather than leave the
+                        // stream black indefinitely.
+                        shutdown.cancel();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1910,5 +2176,211 @@ mod tests {
         reg.register("same-ufrag".into(), a1);
         reg.register("same-ufrag".into(), a2);
         assert_eq!(reg.lookup("same-ufrag"), Some(a2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3c.3b.2: pool-mode intake
+    // -----------------------------------------------------------------------
+
+    /// `codec_set_from_subscriptions` dedups codecs across multi-layer
+    /// (simulcast-style) subscription sets. The downstream str0m
+    /// `enable_*(true)` calls would tolerate duplicates, but dedup
+    /// keeps the SDP shape clean and avoids subtle effects in
+    /// future negotiation logic.
+    #[test]
+    fn codec_set_from_subscriptions_dedups_multi_layer() {
+        use crate::display::encode::pool::{EncoderId, LayerSpec, SimulcastRid};
+        let (s, _r) = broadcast::channel::<Arc<EncodedFrame>>(4);
+        let make = |codec: CodecKind, rid: SimulcastRid| EncoderSubscription {
+            id: EncoderId::new(codec, rid),
+            layer: LayerSpec::single(codec, 64, 64, 30),
+            frames: s.subscribe(),
+        };
+        let subs = vec![
+            make(CodecKind::Vp8, SimulcastRid::full()),
+            // Same codec, different RID — must dedup (one
+            // enable_vp8 call covers both layers).
+            make(CodecKind::Vp8, SimulcastRid::half()),
+            make(CodecKind::H264, SimulcastRid::full()),
+        ];
+        let codecs = codec_set_from_subscriptions(&subs);
+        assert_eq!(codecs.len(), 2);
+        assert!(codecs.contains(&CodecKind::Vp8));
+        assert!(codecs.contains(&CodecKind::H264));
+    }
+
+    /// **3c.3b.2 first explicit test, per the 3c.3b.1a review.**
+    ///
+    /// `subscribe()` racing with `on_resize()` can briefly hand back
+    /// `EncoderSubscription`s whose underlying `broadcast::Sender`
+    /// has already been dropped — the receiver returns
+    /// `RecvError::Closed` on its very first `recv()`. The pool
+    /// intake must treat this as a normal "encoder epoch
+    /// transitioned" signal: drop the lease, resubscribe, continue
+    /// forwarding from the fresh handles. Critically: do NOT
+    /// shut the peer down.
+    ///
+    /// Setup pins the contract by deliberately constructing the
+    /// scenario:
+    ///   1. Pool with VP8 always-on at 64x64.
+    ///   2. `pool.subscribe(VP8)` → `initial_subs` whose Receiver
+    ///      points at the original handle.
+    ///   3. `pool.on_resize(128, 96)` — drops the original handle
+    ///      (its broadcast Sender goes away with it), spawns a
+    ///      replacement at 128x96. `initial_subs` is now stale.
+    ///   4. Hand `initial_subs` to a freshly-spawned intake task.
+    ///   5. Push frames at the new dimensions; the new always-on
+    ///      encoder produces output that the intake — after
+    ///      resubscribing — forwards into `frame_rx`.
+    ///
+    /// Pre-fix behavior would either time out (intake stuck waiting
+    /// on a closed Receiver) or shut the peer down (treating Closed
+    /// as fatal). Either fires this test's assertion.
+    #[tokio::test]
+    async fn pool_intake_resubscribes_when_initial_subs_already_closed() {
+        use crate::display::encode::pool::{EncoderPool, LayerSpec};
+
+        let pool = Arc::new(EncoderPool::new(
+            64,
+            64,
+            30,
+            vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+        ));
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+
+        // Subscribe AGAINST the original handle.
+        let (initial_subs, initial_lease) =
+            pool.subscribe(&prefs).expect("initial subscribe");
+
+        // Resize: original handle dropped, new one spawned.
+        // initial_subs's Receivers will return Closed on first recv.
+        pool.on_resize(128, 96);
+
+        let (frame_tx, mut frame_rx) =
+            mpsc::channel::<Arc<EncodedFrame>>(16);
+        let shutdown = CancellationToken::new();
+        let pool_clone = Arc::clone(&pool);
+        let intake_shutdown = shutdown.clone();
+        let intake_handle = tokio::spawn(pool_frame_intake(
+            pool_clone,
+            prefs,
+            initial_subs,
+            initial_lease,
+            frame_tx,
+            intake_shutdown,
+        ));
+
+        // Push several frames so the resubscribe-window race has time
+        // to settle and we definitely hit a frame after resubscribe.
+        // 5 frames over 200ms is generous; in practice the intake
+        // detects Closed within one tick.
+        let frame = Arc::new(vec![0u8; 128 * 96 * 3 / 2]);
+        for _ in 0..5 {
+            pool.push_i420_frame(Arc::clone(&frame), Instant::now());
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            frame_rx.recv(),
+        )
+        .await
+        .expect(
+            "frame_rx must produce within 2s — timeout indicates the \
+             intake task either deadlocked on a closed Receiver or \
+             escalated to peer shutdown instead of treating Closed \
+             as a normal epoch transition",
+        );
+        assert!(
+            result.is_some(),
+            "intake must forward a frame from the post-resize encoder; \
+             got None which means the channel closed — likely intake \
+             tore down rather than resubscribed"
+        );
+
+        assert!(
+            !shutdown.is_cancelled(),
+            "intake must not shut down the peer on a normal \
+             Closed → resubscribe path; this assertion catches a \
+             regression where Closed escalates to peer teardown"
+        );
+
+        shutdown.cancel();
+        let _ = intake_handle.await;
+    }
+
+    /// Escalation: when resubscribe genuinely cannot find a
+    /// compatible codec (e.g. the pool no longer serves anything
+    /// the peer wants), the intake signals peer shutdown rather
+    /// than leaving the stream black. Mirror image of the
+    /// happy-path test above — Closed should not always escalate,
+    /// but it MUST escalate when there's no recovery available.
+    #[tokio::test]
+    async fn pool_intake_shuts_down_peer_when_resubscribe_finds_no_codec() {
+        use crate::display::encode::pool::EncoderPool;
+
+        // Pool with NO always-on encoders; on-demand only. Subscribe
+        // for VP8 (spawns on-demand VP8 slot) to get initial_subs.
+        let pool = Arc::new(EncoderPool::new(64, 64, 30, vec![]));
+        let prefs_vp8 = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (initial_subs, initial_lease) =
+            pool.subscribe(&prefs_vp8).expect("initial on-demand VP8");
+
+        // Drop the on-demand slot via resize. initial_subs's Receivers
+        // will see Closed.
+        pool.on_resize(128, 96);
+
+        // Hand the intake a prefs the pool CANNOT serve (VP9 has no
+        // backend wired). When intake sees Closed and resubscribes
+        // with these prefs, pool.subscribe returns NoCompatibleCodec.
+        // Intake must then shutdown.cancel() to terminate the peer
+        // cleanly.
+        let prefs_unservable = PeerCodecPreferences::new(vec![CodecKind::Vp9]);
+        let (frame_tx, _frame_rx) =
+            mpsc::channel::<Arc<EncodedFrame>>(16);
+        let shutdown = CancellationToken::new();
+        let pool_clone = Arc::clone(&pool);
+        let intake_shutdown = shutdown.clone();
+        let intake_handle = tokio::spawn(pool_frame_intake(
+            pool_clone,
+            prefs_unservable,
+            initial_subs,
+            initial_lease,
+            frame_tx,
+            intake_shutdown,
+        ));
+
+        // Wake the orphaned encoder thread so it sees its cancelled
+        // shutdown and exits, dropping its frames-Sender clone. With
+        // both senders gone (handle.frames already dropped by
+        // on_resize, thread's clone dropped by exit) the broadcast
+        // channel closes — only then does the intake's forwarder
+        // see Closed and trigger the resubscribe → NoCompatibleCodec
+        // → shutdown.cancel() escalation. In production the bridge
+        // pushes constantly so this is automatic; the test simulates
+        // by pushing a few wake-frames.
+        let frame = Arc::new(vec![0u8; 128 * 96 * 3 / 2]);
+        for _ in 0..3 {
+            pool.push_i420_frame(Arc::clone(&frame), Instant::now());
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        let exited = tokio::time::timeout(
+            Duration::from_secs(2),
+            async {
+                while !shutdown.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await;
+        assert!(
+            exited.is_ok(),
+            "intake must escalate to shutdown within 2s when \
+             resubscribe returns NoCompatibleCodec; otherwise the \
+             peer would sit forever with a black stream"
+        );
+
+        let _ = intake_handle.await;
     }
 }
