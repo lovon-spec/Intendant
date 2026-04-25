@@ -1554,6 +1554,52 @@ impl EncoderPool {
         false
     }
 
+    /// Request a keyframe from EVERY active encoder in the pool —
+    /// always-on layers + on-demand encoders that currently have at
+    /// least one subscriber (`refcount > 0`). Each individual request
+    /// goes through [`Self::request_keyframe`] so it's coalesced per
+    /// `(codec, rid)` against the same window: a second peer joining
+    /// in the same beat as the first does NOT produce a second
+    /// keyframe per encoder. PLI-storm safe.
+    ///
+    /// Returns the count of admitted requests (i.e. how many encoders
+    /// will produce a forced keyframe on their next encode). Useful
+    /// for tests; production callers can ignore.
+    ///
+    /// **Call site: peer-join.** Called by
+    /// [`crate::display::DisplaySession::handle_offer_pool_mode`]
+    /// after the new peer's pool subscription is in place. Without
+    /// this, a peer joining during an idle desktop would wait up to
+    /// one GOP boundary (and for VP8 on static content, potentially
+    /// much longer) for a natural keyframe before its decoder could
+    /// produce a visible image. Mirrors the legacy path's
+    /// `keyframe_tx.send(())` from b241cf5.
+    ///
+    /// On-demand encoders with `refcount == 0` are skipped: they
+    /// have no consumer that would benefit, and an on-demand spawn
+    /// emits a cold-start keyframe naturally on first encode.
+    pub fn request_keyframe_all(&self) -> usize {
+        let always_on_ids: Vec<EncoderId> = {
+            let always_on = self.inner.always_on.read().unwrap();
+            always_on.iter().map(|h| h.id.clone()).collect()
+        };
+        let on_demand_ids: Vec<EncoderId> = {
+            let on_demand = self.inner.on_demand.lock().unwrap();
+            on_demand
+                .iter()
+                .filter(|(_, slot)| slot.refcount > 0)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut count = 0usize;
+        for id in always_on_ids.into_iter().chain(on_demand_ids) {
+            if self.request_keyframe(id.codec, Some(id.rid)) {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Test-only access to the always-on handles. Lets tests verify
     /// pool composition without exposing internals to production code.
     ///
@@ -2499,6 +2545,70 @@ mod tests {
         let fired2 = pool.request_keyframe(CodecKind::Vp8, Some(SimulcastRid::full()));
         assert!(!fired2);
         assert!(handle.force_keyframe.load(Ordering::SeqCst));
+    }
+
+    /// `request_keyframe_all` sets the force-keyframe flag on every
+    /// active encoder (always-on + on-demand with refcount > 0), and
+    /// coalesces against the per-`(codec, rid)` window so a second
+    /// immediate call admits zero requests. Pins the peer-join
+    /// keyframe-on-join contract used by
+    /// `DisplaySession::handle_offer_pool_mode`. Without this, late-
+    /// joining pool peers wait up to one GOP boundary on idle
+    /// desktops (the b241cf5 black-screen-on-idle class).
+    #[tokio::test]
+    async fn pool_request_keyframe_all_fires_all_active_encoders() {
+        // Three always-on layers (full / half / quarter) — exercises
+        // multi-encoder iteration, not just a single layer.
+        let layers = LayerSpec::vp8_simulcast(64, 64, 30);
+        let pool = EncoderPool::new(64, 64, 30, layers);
+
+        // Initial state: flags clear on every always-on encoder.
+        {
+            let always_on = pool.always_on();
+            assert_eq!(always_on.len(), 3, "expected three always-on layers");
+            for handle in always_on.iter() {
+                assert!(
+                    !handle.force_keyframe.load(Ordering::SeqCst),
+                    "encoder {:?} flag must start clear",
+                    handle.id,
+                );
+            }
+        }
+
+        let fired = pool.request_keyframe_all();
+        assert_eq!(
+            fired, 3,
+            "request_keyframe_all must admit one request per active \
+             encoder; got {fired}, expected 3 (three always-on layers)",
+        );
+
+        // All flags set after the call.
+        {
+            let always_on = pool.always_on();
+            for handle in always_on.iter() {
+                assert!(
+                    handle.force_keyframe.load(Ordering::SeqCst),
+                    "encoder {:?} flag must be set after \
+                     request_keyframe_all",
+                    handle.id,
+                );
+            }
+        }
+
+        // Second immediate call: coalesced. Encoders haven't run yet
+        // (no I420 push) so flags stay set.
+        let fired2 = pool.request_keyframe_all();
+        assert_eq!(
+            fired2, 0,
+            "second immediate request_keyframe_all must coalesce \
+             per-(codec,rid) window; got {fired2}",
+        );
+        {
+            let always_on = pool.always_on();
+            for handle in always_on.iter() {
+                assert!(handle.force_keyframe.load(Ordering::SeqCst));
+            }
+        }
     }
 
     /// End-to-end: push synthetic I420 frames through the pool and

@@ -1438,12 +1438,14 @@ impl DisplaySession {
     ///     driven by the codecs the pool's initial subscribe actually
     ///     returned. No first-peer codec lock.
     ///   - No `keyframe_tx` wake: pool peers don't share the legacy
-    ///     bridge's keyframe channel. Per-peer keyframe-on-join is
-    ///     wired via the encoder pool's `request_keyframe_*` API in
-    ///     3c.4 (today the encoder's intrinsic GOP cadence still
-    ///     produces a keyframe within ~one GOP boundary; the
-    ///     PLI-driven explicit request lands with the simulcast
-    ///     work).
+    ///     bridge's keyframe channel. Peer-join keyframe is wired
+    ///     via [`crate::display::encode::pool::EncoderPool::request_keyframe_all`]
+    ///     called at the end of this function (3c.3b.4a), which
+    ///     fires a coalesced PLI-equivalent across every active
+    ///     encoder so the new peer's first encoded frame is
+    ///     decodable rather than waiting up to one GOP boundary.
+    ///     The PLI-driven per-peer explicit request from str0m's
+    ///     inbound RTCP lands with the simulcast work.
     ///   - No `pool_leases` tracking on `DisplaySession`:
     ///     `WebRtcPeer::new_pool_mode` hands the lease to the
     ///     per-peer `pool_frame_intake` task, which owns it for the
@@ -1583,6 +1585,17 @@ impl DisplaySession {
         }
 
         self.ensure_clipboard_forwarding().await;
+
+        // 3c.3b.4a: force a keyframe on every active pool encoder so
+        // the new peer's first encoded frame is a decodable I-frame
+        // rather than a P-frame referencing a keyframe the peer never
+        // received. Coalesced per (codec, rid) — N peers joining in
+        // the same beat produce one keyframe per encoder, not N
+        // (mediasoup PLI-storm guard). Mirrors the legacy
+        // `keyframe_tx.send(())` at the tail of `handle_offer`.
+        // Placed AFTER all peer setup so the peer's pool subscription
+        // is in place when the keyframe lands in the encoder broadcast.
+        pool.request_keyframe_all();
 
         Ok(answer_sdp)
     }
