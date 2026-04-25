@@ -450,6 +450,33 @@ pub struct DisplaySession {
     /// tokio dependency. Concurrent `start()` callers (not expected but
     /// cheap to tolerate) converge on a single pool.
     pool: std::sync::OnceLock<Arc<encode::pool::EncoderPool>>,
+    /// Handle for the pool-only capture-to-I420 bridge task, or
+    /// `None` when no pool peer has connected yet (and never set in
+    /// legacy-only sessions — there the legacy bridge dual-feeds the
+    /// pool itself).
+    ///
+    /// Spawned by [`Self::ensure_pool_feed_bridge_started`] on the
+    /// first pool-mode offer. Owns its own BGRA→I420 conversion and
+    /// `pool.push_i420_frame` loop, so it doesn't touch
+    /// `encoder_init_lock` / `codec_mime` / the legacy encoder
+    /// pipeline. That's the 3c.3b.3a fix for the codec-lock-in
+    /// regression: a pool first-offer no longer locks the session
+    /// codec to VP8 and reject a later legacy H.264-only peer.
+    ///
+    /// Coordination with the legacy `start_encoder_pipeline`'s
+    /// dual-feed: both paths take `encoder_init_lock` (legacy as part
+    /// of its first-peer dance, pool inside `ensure_pool_feed_bridge_started`)
+    /// before consulting this handle, so the "pool gets fed by exactly
+    /// one bridge" invariant holds across concurrent first-offers.
+    /// Whichever path takes the init lock first wins the right to
+    /// own the pool feed; the loser observes the winner's state and
+    /// skips its own attempt.
+    ///
+    /// 3c.4 deletes the legacy pipeline; the pool-feed bridge becomes
+    /// the only bridge and gets spawned unconditionally from `start()`.
+    /// At that point this field becomes vestigial and goes away
+    /// alongside the legacy code.
+    pool_feed_bridge_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Parse the truthiness of an `INTENDANT_DISPLAY_POOL` env value
@@ -506,6 +533,7 @@ impl DisplaySession {
             clipboard_handle: Mutex::new(None),
             keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
+            pool_feed_bridge_handle: Mutex::new(None),
         }
     }
 
@@ -891,12 +919,30 @@ impl DisplaySession {
         // spawned task) so the task closure owns an `Option<Arc>` and
         // doesn't need to touch `self.pool` at runtime.
         //
-        // Deliberately unconditional — if the pool is None (shouldn't
-        // happen post-start, but belt-and-braces), the dual-feed is a
-        // no-op. Old path stays the only one that affects peer
-        // observability until 3c.3/3c.4.
-        let pool_for_bridge: Option<Arc<encode::pool::EncoderPool>> =
-            self.pool.get().map(Arc::clone);
+        // **Phase 3c.3b.3a coordination:** if `ensure_pool_feed_bridge_started`
+        // already spawned a pool-only bridge for an earlier pool-mode
+        // offer, that bridge owns the pool feed; the legacy bridge
+        // here MUST NOT also push to the pool, or each captured frame
+        // would be I420-converted and pushed twice → duplicate frames
+        // on the pool's broadcast → encoded duplicates on every pool
+        // peer's RTP stream → corrupted decode (same shape as the
+        // 3c.3b.2a multi-sub fan-out bug). The Option short-circuits
+        // both `pool.push_i420_frame` and `pool.on_resize` calls below
+        // — pool-feed bridge handles both for the pool side when it
+        // owns the feed. The check is one mutex acquisition before
+        // the bridge task spawn (not in the hot per-frame path).
+        let pool_for_bridge: Option<Arc<encode::pool::EncoderPool>> = {
+            let pool_feed_running = self
+                .pool_feed_bridge_handle
+                .lock()
+                .await
+                .is_some();
+            if pool_feed_running {
+                None
+            } else {
+                self.pool.get().map(Arc::clone)
+            }
+        };
         let bridge_handle = tokio::spawn(async move {
             // Track current encoder dimensions for resize detection.
             let mut enc_width = width;
@@ -1426,36 +1472,6 @@ impl DisplaySession {
             )
         })?;
 
-        // Ensure the capture-to-I420 bridge is running. The bridge's
-        // `pool.push_i420_frame` call is the only path that delivers
-        // captured frames into the pool's always-on encoder; without
-        // it, this peer subscribes successfully but the encoder never
-        // produces output → connected WebRTC peer with a black stream.
-        //
-        // The bridge today lives inside `start_encoder_pipeline`, which
-        // also starts the legacy single-encoder thread + fan-out. In a
-        // pool-only deployment those run with no consumers (the
-        // fan-out's `is_pool_mode` filter at `display/mod.rs:1126`
-        // skips pool peers, and there are no legacy peers). That's a
-        // bounded CPU waste — bounded because 3c.4 deletes the legacy
-        // path entirely. We accept it during the cutover to keep the
-        // BGRA→I420 conversion single-pass: a separate pool-only
-        // bridge would double the conversion cost in mixed-mode
-        // deployments (legacy + pool peers on the same session, which
-        // is the common cutover scenario), and would require a
-        // second `pool.push_i420_frame` path that races the legacy
-        // bridge's existing dual-feed and produces double-encoded
-        // frames at the pool's broadcast — same shape as the
-        // multi-sub fan-out bug from 3c.3b.2a.
-        //
-        // VP8 is the always-on codec the pool spawned at `start()`;
-        // matching the legacy encoder's codec to it keeps both
-        // encoders aligned on the same session-level codec mime so
-        // that a future legacy peer arriving in mixed mode finds a
-        // codec it can pair with via the existing
-        // `encoder_init_lock` validation path.
-        self.ensure_legacy_bridge_running_for_pool().await;
-
         // Build the peer's codec preferences from its SDP offer. The
         // strict `forward::codec_preferences_from_offer` filters
         // H.264 by str0m's exact match rules (profile / packetization
@@ -1530,6 +1546,15 @@ impl DisplaySession {
         )
         .await?;
 
+        // Bridge spawn deferred until AFTER prefs validation +
+        // pool.subscribe + new_pool_mode all succeed, per the 3c.3b.3a
+        // review's low-priority finding: an invalid pool offer (no
+        // overlapping codecs, encoder backend exhausted, etc.) MUST
+        // NOT leave a bridge running with no peer ever attached. By
+        // gating on success here, every spawned bridge has at least
+        // one peer about to be inserted into the registry.
+        self.ensure_pool_feed_bridge_started().await;
+
         let peer = Arc::new(peer);
         // Same replaced-peer handling as the legacy path: close the
         // displaced peer (if any) so its driver task tears down,
@@ -1554,41 +1579,130 @@ impl DisplaySession {
         Ok(answer_sdp)
     }
 
-    /// Idempotently ensure the legacy capture-to-I420 bridge is
-    /// running, with VP8 as the legacy encoder's codec. The bridge's
-    /// `pool.push_i420_frame` call is the only path that delivers
-    /// captured frames into the pool's always-on encoder; this hook
-    /// closes the pool-mode-only black-stream regression flagged in
-    /// the 3c.3b.3 review (pool peer subscribed but encoder never
-    /// produced output because the bridge had never been started).
+    /// Idempotently ensure the **pool-only** capture-to-I420 bridge is
+    /// running. This bridge's `pool.push_i420_frame` call is what
+    /// keeps the pool's always-on (and on-demand) encoders fed in
+    /// pool-mode-only sessions. Without it, a pool peer subscribes
+    /// successfully but the encoder never produces output → black
+    /// stream (the 3c.3b.3 high-priority finding).
     ///
-    /// Side effects on first call:
-    ///   - `start_encoder_pipeline(VP8)` runs (spawns the bridge,
-    ///     legacy encoder thread, fan-out task).
-    ///   - `codec_mime` set to VP8.
-    ///   - `encoder_init_lock` flipped to `true`.
+    /// Distinct from the legacy bridge inside [`Self::start_encoder_pipeline`]
+    /// in three deliberate ways:
+    ///   1. **Doesn't touch `encoder_init_lock` or `codec_mime`** —
+    ///      so a pool first-offer no longer locks the session codec
+    ///      to VP8 and rejects a later legacy H.264-only peer
+    ///      (3c.3b.3a finding 1).
+    ///   2. **Doesn't spawn a legacy encoder thread or fan-out task**
+    ///      — so a pool-only deployment doesn't pay the CPU cost of
+    ///      a legacy VP8 encoder running with no consumers.
+    ///   3. **No tick gating, no force-keyframe burst window** — the
+    ///      pool's encoder threads and the per-peer `pool_frame_intake`
+    ///      manage their own keyframe cadence (PLI, GOP) and lossy
+    ///      forwarding. The pool-feed bridge just converts every
+    ///      captured frame and pushes it. (Phase 4's TWCC layer
+    ///      switching may add gating here when it lands; the legacy
+    ///      bridge's gating is a 3c.4-deletion candidate too.)
     ///
-    /// Subsequent calls (whether from another pool offer OR the legacy
-    /// `handle_offer` path) are no-ops: the lock guard returns early.
-    /// In a mixed-mode session where a legacy peer connects after the
-    /// bridge was started by a pool peer, the legacy peer's
-    /// `encoder_init_lock` check (`handle_offer` line ~1190) finds
-    /// init=true and validates its offer's codec against the locked
-    /// VP8 — exactly the contract the existing legacy first-peer
-    /// path produces.
-    ///
-    /// 3c.4 will delete `start_encoder_pipeline` (and the encoder /
-    /// fan-out it spawns) entirely; the bridge will then live as a
-    /// pool-only feed wired in `start()`. This helper is the
-    /// transitional shim that keeps pool-mode correctness without
-    /// duplicating the bridge.
-    async fn ensure_legacy_bridge_running_for_pool(&self) {
-        let mut init = self.encoder_init_lock.lock().await;
-        if !*init {
-            self.start_encoder_pipeline(encode::MIME_TYPE_VP8).await;
-            *self.codec_mime.write().await = encode::MIME_TYPE_VP8;
-            *init = true;
+    /// Coordination with the legacy bridge: both paths take
+    /// `encoder_init_lock` BEFORE consulting `pool_feed_bridge_handle`.
+    /// Whichever first-offer path acquires the init lock first wins
+    /// the right to feed the pool:
+    ///   - If legacy ran first: `init=true` here → skip (legacy bridge
+    ///     dual-feeds the pool via the existing 3c.2 path).
+    ///   - If pool ran first: `init=false` here → spawn the pool-feed
+    ///     bridge. A subsequent legacy offer will see
+    ///     `pool_feed_bridge_handle.is_some()` in
+    ///     `start_encoder_pipeline` and skip its own dual-feed.
+    /// Either way the pool's broadcast gets exactly one feed, and
+    /// no double-encoding bug.
+    async fn ensure_pool_feed_bridge_started(&self) {
+        // Order: encoder_init_lock first, then pool_feed_bridge_handle.
+        // Same nesting in `start_encoder_pipeline`'s consultation, so
+        // concurrent first-offers can't deadlock and can't both end up
+        // owning the pool feed.
+        let init = self.encoder_init_lock.lock().await;
+        let mut handle = self.pool_feed_bridge_handle.lock().await;
+        if handle.is_some() {
+            // Already running from a previous pool offer.
+            return;
         }
+        if *init {
+            // Legacy bridge is running and dual-feeds the pool. We'd
+            // double-feed if we also spawned. Skip.
+            return;
+        }
+        let Some(pool) = self.pool.get().map(Arc::clone) else {
+            // Pool not initialized — caller must invoke `start()` first.
+            // `handle_offer_pool_mode` already errors if the pool is
+            // missing; if we somehow reach here without it, silently
+            // skip rather than panic. Diagnostic eprintln so the bug
+            // is visible in logs without crashing the session.
+            eprintln!(
+                "[display/pool-feed] pool not initialized — \
+                 ensure_pool_feed_bridge_started is a no-op; \
+                 DisplaySession::start() must run before any offer"
+            );
+            return;
+        };
+        let mut broadcast_rx = self.frame_tx.subscribe();
+        let (initial_w, initial_h) = self.backend.resolution();
+        let shutdown = self.shutdown.clone();
+        let display_id = self.display_id;
+        let task = tokio::spawn(async move {
+            let mut enc_w = initial_w & !1;
+            let mut enc_h = initial_h & !1;
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    result = broadcast_rx.recv() => {
+                        let frame = match result {
+                            Ok(f) => f,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
+
+                        let frame_w = frame.width & !1;
+                        let frame_h = frame.height & !1;
+                        if frame_w == 0 || frame_h == 0 {
+                            continue;
+                        }
+
+                        // Resize handling. The legacy bridge calls
+                        // `pool.on_resize` from its dual-feed path
+                        // (gated on `pool_for_bridge.is_some()`),
+                        // which is None when this pool-feed bridge
+                        // runs — so we own pool resize coordination
+                        // entirely in pool-only mode.
+                        if frame_w != enc_w || frame_h != enc_h {
+                            eprintln!(
+                                "[display/pool-feed] display {} resolution \
+                                 {}x{} -> {}x{}",
+                                display_id, enc_w, enc_h, frame_w, frame_h,
+                            );
+                            pool.on_resize(frame_w, frame_h);
+                            enc_w = frame_w;
+                            enc_h = frame_h;
+                        }
+
+                        let frame_arc = Arc::clone(&frame);
+                        let arrived = Instant::now();
+                        let i420_result = tokio::task::spawn_blocking(move || {
+                            encode::bgra_to_i420(
+                                &frame_arc.data,
+                                frame_arc.width,
+                                frame_arc.height,
+                                frame_arc.stride,
+                            )
+                        })
+                        .await;
+                        if let Ok(i420) = i420_result {
+                            pool.push_i420_frame(Arc::new(i420), arrived);
+                        }
+                    }
+                }
+            }
+        });
+        *handle = Some(task);
     }
 
     /// Ensure a clipboard forwarding task is running.
@@ -2264,26 +2378,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 3c.3b.3a: pool-mode bridge-startup regression
+    // Phase 3c.3b.3a: pool-feed bridge — does NOT lock legacy codec
     // -----------------------------------------------------------------------
 
-    /// **3c.3b.3 review finding regression test.**
+    /// **3c.3b.3a finding 1 regression test.** The first iteration of
+    /// the pool-mode bridge-startup hook piggybacked on
+    /// `start_encoder_pipeline(VP8)` and set `encoder_init_lock=true`
+    /// + `codec_mime=VP8` as a side effect. That weakened the
+    /// coexistence story: a pool first-offer would lock the session
+    /// to VP8 and reject a later legacy H.264-only peer that the
+    /// original first-peer codec negotiation would have accepted.
     ///
-    /// The 3c.3b.3 wire-in initially returned from `handle_offer`
-    /// straight into `handle_offer_pool_mode` BEFORE
-    /// `start_encoder_pipeline` could run. The bridge that calls
-    /// `pool.push_i420_frame` only spawns inside that pipeline, so a
-    /// pool-mode-only deployment connected its WebRTC peer
-    /// successfully but the always-on encoder never received I420
-    /// frames → black stream.
-    ///
-    /// `ensure_legacy_bridge_running_for_pool` is the shim that
-    /// closes the hole. This test pins the contract: a single call
-    /// on a freshly-`start()`-ed session triggers the legacy
-    /// pipeline (which includes the bridge, which is the only
-    /// caller of `pool.push_i420_frame`).
+    /// The fix decouples "bridge needs to run for pool feed" from
+    /// "legacy codec is decided." The pool-feed bridge is a separate
+    /// task that does BGRA→I420→`pool.push_i420_frame` without
+    /// touching `encoder_init_lock` or `codec_mime`. This test pins
+    /// the contract.
     #[tokio::test]
-    async fn ensure_legacy_bridge_running_starts_pipeline_on_first_call() {
+    async fn ensure_pool_feed_bridge_started_does_not_lock_legacy_codec() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
         let session = DisplaySession::new(0, backend);
         session
@@ -2291,38 +2403,44 @@ mod tests {
             .await
             .expect("start() must succeed");
 
-        // Pre-condition: legacy pipeline not yet started; the bridge
-        // that feeds the pool's always-on encoder is therefore not
-        // running. (start() initializes the pool but does NOT spawn
-        // the bridge — the bridge lives inside start_encoder_pipeline.)
+        // Pre-condition baseline: legacy pipeline never started.
+        assert!(!*session.encoder_init_lock.lock().await);
+        let codec_before = *session.codec_mime.read().await;
+
+        session.ensure_pool_feed_bridge_started().await;
+
+        // Post-condition: bridge handle is set (pool feed is running)
+        // BUT the legacy codec/init state is untouched. A legacy
+        // H.264-only peer arriving next runs through handle_offer's
+        // first-peer codec-negotiation path normally.
+        assert!(
+            session.pool_feed_bridge_handle.lock().await.is_some(),
+            "pool feed bridge must be spawned"
+        );
         assert!(
             !*session.encoder_init_lock.lock().await,
-            "encoder_init_lock starts false (no peer/bridge yet)"
-        );
-
-        session.ensure_legacy_bridge_running_for_pool().await;
-
-        assert!(
-            *session.encoder_init_lock.lock().await,
-            "shim must set encoder_init_lock=true so subsequent calls \
-             from either path skip a duplicate pipeline start"
+            "encoder_init_lock MUST stay false — pool path does not \
+             decide a session codec, only ensures the pool feed is \
+             running. A later legacy peer must be free to negotiate \
+             its own codec via select_codec."
         );
         assert_eq!(
             *session.codec_mime.read().await,
-            encode::MIME_TYPE_VP8,
-            "shim must lock the legacy session codec to VP8 — matching \
-             the always-on codec the pool spawned in start() — so a \
-             mixed-mode legacy peer arriving later finds VP8 and the \
-             validation path in handle_offer succeeds"
+            codec_before,
+            "codec_mime MUST stay at its default — pool path does not \
+             touch the legacy session codec. Changing it would break \
+             a later legacy peer's codec validation."
         );
+
+        // Cleanup: cancel shutdown so the bridge task exits.
+        session.shutdown.cancel();
     }
 
-    /// Calling the shim a second time (e.g. by a second pool-mode
-    /// offer, or by both pool and legacy offers in the same session)
-    /// is a no-op: the lock guard returns early. The bridge is not
-    /// re-spawned; codec_mime stays VP8.
+    /// Calling the bridge starter a second time is a no-op: the
+    /// handle guard returns early. The first task keeps running; we
+    /// don't spawn duplicates.
     #[tokio::test]
-    async fn ensure_legacy_bridge_running_is_idempotent() {
+    async fn ensure_pool_feed_bridge_started_is_idempotent() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
         let session = DisplaySession::new(0, backend);
         session
@@ -2330,20 +2448,72 @@ mod tests {
             .await
             .expect("start() must succeed");
 
-        session.ensure_legacy_bridge_running_for_pool().await;
-        session.ensure_legacy_bridge_running_for_pool().await;
-        session.ensure_legacy_bridge_running_for_pool().await;
+        session.ensure_pool_feed_bridge_started().await;
+        // Capture the handle's task id (via Debug repr) so a
+        // second-spawn regression would surface as a different id.
+        let first_handle_dbg = format!(
+            "{:?}",
+            session
+                .pool_feed_bridge_handle
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.id())
+        );
 
-        assert!(
-            *session.encoder_init_lock.lock().await,
-            "after multiple calls the lock stays true"
+        session.ensure_pool_feed_bridge_started().await;
+        session.ensure_pool_feed_bridge_started().await;
+
+        let after_handle_dbg = format!(
+            "{:?}",
+            session
+                .pool_feed_bridge_handle
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.id())
         );
         assert_eq!(
-            *session.codec_mime.read().await,
-            encode::MIME_TYPE_VP8,
-            "codec_mime must NOT change on repeat calls — that would \
-             break the encoder_init_lock validation contract for any \
-             legacy peer that has already negotiated against VP8"
+            first_handle_dbg, after_handle_dbg,
+            "subsequent calls must NOT replace the existing bridge task"
         );
+
+        session.shutdown.cancel();
+    }
+
+    /// When the legacy bridge is already running (legacy first-peer
+    /// arrived before any pool peer), the pool-feed bridge MUST NOT
+    /// spawn — the legacy bridge's existing 3c.2 dual-feed already
+    /// covers the pool. Spawning a second bridge would double-feed
+    /// the pool's I420 broadcast → duplicate encoded frames on every
+    /// pool peer → corrupted decode (3c.3b.2a multi-sub fan-out
+    /// shape).
+    ///
+    /// We simulate "legacy bridge already running" by setting
+    /// `encoder_init_lock=true` directly. The `start_encoder_pipeline`
+    /// call sequence isn't necessary for this contract — the gate
+    /// the test exercises is purely the init-lock check inside
+    /// `ensure_pool_feed_bridge_started`.
+    #[tokio::test]
+    async fn ensure_pool_feed_bridge_started_skips_when_legacy_running() {
+        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed");
+
+        // Pretend the legacy first-peer path has already run.
+        *session.encoder_init_lock.lock().await = true;
+
+        session.ensure_pool_feed_bridge_started().await;
+
+        assert!(
+            session.pool_feed_bridge_handle.lock().await.is_none(),
+            "with encoder_init_lock=true, the pool-feed bridge must \
+             NOT spawn — legacy bridge owns the pool feed via dual-feed"
+        );
+
+        session.shutdown.cancel();
     }
 }
