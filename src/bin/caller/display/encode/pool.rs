@@ -891,6 +891,16 @@ struct EncoderPoolInner {
     /// unique-across-all-slots is sufficient; the bookkeeping cost of
     /// a per-id counter isn't worth the extra state.
     slot_gen_counter: AtomicU64,
+
+    /// 3c.3b.4h: shared metrics counters. Every encoder thread
+    /// holds an `Arc::clone` of this and bumps `encode_frames` +
+    /// `encode_latency_us_sum` per encoded packet, plus
+    /// `encode_drops` on broadcast lag. Until 3c.4 deletes the
+    /// legacy bridge, both pool and legacy encoders feed the same
+    /// `Arc<DisplayMetricsCounters>` so [`crate::display::DisplayMetricsSnapshot`]
+    /// continues to reflect total throughput. After 3c.4 the pool
+    /// is the sole producer.
+    counters: Arc<crate::display::DisplayMetricsCounters>,
 }
 
 /// Atomic snapshot of source dimensions + resize epoch. Stored
@@ -940,7 +950,18 @@ impl EncoderPool {
         source_height: u32,
         framerate: u32,
         always_on_layers: Vec<LayerSpec>,
+        counters: Option<Arc<crate::display::DisplayMetricsCounters>>,
     ) -> Self {
+        // 3c.3b.4h: every pool encoder thread bumps these counters on
+        // each encoded packet (encode_frames, encode_latency_us_sum)
+        // and on broadcast lag (encode_drops). When the legacy bridge
+        // also exists in this session, it shares the same Arc so
+        // DisplayMetricsSnapshot continues to reflect total throughput
+        // across pre-pool and pool encoders. Tests that don't care
+        // about metrics pass `None`; production passes
+        // `Some(Arc::clone(&self.counters))` from DisplaySession::start.
+        let counters = counters
+            .unwrap_or_else(|| Arc::new(crate::display::DisplayMetricsCounters::new()));
         let duration_ms = if framerate > 0 { 1000 / framerate as u64 } else { 33 };
         let (i420_tx, _) = broadcast::channel::<I420Frame>(I420_BROADCAST_CAPACITY);
 
@@ -954,15 +975,16 @@ impl EncoderPool {
             // loud at pool construction than produce a silent
             // never-decoding stream.
             let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
-            let handle = try_spawn_encoder_thread(id.clone(), layer, &i420_tx, duration_ms)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "always-on encoder {} construction failed at pool startup: {} — \
-                         always-on codecs must always be constructable; a VP8 libvpx \
-                         failure at startup is unrecoverable",
-                        id, e,
-                    )
-                });
+            let handle =
+                try_spawn_encoder_thread(id.clone(), layer, &i420_tx, duration_ms, &counters)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "always-on encoder {} construction failed at pool startup: {} — \
+                             always-on codecs must always be constructable; a VP8 libvpx \
+                             failure at startup is unrecoverable",
+                            id, e,
+                        )
+                    });
             always_on.push(handle);
         }
 
@@ -980,6 +1002,7 @@ impl EncoderPool {
                 }),
                 framerate,
                 slot_gen_counter: AtomicU64::new(0),
+                counters,
             }),
         }
     }
@@ -1137,6 +1160,7 @@ impl EncoderPool {
                     rescaled,
                     &self.inner.i420_tx,
                     self.inner.duration_ms,
+                    &self.inner.counters,
                 )
                 .unwrap_or_else(|e| {
                     panic!(
@@ -1384,6 +1408,7 @@ impl EncoderPool {
                 layer.clone(),
                 &self.inner.i420_tx,
                 self.inner.duration_ms,
+                &self.inner.counters,
             ) {
                 Ok(handle) => constructed.push((id, handle, layer)),
                 Err(e) => {
@@ -1749,6 +1774,7 @@ fn try_spawn_encoder_thread(
     layer: LayerSpec,
     i420_tx: &broadcast::Sender<I420Frame>,
     duration_ms: u64,
+    counters: &Arc<crate::display::DisplayMetricsCounters>,
 ) -> Result<EncoderHandle, String> {
     // Synchronous construction probe. If this fails, we never spawn
     // the thread, never publish a handle, and the caller knows to
@@ -1759,7 +1785,9 @@ fn try_spawn_encoder_thread(
         layer.height,
         layer.target_bitrate_kbps,
     )?;
-    Ok(spawn_encoder_thread_with(id, layer, encoder, i420_tx, duration_ms))
+    Ok(spawn_encoder_thread_with(
+        id, layer, encoder, i420_tx, duration_ms, counters,
+    ))
 }
 
 /// 3c.3b.4f: per-encoder silent-output watchdog.
@@ -1899,6 +1927,7 @@ fn spawn_encoder_thread_with(
     encoder: Box<dyn super::Encoder>,
     i420_tx: &broadcast::Sender<I420Frame>,
     duration_ms: u64,
+    counters: &Arc<crate::display::DisplayMetricsCounters>,
 ) -> EncoderHandle {
     let (frames_tx, _) =
         broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
@@ -1916,6 +1945,10 @@ fn spawn_encoder_thread_with(
     // + a SimulcastRid String).
     let codec_for_thread = id.codec;
     let layer_for_thread = layer.clone();
+    // 3c.3b.4h: per-encoder metrics. Bumped per encoded packet
+    // (encode_frames + encode_latency_us_sum) and on broadcast lag
+    // (encode_drops). Counter is shared with DisplaySession via Arc.
+    let counters_for_thread = Arc::clone(counters);
 
     std::thread::spawn(move || {
         let mut encoder = encoder;
@@ -1931,7 +1964,13 @@ fn spawn_encoder_thread_with(
                     // Slow encoder fell behind by `n` frames; skip
                     // ahead. Codec keyframe machinery will recover
                     // (next force_keyframe or the encoder's natural
-                    // GOP cadence).
+                    // GOP cadence). 3c.3b.4h: count the skipped
+                    // frames as encode_drops so the metric reflects
+                    // backpressure pressure even when the encoder
+                    // itself isn't logging individual drops.
+                    counters_for_thread
+                        .encode_drops
+                        .fetch_add(n, Ordering::Relaxed);
                     eprintln!(
                         "[encoder/pool] {} lagged by {} frames, skipping ahead",
                         id_for_log, n
@@ -1969,7 +2008,23 @@ fn spawn_encoder_thread_with(
             let produced = match encoder.encode(&frame.data, duration_ms, force_kf) {
                 Ok(packets) => {
                     let n = packets.len();
+                    // 3c.3b.4h: latency from capture-arrival to
+                    // encoded-packet-emission. Mirrors the legacy
+                    // mod.rs::start_encoder_pipeline arithmetic
+                    // (one latency value computed per encode call,
+                    // summed in once per packet — multi-packet
+                    // outputs accumulate the same latency value
+                    // per packet, matching legacy semantics so
+                    // average rates compose cleanly when both
+                    // bridges share the counter pre-3c.4).
+                    let latency_us = frame.arrived.elapsed().as_micros() as u64;
                     for pkt in packets {
+                        counters_for_thread
+                            .encode_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                        counters_for_thread
+                            .encode_latency_us_sum
+                            .fetch_add(latency_us, Ordering::Relaxed);
                         let ef = Arc::new(pkt.into_encoded_frame());
                         // Lossy broadcast: returns Err only if there
                         // are zero subscribers, which is fine.
@@ -2142,7 +2197,7 @@ mod tests {
     #[tokio::test]
     async fn on_resize_with_same_dimensions_is_noop() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
 
         // Snapshot the single always-on handle's identity *before*
         // resize. If resize respawns anything on a same-dim call, the
@@ -2184,7 +2239,7 @@ mod tests {
     #[tokio::test]
     async fn on_resize_to_new_dimensions_respawns_always_on() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
 
         // Grab a subscription against the old handle. After resize
         // it should return Closed on its next recv (the old handle's
@@ -2274,7 +2329,7 @@ mod tests {
     #[tokio::test]
     async fn on_resize_leaves_pool_ready_for_push_at_new_dimensions() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
 
         pool.on_resize(128, 96);
 
@@ -2306,7 +2361,7 @@ mod tests {
             framerate: 30,
         };
         // Use vp8_simulcast-style: half-res layer on a 1000x500 source.
-        let pool = EncoderPool::new(1000, 500, 30, vec![half_layer]);
+        let pool = EncoderPool::new(1000, 500, 30, vec![half_layer], None);
 
         pool.on_resize(2000, 1000);
 
@@ -2337,7 +2392,7 @@ mod tests {
     #[tokio::test]
     async fn encoder_thread_exits_on_shutdown_without_emitting_frame() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
 
         // Subscribe to the always-on encoder's frames.
         let mut frames_rx = {
@@ -2407,7 +2462,7 @@ mod tests {
     async fn on_resize_drops_on_demand_slots_rather_than_respawning() {
         // Construct with empty always_on so VP8 falls to on-demand,
         // giving us a VP8 slot to observe.
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (_subs, _lease) = pool
             .subscribe(&prefs)
@@ -2443,7 +2498,7 @@ mod tests {
     ///   T4: drop lease B — tears slot down
     #[tokio::test]
     async fn stale_lease_does_not_decrement_replacement_slot() {
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         let (_subs_a, lease_a) = pool.subscribe(&prefs).expect("first subscribe");
@@ -2504,6 +2559,7 @@ mod tests {
             64,
             30,
             vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+            None,
         );
 
         // Initial snapshot: matches construction.
@@ -2573,6 +2629,7 @@ mod tests {
             64,
             30,
             vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+            None,
         );
         let before = pool.source_gen();
 
@@ -2616,7 +2673,7 @@ mod tests {
     /// post-resize dimensions.
     #[tokio::test]
     async fn subscribe_after_resize_uses_new_dimensions() {
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         pool.on_resize(128, 96);
 
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
@@ -2641,7 +2698,7 @@ mod tests {
         // and readback would silently bypass the bridge's safety gate
         // and feed mis-sized I420 into the encoder.
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(1280, 720, 30, vec![layer]);
+        let pool = EncoderPool::new(1280, 720, 30, vec![layer], None);
         assert_eq!(pool.dimensions(), (1280, 720));
     }
 
@@ -2650,7 +2707,7 @@ mod tests {
         // VP8 always-on. Peer supporting VP8 gets one subscription from
         // always_on (no on-demand spawn needed).
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
 
         let vp8_prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (subs, _lease) = pool.subscribe(&vp8_prefs).expect("subscribe must succeed");
@@ -2665,7 +2722,7 @@ mod tests {
         // spawn because on_demand_spawnable rejects them. Subscription
         // set is empty → subscribe returns NoCompatibleCodec.
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
 
         let unsupported_prefs =
             PeerCodecPreferences::new(vec![CodecKind::Vp9, CodecKind::Av1]);
@@ -2681,7 +2738,7 @@ mod tests {
         // Empty layer set — no encoders spawned, so request_keyframe
         // consistently returns false (coalescer admits the first, but
         // no matching encoder exists).
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         let rid = SimulcastRid::full();
         // Coalescer admits first, but no encoder matches → false.
         assert!(!pool.request_keyframe(CodecKind::Vp8, Some(rid.clone())));
@@ -2695,7 +2752,7 @@ mod tests {
     #[tokio::test]
     async fn pool_request_keyframe_sets_encoder_flag() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
 
         // Initial state: flag is false.
         let handle = &pool.always_on()[0];
@@ -2727,7 +2784,7 @@ mod tests {
         // Three always-on layers (full / half / quarter) — exercises
         // multi-encoder iteration, not just a single layer.
         let layers = LayerSpec::vp8_simulcast(64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, layers);
+        let pool = EncoderPool::new(64, 64, 30, layers, None);
 
         // Initial state: flags clear on every always-on encoder.
         {
@@ -2873,7 +2930,7 @@ mod tests {
         let frame_arc = Arc::new(frame_data);
 
         let layer = LayerSpec::single(CodecKind::Vp8, W as u32, H as u32, 30);
-        let pool = EncoderPool::new(W as u32, H as u32, 30, vec![layer]);
+        let pool = EncoderPool::new(W as u32, H as u32, 30, vec![layer], None);
 
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (mut subs, _lease) = pool.subscribe(&prefs).expect("subscribe must succeed");
@@ -2901,6 +2958,78 @@ mod tests {
         assert!(!ef.data.is_empty(), "encoded frame payload must be non-empty");
     }
 
+    /// **3c.3b.4h regression test.** When `EncoderPool::new` is
+    /// passed an explicit metrics counters Arc, the pool's encoder
+    /// thread bumps `encode_frames` and `encode_latency_us_sum` per
+    /// emitted packet. Pre-3c.3b.4h: pool encoders ran but didn't
+    /// touch the counters, so after 3c.4 deletes the legacy bridge
+    /// the dashboard's fps/latency metrics would go dark. This test
+    /// pins the wiring end-to-end: explicit counters Arc → pool →
+    /// encoder thread → counter increments observable from the test.
+    #[tokio::test]
+    async fn pool_encoder_thread_increments_metrics_counters() {
+        const W: usize = 64;
+        const H: usize = 64;
+        let i420_size = W * H * 3 / 2;
+        let mut frame_data = vec![0u8; i420_size];
+        for byte in &mut frame_data[W * H..] {
+            *byte = 128;
+        }
+        let frame_arc = Arc::new(frame_data);
+
+        // Construct pool with an EXPLICIT counters Arc (production
+        // path) and hold a clone so the test can read post-encode.
+        let counters = Arc::new(crate::display::DisplayMetricsCounters::new());
+        let layer = LayerSpec::single(CodecKind::Vp8, W as u32, H as u32, 30);
+        let pool = EncoderPool::new(
+            W as u32,
+            H as u32,
+            30,
+            vec![layer],
+            Some(Arc::clone(&counters)),
+        );
+
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (mut subs, _lease) = pool.subscribe(&prefs).expect("subscribe");
+        let mut rx = subs.remove(0).frames;
+
+        // Wait for encoder thread construction.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Push a handful of frames so the encoder produces packets.
+        for _ in 0..5 {
+            pool.push_i420_frame(Arc::clone(&frame_arc), Instant::now());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Drain at least one encoded packet so we know the encoder
+        // ran (and therefore had a chance to bump counters).
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("encoded frame within 2s")
+            .expect("broadcast not closed");
+
+        // Give the encoder a moment to process additional pushes
+        // (the first packet only proves one encode happened; we want
+        // the cumulative counter > 0 across multiple).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let frames_encoded = counters.encode_frames.load(Ordering::SeqCst);
+        let latency_sum = counters.encode_latency_us_sum.load(Ordering::SeqCst);
+
+        assert!(
+            frames_encoded > 0,
+            "encode_frames must be incremented per encoded packet; got \
+             {frames_encoded}. Pre-3c.3b.4h: pool encoders didn't touch \
+             metrics → dashboard fps reads zero after 3c.4 deletes legacy.",
+        );
+        assert!(
+            latency_sum > 0,
+            "encode_latency_us_sum must accumulate from frame.arrived → \
+             encoded packet emission; got {latency_sum}",
+        );
+    }
+
     /// Dropping the pool shuts down encoder threads. This is the
     /// regression guard for the "pool drop leaks encoder threads" class
     /// of bug — if we forget to cancel shutdown tokens or drop the
@@ -2910,7 +3039,7 @@ mod tests {
     #[tokio::test]
     async fn pool_drop_shuts_down_encoders() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (mut subs, lease) = pool.subscribe(&prefs).expect("subscribe must succeed");
         let mut rx = subs.remove(0).frames;
@@ -2962,7 +3091,7 @@ mod tests {
     /// so the test doesn't depend on the platform's H.264 backend.
     #[tokio::test]
     async fn on_demand_spawns_on_first_peer() {
-        let pool = EncoderPool::new(64, 64, 30, vec![]); // no always-on
+        let pool = EncoderPool::new(64, 64, 30, vec![], None); // no always-on
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         // Nothing on-demand yet.
@@ -2986,7 +3115,7 @@ mod tests {
     /// refcount without spawning a new encoder.
     #[tokio::test]
     async fn on_demand_shares_encoder_across_peers() {
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         let (subs_a, _lease_a) = pool.subscribe(&prefs).expect("subscribe a");
@@ -3007,7 +3136,7 @@ mod tests {
     /// `release(&prefs)` call.
     #[tokio::test]
     async fn on_demand_releases_tear_down_at_refcount_zero() {
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         // Two peers.
@@ -3059,7 +3188,7 @@ mod tests {
     ///      torn down.
     #[tokio::test]
     async fn release_on_demand_subset_decrements_only_specified_ids() {
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         let (_subs_a, mut lease_a) =
@@ -3122,6 +3251,7 @@ mod tests {
             64,
             30,
             vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+            None,
         );
         // VP8 is always-on; no on-demand claim. Subscribe still
         // returns the always-on sub but lease has empty on_demand_refs.
@@ -3143,7 +3273,7 @@ mod tests {
     /// doesn't accidentally make a hot path slower.
     #[tokio::test]
     async fn release_on_demand_subset_empty_ids_is_noop() {
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (_subs, mut lease) =
             pool.subscribe(&prefs).expect("subscribe on-demand VP8");
@@ -3170,7 +3300,7 @@ mod tests {
     /// only one ordering.
     #[tokio::test]
     async fn subscribe_race_for_same_on_demand_codec() {
-        let pool = Arc::new(EncoderPool::new(64, 64, 30, vec![]));
+        let pool = Arc::new(EncoderPool::new(64, 64, 30, vec![], None));
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
         let pool_a = Arc::clone(&pool);
@@ -3205,7 +3335,7 @@ mod tests {
     /// over-decrementing the refcount.
     #[tokio::test]
     async fn on_demand_lease_explicit_release() {
-        let pool = EncoderPool::new(64, 64, 30, vec![]);
+        let pool = EncoderPool::new(64, 64, 30, vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (_subs, lease) = pool.subscribe(&prefs).expect("subscribe");
         assert_eq!(
@@ -3225,7 +3355,7 @@ mod tests {
     #[tokio::test]
     async fn pool_mixes_always_on_and_on_demand_subscriptions() {
         let layer = LayerSpec::single(CodecKind::Vp8, 64, 64, 30);
-        let pool = EncoderPool::new(64, 64, 30, vec![layer]);
+        let pool = EncoderPool::new(64, 64, 30, vec![layer], None);
 
         // Peer supporting both VP8 (always-on) and H.264 (on-demand).
         // H.264 on-demand spawn synchronously calls select_codec_for_mime;

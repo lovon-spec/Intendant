@@ -657,6 +657,11 @@ impl DisplaySession {
                     height,
                     fps,
                 )],
+                // 3c.3b.4h: pool encoders feed the same metrics
+                // counters as the legacy bridge so DisplayMetricsSnapshot
+                // continues to reflect total throughput. After 3c.4
+                // deletes the legacy bridge, pool is the sole producer.
+                Some(Arc::clone(&self.counters)),
             ))
         });
 

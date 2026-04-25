@@ -2657,6 +2657,7 @@ mod tests {
             64,
             30,
             vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+            None,
         ));
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
@@ -2735,7 +2736,7 @@ mod tests {
 
         // Pool with NO always-on encoders; on-demand only. Subscribe
         // for VP8 (spawns on-demand VP8 slot) to get initial_subs.
-        let pool = Arc::new(EncoderPool::new(64, 64, 30, vec![]));
+        let pool = Arc::new(EncoderPool::new(64, 64, 30, vec![], None));
         let prefs_vp8 = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (initial_subs, initial_lease) =
             pool.subscribe(&prefs_vp8).expect("initial on-demand VP8");
@@ -2941,6 +2942,7 @@ mod tests {
             64,
             30,
             LayerSpec::vp8_simulcast(64, 64, 30),
+            None,
         ));
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
@@ -3049,6 +3051,7 @@ mod tests {
             64,
             30,
             vec![LayerSpec::single(CodecKind::Vp8, 64, 64, 30)],
+            None,
         ));
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let (initial_subs, initial_lease) =
