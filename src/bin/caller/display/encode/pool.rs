@@ -146,6 +146,29 @@ use tokio_util::sync::CancellationToken;
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Maximum attempts [`EncoderPool::subscribe`] will make before
+/// giving up on a stale-epoch race. Two attempts is enough: the
+/// first races with `on_resize`, the second has fresh dimensions
+/// (and a microsecond-scale construct window before the next
+/// possible on_resize). A pathological case where every attempt
+/// races would mean resize traffic at sub-millisecond cadence,
+/// which is itself a bug worth surfacing.
+const MAX_SUBSCRIBE_ATTEMPTS: usize = 2;
+
+/// Outcome of one [`EncoderPool::subscribe_once`] attempt. The outer
+/// `subscribe` loop continues only on [`Self::StaleEpochRetry`].
+enum SubscribeAttemptOutcome {
+    /// Attempt produced a final result — either a successful
+    /// subscription or a definitive NoCompatibleCodec that doesn't
+    /// stem from a resize race. Outer subscribe returns this verbatim.
+    Done(Result<(Vec<EncoderSubscription>, PoolLease), SubscribeError>),
+    /// Attempt detected `source_gen` advanced during off-lock
+    /// construction AND the would-be result is empty (only on-demand
+    /// codecs requested, all stale). Outer subscribe retries with
+    /// fresh dimensions.
+    StaleEpochRetry,
+}
+
 /// Conventional simulcast RID for the highest-quality layer (full
 /// resolution). Matches LiveKit / mediasoup convention.
 pub const RID_FULL: &str = "f";
@@ -1100,6 +1123,19 @@ impl EncoderPool {
     /// section is brief (map insert + encoder-thread spawn on the
     /// std::thread side, no I/O).
     ///
+    /// Resize-race retry: subscribe runs `subscribe_once` in a loop
+    /// of up to [`MAX_SUBSCRIBE_ATTEMPTS`] attempts. When the inner
+    /// attempt detects an `on_resize` raced its off-lock construction
+    /// AND would otherwise return [`SubscribeError::NoCompatibleCodec`]
+    /// (i.e. all returnable codecs were stale), we retry once with a
+    /// fresh source-epoch snapshot — turning a microsecond-window
+    /// race into a transparent recovery rather than an offer
+    /// rejection. After all attempts hit stale-epoch, we return
+    /// `NoCompatibleCodec`; in practice two consecutive races inside
+    /// the same call require resize traffic at sub-millisecond
+    /// cadence, which would itself be a higher-order bug worth
+    /// failing loud on.
+    ///
     /// Failure-filtering contract:
     /// - For **always-on** codecs whose layer matches a peer-preferred
     ///   codec: always returns a subscription (always-on encoders are
@@ -1122,6 +1158,32 @@ impl EncoderPool {
         &self,
         prefs: &PeerCodecPreferences,
     ) -> Result<(Vec<EncoderSubscription>, PoolLease), SubscribeError> {
+        for attempt in 0..MAX_SUBSCRIBE_ATTEMPTS {
+            match self.subscribe_once(prefs) {
+                SubscribeAttemptOutcome::Done(result) => return result,
+                SubscribeAttemptOutcome::StaleEpochRetry => {
+                    eprintln!(
+                        "[encoder/pool] subscribe: stale-epoch detected on \
+                         attempt {} — retrying with fresh source dimensions",
+                        attempt + 1,
+                    );
+                    continue;
+                }
+            }
+        }
+        // Every attempt hit a resize race. This means on_resize is
+        // firing faster than subscribe's pass-2 construct can
+        // complete — should be impossible under normal operation
+        // (resize is rare; pass 2 is microseconds). Return the
+        // standard NoCompatibleCodec; caller (offer handler) treats
+        // it as transient and retries on next offer.
+        Err(SubscribeError::NoCompatibleCodec)
+    }
+
+    fn subscribe_once(
+        &self,
+        prefs: &PeerCodecPreferences,
+    ) -> SubscribeAttemptOutcome {
         let mut subs = Vec::new();
         let mut always_on_codecs: Vec<CodecKind> = Vec::new();
 
@@ -1267,20 +1329,29 @@ impl EncoderPool {
                     );
                     handle.shutdown.cancel();
                 }
-                // Don't install; skip directly to the
-                // empty-result check below.
+                // Don't install. Drop the lock before deciding:
+                // - subs non-empty: we have always-on / fast-path
+                //   codecs to serve; return partial result. Caller
+                //   gets a working subscription, just not at the
+                //   full set of requested codecs. This is identical
+                //   to a peer that asked for codecs we don't
+                //   support — same SDP semantics, no need to retry.
+                // - subs empty: ALL the codecs the peer wanted were
+                //   stale. Returning NoCompatibleCodec here would
+                //   reject an offer that would succeed on retry.
+                //   Signal the outer `subscribe` to retry instead.
                 drop(on_demand);
                 if subs.is_empty() {
-                    return Err(SubscribeError::NoCompatibleCodec);
+                    return SubscribeAttemptOutcome::StaleEpochRetry;
                 }
-                return Ok((
+                return SubscribeAttemptOutcome::Done(Ok((
                     subs,
                     PoolLease {
                         pool: Arc::clone(&self.inner),
                         on_demand_refs,
                         released: AtomicBool::new(false),
                     },
-                ));
+                )));
             }
             for (id, handle, _layer) in constructed {
                 match on_demand.get_mut(&id) {
@@ -1324,17 +1395,17 @@ impl EncoderPool {
         }
 
         if subs.is_empty() {
-            return Err(SubscribeError::NoCompatibleCodec);
+            return SubscribeAttemptOutcome::Done(Err(SubscribeError::NoCompatibleCodec));
         }
 
-        Ok((
+        SubscribeAttemptOutcome::Done(Ok((
             subs,
             PoolLease {
                 pool: Arc::clone(&self.inner),
                 on_demand_refs,
                 released: AtomicBool::new(false),
             },
-        ))
+        )))
     }
 
     /// Request a keyframe from one encoder (or all layers of one codec
