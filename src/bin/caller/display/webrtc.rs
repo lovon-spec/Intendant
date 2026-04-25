@@ -582,7 +582,6 @@ fn parse_stun_username(bytes: &[u8]) -> Option<String> {
 pub struct WebRtcPeer {
     #[allow(dead_code)]
     pub peer_id: PeerId,
-    encoded_frame_tx: mpsc::Sender<Arc<EncodedFrame>>,
     command_tx: mpsc::Sender<Command>,
     shutdown: CancellationToken,
 }
@@ -624,6 +623,10 @@ impl WebRtcPeer {
     /// inline in the answer SDP, so there is nothing to trickle from the
     /// server side. The browser still trickles its candidates via
     /// `add_ice_candidate`.
+    /// Returns `(peer, encoded_frame_tx, answer_sdp)`. The
+    /// `encoded_frame_tx` is the sender side of the per-peer encoded
+    /// frame channel — the caller (`Self::new`) hands it directly to
+    /// `pool_frame_intake` rather than parking it on the struct.
     async fn build_with_codec_set(
         peer_id: PeerId,
         offer_sdp: &str,
@@ -634,7 +637,7 @@ impl WebRtcPeer {
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
-    ) -> Result<(Self, String), CallerError> {
+    ) -> Result<(Self, mpsc::Sender<Arc<EncodedFrame>>, String), CallerError> {
         // --- Pre-generate ICE credentials ----------------------------------
         // We need to know the local ufrag *before* Rtc::build so we can
         // register it with the TCP dispatcher, if present.
@@ -840,20 +843,12 @@ impl WebRtcPeer {
         Ok((
             Self {
                 peer_id,
-                encoded_frame_tx,
                 command_tx,
                 shutdown,
             },
+            encoded_frame_tx,
             answer_sdp,
         ))
-    }
-
-    /// Returns the sender side of this peer's encoded-frame channel.
-    ///
-    /// The encoder fan-out task pushes `Arc<EncodedFrame>` via `try_send`;
-    /// frames are dropped (with metrics) when the driver is behind.
-    pub fn encoded_frame_tx(&self) -> &mpsc::Sender<Arc<EncodedFrame>> {
-        &self.encoded_frame_tx
     }
 
     /// Pool-mode constructor: builds the same str0m peer as
@@ -939,7 +934,7 @@ impl WebRtcPeer {
                     .to_string(),
             ));
         }
-        let (mut peer, answer_sdp) = Self::build_with_codec_set(
+        let (peer, encoded_frame_tx, answer_sdp) = Self::build_with_codec_set(
             peer_id,
             offer_sdp,
             &codec_set,
@@ -951,19 +946,19 @@ impl WebRtcPeer {
             ice_tx,
         )
         .await?;
-        // Spawn the intake task. It clones the encoded_frame_tx and
-        // shutdown so it can push frames into the existing driver and
-        // exit when the peer is torn down. The task owns the lease
-        // and resubscribes as needed (see `pool_frame_intake` for
-        // the Closed-handling contract).
-        let intake_tx = peer.encoded_frame_tx.clone();
+        // Spawn the intake task. It owns the encoded_frame_tx (no
+        // longer parked on Self after the 3c.4d follow-up cleanup)
+        // and a clone of `shutdown` so it can push frames into the
+        // existing driver and exit when the peer is torn down. The
+        // task owns the lease and resubscribes as needed (see
+        // `pool_frame_intake` for the Closed-handling contract).
         let intake_shutdown = peer.shutdown.clone();
         tokio::spawn(pool_frame_intake(
             pool,
             negotiated_prefs,
             subscriptions,
             lease,
-            intake_tx,
+            encoded_frame_tx,
             drops_counter,
             intake_shutdown,
         ));
