@@ -279,7 +279,14 @@ pub struct DisplayMetricsCounters {
     pub encode_latency_us_sum: AtomicU64,
 
     /// Total per-peer try_send failures in the fan-out task.
-    pub peer_drops: AtomicU64,
+    ///
+    /// `Arc<AtomicU64>` (not bare `AtomicU64`) so the pool-mode
+    /// per-peer intake task at `webrtc.rs::pool_frame_intake` can
+    /// share the same counter via `Arc::clone(&self.counters.peer_drops)`.
+    /// Until 3c.4 deletes the legacy fan-out, both paths feed this
+    /// counter so `DisplayMetricsSnapshot.peer_drops` continues to
+    /// reflect total drops across pre-pool and pool peers.
+    pub peer_drops: Arc<AtomicU64>,
     /// Current number of connected WebRTC peers.
     pub peer_count: AtomicU64,
 
@@ -296,7 +303,7 @@ impl DisplayMetricsCounters {
             encode_frames: AtomicU64::new(0),
             encode_drops: AtomicU64::new(0),
             encode_latency_us_sum: AtomicU64::new(0),
-            peer_drops: AtomicU64::new(0),
+            peer_drops: Arc::new(AtomicU64::new(0)),
             peer_count: AtomicU64::new(0),
             epoch_us: AtomicU64::new(now_us),
         }
@@ -443,6 +450,37 @@ pub struct DisplaySession {
     /// tokio dependency. Concurrent `start()` callers (not expected but
     /// cheap to tolerate) converge on a single pool.
     pool: std::sync::OnceLock<Arc<encode::pool::EncoderPool>>,
+}
+
+/// Parse the truthiness of an `INTENDANT_DISPLAY_POOL` env value
+/// (or any equivalent on/off flag). `Some("1")`, `Some("true")` (any
+/// case), `Some("TRUE")` → `true`. Everything else (`None`, empty
+/// string, `"0"`, `"false"`, garbage) → `false`.
+///
+/// Extracted from [`pool_mode_enabled`] so the parsing rules can be
+/// unit-tested without touching `std::env::var` (env mutation in
+/// parallel tests is racy across the cargo-test process).
+fn parse_pool_flag(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        None => false,
+    }
+}
+
+/// Whether `INTENDANT_DISPLAY_POOL=1` (or `=true`, case-insensitive)
+/// routes new offers through the encoder-pool path
+/// (`DisplaySession::handle_offer_pool_mode`). Default OFF — the
+/// legacy single-encoder fan-out is the live path until 3c.4 flips
+/// the default and 3c.5 deletes the legacy code.
+///
+/// Read per-call rather than at startup so an operator can flip the
+/// flag mid-session via `kill -HUP`-and-restart pattern (or, more
+/// usefully, set/unset between offers in a debug session). Concurrent
+/// peers can be on different paths; the [`webrtc::WebRtcPeer::is_pool_mode`]
+/// marker keeps the legacy fan-out from duplicating frames into pool
+/// peers.
+fn pool_mode_enabled() -> bool {
+    parse_pool_flag(std::env::var("INTENDANT_DISPLAY_POOL").as_deref().ok())
 }
 
 impl DisplaySession {
@@ -1117,6 +1155,21 @@ impl DisplaySession {
                         };
                         let peers_guard = peers.read().await;
                         for peer in peers_guard.values() {
+                            // Phase 3c.3b.3: skip pool-mode peers.
+                            // They receive frames via their per-peer
+                            // `pool_frame_intake` task; forwarding
+                            // here would produce duplicate RTP
+                            // samples on the peer's encoded-frame
+                            // mpsc and corrupt decode (codec PTs
+                            // wouldn't match either, since the pool
+                            // peer's str0m enabled codec set was
+                            // negotiated separately from the legacy
+                            // session codec). The marker is a bool
+                            // on `WebRtcPeer` (no lock acquisition
+                            // on this hot path).
+                            if peer.is_pool_mode() {
+                                continue;
+                            }
                             if peer.encoded_frame_tx().try_send(Arc::clone(&ef)).is_err() {
                                 fanout_counters
                                     .peer_drops
@@ -1155,6 +1208,29 @@ impl DisplaySession {
         tcp_advertised_addr: Option<std::net::SocketAddr>,
         ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<String, CallerError> {
+        // Phase 3c.3b.3: env-gated route to the pool-mode path.
+        // `INTENDANT_DISPLAY_POOL=1` (or `=true`, case-insensitive)
+        // routes the offer through the encoder pool +
+        // `WebRtcPeer::new_pool_mode`. Default OFF — the legacy
+        // single-encoder fan-out below remains the live path until
+        // 3c.4 flips the default and 3c.5 deletes the legacy code.
+        // Read per-call so an operator can enable the flag without
+        // restarting; concurrent peers can be on different paths
+        // (the `WebRtcPeer.pool_mode` marker keeps the fan-out from
+        // duplicating frames into pool peers).
+        if pool_mode_enabled() {
+            return self
+                .handle_offer_pool_mode(
+                    peer_id,
+                    sdp,
+                    ice_config,
+                    tcp_peer_registry,
+                    tcp_advertised_addr,
+                    ice_tx,
+                )
+                .await;
+        }
+
         // Serialize codec selection + encoder startup.
         let codec_mime = {
             let mut init = self.encoder_init_lock.lock().await;
@@ -1295,6 +1371,155 @@ impl DisplaySession {
         if let Some(tx) = self.keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
         }
+
+        Ok(answer_sdp)
+    }
+
+    /// Pool-mode counterpart to [`Self::handle_offer`], gated by
+    /// `INTENDANT_DISPLAY_POOL=1` (3c.3b.3 → 3c.4 cutover).
+    ///
+    /// Differences from the legacy path:
+    ///   - No `encoder_init_lock` dance: codec selection is per-peer
+    ///     via str0m's `enable_*()` calls in `WebRtcPeer::new_pool_mode`,
+    ///     driven by the codecs the pool's initial subscribe actually
+    ///     returned. No first-peer codec lock.
+    ///   - No `keyframe_tx` wake: pool peers don't share the legacy
+    ///     bridge's keyframe channel. Per-peer keyframe-on-join is
+    ///     wired via the encoder pool's `request_keyframe_*` API in
+    ///     3c.4 (today the encoder's intrinsic GOP cadence still
+    ///     produces a keyframe within ~one GOP boundary; the
+    ///     PLI-driven explicit request lands with the simulcast
+    ///     work).
+    ///   - No `pool_leases` tracking on `DisplaySession`:
+    ///     `WebRtcPeer::new_pool_mode` hands the lease to the
+    ///     per-peer `pool_frame_intake` task, which owns it for the
+    ///     peer's lifetime. `Self::remove_peer` calls
+    ///     `peer.close()`, which fires the shutdown token, which the
+    ///     intake task observes — its select-arm drops the lease via
+    ///     `drop(current_lease.take())` (RAII releases on-demand
+    ///     refcounts under the existing generation gate). The
+    ///     primer's "DisplaySession stores HashMap<PeerId, PoolLease>"
+    ///     suggestion was written before the 3c.3b.2 design
+    ///     finalized intake-owns-lease; tracking the lease in two
+    ///     places would either duplicate ownership (won't compile)
+    ///     or race the intake's resubscribe path on early release.
+    ///
+    /// Common with legacy: input/clipboard handler closures, peer
+    /// insertion + replaced-peer close + counter, ensure_clipboard_forwarding.
+    /// 3c.4 deletes the legacy path and folds the common boilerplate
+    /// into a single fn; until then the duplication is intentional.
+    async fn handle_offer_pool_mode(
+        &self,
+        peer_id: PeerId,
+        sdp: &str,
+        ice_config: &IceConfig,
+        tcp_peer_registry: Option<Arc<self::webrtc::TcpPeerRegistry>>,
+        tcp_advertised_addr: Option<std::net::SocketAddr>,
+        ice_tx: mpsc::Sender<(PeerId, String)>,
+    ) -> Result<String, CallerError> {
+        let pool = self.pool.get().ok_or_else(|| {
+            CallerError::WebRtc(
+                "pool-mode handle_offer: encoder pool not initialized — \
+                 caller must invoke DisplaySession::start() before serving \
+                 offers"
+                    .to_string(),
+            )
+        })?;
+
+        // Build the peer's codec preferences from its SDP offer. The
+        // strict `forward::codec_preferences_from_offer` filters
+        // H.264 by str0m's exact match rules (profile / packetization
+        // / level), so an offer that advertises an incompatible H.264
+        // variant is correctly excluded here rather than producing a
+        // black stream after match_params drops the spec downstream.
+        let prefs = forward::codec_preferences_from_offer(sdp);
+        if prefs.is_empty() {
+            return Err(CallerError::WebRtc(format!(
+                "pool-mode: peer offer has no compatible codecs (offered: {:?})",
+                encode::parse_offered_codecs(sdp),
+            )));
+        }
+
+        let (subs, lease) = pool.subscribe(&prefs).map_err(|e| {
+            CallerError::WebRtc(format!(
+                "pool-mode subscribe failed for peer prefs {:?}: {:?}",
+                prefs.supported, e,
+            ))
+        })?;
+
+        let backend = Arc::clone(&self.backend);
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
+            Arc::new(move |event: InputEvent| {
+                let backend = Arc::clone(&backend);
+                tokio::spawn(async move {
+                    if let Err(e) = backend.inject_input(event).await {
+                        eprintln!("[display] input injection failed: {e}");
+                    }
+                });
+            });
+
+        let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
+        let clipboard_handler: Arc<dyn Fn(clipboard::ClipboardContent) + Send + Sync> =
+            Arc::new(move |content: clipboard::ClipboardContent| {
+                let monitor = Arc::clone(&clipboard_monitor);
+                tokio::spawn(async move {
+                    match content {
+                        clipboard::ClipboardContent::Text(text) => {
+                            if let Err(e) = monitor.set_text(&text).await {
+                                eprintln!("[display/clipboard] set_text failed: {e}");
+                            }
+                        }
+                        clipboard::ClipboardContent::Image { mime, data } => {
+                            if let Err(e) = monitor.set_image(&mime, &data).await {
+                                eprintln!("[display/clipboard] set_image failed: {e}");
+                            }
+                        }
+                    }
+                });
+            });
+
+        // Share the legacy fan-out's `peer_drops` counter so the
+        // pool path's drops show up alongside legacy drops in
+        // `DisplayMetricsSnapshot.peer_drops`. Cheap clone (Arc).
+        let drops_counter = Arc::clone(&self.counters.peer_drops);
+
+        let (peer, answer_sdp) = self::webrtc::WebRtcPeer::new_pool_mode(
+            peer_id,
+            sdp,
+            ice_config,
+            tcp_peer_registry,
+            tcp_advertised_addr,
+            input_handler,
+            clipboard_handler,
+            ice_tx,
+            Arc::clone(pool),
+            subs,
+            lease,
+            prefs,
+            drops_counter,
+        )
+        .await?;
+
+        let peer = Arc::new(peer);
+        // Same replaced-peer handling as the legacy path: close the
+        // displaced peer (if any) so its driver task tears down,
+        // skip the gauge bump on replacement so peer_count stays
+        // accurate. See the comment block in `handle_offer` (legacy)
+        // for the federation-smoke-test backstory.
+        let replaced = {
+            let mut guard = self.peers.write().await;
+            guard.insert(peer_id, Arc::clone(&peer))
+        };
+        match replaced {
+            Some(old) => {
+                old.close().await;
+            }
+            None => {
+                self.counters.peer_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        self.ensure_clipboard_forwarding().await;
 
         Ok(answer_sdp)
     }
@@ -1559,6 +1784,51 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Phase 3c.3b.3: env-flag parsing
+    // -----------------------------------------------------------------------
+
+    /// `1` → enabled. The canonical "set" value, matching the
+    /// primer's `INTENDANT_DISPLAY_POOL=1` recipe.
+    #[test]
+    fn parse_pool_flag_one_is_true() {
+        assert!(parse_pool_flag(Some("1")));
+    }
+
+    /// `true`, `True`, `TRUE`, `tRuE` → enabled. Case-insensitive
+    /// because env-var typing is finicky and we'd rather "obviously
+    /// truthy" works than make operators remember an exact spelling.
+    #[test]
+    fn parse_pool_flag_true_is_case_insensitive() {
+        for v in ["true", "True", "TRUE", "tRuE", "TRue"] {
+            assert!(
+                parse_pool_flag(Some(v)),
+                "value {:?} must enable pool mode",
+                v
+            );
+        }
+    }
+
+    /// Unset → disabled. The default is OFF until 3c.4 flips it.
+    #[test]
+    fn parse_pool_flag_none_is_false() {
+        assert!(!parse_pool_flag(None));
+    }
+
+    /// Anything else → disabled. Empty string, `0`, `false`, garbage.
+    /// We don't accept `yes`/`on` to stay narrow — `1` and `true`
+    /// are the documented recipe; anything else might be an accident.
+    #[test]
+    fn parse_pool_flag_other_values_are_false() {
+        for v in ["", "0", "false", "False", "FALSE", "yes", "on", " 1", "1 ", "no", "garbage"] {
+            assert!(
+                !parse_pool_flag(Some(v)),
+                "value {:?} must NOT enable pool mode (only `1` / `true` do)",
+                v
+            );
+        }
+    }
 
     #[test]
     fn input_event_deserialize_key_down() {
