@@ -3286,15 +3286,17 @@ mod tests {
         session.shutdown.cancel();
     }
 
-    /// **3c.3b.4c regression test (mixed session).** When a legacy
-    /// peer attached first, the legacy bridge owns the pool feed
-    /// and `ensure_pool_feed_bridge_started` early-returns without
-    /// installing `pool_feed_keyframe_tx`. A later pool peer's
-    /// burst signal must reach the LEGACY bridge's `keyframe_tx`,
-    /// or Linux H.264 stays black on the pool peer.
-    /// `signal_peer_join_burst` dispatches to both channels;
-    /// asserting the legacy channel receives confirms the mixed-
-    /// session path is wired.
+    /// **3c.3b.4c regression test (legacy-first mixed session).**
+    /// When a legacy peer attached first, the legacy bridge owns
+    /// the pool feed and `ensure_pool_feed_bridge_started` early-
+    /// returns without installing `pool_feed_keyframe_tx`. A later
+    /// pool peer's burst signal must reach the LEGACY bridge's
+    /// `keyframe_tx`, or Linux H.264 stays black on the pool peer.
+    /// `signal_peer_join_burst` dispatches to the pool-feed channel
+    /// first and falls back to the legacy channel only when
+    /// `pool_feed_keyframe_tx` is `None` (3c.3b.4d). Asserting the
+    /// legacy channel receives in this state confirms the fallback
+    /// path is wired.
     #[tokio::test]
     async fn signal_peer_join_burst_wakes_legacy_bridge_in_mixed_session() {
         let backend = Arc::new(StubBackend { width: 64, height: 64 });
