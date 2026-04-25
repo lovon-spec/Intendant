@@ -342,6 +342,35 @@ pub struct LayerSpec {
 /// pool-frame-intake reconnect path.
 pub const MIN_LAYER_DIM: u32 = 16;
 
+/// Normalize a `(width, height)` pair to the constraints both
+/// VP8 encoder construction and [`super::downscale_i420`] require:
+///
+///   1. Round to nearest even (`& !1`).
+///   2. Reject if either dim falls below [`MIN_LAYER_DIM`].
+///
+/// Returns `Some((even_w, even_h))` for valid layer dims,
+/// `None` for dims that should drop the layer entirely.
+///
+/// **Single source of truth.** Used by [`LayerSpec::vp8_simulcast`]
+/// (initial pool construction) and [`rescale_layer_spec`] (resize
+/// path). Centralizing the rule means a 64×64→60×48 resize drops
+/// the quarter layer the same way `vp8_simulcast(60, 48, ...)`
+/// would on a fresh pool — no inconsistency between "what dims
+/// you get on first build" and "what dims you get after a
+/// resize." Without this guarantee, the resize path could keep
+/// an unsupported tiny VP8 layer alive (e.g. 14×12 quarter on a
+/// 60×48 source) instead of closing that RID and letting the
+/// forwarder resubscribe.
+fn normalize_layer_dims(w: u32, h: u32) -> Option<(u32, u32)> {
+    let w = w & !1;
+    let h = h & !1;
+    if w < MIN_LAYER_DIM || h < MIN_LAYER_DIM {
+        None
+    } else {
+        Some((w, h))
+    }
+}
+
 impl LayerSpec {
     /// Reference VP8 simulcast layout — up to three layers at full /
     /// half / quarter resolution from a source resolution. Bitrates
@@ -374,11 +403,11 @@ impl LayerSpec {
             (SimulcastRid::half(), 2, 400),
             (SimulcastRid::quarter(), 4, 125),
         ] {
-            let w = (source_w / divisor) & !1;
-            let h = (source_h / divisor) & !1;
-            if w < MIN_LAYER_DIM || h < MIN_LAYER_DIM {
+            let Some((w, h)) =
+                normalize_layer_dims(source_w / divisor, source_h / divisor)
+            else {
                 continue;
-            }
+            };
             out.push(LayerSpec {
                 rid,
                 width: w,
@@ -1185,13 +1214,36 @@ impl EncoderPool {
                 handle.shutdown.cancel();
             }
             for old_handle in old_handles {
-                let rescaled = rescale_layer_spec(
+                let Some(rescaled) = rescale_layer_spec(
                     &old_handle.layer,
                     old_width,
                     old_height,
                     new_width,
                     new_height,
-                );
+                ) else {
+                    // Layer would violate MIN_LAYER_DIM (or other
+                    // portability constraint) at the new dims — drop
+                    // it from always_on. The old handle's shutdown was
+                    // already cancelled above; its encoder thread
+                    // exits and existing subscribers see RecvError::
+                    // Closed via the broadcast. The pool-frame-intake
+                    // resubscribe path treats that as a normal epoch
+                    // transition; the dropped RID just won't appear
+                    // in the next subscription set, matching what
+                    // `vp8_simulcast(new_width, new_height)` would
+                    // return for a fresh pool at the new dims.
+                    eprintln!(
+                        "[encoder/pool] on_resize: dropping always-on \
+                         layer {:?} ({}x{}) — rescale to {}x{} below \
+                         MIN_LAYER_DIM",
+                        old_handle.id,
+                        old_handle.layer.width,
+                        old_handle.layer.height,
+                        new_width,
+                        new_height,
+                    );
+                    continue;
+                };
                 let new_handle = try_spawn_encoder_thread(
                     old_handle.id.clone(),
                     rescaled,
@@ -1775,45 +1827,49 @@ impl Drop for EncoderPoolInner {
 /// at the new source dimensions, a half-resolution simulcast layer
 /// stays at half of the new source, etc.
 ///
-/// Widths and heights are rounded down to even (VP8/H.264 both
-/// require even dimensions). `rid`, `target_bitrate_kbps`, and
-/// `framerate` are preserved unchanged — RID identifies the layer
-/// across resize, and bitrate adaptation is TWCC's responsibility
-/// (future phase).
+/// Returns `None` when the rescaled layer would violate the
+/// portability floor (`MIN_LAYER_DIM`) — e.g. resizing a 64×64
+/// pool to 60×48 produces a 14×12 quarter, which VP8 can't
+/// portably encode and `downscale_i420` debug-asserts against.
+/// `on_resize` skips `None` layers, dropping them from the
+/// always-on set rather than spawning an unsupported encoder.
 ///
-/// For the single-VP8-layer baseline case (phase 3c.3a), this
-/// simplifies to "the new source dimensions," because the always-on
-/// layer's dimensions match the source. The general form exists for
-/// simulcast (phase 4), where always_on will have multiple layers at
-/// different ratios.
+/// **Shared with [`LayerSpec::vp8_simulcast`] via
+/// [`normalize_layer_dims`]** so the resize path drops the same
+/// layers a fresh pool would for the new source dims — no
+/// inconsistency between "what dims you get on first build" and
+/// "what dims you get after a resize."
+///
+/// `rid`, `target_bitrate_kbps`, and `framerate` are preserved
+/// unchanged — RID identifies the layer across resize, and bitrate
+/// adaptation is TWCC's responsibility (future phase).
 fn rescale_layer_spec(
     spec: &LayerSpec,
     old_src_w: u32,
     old_src_h: u32,
     new_src_w: u32,
     new_src_h: u32,
-) -> LayerSpec {
+) -> Option<LayerSpec> {
     // Defensive — divide-by-zero would be a bug elsewhere (pool is
     // constructed from real capture dimensions which are always > 0),
-    // but emit a sensible spec rather than panicking.
-    if old_src_w == 0 || old_src_h == 0 {
-        return LayerSpec {
-            rid: spec.rid.clone(),
-            width: new_src_w & !1,
-            height: new_src_h & !1,
-            target_bitrate_kbps: spec.target_bitrate_kbps,
-            framerate: spec.framerate,
-        };
-    }
-    let w = (spec.width as u64 * new_src_w as u64 / old_src_w as u64) as u32;
-    let h = (spec.height as u64 * new_src_h as u64 / old_src_h as u64) as u32;
-    LayerSpec {
+    // but emit a sensible spec rather than panicking. Treats the
+    // bug case as "carry the new source dims forward" subject to
+    // the same normalization the rest of the function uses.
+    let (raw_w, raw_h) = if old_src_w == 0 || old_src_h == 0 {
+        (new_src_w, new_src_h)
+    } else {
+        let w = (spec.width as u64 * new_src_w as u64 / old_src_w as u64) as u32;
+        let h = (spec.height as u64 * new_src_h as u64 / old_src_h as u64) as u32;
+        (w, h)
+    };
+    let (w, h) = normalize_layer_dims(raw_w, raw_h)?;
+    Some(LayerSpec {
         rid: spec.rid.clone(),
-        width: w & !1,
-        height: h & !1,
+        width: w,
+        height: h,
         target_bitrate_kbps: spec.target_bitrate_kbps,
         framerate: spec.framerate,
-    }
+    })
 }
 
 fn try_spawn_encoder_thread(
@@ -2557,6 +2613,109 @@ mod tests {
         assert_eq!(
             scaled.target_bitrate_kbps, 400,
             "bitrate preserved across rescale; TWCC adjusts at runtime"
+        );
+    }
+
+    /// **Phase 4a follow-up regression test (review finding).** The
+    /// resize path must enforce the same `MIN_LAYER_DIM` floor as
+    /// initial construction (`vp8_simulcast`) — otherwise an
+    /// undersized layer survives a resize-down and tries to keep
+    /// encoding at unsupported dims.
+    ///
+    /// 64×64 → 60×48 is the canonical case:
+    /// - Pool starts with `vp8_simulcast(64, 64)` → full 64×64,
+    ///   half 32×32, quarter 16×16. All survive.
+    /// - Resize to 60×48: full → 60×48 (ok), half → 30×24 (ok),
+    ///   quarter → 14×12 (width 14 < MIN_LAYER_DIM=16) → drop.
+    ///
+    /// Pre-fix: `rescale_layer_spec` only rounded to even, so
+    /// `on_resize` blindly respawned a 14×12 quarter encoder.
+    /// VP8 either rejected it (panic via `unwrap_or_else`) or
+    /// silently mis-encoded — both broken. Post-fix:
+    /// `rescale_layer_spec` returns `None` for sub-MIN dims and
+    /// `on_resize` skips the layer, matching the set
+    /// `vp8_simulcast(60, 48)` would return on a fresh pool.
+    #[tokio::test]
+    async fn on_resize_drops_simulcast_layers_below_min_dim() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            LayerSpec::vp8_simulcast(64, 64, 30),
+            None,
+        );
+
+        // Precondition: all 3 simulcast layers spawned cleanly.
+        {
+            let always_on = pool.always_on();
+            assert_eq!(
+                always_on.len(),
+                3,
+                "vp8_simulcast at 64x64 must yield all 3 layers"
+            );
+        }
+
+        // Resize to dims where quarter would round to 14×12.
+        pool.on_resize(60, 48);
+
+        let always_on = pool.always_on();
+        let rids: Vec<SimulcastRid> =
+            always_on.iter().map(|h| h.layer.rid.clone()).collect();
+        assert_eq!(
+            always_on.len(),
+            2,
+            "quarter layer must be dropped on resize below MIN_LAYER_DIM \
+             (got rids={rids:?})"
+        );
+        assert!(
+            rids.contains(&SimulcastRid::full()),
+            "full layer must survive — got rids={rids:?}"
+        );
+        assert!(
+            rids.contains(&SimulcastRid::half()),
+            "half layer must survive at 30×24 — got rids={rids:?}"
+        );
+        assert!(
+            !rids.contains(&SimulcastRid::quarter()),
+            "quarter layer must be dropped (would have been 14×12) — \
+             got rids={rids:?}"
+        );
+
+        // Survivors must have valid even dims at or above MIN_LAYER_DIM
+        // — the same contract `vp8_simulcast` enforces on a fresh pool.
+        for h in always_on.iter() {
+            assert_eq!(h.layer.width % 2, 0, "{:?} width must be even", h.id);
+            assert_eq!(h.layer.height % 2, 0, "{:?} height must be even", h.id);
+            assert!(
+                h.layer.width >= MIN_LAYER_DIM,
+                "{:?} width {} below MIN_LAYER_DIM",
+                h.id,
+                h.layer.width,
+            );
+            assert!(
+                h.layer.height >= MIN_LAYER_DIM,
+                "{:?} height {} below MIN_LAYER_DIM",
+                h.id,
+                h.layer.height,
+            );
+        }
+
+        // The surviving set must equal what a fresh-pool
+        // `vp8_simulcast(60, 48, 30)` would return — single source
+        // of truth for "valid layer dims at this source size,"
+        // checked by both the resize and initial-construction paths
+        // through `normalize_layer_dims`.
+        let fresh = LayerSpec::vp8_simulcast(60, 48, 30);
+        let fresh_rids: Vec<SimulcastRid> =
+            fresh.iter().map(|l| l.rid.clone()).collect();
+        let mut sorted_rids = rids.clone();
+        sorted_rids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut sorted_fresh = fresh_rids.clone();
+        sorted_fresh.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(
+            sorted_rids, sorted_fresh,
+            "after-resize RIDs must match fresh-pool RIDs at the same \
+             source dims (resize: {rids:?}, fresh: {fresh_rids:?})"
         );
     }
 
