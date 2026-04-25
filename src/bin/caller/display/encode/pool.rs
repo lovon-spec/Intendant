@@ -1762,6 +1762,121 @@ fn try_spawn_encoder_thread(
     Ok(spawn_encoder_thread_with(id, layer, encoder, i420_tx, duration_ms))
 }
 
+/// 3c.3b.4f: per-encoder silent-output watchdog.
+///
+/// Detects encoders that accept input but produce no encoded output
+/// (the canonical failure mode is `h264_vaapi` on hosts where
+/// virtio-gpu video acceleration is half-broken: `vaInitialize`
+/// "succeeds" but no NAL units ever come out of stdout). After
+/// [`ENCODER_SILENT_FRAMES_THRESHOLD`] consecutive silent encodes
+/// the watchdog asks the caller to attempt a fallback once; after
+/// the swap (or after the swap-attempt fails) the watchdog stops
+/// firing for the lifetime of this encoder thread.
+///
+/// Mirrors the legacy bridge's watchdog at `mod.rs::start_encoder_pipeline`
+/// so the pool path doesn't silently regress on hosts where the
+/// legacy path was actually keeping displays alive via the libx264
+/// fallback. The two implementations will collapse to one when 3c.4
+/// deletes the legacy path.
+struct WatchdogState {
+    frames_since_last_output: u64,
+    swap_done: bool,
+}
+
+/// Threshold MUST match `mod.rs::start_encoder_pipeline`'s legacy
+/// constant of the same shape until 3c.4 deletes that path.
+/// 30 frames ≈ 1s at 30fps, well above the normal 1–2 frame
+/// pipeline depth for any healthy encoder.
+const ENCODER_SILENT_FRAMES_THRESHOLD: u64 = 30;
+
+impl WatchdogState {
+    fn new() -> Self {
+        Self {
+            frames_since_last_output: 0,
+            swap_done: false,
+        }
+    }
+
+    /// Record the result of one `encoder.encode` call. `produced` is
+    /// the number of encoded packets emitted (zero on silent-success
+    /// AND on encode-error — both are "no output reached the wire").
+    /// Returns `true` if the caller should attempt a fallback swap
+    /// AFTER this call. The watchdog never returns `true` more than
+    /// once per encoder lifetime — a failed fallback swap doesn't
+    /// re-arm.
+    fn record(&mut self, produced: usize) -> bool {
+        if produced > 0 {
+            self.frames_since_last_output = 0;
+            return false;
+        }
+        if self.swap_done {
+            return false;
+        }
+        self.frames_since_last_output += 1;
+        if self.frames_since_last_output >= ENCODER_SILENT_FRAMES_THRESHOLD {
+            self.swap_done = true;
+            self.frames_since_last_output = 0;
+            return true;
+        }
+        false
+    }
+}
+
+/// 3c.3b.4f: pool-path counterpart to `mod.rs::try_h264_fallback`.
+///
+/// Same invariants:
+///   - only fires for H.264 (no fallback for VP8 — libvpx doesn't
+///     exhibit the silent-failure pattern)
+///   - VA-API not already banned (if it is, we're already on
+///     libx264 and there's nothing better to swap to)
+///   - the new encoder constructs cleanly
+///
+/// Layer-aware: takes the existing [`LayerSpec`] so the replacement
+/// encoder is configured for the same width / height / bitrate /
+/// framerate as the original. The legacy mod.rs version takes raw
+/// `(width, height, bitrate=2000)` because legacy has only one
+/// shared encoder; pool has one per layer, each with its own spec.
+///
+/// On non-Linux targets there's no VA-API path to ban, so this is
+/// a no-op — same as the legacy `#[cfg(not(target_os = "linux"))]`
+/// arm.
+#[cfg(target_os = "linux")]
+fn try_h264_fallback_for_layer(
+    codec: CodecKind,
+    layer: &LayerSpec,
+) -> Option<Box<dyn super::Encoder>> {
+    if codec != CodecKind::H264 {
+        return None;
+    }
+    if super::h264_linux::is_vaapi_banned() {
+        return None;
+    }
+    super::h264_linux::ban_vaapi();
+    match super::select_codec_for_mime(
+        codec.mime(),
+        layer.width,
+        layer.height,
+        layer.target_bitrate_kbps,
+    ) {
+        Ok((enc, _)) => Some(enc),
+        Err(e) => {
+            eprintln!(
+                "[encoder/pool] watchdog: libx264 fallback creation failed: {}",
+                e,
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_h264_fallback_for_layer(
+    _codec: CodecKind,
+    _layer: &LayerSpec,
+) -> Option<Box<dyn super::Encoder>> {
+    None
+}
+
 /// Spawn the encoder driver thread with a pre-constructed [`super::Encoder`].
 /// Returns immediately; the thread runs until `shutdown.cancel()` or the
 /// i420 broadcast closes.
@@ -1782,9 +1897,16 @@ fn spawn_encoder_thread_with(
     let force_kf_for_thread = Arc::clone(&force_keyframe);
     let shutdown_for_thread = shutdown.clone();
     let id_for_log = id.clone();
+    // 3c.3b.4f: watchdog needs the codec + layer to attempt a
+    // fallback if the encoder goes silent. CodecKind is Copy;
+    // LayerSpec clones cheaply (no Arc, no Vec — just primitives
+    // + a SimulcastRid String).
+    let codec_for_thread = id.codec;
+    let layer_for_thread = layer.clone();
 
     std::thread::spawn(move || {
         let mut encoder = encoder;
+        let mut watchdog = WatchdogState::new();
 
         loop {
             if shutdown_for_thread.is_cancelled() {
@@ -1831,17 +1953,49 @@ fn spawn_encoder_thread_with(
 
             let force_kf = force_kf_for_thread.swap(false, Ordering::SeqCst);
 
-            match encoder.encode(&frame.data, duration_ms, force_kf) {
+            let produced = match encoder.encode(&frame.data, duration_ms, force_kf) {
                 Ok(packets) => {
+                    let n = packets.len();
                     for pkt in packets {
                         let ef = Arc::new(pkt.into_encoded_frame());
                         // Lossy broadcast: returns Err only if there
                         // are zero subscribers, which is fine.
                         let _ = frames_tx_for_thread.send(ef);
                     }
+                    n
                 }
                 Err(e) => {
                     eprintln!("[encoder/pool] {} encode error: {}", id_for_log, e);
+                    0
+                }
+            };
+
+            // 3c.3b.4f: silent-output watchdog. After 30 consecutive
+            // input frames produced no output, attempt a one-shot
+            // fallback swap (Linux H.264 → libx264). Mirrors the
+            // legacy bridge's watchdog at mod.rs::start_encoder_pipeline.
+            // Prevents h264_vaapi silent-failure (vaInitialize
+            // succeeds, no NALs ever emitted) from black-screening
+            // the stream forever.
+            if watchdog.record(produced) {
+                eprintln!(
+                    "[encoder/pool] {} watchdog: {} consecutive input \
+                     frames produced no output",
+                    id_for_log, ENCODER_SILENT_FRAMES_THRESHOLD,
+                );
+                if let Some(new_enc) =
+                    try_h264_fallback_for_layer(codec_for_thread, &layer_for_thread)
+                {
+                    eprintln!(
+                        "[encoder/pool] {} watchdog: swapped encoder to libx264 fallback",
+                        id_for_log,
+                    );
+                    encoder = new_enc;
+                } else {
+                    eprintln!(
+                        "[encoder/pool] {} watchdog: no fallback available, encoder stays",
+                        id_for_log,
+                    );
                 }
             }
         }
@@ -2609,6 +2763,82 @@ mod tests {
                 assert!(handle.force_keyframe.load(Ordering::SeqCst));
             }
         }
+    }
+
+    /// **3c.3b.4f WatchdogState contract.** Pinning the four
+    /// behaviors the encoder thread relies on:
+    ///   1. produced > 0 resets the silent-frame counter
+    ///   2. exactly `ENCODER_SILENT_FRAMES_THRESHOLD` consecutive
+    ///      silent frames trigger ONE swap-attempt request
+    ///   3. after the swap-attempt is recorded, the watchdog never
+    ///      fires again — even on continued silence (the fallback
+    ///      either succeeded or there's nothing better to swap to)
+    ///   4. interleaved silent/produced frames never accumulate
+    ///      across non-silent frames
+    /// Mirrors the legacy `mod.rs::start_encoder_pipeline` watchdog
+    /// state machine; this test pins the parity until 3c.4 deletes
+    /// that path.
+    #[test]
+    fn watchdog_state_contract() {
+        let mut w = WatchdogState::new();
+
+        // Behavior 1: produced > 0 keeps the counter at zero.
+        for _ in 0..50 {
+            assert!(!w.record(1));
+        }
+
+        // Behavior 2: silent frames accumulate; below threshold returns
+        // false; AT threshold returns true exactly once.
+        for i in 1..ENCODER_SILENT_FRAMES_THRESHOLD {
+            assert!(
+                !w.record(0),
+                "silent frame {i} below threshold must not fire watchdog",
+            );
+        }
+        assert!(
+            w.record(0),
+            "{}th silent frame must fire watchdog (swap request)",
+            ENCODER_SILENT_FRAMES_THRESHOLD,
+        );
+
+        // Behavior 3: post-swap latch — never fires again, even on
+        // continued silence well past the threshold.
+        for _ in 0..(ENCODER_SILENT_FRAMES_THRESHOLD * 3) {
+            assert!(
+                !w.record(0),
+                "post-swap watchdog must never fire again",
+            );
+        }
+        // Even produced > 0 followed by silence stays latched.
+        assert!(!w.record(2));
+        for _ in 0..(ENCODER_SILENT_FRAMES_THRESHOLD * 2) {
+            assert!(!w.record(0));
+        }
+    }
+
+    /// **3c.3b.4f WatchdogState reset behavior.** A produced frame
+    /// in the middle of an accumulating silent run resets the counter
+    /// to zero. Pre-fix bug class: any "stuck once accumulated"
+    /// implementation would fire prematurely on a partially-silent
+    /// pattern that's actually healthy (e.g. occasional skipped
+    /// frames in a normal encoder).
+    #[test]
+    fn watchdog_state_resets_counter_on_produced() {
+        let mut w = WatchdogState::new();
+
+        // Accumulate just below threshold.
+        for _ in 0..(ENCODER_SILENT_FRAMES_THRESHOLD - 1) {
+            assert!(!w.record(0));
+        }
+        // Single produced frame resets.
+        assert!(!w.record(1));
+        // After reset we can again accumulate up to (but not past)
+        // threshold without firing.
+        for _ in 0..(ENCODER_SILENT_FRAMES_THRESHOLD - 1) {
+            assert!(!w.record(0));
+        }
+        // The threshold-th silent frame after reset is what fires.
+        assert!(w.record(0));
     }
 
     /// End-to-end: push synthetic I420 frames through the pool and
