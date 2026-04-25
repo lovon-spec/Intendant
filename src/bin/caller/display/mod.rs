@@ -498,25 +498,38 @@ pub struct DisplaySession {
 }
 
 /// Parse the truthiness of an `INTENDANT_DISPLAY_POOL` env value
-/// (or any equivalent on/off flag). `Some("1")`, `Some("true")` (any
-/// case), `Some("TRUE")` → `true`. Everything else (`None`, empty
-/// string, `"0"`, `"false"`, garbage) → `false`.
+/// (or any equivalent on/off flag).
+///
+/// **3c.4a flipped the default.** Pool is now the default path; the
+/// flag is interpreted as opt-OUT, narrow. Only `Some("0")` and
+/// `Some("false")` (case-insensitive) explicitly disable pool mode
+/// and route through the legacy single-encoder fan-out. `None`,
+/// empty string, and any other value (including `"1"`, `"true"`,
+/// garbage) all enable pool mode.
+///
+/// The narrow opt-out matches the previous narrow opt-in: there are
+/// only two documented "pool off" values, mirroring the previous
+/// two "pool on" values. Operators who set `INTENDANT_DISPLAY_POOL=1`
+/// for the pre-flip rollout continue to get pool mode (no behavior
+/// change for them), and the flag remains an emergency rollback path
+/// until 3c.5 deletes both the env flag and the legacy code.
 ///
 /// Extracted from [`pool_mode_enabled`] so the parsing rules can be
 /// unit-tested without touching `std::env::var` (env mutation in
 /// parallel tests is racy across the cargo-test process).
 fn parse_pool_flag(value: Option<&str>) -> bool {
     match value {
-        Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        None => false,
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        _ => true,
     }
 }
 
-/// Whether `INTENDANT_DISPLAY_POOL=1` (or `=true`, case-insensitive)
-/// routes new offers through the encoder-pool path
-/// (`DisplaySession::handle_offer_pool_mode`). Default OFF — the
-/// legacy single-encoder fan-out is the live path until 3c.4 flips
-/// the default and 3c.5 deletes the legacy code.
+/// Whether the encoder-pool path
+/// (`DisplaySession::handle_offer_pool_mode`) is active. **Default
+/// ON** as of 3c.4a; opt out with `INTENDANT_DISPLAY_POOL=0` (or
+/// `=false`, case-insensitive) for emergency rollback to the legacy
+/// single-encoder fan-out. 3c.5 removes the env flag and deletes
+/// the legacy code entirely.
 ///
 /// Read per-call rather than at startup so an operator can flip the
 /// flag mid-session via `kill -HUP`-and-restart pattern (or, more
@@ -2322,16 +2335,17 @@ mod tests {
     // Phase 3c.3b.3: env-flag parsing
     // -----------------------------------------------------------------------
 
-    /// `1` → enabled. The canonical "set" value, matching the
-    /// primer's `INTENDANT_DISPLAY_POOL=1` recipe.
+    /// `1` → enabled. The canonical "set" value, kept compatible
+    /// with the pre-3c.4a `INTENDANT_DISPLAY_POOL=1` recipe so
+    /// operators who set it during the rollout continue to get pool
+    /// mode (no behavior change).
     #[test]
     fn parse_pool_flag_one_is_true() {
         assert!(parse_pool_flag(Some("1")));
     }
 
-    /// `true`, `True`, `TRUE`, `tRuE` → enabled. Case-insensitive
-    /// because env-var typing is finicky and we'd rather "obviously
-    /// truthy" works than make operators remember an exact spelling.
+    /// `true`, `True`, `TRUE`, `tRuE` → enabled. Same back-compat
+    /// rationale as `parse_pool_flag_one_is_true`.
     #[test]
     fn parse_pool_flag_true_is_case_insensitive() {
         for v in ["true", "True", "TRUE", "tRuE", "TRue"] {
@@ -2343,21 +2357,44 @@ mod tests {
         }
     }
 
-    /// Unset → disabled. The default is OFF until 3c.4 flips it.
+    /// **3c.4a flip.** Unset → enabled (was: disabled). Pool is
+    /// now the default path; operators don't have to set anything
+    /// to opt in.
     #[test]
-    fn parse_pool_flag_none_is_false() {
-        assert!(!parse_pool_flag(None));
+    fn parse_pool_flag_none_is_true_after_flip() {
+        assert!(
+            parse_pool_flag(None),
+            "post-3c.4a default is pool ON when INTENDANT_DISPLAY_POOL is unset",
+        );
     }
 
-    /// Anything else → disabled. Empty string, `0`, `false`, garbage.
-    /// We don't accept `yes`/`on` to stay narrow — `1` and `true`
-    /// are the documented recipe; anything else might be an accident.
+    /// **3c.4a flip.** Only `0` and `false` (case-insensitive)
+    /// explicitly opt OUT to legacy. Narrow opt-out mirroring the
+    /// previous narrow opt-in (`1` / `true`). Empty string, `yes`,
+    /// `no`, garbage all stay enabled — the operator either
+    /// affirmatively typed an opt-out value or they get the default.
     #[test]
-    fn parse_pool_flag_other_values_are_false() {
-        for v in ["", "0", "false", "False", "FALSE", "yes", "on", " 1", "1 ", "no", "garbage"] {
+    fn parse_pool_flag_zero_and_false_disable() {
+        for v in ["0", "false", "False", "FALSE", "fAlSe"] {
             assert!(
                 !parse_pool_flag(Some(v)),
-                "value {:?} must NOT enable pool mode (only `1` / `true` do)",
+                "value {:?} must DISABLE pool mode (legacy opt-out)",
+                v
+            );
+        }
+    }
+
+    /// **3c.4a flip.** Anything that isn't a documented opt-out
+    /// keeps pool ON. Includes obvious "off-ish" garbage like
+    /// "no" and "off" that we deliberately do NOT recognize as
+    /// opt-out — only `0` / `false` qualify (mirrors the pre-flip
+    /// narrowness around `1` / `true` for opt-in).
+    #[test]
+    fn parse_pool_flag_other_values_stay_enabled_after_flip() {
+        for v in ["", "yes", "on", " 0", "0 ", "no", "off", "garbage"] {
+            assert!(
+                parse_pool_flag(Some(v)),
+                "value {:?} must enable pool mode (only `0` / `false` opt out)",
                 v
             );
         }
