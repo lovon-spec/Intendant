@@ -485,6 +485,28 @@ pub struct EncoderHandle {
     /// signaling lock-free between the async pool API and the std::thread
     /// encoder loop.
     pub force_keyframe: Arc<AtomicBool>,
+    /// **Phase 4d.0**: per-encoder pause flag. When set, the encoder
+    /// thread drains its `i420_rx` broadcast subscription as usual
+    /// (so the channel doesn't lag) but skips the downscale + encode
+    /// + broadcast step entirely. Used by the layer-selection policy
+    /// (4d.2) to throttle layers no peer is consuming under current
+    /// bandwidth conditions, without tearing down the encoder slot
+    /// itself — resume is just a flag flip and the next captured frame
+    /// gets encoded.
+    ///
+    /// Behavior preserved across pause:
+    /// - `force_keyframe`: NOT consumed while paused, so a keyframe
+    ///   request that arrives during pause is honored on the first
+    ///   frame after resume — exactly the right thing for "viewer just
+    ///   subscribed to this layer, give them a fresh keyframe."
+    /// - Watchdog: not advanced while paused (otherwise a long pause
+    ///   would trip the silent-output threshold and trigger an
+    ///   unnecessary H.264 fallback on resume).
+    /// - Metrics: encoder doesn't count `encode_frames` /
+    ///   `encode_latency_us_sum` while paused (no work was done).
+    ///   `encode_drops` from broadcast lag still counts (lag reflects
+    ///   subscriber slowness, not pause state).
+    pub paused: Arc<AtomicBool>,
     /// Per-encoder shutdown signal. Cancelled by [`EncoderPool`] on
     /// release/drop. Encoder thread checks between frames and breaks
     /// cleanly on next iter. Distinct from "i420 broadcast closed" so
@@ -1746,6 +1768,104 @@ impl EncoderPool {
         count
     }
 
+    /// **Phase 4d.0**: pause one encoder slot, identified by
+    /// `(codec, rid)`. The slot's encoder thread keeps running and
+    /// keeps draining its `i420_rx` broadcast subscription (so the
+    /// channel doesn't lag), but skips the downscale + encode +
+    /// broadcast step entirely. Resume via [`Self::resume_layer`].
+    ///
+    /// Returns `true` if a matching slot was found and its pause flag
+    /// flipped to `true`; `false` if no slot exists for `(codec, rid)`.
+    /// Idempotent: pausing an already-paused slot returns `true` and
+    /// is a no-op for the encoder thread.
+    ///
+    /// Searches always-on slots first, then on-demand. Mirrors the
+    /// lookup pattern in [`Self::request_keyframe`] so a future code
+    /// path that does both (e.g. a layer-selection policy
+    /// pause-then-resume) sees consistent semantics.
+    ///
+    /// Used by the layer-selection policy (4d.2) to throttle layers
+    /// no peer is consuming under current TWCC bandwidth conditions.
+    /// Direct callers in production should be the aggregator only;
+    /// peer-side code never calls this directly.
+    pub fn pause_layer(&self, codec: CodecKind, rid: SimulcastRid) -> bool {
+        let id = EncoderId::new(codec, rid);
+        {
+            let always_on = self.inner.always_on.read().unwrap();
+            for handle in always_on.iter() {
+                if handle.id == id {
+                    handle.paused.store(true, Ordering::SeqCst);
+                    return true;
+                }
+            }
+        }
+        let on_demand = self.inner.on_demand.lock().unwrap();
+        if let Some(slot) = on_demand.get(&id) {
+            slot.handle.paused.store(true, Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+
+    /// **Phase 4d.0**: resume an encoder slot previously paused via
+    /// [`Self::pause_layer`]. Returns `true` if a matching slot was
+    /// found; `false` if no slot exists for `(codec, rid)`.
+    /// Idempotent: resuming an already-active slot is a no-op.
+    ///
+    /// Resume is fast — just an atomic flag flip — so the next
+    /// captured frame after the flip is encoded normally. Within
+    /// one capture interval (~33ms at 30fps) the resumed layer is
+    /// producing again.
+    ///
+    /// `force_keyframe` requests that arrived during the pause window
+    /// were preserved (the encoder thread skips the swap while
+    /// paused), so the first post-resume encode is a keyframe — what
+    /// every viewer subscribing to a freshly-resumed layer needs.
+    pub fn resume_layer(&self, codec: CodecKind, rid: SimulcastRid) -> bool {
+        let id = EncoderId::new(codec, rid);
+        {
+            let always_on = self.inner.always_on.read().unwrap();
+            for handle in always_on.iter() {
+                if handle.id == id {
+                    handle.paused.store(false, Ordering::SeqCst);
+                    return true;
+                }
+            }
+        }
+        let on_demand = self.inner.on_demand.lock().unwrap();
+        if let Some(slot) = on_demand.get(&id) {
+            slot.handle.paused.store(false, Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+
+    /// **Phase 4d.0**: query the pause state of an encoder slot.
+    /// Returns `Some(true)` if paused, `Some(false)` if active,
+    /// `None` if no slot exists for `(codec, rid)`.
+    ///
+    /// Caller-visible distinction between "paused" and "no slot" lets
+    /// the aggregator (4d.2) tell apart "I asked for a layer that
+    /// doesn't exist" (bug — should never reach here in production)
+    /// from "the layer is paused" (expected steady state under
+    /// bandwidth-constrained conditions).
+    pub fn is_layer_paused(&self, codec: CodecKind, rid: SimulcastRid) -> Option<bool> {
+        let id = EncoderId::new(codec, rid);
+        {
+            let always_on = self.inner.always_on.read().unwrap();
+            for handle in always_on.iter() {
+                if handle.id == id {
+                    return Some(handle.paused.load(Ordering::SeqCst));
+                }
+            }
+        }
+        let on_demand = self.inner.on_demand.lock().unwrap();
+        if let Some(slot) = on_demand.get(&id) {
+            return Some(slot.handle.paused.load(Ordering::SeqCst));
+        }
+        None
+    }
+
     /// Test-only access to the always-on handles. Lets tests verify
     /// pool composition without exposing internals to production code.
     ///
@@ -2006,11 +2126,17 @@ fn spawn_encoder_thread_with(
     let (frames_tx, _) =
         broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
     let force_keyframe = Arc::new(AtomicBool::new(false));
+    // Phase 4d.0: paused defaults to false. Layer-selection policy
+    // (4d.2) flips this via [`EncoderPool::pause_layer`] /
+    // [`EncoderPool::resume_layer`] when no peer is consuming the
+    // layer under current TWCC bandwidth conditions.
+    let paused = Arc::new(AtomicBool::new(false));
     let shutdown = CancellationToken::new();
 
     let mut i420_rx = i420_tx.subscribe();
     let frames_tx_for_thread = frames_tx.clone();
     let force_kf_for_thread = Arc::clone(&force_keyframe);
+    let paused_for_thread = Arc::clone(&paused);
     let shutdown_for_thread = shutdown.clone();
     let id_for_log = id.clone();
     // 3c.3b.4f: watchdog needs the codec + layer to attempt a
@@ -2095,6 +2221,26 @@ fn spawn_encoder_thread_with(
             // not produce another unit of output."
             if shutdown_for_thread.is_cancelled() {
                 break;
+            }
+
+            // Phase 4d.0: pause check. Done AFTER the shutdown
+            // re-check (so a paused encoder that's also shutting
+            // down exits cleanly) but BEFORE the force_keyframe
+            // swap (so a keyframe request that arrives during pause
+            // is preserved across pause→resume — the resume's first
+            // encode honors it). Watchdog is also skipped while
+            // paused: a long pause should not trip the silent-
+            // output threshold and trigger an unnecessary H.264
+            // fallback when we resume.
+            //
+            // Frame is consumed (we already `blocking_recv`'d above)
+            // and dropped — we don't try to keep it around for
+            // resume because i420 frames are pushed at capture rate
+            // (typically 30fps), so the next post-resume blocking_recv
+            // returns a fresh frame in ≤33ms. Buffering would just
+            // surface a stale frame.
+            if paused_for_thread.load(Ordering::SeqCst) {
+                continue;
             }
 
             let force_kf = force_kf_for_thread.swap(false, Ordering::SeqCst);
@@ -2197,6 +2343,7 @@ fn spawn_encoder_thread_with(
         layer,
         frames: frames_tx,
         force_keyframe,
+        paused,
         shutdown,
     }
 }
@@ -4079,5 +4226,308 @@ mod tests {
             h264_refcount.is_some(),
             "H.264 subscription presence must agree with refcount presence"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 4d.0: pause_layer / resume_layer / is_layer_paused
+    // -------------------------------------------------------------------
+
+    /// Default state: every encoder slot starts with `paused == false`,
+    /// and `is_layer_paused` reflects that. Pins the contract that
+    /// pool.subscribe wires up an active encoder, NOT a paused one
+    /// (the layer-selection policy in 4d.2 explicitly pauses; nothing
+    /// implicitly paused at construction).
+    #[tokio::test]
+    async fn pool_layer_paused_defaults_false() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        );
+
+        for rid in [SimulcastRid::full(), SimulcastRid::half(), SimulcastRid::quarter()] {
+            assert_eq!(
+                pool.is_layer_paused(CodecKind::Vp8, rid.clone()),
+                Some(false),
+                "VP8 simulcast layer {} must start un-paused",
+                rid.as_str(),
+            );
+        }
+    }
+
+    /// `pause_layer` flips the slot's atomic flag; `resume_layer`
+    /// flips it back. Each return `true` for known slots; both are
+    /// idempotent (pause-then-pause, resume-then-resume — the second
+    /// call is a no-op for the encoder thread but the API still
+    /// returns true since the slot exists).
+    #[tokio::test]
+    async fn pool_pause_resume_layer_toggles_flag() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        );
+
+        // Pause half — full and quarter stay active.
+        let paused = pool.pause_layer(CodecKind::Vp8, SimulcastRid::half());
+        assert!(paused, "pause_layer must return true for known slot");
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::half()),
+            Some(true)
+        );
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::full()),
+            Some(false),
+            "pausing one layer must not affect siblings"
+        );
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::quarter()),
+            Some(false)
+        );
+
+        // Idempotent pause: second call returns true, state unchanged.
+        let paused_again = pool.pause_layer(CodecKind::Vp8, SimulcastRid::half());
+        assert!(paused_again, "pause_layer is idempotent on already-paused slot");
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::half()),
+            Some(true)
+        );
+
+        // Resume.
+        let resumed = pool.resume_layer(CodecKind::Vp8, SimulcastRid::half());
+        assert!(resumed, "resume_layer must return true for known slot");
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::half()),
+            Some(false)
+        );
+
+        // Idempotent resume.
+        let resumed_again = pool.resume_layer(CodecKind::Vp8, SimulcastRid::half());
+        assert!(resumed_again, "resume_layer is idempotent on already-active slot");
+    }
+
+    /// Unknown `(codec, rid)` lookups return `false` from
+    /// pause/resume and `None` from is_layer_paused — distinct from
+    /// "paused" so the aggregator (4d.2) can distinguish "I asked
+    /// for a layer that doesn't exist" (bug) from "the layer is
+    /// paused" (expected steady state).
+    #[tokio::test]
+    async fn pool_pause_resume_unknown_layer_is_noop() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
+
+        // No H.264 always-on; no H.264 on-demand subscribed yet.
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::H264, SimulcastRid::full()),
+            None,
+            "is_layer_paused returns None for unknown (codec, rid)"
+        );
+        assert!(
+            !pool.pause_layer(CodecKind::H264, SimulcastRid::full()),
+            "pause_layer returns false for unknown (codec, rid)"
+        );
+        assert!(
+            !pool.resume_layer(CodecKind::H264, SimulcastRid::full()),
+            "resume_layer returns false for unknown (codec, rid)"
+        );
+
+        // VP8 quarter layer not in the single-layer pool either.
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::quarter()),
+            None
+        );
+    }
+
+    /// `force_keyframe` requests survive across pause windows: a
+    /// keyframe requested while paused is preserved in the flag (the
+    /// encoder thread never reaches the swap while paused), so the
+    /// first encoded frame after resume IS a keyframe. This is what
+    /// makes the layer-selection policy's "viewer subscribed to a
+    /// resumed layer" path immediately decodable.
+    #[tokio::test]
+    async fn pool_force_keyframe_survives_pause_window() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
+
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());
+        let fired = pool.request_keyframe(CodecKind::Vp8, Some(SimulcastRid::full()));
+        assert!(fired, "request_keyframe still admits while paused");
+
+        // The flag is set on the encoder handle. The encoder thread
+        // is paused, so it never reaches the `force_keyframe.swap`
+        // call — the flag stays set.
+        let handle_paused = &pool.always_on()[0];
+        assert!(
+            handle_paused.force_keyframe.load(Ordering::SeqCst),
+            "force_keyframe flag must be set on the handle while paused"
+        );
+
+        // Resume — the next encode (next captured frame) will swap
+        // the flag and produce a keyframe. We can't drive a real
+        // encoder here without a bridge feeding I420, but the flag
+        // surviving across pause is the contract the encoder loop
+        // depends on.
+        pool.resume_layer(CodecKind::Vp8, SimulcastRid::full());
+        let handle_resumed = &pool.always_on()[0];
+        assert!(
+            handle_resumed.force_keyframe.load(Ordering::SeqCst),
+            "force_keyframe flag must STILL be set after resume — \
+             the encoder thread will swap+consume on its next encode"
+        );
+    }
+
+    /// Pause/resume targets the right layer in a multi-layer pool.
+    /// Pause full, leave half + quarter active; verify each one's
+    /// state independently. Pins per-(codec, rid) routing so a
+    /// future refactor that switches the lookup data structure can't
+    /// accidentally collapse layer state.
+    #[tokio::test]
+    async fn pool_pause_resume_targets_correct_layer_in_simulcast() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        );
+
+        // Pause full only.
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::full()),
+            Some(true)
+        );
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::half()),
+            Some(false)
+        );
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::quarter()),
+            Some(false)
+        );
+
+        // Pause quarter while full is paused; verify both paused +
+        // half still active.
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::quarter());
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::full()),
+            Some(true)
+        );
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::half()),
+            Some(false)
+        );
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::quarter()),
+            Some(true)
+        );
+
+        // Resume full only — quarter stays paused.
+        pool.resume_layer(CodecKind::Vp8, SimulcastRid::full());
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::full()),
+            Some(false)
+        );
+        assert_eq!(
+            pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::quarter()),
+            Some(true)
+        );
+    }
+
+    /// **End-to-end behavioral test**: paused layer's encoder thread
+    /// consumes I420 frames (so the broadcast doesn't lag) but
+    /// produces NO encoded output. Resume restores production.
+    ///
+    /// Drives a real encoder via `push_i420_frame` (no mocking) and
+    /// observes the encoded-frames broadcast directly. This is the
+    /// contract the layer-selection policy (4d.2) actually relies on
+    /// — pausing must save real encoder CPU, not just flip a flag.
+    ///
+    /// The 200ms quiet-window assertion gives the encoder thread
+    /// plenty of time to wake from blocking_recv, see the pause flag,
+    /// and skip the encode. A real encode takes single-digit ms; if
+    /// the pause check were broken, frames would arrive within ~10ms
+    /// and the test would fail well within the window.
+    #[tokio::test]
+    async fn pool_paused_encoder_produces_no_frames_resume_restores() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
+
+        // Subscribe directly to the always-on full layer's broadcast.
+        // We hold this receiver to observe encoded output.
+        let mut frames_rx = {
+            let always_on = pool.always_on();
+            always_on[0].subscribe()
+        };
+
+        // Pause BEFORE pushing any frames. Push several I420 frames
+        // and verify nothing arrives on the broadcast within 200ms.
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());
+
+        let i420 = Arc::new(vec![0u8; 64 * 64 * 3 / 2]);
+        for _ in 0..5 {
+            pool.push_i420_frame(Arc::clone(&i420), Instant::now());
+        }
+
+        let quiet_window = std::time::Duration::from_millis(200);
+        match tokio::time::timeout(quiet_window, frames_rx.recv()).await {
+            Err(_timeout) => {
+                // Expected: no frames arrived during pause window.
+            }
+            Ok(Ok(_frame)) => {
+                panic!(
+                    "paused encoder produced an encoded frame within {}ms; \
+                     the pause flag check in the encoder loop is broken \
+                     (the encode + broadcast happened despite paused=true)",
+                    quiet_window.as_millis(),
+                );
+            }
+            Ok(Err(e)) => {
+                panic!("broadcast error during pause window: {e:?}");
+            }
+        }
+
+        // Resume — push a fresh frame and verify a frame arrives.
+        // The first post-resume encode should also be a keyframe
+        // (the encoder's natural cold-start behavior plus our
+        // implicit "first encode after a quiet period" treatment).
+        pool.resume_layer(CodecKind::Vp8, SimulcastRid::full());
+        pool.push_i420_frame(Arc::clone(&i420), Instant::now());
+
+        let active_window = std::time::Duration::from_secs(2);
+        match tokio::time::timeout(active_window, frames_rx.recv()).await {
+            Ok(Ok(_frame)) => {
+                // Got it — resume restored encoding.
+            }
+            Ok(Err(e)) => {
+                panic!("broadcast error after resume: {e:?}");
+            }
+            Err(_timeout) => {
+                panic!(
+                    "resumed encoder produced no frame within {}s — \
+                     the resume path is broken",
+                    active_window.as_secs(),
+                );
+            }
+        }
     }
 }
