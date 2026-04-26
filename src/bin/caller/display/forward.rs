@@ -290,6 +290,103 @@ pub fn codec_preferences_from_offer(sdp: &str) -> PeerCodecPreferences {
     PeerCodecPreferences::new(supported)
 }
 
+/// Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into
+/// the m=video section of an Offer SDP. This is the canonical impl
+/// for the recv-simulcast hint that rtc 0.9 (the answer side)
+/// requires before it'll emit `a=simulcast:send` in the answer.
+///
+/// **Mirror in JS**: `injectRecvSimulcastIntoVideoOffer` in
+/// `static/app.html`. The two implementations MUST stay in sync —
+/// the JS version is what real browsers run before
+/// `setLocalDescription`, this Rust version exists for unit testing
+/// the bug-fix corner cases (video-only SDP with trailing CRLF;
+/// video followed by m=application; idempotent re-call). Drift here
+/// vs JS means the two sides advertise different RID sets to the
+/// answerer and simulcast doesn't wire up.
+///
+/// ## Insertion-point logic
+///
+/// Naive `insert at end` breaks for video-only SDPs: an SDP ending
+/// with `\r\n` produces a trailing empty string when split on CRLF,
+/// and inserting at `lines.len()` puts the rid lines AFTER the blank
+/// SDP terminator. Some parsers treat that as garbage and drop the
+/// whole post-terminator block. The fix:
+///
+///   - If a later `m=` section exists, insert immediately before it
+///     (pushes that section down — the canonical multi-m-section case).
+///   - If `m=video` is the last `m=` section (video-only SDP), back
+///     up past any trailing empty strings and insert before them.
+///     The rid lines land as the LAST attribute lines of the m=video
+///     section; the SDP terminator(s) stay at the end.
+///
+/// ## Idempotency
+///
+/// Returns `sdp` unchanged if the m=video section already declares
+/// `a=simulcast:`. The browser side can re-call without checking
+/// (the reconnect / re-offer paths recreate the RTCPeerConnection
+/// from a previous offer's SDP).
+///
+/// ## No-op cases
+///
+/// - `rids` empty → return sdp unchanged.
+/// - No `m=video` section → return sdp unchanged.
+/// - `m=video` already has `a=simulcast:` → return sdp unchanged.
+pub fn inject_recv_simulcast_into_video_offer(sdp: &str, rids: &[&str]) -> String {
+    if rids.is_empty() {
+        return sdp.to_string();
+    }
+    let mut lines: Vec<String> = sdp.split("\r\n").map(|s| s.to_string()).collect();
+
+    let mut video_start: Option<usize> = None;
+    let mut next_section: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("m=video") {
+            video_start = Some(i);
+        } else if line.starts_with("m=") && video_start.is_some() {
+            next_section = Some(i);
+            break;
+        }
+    }
+
+    let video_start = match video_start {
+        Some(i) => i,
+        None => return sdp.to_string(),
+    };
+
+    // Insertion point: before next m= section if found, otherwise
+    // back up past trailing empty lines (the CRLF-terminator-induced
+    // blank from `split("\r\n")`) so we don't insert AFTER the SDP
+    // body terminator.
+    let insert_at = match next_section {
+        Some(i) => i,
+        None => {
+            let mut i = lines.len();
+            while i > video_start + 1 && lines[i - 1].is_empty() {
+                i -= 1;
+            }
+            i
+        }
+    };
+
+    // Idempotent: skip if m=video section already declares simulcast.
+    for line in &lines[video_start..insert_at] {
+        if line.starts_with("a=simulcast:") {
+            return sdp.to_string();
+        }
+    }
+
+    let mut inject: Vec<String> = rids
+        .iter()
+        .map(|rid| format!("a=rid:{rid} recv"))
+        .collect();
+    inject.push(format!("a=simulcast:recv {}", rids.join(";")));
+
+    let tail = lines.split_off(insert_at);
+    lines.extend(inject);
+    lines.extend(tail);
+    lines.join("\r\n")
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -549,5 +646,210 @@ mod tests {
         let s = format!("{}", e);
         assert!(s.contains("h264"));
         assert!(s.contains("f"));
+    }
+
+    // -------------------------------------------------------------------
+    // inject_recv_simulcast_into_video_offer — Phase 4c follow-up tests
+    // -------------------------------------------------------------------
+
+    /// Canonical multi-section case: video followed by m=application.
+    /// Insertion happens immediately before m=application; the
+    /// application section's attrs are preserved untouched and the
+    /// rid+simulcast lines land inside the m=video section.
+    #[test]
+    fn inject_recv_simulcast_video_first_application_after() {
+        let sdp = "v=0\r\n\
+                   o=- 1 2 IN IP4 0.0.0.0\r\n\
+                   s=-\r\n\
+                   t=0 0\r\n\
+                   a=group:BUNDLE 0 1\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   c=IN IP4 0.0.0.0\r\n\
+                   a=mid:0\r\n\
+                   a=recvonly\r\n\
+                   a=rtpmap:96 VP8/90000\r\n\
+                   m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                   c=IN IP4 0.0.0.0\r\n\
+                   a=mid:1\r\n\
+                   a=sctp-port:5000\r\n";
+
+        let out = inject_recv_simulcast_into_video_offer(sdp, &["f", "h", "q"]);
+
+        let video_idx = out.find("m=video").expect("m=video preserved");
+        let app_idx = out.find("m=application").expect("m=application preserved");
+        let simulcast_idx = out
+            .find("a=simulcast:recv f;h;q")
+            .expect("a=simulcast:recv injected");
+        let rid_f_idx = out.find("a=rid:f recv").expect("a=rid:f recv injected");
+
+        assert!(video_idx < rid_f_idx, "rid:f after m=video");
+        assert!(rid_f_idx < simulcast_idx, "rid lines before simulcast line");
+        assert!(
+            simulcast_idx < app_idx,
+            "simulcast lines must land inside m=video, BEFORE m=application; \
+             got:\n{out}"
+        );
+
+        // m=application section integrity: its own attrs come right
+        // after its m= line, no garbage interleaved.
+        let app_section = &out[app_idx..];
+        assert!(app_section.contains("a=mid:1"));
+        assert!(app_section.contains("a=sctp-port:5000"));
+    }
+
+    /// **The bug-fix scenario from review.** Video as final m= section
+    /// with the SDP terminating in CRLF: `split("\r\n")` produces a
+    /// trailing empty string. Naive `splice(lines.len(), ...)` would
+    /// insert AFTER the blank SDP body terminator, putting the rid
+    /// lines outside the m=video section where parsers may drop them.
+    ///
+    /// The fix: when no later m= section exists, back up past
+    /// trailing empties before splicing. This test pins that no
+    /// blank line appears strictly between m=video and a=simulcast
+    /// in the output.
+    #[test]
+    fn inject_recv_simulcast_video_only_with_trailing_crlf() {
+        let sdp = "v=0\r\n\
+                   o=- 1 2 IN IP4 0.0.0.0\r\n\
+                   s=-\r\n\
+                   t=0 0\r\n\
+                   a=group:BUNDLE 0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   c=IN IP4 0.0.0.0\r\n\
+                   a=mid:0\r\n\
+                   a=recvonly\r\n\
+                   a=rtpmap:96 VP8/90000\r\n";
+
+        let out = inject_recv_simulcast_into_video_offer(sdp, &["f", "h", "q"]);
+
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        let video_idx = lines
+            .iter()
+            .position(|l| l.starts_with("m=video"))
+            .expect("m=video preserved");
+        let simulcast_idx = lines
+            .iter()
+            .position(|l| l.starts_with("a=simulcast:"))
+            .expect("a=simulcast: injected");
+
+        assert!(simulcast_idx > video_idx, "simulcast comes after m=video");
+        for (i, line) in lines
+            .iter()
+            .enumerate()
+            .take(simulcast_idx)
+            .skip(video_idx + 1)
+        {
+            assert!(
+                !line.is_empty(),
+                "no blank line allowed between m=video and a=simulcast \
+                 (would put simulcast outside the video section); found \
+                 empty line at index {i}\nfull output:\n{out}"
+            );
+        }
+
+        assert!(
+            out.ends_with("\r\n"),
+            "trailing CRLF terminator preserved; got tail bytes: {:?}",
+            out.as_bytes().get(out.len().saturating_sub(4)..)
+        );
+    }
+
+    /// Video as final m= section without the trailing CRLF (split
+    /// produces no trailing empty string). Insertion happens at
+    /// `lines.len()` directly — the back-up-past-empties branch
+    /// short-circuits when there ARE no trailing empties.
+    #[test]
+    fn inject_recv_simulcast_video_only_no_trailing_crlf() {
+        let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0";
+
+        let out = inject_recv_simulcast_into_video_offer(sdp, &["f"]);
+
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        let mid_idx = lines
+            .iter()
+            .position(|l| l.starts_with("a=mid"))
+            .expect("a=mid preserved");
+        let rid_idx = lines
+            .iter()
+            .position(|l| l.starts_with("a=rid:f"))
+            .expect("a=rid:f injected");
+        let simulcast_idx = lines
+            .iter()
+            .position(|l| l.starts_with("a=simulcast:"))
+            .expect("a=simulcast: injected");
+
+        assert!(mid_idx < rid_idx, "rid line after pre-existing m=video attrs");
+        assert!(rid_idx < simulcast_idx);
+    }
+
+    /// Idempotent: an SDP that already declares `a=simulcast:` in its
+    /// m=video section is returned unchanged (reconnect / re-offer
+    /// safety — the browser-side caller doesn't have to check before
+    /// re-applying).
+    #[test]
+    fn inject_recv_simulcast_idempotent_on_already_present() {
+        let sdp = "v=0\r\n\
+                   o=- 1 2 IN IP4 0.0.0.0\r\n\
+                   s=-\r\n\
+                   t=0 0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=mid:0\r\n\
+                   a=rid:f recv\r\n\
+                   a=simulcast:recv f;h;q\r\n";
+
+        let out = inject_recv_simulcast_into_video_offer(sdp, &["f", "h", "q"]);
+        assert_eq!(
+            out, sdp,
+            "no-op on SDP that already declares a=simulcast"
+        );
+    }
+
+    /// Empty `rids` slice → no-op. Caller bug if this is reached in
+    /// production; the helper just returns the input unchanged.
+    #[test]
+    fn inject_recv_simulcast_empty_rids_is_noop() {
+        let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n";
+        assert_eq!(inject_recv_simulcast_into_video_offer(sdp, &[]), sdp);
+    }
+
+    /// No m=video section → no-op. Audio-only offers don't apply for
+    /// our display flow but the helper is defensively safe.
+    #[test]
+    fn inject_recv_simulcast_no_video_section_is_noop() {
+        let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n";
+        assert_eq!(
+            inject_recv_simulcast_into_video_offer(sdp, &["f", "h", "q"]),
+            sdp
+        );
+    }
+
+    /// SDP ending with multiple trailing CRLFs (`\r\n\r\n`) — split
+    /// produces multiple trailing empties. The back-up loop must
+    /// step past all of them so the simulcast line still lands inside
+    /// the m=video section, not after the blank lines.
+    #[test]
+    fn inject_recv_simulcast_video_only_with_multiple_trailing_crlfs() {
+        let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n\r\n\r\n";
+
+        let out = inject_recv_simulcast_into_video_offer(sdp, &["f"]);
+
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        let video_idx = lines.iter().position(|l| l.starts_with("m=video")).unwrap();
+        let simulcast_idx = lines
+            .iter()
+            .position(|l| l.starts_with("a=simulcast:"))
+            .unwrap();
+        for (i, line) in lines
+            .iter()
+            .enumerate()
+            .take(simulcast_idx)
+            .skip(video_idx + 1)
+        {
+            assert!(
+                !line.is_empty(),
+                "no empty line allowed between m=video and a=simulcast; \
+                 found empty at index {i}\nfull output:\n{out}"
+            );
+        }
     }
 }

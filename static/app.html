@@ -11053,6 +11053,24 @@ const DISPLAY_SIMULCAST_RIDS = ['f', 'h', 'q'];
 // `setLocalDescription` so the local description matches the wire
 // payload exactly.
 //
+// **Mirror of**: `inject_recv_simulcast_into_video_offer` in
+// `src/bin/caller/display/forward.rs`. The Rust impl is the
+// canonical source — it has the unit tests pinning the corner cases
+// (video as final m= section with trailing CRLF; video followed by
+// m=application; idempotent re-call). Drift here vs Rust means the
+// browser advertises a different RID set than the answer-side test
+// expects and simulcast doesn't wire up. Keep both in sync.
+//
+// Insertion-point logic (matches the Rust impl):
+//   - If a later m= section exists, insert immediately before it
+//     (canonical multi-m-section case — the section gets pushed down).
+//   - If m=video is the LAST m= section (video-only SDP), back up
+//     past trailing empty strings before splicing. An SDP ending
+//     with CRLF makes `split('\r\n')` produce a trailing empty
+//     string; splicing at `lines.length` would put the rid lines
+//     AFTER the blank SDP body terminator, which some parsers treat
+//     as out-of-band garbage and drop.
+//
 // Idempotent: returns `sdp` unchanged if the m=video section already
 // declares `a=simulcast:` — avoids double-injection on the
 // reconnect / re-offer paths that recreate the RTCPeerConnection
@@ -11070,22 +11088,40 @@ function injectRecvSimulcastIntoVideoOffer(sdp, rids) {
   if (!rids || rids.length === 0) return sdp;
   const lines = sdp.split('\r\n');
   let videoStart = -1;
-  let videoEnd = lines.length;
+  let nextSection = -1;
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].startsWith('m=video')) {
       videoStart = i;
     } else if (lines[i].startsWith('m=') && videoStart >= 0) {
-      videoEnd = i;
+      nextSection = i;
       break;
     }
   }
   if (videoStart < 0) return sdp;
-  for (let i = videoStart; i < videoEnd; i++) {
+
+  // Insertion point: before next m= section if found, otherwise
+  // back up past any trailing empty lines from the SDP's CRLF
+  // terminator(s) so we don't insert AFTER the blank SDP body
+  // terminator. See the Rust impl's doc-comment for the full
+  // rationale.
+  let insertAt;
+  if (nextSection >= 0) {
+    insertAt = nextSection;
+  } else {
+    insertAt = lines.length;
+    while (insertAt > videoStart + 1 && lines[insertAt - 1] === '') {
+      insertAt--;
+    }
+  }
+
+  // Idempotent: skip if m=video section already declares simulcast.
+  for (let i = videoStart; i < insertAt; i++) {
     if (lines[i].startsWith('a=simulcast:')) return sdp;
   }
+
   const inject = rids.map(rid => `a=rid:${rid} recv`);
   inject.push(`a=simulcast:recv ${rids.join(';')}`);
-  lines.splice(videoEnd, 0, ...inject);
+  lines.splice(insertAt, 0, ...inject);
   return lines.join('\r\n');
 }
 
