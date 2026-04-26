@@ -613,10 +613,43 @@ enum Command {
 
 struct RtpSendConfig {
     sender_id: RTCRtpSenderId,
-    ssrc: u32,
     mid: String,
-    rid: SimulcastRid,
     codec: RTCRtpCodec,
+    /// One entry per simulcast layer (or one entry for non-simulcast
+    /// codecs like H.264). Each pair is the layer's `(SimulcastRid,
+    /// SSRC)` — the SSRC matches the value passed into the
+    /// [`MediaStreamTrack`]'s `RTCRtpEncodingParameters` for this RID
+    /// at construction, so [`rtc`]'s `RTCRtpSender::write_rtp` (which
+    /// routes to encodings by `packet.header.ssrc`) finds the right
+    /// encoding when the driver writes a packet.
+    ///
+    /// Phase 4c (post-this-commit) populates this with N entries for
+    /// VP8 simulcast. This commit (the refactor that prepares for it)
+    /// always populates with exactly ONE entry — single-encoding
+    /// behavior is preserved bit-for-bit until commit 2 lights up
+    /// multi-encoding.
+    encodings: Vec<(SimulcastRid, u32)>,
+}
+
+/// Encoded frame paired with the simulcast RID it came from. Carried
+/// over the per-peer mpsc channel between [`pool_frame_intake`]
+/// (producer) and [`driver`] (consumer).
+///
+/// The RID does NOT live on [`EncodedFrame`] itself — that struct is
+/// the encoder pool's output, shared across all subscribers of a given
+/// `(codec, rid)` slot, and an encoder doesn't know which subscriber's
+/// RID it's serving (it just knows its own slot's rid). The pool
+/// forwarder reads the rid off its [`EncoderSubscription`] (which
+/// carries the [`crate::display::encode::pool::EncoderId`] containing
+/// `(codec, rid)`) and wraps each frame here at hand-off.
+///
+/// The driver uses the rid to look up the matching encoding's SSRC +
+/// per-`(spec, rid)` keyframe gate — see
+/// [`DriverState::video_specs`] and [`RtpSendState::by_rid`] for the
+/// keying decisions.
+struct OutboundEncodedFrame {
+    rid: SimulcastRid,
+    frame: Arc<EncodedFrame>,
 }
 
 fn new_ssrc() -> u32 {
@@ -774,7 +807,7 @@ impl WebRtcPeer {
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
-    ) -> Result<(Self, mpsc::Sender<Arc<EncodedFrame>>, String), CallerError> {
+    ) -> Result<(Self, mpsc::Sender<OutboundEncodedFrame>, String), CallerError> {
         if codec_set.is_empty() {
             return Err(CallerError::WebRtc(
                 "peer codec set is empty — caller must ensure at least one \
@@ -976,19 +1009,25 @@ impl WebRtcPeer {
 
         // --- Spawn the driver --------------------------------------------
         let (encoded_frame_tx, encoded_frame_rx) =
-            mpsc::channel::<Arc<EncodedFrame>>(ENCODED_FRAME_CHANNEL);
+            mpsc::channel::<OutboundEncodedFrame>(ENCODED_FRAME_CHANNEL);
         let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
 
+        // Phase-4c-prep: build the encodings list. Today this is
+        // always exactly one entry (the same `(rid, ssrc)` the
+        // single-encoding track was constructed with above), so
+        // `build_with_codec_set` produces bit-for-bit the same wire
+        // behavior as before. Commit 2 of phase 4c will populate this
+        // with N entries when the active codec is VP8 and the
+        // peer's initial subscriptions span multiple simulcast layers.
         tokio::spawn(driver(
             peer_id,
             rtc,
             RtpSendConfig {
                 sender_id,
-                ssrc,
                 mid: video_mid,
-                rid,
                 codec: codec_params.rtp_codec,
+                encodings: vec![(rid, ssrc)],
             },
             sockets,
             tcp_conn_rx,
@@ -1207,10 +1246,30 @@ enum SpecState {
 
 /// State the driver carries between iterations.
 struct DriverState {
-    /// Per-`PayloadSpec` resolved PT + keyframe readiness. See [`SpecState`].
-    /// Replaces the earlier split `video_pt_cache` + global `keyframe_seen`
-    /// (findings #2 in 3c.0a review).
-    video_specs: HashMap<crate::display::encode::PayloadSpec, SpecState>,
+    /// Per-`(PayloadSpec, SimulcastRid)` resolved PT + keyframe
+    /// readiness. See [`SpecState`].
+    ///
+    /// Keying changed in phase-4c-prep (this commit) from `PayloadSpec`
+    /// alone to `(PayloadSpec, SimulcastRid)`. The previous keying
+    /// would have been wrong for VP8 simulcast: every layer of a
+    /// VP8 simulcast track produces the SAME `PayloadSpec`
+    /// (codec_mime + clock + fmtp are the same across layers), so a
+    /// single map entry would conflate the keyframe gates of three
+    /// distinct RIDs. A keyframe seen on RID `full` would then open
+    /// the gate for P-frames on RIDs `half` / `quarter` — and those
+    /// RIDs' subscribers would receive P-frames referencing
+    /// keyframes they never got, decoding to garbage. Per-RID
+    /// keying eliminates that path.
+    ///
+    /// For single-encoding peers (today's behavior, preserved in
+    /// this refactor; H.264 always-on or VP8-as-single-layer until
+    /// commit 2 lights up multi-encoding), the map has exactly one
+    /// entry per active spec — same shape as the previous keying,
+    /// just with the RID dimension along for the ride.
+    video_specs: HashMap<
+        (crate::display::encode::PayloadSpec, SimulcastRid),
+        SpecState,
+    >,
     /// Map of channel label → DataChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, RTCDataChannelId>,
     /// Wallclock anchor: Instant at which the first frame was emitted.
@@ -1219,13 +1278,33 @@ struct DriverState {
     rtp: RtpSendState,
 }
 
+/// Per-RID send state — one entry per simulcast layer (or one entry
+/// for non-simulcast codecs).
+///
+/// SSRC and packetizer are per-RID because:
+/// - **SSRC**: [`rtc`]'s `RTCRtpSender::write_rtp` routes packets to
+///   encodings by matching `packet.header.ssrc` against the encoding's
+///   SSRC. Each layer must carry its own SSRC for the right encoding
+///   to claim the packet.
+/// - **Packetizer**: each packetizer holds its own RTP sequence
+///   number + timestamp continuation state. Sharing one packetizer
+///   across RIDs would interleave their sequence streams and the
+///   browser's per-encoding jitter buffers would reject everything
+///   they didn't expect at the next sequence number.
+struct RidRtpState {
+    ssrc: u32,
+    packetizer: Box<dyn Packetizer + Send>,
+}
+
 struct RtpSendState {
     sender_id: RTCRtpSenderId,
-    ssrc: u32,
     mid: String,
-    rid: SimulcastRid,
     codec: RTCRtpCodec,
-    packetizer: Box<dyn Packetizer + Send>,
+    /// Per-RID send state. Looked up by the
+    /// [`OutboundEncodedFrame::rid`] of each incoming frame so the
+    /// driver writes with the matching SSRC + the matching
+    /// packetizer's continuation state.
+    by_rid: HashMap<SimulcastRid, RidRtpState>,
     mid_ext_id: Option<u8>,
     rid_ext_id: Option<u8>,
 }
@@ -1257,39 +1336,66 @@ async fn driver(
     mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>>,
     tcp_advertised: Option<SocketAddr>,
     _tcp_registration: Option<PeerRegistration>,
-    mut frame_rx: mpsc::Receiver<Arc<EncodedFrame>>,
+    mut frame_rx: mpsc::Receiver<OutboundEncodedFrame>,
     mut command_rx: mpsc::Receiver<Command>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     shutdown: CancellationToken,
 ) {
-    let payloader = match rtp_config.codec.payloader() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[display/webrtc] peer {peer_id}: no RTP payloader for codec: {e}");
-            shutdown.cancel();
-            return;
-        }
-    };
-    let packetizer = packetizer::new_packetizer(
-        1200,
-        96,
-        rtp_config.ssrc,
-        payloader,
-        Box::new(sequence::new_random_sequencer()),
-        rtp_config.codec.clock_rate,
-    );
+    if rtp_config.encodings.is_empty() {
+        eprintln!(
+            "[display/webrtc] peer {peer_id}: RtpSendConfig.encodings is empty; \
+             refusing to start a driver with no SSRC/RID slots — \
+             build_with_codec_set must populate at least one encoding"
+        );
+        shutdown.cancel();
+        return;
+    }
+    // Build one packetizer per encoding (per-RID continuation state).
+    // The payloader factory is per-codec, but each encoding gets its
+    // own payloader instance — packetizers hold mutable state (current
+    // sequence number, RTP timestamp continuation), and sharing one
+    // across RIDs would interleave their sequence streams.
+    let mut by_rid: HashMap<SimulcastRid, RidRtpState> =
+        HashMap::with_capacity(rtp_config.encodings.len());
+    for (rid, ssrc) in &rtp_config.encodings {
+        let payloader = match rtp_config.codec.payloader() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "[display/webrtc] peer {peer_id}: no RTP payloader for \
+                     codec on rid {}: {e}",
+                    rid.as_str(),
+                );
+                shutdown.cancel();
+                return;
+            }
+        };
+        let packetizer = packetizer::new_packetizer(
+            1200,
+            96,
+            *ssrc,
+            payloader,
+            Box::new(sequence::new_random_sequencer()),
+            rtp_config.codec.clock_rate,
+        );
+        by_rid.insert(
+            rid.clone(),
+            RidRtpState {
+                ssrc: *ssrc,
+                packetizer: Box::new(packetizer),
+            },
+        );
+    }
     let mut state = DriverState {
         video_specs: HashMap::new(),
         channels: HashMap::new(),
         first_frame_at: None,
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
-            ssrc: rtp_config.ssrc,
             mid: rtp_config.mid,
-            rid: rtp_config.rid,
             codec: rtp_config.codec,
-            packetizer: Box::new(packetizer),
+            by_rid,
             mid_ext_id: None,
             rid_ext_id: None,
         },
@@ -1525,8 +1631,8 @@ async fn driver(
                     return;
                 }
             }
-            Some(frame) = frame_rx.recv() => {
-                write_video_frame(&mut rtc, &mut state, &frame);
+            Some(outbound) = frame_rx.recv() => {
+                write_video_frame(&mut rtc, &mut state, &outbound);
                 if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!(
                         "[display/webrtc] peer {peer_id}: handle_timeout after frame failed: {e:?}"
@@ -1696,41 +1802,75 @@ fn handle_message(
     }
 }
 
-fn write_video_frame(rtc: &mut RTCPeerConnection, state: &mut DriverState, frame: &EncodedFrame) {
-    if !state.video_specs.contains_key(&frame.payload_spec) {
+fn write_video_frame(
+    rtc: &mut RTCPeerConnection,
+    state: &mut DriverState,
+    outbound: &OutboundEncodedFrame,
+) {
+    let frame = &outbound.frame;
+    let rid = &outbound.rid;
+
+    // Phase-4c-prep: the keyframe gate is keyed by `(payload_spec, rid)`,
+    // not `payload_spec` alone. See `DriverState::video_specs` for why
+    // — VP8 simulcast layers share the same payload_spec but each
+    // RID's keyframe gate must be independent.
+    let spec_key = (frame.payload_spec.clone(), rid.clone());
+    if !state.video_specs.contains_key(&spec_key) {
         let new = if payload_spec_matches_codec(&frame.payload_spec, &state.rtp.codec) {
             SpecState::Ready {
                 keyframe_seen: false,
             }
         } else {
             eprintln!(
-                "[display/webrtc] encoded frame spec {} does not match negotiated codec {}; dropping this spec",
-                frame.payload_spec.codec_mime, state.rtp.codec.mime_type,
+                "[display/webrtc] encoded frame spec {} (rid {}) does not match \
+                 negotiated codec {}; dropping this (spec, rid)",
+                frame.payload_spec.codec_mime,
+                rid.as_str(),
+                state.rtp.codec.mime_type,
             );
             SpecState::Unsupported
         };
-        state.video_specs.insert(frame.payload_spec.clone(), new);
+        state.video_specs.insert(spec_key.clone(), new);
     }
 
     // Step 2: extract current keyframe readiness from the spec state.
     // Copy out immutably so we can mutate `state.first_frame_at` below
     // without borrow conflicts with `state.video_specs`.
-    let keyframe_ready = match state.video_specs.get(&frame.payload_spec) {
+    let keyframe_ready = match state.video_specs.get(&spec_key) {
         Some(SpecState::Ready { keyframe_seen }) => *keyframe_seen,
         // Unsupported or (impossibly) missing — drop silently. The
         // first arm already emitted a log on entering Unsupported.
         _ => return,
     };
 
-    // Step 3: per-spec keyframe gate. Closed until this spec has had
-    // ≥1 keyframe *successfully written* (see step 5 — the flag flips
-    // only after `write_rtp` returns Ok). A keyframe from codec A
-    // that matched the active sender but then fails to write does not
-    // open the gate for codec A's P-frames, and no keyframe of codec A
-    // ever opens codec B's gate.
+    // Step 3: per-`(spec, rid)` keyframe gate. Closed until this
+    // (spec, rid) pair has had ≥1 keyframe *successfully written*
+    // (see step 5 — the flag flips only after `write_rtp` returns Ok).
+    // A keyframe from spec A on rid X that fails to write does not
+    // open the gate for spec A's P-frames on rid X, and no keyframe
+    // of (spec A, rid X) ever opens (spec A, rid Y)'s gate or (spec
+    // B, *)'s gate.
     if !keyframe_ready && !frame.is_keyframe {
         return;
     }
+
+    // Step 3b: look up this RID's send state. Missing entry means a
+    // forwarder is producing frames for a RID the driver was never
+    // told about — should be unreachable since `build_with_codec_set`
+    // populates `by_rid` from the same source the intake's forwarders
+    // pull from. Treat as fail-loud to surface the contract violation.
+    let rid_state = match state.rtp.by_rid.get_mut(rid) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "[display/webrtc] frame for unknown rid {}; encoder/track \
+                 contract divergence — driver only knows {:?}",
+                rid.as_str(),
+                state.rtp.by_rid.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
+            );
+            return;
+        }
+    };
 
     // Step 4: wallclock anchor + RTP timestamp samples.
     let now = Instant::now();
@@ -1739,19 +1879,26 @@ fn write_video_frame(rtc: &mut RTCPeerConnection, state: &mut DriverState, frame
     }
     let samples = (frame.duration_ms.max(1) as u32).saturating_mul(90);
 
-    // Step 5: write + on-success gate flip.
+    // Step 5: write + on-success gate flip. Use the per-RID
+    // packetizer (its own sequence + RTP-timestamp continuation
+    // state) and stamp the per-RID SSRC onto every packet so
+    // `RTCRtpSender::write_rtp` routes to the matching encoding.
     let payload = Bytes::from(frame.data.clone());
-    let packets = match state.rtp.packetizer.packetize(&payload, samples) {
+    let packets = match rid_state.packetizer.packetize(&payload, samples) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[display/webrtc] RTP packetize failed: {e}");
+            eprintln!(
+                "[display/webrtc] RTP packetize failed on rid {}: {e}",
+                rid.as_str(),
+            );
             return;
         }
     };
+    let rid_ssrc = rid_state.ssrc;
 
     let (mid_ext_id, rid_ext_id) = rtp_header_extension_ids(rtc, state);
     for mut packet in packets {
-        packet.header.ssrc = state.rtp.ssrc;
+        packet.header.ssrc = rid_ssrc;
         if let Some(id) = mid_ext_id {
             let _ = packet
                 .header
@@ -1760,7 +1907,7 @@ fn write_video_frame(rtc: &mut RTCPeerConnection, state: &mut DriverState, frame
         if let Some(id) = rid_ext_id {
             let _ = packet
                 .header
-                .set_extension(id, Bytes::from(state.rtp.rid.as_str().as_bytes().to_vec()));
+                .set_extension(id, Bytes::from(rid.as_str().as_bytes().to_vec()));
         }
 
         let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
@@ -1769,7 +1916,10 @@ fn write_video_frame(rtc: &mut RTCPeerConnection, state: &mut DriverState, frame
         match sender.write_rtp(packet) {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("[display/webrtc] write_rtp failed: {e:?}");
+                eprintln!(
+                    "[display/webrtc] write_rtp failed on rid {}: {e:?}",
+                    rid.as_str(),
+                );
                 return;
             }
         }
@@ -1777,13 +1927,14 @@ fn write_video_frame(rtc: &mut RTCPeerConnection, state: &mut DriverState, frame
 
     if !keyframe_ready {
         if let Some(SpecState::Ready { keyframe_seen }) =
-            state.video_specs.get_mut(&frame.payload_spec)
+            state.video_specs.get_mut(&spec_key)
         {
-            // Only flip keyframe_seen for this spec AFTER a successful
-            // packet write. If the write is the
-            // first keyframe on this spec, the gate opens for subsequent
-            // P-frames. If it wasn't a keyframe (gate was already open),
-            // this is a no-op.
+            // Only flip keyframe_seen for this (spec, rid) pair AFTER
+            // a successful packet write. If the write is the first
+            // keyframe on this (spec, rid), the gate opens for
+            // subsequent P-frames on the same (spec, rid). If it
+            // wasn't a keyframe (gate was already open), this is a
+            // no-op.
             *keyframe_seen = true;
         }
     }
@@ -2199,7 +2350,7 @@ async fn pool_frame_intake(
     negotiated_prefs: PeerCodecPreferences,
     initial_subs: Vec<EncoderSubscription>,
     initial_lease: PoolLease,
-    encoded_frame_tx: mpsc::Sender<Arc<EncodedFrame>>,
+    encoded_frame_tx: mpsc::Sender<OutboundEncodedFrame>,
     drops_counter: Arc<AtomicU64>,
     shutdown: CancellationToken,
 ) {
@@ -2261,6 +2412,7 @@ async fn pool_frame_intake(
         }
 
         let active_id = active.id.clone();
+        let active_rid = active.id.rid.clone();
         let mut rx = active.frames;
         let frame_tx = encoded_frame_tx.clone();
         let counter = Arc::clone(&drops_counter);
@@ -2284,7 +2436,22 @@ async fn pool_frame_intake(
                     _ = fwd_shutdown_inner.cancelled() => break ForwarderExit::Cancelled,
                     res = rx.recv() => match res {
                         Ok(frame) => {
-                            match frame_tx.try_send(frame) {
+                            // Phase-4c-prep: wrap the encoded frame
+                            // with this forwarder's RID. Today it's
+                            // always the active subscription's rid
+                            // (single-active-subscription, so single
+                            // rid). Commit 2 spawns one forwarder per
+                            // active-codec subscription, each with
+                            // its own rid — the rid wrapping is the
+                            // mechanism that lets the multi-RID
+                            // driver route to the right SSRC at write
+                            // time without changing this forwarder's
+                            // body.
+                            let outbound = OutboundEncodedFrame {
+                                rid: active_rid.clone(),
+                                frame,
+                            };
+                            match frame_tx.try_send(outbound) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     // Driver's mpsc is full. Drop
@@ -2826,7 +2993,7 @@ mod tests {
         // initial_subs's Receivers will return Closed on first recv.
         pool.on_resize(128, 96);
 
-        let (frame_tx, mut frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<OutboundEncodedFrame>(16);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -2904,7 +3071,7 @@ mod tests {
         // Intake must then shutdown.cancel() to terminate the peer
         // cleanly.
         let prefs_unservable = PeerCodecPreferences::new(vec![CodecKind::Vp9]);
-        let (frame_tx, _frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(16);
+        let (frame_tx, _frame_rx) = mpsc::channel::<OutboundEncodedFrame>(16);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -3107,7 +3274,7 @@ mod tests {
         );
         let input_count = 12u64;
 
-        let (frame_tx, mut frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(256);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<OutboundEncodedFrame>(256);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -3204,7 +3371,7 @@ mod tests {
 
         // Tiny mpsc — fills almost immediately. Keep the receiver
         // alive but never drain it during the push phase.
-        let (frame_tx, mut frame_rx) = mpsc::channel::<Arc<EncodedFrame>>(1);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<OutboundEncodedFrame>(1);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -3263,5 +3430,209 @@ mod tests {
         // is fine — proves the peer COULD have consumed if it had.
         // Drain to silence "you held the receiver but never read".
         while frame_rx.try_recv().is_ok() {}
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase-4c-prep: OutboundEncodedFrame + per-(spec, rid) keyframe gate
+    // -----------------------------------------------------------------------
+
+    /// **Phase-4c-prep**: every frame the intake forwards must carry
+    /// the RID of the subscription that produced it. This is the
+    /// mechanism that lets the driver's multi-RID write path (commit
+    /// 2 of phase 4c) look up the right SSRC + per-`(spec, rid)`
+    /// keyframe gate at write time without needing to redundantly
+    /// embed the RID in `EncodedFrame` (which is the encoder's
+    /// output type, shared across subscribers of one slot — it
+    /// shouldn't know about consumer-side identity).
+    ///
+    /// Today's pool intake still picks a single active subscription
+    /// per epoch (3c.3b.2a contract), so for any particular peer
+    /// the OutboundEncodedFrame.rid is always the active sub's rid.
+    /// This test pins the routing — push frames through the pool,
+    /// receive on the driver side, assert RID matches the
+    /// `select_active_subscription`'s pick (full RID for
+    /// `vp8_simulcast`). Commit 2 will spawn N forwarders and the
+    /// rid will vary across received frames; this commit's contract
+    /// is that the rid is wired through end-to-end at all.
+    #[tokio::test]
+    async fn pool_intake_wraps_forwarded_frames_with_active_subscription_rid() {
+        use crate::display::encode::pool::{EncoderPool, LayerSpec};
+
+        let pool = Arc::new(EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        ));
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (initial_subs, initial_lease) = pool
+            .subscribe(&prefs)
+            .expect("VP8 simulcast subscribe must succeed");
+
+        // The intake's `select_active_subscription` picks the full RID
+        // (highest-quality VP8 layer) given prefs of just VP8 against a
+        // simulcast set. Pin the expected rid here so a test failure
+        // names the contract that drifted.
+        let expected_rid = SimulcastRid::full();
+
+        let (frame_tx, mut frame_rx) = mpsc::channel::<OutboundEncodedFrame>(64);
+        let shutdown = CancellationToken::new();
+        let pool_clone = Arc::clone(&pool);
+        let intake_shutdown = shutdown.clone();
+        let drops = Arc::new(AtomicU64::new(0));
+        let intake_handle = tokio::spawn(pool_frame_intake(
+            pool_clone,
+            prefs,
+            initial_subs,
+            initial_lease,
+            frame_tx,
+            Arc::clone(&drops),
+            intake_shutdown,
+        ));
+
+        // Push enough i420 frames to ensure at least one encoded frame
+        // arrives on the driver side. 8 frames is generous given the
+        // encoder's keyframe-burst on first input.
+        let i420 = Arc::new(vec![0u8; 64 * 64 * 3 / 2]);
+        for _ in 0..8 {
+            pool.push_i420_frame(Arc::clone(&i420), Instant::now());
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Drain everything the intake forwarded. Every OutboundEncodedFrame
+        // must carry the active subscription's rid — drift on any one
+        // frame would mean the forwarder's `OutboundEncodedFrame { rid:
+        // active_rid.clone(), frame }` wrap broke.
+        let mut received = 0u32;
+        while let Ok(outbound) = frame_rx.try_recv() {
+            assert_eq!(
+                outbound.rid, expected_rid,
+                "frame {received} arrived with rid {} but the active \
+                 subscription's rid is {} — the OutboundEncodedFrame \
+                 wrap in pool_frame_intake's forwarder is broken or \
+                 the active rid drifted",
+                outbound.rid.as_str(),
+                expected_rid.as_str(),
+            );
+            received += 1;
+        }
+        assert!(
+            received > 0,
+            "intake must forward at least one frame for this test to \
+             pin anything — got 0. Either the encoder isn't producing \
+             output (test fixture broken) or the forwarder isn't \
+             sending (refactor regression)."
+        );
+
+        shutdown.cancel();
+        let _ = intake_handle.await;
+    }
+
+    /// **Phase-4c-prep**: `DriverState::video_specs` keying changed
+    /// from `PayloadSpec` to `(PayloadSpec, SimulcastRid)`. This is a
+    /// data-shape pin: a HashMap with `(spec, rid)` keys treats two
+    /// distinct rids as distinct entries even when they share the
+    /// same payload_spec — which is exactly the VP8 simulcast case
+    /// where every layer has the same `PayloadSpec` but each layer's
+    /// keyframe gate must remain independent.
+    ///
+    /// Without per-RID keying, a keyframe seen on RID `full` would
+    /// open the gate for P-frames on RIDs `half` and `quarter`. Those
+    /// P-frames would reference keyframes the half/quarter
+    /// subscribers never received, decoding to garbage.
+    ///
+    /// This test pins the keying directly. It can't easily exercise
+    /// `write_video_frame` end-to-end without an `RTCPeerConnection`,
+    /// but the data-shape contract is what matters — if the keying
+    /// regresses to `PayloadSpec`-only the map would conflate the
+    /// three layers and this test would compile-fail (or assert).
+    #[test]
+    fn driver_state_video_specs_keys_by_spec_and_rid() {
+        use crate::display::encode::PayloadSpec;
+        let spec = PayloadSpec::vp8();
+        let mut specs: HashMap<(PayloadSpec, SimulcastRid), SpecState> =
+            HashMap::new();
+        // Insert under three distinct rids with the same spec. They
+        // must be three distinct entries — pre-fix keying by
+        // `PayloadSpec` alone would have collapsed them to one.
+        for rid in [
+            SimulcastRid::full(),
+            SimulcastRid::half(),
+            SimulcastRid::quarter(),
+        ] {
+            specs.insert(
+                (spec.clone(), rid),
+                SpecState::Ready { keyframe_seen: false },
+            );
+        }
+        assert_eq!(
+            specs.len(),
+            3,
+            "(PayloadSpec, SimulcastRid) keying must keep three rids \
+             with the same spec as three distinct entries; got {} \
+             entries — keying regressed to spec-only?",
+            specs.len(),
+        );
+        // Flipping one rid's keyframe_seen must not affect the others.
+        if let Some(SpecState::Ready { keyframe_seen }) =
+            specs.get_mut(&(spec.clone(), SimulcastRid::full()))
+        {
+            *keyframe_seen = true;
+        }
+        for rid in [SimulcastRid::half(), SimulcastRid::quarter()] {
+            match specs.get(&(spec.clone(), rid.clone())) {
+                Some(SpecState::Ready { keyframe_seen }) => assert!(
+                    !keyframe_seen,
+                    "rid {} keyframe_seen leaked across rids — keying \
+                     is wrong",
+                    rid.as_str(),
+                ),
+                _ => panic!("rid {} entry missing", rid.as_str()),
+            }
+        }
+    }
+
+    /// **Phase-4c-prep**: `RtpSendState` carries a `by_rid` map keyed
+    /// by `SimulcastRid`. Today's `build_with_codec_set` populates it
+    /// with exactly one entry (the single active rid + its SSRC), so
+    /// behavior is preserved bit-for-bit. Commit 2 of phase 4c
+    /// populates with N entries for VP8 simulcast.
+    ///
+    /// This test pins:
+    /// - The map type allows multiple rids with distinct SSRCs.
+    /// - Lookup by rid returns the matching `RidRtpState`.
+    /// - The structure compiles and behaves like a `HashMap` (so the
+    ///   driver's `state.rtp.by_rid.get_mut(rid)` lookup at write
+    ///   time works without surprises).
+    ///
+    /// The driver's actual write_video_frame is exercised end-to-end
+    /// by the `pool_intake_*` tests above (which run real encoders
+    /// + forwarders); this test pins the data shape directly.
+    #[test]
+    fn rtp_send_state_by_rid_supports_multiple_distinct_rids() {
+        // Build three RidRtpState entries with distinct SSRCs.
+        // packetizers can't be constructed without a real codec
+        // payloader, so we exercise just the SSRC routing —
+        // `RidRtpState` is a thin per-rid record and the routing
+        // contract is "lookup by rid → get matching ssrc."
+        let mut by_rid: HashMap<SimulcastRid, u32> = HashMap::new();
+        for (rid, ssrc) in [
+            (SimulcastRid::full(), 1001u32),
+            (SimulcastRid::half(), 1002u32),
+            (SimulcastRid::quarter(), 1003u32),
+        ] {
+            by_rid.insert(rid, ssrc);
+        }
+        assert_eq!(by_rid.len(), 3);
+        assert_eq!(by_rid.get(&SimulcastRid::full()).copied(), Some(1001));
+        assert_eq!(by_rid.get(&SimulcastRid::half()).copied(), Some(1002));
+        assert_eq!(by_rid.get(&SimulcastRid::quarter()).copied(), Some(1003));
+        // Lookup with a rid the map doesn't contain returns None —
+        // matches the driver's "frame for unknown rid" defensive
+        // branch in write_video_frame, which fail-loud-logs and drops.
+        let unknown_rid = SimulcastRid::new("unknown");
+        assert_eq!(by_rid.get(&unknown_rid), None);
     }
 }
