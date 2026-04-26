@@ -3767,6 +3767,17 @@ mod tests {
     /// `a=rtpmap`). Used by the build_with_codec_set integration
     /// tests below to drive `RTCPeerConnection::create_answer`
     /// without standing up a real browser.
+    ///
+    /// **Phase 4c follow-up (b)**: includes the recv-side simulcast
+    /// hint (`a=rid:f/h/q recv` + `a=simulcast:recv f;h;q`) plus the
+    /// repaired-rtp-stream-id extmap so the answer-side simulcast
+    /// path is exercised by the test the same way the production
+    /// browser side now exercises it (via the
+    /// `injectRecvSimulcastIntoVideoOffer` helper in static/app.html).
+    /// Without the offer's `recv` advertisement, rtc 0.9 omits
+    /// `a=simulcast:send` from the answer regardless of how many
+    /// encodings the track has — see the test's panic message for
+    /// the full reasoning.
     fn synth_recvonly_video_offer_for_rtc() -> String {
         concat!(
             "v=0\r\n",
@@ -3782,6 +3793,11 @@ mod tests {
             "a=rtpmap:96 VP8/90000\r\n",
             "a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid\r\n",
             "a=extmap:2 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n",
+            "a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id\r\n",
+            "a=rid:f recv\r\n",
+            "a=rid:h recv\r\n",
+            "a=rid:q recv\r\n",
+            "a=simulcast:recv f;h;q\r\n",
             "a=ice-ufrag:testufrag1234\r\n",
             "a=ice-pwd:testpassword12345678901234\r\n",
             "a=fingerprint:sha-256 ",
