@@ -66,6 +66,8 @@ use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::packetizer::{self, Packetizer};
 use rtc::rtp::sequence;
+use rtc::statistics::report::RTCStatsReportEntry;
+use rtc::statistics::stats::RTCStatsType;
 use rtc::statistics::StatsSelector;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
@@ -654,7 +656,53 @@ pub struct WebRtcPeer {
     /// needs a remote signal — RTCP RR `fraction_lost` per SSRC,
     /// TWCC arrival feedback, browser-side `getStats` — see 4d.3.
     observed_send_bitrate_rx: watch::Receiver<Option<u64>>,
+    /// **Phase 4d.3a**: per-peer per-RID receiver-feedback health,
+    /// derived from inbound RTCP RR via rtc 0.9's
+    /// `RTCRemoteInboundRtpStreamStats` (the only RR-derived signal
+    /// rtc 0.9 actually populates — see
+    /// [`Self::observed_send_bitrate_rx`] for why local egress is
+    /// the wrong proxy for capacity). Refreshed by the driver every
+    /// `TWCC_POLL_INTERVAL` from the same `get_stats` call that
+    /// drives `observed_send_bitrate`.
+    ///
+    /// Initial value is the empty map ("no RR has arrived for any
+    /// SSRC yet"); per-RID entries appear as RRs arrive. A RID
+    /// missing from the map means no signal yet for that layer —
+    /// the 4d.3b/c policy treats missing as "stay conservative,
+    /// don't act on absence."
+    ///
+    /// **Phase 4d.3a is observation only.** No layer decisions are
+    /// made from this signal. 4d.3b adds the pure policy
+    /// (per-(peer, RID) wanted-set + hysteresis); 4d.3c wires the
+    /// aggregator to react.
+    remote_inbound_health_rx: watch::Receiver<HashMap<SimulcastRid, PeerLayerHealth>>,
     shutdown: CancellationToken,
+}
+
+/// **Phase 4d.3a**: per-RID receiver-feedback health, derived from a
+/// single `RTCRemoteInboundRtpStreamStats` entry (one outbound SSRC's
+/// RR-reported state). Surfaced to the layer-selection aggregator via
+/// [`WebRtcPeer::subscribe_remote_inbound_health`].
+///
+/// All fields come straight from rtc 0.9's RR accumulator (no delta
+/// computation in 4d.3a — 4d.3b decides which signals to use and how).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerLayerHealth {
+    /// Fraction of packets lost on this layer in the most recent RR
+    /// window, 0.0-1.0. RR-derived: instantaneous, not cumulative.
+    /// The most actionable signal for "this layer's link can't
+    /// sustain it right now."
+    pub fraction_lost: f64,
+    /// Cumulative packets lost on this layer since the connection
+    /// started, as reported by the most recent RR. Signed because
+    /// the upstream field is `i64` (negative values shouldn't occur
+    /// in practice; surfaced as-is so callers can defend or assert
+    /// per their needs).
+    pub packets_lost_total: i64,
+    /// Most recent round-trip time on this layer in seconds, from
+    /// RTCP SR/RR exchange. `0.0` until the first RTT measurement
+    /// lands.
+    pub round_trip_time_seconds: f64,
 }
 
 impl WebRtcPeer {
@@ -682,6 +730,36 @@ impl WebRtcPeer {
     /// [`Self::subscribe_observed_send_bitrate`].
     pub fn current_observed_send_bitrate(&self) -> Option<u64> {
         *self.observed_send_bitrate_rx.borrow()
+    }
+
+    /// **Phase 4d.3a**: subscribe to this peer's per-RID receiver-
+    /// feedback health signal. RR-derived (RTCP receiver reports
+    /// the remote sends to us about our outbound streams) — unlike
+    /// `observed_send_bitrate`, this IS a remote signal and CAN
+    /// drive capacity decisions in 4d.3b/c.
+    ///
+    /// Returns a fresh `watch::Receiver` that always carries the
+    /// latest published map (initial value is the empty map until
+    /// the driver completes its first poll AND the first RR has
+    /// arrived for at least one outbound SSRC).
+    ///
+    /// Receivers are independent — multiple subscribers (e.g. the
+    /// layer-selection aggregator AND a metrics dashboard) can each
+    /// `subscribe_remote_inbound_health` and read independently.
+    pub fn subscribe_remote_inbound_health(
+        &self,
+    ) -> watch::Receiver<HashMap<SimulcastRid, PeerLayerHealth>> {
+        self.remote_inbound_health_rx.clone()
+    }
+
+    /// **Phase 4d.3a**: read the current per-RID receiver-feedback
+    /// health snapshot without subscribing. Returns the empty map
+    /// until the first RR has arrived. For change-driven consumers,
+    /// prefer [`Self::subscribe_remote_inbound_health`].
+    pub fn current_remote_inbound_health(
+        &self,
+    ) -> HashMap<SimulcastRid, PeerLayerHealth> {
+        self.remote_inbound_health_rx.borrow().clone()
     }
 }
 
@@ -1141,6 +1219,15 @@ impl WebRtcPeer {
         // rate (None still until any RTP has actually been sent).
         let (observed_send_bitrate_tx, observed_send_bitrate_rx) =
             watch::channel::<Option<u64>>(None);
+        // Phase 4d.3a: per-peer per-RID receiver-feedback health
+        // (RR-derived, populated from rtc 0.9's
+        // `RTCRemoteInboundRtpStreamStats`). Initial value is the
+        // empty map: no RR has arrived yet. Per-RID entries appear
+        // as RRs land for each outbound SSRC. Layer-selection
+        // policy (4d.3b/c) treats missing RIDs as "no signal yet,
+        // stay conservative" rather than as "healthy."
+        let (remote_inbound_health_tx, remote_inbound_health_rx) =
+            watch::channel::<HashMap<SimulcastRid, PeerLayerHealth>>(HashMap::new());
         let shutdown = CancellationToken::new();
 
         // Phase 4c: pass the full per-RID encoding map through to the
@@ -1168,6 +1255,7 @@ impl WebRtcPeer {
             clipboard_handler,
             keyframe_request_tx,
             observed_send_bitrate_tx,
+            remote_inbound_health_tx,
             shutdown.clone(),
         ));
 
@@ -1176,6 +1264,7 @@ impl WebRtcPeer {
                 peer_id,
                 command_tx,
                 observed_send_bitrate_rx,
+                remote_inbound_health_rx,
                 shutdown,
             },
             encoded_frame_tx,
@@ -1515,6 +1604,7 @@ async fn driver(
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     observed_send_bitrate_tx: watch::Sender<Option<u64>>,
+    remote_inbound_health_tx: watch::Sender<HashMap<SimulcastRid, PeerLayerHealth>>,
     shutdown: CancellationToken,
 ) {
     if rtp_config.encodings.is_empty() {
@@ -1877,6 +1967,37 @@ async fn driver(
                     Instant::now(),
                 );
                 observed_send_bitrate_tx.send_replace(bitrate);
+
+                // Phase 4d.3a: project remote-inbound-rtp entries
+                // (RR-derived, the field set rtc 0.9 actually
+                // populates per `accumulator/rtp_stream/outbound.rs`)
+                // into per-RID health, mapping outbound SSRCs back
+                // through `state.rtp.by_rid`. Empty map publishes
+                // every poll until the first RR arrives — receivers
+                // see `borrow()` returning the empty map and can
+                // distinguish "no signal yet" from "healthy."
+                let ssrc_table: Vec<(SimulcastRid, u32)> = state
+                    .rtp
+                    .by_rid
+                    .iter()
+                    .map(|(rid, s)| (rid.clone(), s.ssrc))
+                    .collect();
+                let remote_inbound_iter = report
+                    .iter_by_type(RTCStatsType::RemoteInboundRTP)
+                    .filter_map(|entry| match entry {
+                        RTCStatsReportEntry::RemoteInboundRtp(s) => Some((
+                            s.received_rtp_stream_stats.rtp_stream_stats.ssrc,
+                            s.fraction_lost,
+                            s.received_rtp_stream_stats.packets_lost,
+                            s.round_trip_time,
+                        )),
+                        _ => None,
+                    });
+                let health = map_remote_inbound_to_rid_health(
+                    remote_inbound_iter,
+                    &ssrc_table,
+                );
+                remote_inbound_health_tx.send_replace(health);
             }
         }
     }
@@ -2030,6 +2151,50 @@ fn handle_event(
 /// a usable delta sample. Total is summed across SSRCs because
 /// the layer-selection decision is per-peer (the peer's outbound
 /// link is the bottleneck, not any individual encoding).
+/// **Phase 4d.3a**: project per-SSRC remote-inbound stats (RR-derived,
+/// from rtc 0.9's `RTCRemoteInboundRtpStreamStats` accumulator) onto
+/// the per-RID SSRC table the driver maintains in `state.rtp.by_rid`.
+/// Returns one [`PeerLayerHealth`] entry per recognized RID; SSRCs not
+/// present in the table (transient renegotiation windows, on-demand
+/// codecs we don't carry per-RID, RR for an SSRC we never advertised)
+/// are silently dropped — same defensive policy as the per-RID PLI
+/// router in [`route_rtcp_keyframe_requests`].
+///
+/// Pure: takes flat `(ssrc, fraction_lost, packets_lost, rtt)` tuples
+/// rather than `&RTCRemoteInboundRtpStreamStats` so tests can
+/// construct synthetic inputs directly without the rtc 0.9
+/// `pub(crate)` constructor walls. Production projection from
+/// `report.iter_by_type(RTCStatsType::RemoteInboundRTP)` happens at
+/// the caller (the driver's `twcc_poll` branch).
+///
+/// **No deltas in 4d.3a.** All input fields are forwarded as-is:
+/// `fraction_lost` is already a per-RR-window value (rtc 0.9 derives
+/// it from RR), `packets_lost` is cumulative-since-start (deltas can
+/// be derived in 4d.3b if the policy needs them), `rtt` is the most
+/// recent measurement. Keeping the helper purely projective lets
+/// 4d.3b decide which signals to use without re-shaping this layer.
+fn map_remote_inbound_to_rid_health(
+    remote_inbound: impl IntoIterator<Item = (u32, f64, i64, f64)>,
+    ssrc_table: &[(SimulcastRid, u32)],
+) -> HashMap<SimulcastRid, PeerLayerHealth> {
+    let mut out = HashMap::new();
+    for (ssrc, fraction_lost, packets_lost_total, round_trip_time_seconds) in
+        remote_inbound
+    {
+        if let Some(rid) = rid_for_ssrc(ssrc_table, ssrc) {
+            out.insert(
+                rid,
+                PeerLayerHealth {
+                    fraction_lost,
+                    packets_lost_total,
+                    round_trip_time_seconds,
+                },
+            );
+        }
+    }
+    out
+}
+
 fn extract_recent_outbound_bitrate(
     current: impl IntoIterator<Item = (u32, u64)>,
     prev: &mut HashMap<u32, (u64, Instant)>,
@@ -4929,5 +5094,180 @@ mod tests {
         // path (which errors out upstream, but the lookup must still
         // be a no-op rather than a panic if it's reached).
         assert_eq!(rid_for_ssrc(&[], 0xAAAA_0001), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4d.3a: map_remote_inbound_to_rid_health helper tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn map_remote_inbound_empty_input_returns_empty_map() {
+        // No RR data yet — common steady state immediately after a
+        // peer connects but before the first RR has been received.
+        // The watch publishes the empty map; consumers see "no
+        // signal yet" rather than a stale or fabricated reading.
+        let table = vp8_simulcast_ssrc_table();
+        let out = map_remote_inbound_to_rid_health(std::iter::empty(), &table);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn map_remote_inbound_unknown_ssrc_dropped_silently() {
+        // RR for an SSRC we don't carry per-RID (transient
+        // renegotiation, on-demand H.264 SSRC outside the simulcast
+        // RID table, RR for an SSRC we never advertised). Same
+        // defensive policy as `route_rtcp_keyframe_requests`: drop
+        // silently rather than fail, since these can occur in the
+        // normal lifecycle and aren't actionable.
+        let table = vp8_simulcast_ssrc_table();
+        let out = map_remote_inbound_to_rid_health(
+            vec![(0xDEAD_BEEFu32, 0.05, 42, 0.018)],
+            &table,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn map_remote_inbound_all_known_ssrcs_mapped_to_rids() {
+        let table = vp8_simulcast_ssrc_table();
+        let out = map_remote_inbound_to_rid_health(
+            vec![
+                (0xAAAA_0001u32, 0.01, 5, 0.012),  // full
+                (0xAAAA_0002u32, 0.05, 23, 0.018), // half
+                (0xAAAA_0003u32, 0.20, 99, 0.025), // quarter
+            ],
+            &table,
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out.get(&SimulcastRid::full()),
+            Some(&PeerLayerHealth {
+                fraction_lost: 0.01,
+                packets_lost_total: 5,
+                round_trip_time_seconds: 0.012,
+            })
+        );
+        assert_eq!(
+            out.get(&SimulcastRid::half()),
+            Some(&PeerLayerHealth {
+                fraction_lost: 0.05,
+                packets_lost_total: 23,
+                round_trip_time_seconds: 0.018,
+            })
+        );
+        assert_eq!(
+            out.get(&SimulcastRid::quarter()),
+            Some(&PeerLayerHealth {
+                fraction_lost: 0.20,
+                packets_lost_total: 99,
+                round_trip_time_seconds: 0.025,
+            })
+        );
+    }
+
+    #[test]
+    fn map_remote_inbound_mixed_known_and_unknown_keeps_only_known() {
+        // A realistic transient-window state: RR for one
+        // simulcast layer arrives alongside RR for a now-released
+        // on-demand H.264 SSRC. Helper preserves the known RID
+        // entry, drops the unknown.
+        let table = vp8_simulcast_ssrc_table();
+        let out = map_remote_inbound_to_rid_health(
+            vec![
+                (0xAAAA_0002u32, 0.07, 30, 0.020), // half (known)
+                (0xCAFE_BABEu32, 0.50, 200, 0.100), // unknown
+            ],
+            &table,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out.get(&SimulcastRid::half()),
+            Some(&PeerLayerHealth {
+                fraction_lost: 0.07,
+                packets_lost_total: 30,
+                round_trip_time_seconds: 0.020,
+            })
+        );
+        assert!(!out.contains_key(&SimulcastRid::full()));
+        assert!(!out.contains_key(&SimulcastRid::quarter()));
+    }
+
+    #[test]
+    fn map_remote_inbound_empty_ssrc_table_drops_everything() {
+        // Defends the early-session window before `state.rtp.by_rid`
+        // is fully populated (or after teardown clears it). Every
+        // RR that arrives has nothing to map against; helper returns
+        // empty rather than panicking on the lookup.
+        let out = map_remote_inbound_to_rid_health(
+            vec![
+                (0xAAAA_0001u32, 0.0, 0, 0.0),
+                (0xAAAA_0002u32, 0.0, 0, 0.0),
+            ],
+            &[],
+        );
+        assert!(out.is_empty());
+    }
+
+    /// **Phase 4d.3a**: a freshly-constructed `WebRtcPeer` exposes a
+    /// remote-inbound-health watch that starts at the empty map (the
+    /// watch channel's initial value). The driver's first poll
+    /// publishes whatever's in `report.iter_by_type(RTCStatsType::RemoteInboundRTP)`
+    /// at that moment — empty until any RR has arrived.
+    ///
+    /// In this test there's no real ICE flow, so no RTP is ever sent
+    /// and no RR is ever received → the steady state is the empty
+    /// map.
+    ///
+    /// Pin both APIs:
+    /// - `current_remote_inbound_health()` for one-shot reads.
+    /// - `subscribe_remote_inbound_health()` for change-driven consumers
+    ///   (the layer-selection aggregator in 4d.3c).
+    #[tokio::test]
+    async fn web_rtc_peer_exposes_remote_inbound_health_api_starting_at_empty() {
+        ensure_rustls_crypto_provider();
+        let offer_sdp = synth_recvonly_video_offer_for_rtc();
+        let active_rids = vec![SimulcastRid::full()];
+        let ice_config = IceConfig::default();
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
+            Arc::new(|_| {});
+        let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
+        let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let (peer, _frame_tx, _answer_sdp) = WebRtcPeer::build_with_codec_set(
+            44,
+            &offer_sdp,
+            CodecKind::Vp8,
+            &active_rids,
+            &ice_config,
+            None,
+            None,
+            input_handler,
+            clipboard_handler,
+            ice_tx,
+            kf_tx,
+        )
+        .await
+        .expect("build_with_codec_set must succeed");
+
+        // One-shot read: empty map initially.
+        let snapshot = peer.current_remote_inbound_health();
+        assert!(
+            snapshot.is_empty(),
+            "freshly-constructed peer's remote-inbound-health snapshot \
+             must be empty until the driver projects a non-empty \
+             remote-inbound-rtp set into per-RID health; got {snapshot:?}",
+        );
+
+        // Subscriber: initial `borrow` returns empty too. Mirrors
+        // `current_remote_inbound_health` for the initial state.
+        let rx = peer.subscribe_remote_inbound_health();
+        assert!(rx.borrow().is_empty());
+        // Independent receivers: a second subscribe returns its own
+        // receiver carrying the same initial value.
+        let rx2 = peer.subscribe_remote_inbound_health();
+        assert!(rx2.borrow().is_empty());
+
+        drop(peer);
     }
 }
