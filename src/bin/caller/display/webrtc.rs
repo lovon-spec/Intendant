@@ -2120,37 +2120,6 @@ fn handle_event(
     false
 }
 
-/// **Phase 4d.1**: compute the per-peer recent observed send bitrate
-/// (bits per second) from the deltas of `bytes_sent` across all
-/// outbound RTP streams over one polling window.
-///
-/// **What this signals**: how much data the peer is actually pushing
-/// onto the wire right now, summed across simulcast layers + RTX
-/// streams. NOT a congestion-control bandwidth estimate (rtc 0.9
-/// doesn't expose one — see `TWCC_POLL_INTERVAL` for why). The
-/// layer-selection aggregator (4d.2) interprets this as "delivery
-/// rate the peer's encoder + network are sustaining." A drop from
-/// the encoder's configured target indicates either encoder
-/// underrun or network constraint; either way, it's a layer-
-/// selection signal.
-///
-/// `current` is `(ssrc, bytes_sent)` for each outbound stream,
-/// projected from `report.outbound_rtp_streams()` at the production
-/// caller. `prev` is the per-SSRC last-sample state the driver
-/// maintains across polls; this helper updates it in place.
-///
-/// Returns `None` when:
-/// - First poll for a peer (`prev` empty for every observed SSRC).
-/// - All observed SSRCs had zero delta-time since last poll
-///   (caller polled twice in the same instant — shouldn't happen
-///   with the 1s interval).
-/// - All observed SSRCs had non-positive byte deltas (counter
-///   wraparound or stream restart, both defensive).
-///
-/// Returns `Some(total_bps)` when at least one SSRC contributed
-/// a usable delta sample. Total is summed across SSRCs because
-/// the layer-selection decision is per-peer (the peer's outbound
-/// link is the bottleneck, not any individual encoding).
 /// **Phase 4d.3a**: project per-SSRC remote-inbound stats (RR-derived,
 /// from rtc 0.9's `RTCRemoteInboundRtpStreamStats` accumulator) onto
 /// the per-RID SSRC table the driver maintains in `state.rtp.by_rid`.
@@ -2195,6 +2164,37 @@ fn map_remote_inbound_to_rid_health(
     out
 }
 
+/// **Phase 4d.1**: compute the per-peer recent observed send bitrate
+/// (bits per second) from the deltas of `bytes_sent` across all
+/// outbound RTP streams over one polling window.
+///
+/// **What this signals**: how much data the peer is actually pushing
+/// onto the wire right now, summed across simulcast layers + RTX
+/// streams. NOT a congestion-control bandwidth estimate (rtc 0.9
+/// doesn't expose one — see `TWCC_POLL_INTERVAL` for why). The
+/// layer-selection aggregator (4d.2) interprets this as "delivery
+/// rate the peer's encoder + network are sustaining." A drop from
+/// the encoder's configured target indicates either encoder
+/// underrun or network constraint; either way, it's a layer-
+/// selection signal.
+///
+/// `current` is `(ssrc, bytes_sent)` for each outbound stream,
+/// projected from `report.outbound_rtp_streams()` at the production
+/// caller. `prev` is the per-SSRC last-sample state the driver
+/// maintains across polls; this helper updates it in place.
+///
+/// Returns `None` when:
+/// - First poll for a peer (`prev` empty for every observed SSRC).
+/// - All observed SSRCs had zero delta-time since last poll
+///   (caller polled twice in the same instant — shouldn't happen
+///   with the 1s interval).
+/// - All observed SSRCs had non-positive byte deltas (counter
+///   wraparound or stream restart, both defensive).
+///
+/// Returns `Some(total_bps)` when at least one SSRC contributed
+/// a usable delta sample. Total is summed across SSRCs because
+/// the layer-selection decision is per-peer (the peer's outbound
+/// link is the bottleneck, not any individual encoding).
 fn extract_recent_outbound_bitrate(
     current: impl IntoIterator<Item = (u32, u64)>,
     prev: &mut HashMap<u32, (u64, Instant)>,
