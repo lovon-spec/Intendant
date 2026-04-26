@@ -2205,7 +2205,7 @@ fn active_codec_from_subscriptions(
 /// Filters `original_prefs` against the codec set actually returned
 /// by the initial subscribe (`actual_codecs`). Preserves
 /// `original_prefs` ordering — the intake's
-/// [`select_active_subscription`] uses prefs order as the
+/// [`active_codec_from_subscriptions`] uses prefs order as the
 /// preference signal, and re-ordering would silently change the
 /// peer's chosen codec.
 ///
@@ -2257,63 +2257,6 @@ enum ForwarderExit {
     Cancelled,
 }
 
-/// Pick the single subscription the intake should forward from, given
-/// the peer's prefs and the set the pool returned.
-///
-/// Selection rule, in priority order:
-///   1. **First codec in `prefs.supported`** that has any matching
-///      subscription. Prefs order encodes the peer's codec preference
-///      from its SDP offer (`codec_preferences_from_offer`), so this
-///      respects the peer's own ranking.
-///   2. **Within that codec**, prefer the [`SimulcastRid::full`] layer.
-///      Pre-phase-4 the pool only publishes the full layer per codec;
-///      phase 4 will replace this with TWCC-driven layer choice. Until
-///      then, full is the right baseline — peers that need lower
-///      bitrate hit the encoder's existing rate-control rather than
-///      a separate layer.
-///   3. **Fall back to any RID for the chosen codec** if full isn't
-///      present. Defensive: today this never fires (pre-phase-4 always
-///      publishes full), but pinning the contract here makes
-///      multi-layer add-on work less surprising.
-///
-/// Returns `Some` with the chosen subscription removed from
-/// `subscriptions` (via `swap_remove`, so order of remaining elements
-/// is not preserved — they're about to be dropped anyway). Returns
-/// `None` only when no codec in `prefs.supported` has any subscription
-/// in the input set, which the caller treats as escalation: with the
-/// strict `codec_set_from_subscriptions` contract from 3c.3b.2 the SDP
-/// we negotiate enables exactly the codecs the pool committed to, so
-/// reaching `None` indicates a pool/peer state divergence the intake
-/// can't recover from silently.
-///
-/// The remaining (unused) subscriptions in `subscriptions` are the
-/// caller's to drop. Dropping them releases their `broadcast::Receiver`
-/// clones, which in turn lets the corresponding encoder slots see
-/// reduced receiver pressure (no functional effect — the slots stay
-/// alive via the lease's refcount — but it keeps the channel state
-/// minimal and avoids confusing `receiver_count()` accounting in
-/// later debug sessions).
-fn select_active_subscription(
-    subscriptions: &mut Vec<EncoderSubscription>,
-    prefs: &PeerCodecPreferences,
-) -> Option<EncoderSubscription> {
-    let full_rid = SimulcastRid::full();
-    for &codec in &prefs.supported {
-        // Pass 1: codec + full RID (the canonical pre-phase-4 case).
-        if let Some(idx) = subscriptions
-            .iter()
-            .position(|s| s.id.codec == codec && s.id.rid == full_rid)
-        {
-            return Some(subscriptions.swap_remove(idx));
-        }
-        // Pass 2: codec, any RID (defensive — pre-phase-4 unreachable).
-        if let Some(idx) = subscriptions.iter().position(|s| s.id.codec == codec) {
-            return Some(subscriptions.swap_remove(idx));
-        }
-    }
-    None
-}
-
 /// Per-peer task that bridges the [`EncoderPool`]'s per-subscription
 /// `broadcast::Receiver<Arc<EncodedFrame>>` channels to the
 /// [`WebRtcPeer`] driver's encoded-frame mpsc, and re-subscribes
@@ -2321,36 +2264,58 @@ fn select_active_subscription(
 /// [`EncoderPool::on_resize`] or an on-demand slot's last-leaseholder
 /// exit).
 ///
-/// ## Single active subscription per epoch — the 3c.3b.2a contract
+/// ## Multi-forwarder per active codec — the phase 4c contract
 ///
 /// `pool.subscribe(prefs)` may return multiple subscriptions: one per
 /// `(codec × layer)` the peer's prefs overlap with. For a peer that
 /// supports both VP8 and H.264, that's two subscriptions; for a peer
 /// supporting VP8 against a simulcast pool, that's one per layer.
 ///
-/// The intake forwards from **exactly one** of those subscriptions
-/// per epoch. Forwarding from all of them into a single per-peer
-/// encoded-frame `mpsc` would feed multiple codec streams (or
-/// multiple simulcast layers of the same codec) into one WebRTC
-/// sender — at best doubling bandwidth, at worst producing
-/// codec-interleaved bytes the browser cannot decode and rendering
-/// the stream black.
+/// **Codec selection stays single-codec.** Per epoch the intake picks
+/// the active codec via [`active_codec_from_subscriptions`] from
+/// `negotiated_prefs`'s ordering, then partitions the subscriptions
+/// into:
 ///
-/// The active subscription is picked via [`select_active_subscription`]
-/// from `negotiated_prefs`'s codec ordering. The unused subscriptions
-/// are dropped explicitly so their `broadcast::Receiver` clones release
-/// immediately rather than lingering until end-of-scope.
+/// 1. **Active partition** — every subscription whose codec matches
+///    the active codec. For VP8 simulcast that's all three layer
+///    subscriptions ([full, half, quarter]); for H.264 it's the single
+///    layer. Each subscription in this partition gets its own
+///    forwarder task; the per-peer mpsc receives [`OutboundEncodedFrame`]s
+///    tagged with each forwarder's RID. **This is what makes
+///    browser-visible simulcast possible** — the answer SDP advertises
+///    N rids, and the multi-RID driver write path needs frames for
+///    each rid to actually produce wire packets per encoding.
 ///
-/// Dropping a subscription **does not** decrement the encoder's
-/// refcount — refcounts live on the [`PoolLease`]. So we additionally
-/// call [`PoolLease::release_on_demand_subset`] with the inactive
-/// subs' ids: on-demand encoders the peer's active codec doesn't use
-/// drop their refcount immediately, and (when the refcount hits zero)
-/// the encoder is torn down. Always-on slots have no refcount entry;
-/// passing their ids is a silent no-op. The 3c.3b.2a review caught
-/// this as a wasted-CPU regression (multi-codec pool with a
-/// VP8-preferring peer would keep the H.264 encoder spinning into
-/// no-op broadcast until peer disconnect); 3c.3b.2b closed it.
+/// 2. **Inactive partition** — every subscription whose codec is
+///    NOT the active codec (e.g. H.264 subscriptions when VP8 wins).
+///    These IDs are passed to [`PoolLease::release_on_demand_subset`]
+///    so on-demand encoders for the inactive codec(s) drop their
+///    refcount immediately and (when refcount → 0) tear down rather
+///    than spinning into a broadcast nobody reads. Always-on slots
+///    are silently skipped (no refcount entry).
+///
+/// Codec mixing across the per-peer mpsc is forbidden — feeding two
+/// codecs into one WebRTC sender produces codec-interleaved bytes the
+/// browser cannot decode and renders the stream black. Per-RID
+/// streams of the same codec ARE intentionally interleaved on the
+/// mpsc; the driver's `state.video_specs[(spec, rid)]` keying keeps
+/// keyframe gates independent per-rid so a P-frame on rid `h` doesn't
+/// prematurely open the gate for rid `q`.
+///
+/// ## Multi-forwarder lifecycle
+///
+/// All forwarders for one epoch share a single
+/// [`CancellationToken`] and report exit reasons via a bounded mpsc
+/// sized to the forwarder count. **First exit wins**: whichever
+/// forwarder reports first determines the epoch's exit reason
+/// ([`ForwarderExit::EncoderClosed`] → resubscribe;
+/// [`ForwarderExit::DriverClosed`] / [`ForwarderExit::Cancelled`] →
+/// shut down). The intake then cancels the sibling forwarders and
+/// reaps them via the exit channel, keeping the (codec, rid) set the
+/// driver sees aligned with what the answer SDP advertised — a
+/// straggler forwarder still trying to forward stale-epoch frames
+/// would write packets the driver's video_specs map no longer
+/// recognizes.
 ///
 /// ## `negotiated_prefs` — the 3c.3b.2b finding-1 contract
 ///
@@ -2365,10 +2330,11 @@ fn select_active_subscription(
 /// unfiltered prefs, the resubscribe could return a codec the peer
 /// never negotiated (e.g. H.264 construction failed initially but
 /// succeeds after a later resize that respawns the on-demand slot).
-/// `select_active_subscription` would then pick that codec, the driver would
-/// reject it as `Unsupported`, and every frame would silently drop -> black
-/// stream. Locking the prefs to the negotiated set at construction time and
-/// using that on every resubscribe is the structural fix.
+/// `active_codec_from_subscriptions` would then pick that codec, the
+/// driver would reject it as `Unsupported`, and every frame would
+/// silently drop -> black stream. Locking the prefs to the negotiated
+/// set at construction time and using that on every resubscribe is
+/// the structural fix.
 ///
 /// ## Lossy forwarding — the 3c.3b.2a contract (continued)
 ///
@@ -2409,11 +2375,11 @@ fn select_active_subscription(
 /// The escalation path: if `pool.subscribe(&negotiated_prefs)` itself
 /// returns `NoCompatibleCodec` (typically: a resize wiped every
 /// negotiated codec and re-spawn failed) — or if
-/// `select_active_subscription` returns `None` against a non-empty
-/// subscription set (a contract violation indicating pool/peer
-/// divergence) — the intake signals `shutdown.cancel()` so the driver
-/// tears the peer down cleanly rather than leaving a never-decoding
-/// stream behind.
+/// `active_codec_from_subscriptions` returns `None` against a
+/// non-empty subscription set (a contract violation indicating
+/// pool/peer divergence) — the intake signals `shutdown.cancel()` so
+/// the driver tears the peer down cleanly rather than leaving a
+/// never-decoding stream behind.
 async fn pool_frame_intake(
     pool: Arc<EncoderPool>,
     negotiated_prefs: PeerCodecPreferences,
@@ -3012,7 +2978,7 @@ mod tests {
     /// **3c.3b.2b finding 1 contract.** Filters original prefs against
     /// the codec set actually returned by initial subscribe, preserving
     /// the original ordering. Order matters because
-    /// `select_active_subscription` uses prefs order as the codec
+    /// `active_codec_from_subscriptions` uses prefs order as the codec
     /// preference signal — re-ordering would change which codec the
     /// peer actually receives.
     #[test]
@@ -3242,131 +3208,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 3c.3b.2a: select_active_subscription unit tests + intake contract
+    // Phase 4c: pool_frame_intake multi-forwarder contract tests
     // -----------------------------------------------------------------------
 
-    /// Build an `EncoderSubscription` whose `frames` is a fresh
-    /// `broadcast::Receiver`. The Sender is dropped at end-of-scope of
-    /// the test; that's fine for `select_active_subscription` tests
-    /// which never `recv()` from the receivers — they only inspect IDs.
-    fn make_test_subscription(codec: CodecKind, rid: SimulcastRid) -> EncoderSubscription {
-        use crate::display::encode::pool::LayerSpec;
-        let (s, r) = broadcast::channel::<Arc<EncodedFrame>>(4);
-        // Keep the sender alive at least until the receiver is taken.
-        // Forgetting the sender keeps the channel open; for unit tests
-        // that only read `id` and `layer` from the subscription this is
-        // strictly correct (we never call `recv()`). The sender leak is
-        // bounded by test lifetime.
-        std::mem::forget(s);
-        EncoderSubscription {
-            id: EncoderId::new(codec, rid),
-            layer: LayerSpec::single(codec, 64, 64, 30),
-            frames: r,
-        }
-    }
-
-    /// First-codec-in-prefs wins. With VP8 and H.264 both available,
-    /// prefs `[VP8, H264]` picks VP8 — and with VP8 also at full RID,
-    /// the full layer wins over no other layer.
-    #[test]
-    fn select_active_subscription_picks_first_pref_codec() {
-        let mut subs = vec![
-            make_test_subscription(CodecKind::H264, SimulcastRid::full()),
-            make_test_subscription(CodecKind::Vp8, SimulcastRid::full()),
-        ];
-        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8, CodecKind::H264]);
-        let active = select_active_subscription(&mut subs, &prefs)
-            .expect("pool returned both codecs; one must be active");
-        assert_eq!(active.id.codec, CodecKind::Vp8);
-        assert_eq!(active.id.rid, SimulcastRid::full());
-        // The unused subscription remains in `subs` for the caller to drop.
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].id.codec, CodecKind::H264);
-    }
-
-    /// Within a chosen codec, full RID beats half/quarter. With VP8
-    /// simulcast the pool returns three subscriptions; we always pick
-    /// full pre-phase-4. Phase 4 will replace this rule with
-    /// TWCC-driven layer selection.
-    #[test]
-    fn select_active_subscription_prefers_full_rid_within_codec() {
-        let mut subs = vec![
-            make_test_subscription(CodecKind::Vp8, SimulcastRid::quarter()),
-            make_test_subscription(CodecKind::Vp8, SimulcastRid::half()),
-            make_test_subscription(CodecKind::Vp8, SimulcastRid::full()),
-        ];
-        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let active = select_active_subscription(&mut subs, &prefs)
-            .expect("VP8 in prefs and three VP8 subs; one must be active");
-        assert_eq!(active.id.rid, SimulcastRid::full());
-        assert_eq!(subs.len(), 2);
-    }
-
-    /// Defensive RID fallback: if the chosen codec has no full-RID
-    /// subscription (pre-phase-4 unreachable; phase-4-onward could
-    /// happen if TWCC pinned a non-full layer at construction time),
-    /// pick any RID for that codec rather than dropping to a
-    /// less-preferred codec. Pinning the contract here so a future
-    /// refactor doesn't accidentally fall through to the next codec.
-    #[test]
-    fn select_active_subscription_falls_back_to_any_rid_for_chosen_codec() {
-        let mut subs = vec![
-            make_test_subscription(CodecKind::H264, SimulcastRid::full()),
-            make_test_subscription(CodecKind::Vp8, SimulcastRid::half()),
-        ];
-        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8, CodecKind::H264]);
-        let active = select_active_subscription(&mut subs, &prefs)
-            .expect("VP8 sub at half RID is still a VP8 match");
-        assert_eq!(active.id.codec, CodecKind::Vp8);
-        assert_eq!(active.id.rid, SimulcastRid::half());
-    }
-
-    /// No codec match → `None`. The intake escalates to peer
-    /// shutdown rather than silently picking nothing.
-    #[test]
-    fn select_active_subscription_returns_none_when_no_codec_matches() {
-        let mut subs = vec![
-            make_test_subscription(CodecKind::Vp8, SimulcastRid::full()),
-            make_test_subscription(CodecKind::H264, SimulcastRid::full()),
-        ];
-        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp9]);
-        let active = select_active_subscription(&mut subs, &prefs);
-        assert!(
-            active.is_none(),
-            "VP9-only prefs against VP8+H.264 subs must return None — \
-             escalation path lives in pool_frame_intake"
-        );
-        // All subs left intact for the caller (not that the caller
-        // does anything with them; they'll be dropped on the
-        // escalation path).
-        assert_eq!(subs.len(), 2);
-    }
-
-    /// Empty prefs → `None`. Belt-and-suspenders: prefs always
-    /// non-empty in production (codec_preferences_from_offer rejects
-    /// empty offers), but the function should still behave sanely.
-    #[test]
-    fn select_active_subscription_returns_none_for_empty_prefs() {
-        let mut subs = vec![make_test_subscription(CodecKind::Vp8, SimulcastRid::full())];
-        let prefs = PeerCodecPreferences::new(vec![]);
-        assert!(select_active_subscription(&mut subs, &prefs).is_none());
-    }
-
-    /// **3c.3b.2a contract: single active subscription per epoch.**
-    ///
-    /// With VP8 simulcast (3 always-on layers), `pool.subscribe(VP8)`
-    /// returns three subscriptions. Pre-3c.3b.2a the intake spawned
-    /// one forwarder per subscription, so each i420 frame produced
     /// **Phase 4c contract: forward all active-codec layers.**
     ///
-    /// Pre-4c the intake picked a single subscription and dropped the
-    /// rest (3c.3b.2a). 4c reverses that: when the active codec is
-    /// VP8 simulcast, all 3 layers' subscriptions get their own
-    /// forwarder and the per-peer mpsc receives frames from every
-    /// rid concurrently. This is what makes browser-visible simulcast
-    /// possible — the answer SDP advertises N rids, and the multi-RID
-    /// driver write path needs frames for each rid to actually
-    /// produce wire packets per encoding.
+    /// With VP8 simulcast (3 always-on layers), `pool.subscribe(VP8)`
+    /// returns three subscriptions. The intake spawns one forwarder
+    /// per active-codec subscription and the per-peer mpsc receives
+    /// frames from every rid concurrently. This is what makes
+    /// browser-visible simulcast possible — the answer SDP advertises
+    /// N rids, and the multi-RID driver write path needs frames for
+    /// each rid to actually produce wire packets per encoding.
     ///
     /// Test pins:
     ///   1. With VP8 simulcast (3 layers) active, every rid appears
@@ -3974,13 +3827,14 @@ mod tests {
         drop(peer);
     }
 
-    /// **Phase-4c-prep**: `RtpSendState` carries a `by_rid` map keyed
-    /// by `SimulcastRid`. Today's `build_with_codec_set` populates it
-    /// with exactly one entry (the single active rid + its SSRC), so
-    /// behavior is preserved bit-for-bit. Commit 2 of phase 4c
-    /// populates with N entries for VP8 simulcast.
+    /// **Phase 4c**: `RtpSendState` carries a `by_rid` map keyed by
+    /// `SimulcastRid`. `build_with_codec_set` populates it with one
+    /// entry per active RID — N entries for VP8 simulcast (full +
+    /// half + quarter), single entry for H.264. The driver's
+    /// `state.rtp.by_rid.get_mut(rid)` lookup at write time uses this
+    /// map to route per-RID packetizer / SSRC state.
     ///
-    /// This test pins:
+    /// This test pins the data shape directly:
     /// - The map type allows multiple rids with distinct SSRCs.
     /// - Lookup by rid returns the matching `RidRtpState`.
     /// - The structure compiles and behaves like a `HashMap` (so the
@@ -3989,7 +3843,7 @@ mod tests {
     ///
     /// The driver's actual write_video_frame is exercised end-to-end
     /// by the `pool_intake_*` tests above (which run real encoders
-    /// + forwarders); this test pins the data shape directly.
+    /// + forwarders).
     #[test]
     fn rtp_send_state_by_rid_supports_multiple_distinct_rids() {
         // Build three RidRtpState entries with distinct SSRCs.

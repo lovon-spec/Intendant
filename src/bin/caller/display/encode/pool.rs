@@ -689,12 +689,14 @@ impl PoolLease {
     ///
     /// Used by the per-peer pool intake at
     /// `webrtc.rs::pool_frame_intake` after
-    /// `select_active_subscription` picks one subscription out of a
-    /// multi-codec / multi-layer set: the inactive codecs' on-demand
-    /// claims must be released so encoders we won't consume don't
-    /// stay refcounted into perpetuity (encoding into a broadcast
-    /// channel with no receivers — the wasted-CPU regression caught
-    /// in the 3c.3b.2a review).
+    /// `active_codec_from_subscriptions` picks the active codec out
+    /// of a multi-codec subscription set: the inactive codecs'
+    /// subscriptions are partitioned off and their on-demand claims
+    /// released so encoders we won't consume don't stay refcounted
+    /// into perpetuity (encoding into a broadcast channel with no
+    /// receivers — the wasted-CPU regression caught in the 3c.3b.2a
+    /// review). Active-codec subscriptions stay in the lease and feed
+    /// the multi-forwarder fan-out (phase 4c).
     ///
     /// IDs in `ids` that don't appear in `on_demand_refs` are
     /// silently skipped. This is the always-on case: the intake

@@ -599,11 +599,14 @@ impl DisplaySession {
                 // filter, so resize-down dropping the quarter layer
                 // and resize-up restoring it both work cleanly.
                 //
-                // Phase 4b's encoder change has no user-visible
-                // behavior — `select_active_subscription` still picks
-                // one RID per peer. Phase 4c (SDP simulcast
-                // negotiation) and 4d (multi-RID forwarding) light
-                // up the additional layers on the wire.
+                // Phase 4c lights up multi-RID simulcast end-to-end:
+                // the pool produces `vp8_simulcast`'s 3 layers
+                // simultaneously, the answer SDP carries
+                // `a=simulcast:send f;h;q` + per-rid lines, and the
+                // multi-forwarder intake feeds each rid's frames to
+                // the driver's per-rid SSRC packetizer. Phase 4d
+                // (TWCC-driven layer pick) and 4e (per-layer PLI)
+                // build on top of this baseline.
                 move |w, h| encode::pool::LayerSpec::vp8_simulcast(w, h, fps),
                 // Pool encoders feed the same metrics counters as the
                 // capture bridge so DisplayMetricsSnapshot continues to
