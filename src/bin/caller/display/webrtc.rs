@@ -775,32 +775,50 @@ impl WebRtcPeer {
     /// 3. Apply the browser offer and generate the SDP answer.
     /// 4. Spawn the driver task and return.
     ///
-    /// ## `codec_set` contract
+    /// ## `active_codec` + `active_rids` contract
     ///
-    /// Each peer gets its own RTC peer connection, so codec registration is a
-    /// per-peer decision. The caller passes the codec this peer should be
-    /// allowed to negotiate — the active codec selected from "what the encoder
-    /// pool can currently produce" and "what the peer's offer advertised."
-    /// An empty set is rejected up front; unknown codecs return an explicit
-    /// error so the failure point is not buried inside SDP answer generation.
+    /// Each peer gets its own RTC peer connection. The caller passes
+    /// the single codec this peer should negotiate (the active codec
+    /// selected from "what the encoder pool can currently produce"
+    /// AND "what the peer's offer advertised") plus the simulcast
+    /// RIDs the pool is currently producing for that codec. The
+    /// caller derives `active_rids` from the initial pool
+    /// subscriptions filtered to the active codec — NOT from
+    /// `pool.always_on()` directly — so the answer SDP advertises
+    /// exactly what the intake will forward (per phase 4c
+    /// correction #2).
+    ///
+    /// VP8 simulcast lights up here when `active_rids.len() > 1`:
+    /// the track is built with N encodings (one per RID, each with
+    /// its own SSRC), and the answer SDP carries
+    /// `a=simulcast:send full;half;quarter` plus `a=rid:* send`
+    /// lines automatically as a consequence of the multi-encoding
+    /// track shape. For single-codec / single-layer paths (H.264,
+    /// or VP8 with only one surviving layer post-MIN_LAYER_DIM
+    /// filter) `active_rids.len() == 1` and the answer is plain
+    /// sendonly.
     ///
     /// Empty / no-overlap cases are surfaced to `handle_offer` as
     /// [`CallerError::WebRtc`] errors rather than producing a silent
-    /// broken stream — matches the "no compatible codec, clean reject"
-    /// contract from the multi-viewer redesign.
+    /// broken stream — matches the "no compatible codec, clean
+    /// reject" contract from the multi-viewer redesign.
     ///
-    /// `ice_tx` is accepted for API parity with earlier implementations but is
-    /// currently unused: local host candidates are emitted inline in the
-    /// answer SDP, so there is nothing to trickle from the server side. The
-    /// browser still trickles its candidates via `add_ice_candidate`.
+    /// `ice_tx` is accepted for API parity with earlier
+    /// implementations but is currently unused: local host
+    /// candidates are emitted inline in the answer SDP, so there is
+    /// nothing to trickle from the server side. The browser still
+    /// trickles its candidates via `add_ice_candidate`.
+    ///
     /// Returns `(peer, encoded_frame_tx, answer_sdp)`. The
-    /// `encoded_frame_tx` is the sender side of the per-peer encoded
-    /// frame channel — the caller (`Self::new`) hands it directly to
-    /// `pool_frame_intake` rather than parking it on the struct.
+    /// `encoded_frame_tx` is the sender side of the per-peer
+    /// encoded frame channel — the caller (`Self::new`) hands it
+    /// directly to `pool_frame_intake` rather than parking it on
+    /// the struct.
     async fn build_with_codec_set(
         peer_id: PeerId,
         offer_sdp: &str,
-        codec_set: &[CodecKind],
+        active_codec: CodecKind,
+        active_rids: &[SimulcastRid],
         _ice_config: &IceConfig,
         tcp_peer_registry: Option<Arc<TcpPeerRegistry>>,
         tcp_advertised_addr: Option<SocketAddr>,
@@ -808,18 +826,15 @@ impl WebRtcPeer {
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
     ) -> Result<(Self, mpsc::Sender<OutboundEncodedFrame>, String), CallerError> {
-        if codec_set.is_empty() {
+        if active_rids.is_empty() {
             return Err(CallerError::WebRtc(
-                "peer codec set is empty — caller must ensure at least one \
-                 encoder codec overlaps with the peer's offer before \
+                "active_rids is empty — caller must derive at least one \
+                 RID from the peer's initial pool subscriptions before \
                  constructing WebRtcPeer"
                     .to_string(),
             ));
         }
 
-        // The existing intake forwards one active codec. Preserve that
-        // behavioral contract while moving the transport stack to rtc.
-        let active_codec = codec_set[0];
         let codec_params = rtc_codec_parameters(active_codec)?;
         let video_mid = first_video_mid_from_offer(offer_sdp).unwrap_or_else(|| "0".to_string());
 
@@ -851,14 +866,32 @@ impl WebRtcPeer {
                 .map_err(|e| CallerError::WebRtc(format!("register RTP extension: {e}")))?;
         }
 
-        let ssrc = new_ssrc();
-        let rid = SimulcastRid::full();
-        let track = MediaStreamTrack::new(
-            format!("display-{peer_id}"),
-            format!("display-video-{peer_id}"),
-            format!("display-video-{peer_id}"),
-            RtpCodecKind::Video,
-            vec![RTCRtpEncodingParameters {
+        // Phase 4c: build one encoding per active RID. For VP8
+        // simulcast (active_rids = [full, half, quarter]) this produces
+        // a 3-encoding track and `RTCPeerConnection::create_answer` then
+        // emits `a=simulcast:send full;half;quarter` + `a=rid:* send`
+        // lines as a consequence of the multi-encoding shape — server-
+        // side answer-side simulcast that str0m couldn't do, hence the
+        // migration to rtc 0.9.
+        //
+        // For single-RID (H.264 or VP8 with all simulcast layers
+        // dropped below MIN_LAYER_DIM) this produces a single
+        // encoding and the answer is plain sendonly with no
+        // simulcast lines — bit-for-bit equivalent to pre-4c output.
+        //
+        // Each encoding gets its own SSRC because rtc's
+        // `RTCRtpSender::write_rtp` routes packets to encodings by
+        // matching `packet.header.ssrc` against the encoding's
+        // declared SSRC. The driver looks up the SSRC by RID at
+        // write time via `state.rtp.by_rid` (populated below from
+        // `encodings_by_rid`).
+        let mut encodings = Vec::with_capacity(active_rids.len());
+        let mut encodings_by_rid: Vec<(SimulcastRid, u32)> =
+            Vec::with_capacity(active_rids.len());
+        for rid in active_rids {
+            let ssrc = new_ssrc();
+            encodings_by_rid.push((rid.clone(), ssrc));
+            encodings.push(RTCRtpEncodingParameters {
                 rtp_coding_parameters: RTCRtpCodingParameters {
                     rid: rid.as_str().to_string(),
                     ssrc: Some(ssrc),
@@ -866,7 +899,14 @@ impl WebRtcPeer {
                 },
                 codec: codec_params.rtp_codec.clone(),
                 ..Default::default()
-            }],
+            });
+        }
+        let track = MediaStreamTrack::new(
+            format!("display-{peer_id}"),
+            format!("display-video-{peer_id}"),
+            format!("display-video-{peer_id}"),
+            RtpCodecKind::Video,
+            encodings,
         );
 
         let mut rtc = RTCPeerConnectionBuilder::new()
@@ -1013,13 +1053,12 @@ impl WebRtcPeer {
         let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
 
-        // Phase-4c-prep: build the encodings list. Today this is
-        // always exactly one entry (the same `(rid, ssrc)` the
-        // single-encoding track was constructed with above), so
-        // `build_with_codec_set` produces bit-for-bit the same wire
-        // behavior as before. Commit 2 of phase 4c will populate this
-        // with N entries when the active codec is VP8 and the
-        // peer's initial subscriptions span multiple simulcast layers.
+        // Phase 4c: pass the full per-RID encoding map through to the
+        // driver. For VP8 simulcast `encodings_by_rid` carries
+        // (full, ssrc_f), (half, ssrc_h), (quarter, ssrc_q); the
+        // driver builds one packetizer per RID + uses the matching
+        // SSRC at write time so `RTCRtpSender::write_rtp` routes to
+        // the right encoding.
         tokio::spawn(driver(
             peer_id,
             rtc,
@@ -1027,7 +1066,7 @@ impl WebRtcPeer {
                 sender_id,
                 mid: video_mid,
                 codec: codec_params.rtp_codec,
-                encodings: vec![(rid, ssrc)],
+                encodings: encodings_by_rid,
             },
             sockets,
             tcp_conn_rx,
@@ -1133,10 +1172,40 @@ impl WebRtcPeer {
                     .to_string(),
             ));
         }
+
+        // Phase 4c: derive the RID set the peer's track will advertise
+        // from the initial subscriptions filtered to the active codec
+        // — per the user's correction #2, the answer SDP must match
+        // exactly what the peer subscribed to (NOT what
+        // `pool.always_on()` happens to advertise globally; an
+        // on-demand encoder construction failure could produce a
+        // subscription set narrower than the pool's general layout).
+        // Order is preserved as encountered in the subscriptions
+        // (which is layer order from `vp8_simulcast`: full / half /
+        // quarter), so the answer's `a=rid` lines come out in
+        // preference order.
+        let active_rids: Vec<SimulcastRid> = subscriptions
+            .iter()
+            .filter(|s| s.id.codec == active_codec)
+            .map(|s| s.id.rid.clone())
+            .collect();
+        // Defensive — `active_codec_from_subscriptions` returned
+        // Some, so at least one subscription has this codec.
+        // Treating an empty active_rids as a bug rather than a soft
+        // failure: build_with_codec_set rejects empty too, so this
+        // is a redundant guard with a more specific error message.
+        if active_rids.is_empty() {
+            return Err(CallerError::WebRtc(format!(
+                "new: active_codec={active_codec:?} resolved but no \
+                 subscriptions match it — internal pool/peer state \
+                 divergence",
+            )));
+        }
         let (peer, encoded_frame_tx, answer_sdp) = Self::build_with_codec_set(
             peer_id,
             offer_sdp,
-            &active_codec_set,
+            active_codec,
+            &active_rids,
             ice_config,
             tcp_peer_registry,
             tcp_advertised_addr,
@@ -2358,11 +2427,19 @@ async fn pool_frame_intake(
     let mut current_subs = initial_subs;
 
     'epoch: loop {
-        // Pick exactly one subscription. Drop the rest explicitly so
-        // their broadcast::Receiver clones release at this scope's
-        // statement boundary rather than at end-of-function.
-        let active = match select_active_subscription(&mut current_subs, &negotiated_prefs) {
-            Some(s) => s,
+        // Phase 4c: pick the active codec, then partition subscriptions
+        // into "active codec" (forward all of them — this is what
+        // makes simulcast work) and "everything else" (release any
+        // on-demand claims so abandoned codecs' encoders shut down).
+        //
+        // Per the user's correction #3: keep codec selection
+        // single-codec — if VP8 wins, forward all VP8 subscriptions
+        // (the simulcast layers); if H.264 wins, forward the single
+        // H.264 subscription. NEVER mix codecs into one peer's
+        // sender.
+        let subs_now = std::mem::take(&mut current_subs);
+        let active_codec = match active_codec_from_subscriptions(&subs_now, &negotiated_prefs) {
+            Some(c) => c,
             None => {
                 // Strict-by-construction `codec_set_from_subscriptions`
                 // upstream means this should be unreachable: the SDP
@@ -2376,135 +2453,180 @@ async fn pool_frame_intake(
                      negotiated_prefs (supported={:?}) from {} returned subs; \
                      signalling peer shutdown",
                     negotiated_prefs.supported,
-                    current_subs.len(),
+                    subs_now.len(),
                 );
                 shutdown.cancel();
                 return;
             }
         };
-        // Collect the inactive subs' ids BEFORE dropping the subs so
-        // we can release their on-demand claims (3c.3b.2b finding 2).
-        // Always-on slots have no on_demand_refs entry; passing their
-        // ids is a silent no-op via `release_on_demand_subset`'s
-        // skip-unknown-ids contract. So we don't have to distinguish
-        // always-on from on-demand here — just pass everything.
-        let inactive_ids: Vec<EncoderId> = current_subs.iter().map(|s| s.id.clone()).collect();
-        // Make the drop point obvious. Future maintainers reading the
-        // function should not have to wonder when the unused subs go
-        // away — it's right here, between selection and forwarder
-        // spawn. `current_subs` is moved-from after this and is only
-        // re-initialized on the resubscribe path
-        // (`current_subs = subs` in the EncoderClosed branch below)
-        // before the next read at the top of the loop, so no
-        // `= Vec::new()` placeholder is needed here.
-        drop(current_subs);
+        let (active_subs, inactive_subs): (
+            Vec<EncoderSubscription>,
+            Vec<EncoderSubscription>,
+        ) = subs_now
+            .into_iter()
+            .partition(|s| s.id.codec == active_codec);
+        // Collect inactive ids BEFORE dropping the subs so we can
+        // release their on-demand claims. Always-on slots have no
+        // on_demand_refs entry; passing their ids is a silent no-op
+        // via `release_on_demand_subset`'s skip-unknown-ids
+        // contract. So we don't have to distinguish always-on from
+        // on-demand here — just pass everything inactive.
+        let inactive_ids: Vec<EncoderId> =
+            inactive_subs.iter().map(|s| s.id.clone()).collect();
+        drop(inactive_subs);
         // Release the inactive on-demand claims on the active lease.
         // For a peer with prefs [VP8, H264] against a pool that has
-        // VP8 always-on + H264 on-demand, this is what tears down the
-        // never-consumed H264 encoder when the active codec is VP8 —
-        // without it, H264 keeps encoding into a broadcast channel
-        // with no receivers until peer disconnect (the wasted-CPU
-        // regression caught in the 3c.3b.2a review).
+        // VP8 always-on + H264 on-demand, this is what tears down
+        // the never-consumed H264 encoder when the active codec is
+        // VP8 — without it, H264 keeps encoding into a broadcast
+        // channel with no receivers until peer disconnect (the
+        // wasted-CPU regression caught in the 3c.3b.2a review).
+        // After `filter_prefs_to_negotiated` locks resubscribes to
+        // a single codec, this releases on the FIRST iteration only
+        // (when initial_subs may include other codecs); subsequent
+        // resubscribes return only active-codec subs, so
+        // inactive_ids is empty.
         if !inactive_ids.is_empty() {
             if let Some(lease) = current_lease.as_mut() {
                 lease.release_on_demand_subset(&inactive_ids);
             }
         }
 
-        let active_id = active.id.clone();
-        let active_rid = active.id.rid.clone();
-        let mut rx = active.frames;
-        let frame_tx = encoded_frame_tx.clone();
-        let counter = Arc::clone(&drops_counter);
-        // Forwarder cancellation. With a single forwarder per epoch
-        // this is overkill (we could just await the JoinHandle), but
-        // it gives the intake a clean way to interrupt a forwarder
-        // that's parked inside `rx.recv()` waiting for the next frame
-        // — `shutdown` propagation should not have to wait for the
-        // encoder to publish another frame to wake the recv.
+        let active_ids: Vec<EncoderId> =
+            active_subs.iter().map(|s| s.id.clone()).collect();
+        let active_rids_summary: Vec<String> = active_subs
+            .iter()
+            .map(|s| s.id.rid.as_str().to_string())
+            .collect();
+        if active_subs.is_empty() {
+            // Defensive: `active_codec_from_subscriptions` returned
+            // Some, so at least one subscription matched. If the
+            // partition produced an empty active set, something went
+            // very wrong (subscriptions changed under us between
+            // the two reads, which shouldn't be possible). Escalate.
+            eprintln!(
+                "[display/webrtc/pool-intake] active_codec={active_codec:?} \
+                 resolved but partition produced 0 active subs; \
+                 signalling peer shutdown"
+            );
+            shutdown.cancel();
+            return;
+        }
+
+        // Spawn one forwarder task per active subscription. Each
+        // forwarder reads encoded frames off ITS subscription's
+        // broadcast (one per `(codec, rid)` slot) and pushes them to
+        // the peer's mpsc as `OutboundEncodedFrame { rid, frame }`.
+        // The driver looks up each frame's rid in `state.rtp.by_rid`
+        // to pick the matching SSRC + packetizer at write time.
+        //
+        // Forwarder lifecycle: cancellation token shared across all
+        // forwarders so an exit on one (encoder Closed, driver
+        // Closed) cancels the others uniformly. Exit channel
+        // capacity = number of active subs so the first-to-exit
+        // forwarder's reason is preserved even if others race to
+        // exit before we can drain.
         let fwd_shutdown = CancellationToken::new();
-        let fwd_shutdown_inner = fwd_shutdown.clone();
-        // Exit channel so the intake's outer `select!` can receive
-        // the forwarder's exit reason without consuming the
-        // `JoinHandle` (the JoinHandle would otherwise be moved by
-        // both arms of the select). Capacity 1 is enough — the
-        // forwarder sends exactly once on exit.
-        let (exit_tx, mut exit_rx) = mpsc::channel::<ForwarderExit>(1);
-        let forwarder = tokio::spawn(async move {
-            let exit = loop {
-                tokio::select! {
-                    _ = fwd_shutdown_inner.cancelled() => break ForwarderExit::Cancelled,
-                    res = rx.recv() => match res {
-                        Ok(frame) => {
-                            // Phase-4c-prep: wrap the encoded frame
-                            // with this forwarder's RID. Today it's
-                            // always the active subscription's rid
-                            // (single-active-subscription, so single
-                            // rid). Commit 2 spawns one forwarder per
-                            // active-codec subscription, each with
-                            // its own rid — the rid wrapping is the
-                            // mechanism that lets the multi-RID
-                            // driver route to the right SSRC at write
-                            // time without changing this forwarder's
-                            // body.
-                            let outbound = OutboundEncodedFrame {
-                                rid: active_rid.clone(),
-                                frame,
-                            };
-                            match frame_tx.try_send(outbound) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // Driver's mpsc is full. Drop
-                                    // the frame; the codec's
-                                    // keyframe cadence will recover
-                                    // the visual stream.
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    // Driver receiver dropped. Peer
-                                    // is gone; nothing to forward to.
-                                    break ForwarderExit::DriverClosed;
+        let (exit_tx, mut exit_rx) =
+            mpsc::channel::<ForwarderExit>(active_subs.len().max(1));
+        let mut forwarders = Vec::with_capacity(active_subs.len());
+        for sub in active_subs {
+            let rid = sub.id.rid.clone();
+            let mut rx = sub.frames;
+            let frame_tx = encoded_frame_tx.clone();
+            let counter = Arc::clone(&drops_counter);
+            let fwd_shutdown_inner = fwd_shutdown.clone();
+            let exit_tx_inner = exit_tx.clone();
+            forwarders.push(tokio::spawn(async move {
+                let exit = loop {
+                    tokio::select! {
+                        _ = fwd_shutdown_inner.cancelled() => break ForwarderExit::Cancelled,
+                        res = rx.recv() => match res {
+                            Ok(frame) => {
+                                let outbound = OutboundEncodedFrame {
+                                    rid: rid.clone(),
+                                    frame,
+                                };
+                                match frame_tx.try_send(outbound) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        // Driver's mpsc is full. Drop
+                                        // the frame; the codec's
+                                        // keyframe cadence will recover
+                                        // the visual stream. Lossy
+                                        // forwarding is the 3c.3b.2a
+                                        // contract — `send().await`
+                                        // would park inside the mpsc
+                                        // and break shutdown
+                                        // propagation. Per-RID
+                                        // forwarders inherit this:
+                                        // a slow consumer on one RID
+                                        // doesn't backpressure the
+                                        // others (each has its own
+                                        // forwarder task and the
+                                        // try_send is per-task).
+                                        counter.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        // Driver receiver dropped.
+                                        // Peer is gone; nothing to
+                                        // forward to.
+                                        break ForwarderExit::DriverClosed;
+                                    }
                                 }
                             }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            // Encoder torn down. Intake will
-                            // resubscribe (or escalate to peer
-                            // shutdown if that fails).
-                            break ForwarderExit::EncoderClosed;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Slow consumer; broadcast skipped
-                            // ahead. Codec keyframe machinery
-                            // (request_keyframe / GOP) recovers.
-                            continue;
+                            Err(broadcast::error::RecvError::Closed) => {
+                                // Encoder for THIS rid torn down.
+                                // Intake escalates to a unified
+                                // resubscribe (cancels all sibling
+                                // forwarders + drops lease). The
+                                // sibling forwarders are still
+                                // delivering to active encoders, but
+                                // a Closed on any one rid likely
+                                // means an `on_resize` epoch
+                                // transition that affects ALL
+                                // layers; resubscribe-as-a-unit
+                                // keeps the multi-RID encodings
+                                // coherent.
+                                break ForwarderExit::EncoderClosed;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                // Slow consumer; broadcast skipped
+                                // ahead. Codec keyframe machinery
+                                // (GOP / request_keyframe) recovers.
+                                continue;
+                            }
                         }
                     }
-                }
-            };
-            // Send is best-effort: if the intake is already
-            // tearing down (shutdown branch fired and the receiver
-            // was dropped), we just exit.
-            let _ = exit_tx.send(exit).await;
-        });
+                };
+                // Send is best-effort: if the intake is already
+                // tearing down (shutdown branch fired and the
+                // receiver was dropped), we just exit.
+                let _ = exit_tx_inner.send(exit).await;
+            }));
+        }
+        // Drop our `exit_tx` so when ALL forwarders' clones go away,
+        // `exit_rx.recv()` returns None — gives a "all forwarders
+        // gone" signal even if some forwarders' send-on-exit raced
+        // teardown.
+        drop(exit_tx);
 
         tokio::select! {
             _ = shutdown.cancelled() => {
-                // Peer is going away. Cancel forwarder, await it,
-                // drop the lease, exit.
+                // Peer is going away. Cancel all forwarders, await
+                // them, drop the lease, exit.
                 fwd_shutdown.cancel();
-                let _ = forwarder.await;
+                for f in forwarders { let _ = f.await; }
                 drop(current_lease.take());
                 return;
             }
             recv = exit_rx.recv() => {
-                // Forwarder reported its exit via the exit channel
-                // (and is on the way out — its task body already ran
-                // past the loop). `fwd_shutdown.cancel()` here is a
-                // defensive no-op; await the JoinHandle so the task's
-                // resources are reaped before we move on.
+                // First forwarder to exit reports its reason. Cancel
+                // all sibling forwarders so the (codec, rid) set
+                // doesn't drift (e.g. one rid resubscribing while
+                // another keeps streaming the old epoch).
                 fwd_shutdown.cancel();
-                let _ = forwarder.await;
+                for f in forwarders { let _ = f.await; }
                 let exit = recv.unwrap_or(ForwarderExit::DriverClosed);
                 match exit {
                     ForwarderExit::EncoderClosed => {
@@ -2539,8 +2661,9 @@ async fn pool_frame_intake(
                                 current_lease = Some(lease);
                                 eprintln!(
                                     "[display/webrtc/pool-intake] resubscribed \
-                                     after encoder Closed (active was {:?})",
-                                    active_id,
+                                     after encoder Closed (was forwarding \
+                                     codec={active_codec:?} rids={:?})",
+                                    active_rids_summary,
                                 );
                                 continue 'epoch;
                             }
@@ -2548,7 +2671,8 @@ async fn pool_frame_intake(
                                 eprintln!(
                                     "[display/webrtc/pool-intake] resubscribe \
                                      after Closed failed ({e:?}): no compatible \
-                                     codec; signalling peer shutdown"
+                                     codec; signalling peer shutdown (was \
+                                     forwarding {active_ids:?})"
                                 );
                                 shutdown.cancel();
                                 return;
@@ -3233,22 +3357,31 @@ mod tests {
     /// With VP8 simulcast (3 always-on layers), `pool.subscribe(VP8)`
     /// returns three subscriptions. Pre-3c.3b.2a the intake spawned
     /// one forwarder per subscription, so each i420 frame produced
-    /// three encoded frames at the peer's mpsc — at best 3× bandwidth,
-    /// at worst codec/layer-interleaved bytes the browser cannot
-    /// decode (silent black stream).
+    /// **Phase 4c contract: forward all active-codec layers.**
     ///
-    /// Post-3c.3b.2a: the intake picks the full RID layer and drops
-    /// the other two subscriptions. This test pins that by counting
-    /// frames received over a fixed window: with one active layer,
-    /// the count is roughly equal to input frame count (one encoded
-    /// frame per i420 input, modulo encoder packetization). With
-    /// three active layers, the count would be ~3× larger.
+    /// Pre-4c the intake picked a single subscription and dropped the
+    /// rest (3c.3b.2a). 4c reverses that: when the active codec is
+    /// VP8 simulcast, all 3 layers' subscriptions get their own
+    /// forwarder and the per-peer mpsc receives frames from every
+    /// rid concurrently. This is what makes browser-visible simulcast
+    /// possible — the answer SDP advertises N rids, and the multi-RID
+    /// driver write path needs frames for each rid to actually
+    /// produce wire packets per encoding.
     ///
-    /// We assert "received ≤ 1.5 × input" as the contract; the
-    /// hysteresis tolerance is for keyframe-vs-delta duplication
-    /// quirks of the encoder. The pre-fix behavior would produce ~3×.
+    /// Test pins:
+    ///   1. With VP8 simulcast (3 layers) active, every rid appears
+    ///      among forwarded frames over a fixed window.
+    ///   2. Frame count is proportional to layers × inputs (NOT 1×
+    ///      inputs as pre-4c). Pre-4c behavior would land at ~1×
+    ///      (one layer forwarded), so we assert ≥ 2× to leave clear
+    ///      daylight even with encoder warm-up irregularities.
+    ///
+    /// Replaces the pre-4c
+    /// `pool_intake_forwards_only_one_layer_with_simulcast_set`
+    /// (deleted with this commit) — the inverse contract is now in
+    /// effect.
     #[tokio::test]
-    async fn pool_intake_forwards_only_one_layer_with_simulcast_set() {
+    async fn pool_intake_forwards_all_active_codec_layers() {
         use crate::display::encode::pool::{EncoderPool, LayerSpec};
 
         let pool = Arc::new(EncoderPool::new(
@@ -3266,15 +3399,17 @@ mod tests {
         // assertion fires the simulcast set was dropped to a single
         // layer somewhere upstream and this test no longer exercises
         // the multi-sub case it claims to.
+        let n_layers = initial_subs.len();
         assert!(
-            initial_subs.len() >= 2,
+            n_layers >= 2,
             "test setup expects multiple simulcast layers from \
-             vp8_simulcast(); got {}",
-            initial_subs.len(),
+             vp8_simulcast(); got {n_layers}",
         );
+        let expected_rids: std::collections::HashSet<SimulcastRid> =
+            initial_subs.iter().map(|s| s.id.rid.clone()).collect();
         let input_count = 12u64;
 
-        let (frame_tx, mut frame_rx) = mpsc::channel::<OutboundEncodedFrame>(256);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<OutboundEncodedFrame>(1024);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -3291,41 +3426,47 @@ mod tests {
 
         // Push frames at the source dimensions. Each i420 buffer
         // arrives at every always-on encoder via the bridge's
-        // broadcast; pre-fix behavior would have THREE encoders
-        // producing one encoded frame each per input.
+        // broadcast; with N forwarders, expect ~N×inputs encoded
+        // frames at the per-peer mpsc.
         let frame = Arc::new(vec![0u8; 64 * 64 * 3 / 2]);
         for _ in 0..input_count {
             pool.push_i420_frame(Arc::clone(&frame), Instant::now());
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
-        // Drain a short window past the last push so any in-flight
-        // encoded frames land.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
+        let mut seen_rids: std::collections::HashSet<SimulcastRid> =
+            std::collections::HashSet::new();
         let mut received: u64 = 0;
-        while frame_rx.try_recv().is_ok() {
+        while let Ok(outbound) = frame_rx.try_recv() {
+            seen_rids.insert(outbound.rid);
             received += 1;
         }
 
-        // The lower bound (>0) catches "intake dropped everything"
-        // regressions. The upper bound is the actual contract: with
-        // one active layer, count tracks input. Pre-fix would deliver
-        // ~3 × input, so 1.5 × leaves clear daylight even with
-        // encoder warm-up keyframe-burst quirks.
+        // Every expected rid must appear in the received stream.
+        // Missing any rid means a forwarder failed to spawn for that
+        // subscription OR the per-RID rid wrap was dropped.
+        for rid in &expected_rids {
+            assert!(
+                seen_rids.contains(rid),
+                "rid {} missing from forwarded frames; got rids {:?}, \
+                 expected {:?} — multi-forwarder spawn or rid wrap broke",
+                rid.as_str(),
+                seen_rids.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                expected_rids.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            );
+        }
+        // Frame count proportional to layers. Pre-4c forwarded only
+        // one rid (≤ 1.5 × input); post-4c forwards N (~ N × input).
+        // Assert ≥ 2× to leave daylight from the pre-4c behavior even
+        // with encoder warm-up quirks.
         assert!(
-            received > 0,
-            "intake must forward SOMETHING from the active layer — \
-             received 0 frames means the subscription was dropped \
-             entirely, not just shrunk to one"
-        );
-        let max_expected = (input_count * 3) / 2; // 1.5x tolerance
-        assert!(
-            received <= max_expected,
-            "intake forwarded {received} frames for {input_count} i420 \
-             inputs (max acceptable = {max_expected}); pre-3c.3b.2a \
-             behavior would land at ~{} (3× input). Multi-layer fan-out \
-             regression?",
-            input_count * 3,
+            received >= input_count * 2,
+            "expected ≥ {} frames forwarded for {input_count} inputs across \
+             {n_layers} layers; got {received} — pre-4c behavior would \
+             land at ~{} (1× input)",
+            input_count * 2,
+            input_count,
         );
 
         shutdown.cancel();
@@ -3436,26 +3577,27 @@ mod tests {
     // Phase-4c-prep: OutboundEncodedFrame + per-(spec, rid) keyframe gate
     // -----------------------------------------------------------------------
 
-    /// **Phase-4c-prep**: every frame the intake forwards must carry
-    /// the RID of the subscription that produced it. This is the
-    /// mechanism that lets the driver's multi-RID write path (commit
-    /// 2 of phase 4c) look up the right SSRC + per-`(spec, rid)`
-    /// keyframe gate at write time without needing to redundantly
-    /// embed the RID in `EncodedFrame` (which is the encoder's
-    /// output type, shared across subscribers of one slot — it
-    /// shouldn't know about consumer-side identity).
+    /// **Phase 4c**: every frame the intake forwards must carry the
+    /// rid of the subscription that produced it. This is the
+    /// mechanism that lets the driver's multi-RID write path look up
+    /// the right SSRC + per-`(spec, rid)` keyframe gate at write
+    /// time without needing to redundantly embed the rid in
+    /// `EncodedFrame` (which is the encoder pool's output type,
+    /// shared across subscribers of one slot).
     ///
-    /// Today's pool intake still picks a single active subscription
-    /// per epoch (3c.3b.2a contract), so for any particular peer
-    /// the OutboundEncodedFrame.rid is always the active sub's rid.
-    /// This test pins the routing — push frames through the pool,
-    /// receive on the driver side, assert RID matches the
-    /// `select_active_subscription`'s pick (full RID for
-    /// `vp8_simulcast`). Commit 2 will spawn N forwarders and the
-    /// rid will vary across received frames; this commit's contract
-    /// is that the rid is wired through end-to-end at all.
+    /// With multi-forwarder intake (this commit), each rid's
+    /// forwarder wraps frames with its own rid. The mpsc receives
+    /// frames tagged with multiple rids, and the rid on each frame
+    /// matches the encoder slot that produced it. This test pins
+    /// that no rid leaks across forwarders (e.g. forwarder A
+    /// accidentally tagging with B's rid).
+    ///
+    /// Replaces the pre-4c
+    /// `pool_intake_wraps_forwarded_frames_with_active_subscription_rid`
+    /// (which assumed single-active-subscription) — the multi-rid
+    /// version pins per-forwarder rid integrity.
     #[tokio::test]
-    async fn pool_intake_wraps_forwarded_frames_with_active_subscription_rid() {
+    async fn pool_intake_wraps_forwarded_frames_with_per_subscription_rid() {
         use crate::display::encode::pool::{EncoderPool, LayerSpec};
 
         let pool = Arc::new(EncoderPool::new(
@@ -3470,13 +3612,17 @@ mod tests {
             .subscribe(&prefs)
             .expect("VP8 simulcast subscribe must succeed");
 
-        // The intake's `select_active_subscription` picks the full RID
-        // (highest-quality VP8 layer) given prefs of just VP8 against a
-        // simulcast set. Pin the expected rid here so a test failure
-        // names the contract that drifted.
-        let expected_rid = SimulcastRid::full();
+        let subscribed_rids: std::collections::HashSet<SimulcastRid> =
+            initial_subs.iter().map(|s| s.id.rid.clone()).collect();
+        // Pre-condition: subscribed to multiple rids. If this fires,
+        // the test no longer exercises multi-forwarder behavior.
+        assert!(
+            subscribed_rids.len() >= 2,
+            "test setup expects multi-rid subscription set; got {} rids",
+            subscribed_rids.len(),
+        );
 
-        let (frame_tx, mut frame_rx) = mpsc::channel::<OutboundEncodedFrame>(64);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<OutboundEncodedFrame>(1024);
         let shutdown = CancellationToken::new();
         let pool_clone = Arc::clone(&pool);
         let intake_shutdown = shutdown.clone();
@@ -3491,39 +3637,51 @@ mod tests {
             intake_shutdown,
         ));
 
-        // Push enough i420 frames to ensure at least one encoded frame
-        // arrives on the driver side. 8 frames is generous given the
-        // encoder's keyframe-burst on first input.
         let i420 = Arc::new(vec![0u8; 64 * 64 * 3 / 2]);
-        for _ in 0..8 {
+        for _ in 0..12 {
             pool.push_i420_frame(Arc::clone(&i420), Instant::now());
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Drain everything the intake forwarded. Every OutboundEncodedFrame
-        // must carry the active subscription's rid — drift on any one
-        // frame would mean the forwarder's `OutboundEncodedFrame { rid:
-        // active_rid.clone(), frame }` wrap broke.
-        let mut received = 0u32;
+        // Every received frame's rid must be in the subscribed set —
+        // a frame tagged with an unsubscribed rid would mean a
+        // forwarder leaked its rid (e.g. an Arc<SimulcastRid> shared
+        // across forwarders by mistake) or a stale rid persisted
+        // through a resubscribe.
+        let mut received: u32 = 0;
+        let mut rid_counts: std::collections::HashMap<SimulcastRid, u32> =
+            std::collections::HashMap::new();
         while let Ok(outbound) = frame_rx.try_recv() {
-            assert_eq!(
-                outbound.rid, expected_rid,
-                "frame {received} arrived with rid {} but the active \
-                 subscription's rid is {} — the OutboundEncodedFrame \
-                 wrap in pool_frame_intake's forwarder is broken or \
-                 the active rid drifted",
+            assert!(
+                subscribed_rids.contains(&outbound.rid),
+                "frame {received} arrived with rid {} but subscribed \
+                 rids are {:?} — per-forwarder rid wrap leaked or \
+                 stale rid persisted",
                 outbound.rid.as_str(),
-                expected_rid.as_str(),
+                subscribed_rids.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
             );
+            *rid_counts.entry(outbound.rid).or_insert(0) += 1;
             received += 1;
         }
         assert!(
             received > 0,
             "intake must forward at least one frame for this test to \
-             pin anything — got 0. Either the encoder isn't producing \
-             output (test fixture broken) or the forwarder isn't \
-             sending (refactor regression)."
+             pin anything — got 0. Either the encoders aren't \
+             producing output (test fixture broken) or the forwarders \
+             aren't sending (refactor regression)."
+        );
+        // At least 2 distinct rids must have produced frames —
+        // single-rid forwarding (pre-4c) would only show 1.
+        assert!(
+            rid_counts.len() >= 2,
+            "expected ≥2 rids in forwarded stream; got {} ({:?}) — \
+             multi-forwarder pool intake regressed to single-rid",
+            rid_counts.len(),
+            rid_counts
+                .keys()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>(),
         );
 
         shutdown.cancel();
@@ -3592,6 +3750,212 @@ mod tests {
                 _ => panic!("rid {} entry missing", rid.as_str()),
             }
         }
+    }
+
+    /// rtc 0.9 uses rustls 0.23, which requires a process-level
+    /// `CryptoProvider`. Production code paths that build an Rtc
+    /// transitively need it; the test fixtures call this at the top
+    /// of every test that constructs a real `RTCPeerConnection`.
+    /// Idempotent — `install_default` returns Err on second call,
+    /// which we discard.
+    fn ensure_rustls_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    /// **Phase 4c**: synthetic recvonly VP8 offer in the shape rtc 0.9
+    /// requires (`a=fingerprint`, `a=ice-ufrag`/`pwd`, `a=setup`,
+    /// `a=rtpmap`). Used by the build_with_codec_set integration
+    /// tests below to drive `RTCPeerConnection::create_answer`
+    /// without standing up a real browser.
+    fn synth_recvonly_video_offer_for_rtc() -> String {
+        concat!(
+            "v=0\r\n",
+            "o=- 1 2 IN IP4 0.0.0.0\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "a=group:BUNDLE 0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "c=IN IP4 0.0.0.0\r\n",
+            "a=mid:0\r\n",
+            "a=recvonly\r\n",
+            "a=rtcp-mux\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid\r\n",
+            "a=extmap:2 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n",
+            "a=ice-ufrag:testufrag1234\r\n",
+            "a=ice-pwd:testpassword12345678901234\r\n",
+            "a=fingerprint:sha-256 ",
+            "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:",
+            "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n",
+            "a=setup:actpass\r\n",
+        )
+        .to_string()
+    }
+
+    /// Same as `synth_recvonly_video_offer_for_rtc` but advertising
+    /// H.264 only (Constrained Baseline, packetization-mode=1).
+    /// Used by the H.264-only answer test to verify no simulcast
+    /// lines appear when active_rids has length 1.
+    fn synth_recvonly_h264_video_offer_for_rtc() -> String {
+        concat!(
+            "v=0\r\n",
+            "o=- 1 2 IN IP4 0.0.0.0\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "a=group:BUNDLE 0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "c=IN IP4 0.0.0.0\r\n",
+            "a=mid:0\r\n",
+            "a=recvonly\r\n",
+            "a=rtcp-mux\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=fmtp:97 profile-level-id=42e01f;packetization-mode=1;",
+            "level-asymmetry-allowed=1\r\n",
+            "a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid\r\n",
+            "a=ice-ufrag:testufrag1234\r\n",
+            "a=ice-pwd:testpassword12345678901234\r\n",
+            "a=fingerprint:sha-256 ",
+            "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:",
+            "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n",
+            "a=setup:actpass\r\n",
+        )
+        .to_string()
+    }
+
+    /// **Phase 4c**: a multi-encoding track (one encoding per
+    /// `active_rids` entry) emits `a=simulcast:send` plus per-rid
+    /// `a=rid:<rid> send` lines in the answer SDP. This is the wire-
+    /// level contract that browser-visible simulcast depends on —
+    /// if these lines are missing, the browser sees a single-stream
+    /// answer regardless of how many encodings the track was built
+    /// with, and the multi-RID forwarder's frames for non-advertised
+    /// rids are silently dropped at the wire.
+    ///
+    /// Pin: VP8 with active_rids=[full, half, quarter] yields an
+    /// answer containing `a=simulcast:send full;half;quarter` and
+    /// matching `a=rid:* send` lines for each rid.
+    ///
+    /// This test exercises `build_with_codec_set` end-to-end (the
+    /// only way to verify the rtc-side answer SDP shape), but
+    /// abandons the spawned driver task by dropping the returned
+    /// peer at scope-end. The driver self-terminates on shutdown
+    /// signal (peer Drop fires shutdown.cancel()).
+    #[tokio::test]
+    async fn build_with_codec_set_emits_simulcast_send_for_multi_rid_vp8() {
+        ensure_rustls_crypto_provider();
+        let offer_sdp = synth_recvonly_video_offer_for_rtc();
+        let active_rids = vec![
+            SimulcastRid::full(),
+            SimulcastRid::half(),
+            SimulcastRid::quarter(),
+        ];
+        let ice_config = crate::display::IceConfig::default();
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
+            Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
+            Arc::new(|_| {});
+        let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
+
+        let (peer, _frame_tx, answer_sdp) = WebRtcPeer::build_with_codec_set(
+            42,
+            &offer_sdp,
+            CodecKind::Vp8,
+            &active_rids,
+            &ice_config,
+            None,
+            None,
+            input_handler,
+            clipboard_handler,
+            ice_tx,
+        )
+        .await
+        .expect("build_with_codec_set must succeed for VP8 multi-rid");
+
+        // Summary line with all three rids in preference order
+        // (f / h / q — LiveKit / mediasoup convention, see RID_FULL
+        // etc. in pool.rs). The order matches the `active_rids`
+        // slice order; rtc emits them in track-encoding order.
+        assert!(
+            answer_sdp.contains("a=simulcast:send f;h;q"),
+            "answer must include a=simulcast:send f;h;q; \
+             got:\n{answer_sdp}"
+        );
+        // Per-rid declarations in `send` direction. Use the wire
+        // strings from `SimulcastRid::*::as_str()` so the test
+        // tracks any future change to the RID vocabulary.
+        for rid in [
+            SimulcastRid::full(),
+            SimulcastRid::half(),
+            SimulcastRid::quarter(),
+        ] {
+            let line = format!("a=rid:{} send", rid.as_str());
+            assert!(
+                answer_sdp.contains(&line),
+                "answer must include `{line}`; got:\n{answer_sdp}"
+            );
+        }
+        // Sanity: NO recv direction (we're sendonly answerer).
+        assert!(
+            !answer_sdp.contains("a=simulcast:recv"),
+            "answer must NOT contain a=simulcast:recv (we're sendonly); \
+             got:\n{answer_sdp}"
+        );
+
+        // Clean up the spawned driver. Dropping `peer` cancels its
+        // shutdown token, the driver task exits on the next select.
+        drop(peer);
+    }
+
+    /// **Phase 4c**: a single-encoding track (active_rids has length
+    /// 1) emits NO simulcast lines in the answer. This pins the
+    /// fall-through path for H.264 (single-layer by design — see
+    /// `LayerSpec::single`'s rationale) and for VP8 cases where all
+    /// simulcast layers but full dropped below MIN_LAYER_DIM.
+    ///
+    /// If this test fires, the unconditional simulcast emission
+    /// regressed — every peer would advertise simulcast even when
+    /// only one encoding exists, and browsers would request
+    /// keyframes for rids the encoder pool can't serve.
+    #[tokio::test]
+    async fn build_with_codec_set_emits_no_simulcast_for_single_rid_h264() {
+        ensure_rustls_crypto_provider();
+        let offer_sdp = synth_recvonly_h264_video_offer_for_rtc();
+        // Single rid → no simulcast in answer.
+        let active_rids = vec![SimulcastRid::full()];
+        let ice_config = crate::display::IceConfig::default();
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
+            Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
+            Arc::new(|_| {});
+        let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
+
+        let (peer, _frame_tx, answer_sdp) = WebRtcPeer::build_with_codec_set(
+            43,
+            &offer_sdp,
+            CodecKind::H264,
+            &active_rids,
+            &ice_config,
+            None,
+            None,
+            input_handler,
+            clipboard_handler,
+            ice_tx,
+        )
+        .await
+        .expect("build_with_codec_set must succeed for H.264 single-rid");
+
+        assert!(
+            !answer_sdp.contains("a=simulcast:"),
+            "single-encoding track must NOT advertise simulcast; \
+             got:\n{answer_sdp}"
+        );
+        assert!(
+            !answer_sdp.contains("a=rid:"),
+            "single-encoding track must NOT advertise per-rid lines; \
+             got:\n{answer_sdp}"
+        );
+
+        drop(peer);
     }
 
     /// **Phase-4c-prep**: `RtpSendState` carries a `by_rid` map keyed
