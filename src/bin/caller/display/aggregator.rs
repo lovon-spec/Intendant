@@ -357,10 +357,21 @@ pub fn step_layer_capacity_state(
         }
         LayerCapacityState::Dropped => LayerCapacityState::Dropped,
 
-        LayerCapacityState::PendingRestore { .. } if over_budget => {
-            // Signal flipped back to over-budget during pending
-            // restore. Return to Dropped (don't restart the drop
-            // debounce — we're already in the dropped equilibrium).
+        LayerCapacityState::PendingRestore { .. } if !healthy => {
+            // Signal stopped being clearly healthy during pending
+            // restore — covers BOTH the gray-band case (above
+            // recovery threshold but ≤ drop threshold) AND the
+            // over-budget case (above drop threshold). Restore
+            // requires the signal to remain `healthy` (≤
+            // recovery) for the full debounce; any drift out of
+            // healthy cancels back to Dropped without restarting
+            // the drop debounce (we're already in the dropped
+            // equilibrium and the signal hasn't recovered to the
+            // standard the wider-hysteresis-band requires).
+            //
+            // Symmetric to PendingDrop's cancel-on-recovery: drop
+            // cancels on any improvement (`!over_budget`); restore
+            // cancels on any regression (`!healthy`).
             LayerCapacityState::Dropped
         }
         LayerCapacityState::PendingRestore { since }
@@ -762,6 +773,62 @@ mod tests {
         let later = now + Duration::from_millis(500);
         let h = health(0.10);
         let s = step_layer_capacity_state(pending, Some(&h), &cfg(), later);
+        assert_eq!(s, LayerCapacityState::Dropped);
+    }
+
+    #[test]
+    fn capacity_step_pending_restore_gray_band_cancels_back_to_dropped() {
+        // **4d.3b review fix regression**: PendingRestore must NOT
+        // restore on gray-band loss (between the recovery
+        // threshold and the drop threshold). Restore requires the
+        // signal to remain clearly `healthy` (≤ recovery threshold)
+        // through the full debounce window; any drift back into
+        // gray-band cancels the restore.
+        //
+        // Asymmetric to drop's cancel-on-recovery: drop cancels on
+        // any improvement (signal ≤ drop threshold), but restore
+        // requires the signal to stay below the wider recovery
+        // threshold. Without this, the policy would restore on
+        // signals that haven't actually recovered to the wider-
+        // hysteresis-band's standard — the same gray-band
+        // oscillation the dual-threshold design exists to prevent.
+        //
+        // Test setup: enter PendingRestore at fraction_lost = 0.01
+        // (clearly healthy), then drift to 0.04 (gray-band: above
+        // recovery 0.02 but ≤ drop threshold 0.05) at exactly the
+        // post-debounce moment. Without this fix the helper would
+        // hit the post-debounce arm and restore to Wanted, which
+        // is wrong: the signal isn't clearly healthy any more.
+        let now = t0();
+        let pending = LayerCapacityState::PendingRestore { since: now };
+        let post = now + cfg().restore_debounce;
+        let gray_band = health(0.04);
+        let s = step_layer_capacity_state(
+            pending,
+            Some(&gray_band),
+            &cfg(),
+            post,
+        );
+        assert_eq!(
+            s,
+            LayerCapacityState::Dropped,
+            "gray-band signal during PendingRestore must cancel \
+             back to Dropped — restore requires the signal to stay \
+             ≤ recovery threshold through the full debounce; got {s:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_step_pending_restore_gray_band_cancels_immediately_pre_debounce() {
+        // Same fix, pre-debounce: gray-band signal during the
+        // restore-pending window cancels immediately, doesn't wait
+        // for the debounce to elapse. Confirms the cancel arm
+        // (`!healthy`) takes precedence over the timer arm.
+        let now = t0();
+        let pending = LayerCapacityState::PendingRestore { since: now };
+        let pre = now + Duration::from_millis(500);
+        let gray_band = health(0.03);
+        let s = step_layer_capacity_state(pending, Some(&gray_band), &cfg(), pre);
         assert_eq!(s, LayerCapacityState::Dropped);
     }
 
