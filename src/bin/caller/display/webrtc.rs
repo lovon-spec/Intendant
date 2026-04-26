@@ -2239,6 +2239,44 @@ fn filter_prefs_to_negotiated(
     )
 }
 
+/// Partition pool subscriptions by active codec, dropping the inactive
+/// subscriptions immediately and returning their ids so the caller can
+/// release the lease's on-demand claims for codecs the active codec
+/// doesn't use.
+///
+/// Active subscriptions are kept and returned for forwarder spawning
+/// (one forwarder per `(codec, rid)` slot — that's how
+/// browser-visible simulcast happens). Inactive subscriptions get
+/// dropped here so their `broadcast::Receiver` clones release
+/// immediately rather than lingering until end-of-scope; only the
+/// ids escape so the caller can call
+/// [`PoolLease::release_on_demand_subset`] on them.
+///
+/// Always-on slots have no `on_demand_refs` entry; passing their
+/// ids to `release_on_demand_subset` is a silent no-op via the
+/// skip-unknown-ids contract on that side. This helper doesn't
+/// distinguish always-on from on-demand — it just emits every
+/// inactive id and lets the lease side decide what to release. That
+/// keeps the wasted-CPU regression caught in the 3c.3b.2a review
+/// (multi-codec pool with a VP8-preferring peer keeping the H.264
+/// encoder spinning into a no-receiver broadcast) closed.
+///
+/// Pure function for unit testability — no side effects on the
+/// lease, no side effects on the pool. The release call lives at
+/// the caller in `pool_frame_intake`.
+fn partition_subscriptions_by_codec(
+    subscriptions: Vec<EncoderSubscription>,
+    active_codec: CodecKind,
+) -> (Vec<EncoderSubscription>, Vec<EncoderId>) {
+    let (active_subs, inactive_subs): (Vec<_>, Vec<_>) = subscriptions
+        .into_iter()
+        .partition(|s| s.id.codec == active_codec);
+    let inactive_ids: Vec<EncoderId> =
+        inactive_subs.iter().map(|s| s.id.clone()).collect();
+    drop(inactive_subs);
+    (active_subs, inactive_ids)
+}
+
 /// Why the intake exits a forwarder loop. The intake's outer select
 /// branches on this to decide between resubscribe (encoder epoch
 /// rolled over) and clean shutdown (driver gone, intake should exit).
@@ -2425,21 +2463,11 @@ async fn pool_frame_intake(
                 return;
             }
         };
-        let (active_subs, inactive_subs): (
-            Vec<EncoderSubscription>,
-            Vec<EncoderSubscription>,
-        ) = subs_now
-            .into_iter()
-            .partition(|s| s.id.codec == active_codec);
-        // Collect inactive ids BEFORE dropping the subs so we can
-        // release their on-demand claims. Always-on slots have no
-        // on_demand_refs entry; passing their ids is a silent no-op
-        // via `release_on_demand_subset`'s skip-unknown-ids
-        // contract. So we don't have to distinguish always-on from
-        // on-demand here — just pass everything inactive.
-        let inactive_ids: Vec<EncoderId> =
-            inactive_subs.iter().map(|s| s.id.clone()).collect();
-        drop(inactive_subs);
+        // Partition by codec, dropping inactive subs immediately and
+        // collecting their ids for release. See
+        // [`partition_subscriptions_by_codec`] for the contract.
+        let (active_subs, inactive_ids) =
+            partition_subscriptions_by_codec(subs_now, active_codec);
         // Release the inactive on-demand claims on the active lease.
         // For a peer with prefs [VP8, H264] against a pool that has
         // VP8 always-on + H264 on-demand, this is what tears down
@@ -3034,6 +3062,146 @@ mod tests {
         let original = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let filtered = filter_prefs_to_negotiated(&original, &[]);
         assert!(filtered.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4c follow-up (d): partition_subscriptions_by_codec unit tests
+    // -----------------------------------------------------------------------
+
+    /// Build a synthetic [`EncoderSubscription`] with a fresh
+    /// `broadcast::Receiver`. The Sender is `mem::forget`ed so the
+    /// channel stays open for the lifetime of the test (we never
+    /// `recv()` — these tests inspect ids only).
+    ///
+    /// Synthetic: lets us construct H.264 subscriptions without
+    /// spawning a real H.264 encoder backend (VAAPI / VideoToolbox
+    /// / ffmpeg), so the partition test can exercise the
+    /// VP8 + H.264 mix without the encoder backend dependency.
+    fn make_partition_test_subscription(
+        codec: CodecKind,
+        rid: SimulcastRid,
+    ) -> EncoderSubscription {
+        use crate::display::encode::pool::LayerSpec;
+        let (s, r) = broadcast::channel::<Arc<EncodedFrame>>(4);
+        std::mem::forget(s);
+        EncoderSubscription {
+            id: EncoderId::new(codec, rid),
+            layer: LayerSpec::single(codec, 64, 64, 30),
+            frames: r,
+        }
+    }
+
+    /// **Phase 4c follow-up (d) contract: mixed-codec partition.**
+    ///
+    /// When `pool.subscribe(prefs=[VP8, H.264])` returns subscriptions
+    /// for both codecs (e.g. VP8 simulcast 3 layers + H.264 single
+    /// layer = 4 subs total), `partition_subscriptions_by_codec` with
+    /// `active_codec=Vp8` must:
+    ///
+    /// - Return all 3 VP8 subscriptions in the active partition (each
+    ///   gets its own forwarder; per-RID frames feed the multi-RID
+    ///   driver write path).
+    /// - Return only the H.264 id in the inactive_ids vec (caller
+    ///   passes to `lease.release_on_demand_subset` so the H.264
+    ///   on-demand encoder tears down rather than spinning into a
+    ///   no-receiver broadcast — the wasted-CPU regression caught
+    ///   in the 3c.3b.2a review).
+    ///
+    /// The end-to-end chain is pinned by composition with the
+    /// existing `release_on_demand_subset_decrements_only_specified_ids`
+    /// + `release_on_demand_subset_silently_skips_unknown_ids` tests
+    /// in `display/encode/pool.rs` — they pin the lease side, this
+    /// pins the partition side, and `pool_frame_intake` passes the
+    /// returned `inactive_ids` verbatim to `release_on_demand_subset`.
+    #[test]
+    fn partition_subscriptions_by_codec_mixed_codec_separates_active_keeps_inactive_ids(
+    ) {
+        let vp8_full =
+            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::full());
+        let vp8_half =
+            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::half());
+        let vp8_quarter =
+            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::quarter());
+        let h264_full =
+            make_partition_test_subscription(CodecKind::H264, SimulcastRid::full());
+
+        let (active, inactive_ids) = partition_subscriptions_by_codec(
+            vec![vp8_full, h264_full, vp8_half, vp8_quarter],
+            CodecKind::Vp8,
+        );
+
+        // Active partition: all 3 VP8 subs (forwarder spawns for each).
+        assert_eq!(
+            active.len(),
+            3,
+            "VP8 simulcast active partition must keep all 3 layer subs"
+        );
+        let active_ids: std::collections::HashSet<EncoderId> =
+            active.iter().map(|s| s.id.clone()).collect();
+        assert!(active_ids.contains(&EncoderId::new(CodecKind::Vp8, SimulcastRid::full())));
+        assert!(active_ids.contains(&EncoderId::new(CodecKind::Vp8, SimulcastRid::half())));
+        assert!(active_ids
+            .contains(&EncoderId::new(CodecKind::Vp8, SimulcastRid::quarter())));
+
+        // Inactive ids: ONLY the H.264 id. pool_frame_intake passes
+        // this verbatim to lease.release_on_demand_subset, which is
+        // what tears down the never-consumed H.264 on-demand encoder.
+        assert_eq!(
+            inactive_ids,
+            vec![EncoderId::new(CodecKind::H264, SimulcastRid::full())],
+            "inactive_ids must contain exactly the H.264 id (and only \
+             the H.264 id) so release_on_demand_subset drops the \
+             unused on-demand claim"
+        );
+    }
+
+    /// Single-codec subscription set → empty inactive_ids → caller
+    /// skips the release call (the `if !inactive_ids.is_empty()` guard
+    /// in `pool_frame_intake`). This is the steady-state case for
+    /// resubscribe-after-Closed: `filter_prefs_to_negotiated` locks
+    /// resubscribe prefs to the active codec only, so subsequent
+    /// epochs always have inactive_ids empty.
+    #[test]
+    fn partition_subscriptions_by_codec_single_codec_returns_empty_inactive_ids() {
+        let vp8_full =
+            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::full());
+        let vp8_half =
+            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::half());
+
+        let (active, inactive_ids) =
+            partition_subscriptions_by_codec(vec![vp8_full, vp8_half], CodecKind::Vp8);
+
+        assert_eq!(active.len(), 2, "both VP8 subs end up in active");
+        assert!(
+            inactive_ids.is_empty(),
+            "single-codec subscription set must produce empty inactive_ids"
+        );
+    }
+
+    /// All subs are inactive — active partition empty, inactive_ids
+    /// has every id. `pool_frame_intake` defends against this by
+    /// calling `active_codec_from_subscriptions` first and escalating
+    /// to peer shutdown if the active codec resolves but the partition
+    /// still produces zero active subs (a "shouldn't happen" contract
+    /// violation). This test pins the helper's behavior at that
+    /// boundary so the defensive check upstream has well-defined
+    /// inputs.
+    #[test]
+    fn partition_subscriptions_by_codec_no_active_match_keeps_all_inactive_ids() {
+        let h264_full =
+            make_partition_test_subscription(CodecKind::H264, SimulcastRid::full());
+        let h264_half =
+            make_partition_test_subscription(CodecKind::H264, SimulcastRid::half());
+
+        let (active, inactive_ids) =
+            partition_subscriptions_by_codec(vec![h264_full, h264_half], CodecKind::Vp8);
+
+        assert!(active.is_empty(), "no VP8 in subs → active partition empty");
+        assert_eq!(
+            inactive_ids.len(),
+            2,
+            "both H.264 ids must surface as inactive when active codec is VP8"
+        );
     }
 
     /// **3c.3b.2 first explicit test, per the 3c.3b.1a review.**
