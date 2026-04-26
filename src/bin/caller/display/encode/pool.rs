@@ -1817,24 +1817,50 @@ impl EncoderPool {
     /// one capture interval (~33ms at 30fps) the resumed layer is
     /// producing again.
     ///
-    /// `force_keyframe` requests that arrived during the pause window
-    /// were preserved (the encoder thread skips the swap while
-    /// paused), so the first post-resume encode is a keyframe — what
-    /// every viewer subscribing to a freshly-resumed layer needs.
+    /// **Forces a keyframe on the paused → active transition.**
+    /// Without this, the first post-resume frame is a P-frame
+    /// referencing decoder state from BEFORE the pause — and the
+    /// decoder either:
+    ///   - has stale state from before the pause (timed out, dropped
+    ///     reference frames during the gap → corruption / black until
+    ///     the next natural keyframe), or
+    ///   - is brand-new (a viewer subscribed to this layer DURING
+    ///     the pause, expecting the resumed stream to be
+    ///     immediately decodable → black until the next keyframe).
+    ///
+    /// The transition detection uses `swap(false, SeqCst)`: when the
+    /// previous value was `true`, this is the paused → active edge
+    /// and we set `force_keyframe = true`. Repeated resume calls on
+    /// an already-active slot see swap-returns-false and skip the
+    /// keyframe force — preserves idempotency without re-firing
+    /// keyframes on every resume call.
+    ///
+    /// (A `force_keyframe` set externally during the pause window
+    /// also survives, because the encoder thread's swap on
+    /// `force_keyframe` only runs after the pause check and was
+    /// skipped while paused. So the first post-resume encode picks
+    /// up either the resume-edge force or the externally-requested
+    /// force — both produce a keyframe.)
     pub fn resume_layer(&self, codec: CodecKind, rid: SimulcastRid) -> bool {
         let id = EncoderId::new(codec, rid);
         {
             let always_on = self.inner.always_on.read().unwrap();
             for handle in always_on.iter() {
                 if handle.id == id {
-                    handle.paused.store(false, Ordering::SeqCst);
+                    let was_paused = handle.paused.swap(false, Ordering::SeqCst);
+                    if was_paused {
+                        handle.force_keyframe.store(true, Ordering::SeqCst);
+                    }
                     return true;
                 }
             }
         }
         let on_demand = self.inner.on_demand.lock().unwrap();
         if let Some(slot) = on_demand.get(&id) {
-            slot.handle.paused.store(false, Ordering::SeqCst);
+            let was_paused = slot.handle.paused.swap(false, Ordering::SeqCst);
+            if was_paused {
+                slot.handle.force_keyframe.store(true, Ordering::SeqCst);
+            }
             return true;
         }
         false
@@ -4390,6 +4416,97 @@ mod tests {
         );
     }
 
+    /// **Review fix**: `resume_layer` MUST force a keyframe on the
+    /// paused → active transition. Without this, the first post-
+    /// resume frame is a P-frame referencing pre-pause state — stale
+    /// for subscribers that lost reference frames during the pause,
+    /// missing entirely for subscribers that joined during the pause.
+    ///
+    /// Pin the contract: pause clears nothing on the force_keyframe
+    /// flag; resume from paused sets it.
+    #[tokio::test]
+    async fn pool_resume_layer_from_paused_sets_force_keyframe() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
+
+        // Initial state: not paused, force_keyframe clear. Pre-condition
+        // for the test (otherwise we'd be measuring noise).
+        let handle = &pool.always_on()[0];
+        assert!(!handle.force_keyframe.load(Ordering::SeqCst));
+        assert!(!handle.paused.load(Ordering::SeqCst));
+
+        // Pause does NOT touch force_keyframe.
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());
+        assert!(
+            !handle.force_keyframe.load(Ordering::SeqCst),
+            "pause_layer must not touch force_keyframe"
+        );
+
+        // Resume from paused → force_keyframe set.
+        pool.resume_layer(CodecKind::Vp8, SimulcastRid::full());
+        assert!(
+            handle.force_keyframe.load(Ordering::SeqCst),
+            "resume_layer from paused MUST set force_keyframe so the \
+             first post-resume encode is decodable for any subscriber \
+             whose decoder state went stale during the pause"
+        );
+    }
+
+    /// Idempotent resume on an already-active slot must NOT newly
+    /// force a keyframe — re-firing on every resume call would burn
+    /// peak-bandwidth keyframes for nothing whenever the aggregator
+    /// (4d.2) recomputes layer state and "resumes" something that
+    /// was never paused.
+    ///
+    /// Uses `swap(false, ..)` to detect the transition: when the
+    /// previous paused value was already false, no force fires.
+    #[tokio::test]
+    async fn pool_resume_layer_on_already_active_does_not_force_keyframe() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
+
+        let handle = &pool.always_on()[0];
+        assert!(!handle.force_keyframe.load(Ordering::SeqCst));
+        assert!(!handle.paused.load(Ordering::SeqCst));
+
+        // First resume on already-active slot: no transition, no force.
+        pool.resume_layer(CodecKind::Vp8, SimulcastRid::full());
+        assert!(
+            !handle.force_keyframe.load(Ordering::SeqCst),
+            "resume_layer on already-active slot must NOT force a keyframe"
+        );
+
+        // Repeated resume calls also no-op the keyframe force.
+        for _ in 0..5 {
+            pool.resume_layer(CodecKind::Vp8, SimulcastRid::full());
+        }
+        assert!(
+            !handle.force_keyframe.load(Ordering::SeqCst),
+            "repeated resume_layer on already-active slot must NOT \
+             accumulate keyframe forces"
+        );
+
+        // Sanity: the only way force_keyframe gets set without an
+        // explicit request_keyframe is via paused → active edge.
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());
+        pool.resume_layer(CodecKind::Vp8, SimulcastRid::full());
+        assert!(
+            handle.force_keyframe.load(Ordering::SeqCst),
+            "paused → active edge must set force_keyframe — sanity \
+             check that the swap-based detection does fire on transitions"
+        );
+    }
+
     /// Pause/resume targets the right layer in a multi-layer pool.
     /// Pause full, leave half + quarter active; verify each one's
     /// state independently. Pins per-(codec, rid) routing so a
@@ -4529,5 +4646,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Review fix end-to-end test**: the first post-resume encoded
+    /// frame must be a keyframe even after the encoder has already
+    /// produced a P-frame in this session (i.e., not just the natural
+    /// cold-start keyframe). Without resume forcing a keyframe,
+    /// subscribers whose decoder state went stale during the pause
+    /// would have garbage / black until the next natural GOP keyframe
+    /// (~30 frames at kf_max_dist=30, i.e., ~1s on idle desktops or
+    /// indefinitely on fully static content).
+    ///
+    /// Test sequence:
+    ///   1. Push frame, drain — naturally a cold-start keyframe.
+    ///   2. Push frame, drain — naturally a P-frame (no force).
+    ///   3. Pause, resume.
+    ///   4. Push frame, drain — assert IS a keyframe.
+    ///
+    /// Step 2 is the load-bearing one: it ensures we've moved past
+    /// the encoder's natural cold-start keyframe so step 4's keyframe
+    /// can only have come from the resume_layer force.
+    #[tokio::test]
+    async fn pool_resume_after_prior_p_frame_produces_keyframe() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            move |w, h| vec![LayerSpec::single(CodecKind::Vp8, w, h, 30)],
+            None,
+        );
+
+        let mut frames_rx = {
+            let always_on = pool.always_on();
+            always_on[0].subscribe()
+        };
+
+        // Helper: push frames + drain encoded output; return the
+        // sequence of `is_keyframe` flags collected. Drains greedily
+        // up to a short deadline to absorb any per-frame multi-packet
+        // splits or queued output.
+        async fn push_and_drain(
+            pool: &EncoderPool,
+            rx: &mut broadcast::Receiver<Arc<EncodedFrame>>,
+            i420: &Arc<Vec<u8>>,
+        ) -> Vec<bool> {
+            pool.push_i420_frame(Arc::clone(i420), Instant::now());
+            let deadline = std::time::Duration::from_secs(2);
+            let mut got: Vec<bool> = Vec::new();
+            // First frame: wait up to 2s.
+            match tokio::time::timeout(deadline, rx.recv()).await {
+                Ok(Ok(frame)) => got.push(frame.is_keyframe),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) => return got,
+                Err(_) => return got,
+            }
+            // Drain any additional frames immediately available without
+            // blocking — handles multi-packet outputs from one encode
+            // (rare for VP8 small frames but defensive).
+            while let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv()).await
+            {
+                got.push(frame.is_keyframe);
+            }
+            got
+        }
+
+        let i420 = Arc::new(vec![0u8; 64 * 64 * 3 / 2]);
+
+        // 1. Cold-start frame — naturally a keyframe.
+        let frames1 = push_and_drain(&pool, &mut frames_rx, &i420).await;
+        assert!(
+            !frames1.is_empty(),
+            "cold-start push must produce at least one frame"
+        );
+        assert!(
+            frames1[0],
+            "cold-start frame must be a keyframe (encoder's natural \
+             behavior on first encode)"
+        );
+
+        // 2. Second frame — naturally a P-frame, no force_keyframe set.
+        // VP8 with identical content ([0u8; …]) emits a tiny P-frame
+        // referencing the cold-start keyframe (verified by the
+        // existing vp8.rs tests).
+        let frames2 = push_and_drain(&pool, &mut frames_rx, &i420).await;
+        assert!(
+            !frames2.is_empty(),
+            "second push must produce at least one frame"
+        );
+        assert!(
+            !frames2[0],
+            "second frame must be a P-frame (no force_keyframe set; \
+             encoder cadence has not yet hit kf_max_dist) — got \
+             keyframe, which means the test setup is producing \
+             keyframes for the wrong reason and the post-resume \
+             keyframe assertion below would be ambiguous"
+        );
+
+        // 3. Pause then resume — the resume call should set
+        // force_keyframe on the encoder handle. The encoder thread
+        // will swap+consume the flag on the next push.
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());
+        pool.resume_layer(CodecKind::Vp8, SimulcastRid::full());
+
+        // 4. Push a frame — assert the result is a keyframe. The
+        // encoder is configured with kf_max_dist=30 and only 2
+        // frames have been encoded, so the natural-cadence keyframe
+        // is ~28 frames away. The ONLY way this frame is a keyframe
+        // is if resume_layer set force_keyframe.
+        let frames3 = push_and_drain(&pool, &mut frames_rx, &i420).await;
+        assert!(
+            !frames3.is_empty(),
+            "post-resume push must produce at least one frame"
+        );
+        assert!(
+            frames3[0],
+            "post-resume frame MUST be a keyframe — natural cadence \
+             is ~28 frames away, so a non-keyframe here means \
+             resume_layer failed to set force_keyframe on the \
+             paused → active transition. Subscribers whose decoder \
+             state went stale during the pause would render garbage \
+             until the next natural keyframe."
+        );
     }
 }
