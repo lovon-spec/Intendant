@@ -703,6 +703,18 @@ pub struct PeerLayerHealth {
     /// RTCP SR/RR exchange. `0.0` until the first RTT measurement
     /// lands.
     pub round_trip_time_seconds: f64,
+    /// Number of RTT measurements ever recorded on this layer
+    /// (monotonically non-decreasing). The freshness discriminator:
+    /// rtc 0.9 keeps surfacing the same RR-derived field values
+    /// every poll until the next RR arrives, so a `fraction_lost`
+    /// reading repeated tick after tick may reflect a single RR
+    /// from minutes ago — not fresh signal. The 4d.3c aggregator
+    /// compares this count against its per-(peer, RID) prev-count
+    /// snapshot; if the count didn't advance since last tick, the
+    /// reading is stale and the policy receives `None` instead.
+    /// This prevents stale loss readings from completing a 5s
+    /// drop debounce all on their own.
+    pub round_trip_time_measurements: u64,
 }
 
 impl WebRtcPeer {
@@ -2191,6 +2203,7 @@ fn map_remote_inbound_to_rid_health(
                     fraction_lost,
                     packets_lost_total,
                     round_trip_time_seconds,
+                    round_trip_time_measurements: rtt_measurements,
                 },
             );
         }
@@ -5183,6 +5196,7 @@ mod tests {
                 fraction_lost: 0.01,
                 packets_lost_total: 5,
                 round_trip_time_seconds: 0.012,
+                round_trip_time_measurements: 3,
             })
         );
         assert_eq!(
@@ -5191,6 +5205,7 @@ mod tests {
                 fraction_lost: 0.05,
                 packets_lost_total: 23,
                 round_trip_time_seconds: 0.018,
+                round_trip_time_measurements: 7,
             })
         );
         assert_eq!(
@@ -5199,6 +5214,7 @@ mod tests {
                 fraction_lost: 0.20,
                 packets_lost_total: 99,
                 round_trip_time_seconds: 0.025,
+                round_trip_time_measurements: 4,
             })
         );
     }
@@ -5227,6 +5243,7 @@ mod tests {
                 fraction_lost: 0.07,
                 packets_lost_total: 30,
                 round_trip_time_seconds: 0.020,
+                round_trip_time_measurements: 9,
             })
         );
         assert!(!out.contains_key(&SimulcastRid::full()));
@@ -5294,6 +5311,7 @@ mod tests {
                 fraction_lost: 0.05,
                 packets_lost_total: 23,
                 round_trip_time_seconds: 0.018,
+                round_trip_time_measurements: 4,
             })
         );
     }

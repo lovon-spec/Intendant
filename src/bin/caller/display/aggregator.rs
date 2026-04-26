@@ -477,6 +477,32 @@ pub enum CapacityAction {
     ResumeLayer(SimulcastRid),
 }
 
+/// **Phase 4d.3c review fix**: returns the health entry only if its
+/// RTT-measurement count is strictly greater than the previously-
+/// observed count for this peer-RID. `None` from the helper means
+/// "no fresh RR since last observation" — pass-through to
+/// [`step_layer_capacity_state`] as "no signal," which preserves
+/// the layer's current state without advancing the debounce.
+///
+/// **Why**: rtc 0.9 keeps surfacing the most recent RR-derived
+/// values every poll until the next RR arrives. Without this
+/// freshness check, a single bad RR from minutes ago would be
+/// re-presented every aggregator tick and complete a 5s drop
+/// debounce all on its own — even if the link recovered or the
+/// peer simply stopped sending RRs. Comparing `round_trip_time_measurements`
+/// (monotonically non-decreasing in rtc 0.9's RR processing
+/// pipeline) against a per-(peer, RID) prev-count snapshot is the
+/// freshness discriminator.
+///
+/// `None` input passes through as `None` — preserves the no-RR
+/// contract from 4d.3a's pre-RR filter.
+pub fn fresh_health<'a>(
+    raw: Option<&'a PeerLayerHealth>,
+    prev_count: u64,
+) -> Option<&'a PeerLayerHealth> {
+    raw.filter(|h| h.round_trip_time_measurements > prev_count)
+}
+
 /// Pure: compute the action sequence for one tick by diffing the
 /// previously-applied wanted set against the current aggregate.
 /// Iteration is bounded by `all_non_floor_rids` (not by either
@@ -542,6 +568,18 @@ pub fn spawn_capacity_aggregator(
             PeerId,
             tokio::sync::watch::Receiver<HashMap<SimulcastRid, PeerLayerHealth>>,
         > = HashMap::new();
+        // Phase 4d.3c review fix: per-(peer, RID) RTT-measurement
+        // count snapshot. Passed to `fresh_health` each tick to
+        // distinguish a freshly-arrived RR (count advanced) from a
+        // stale repeat of the previous RR's values (count
+        // unchanged). Updated AFTER each policy step using the
+        // count from the raw health entry, regardless of whether
+        // the entry was actually used by the policy — so a series
+        // of stale repeats doesn't drift the prev count and a
+        // genuinely-new RR after a stale window registers as
+        // fresh.
+        let mut prev_measurement_count: HashMap<(PeerId, SimulcastRid), u64> =
+            HashMap::new();
         // Initialize on the first tick (after the first
         // `get_non_floor_rids` call sees the actual layer set).
         let mut last_applied: HashSet<SimulcastRid> = HashSet::new();
@@ -581,6 +619,10 @@ pub fn spawn_capacity_aggregator(
 
                     // Drop state entries for peers no longer present.
                     state.retain(|(pid, _), _| current_peers.contains_key(pid));
+                    // Phase 4d.3c review fix: drop freshness snapshot
+                    // entries for absent peers too, mirror state.retain.
+                    prev_measurement_count
+                        .retain(|(pid, _), _| current_peers.contains_key(pid));
 
                     let peer_ids: Vec<PeerId> =
                         current_peers.keys().cloned().collect();
@@ -609,11 +651,33 @@ pub fn spawn_capacity_aggregator(
                                 .get(&key)
                                 .copied()
                                 .unwrap_or(LayerCapacityState::Wanted);
-                            let health = health_map.get(rid);
+                            let raw_health = health_map.get(rid);
+                            // Phase 4d.3c review fix: filter stale
+                            // RRs through `fresh_health`. Only when
+                            // the RTT-measurement count strictly
+                            // exceeds the previously-observed count
+                            // do we treat the entry as a fresh
+                            // signal worth advancing the policy.
+                            let prev_count = prev_measurement_count
+                                .get(&key)
+                                .copied()
+                                .unwrap_or(0);
+                            let fresh = fresh_health(raw_health, prev_count);
                             let next = step_layer_capacity_state(
-                                prev, health, &config, now,
+                                prev, fresh, &config, now,
                             );
-                            state.insert(key, next);
+                            state.insert(key.clone(), next);
+                            // Update the freshness snapshot to the
+                            // observed count regardless of whether
+                            // the policy used the entry — so a
+                            // stale repeat doesn't drift the prev
+                            // count, and a genuinely-new RR after
+                            // a stale window correctly registers
+                            // as fresh.
+                            if let Some(h) = raw_health {
+                                prev_measurement_count
+                                    .insert(key, h.round_trip_time_measurements);
+                            }
                             if layer_state_is_wanted(&next) {
                                 peer_wanted_rids.insert(rid.clone());
                             }
@@ -827,10 +891,28 @@ mod tests {
     }
 
     fn health(fraction_lost: f64) -> PeerLayerHealth {
+        // `round_trip_time_measurements: 1` — synthesizes a single
+        // RR observation. The freshness check (`fresh_health`)
+        // runs at a higher layer (the spawn loop), not in the pure
+        // policy tests; these tests pass `Some(&health)` directly
+        // to `step_layer_capacity_state` to exercise its state-
+        // machine transitions. The measurement count is irrelevant
+        // for the policy itself but must be set so the field
+        // exists.
         PeerLayerHealth {
             fraction_lost,
             packets_lost_total: 0,
             round_trip_time_seconds: 0.0,
+            round_trip_time_measurements: 1,
+        }
+    }
+
+    fn health_with_measurements(fraction_lost: f64, measurements: u64) -> PeerLayerHealth {
+        PeerLayerHealth {
+            fraction_lost,
+            packets_lost_total: 0,
+            round_trip_time_seconds: 0.0,
+            round_trip_time_measurements: measurements,
         }
     }
 
@@ -1242,5 +1324,144 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4d.3c review fix: fresh_health + freshness composition tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn fresh_health_none_input_passes_through_as_none() {
+        // `None` from the projection (no health entry for this RID)
+        // is already "no signal." Freshness check just preserves
+        // that — doesn't synthesize a phantom health from prev count.
+        assert!(fresh_health(None, 0).is_none());
+        assert!(fresh_health(None, 5).is_none());
+    }
+
+    #[test]
+    fn fresh_health_count_advanced_returns_some() {
+        let h = health_with_measurements(0.05, 3);
+        assert!(fresh_health(Some(&h), 0).is_some(), "first observation: 0 → 3");
+        assert!(fresh_health(Some(&h), 2).is_some(), "advanced: 2 → 3");
+    }
+
+    #[test]
+    fn fresh_health_count_unchanged_returns_none() {
+        // The bug 4d.3c review fix targets: stale RR repeated tick
+        // after tick must NOT register as fresh signal.
+        let h = health_with_measurements(0.10, 5);
+        assert!(
+            fresh_health(Some(&h), 5).is_none(),
+            "same count: must be filtered as stale; got Some"
+        );
+    }
+
+    #[test]
+    fn fresh_health_count_regressed_returns_none() {
+        // Defends against rtc-side counter resets / unexpected state.
+        // If the count somehow went backwards (e.g., RR
+        // accumulator reset after renegotiation), treat as stale —
+        // don't act on counter going down.
+        let h = health_with_measurements(0.10, 2);
+        assert!(
+            fresh_health(Some(&h), 5).is_none(),
+            "regressed count: must be filtered as stale"
+        );
+    }
+
+    /// **4d.3c review fix regression**: a single bad RR must NOT
+    /// complete the drop debounce on its own. The signal has to
+    /// remain over-budget across multiple FRESH RRs through the
+    /// full 5s debounce window.
+    ///
+    /// Composition of `fresh_health` + `step_layer_capacity_state`
+    /// — the same composition the spawn loop uses, exercised
+    /// directly with a controlled measurement-count series.
+    #[test]
+    fn stale_repeated_bad_rr_does_not_complete_drop_debounce() {
+        let cfg = cfg();
+        let bad_rr = health_with_measurements(0.10, 1);
+        let mut prev_count: u64 = 0;
+        let mut state = LayerCapacityState::Wanted;
+        let t0 = Instant::now();
+
+        // Tick 0: first observation, count advances 0 → 1, fresh
+        // signal triggers PendingDrop.
+        let fresh = fresh_health(Some(&bad_rr), prev_count);
+        assert!(fresh.is_some(), "first observation must be fresh");
+        state = step_layer_capacity_state(state, fresh, &cfg, t0);
+        assert!(matches!(state, LayerCapacityState::PendingDrop { .. }));
+        prev_count = bad_rr.round_trip_time_measurements;
+
+        // Ticks 1..N: same RR re-presented every tick (count stays
+        // at 1). Walk well past the drop debounce. State must NOT
+        // advance to Dropped because every observation is stale.
+        for tick_n in 1..10 {
+            let fresh = fresh_health(Some(&bad_rr), prev_count);
+            assert!(
+                fresh.is_none(),
+                "stale repeat at tick {tick_n}: count {} matches \
+                 prev {prev_count} — must be filtered",
+                bad_rr.round_trip_time_measurements,
+            );
+            // Pass `None` to the policy (the spawn loop does the
+            // same after fresh_health filters out the entry).
+            state = step_layer_capacity_state(
+                state,
+                fresh,
+                &cfg,
+                t0 + Duration::from_secs(tick_n),
+            );
+            assert!(
+                matches!(state, LayerCapacityState::PendingDrop { .. }),
+                "tick {tick_n}: state must remain PendingDrop \
+                 without fresh RRs; got {state:?}",
+            );
+        }
+    }
+
+    /// **4d.3c review fix regression**: with FRESH bad RRs every
+    /// tick (measurement count strictly advancing), the drop
+    /// debounce completes normally and the layer transitions to
+    /// Dropped. Confirms the freshness filter doesn't break the
+    /// happy path.
+    #[test]
+    fn fresh_repeated_bad_rrs_do_complete_drop_debounce() {
+        let cfg = cfg();
+        let mut prev_count: u64 = 0;
+        let mut state = LayerCapacityState::Wanted;
+        let t0 = Instant::now();
+        let drop_secs = cfg.drop_debounce.as_secs();
+
+        // For each tick, synthesize a fresh RR with an incrementing
+        // measurement count (1, 2, 3, ...) and the same over-budget
+        // fraction_lost. Walk through the drop debounce window.
+        for tick_n in 0..=drop_secs {
+            let bad_rr =
+                health_with_measurements(0.10, (tick_n + 1) as u64);
+            let fresh = fresh_health(Some(&bad_rr), prev_count);
+            assert!(
+                fresh.is_some(),
+                "tick {tick_n}: count {} > prev {prev_count}, must be fresh",
+                bad_rr.round_trip_time_measurements,
+            );
+            state = step_layer_capacity_state(
+                state,
+                fresh,
+                &cfg,
+                t0 + Duration::from_secs(tick_n),
+            );
+            prev_count = bad_rr.round_trip_time_measurements;
+        }
+
+        // After drop_debounce elapsed with fresh bad RRs, the
+        // layer must have transitioned to Dropped.
+        assert_eq!(
+            state,
+            LayerCapacityState::Dropped,
+            "fresh bad RRs across the full drop debounce window \
+             must complete the transition to Dropped; got {state:?}",
+        );
     }
 }
