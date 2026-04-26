@@ -172,10 +172,14 @@ pub fn spawn_zero_peer_aggregator(
         let mut state = AggregatorState::Active;
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // Discard the immediate first tick `interval()` fires so the
-        // first observation happens TICK after spawn — matches the
-        // pool-feed bridge's pattern and avoids racing pool init.
-        tick.tick().await;
+        // We do NOT discard the immediate-first tick: `interval()`
+        // fires its first tick at construction (Burst), and we want
+        // the first observation to happen at spawn time so a session
+        // that starts with zero peers begins the debounce countdown
+        // immediately rather than wasting one TICK of idle CPU.
+        // Pool init and peer-registry init both complete before the
+        // aggregator is spawned (see `DisplaySession::start`), so
+        // there's no init race to wait out.
 
         loop {
             tokio::select! {
@@ -302,12 +306,21 @@ mod tests {
     // ----- Spawn-loop integration test --------------------------------------
 
     /// Verify the spawn function actually issues `PauseAllSimulcast`
-    /// after PAUSE_DEBOUNCE at zero peers. Uses a recording closure
-    /// (no real `EncoderPool` required); pure transition tests
-    /// cover the resume edge, since synthesizing a `WebRtcPeer` to
-    /// bump `peers.len()` is heavyweight and the spawn-site
-    /// `DisplaySession::start` integration test covers the resume
-    /// wiring end-to-end.
+    /// after `PAUSE_DEBOUNCE` at zero peers. Uses a recording
+    /// closure (no real `EncoderPool` required); pure transition
+    /// tests cover the resume edge, since synthesizing a
+    /// `WebRtcPeer` to bump `peers.len()` is heavyweight and the
+    /// spawn-site `DisplaySession::start` integration test covers
+    /// the resume wiring end-to-end.
+    ///
+    /// Polls with a generous timeout instead of a fixed sleep to
+    /// avoid flake on overloaded test runners — the action only has
+    /// to land *eventually* within the deadline, not at any
+    /// specific tick. `Instant::now()` reads inside the spawn loop
+    /// are real wallclock (Tokio's mock clock doesn't advance
+    /// Instant), so test runtimes under load can drift the action
+    /// past `PAUSE_DEBOUNCE` by a tick or two; the deadline
+    /// generously covers that.
     #[tokio::test]
     async fn spawn_records_pause_after_zero_peer_debounce() {
         use std::sync::Mutex as StdMutex;
@@ -328,17 +341,32 @@ mod tests {
             shutdown.clone(),
         );
 
-        // Wait long enough to cross PAUSE_DEBOUNCE plus a few
-        // ticks. Real wallclock — Tokio's mock clock doesn't
-        // advance Instant::now(), which the transition function
-        // reads, so we accept the 6s test cost.
-        tokio::time::sleep(PAUSE_DEBOUNCE + Duration::from_secs(2)).await;
+        // Poll with a generous timeout. PAUSE_DEBOUNCE + 5s of
+        // tolerance handles tick drift on a loaded runtime; we exit
+        // the loop as soon as the action lands.
+        let deadline = Instant::now() + PAUSE_DEBOUNCE + Duration::from_secs(5);
+        loop {
+            if !recorded.lock().unwrap().is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let actions = recorded.lock().unwrap().clone();
+                shutdown.cancel();
+                let _ = handle.await;
+                panic!(
+                    "no aggregator action recorded within \
+                     PAUSE_DEBOUNCE + 5s ({}s total); got {actions:?}",
+                    (PAUSE_DEBOUNCE + Duration::from_secs(5)).as_secs(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         let actions = recorded.lock().unwrap().clone();
         assert_eq!(
             actions,
             vec![AggregatorAction::PauseAllSimulcast],
-            "expected exactly one PauseAllSimulcast after debounce; \
+            "expected exactly one PauseAllSimulcast within deadline; \
              got {actions:?}",
         );
 

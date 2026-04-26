@@ -637,33 +637,26 @@ impl DisplaySession {
         self.spawn_pool_feed_bridge(Arc::clone(&pool_arc), fps, event_bus_for_encoder)
             .await;
 
-        // 4d.2: spawn the zero-peer aggregator. Snapshots the
-        // current always-on simulcast rid set (vp8_simulcast at this
-        // session's source dims) for the closure to drive
-        // pool.pause_layer / pool.resume_layer. The snapshot is
-        // stable for the session lifetime — runtime on_resize that
-        // changes the layer set is rare and the worst case is the
-        // aggregator's pause/resume call hitting a rid that no
-        // longer exists, which the pool silently no-ops. 4d.3 may
-        // refresh this snapshot on resize if it matters in practice.
-        let simulcast_rids: Vec<encode::pool::SimulcastRid> =
-            encode::pool::LayerSpec::vp8_simulcast(width, height, fps)
-                .into_iter()
-                .map(|l| l.rid)
-                .collect();
+        // 4d.2: spawn the zero-peer aggregator. The closure queries
+        // `pool.always_on_ids()` on every action rather than
+        // snapshotting at spawn time so a session that begins with a
+        // small layer set (`vp8_simulcast` may drop `quarter` at very
+        // small source dims via `normalize_layer_dims`) and is then
+        // resized larger while idle still pauses / resumes the
+        // newly-spawned layers correctly. The pool's read lock is
+        // held only for the duration of the snapshot copy; the
+        // subsequent `pause_layer` / `resume_layer` calls reacquire.
         let pool_for_aggregator = Arc::clone(&pool_arc);
         let on_action: Box<dyn Fn(aggregator::AggregatorAction) + Send + Sync> =
             Box::new(move |action| match action {
                 aggregator::AggregatorAction::PauseAllSimulcast => {
-                    for rid in &simulcast_rids {
-                        pool_for_aggregator
-                            .pause_layer(encode::pool::CodecKind::Vp8, rid.clone());
+                    for id in pool_for_aggregator.always_on_ids() {
+                        pool_for_aggregator.pause_layer(id.codec, id.rid);
                     }
                 }
                 aggregator::AggregatorAction::ResumeAllSimulcast => {
-                    for rid in &simulcast_rids {
-                        pool_for_aggregator
-                            .resume_layer(encode::pool::CodecKind::Vp8, rid.clone());
+                    for id in pool_for_aggregator.always_on_ids() {
+                        pool_for_aggregator.resume_layer(id.codec, id.rid);
                     }
                 }
             });

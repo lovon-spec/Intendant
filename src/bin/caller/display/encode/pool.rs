@@ -1747,10 +1747,7 @@ impl EncoderPool {
     /// have no consumer that would benefit, and an on-demand spawn
     /// emits a cold-start keyframe naturally on first encode.
     pub fn request_keyframe_all(&self) -> usize {
-        let always_on_ids: Vec<EncoderId> = {
-            let always_on = self.inner.always_on.read().unwrap();
-            always_on.iter().map(|h| h.id.clone()).collect()
-        };
+        let always_on_ids = self.always_on_ids();
         let on_demand_ids: Vec<EncoderId> = {
             let on_demand = self.inner.on_demand.lock().unwrap();
             on_demand
@@ -1788,6 +1785,37 @@ impl EncoderPool {
     /// no peer is consuming under current TWCC bandwidth conditions.
     /// Direct callers in production should be the aggregator only;
     /// peer-side code never calls this directly.
+    /// Snapshot the current always-on encoder IDs.
+    ///
+    /// Returns a `Vec` (not a borrow) so callers don't hold the
+    /// `always_on` read lock across their loop body — important for
+    /// the 4d.2 aggregator, whose action closure calls back into
+    /// [`Self::pause_layer`] / [`Self::resume_layer`] (which take the
+    /// same lock).
+    ///
+    /// Reflects the **current** pool state at call time, including
+    /// any post-[`Self::on_resize`] layer-set changes. The aggregator
+    /// queries this on every action rather than snapshotting at
+    /// session start, so a session that begins with a small layer set
+    /// (e.g. only `full` because the source dims filter out
+    /// `half`/`quarter` via `vp8_simulcast`'s `normalize_layer_dims`)
+    /// and is then resized larger while idle still pauses / resumes
+    /// the newly-spawned layers correctly.
+    ///
+    /// On-demand encoders are NOT included — they're lifecycle-tied
+    /// to peer presence already (refcounted by
+    /// [`Self::release_on_demand_subset`]) and don't need pause/resume
+    /// orchestration. Use [`Self::on_demand_count`] for those.
+    pub fn always_on_ids(&self) -> Vec<EncoderId> {
+        self.inner
+            .always_on
+            .read()
+            .unwrap()
+            .iter()
+            .map(|h| h.id.clone())
+            .collect()
+    }
+
     pub fn pause_layer(&self, codec: CodecKind, rid: SimulcastRid) -> bool {
         let id = EncoderId::new(codec, rid);
         {
@@ -3532,6 +3560,52 @@ mod tests {
                 assert!(handle.force_keyframe.load(Ordering::SeqCst));
             }
         }
+    }
+
+    /// **Phase 4d.2 follow-up: `always_on_ids` enumeration.** Pins
+    /// the contract the aggregator wiring at
+    /// `DisplaySession::start` relies on: a fresh pool's
+    /// `always_on_ids()` returns one `EncoderId` per always-on
+    /// layer the factory produced, with `(codec, rid)` matching
+    /// what the spec advertised. Aggregator queries this on every
+    /// pause/resume action so post-resize layer-set changes are
+    /// reflected without a separate refresh path.
+    #[tokio::test]
+    async fn pool_always_on_ids_returns_one_id_per_layer() {
+        let pool = EncoderPool::new(
+            64,
+            64,
+            30,
+            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
+            None,
+        );
+
+        let ids = pool.always_on_ids();
+        assert_eq!(
+            ids.len(),
+            3,
+            "vp8_simulcast at 64x64@30 should produce three layers \
+             (full / half / quarter); always_on_ids returned {ids:?}",
+        );
+        for id in &ids {
+            assert_eq!(
+                id.codec,
+                CodecKind::Vp8,
+                "every always-on id must be VP8 (the simulcast \
+                 codec); got {id:?}",
+            );
+        }
+        // Must match what `always_on()` (the internal accessor) sees.
+        let internal_ids: Vec<EncoderId> = pool
+            .always_on()
+            .iter()
+            .map(|h| h.id.clone())
+            .collect();
+        assert_eq!(
+            ids, internal_ids,
+            "always_on_ids must mirror the internal handle set \
+             exactly (same order, same EncoderIds)",
+        );
     }
 
     /// **3c.3b.4f WatchdogState contract.** Pinning the four
