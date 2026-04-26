@@ -1,4 +1,4 @@
-//! Per-peer WebRTC driver built on the sans-I/O `rtc` 0.20 core.
+//! Per-peer WebRTC driver built on the sans-I/O `rtc` core.
 //!
 //! Architecture: each `WebRtcPeer` owns a tokio task ("driver") that holds an
 //! peer connection instance and UDP/TCP sockets. The driver pumps three things in a single
@@ -677,7 +677,7 @@ fn rtc_codec_parameters(codec: CodecKind) -> Result<RTCRtpCodecParameters, Calle
         },
         CodecKind::Vp9 | CodecKind::Av1 => {
             return Err(CallerError::WebRtc(format!(
-                "codec {} not yet wired to rtc 0.20 media engine",
+                "codec {} not yet wired to rtc media engine",
                 codec
             )));
         }
@@ -785,7 +785,7 @@ impl WebRtcPeer {
         }
 
         // The existing intake forwards one active codec. Preserve that
-        // behavioral contract while moving the transport stack to rtc 0.20.
+        // behavioral contract while moving the transport stack to rtc.
         let active_codec = codec_set[0];
         let codec_params = rtc_codec_parameters(active_codec)?;
         let video_mid = first_video_mid_from_offer(offer_sdp).unwrap_or_else(|| "0".to_string());
@@ -1225,7 +1225,7 @@ struct RtpSendState {
     mid: String,
     rid: SimulcastRid,
     codec: RTCRtpCodec,
-    packetizer: Box<dyn Packetizer>,
+    packetizer: Box<dyn Packetizer + Send>,
     mid_ext_id: Option<u8>,
     rid_ext_id: Option<u8>,
 }
