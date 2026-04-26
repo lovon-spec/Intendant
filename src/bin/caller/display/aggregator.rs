@@ -547,6 +547,21 @@ pub fn diff_wanted_aggregate(
 /// `Arc<EncoderPool>` and returns `pool.always_on_ids()` minus the
 /// last entry (the floor); tests pass a fixed Vec.
 ///
+/// `is_layer_paused` queries the pool's actual current pause state
+/// for one RID — `Some(true)` if currently paused, `Some(false)` if
+/// active, `None` if no slot exists for that RID. Production wiring
+/// captures `Arc<EncoderPool>` and forwards to
+/// [`crate::display::encode::pool::EncoderPool::is_layer_paused`]
+/// with `CodecKind::Vp8`. Diffing the wanted set against actual
+/// pool state (rather than against an internally-tracked
+/// `last_applied`) handles the
+/// [`crate::display::encode::pool::EncoderPool::on_resize`] case:
+/// resize regenerates always-on handles ACTIVE, so a previously-
+/// paused upper layer would silently reactivate while a stale
+/// `last_applied` snapshot still believed it was paused. Querying
+/// actual state every tick ensures we re-pause on the very next
+/// tick after resize without needing a resize notification.
+///
 /// `on_action` applies the requested side effect. Production wiring
 /// captures `Arc<EncoderPool>` and routes `PauseLayer` /
 /// `ResumeLayer` to `pool.pause_layer` / `pool.resume_layer` with
@@ -557,6 +572,7 @@ pub fn diff_wanted_aggregate(
 pub fn spawn_capacity_aggregator(
     peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>>,
     get_non_floor_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
+    is_layer_paused: Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync>,
     on_action: Box<dyn Fn(CapacityAction) + Send + Sync>,
     config: CapacityPolicyConfig,
     shutdown: CancellationToken,
@@ -580,10 +596,6 @@ pub fn spawn_capacity_aggregator(
         // fresh.
         let mut prev_measurement_count: HashMap<(PeerId, SimulcastRid), u64> =
             HashMap::new();
-        // Initialize on the first tick (after the first
-        // `get_non_floor_rids` call sees the actual layer set).
-        let mut last_applied: HashSet<SimulcastRid> = HashSet::new();
-        let mut initialized = false;
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -592,11 +604,6 @@ pub fn spawn_capacity_aggregator(
                 _ = shutdown.cancelled() => break,
                 _ = tick.tick() => {
                     let now = Instant::now();
-
-                    if !initialized {
-                        last_applied = get_non_floor_rids().into_iter().collect();
-                        initialized = true;
-                    }
 
                     let current_peers = peers.read().await;
 
@@ -686,15 +693,33 @@ pub fn spawn_capacity_aggregator(
                     }
 
                     let aggregate = aggregate_wanted_layers(per_peer_wanted);
+                    // 4d.3c review fix: diff against actual pool
+                    // state (queried this tick), not against an
+                    // internally-tracked `last_applied`. This way,
+                    // a `pool.on_resize` that regenerates always-on
+                    // handles ACTIVE doesn't leave stale layers
+                    // running because the aggregator believed it
+                    // had paused them — the next tick's diff sees
+                    // them active again and re-pauses if still
+                    // unwanted. Skip RIDs the pool has no slot
+                    // for (None from `is_layer_paused`) so a
+                    // mid-tick layer-set change doesn't produce
+                    // spurious actions for vanished RIDs.
+                    let actual_active: HashSet<SimulcastRid> = non_floor_rids
+                        .iter()
+                        .filter(|rid| {
+                            matches!(is_layer_paused(rid), Some(false))
+                        })
+                        .cloned()
+                        .collect();
                     let actions = diff_wanted_aggregate(
-                        &last_applied,
+                        &actual_active,
                         &aggregate,
                         &non_floor_rids,
                     );
                     for action in actions {
                         on_action(action);
                     }
-                    last_applied = aggregate;
                 }
             }
         }
@@ -1256,6 +1281,50 @@ mod tests {
         );
     }
 
+    /// **4d.3c review fix regression**: pool.on_resize regenerates
+    /// always-on handles ACTIVE — the resize-spawned handles do
+    /// not preserve any prior pause state. If the aggregator
+    /// tracked `last_applied` internally and never re-queried, a
+    /// resize would silently reactivate paused upper layers and
+    /// the aggregator would emit no action because its internal
+    /// snapshot still believed those layers were paused.
+    ///
+    /// The fix replaces internal `last_applied` with a per-tick
+    /// query of actual pool state via the `is_layer_paused`
+    /// closure. After resize, the pool reports `Some(false)`
+    /// (active) for the regenerated handles; if the policy still
+    /// wants the smaller set, the diff against actual fires
+    /// pause for the unwanted layers on the very next tick.
+    ///
+    /// Test pins the diff semantics directly: actual = full+half
+    /// active (post-resize state), aggregate = half only (policy
+    /// hasn't changed) → must emit PauseLayer(full). Without the
+    /// fix, this test would still pass at the diff level (it
+    /// always tested wanted-vs-applied), but the aggregator
+    /// would never pass `actual_active` here — it would pass a
+    /// stale snapshot. So the integration is what changed; the
+    /// pure diff function's contract is the same.
+    #[test]
+    fn diff_wanted_after_pool_regen_pauses_unwanted_layers() {
+        let actual_active: HashSet<SimulcastRid> =
+            [SimulcastRid::full(), SimulcastRid::half()]
+                .into_iter()
+                .collect();
+        let aggregate: HashSet<SimulcastRid> =
+            [SimulcastRid::half()].into_iter().collect();
+        let actions = diff_wanted_aggregate(
+            &actual_active,
+            &aggregate,
+            &vp8_non_floor_rids(),
+        );
+        assert_eq!(
+            actions,
+            vec![CapacityAction::PauseLayer(SimulcastRid::full())],
+            "post-on_resize: full reactivated by pool, policy still \
+             wants {{half}} → must re-pause full",
+        );
+    }
+
     #[test]
     fn diff_wanted_mixed_pause_and_resume_in_spec_order() {
         // full was wanted (now paused); half was paused (now wanted).
@@ -1300,11 +1369,19 @@ mod tests {
             });
         let get_non_floor_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync> =
             Box::new(|| vp8_non_floor_rids());
+        // For the no-peers smoke test the policy never runs, so
+        // is_layer_paused is never consulted; return Some(false)
+        // (active) defensively in case a future change makes it
+        // get called.
+        let is_layer_paused: Box<
+            dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync,
+        > = Box::new(|_| Some(false));
 
         let shutdown = CancellationToken::new();
         let handle = spawn_capacity_aggregator(
             Arc::clone(&peers),
             get_non_floor_rids,
+            is_layer_paused,
             on_action,
             CapacityPolicyConfig::default(),
             shutdown.clone(),

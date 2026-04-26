@@ -729,9 +729,23 @@ impl DisplaySession {
                     .resume_layer(encode::pool::CodecKind::Vp8, rid);
             }
         });
+        // 4d.3c review fix: query actual pool pause state every
+        // tick so the diff handles `pool.on_resize` correctly
+        // (resize regenerates always-on handles ACTIVE, so a
+        // previously-paused layer would silently reactivate
+        // without re-querying). Forwards to
+        // `EncoderPool::is_layer_paused` with `CodecKind::Vp8`.
+        let pool_for_capacity_query = Arc::clone(&pool_arc);
+        let is_layer_paused: Box<
+            dyn Fn(&encode::pool::SimulcastRid) -> Option<bool> + Send + Sync,
+        > = Box::new(move |rid| {
+            pool_for_capacity_query
+                .is_layer_paused(encode::pool::CodecKind::Vp8, rid.clone())
+        });
         let capacity_aggregator_task = aggregator::spawn_capacity_aggregator(
             Arc::clone(&self.peers),
             get_non_floor_rids,
+            is_layer_paused,
             on_capacity_action,
             aggregator::CapacityPolicyConfig::default(),
             self.shutdown.clone(),
