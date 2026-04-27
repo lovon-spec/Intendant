@@ -11034,6 +11034,31 @@ function buildIceServersFromGatewayConfig(config) {
   });
 }
 
+// True when any iceServers entry has at least one `turn:` or `turns:`
+// URL — i.e. an ACTUAL TURN relay is configured (vs STUN-only or empty).
+// Used by the federated peer-display path to decide whether forcing
+// `iceTransportPolicy: 'relay'` is safe: with a real TURN server we
+// constrain ICE to relay candidates (the only path that completes
+// DTLS in the current rtc-0.9-on-ICE-TCP environment); without one,
+// forcing `relay` would guarantee ICE failure since no relay
+// candidate exists to pair against. The local DisplaySlot.connect
+// path does NOT call this helper — local display should never be
+// forced through TURN.
+function hasTurnInIceServers(iceServers) {
+  for (const server of iceServers || []) {
+    const urls = Array.isArray(server.urls)
+      ? server.urls
+      : (typeof server.urls === 'string' ? [server.urls] : []);
+    for (const url of urls) {
+      if (typeof url === 'string' &&
+          (url.startsWith('turn:') || url.startsWith('turns:'))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // True when `url`'s hostname is loopback (127.0.0.1 / ::1 / localhost).
 // Used to filter out loopback URLs before handing them to WebRTC as
 // advertise_tcp_via_url: browsers silently drop remote loopback ICE
@@ -11959,9 +11984,40 @@ class PeerDisplayConnection {
     // [webrtc].ice_servers TOML and both paths pick it up automatically.
     // Earlier hardcoded `iceServers: []` blocked any STUN/TURN config
     // from reaching this path even when one was set on the gateway.
-    this.pc = new RTCPeerConnection({
-      iceServers: buildIceServersFromGatewayConfig(gatewayConfig),
-    });
+    //
+    // When a real TURN server (turn: / turns:) is configured we ALSO
+    // pin `iceTransportPolicy: 'relay'` so the browser only uses
+    // relay candidates. Diagnosed in #41/#42/#43 (commits 364f34b,
+    // 84fcdc5, 3156534, all with diagnostic+revert dance): the rtc
+    // 0.9 crate (Cargo.toml `rtc = "=0.9.0"`) does NOT advance DTLS
+    // handshake over an ICE-TCP candidate — peer's server-role state
+    // machine receives ClientHello but never emits ServerHello over
+    // the TCP selected pair. The browser stays at dtlsState=connecting
+    // with bytesReceived=0 from peer indefinitely. Forcing relay
+    // routes media over UDP via the operator's TURN server (host
+    // coturn at 192.168.1.223:3478 in the smoke topology) where rtc
+    // handles DTLS normally. NOT applied to the local DisplaySlot
+    // path — local display should never be forced through TURN.
+    //
+    // Without a TURN server, `iceTransportPolicy: 'relay'` would
+    // guarantee ICE failure (no relay candidate to pair against), so
+    // we leave the policy unset and emit a clear warn so the
+    // operator sees it instead of a silent hang at dtlsState=
+    // connecting.
+    const iceServers = buildIceServersFromGatewayConfig(gatewayConfig);
+    const pcConfig = { iceServers };
+    if (hasTurnInIceServers(iceServers)) {
+      pcConfig.iceTransportPolicy = 'relay';
+      this._log('info',
+        `iceTransportPolicy=relay (TURN configured: ${iceServers.length} server(s))`);
+    } else {
+      this._log('warn',
+        `no TURN server in [webrtc].ice_servers — leaving iceTransportPolicy ` +
+        `default. rtc 0.9 doesn't drive DTLS over ICE-TCP, so direct paths ` +
+        `may stall at dtlsState=connecting; configure a turn:/turns: URL in ` +
+        `intendant.toml to enable the only verified-working path.`);
+    }
+    this.pc = new RTCPeerConnection(pcConfig);
     this.pc.addTransceiver('video', { direction: 'recvonly' });
     this._log('debug', `connect: sessionKey=${this.sessionKey()} advertiseTcpViaUrl=${this.advertiseTcpViaUrl || '(none)'}`);
 
