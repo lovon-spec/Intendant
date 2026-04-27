@@ -1174,10 +1174,115 @@ impl WebRtcPeer {
             encodings,
         );
 
+        // diag #51 v4 (TO REVERT after smoke): wire rtc 0.9's
+        // interceptor registry with SR/RR + TWCC sender + a CUSTOM
+        // `TwccTapInterceptor` that reads inbound RTCP at the
+        // chain's outermost `handle_read`, downcasts each packet
+        // to `TransportLayerCc`, and projects compact events onto
+        // an mpsc channel. Spike 3 (commit b842a82, reverted in
+        // 0e28db6) confirmed via tcpdump that the browser sends
+        // TLC continuously but rtc 0.9's stats path never surfaces
+        // it; the tap is the operator-directed alternative — parse
+        // TLC directly at the rtc-interceptor layer.
+        //
+        // Chain order: rtcp_reports + twcc_sender_only added FIRST
+        // (innermost) so they keep doing their existing job; the
+        // tap added LAST (outermost) so it sees inbound RTCP first.
+        // `Registry::with(|inner| TwccTapInterceptor::new(inner,
+        // tx))` is the canonical rtc-interceptor 0.9 composition.
+        let (twcc_tap_tx, mut twcc_tap_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::display::twcc_tap::TwccEvent>();
+        let registry = rtc::interceptor::Registry::new();
+        let registry =
+            rtc::peer_connection::configuration::interceptor_registry::configure_rtcp_reports(
+                registry,
+            );
+        let registry =
+            rtc::peer_connection::configuration::interceptor_registry::configure_twcc_sender_only(
+                registry,
+                &mut media_engine,
+            )
+            .map_err(|e| CallerError::WebRtc(format!("configure twcc: {e}")))?;
+        let registry = registry.with(|inner| {
+            crate::display::twcc_tap::TwccTapInterceptor::new(inner, twcc_tap_tx.clone())
+        });
+
+        // Spawn a 1-Hz aggregator that consumes TwccEvents and emits
+        // ONE summary line per second. Rate-limited per the
+        // operator's "don't commit high-volume per-frame logs unless
+        // rate-limited" rule. First-acceptance check: under no loss,
+        // `lost=0`; under pf/dnctl 30%, `lost` ≈ 30% of `status`.
+        //
+        // The aggregator's lifetime is tied to the unbounded channel
+        // sender held inside `TwccTapInterceptor`. When the rtc Rtc
+        // is dropped on peer shutdown, the chain is dropped, the
+        // sender is dropped, the channel closes, `recv()` returns
+        // `None`, and this task exits. No explicit shutdown wiring
+        // needed.
+        let twcc_logger_peer_id = peer_id;
+        tokio::spawn(async move {
+            let mut window_start = std::time::Instant::now();
+            let mut batches: u32 = 0;
+            let mut total_status: u64 = 0;
+            let mut total_received: u64 = 0;
+            let mut total_lost: u64 = 0;
+            let mut last_fb_pkt_count: Option<u8> = None;
+            loop {
+                let timeout = tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(window_start)
+                        + std::time::Duration::from_secs(1),
+                );
+                tokio::pin!(timeout);
+                tokio::select! {
+                    biased;
+                    maybe_event = twcc_tap_rx.recv() => {
+                        match maybe_event {
+                            Some(event) => {
+                                batches = batches.saturating_add(1);
+                                total_status =
+                                    total_status.saturating_add(event.packet_status_count as u64);
+                                total_received =
+                                    total_received.saturating_add(event.received as u64);
+                                total_lost =
+                                    total_lost.saturating_add(event.lost as u64);
+                                last_fb_pkt_count = Some(event.fb_pkt_count);
+                            }
+                            None => {
+                                eprintln!(
+                                    "[diag #51 v4 twcc-tap] peer={twcc_logger_peer_id} \
+                                     channel closed; exiting aggregator"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    _ = &mut timeout => {
+                        let loss_pct = if total_status > 0 {
+                            (total_lost as f64 / total_status as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        eprintln!(
+                            "[diag #51 v4 twcc-tap 1s] peer={twcc_logger_peer_id} \
+                             batches={batches} status={total_status} \
+                             received={total_received} lost={total_lost} \
+                             loss_pct={loss_pct:.1}% last_fb_pkt_count={last_fb_pkt_count:?}",
+                        );
+                        window_start = std::time::Instant::now();
+                        batches = 0;
+                        total_status = 0;
+                        total_received = 0;
+                        total_lost = 0;
+                    }
+                }
+            }
+        });
+
         let mut rtc = RTCPeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
             .with_setting_engine(setting_engine)
             .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
             .build()
             .map_err(|e| CallerError::WebRtc(format!("build rtc peer: {e}")))?;
         let sender_id = rtc
@@ -1737,9 +1842,9 @@ struct InboundPacket {
 type TcpWriter = Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>;
 
 #[allow(clippy::too_many_arguments)]
-async fn driver(
+async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     peer_id: PeerId,
-    mut rtc: RTCPeerConnection,
+    mut rtc: RTCPeerConnection<I>,
     rtp_config: RtpSendConfig,
     sockets: Vec<Arc<UdpSocket>>,
     mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>>,
@@ -2166,8 +2271,8 @@ enum DriverExit {
 
 /// Drain pending writes, reads, and events from the sans-I/O peer connection.
 #[allow(clippy::too_many_arguments)]
-async fn drain_outputs(
-    rtc: &mut RTCPeerConnection,
+async fn drain_outputs<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
     tcp_writers: &mut HashMap<SocketAddr, TcpWriter>,
     state: &mut DriverState,
@@ -2242,8 +2347,8 @@ async fn drain_outputs(
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400)))
 }
 
-fn handle_event(
-    rtc: &mut RTCPeerConnection,
+fn handle_event<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
     state: &mut DriverState,
     event: RTCPeerConnectionEvent,
 ) -> bool {
@@ -2571,8 +2676,8 @@ fn handle_message(
     }
 }
 
-fn write_video_frame(
-    rtc: &mut RTCPeerConnection,
+fn write_video_frame<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
     state: &mut DriverState,
     outbound: &OutboundEncodedFrame,
 ) {
@@ -2730,8 +2835,8 @@ fn payload_spec_matches_codec(
     false
 }
 
-fn rtp_header_extension_ids(
-    rtc: &mut RTCPeerConnection,
+fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
     state: &mut DriverState,
 ) -> (Option<u8>, Option<u8>) {
     if state.rtp.mid_ext_id.is_some() || state.rtp.rid_ext_id.is_some() {
@@ -2750,7 +2855,11 @@ fn rtp_header_extension_ids(
     (state.rtp.mid_ext_id, state.rtp.rid_ext_id)
 }
 
-fn handle_command(rtc: &mut RTCPeerConnection, state: &DriverState, cmd: Command) {
+fn handle_command<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    state: &DriverState,
+    cmd: Command,
+) {
     match cmd {
         Command::AddIceCandidate(s) => {
             let init = RTCIceCandidateInit {
