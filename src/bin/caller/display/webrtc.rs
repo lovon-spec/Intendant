@@ -1020,7 +1020,7 @@ impl WebRtcPeer {
         // Pin the answerer's DTLS role to `Server` so the generated
         // answer carries `a=setup:passive`. Per RFC 5763 § 5 that makes
         // the browser the DTLS client and the initiator of the
-        // handshake — which is the path the rtc 0.20 stack actually
+        // handshake — which is the path the rtc 0.9 stack actually
         // drives. Letting the answer default to `a=setup:active` (the
         // alternative role for an answerer to `actpass`) leaves rtc's
         // DTLS state machine waiting for an event that never fires
@@ -4576,7 +4576,7 @@ mod tests {
 
     /// The answerer's DTLS role MUST be `passive` so the browser
     /// becomes the DTLS client and initiates the handshake. With
-    /// the role left to default to `active`, the rtc 0.20 stack
+    /// the role left to default to `active`, the rtc 0.9 stack
     /// signals `a=setup:active` but never actually emits a
     /// ClientHello over the selected ICE-TCP candidate — the session
     /// stalls at STUN keepalives forever and the dashboard renders
