@@ -76,7 +76,7 @@ use rtc::rtp_transceiver::rtp_sender::{
 use rtc::rtp_transceiver::RTCRtpSenderId;
 use rtc::sansio::Protocol as RtcProtocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1334,6 +1334,25 @@ impl WebRtcPeer {
         prefs: PeerCodecPreferences,
         drops_counter: Arc<AtomicU64>,
     ) -> Result<(Self, String), CallerError> {
+        // [diag/encoder-flow] Diagnostic 1: log the inputs to the
+        // codec-selection step. Confirms (a) which codecs the peer's
+        // SDP actually offered (`prefs.supported`), (b) what the pool
+        // returned (`subscription_summary`), (c) which codec the
+        // intake will lock onto (`active_codec`), and (d) the
+        // narrowed prefs the resubscribe path will use. If any of
+        // these disagree with the eventual answer SDP's m=video, the
+        // bug is upstream of the driver.
+        let subscription_summary: Vec<String> = subscriptions
+            .iter()
+            .map(|s| format!("{:?}:{}", s.id.codec, s.id.rid.as_str()))
+            .collect();
+        eprintln!(
+            "[diag/encoder-flow] WebRtcPeer::new peer={peer_id:?} \
+             prefs.supported={:?} subscriptions=[{}] (count={})",
+            prefs.supported,
+            subscription_summary.join(", "),
+            subscription_summary.len(),
+        );
         if subscriptions.is_empty() {
             return Err(CallerError::WebRtc(
                 "new: empty subscription set — offer handler must \
@@ -1347,6 +1366,10 @@ impl WebRtcPeer {
                     "new: no subscription matched peer codec preferences".to_string(),
                 )
             })?;
+        eprintln!(
+            "[diag/encoder-flow] WebRtcPeer::new peer={peer_id:?} \
+             active_codec={active_codec:?}"
+        );
         let active_codec_set = [active_codec];
         // Filter the peer's original prefs against the single codec the
         // intake will actually forward. The answer and all future
@@ -1366,6 +1389,15 @@ impl WebRtcPeer {
                     .to_string(),
             ));
         }
+        // [diag/encoder-flow] Diagnostic 1 (cont): log the narrowed
+        // prefs used for resubscribes — drift between this set and
+        // the SDP answer's m=video would explain a "encoder produces,
+        // driver drops" pattern.
+        eprintln!(
+            "[diag/encoder-flow] WebRtcPeer::new peer={peer_id:?} \
+             negotiated_prefs.supported={:?}",
+            negotiated_prefs.supported,
+        );
 
         // Phase 4c: derive the RID set the peer's track will advertise
         // from the initial subscriptions filtered to the active codec
@@ -1550,6 +1582,10 @@ struct DriverState {
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
     rtp: RtpSendState,
+    /// [diag/encoder-flow] Set of (payload_spec_mime, rid) pairs whose
+    /// first successful `write_rtp` has been logged. Diagnostic-only —
+    /// removed when the temporary instrumentation commit is reverted.
+    diag_first_write_seen: HashSet<(String, SimulcastRid)>,
 }
 
 /// Per-RID send state — one entry per simulcast layer (or one entry
@@ -1668,6 +1704,7 @@ async fn driver(
         video_specs: HashMap::new(),
         channels: HashMap::new(),
         first_frame_at: None,
+        diag_first_write_seen: HashSet::new(),
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
             mid: rtp_config.mid,
@@ -2548,7 +2585,28 @@ fn write_video_frame(
             return;
         };
         match sender.write_rtp(packet) {
-            Ok(()) => {}
+            Ok(()) => {
+                // [diag/encoder-flow] Diagnostic 4: log first successful
+                // write_rtp per (payload_spec, rid). Pinpoints exactly
+                // when the driver starts emitting wire packets for each
+                // RID — a (spec, rid) pair never logged here means
+                // either no frame ever reached the driver for it
+                // (forwarder issue) or every attempted write returned
+                // Err (existing failure log fires in that case).
+                let key = (
+                    frame.payload_spec.codec_mime.to_string(),
+                    rid.clone(),
+                );
+                if state.diag_first_write_seen.insert(key) {
+                    eprintln!(
+                        "[diag/encoder-flow] driver first write_rtp \
+                         spec={} rid={} (keyframe={})",
+                        frame.payload_spec.codec_mime,
+                        rid.as_str(),
+                        frame.is_keyframe,
+                    );
+                }
+            }
             Err(e) => {
                 eprintln!(
                     "[display/webrtc] write_rtp failed on rid {}: {e:?}",
@@ -3059,6 +3117,31 @@ async fn pool_frame_intake(
             .iter()
             .map(|s| s.id.rid.as_str().to_string())
             .collect();
+        // [diag/encoder-flow] Diagnostic 2: log once per intake epoch
+        // (epoch = forwarder spawn / re-spawn). Confirms the active
+        // codec, the subscriptions we'll forward, and the inactive
+        // ones we just released — and reports the lease's on-demand
+        // refcount so we can see if releases actually shrank it.
+        let on_demand_count = current_lease
+            .as_ref()
+            .map(|l| l.on_demand_count())
+            .unwrap_or(0);
+        let active_summary: Vec<String> = active_ids
+            .iter()
+            .map(|id| format!("{:?}:{}", id.codec, id.rid.as_str()))
+            .collect();
+        let inactive_summary: Vec<String> = inactive_ids
+            .iter()
+            .map(|id| format!("{:?}:{}", id.codec, id.rid.as_str()))
+            .collect();
+        eprintln!(
+            "[diag/encoder-flow] pool-intake epoch active_codec={:?} \
+             active=[{}] inactive_released=[{}] on_demand_count={}",
+            active_codec,
+            active_summary.join(", "),
+            inactive_summary.join(", "),
+            on_demand_count,
+        );
         if active_subs.is_empty() {
             // Defensive: `active_codec_from_subscriptions` returned
             // Some, so at least one subscription matched. If the
@@ -3219,6 +3302,17 @@ async fn pool_frame_intake(
                 fwd_shutdown.cancel();
                 for f in forwarders { let _ = f.await; }
                 let exit = recv.unwrap_or(ForwarderExit::DriverClosed);
+                // [diag/encoder-flow] Diagnostic 2 (cont): log every
+                // forwarder exit reason — distinguishes EncoderClosed
+                // (resubscribe) from DriverClosed/Cancelled (peer
+                // teardown). High-signal: this fires once per epoch
+                // transition.
+                eprintln!(
+                    "[diag/encoder-flow] pool-intake forwarder exited \
+                     reason={exit:?} (was forwarding codec={active_codec:?} \
+                     rids={:?})",
+                    active_rids_summary,
+                );
                 match exit {
                     ForwarderExit::EncoderClosed => {
                         // Drop the old lease BEFORE resubscribing so

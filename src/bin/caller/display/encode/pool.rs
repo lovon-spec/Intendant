@@ -2224,6 +2224,16 @@ fn spawn_encoder_thread_with(
     std::thread::spawn(move || {
         let mut encoder = encoder;
         let mut watchdog = WatchdogState::new();
+        // [diag/encoder-flow] Diagnostic 3: track frames_tx subscribers
+        // over time. Logs (a) the first time we observe a non-zero
+        // count (consumer attached), (b) every change after that, and
+        // (c) a heartbeat every 10s while non-zero. Quiet while count
+        // stays 0 (e.g. always-on VP8 in an H.264-only session — no
+        // value in spamming a "still 0" line). Sampled once per encode
+        // call, after produce, so we capture the steady-state count
+        // most callers will care about.
+        let mut diag_last_rcv_count: i32 = -1;
+        let mut diag_last_log_at = std::time::Instant::now();
 
         loop {
             if shutdown_for_thread.is_cancelled() {
@@ -2345,7 +2355,25 @@ fn spawn_encoder_thread_with(
                     // Receiver-count is an atomic load on the
                     // broadcast::Sender, cheap enough to sample once
                     // per encode call.
-                    let has_consumer = frames_tx_for_thread.receiver_count() > 0;
+                    let cur_count = frames_tx_for_thread.receiver_count();
+                    let has_consumer = cur_count > 0;
+                    // [diag/encoder-flow] Diagnostic 3 (cont): log
+                    // first non-zero, every change, and 10s heartbeats
+                    // while non-zero. See the per-thread state setup
+                    // above the loop.
+                    let cur_count_i = cur_count as i32;
+                    let now = std::time::Instant::now();
+                    let count_changed = cur_count_i != diag_last_rcv_count;
+                    let heartbeat_due =
+                        cur_count > 0 && now.duration_since(diag_last_log_at).as_secs() >= 10;
+                    if count_changed || heartbeat_due {
+                        eprintln!(
+                            "[diag/encoder-flow] {} frames_tx receiver_count={} (was {})",
+                            id_for_log, cur_count, diag_last_rcv_count,
+                        );
+                        diag_last_rcv_count = cur_count_i;
+                        diag_last_log_at = now;
+                    }
                     let latency_us = frame.arrived.elapsed().as_micros() as u64;
                     for pkt in packets {
                         if has_consumer {
