@@ -7682,16 +7682,11 @@ class DisplaySlot {
   }
 
   connect() {
-    // ICE config — read STUN/TURN servers from gateway config, default empty for local
-    const iceServers = (gatewayConfig && gatewayConfig.ice_servers)
-      ? gatewayConfig.ice_servers.map(s => {
-          const entry = { urls: s.urls };
-          if (s.username) entry.username = s.username;
-          if (s.credential) entry.credential = s.credential;
-          return entry;
-        })
-      : [];
-    const config = { iceServers };
+    // ICE config — STUN/TURN servers from [webrtc].ice_servers TOML config,
+    // default empty for local LAN deployments. Goes through the shared
+    // helper so the peer-display path (PeerDisplayConnection.connect) can't
+    // drift in what it hands to the browser's ICE agent.
+    const config = { iceServers: buildIceServersFromGatewayConfig(gatewayConfig) };
     this.pc = new RTCPeerConnection(config);
 
     // Add a recvonly video transceiver so the SDP offer includes a video
@@ -11010,6 +11005,35 @@ function wsUrlToBaseUrl(wsUrl) {
     .replace(/\/ws$/, '');
 }
 
+// Build the `iceServers` array for `new RTCPeerConnection({ iceServers })`
+// from `gatewayConfig.ice_servers` (the [webrtc].ice_servers TOML config,
+// surfaced by the daemon via /.well-known/agent-card.json + /config). Used
+// by both the local primary-display path (DisplaySlot.connect) and the
+// peer-display federation path (PeerDisplayConnection.connect) so the two
+// can't drift in what they advertise to the browser's ICE agent. Default
+// is empty — trust-the-network, which is what local LAN deployments
+// without STUN/TURN want.
+//
+// Empty-string username/credential are filtered out (matches the truthy
+// check `if (s.username)` rather than a strict null check). Browsers don't
+// treat empty-string TURN credentials as "no credential": depending on the
+// implementation they silently fail auth or refuse to gather candidates
+// from that server. This helper keeps the gating in one place.
+//
+// Canonical Rust mirror: `ice_servers_to_rtc_peer_connection_config` in
+// `src/bin/caller/display/forward.rs` carries the unit tests for the
+// corner cases this function must also handle (empty list, empty creds,
+// multiple URLs, multiple servers, JSON-shape contract).
+function buildIceServersFromGatewayConfig(config) {
+  if (!config || !Array.isArray(config.ice_servers)) return [];
+  return config.ice_servers.map(s => {
+    const entry = { urls: s.urls };
+    if (s.username) entry.username = s.username;
+    if (s.credential) entry.credential = s.credential;
+    return entry;
+  });
+}
+
 // True when `url`'s hostname is loopback (127.0.0.1 / ::1 / localhost).
 // Used to filter out loopback URLs before handing them to WebRTC as
 // advertise_tcp_via_url: browsers silently drop remote loopback ICE
@@ -11928,10 +11952,16 @@ class PeerDisplayConnection {
   }
 
   async connect() {
-    // Slice 3a uses an empty iceServers list — peer's UDP host
-    // candidates only. STUN/TURN plumbing for the no-direct-path
-    // case lands in 3b along with primary-as-relay.
-    this.pc = new RTCPeerConnection({ iceServers: [] });
+    // ICE config — same shared helper as the local primary-display path
+    // (DisplaySlot.connect). Default is empty (trust-the-network LAN
+    // deployment); operators wanting STUN/TURN-relay-style ICE on the
+    // federated path configure a real server through the daemon's
+    // [webrtc].ice_servers TOML and both paths pick it up automatically.
+    // Earlier hardcoded `iceServers: []` blocked any STUN/TURN config
+    // from reaching this path even when one was set on the gateway.
+    this.pc = new RTCPeerConnection({
+      iceServers: buildIceServersFromGatewayConfig(gatewayConfig),
+    });
     this.pc.addTransceiver('video', { direction: 'recvonly' });
     this._log('debug', `connect: sessionKey=${this.sessionKey()} advertiseTcpViaUrl=${this.advertiseTcpViaUrl || '(none)'}`);
 

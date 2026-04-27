@@ -387,6 +387,40 @@ pub fn inject_recv_simulcast_into_video_offer(sdp: &str, rids: &[&str]) -> Strin
     lines.join("\r\n")
 }
 
+/// Map [`crate::display::IceServer`]s onto the shape an
+/// `RTCPeerConnection` constructor expects in its `iceServers` array.
+///
+/// The transform is small but has one non-obvious rule: `username` and
+/// `credential` are dropped when empty, not just when `None`. Some
+/// gateway-config code paths produce `Some("")` for unset credentials
+/// (TOML default for missing keys, env-var-source returning an empty
+/// string, etc.); browsers don't treat empty-string credentials as
+/// "no credential" — depending on the browser they either silently
+/// fail auth, log a warning, or refuse to gather candidates from that
+/// server at all. Filtering empty strings here matches the JS mirror's
+/// `if (s.username)` truthy check exactly.
+///
+/// **Mirror in JS**: `buildIceServersFromGatewayConfig` in
+/// `static/app.html`. Both display paths (local primary display, peer
+/// federation display) MUST go through the JS mirror to construct
+/// their `RTCPeerConnection({ iceServers: ... })` config — so the two
+/// can't drift in what they advertise to the browser's ICE agent. This
+/// Rust function exists for unit-test coverage of the corner cases the
+/// JS version must also handle (empty username, empty credential,
+/// multiple servers, default-empty config).
+pub fn ice_servers_to_rtc_peer_connection_config(
+    servers: &[crate::display::IceServer],
+) -> Vec<crate::display::IceServer> {
+    servers
+        .iter()
+        .map(|s| crate::display::IceServer {
+            urls: s.urls.clone(),
+            username: s.username.as_ref().filter(|u| !u.is_empty()).cloned(),
+            credential: s.credential.as_ref().filter(|c| !c.is_empty()).cloned(),
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -851,5 +885,165 @@ mod tests {
                  found empty at index {i}\nfull output:\n{out}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // ice_servers_to_rtc_peer_connection_config — JS-mirror coverage
+    // -----------------------------------------------------------------
+
+    use crate::display::IceServer;
+
+    fn srv(urls: &[&str], username: Option<&str>, credential: Option<&str>) -> IceServer {
+        IceServer {
+            urls: urls.iter().map(|s| (*s).to_string()).collect(),
+            username: username.map(|s| s.to_string()),
+            credential: credential.map(|s| s.to_string()),
+        }
+    }
+
+    /// Empty input list → empty output. The JS mirror ternary
+    /// `(config && config.ice_servers) ? .map(...) : []` yields the
+    /// same. This is the trust-the-network-default that ships in
+    /// trusted-LAN deployments where no STUN/TURN is needed.
+    #[test]
+    fn ice_servers_empty_input_yields_empty_output() {
+        let out = ice_servers_to_rtc_peer_connection_config(&[]);
+        assert!(out.is_empty());
+    }
+
+    /// Single STUN-only entry — only `urls` field carries through.
+    /// Username/credential are `None`, must NOT be serialized as
+    /// `"username": null` (RTCIceServer rejects non-string types).
+    /// `IceServer`'s `#[serde(skip_serializing_if = "Option::is_none")]`
+    /// covers the wire side of this; the test confirms the field is
+    /// `None` so the skip kicks in.
+    #[test]
+    fn ice_servers_stun_only_drops_credential_fields() {
+        let input = vec![srv(&["stun:stun.example:3478"], None, None)];
+        let out = ice_servers_to_rtc_peer_connection_config(&input);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].urls, vec!["stun:stun.example:3478".to_string()]);
+        assert!(out[0].username.is_none());
+        assert!(out[0].credential.is_none());
+    }
+
+    /// TURN with credentials passes both through verbatim.
+    #[test]
+    fn ice_servers_turn_with_credentials_passes_through() {
+        let input = vec![srv(
+            &["turn:turn.example:3478?transport=tcp"],
+            Some("user1"),
+            Some("pass1"),
+        )];
+        let out = ice_servers_to_rtc_peer_connection_config(&input);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].username.as_deref(), Some("user1"));
+        assert_eq!(out[0].credential.as_deref(), Some("pass1"));
+    }
+
+    /// Empty-string username gets filtered to None — matches the JS
+    /// mirror's `if (s.username)` truthy check. Without this, browsers
+    /// silently fail TURN auth or refuse to gather candidates from a
+    /// server with empty credentials. The test name calls out "matches
+    /// JS truthy check" so future readers know this isn't a stylistic
+    /// choice — it's a correctness invariant tying the two sides.
+    #[test]
+    fn ice_servers_empty_string_username_filtered_to_none_matches_js_truthy() {
+        let input = vec![srv(
+            &["turn:turn.example:3478"],
+            Some(""),
+            Some("validpass"),
+        )];
+        let out = ice_servers_to_rtc_peer_connection_config(&input);
+        assert!(
+            out[0].username.is_none(),
+            "empty-string username must be filtered to None"
+        );
+        assert_eq!(out[0].credential.as_deref(), Some("validpass"));
+    }
+
+    /// Empty-string credential filtered to None — symmetric to the
+    /// username case.
+    #[test]
+    fn ice_servers_empty_string_credential_filtered_to_none_matches_js_truthy() {
+        let input = vec![srv(
+            &["turn:turn.example:3478"],
+            Some("user1"),
+            Some(""),
+        )];
+        let out = ice_servers_to_rtc_peer_connection_config(&input);
+        assert_eq!(out[0].username.as_deref(), Some("user1"));
+        assert!(
+            out[0].credential.is_none(),
+            "empty-string credential must be filtered to None"
+        );
+    }
+
+    /// Multiple URLs in one entry preserved as the same array — the
+    /// RTCIceServer `urls` field accepts both `string` and `string[]`,
+    /// and we always pass the array form for consistency.
+    #[test]
+    fn ice_servers_multiple_urls_in_one_entry_preserved() {
+        let input = vec![srv(
+            &[
+                "stun:stun.example:3478",
+                "stun:stun-backup.example:3478",
+            ],
+            None,
+            None,
+        )];
+        let out = ice_servers_to_rtc_peer_connection_config(&input);
+        assert_eq!(out[0].urls.len(), 2);
+        assert_eq!(out[0].urls[0], "stun:stun.example:3478");
+        assert_eq!(out[0].urls[1], "stun:stun-backup.example:3478");
+    }
+
+    /// Multiple servers in the input — each maps independently. Common
+    /// real-world shape: a STUN-only entry plus a TURN-with-creds
+    /// entry as a fallback for restrictive NATs.
+    #[test]
+    fn ice_servers_multiple_servers_each_map_independently() {
+        let input = vec![
+            srv(&["stun:stun.example:3478"], None, None),
+            srv(
+                &["turn:turn.example:3478?transport=tcp"],
+                Some("user2"),
+                Some("pass2"),
+            ),
+        ];
+        let out = ice_servers_to_rtc_peer_connection_config(&input);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].username.is_none());
+        assert_eq!(out[1].username.as_deref(), Some("user2"));
+    }
+
+    /// Verifies the output serializes to the JSON shape an
+    /// `RTCPeerConnection` constructor accepts: `urls` is a JSON
+    /// array, `username`/`credential` are JSON strings when present,
+    /// the keys are absent (not `null`) when filtered out. This is
+    /// the wire-level contract with the browser's WebRTC layer.
+    #[test]
+    fn ice_servers_serialize_to_browser_compatible_json_shape() {
+        let input = vec![
+            srv(&["stun:stun.example:3478"], None, None),
+            srv(&["turn:turn.example:3478"], Some("user"), Some("pass")),
+        ];
+        let out = ice_servers_to_rtc_peer_connection_config(&input);
+        let json = serde_json::to_value(&out).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        // STUN entry: only `urls` key.
+        let stun = arr[0].as_object().unwrap();
+        assert!(stun.contains_key("urls"));
+        assert!(!stun.contains_key("username"));
+        assert!(!stun.contains_key("credential"));
+        assert!(stun["urls"].is_array());
+
+        // TURN entry: all three keys, all strings.
+        let turn = arr[1].as_object().unwrap();
+        assert_eq!(turn["username"].as_str(), Some("user"));
+        assert_eq!(turn["credential"].as_str(), Some("pass"));
+        assert!(turn["urls"].is_array());
     }
 }
