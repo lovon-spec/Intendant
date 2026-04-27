@@ -5295,26 +5295,6 @@ async function main() {
     // msg is a JS object (from WASM serde), not a raw string.
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
-      // [diag/peer-webrtc-routing] Trace 1 of 3: log every raw WS frame
-      // that looks like a peer-event-forwarded webrtc_signal. Tells us
-      // whether the answer reaches the WS layer at all (vs being dropped
-      // upstream in the registry → WS broadcast bridge).
-      if (
-        d &&
-        (d.event === 'peer_event_forwarded' ||
-          (d.payload && d.payload.event === 'webrtc_signal'))
-      ) {
-        const inner = (d.payload && d.payload.signal) || d.signal || {};
-        const sess = (d.payload && d.payload.session_id) || d.session_id || '?';
-        console.info(
-          '[diag/peer-webrtc] WS raw:',
-          'outer=' + (d.event || '?'),
-          'inner=' + ((d.payload && d.payload.event) || '?'),
-          'kind=' + (inner.kind || '?'),
-          'session=' + (sess + '').slice(0, 13),
-          'host=' + ((d.peer && d.peer.id) || d.peer || d.host_id || d.peer_id || '?')
-        );
-      }
       if (d.t === 'annotation_saved' && d.path) {
         showAnnotationResult(d.path);
         return;
@@ -5911,17 +5891,6 @@ function processCommands(cmds) {
         removePendingApproval(c.host_id, c.id);
         break;
       case 'peer_webrtc_signal':
-        // [diag/peer-webrtc-routing] Trace 2 of 3: log every UiCommand
-        // dispatch into the JS routing layer. Tells us whether the
-        // WASM AppState's render_peer_event branch produced the
-        // expected PeerWebRtcSignal command (see app_state.rs:2055).
-        console.info(
-          '[diag/peer-webrtc] UiCommand dispatch:',
-          'host=' + c.host_id,
-          'display=' + c.display_id,
-          'session=' + ((c.session_id || '') + '').slice(0, 13),
-          'kind=' + (c.signal && c.signal.kind)
-        );
         // Per-peer WebRTC signaling: route to the matching
         // RTCPeerConnection (keyed by host_id|display_id|session_id)
         // so the browser can complete the offer/answer/ICE handshake
@@ -12222,23 +12191,6 @@ function handlePeerWebRtcSignal(hostId, displayId, sessionId, signal) {
   const sessionKey = `${hostId}|${displayId}|${sessionId}`;
   const conn = peerDisplayConnections.get(sessionKey);
   const kind = signal && signal.kind;
-  // [diag/peer-webrtc-routing] Trace 3 of 3: log every dispatch into
-  // the per-PeerDisplayConnection handler. `hasConn` distinguishes the
-  // sessionKey-mismatch failure mode (signal arrived but no connection
-  // is registered under that key) from the every-other failure mode
-  // (signal never arrived). All registered keys are listed so
-  // operator can spot which dimension differs (host vs display vs
-  // session).
-  const allKeys = [...peerDisplayConnections.keys()];
-  console.info(
-    '[diag/peer-webrtc] handler entry:',
-    'hostId=' + hostId,
-    'displayId=' + displayId,
-    'sessionId=' + ((sessionId || '') + '').slice(0, 13),
-    'kind=' + kind,
-    'hasConn=' + !!conn,
-    'registered=[' + allKeys.map((k) => k.slice(0, 30)).join(', ') + ']'
-  );
   if (!conn) {
     // Late straggler (after close) or a session belonging to another
     // dashboard tab. Silent-drop in production was fine but made
