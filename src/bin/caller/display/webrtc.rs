@@ -73,6 +73,7 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
+use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::rtp_transceiver::RTCRtpSenderId;
 use rtc::sansio::Protocol as RtcProtocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
@@ -1016,6 +1017,27 @@ impl WebRtcPeer {
 
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_ice_credentials(local_ufrag.clone(), local_pwd);
+        // Pin the answerer's DTLS role to `Server` so the generated
+        // answer carries `a=setup:passive`. Per RFC 5763 § 5 that makes
+        // the browser the DTLS client and the initiator of the
+        // handshake — which is the path the rtc 0.20 stack actually
+        // drives. Letting the answer default to `a=setup:active` (the
+        // alternative role for an answerer to `actpass`) leaves rtc's
+        // DTLS state machine waiting for an event that never fires
+        // over the selected ICE-TCP candidate: in our slice-3a.2 setup
+        // the connection stalls at STUN keepalives forever, no DTLS
+        // bytes are ever emitted, no SRTP context is established,
+        // write_rtp returns Ok but produces no encrypted output, and
+        // the dashboard renders black indefinitely. Diagnosed in
+        // #41 (RFC 7983 byte-class instrumentation across all four
+        // hops showed Stun-only both ways with `a=setup:active` in
+        // the answer); the fix is named explicit role assignment
+        // here, before the RTCPeerConnection is built so all generated
+        // SDP carries the pinned role. See the
+        // `build_with_codec_set_pins_setup_passive_in_answer` test.
+        setting_engine
+            .set_answering_dtls_role(RTCDtlsRole::Server)
+            .map_err(|e| CallerError::WebRtc(format!("set answering DTLS role: {e}")))?;
 
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -4549,6 +4571,62 @@ mod tests {
 
         // Clean up the spawned driver. Dropping `peer` cancels its
         // shutdown token, the driver task exits on the next select.
+        drop(peer);
+    }
+
+    /// The answerer's DTLS role MUST be `passive` so the browser
+    /// becomes the DTLS client and initiates the handshake. With
+    /// the role left to default to `active`, the rtc 0.20 stack
+    /// signals `a=setup:active` but never actually emits a
+    /// ClientHello over the selected ICE-TCP candidate — the session
+    /// stalls at STUN keepalives forever and the dashboard renders
+    /// black. Diagnosed across four hops in #41 (RFC 7983 byte-class
+    /// instrumentation showed Stun-only in every direction) and
+    /// fixed by `setting_engine.set_answering_dtls_role(Server)`
+    /// in `build_with_codec_set`. This test pins both the
+    /// affirmative (passive present) and the negative (active
+    /// absent) so a future refactor that drops the role assignment
+    /// re-introduces the regression loudly instead of silently.
+    #[tokio::test]
+    async fn build_with_codec_set_pins_setup_passive_in_answer() {
+        ensure_rustls_crypto_provider();
+        let offer_sdp = synth_recvonly_video_offer_for_rtc();
+        let active_rids = vec![SimulcastRid::full()];
+        let ice_config = crate::display::IceConfig::default();
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
+            Arc::new(|_| {});
+        let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
+        let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let (peer, _frame_tx, answer_sdp) = WebRtcPeer::build_with_codec_set(
+            42,
+            &offer_sdp,
+            CodecKind::Vp8,
+            &active_rids,
+            &ice_config,
+            None,
+            None,
+            input_handler,
+            clipboard_handler,
+            ice_tx,
+            kf_tx,
+        )
+        .await
+        .expect("build_with_codec_set must succeed for the role-pin test");
+
+        assert!(
+            answer_sdp.contains("a=setup:passive"),
+            "answer must contain `a=setup:passive` so the browser becomes \
+             the DTLS client and initiates the handshake; got:\n{answer_sdp}"
+        );
+        assert!(
+            !answer_sdp.contains("a=setup:active"),
+            "answer must NOT contain `a=setup:active` — that role left \
+             rtc's DTLS state machine waiting forever over ICE-TCP \
+             (diagnosed in #41 / fixed in #42); got:\n{answer_sdp}"
+        );
+
         drop(peer);
     }
 
