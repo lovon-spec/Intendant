@@ -76,7 +76,7 @@ use rtc::rtp_transceiver::rtp_sender::{
 use rtc::rtp_transceiver::RTCRtpSenderId;
 use rtc::sansio::Protocol as RtcProtocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -397,85 +397,16 @@ impl TcpRelayRegistry {
             .await
             .map_err(|e| format!("write first frame to {outbound_addr}: {e}"))?;
 
-        // [DIAGNOSTIC — to revert] Replace `tokio::io::copy_bidirectional`
-        // with two metered diag_relay_copy tasks that are RFC-4571 frame-
-        // aware. Each task parses the 2-byte length prefix + payload,
-        // classifies the payload via RFC 7983, and writes the frame back
-        // through re-framed. Logs FIRST-per-class plus a 2s periodic
-        // totals dump per direction. Slight semantic diff vs
-        // copy_bidirectional: an early EOF on one direction no longer
-        // tears down the other; acceptable for diagnostic.
-        eprintln!(
-            "[diag/relay] route_accepted entry first_frame_len={} ufrag={local_ufrag:?}",
-            first_frame.len()
-        );
-        let (r_in, w_in) = stream.into_split();
-        let (r_out, w_out) = outbound.into_split();
-        tokio::spawn(diag_relay_copy(r_in, w_out, "browser→peer"));
-        tokio::spawn(diag_relay_copy(r_out, w_in, "peer→browser"));
+        // Spawn a bidirectional byte-forwarder. `copy_bidirectional`
+        // handles both directions concurrently and exits when either
+        // side closes — matches the ICE-TCP lifecycle where a single
+        // candidate pair's TCP connection lives for the WebRTC
+        // session's duration.
+        let mut stream = stream;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut outbound).await;
+        });
         Ok(())
-    }
-}
-
-// [DIAGNOSTIC — to revert] Frame-aware bidirectional helper for
-// `TcpRelayRegistry::route_accepted`. Reads 2-byte-length-prefixed RFC
-// 4571 frames, classifies each payload by RFC 7983 first byte, writes
-// the frame through re-framed, and reports per-class byte counters
-// every 2 seconds plus on EOF/error. Compatible with
-// `tokio::net::tcp::OwnedReadHalf` / `OwnedWriteHalf`.
-async fn diag_relay_copy(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
-    name: &'static str,
-) -> std::io::Result<u64> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut total = 0u64;
-    let mut class_seen: HashSet<DiagPayloadClass> = HashSet::new();
-    let mut class_count: HashMap<DiagPayloadClass, u64> = HashMap::new();
-    let mut last_log = Instant::now();
-    let mut len_buf = [0u8; 2];
-    loop {
-        if let Err(e) = reader.read_exact(&mut len_buf).await {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                eprintln!(
-                    "[diag/relay] {name} EOF total={total} {}",
-                    sorted_classes(&class_count)
-                );
-                return Ok(total);
-            }
-            eprintln!("[diag/relay] {name} length-prefix read error after {total}B: {e}");
-            return Err(e);
-        }
-        let len = u16::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; len];
-        if let Err(e) = reader.read_exact(&mut payload).await {
-            eprintln!("[diag/relay] {name} payload read error after {total}B: {e}");
-            return Err(e);
-        }
-        let class = classify_rfc7983(&payload);
-        if class_seen.insert(class) {
-            eprintln!(
-                "[diag/relay] {name} FIRST class={class:?} payload_len={}",
-                payload.len()
-            );
-        }
-        *class_count.entry(class).or_insert(0u64) += payload.len() as u64;
-        if let Err(e) = writer.write_all(&len_buf).await {
-            eprintln!("[diag/relay] {name} length-prefix write error: {e}");
-            return Err(e);
-        }
-        if let Err(e) = writer.write_all(&payload).await {
-            eprintln!("[diag/relay] {name} payload write error: {e}");
-            return Err(e);
-        }
-        total += 2 + payload.len() as u64;
-        if last_log.elapsed() >= Duration::from_secs(2) {
-            eprintln!(
-                "[diag/relay] {name} total={total} {}",
-                sorted_classes(&class_count)
-            );
-            last_log = Instant::now();
-        }
     }
 }
 
@@ -1619,15 +1550,6 @@ struct DriverState {
     /// All subsequent rtp_time values are relative to this.
     first_frame_at: Option<Instant>,
     rtp: RtpSendState,
-    // [DIAGNOSTIC — to revert] Per-(peer_addr, RFC 7983 class) outbound
-    // TCP-payload byte counters. Distinguishes "rtc emits only STUN
-    // keepalives" from "rtc emits DTLS handshake" from "rtc emits RTP" —
-    // each on a different first-byte range. Periodic dump from
-    // drain_outputs surfaces the class breakdown so DTLS-stall (only
-    // STUN both ways, no DTLS) is immediately visible.
-    diag_tcp_class_seen: HashSet<(SocketAddr, DiagPayloadClass)>,
-    diag_tcp_class_count: HashMap<(SocketAddr, DiagPayloadClass), u64>,
-    diag_last_class_dump_at: Option<Instant>,
 }
 
 /// Per-RID send state — one entry per simulcast layer (or one entry
@@ -1754,10 +1676,6 @@ async fn driver(
             mid_ext_id: None,
             rid_ext_id: None,
         },
-        // [DIAGNOSTIC — to revert] See DriverState field docs.
-        diag_tcp_class_seen: HashSet::new(),
-        diag_tcp_class_count: HashMap::new(),
-        diag_last_class_dump_at: None,
     };
 
     // Index sockets by their local address so we can route outbound writes
@@ -1946,37 +1864,11 @@ async fn driver(
                 let reader_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     let mut read_half = read_half;
-                    // [DIAGNOSTIC — to revert] Per-class inbound counters
-                    // for THIS accepted connection. Local to the task; one
-                    // FIRST log per class plus a 2s periodic totals dump.
-                    let mut diag_in_seen: HashSet<DiagPayloadClass> = HashSet::new();
-                    let mut diag_in_count: HashMap<DiagPayloadClass, u64> =
-                        HashMap::new();
-                    let mut diag_last_log = Instant::now();
                     loop {
                         tokio::select! {
                             _ = reader_shutdown.cancelled() => break,
                             frame = read_rfc4571_frame(&mut read_half) => match frame {
                                 Ok(bytes) => {
-                                    // [DIAGNOSTIC — to revert] RFC 7983
-                                    // first-byte classification before
-                                    // handing off to rtc.
-                                    let class = classify_rfc7983(&bytes);
-                                    if diag_in_seen.insert(class) {
-                                        eprintln!(
-                                            "[diag/tcp-in] FIRST from {remote_addr} class={class:?} bytes={}",
-                                            bytes.len(),
-                                        );
-                                    }
-                                    *diag_in_count.entry(class).or_insert(0u64) +=
-                                        bytes.len() as u64;
-                                    if diag_last_log.elapsed() >= Duration::from_secs(2) {
-                                        eprintln!(
-                                            "[diag/tcp-in] {remote_addr} totals: {}",
-                                            sorted_classes(&diag_in_count),
-                                        );
-                                        diag_last_log = Instant::now();
-                                    }
                                     let pkt = InboundPacket {
                                         proto: TransportProtocol::TCP,
                                         source: remote_addr,
@@ -1991,10 +1883,6 @@ async fn driver(
                                 Err(e) => {
                                     eprintln!(
                                         "[display/webrtc] ICE-TCP reader for {remote_addr} exiting: {e}"
-                                    );
-                                    eprintln!(
-                                        "[diag/tcp-in] {remote_addr} final totals: {}",
-                                        sorted_classes(&diag_in_count),
                                     );
                                     break;
                                 }
@@ -2141,59 +2029,6 @@ enum DriverExit {
     Closed,
 }
 
-// ===========================================================================
-// [DIAGNOSTIC — to revert] RFC 7983 first-byte payload classification.
-//
-// Distinguishes the four payload classes that share an ICE-TCP / DTLS-SRTP
-// 5-tuple:
-//
-//   STUN       0x00..=0x03  — binding requests/responses, ICE keepalives
-//   DTLS       0x14..=0x3F  — handshake (0x16), change_cipher_spec (0x14),
-//                            alert (0x15), application_data (0x17)
-//   TURN-Chan  0x40..=0x4F  — RFC 5766 ChannelData (not used by us, included
-//                            for completeness)
-//   RTP/RTCP   0x80..=0xBF  — RTP version=2 has bits 7-6 = 10 → first byte
-//                            in 0x80..=0xBF
-//   Other      everything else — surface unknowns rather than silent-drop
-//
-// Used by `drain_outputs` (peer outbound TCP), the per-connection reader
-// task (peer inbound TCP), and `diag_relay_copy` (primary relay both
-// directions). All sites carry the [diag/...] prefix so a single grep
-// shows the byte-class flow at every hop.
-// ===========================================================================
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
-enum DiagPayloadClass {
-    Stun,
-    Dtls,
-    TurnChan,
-    RtpRtcp,
-    Other(u8),
-    Empty,
-}
-
-fn classify_rfc7983(bytes: &[u8]) -> DiagPayloadClass {
-    let Some(&b) = bytes.first() else {
-        return DiagPayloadClass::Empty;
-    };
-    match b {
-        0..=3 => DiagPayloadClass::Stun,
-        20..=63 => DiagPayloadClass::Dtls,
-        64..=79 => DiagPayloadClass::TurnChan,
-        128..=191 => DiagPayloadClass::RtpRtcp,
-        _ => DiagPayloadClass::Other(b),
-    }
-}
-
-fn sorted_classes(map: &HashMap<DiagPayloadClass, u64>) -> String {
-    let mut v: Vec<_> = map.iter().collect();
-    v.sort_by_key(|(k, _)| *k);
-    let parts: Vec<String> = v
-        .into_iter()
-        .map(|(k, v)| format!("{k:?}={v}B"))
-        .collect();
-    format!("[{}]", parts.join(", "))
-}
-
 /// Drain pending writes, reads, and events from the sans-I/O peer connection.
 #[allow(clippy::too_many_arguments)]
 async fn drain_outputs(
@@ -2237,27 +2072,6 @@ async fn drain_outputs(
                 }
             }
             TransportProtocol::TCP => {
-                // [DIAGNOSTIC — to revert] RFC 7983 classification of the
-                // outbound TCP payload BEFORE write_rfc4571_frame wraps it.
-                // Counts + first-log per (peer_addr, class) — directly
-                // tells us whether rtc is emitting only STUN keepalives,
-                // DTLS handshake fragments, RTP/RTCP, or some mix.
-                let class = classify_rfc7983(&t.message);
-                if state
-                    .diag_tcp_class_seen
-                    .insert((t.transport.peer_addr, class))
-                {
-                    eprintln!(
-                        "[diag/tcp-out] FIRST → {} class={class:?} bytes={}",
-                        t.transport.peer_addr,
-                        t.message.len(),
-                    );
-                }
-                *state
-                    .diag_tcp_class_count
-                    .entry((t.transport.peer_addr, class))
-                    .or_insert(0u64) += t.message.len() as u64;
-
                 let Some(writer) = tcp_writers.get(&t.transport.peer_addr).cloned() else {
                     continue;
                 };
@@ -2269,37 +2083,6 @@ async fn drain_outputs(
                     }
                 });
             }
-        }
-    }
-    // [DIAGNOSTIC — to revert] Periodic dump (2s) of the per-(peer_addr,
-    // class) byte counters. Empty before any TCP transmit; one log line
-    // per peer_addr after that, listing all classes ever seen with
-    // running totals.
-    let now_dump = Instant::now();
-    let should_dump = state
-        .diag_last_class_dump_at
-        .map(|t| now_dump.duration_since(t) >= Duration::from_secs(2))
-        .unwrap_or(true);
-    if should_dump && !state.diag_tcp_class_count.is_empty() {
-        state.diag_last_class_dump_at = Some(now_dump);
-        // Group by peer_addr for readable output.
-        let mut by_peer: HashMap<SocketAddr, HashMap<DiagPayloadClass, u64>> =
-            HashMap::new();
-        for ((addr, class), bytes) in &state.diag_tcp_class_count {
-            *by_peer
-                .entry(*addr)
-                .or_insert_with(HashMap::new)
-                .entry(*class)
-                .or_insert(0u64) += bytes;
-        }
-        let mut peers: Vec<_> = by_peer.into_iter().collect();
-        peers.sort_by_key(|(addr, _)| *addr);
-        for (addr, classes) in peers {
-            eprintln!(
-                "[diag/tcp-out] dump {} {}",
-                addr,
-                sorted_classes(&classes)
-            );
         }
     }
 

@@ -6595,36 +6595,6 @@ async fn handle_federated_webrtc_signal(
                 .await;
             match answer_result {
                 Ok(answer_sdp) => {
-                    // [DIAGNOSTIC — to revert] Log the answerer's DTLS
-                    // role from the answer SDP. RFC 5763 / 8842: offerer
-                    // typically sends `a=setup:actpass`, answerer picks
-                    // `a=setup:active` (we initiate DTLS as client) or
-                    // `a=setup:passive` (browser is client, we wait).
-                    // If we pick `passive` the browser must initiate
-                    // DTLS handshake — if those packets never arrive
-                    // here it's a relay/framing problem; if we pick
-                    // `active` and never emit DTLS it's our state
-                    // machine.
-                    let setup_line = answer_sdp
-                        .lines()
-                        .find(|l| l.starts_with("a=setup:"))
-                        .unwrap_or("(no a=setup line)");
-                    let ufrag_line = answer_sdp
-                        .lines()
-                        .find(|l| l.starts_with("a=ice-ufrag:"))
-                        .unwrap_or("(no a=ice-ufrag line)");
-                    let fingerprint_line = answer_sdp
-                        .lines()
-                        .find(|l| l.starts_with("a=fingerprint:"))
-                        .map(|l| {
-                            // Truncate the long hex to keep the log line readable.
-                            let trimmed = l.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-                            format!("{trimmed} …")
-                        })
-                        .unwrap_or_else(|| "(no a=fingerprint line)".to_string());
-                    eprintln!(
-                        "[diag/sdp] answer setup={setup_line} ufrag={ufrag_line} fingerprint={fingerprint_line}"
-                    );
                     bus.send(AppEvent::LogEntry {
                         level: "info".to_string(),
                         source: LOG_SOURCE.to_string(),
