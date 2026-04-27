@@ -875,7 +875,16 @@ fn rtc_codec_parameters(codec: CodecKind) -> Result<RTCRtpCodecParameters, Calle
             mime_type: RTC_MIME_TYPE_H264.to_string(),
             clock_rate: 90_000,
             channels: 0,
-            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+            // profile-level-id=42e028 → Constrained Baseline, Level 4.0.
+            // Level 3.1 (`42e01f`) caps frame size at 3,600 macroblocks
+            // (~720p); typical desktop captures (1360x768 = 4,080 mbs,
+            // 1080p = 8,160 mbs) exceed that, so WebKit's H.264 decoder
+            // rejected every frame as out-of-spec — DTLS+ICE healthy,
+            // RTP flowing, framesDecoded=0, browser PLI-storming. Level
+            // 4.0 covers up to 1920x1088 @ 30fps which fits any common
+            // desktop resolution. `level-asymmetry-allowed=1` lets peers
+            // still negotiate different levels.
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e028"
                 .to_string(),
             rtcp_feedback: video_rtcp_feedback(),
         },
@@ -2612,7 +2621,7 @@ fn payload_spec_matches_codec(
     {
         return codec.mime_type.eq_ignore_ascii_case(RTC_MIME_TYPE_H264)
             && spec.h264_packetization_mode == Some(1)
-            && spec.h264_profile_level_id.as_deref() == Some("42e01f");
+            && spec.h264_profile_level_id.as_deref() == Some("42e028");
     }
     false
 }

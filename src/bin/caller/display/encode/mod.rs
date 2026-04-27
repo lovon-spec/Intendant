@@ -67,12 +67,17 @@ impl PayloadSpec {
     /// H.264 Constrained Baseline, packetization-mode 1 — what both of
     /// our H.264 encoder backends (VideoToolbox on macOS, libx264/VAAPI
     /// on Linux) produce. Matches `profile_idc=0x42`, `constraint_set1=1`,
-    /// Level 3.1.
+    /// Level 4.0 (`profile-level-id=42e028`). Level 4.0 covers up to
+    /// 1920x1088 @ 30fps, which fits any common desktop resolution.
+    /// Previously Level 3.1 (`42e01f`) which capped at 720p — typical
+    /// desktop captures (1360x768 = 4,080 mbs, 1080p = 8,160 mbs)
+    /// exceeded that and WebKit's H.264 decoder rejected every frame
+    /// (DTLS+ICE healthy, RTP flowing, framesDecoded=0).
     pub fn h264_constrained_baseline() -> Self {
         Self {
             codec_mime: MIME_TYPE_H264,
             clock_rate: 90_000,
-            h264_profile_level_id: Some("42e01f".to_string()),
+            h264_profile_level_id: Some("42e028".to_string()),
             h264_packetization_mode: Some(1),
         }
     }
