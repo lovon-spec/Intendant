@@ -1174,44 +1174,10 @@ impl WebRtcPeer {
             encodings,
         );
 
-        // diag #51 v3 (TO REVERT after smoke): wire rtc 0.9's
-        // interceptor registry with SR/RR + TWCC sender. Required
-        // setup so that:
-        //   - `configure_rtcp_reports` adds the SR + RR
-        //     interceptors → we emit Sender Reports and process
-        //     incoming Receiver Reports.
-        //   - `configure_twcc_sender_only` registers `transport-cc`
-        //     rtcp-fb + the transport-wide-cc RTP header extension
-        //     on the media engine, then attaches the TwccSender
-        //     interceptor that stamps outbound RTP with transport-
-        //     wide sequence numbers — without these, the browser
-        //     cannot produce TransportLayerCC feedback at all.
-        //
-        // Spike 2 (commit dfbb027 reverted in ea8bd02) confirmed
-        // wiring this is necessary to advertise TWCC + rtcp-fb in
-        // the answer SDP. Spike 2 ALSO confirmed that
-        // RemoteInboundRtpStreamStats stays at all-zero defaults
-        // even with this wiring — so we are NOT verifying TWCC
-        // through that stats accumulator anymore (per operator).
-        // The new verification point is below in `handle_message`,
-        // where rtc delivers RTCP packets to the app boundary.
-        let registry = rtc::interceptor::Registry::new();
-        let registry =
-            rtc::peer_connection::configuration::interceptor_registry::configure_rtcp_reports(
-                registry,
-            );
-        let registry =
-            rtc::peer_connection::configuration::interceptor_registry::configure_twcc_sender_only(
-                registry,
-                &mut media_engine,
-            )
-            .map_err(|e| CallerError::WebRtc(format!("configure twcc: {e}")))?;
-
         let mut rtc = RTCPeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
             .with_setting_engine(setting_engine)
             .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
             .build()
             .map_err(|e| CallerError::WebRtc(format!("build rtc peer: {e}")))?;
         let sender_id = rtc
@@ -1771,9 +1737,9 @@ struct InboundPacket {
 type TcpWriter = Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>;
 
 #[allow(clippy::too_many_arguments)]
-async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
+async fn driver(
     peer_id: PeerId,
-    mut rtc: RTCPeerConnection<I>,
+    mut rtc: RTCPeerConnection,
     rtp_config: RtpSendConfig,
     sockets: Vec<Arc<UdpSocket>>,
     mut tcp_conn_rx: Option<mpsc::Receiver<AcceptedTcpConnection>>,
@@ -2200,8 +2166,8 @@ enum DriverExit {
 
 /// Drain pending writes, reads, and events from the sans-I/O peer connection.
 #[allow(clippy::too_many_arguments)]
-async fn drain_outputs<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
+async fn drain_outputs(
+    rtc: &mut RTCPeerConnection,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
     tcp_writers: &mut HashMap<SocketAddr, TcpWriter>,
     state: &mut DriverState,
@@ -2276,8 +2242,8 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400)))
 }
 
-fn handle_event<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
+fn handle_event(
+    rtc: &mut RTCPeerConnection,
     state: &mut DriverState,
     event: RTCPeerConnectionEvent,
 ) -> bool {
@@ -2567,62 +2533,6 @@ fn handle_message(
     keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) {
     if let RTCMessage::RtcpPacket(_track_id, packets) = &message {
-        // diag #51 v3 (TO REVERT): classify EACH packet rtc 0.9
-        // delivers to the app boundary. This is the operator's
-        // chosen verification point — if browser-sent feedback
-        // (RR / TransportLayerCC) reaches us, it shows up here
-        // before any of rtc's own stats accumulators have a chance
-        // to swallow or mis-attribute it. If feedback DOESN'T show
-        // up here, the next step is a tcpdump on the daemon UDP
-        // port to distinguish "browser never sent it" from "rtc
-        // received it but didn't deliver to the app."
-        //
-        // Format: `[diag #51 v3 rtcp] count=N rr=n sr=n pli=n
-        // fir=n nack=n twcc=n other=n` per RTCP batch. Volume is
-        // bounded by the browser's RTCP rate (~1-5 batches/sec).
-        let mut rr = 0u32;
-        let mut sr = 0u32;
-        let mut pli = 0u32;
-        let mut fir = 0u32;
-        let mut nack = 0u32;
-        let mut twcc = 0u32;
-        let mut other = 0u32;
-        for pkt in packets {
-            let any = pkt.as_any();
-            if any
-                .downcast_ref::<rtc::rtcp::receiver_report::ReceiverReport>()
-                .is_some()
-            {
-                rr += 1;
-            } else if any
-                .downcast_ref::<rtc::rtcp::sender_report::SenderReport>()
-                .is_some()
-            {
-                sr += 1;
-            } else if any.downcast_ref::<PictureLossIndication>().is_some() {
-                pli += 1;
-            } else if any.downcast_ref::<FullIntraRequest>().is_some() {
-                fir += 1;
-            } else if any
-                .downcast_ref::<rtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack>()
-                .is_some()
-            {
-                nack += 1;
-            } else if any
-                .downcast_ref::<rtc::rtcp::transport_feedbacks::transport_layer_cc::TransportLayerCc>()
-                .is_some()
-            {
-                twcc += 1;
-            } else {
-                other += 1;
-            }
-        }
-        eprintln!(
-            "[diag #51 v3 rtcp] count={} rr={rr} sr={sr} pli={pli} fir={fir} \
-             nack={nack} twcc={twcc} other={other}",
-            packets.len(),
-        );
-
         // Project by_rid → flat (rid, ssrc) table for the routing
         // helper. N ≤ 3 in production (VP8 simulcast layers);
         // allocation cost is negligible at RTCP rates.
@@ -2661,8 +2571,8 @@ fn handle_message(
     }
 }
 
-fn write_video_frame<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
+fn write_video_frame(
+    rtc: &mut RTCPeerConnection,
     state: &mut DriverState,
     outbound: &OutboundEncodedFrame,
 ) {
@@ -2820,8 +2730,8 @@ fn payload_spec_matches_codec(
     false
 }
 
-fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
+fn rtp_header_extension_ids(
+    rtc: &mut RTCPeerConnection,
     state: &mut DriverState,
 ) -> (Option<u8>, Option<u8>) {
     if state.rtp.mid_ext_id.is_some() || state.rtp.rid_ext_id.is_some() {
@@ -2840,11 +2750,7 @@ fn rtp_header_extension_ids<I: rtc::interceptor::Interceptor>(
     (state.rtp.mid_ext_id, state.rtp.rid_ext_id)
 }
 
-fn handle_command<I: rtc::interceptor::Interceptor>(
-    rtc: &mut RTCPeerConnection<I>,
-    state: &DriverState,
-    cmd: Command,
-) {
+fn handle_command(rtc: &mut RTCPeerConnection, state: &DriverState, cmd: Command) {
     match cmd {
         Command::AddIceCandidate(s) => {
             let init = RTCIceCandidateInit {
