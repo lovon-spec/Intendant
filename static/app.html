@@ -2466,6 +2466,37 @@ html, body {
 }
 .display-status.connected { color: var(--green); }
 .display-status.error { color: var(--red); }
+/* Phase 5c: per-display input-authority chip.  Three states map to
+   three accent colours from the Catppuccin palette; the `unknown`
+   state is hidden entirely (no chip until the server has told this
+   browser its authority for this display).
+   - you       → green, this browser holds input authority
+   - other     → yellow, another browser holds it
+   - unclaimed → grey,  no one holds it (any connection can input) */
+.display-input-authority {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  margin-left: 6px;
+  background: rgba(108, 112, 134, 0.18);
+  color: var(--overlay0);
+  border: 1px solid var(--surface1);
+}
+.display-input-authority.you {
+  background: rgba(166, 227, 161, 0.18);
+  color: var(--green);
+  border-color: rgba(166, 227, 161, 0.4);
+}
+.display-input-authority.other {
+  background: rgba(249, 226, 175, 0.18);
+  color: var(--yellow);
+  border-color: rgba(249, 226, 175, 0.4);
+}
+.display-input-authority.unclaimed {
+  background: rgba(108, 112, 134, 0.18);
+  color: var(--overlay1);
+  border-color: var(--surface1);
+}
 .display-toolbar .take-control-btn,
 .display-toolbar .release-control-btn,
 .display-toolbar .stream-btn {
@@ -5564,6 +5595,19 @@ async function main() {
     if (modelConnected) app.handle_server_event(evt);
   });
 
+  // Phase 5c: per-display input-authority state from the server.  Fired
+  // for both the bootstrap snapshot at WS connect (one event per active
+  // display) and live transitions (Request/Release/WS-close elsewhere,
+  // plus DisplayReady for fresh sessions starting at unclaimed).  The
+  // server has already resolved its holder ID against this connection's
+  // ID, so `state` is one of `'you' | 'other' | 'unclaimed'` — connection
+  // IDs never reach JS.  The DisplaySlot itself owns the chip + button +
+  // interactive-mode promotion logic; we just route by display_id.
+  app.set_on_display_input_authority_change((displayId, state) => {
+    const slot = displaySlots.get(Number(displayId));
+    if (slot) slot.setAuthority(state);
+  });
+
   app.set_on_force_disconnect((reason) => {
     try { app.send_voice_diagnostic('make_active_force_disconnect_client', 'reason=' + reason); } catch(_) {}
     if (modelConnected) {
@@ -7570,6 +7614,20 @@ class DisplaySlot {
     this.clipboardChannel = null; // reliable, ordered — clipboard sync
     this.videoEl = null;
     this.interactive = false;
+    // Phase 5c: per-display input-authority state, populated by the WASM
+    // callback wired to `set_on_display_input_authority_change`. Starts at
+    // `'unknown'` and is replaced with one of `'you' | 'other' | 'unclaimed'`
+    // on the first `display_input_authority_state` frame the gateway sends
+    // (bootstrap on WS connect, then live on every authority transition).
+    // The chip + button visibility renders against this; `interactive` only
+    // ever flips to `true` while state === 'you'.  Source of truth is the
+    // server gate at `web_gateway::gated_input_handler` — JS gating below
+    // is UX consistency only.
+    this.authorityState = 'unknown';
+    // Set when `takeControl` requests authority and is waiting for the
+    // server's `'you'` confirmation; on arrival, `setAuthority` promotes
+    // us into interactive mode rather than just rendering the chip.
+    this._takeControlPending = false;
     this.connected = false;
     this.streaming = false;
     this._answerApplied = false;     // true after setRemoteDescription completes
@@ -7593,6 +7651,7 @@ class DisplaySlot {
       <div class="display-toolbar">
         <span class="display-label">:${displayId}</span>
         <span class="display-status" id="ds-status-${displayId}">Connecting...</span>
+        <span class="display-input-authority" id="ds-authority-${displayId}" style="display:none" title="Input authority for this display: who can drive keyboard/mouse. Phase 5c."></span>
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
         <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">&#x1F441; Stream</button>
         <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">&#x1F4CE; Attach</button>
@@ -7604,6 +7663,7 @@ class DisplaySlot {
       </div>
       <div class="display-canvas" id="display-canvas-${displayId}"></div>`;
     this.statusEl = this.el.querySelector(`#ds-status-${displayId}`);
+    this.authorityEl = this.el.querySelector(`#ds-authority-${displayId}`);
     this.noteInput = this.el.querySelector(`#ds-note-${displayId}`);
     this.takeBtn = this.el.querySelector(`#ds-take-${displayId}`);
     this.releaseBtn = this.el.querySelector(`#ds-release-${displayId}`);
@@ -7933,15 +7993,51 @@ class DisplaySlot {
     });
   }
 
+  // Phase 5c: split into authority-aware entry + UI-only interactive
+  // mode.  `takeControl` is now the user-intent entry point; the actual
+  // listener installation lives in `_enterInteractive`, which is called
+  // either immediately (when this connection already holds authority)
+  // or asynchronously after the server's `'you'` callback arrives.
   takeControl() {
     if (!this.pc) return;
+    if (this.authorityState === 'you') {
+      // Server says we're already the holder — enter interactive mode now.
+      this._enterInteractive();
+      return;
+    }
+    // Otherwise request authority and wait for the `'you'` notification
+    // to arrive via `setAuthority`.  Marker so `setAuthority('you')` knows
+    // to promote us into interactive mode rather than just rendering the
+    // chip.  No UI change here yet — the chip still renders the current
+    // (other / unclaimed / unknown) state until the server answers.
+    this._takeControlPending = true;
+    if (typeof presenceWeb !== 'undefined' && presenceWeb &&
+        typeof presenceWeb.request_display_input_authority === 'function') {
+      presenceWeb.request_display_input_authority(this.displayId);
+    }
+  }
+
+  // Phase 5c: enter interactive mode (UI + listeners).  Called from
+  // `takeControl` synchronously when state === 'you', or from
+  // `setAuthority` asynchronously after the server promotes us.  Idempotent
+  // so a double-fire (rare race between user click and server bootstrap)
+  // doesn't double-install listeners.
+  //
+  // Lifecycle: still emits the legacy `take_display` ControlMsg so the
+  // worker agent yields the display to the human user — that's a separate
+  // signal from input authority and must keep firing on user-intent
+  // entry into interactive mode.
+  _enterInteractive() {
+    if (this.interactive) return;
     this.interactive = true;
-    this.takeBtn.style.display = 'none'; this.releaseBtn.style.display = '';
     this.noteInput.style.display = '';
     const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
     this.statusEl.textContent = `Interactive${res}`;
     this.statusEl.className = 'display-status connected';
     if (app) app.take_display(BigInt(this.displayId));
+    // _renderAuthority handles take/release button visibility from the
+    // authority state (so we don't duplicate the toggle here).
+    this._renderAuthority();
 
     const vid = this.videoEl;
     vid.tabIndex = 0;
@@ -8104,8 +8200,48 @@ class DisplaySlot {
     }
   }
 
+  // Phase 5c: send the authority-release control message to the server.
+  // Pure send — no UI changes, no `_exitInteractive` call, no
+  // `app.release_display` lifecycle event.  Composed by `releaseControl`
+  // (user click) and `disconnect({ userInitiated: true })` (user-close
+  // paths like `removeDisplaySlot` after `_closedByUser = true`).  The
+  // server is idempotent: a release from a non-holder is a silent no-op,
+  // so calling this when authority isn't held is harmless.
+  _releaseAuthority() {
+    if (typeof presenceWeb !== 'undefined' && presenceWeb &&
+        typeof presenceWeb.release_display_input_authority === 'function') {
+      presenceWeb.release_display_input_authority(this.displayId);
+    }
+    // Cancel any pending take so a server `'you'` answer arriving after
+    // the release doesn't re-promote into interactive.
+    this._takeControlPending = false;
+  }
+
+  // Phase 5c: user-intent release of interactive control via the Release
+  // button.  Sends authority release to the server AND exits interactive
+  // mode locally so the UI is consistent immediately rather than waiting
+  // on the server's round-trip; the legacy `release_display` lifecycle
+  // ControlMsg fires alongside (via `_exitInteractive(true)`).  This is
+  // ONLY for the explicit Release-button path — non-user cleanup
+  // (transport reconnect, capture lost) goes through `disconnect()` with
+  // `userInitiated: false`, which calls neither this method nor
+  // `_releaseAuthority`.  Server demotion (someone else takes over) goes
+  // through `_exitInteractive(false)` from `setAuthority` instead.
   releaseControl() {
-    const wasInteractive = this.interactive;
+    this._releaseAuthority();
+    this._exitInteractive(true);
+  }
+
+  // Phase 5c: exit interactive mode (UI + listeners).  `userInitiated`
+  // gates the legacy `release_display` lifecycle ControlMsg:
+  // `true` for explicit user release / disconnect / move-to-thumb (the
+  // user navigated away from interactive mode), `false` for server-driven
+  // demotion when another browser takes authority (the user didn't ask
+  // for this — display is still visible, they just lost input control).
+  // Idempotent so a server `'unclaimed'` arriving right after a user
+  // release-click doesn't re-fire the lifecycle release.
+  _exitInteractive(userInitiated) {
+    if (!this.interactive) return;
     this.interactive = false;
     if (this._heldModifiers) this._heldModifiers.clear();
     const vid = this.videoEl;
@@ -8119,12 +8255,97 @@ class DisplaySlot {
     this._boundHandlers = {};
     const note = this.noteInput.value.trim() || undefined;
     this.noteInput.value = ''; this.noteInput.style.display = 'none';
-    this.takeBtn.style.display = ''; this.releaseBtn.style.display = 'none';
     this.statusEl.textContent = this.connected ? 'Connected (view-only)' : 'Disconnected';
-    // Only notify the backend if control was actually taken. Otherwise
-    // display lifecycle events (disconnect, tab-switch thumb relocation)
-    // spuriously send ReleaseDisplay ControlMsgs that the user never asked for.
-    if (wasInteractive && app) app.release_display(BigInt(this.displayId), note);
+    // Take/release button visibility is driven by `_renderAuthority` from
+    // `authorityState` — but since exiting interactive doesn't itself flip
+    // authority, re-render to clear any toolbar state that the interactive
+    // mode set (note input shown, etc.).
+    this._renderAuthority();
+    if (userInitiated && app) {
+      app.release_display(BigInt(this.displayId), note);
+    }
+  }
+
+  // Phase 5c: server-driven authority state callback.  Called from the
+  // WASM `set_on_display_input_authority_change` dispatcher (wired in the
+  // app init in connect_voice / set_on_display_input_authority_change
+  // callsite) with the resolved `'you' | 'other' | 'unclaimed'` for THIS
+  // browser's connection — never any holder ID, never personalization on
+  // this side.  The server gate at `web_gateway::gated_input_handler` is
+  // the source of truth for input enforcement; this UI logic exists
+  // strictly to keep the chip + buttons + interactive mode consistent
+  // with what the gate is doing.
+  setAuthority(state) {
+    if (state !== 'you' && state !== 'other' && state !== 'unclaimed') {
+      // Forward-compat: future state strings (we don't expect any) leave
+      // the chip on its previous value rather than blanking it.
+      return;
+    }
+    this.authorityState = state;
+    this._renderAuthority();
+
+    // Promote pending take into interactive mode the moment the server
+    // confirms we hold it.  Without this, the user would click Take
+    // Control and see the chip flip but the listeners would not install.
+    if (state === 'you' && this._takeControlPending) {
+      this._takeControlPending = false;
+      this._enterInteractive();
+    }
+
+    // Demote silently on loss of authority.  The user did not initiate
+    // this exit — server picked up that another browser took control —
+    // so no `release_display` lifecycle event fires (per phase 5c spec:
+    // "if state changes from you to other while interactive, exit
+    // interactive silently").
+    if (this.interactive && state !== 'you') {
+      this._exitInteractive(false);
+    }
+  }
+
+  // Phase 5c: render the chip + take/release button visibility from the
+  // current `authorityState`.  Single-source UI projection so any code
+  // that mutates state goes through `setAuthority` and never has to
+  // remember to update DOM directly.
+  _renderAuthority() {
+    const e = this.authorityEl;
+    if (e) {
+      switch (this.authorityState) {
+        case 'you':
+          e.style.display = '';
+          e.textContent = 'Input: you';
+          e.className = 'display-input-authority you';
+          break;
+        case 'other':
+          e.style.display = '';
+          e.textContent = 'Input: another viewer';
+          e.className = 'display-input-authority other';
+          break;
+        case 'unclaimed':
+          e.style.display = '';
+          e.textContent = 'Input: shared';
+          e.className = 'display-input-authority unclaimed';
+          break;
+        default:
+          // 'unknown' — server hasn't told us yet.  Hide the chip rather
+          // than show "shared" speculatively, per phase 5c spec: "do not
+          // show 'unclaimed' unless the server has actually told this
+          // browser the display is unclaimed."
+          e.style.display = 'none';
+          e.textContent = '';
+          e.className = 'display-input-authority';
+          break;
+      }
+    }
+    // Button visibility tracks state, not the `interactive` flag, so the
+    // user can click Take Control even before listeners install (the
+    // request flow handles waiting for the `'you'` callback).
+    if (this.authorityState === 'you') {
+      this.takeBtn.style.display = 'none';
+      this.releaseBtn.style.display = '';
+    } else {
+      this.takeBtn.style.display = '';
+      this.releaseBtn.style.display = 'none';
+    }
   }
 
   toggleStreaming() {
@@ -8214,9 +8435,31 @@ class DisplaySlot {
       this.deleteRecBtn.style.display = 'none';
     }
   }
-  disconnect() {
+  // Phase 5c: teardown.  `userInitiated` separates the user-close path
+  // (display toggled off, `removeDisplaySlot`, etc.) from transient
+  // cleanup (ICE failure reconnect, display_capture_lost — both keep
+  // the slot in case the session comes back).  Without this split,
+  // every transient reconnect would silently release input authority
+  // and fire the legacy `release_display` lifecycle event as if the
+  // user clicked Release.
+  //
+  // - `userInitiated: true`  → release authority + exit interactive
+  //   (with `release_display` lifecycle event firing if interactive).
+  //   Used by `removeDisplaySlot` and any path where the user has
+  //   actually closed the display (not just lost the underlying
+  //   transport).
+  // - `userInitiated: false` → just exit interactive locally; do NOT
+  //   release authority and do NOT fire `release_display`.  The server
+  //   gate stays as-is so a re-grant or transport reconnect resumes
+  //   without the UX surprise of "I had control before, now I don't."
+  //   The WS-close cleanup at the gateway is the safety net for
+  //   genuinely-dropped connections.
+  disconnect({ userInitiated = false } = {}) {
     this.stopStreaming();
-    this.releaseControl();
+    if (userInitiated) {
+      this._releaseAuthority();
+    }
+    this._exitInteractive(userInitiated);
     if (this.controlChannel) { this.controlChannel.close(); this.controlChannel = null; }
     if (this.pointerChannel) { this.pointerChannel.close(); this.pointerChannel = null; }
     if (this.clipboardChannel) { this.clipboardChannel.close(); this.clipboardChannel = null; }
@@ -8235,7 +8478,13 @@ function removeDisplaySlot(displayId) {
   // reconnect timer short-circuits and any subsequent `failed` event
   // skips the retry path. See DisplaySlot._closedByUser.
   slot._closedByUser = true;
-  slot.disconnect();
+  // Phase 5c: user-close path — release input authority + fire the
+  // legacy `release_display` lifecycle event.  Distinct from the
+  // transient `disconnect()` paths (ICE retry at the
+  // `oniceconnectionstatechange` handler; display_capture_lost) which
+  // call `disconnect()` with the `userInitiated: false` default and
+  // therefore preserve authority for a possible re-grant.
+  slot.disconnect({ userInitiated: true });
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
   removeDisplayThumb(displayId);
