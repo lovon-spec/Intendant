@@ -4962,6 +4962,15 @@ const SHELL_KEY_SEQS = {
 
 // Displays
 const displaySlots = new Map();
+// Phase 5c: buffer for `display_input_authority_state` frames that
+// arrive before the corresponding DisplaySlot exists (race between the
+// `display_ready` and `display_input_authority_state` channels in the
+// per-WS outbound select).  Keyed by display_id; values are the latest
+// state string (`'you' | 'other' | 'unclaimed'`).  Drained in
+// `addDisplaySlot` right after the slot is added to `displaySlots`.
+// Replaced (not appended) on each frame so a stale state never wins
+// over a fresh one if multiple arrive while the slot is missing.
+const pendingAuthorityStates = new Map();
 
 // Activity display strip
 const displayThumbs = new Map();
@@ -5604,8 +5613,21 @@ async function main() {
   // IDs never reach JS.  The DisplaySlot itself owns the chip + button +
   // interactive-mode promotion logic; we just route by display_id.
   app.set_on_display_input_authority_change((displayId, state) => {
-    const slot = displaySlots.get(Number(displayId));
-    if (slot) slot.setAuthority(state);
+    const did = Number(displayId);
+    const slot = displaySlots.get(did);
+    if (slot) {
+      slot.setAuthority(state);
+    } else {
+      // Slot may not exist yet: when the server grants a fresh display,
+      // it broadcasts both `display_ready` (which addDisplaySlot consumes
+      // to create the slot) and `display_input_authority_state` (this
+      // message), and the two travel through different channels in the
+      // per-WS outbound select — they can race.  If state arrives first,
+      // queue it; addDisplaySlot drains the queue right after creating
+      // the slot.  Without this buffer the chip would stay at `unknown`
+      // until the next authority transition fires.
+      pendingAuthorityStates.set(did, state);
+    }
   });
 
   app.set_on_force_disconnect((reason) => {
@@ -8011,9 +8033,9 @@ class DisplaySlot {
     // chip.  No UI change here yet — the chip still renders the current
     // (other / unclaimed / unknown) state until the server answers.
     this._takeControlPending = true;
-    if (typeof presenceWeb !== 'undefined' && presenceWeb &&
-        typeof presenceWeb.request_display_input_authority === 'function') {
-      presenceWeb.request_display_input_authority(this.displayId);
+    if (typeof app !== 'undefined' && app &&
+        typeof app.request_display_input_authority === 'function') {
+      app.request_display_input_authority(this.displayId);
     }
   }
 
@@ -8208,9 +8230,9 @@ class DisplaySlot {
   // server is idempotent: a release from a non-holder is a silent no-op,
   // so calling this when authority isn't held is harmless.
   _releaseAuthority() {
-    if (typeof presenceWeb !== 'undefined' && presenceWeb &&
-        typeof presenceWeb.release_display_input_authority === 'function') {
-      presenceWeb.release_display_input_authority(this.displayId);
+    if (typeof app !== 'undefined' && app &&
+        typeof app.release_display_input_authority === 'function') {
+      app.release_display_input_authority(this.displayId);
     }
     // Cancel any pending take so a server `'you'` answer arriving after
     // the release doesn't re-promote into interactive.
@@ -8507,6 +8529,13 @@ function addDisplaySlot(displayId, width, height) {
   }
   const slot = new DisplaySlot(displayId, width, height);
   displaySlots.set(displayId, slot);
+  // Phase 5c: drain any authority state that arrived before this slot
+  // existed.  See pendingAuthorityStates docs for the race rationale.
+  const pendingState = pendingAuthorityStates.get(displayId);
+  if (pendingState !== undefined) {
+    pendingAuthorityStates.delete(displayId);
+    slot.setAuthority(pendingState);
+  }
   const container = document.getElementById('displays-container');
   const placeholder = document.getElementById('displays-placeholder');
   if (placeholder) placeholder.style.display = 'none';
