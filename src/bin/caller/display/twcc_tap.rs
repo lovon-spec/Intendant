@@ -319,7 +319,22 @@ pub fn spawn_twcc_health_aggregator(
                         // state.
                         None
                     } else {
-                        Some(accumulator.snapshot(window_end))
+                        let snapshot = accumulator.snapshot(window_end);
+                        // Operational observability: one line per
+                        // non-empty window. Rate-limited by
+                        // construction (≤ 1 Hz). Skipping empty
+                        // windows keeps idle sessions quiet.
+                        eprintln!(
+                            "[twcc-health] reported={r} received={recv} lost={l} \
+                             loss_fraction={lf:.4} batches={b} last_fb={fb:?}",
+                            r = snapshot.reported_packets,
+                            recv = snapshot.received_packets,
+                            l = snapshot.lost_packets,
+                            lf = snapshot.loss_fraction,
+                            b = snapshot.batches,
+                            fb = snapshot.last_fb_pkt_count,
+                        );
+                        Some(snapshot)
                     };
                     let _ = health_tx.send(payload);
                     accumulator.reset();

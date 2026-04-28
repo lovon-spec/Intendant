@@ -714,12 +714,28 @@ impl DisplaySession {
         let pool_for_action = Arc::clone(&pool_arc);
         let on_action: Box<
             dyn Fn(aggregator::CapacityAction) + Send + Sync,
-        > = Box::new(move |action| match action {
-            aggregator::CapacityAction::PauseLayer(rid) => {
-                pool_for_action.pause_layer(encode::pool::CodecKind::Vp8, rid);
+        > = Box::new(move |action| {
+            // Operational observability: one line per layer-policy
+            // action. Volume is bounded by the cascade (max 4
+            // events per drop+recover cycle: pause top, pause mid,
+            // resume mid, resume top) plus presence transitions.
+            // Format mirrors the action variant for grep-ability:
+            // `[layer-policy] PauseLayer(<rid>)` / `ResumeLayer(<rid>)`.
+            match &action {
+                aggregator::CapacityAction::PauseLayer(rid) => {
+                    eprintln!("[layer-policy] PauseLayer({rid:?})");
+                }
+                aggregator::CapacityAction::ResumeLayer(rid) => {
+                    eprintln!("[layer-policy] ResumeLayer({rid:?})");
+                }
             }
-            aggregator::CapacityAction::ResumeLayer(rid) => {
-                pool_for_action.resume_layer(encode::pool::CodecKind::Vp8, rid);
+            match action {
+                aggregator::CapacityAction::PauseLayer(rid) => {
+                    pool_for_action.pause_layer(encode::pool::CodecKind::Vp8, rid);
+                }
+                aggregator::CapacityAction::ResumeLayer(rid) => {
+                    pool_for_action.resume_layer(encode::pool::CodecKind::Vp8, rid);
+                }
             }
         });
         let layer_policy_task = aggregator::spawn_layer_policy_coordinator(
