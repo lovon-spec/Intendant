@@ -1096,6 +1096,40 @@ fn first_video_mid_from_offer(sdp: &str) -> Option<String> {
     None
 }
 
+/// Pick the single RID for a federated single-encoding peer (offer
+/// without `a=simulcast:recv`). **#48 tuning**: returns the floor
+/// (`pool_rids.last()`), not the top (`pool_rids[0]`).
+///
+/// Rationale: the only consumer of this code path is the federated
+/// `PeerDisplayConnection` (post-`e815bac` it strips `a=simulcast:recv`
+/// from its offer; the local `DisplaySlot` always injects it and goes
+/// down the multi-RID branch instead). Federated runs over a TURN-relay
+/// path where moderate sustained packet loss (~5-10 %) is the
+/// operational baseline. At the full-layer's 2.5 Mbps target, keyframes
+/// run ~500 KB ≈ 420 RTP packets; intact-arrival probability at 8 %
+/// loss is `0.92^420 ≈ 1.4e-15` — effectively zero. At the floor's
+/// 125 kbps quarter-resolution target, keyframes are ~20 KB ≈ 17
+/// packets; intact-arrival is `0.92^17 ≈ 24 %` — recovered within a
+/// few PLI cycles.
+///
+/// Loss-tolerance dominates resolution here: a usable low-resolution
+/// stream beats a frozen full-resolution one. When the operator wants
+/// higher quality on a clean link, that's a future capacity policy
+/// concern (track #48 follow-up): observe loss + dynamically
+/// renegotiate to a higher RID. This baseline is "make federated work
+/// at all under realistic loss."
+///
+/// Robust against partial-layer pools: `pool_rids.last()` degrades to
+/// "best available floor" — when the source resolution is too small for
+/// quarter (per `MIN_LAYER_DIM` filter in `LayerSpec::vp8_simulcast`),
+/// last is `h` or `f`. Caller guarantees `pool_rids` is non-empty.
+fn select_single_rid_for_federated_offer(pool_rids: &[SimulcastRid]) -> SimulcastRid {
+    pool_rids
+        .last()
+        .expect("caller must guarantee pool_rids is non-empty")
+        .clone()
+}
+
 /// Parse the offer SDP's `a=simulcast:recv <rid>;<rid>;...` line and return
 /// the RIDs the browser is willing to receive.
 ///
@@ -1249,6 +1283,51 @@ mod parse_offer_simulcast_recv_rids_tests {
                    m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
                    a=simulcast:recv f;h\r\n";
         assert_eq!(parse_offer_simulcast_recv_rids(sdp), None);
+    }
+
+    // ----- #48 floor-pick tests --------------------------------------------
+
+    /// **#48 acceptance**: full simulcast pool → federated single-RID
+    /// peer picks the floor (`q`), not the top (`f`). The top would
+    /// produce ~500 KB keyframes that can't survive 8 % loss
+    /// (`0.92^420 ≈ 1.4e-15`); the floor produces ~20 KB keyframes
+    /// (`0.92^17 ≈ 24 %`) that recover within seconds of PLI.
+    #[test]
+    fn select_floor_for_full_simulcast_pool() {
+        let pool = vec![
+            SimulcastRid::full(),
+            SimulcastRid::half(),
+            SimulcastRid::quarter(),
+        ];
+        assert_eq!(
+            select_single_rid_for_federated_offer(&pool),
+            SimulcastRid::quarter(),
+        );
+    }
+
+    /// Defensive: partial pool (small source: quarter dropped by
+    /// `MIN_LAYER_DIM` filter in `LayerSpec::vp8_simulcast`) → pick
+    /// the best available floor. Degrades to `h` rather than failing
+    /// or skipping back to `f`.
+    #[test]
+    fn select_floor_for_two_layer_pool() {
+        let pool = vec![SimulcastRid::full(), SimulcastRid::half()];
+        assert_eq!(
+            select_single_rid_for_federated_offer(&pool),
+            SimulcastRid::half(),
+        );
+    }
+
+    /// Tiny source: only `f` survives. Floor *is* `f`. Federated
+    /// peer picks `f` and accepts the higher loss-vulnerability —
+    /// nothing else to fall back to.
+    #[test]
+    fn select_full_when_only_one_layer() {
+        let pool = vec![SimulcastRid::full()];
+        assert_eq!(
+            select_single_rid_for_federated_offer(&pool),
+            SimulcastRid::full(),
+        );
     }
 
     /// Forward-compat: unknown RID tokens silently drop, known ones
@@ -1888,11 +1967,42 @@ impl WebRtcPeer {
         let active_rids: Vec<SimulcastRid> =
             match parse_offer_simulcast_recv_rids(offer_sdp) {
                 None => {
-                    // Single-encoding offer → narrow to one layer. Pool
-                    // returns layers in priority order (full first), so
-                    // index 0 is the right pick. Cloning is cheap (a
-                    // String wrapper).
-                    vec![pool_rids[0].clone()]
+                    // Single-encoding offer → narrow to one layer.
+                    //
+                    // **#48 tuning**: pick the **floor** (last in
+                    // `pool_rids`, which is spec-ordered descending
+                    // bitrate per `LayerSpec::vp8_simulcast` — q
+                    // (125 kbps @ ¼ res) when all three layers are
+                    // present), not `pool_rids[0]` (the full layer at
+                    // 2.5 Mbps). Rationale: the federated path is the
+                    // only consumer of single-encoding negotiation
+                    // (`PeerDisplayConnection` post-#46/`e815bac`),
+                    // and runs over a TURN-relay where moderate (~5-
+                    // 10 %) sustained packet loss is the operational
+                    // baseline. At full-layer keyframe sizes (~500 KB
+                    // = ~420 RTP packets), 8 % loss makes intact
+                    // delivery `0.92^420 ≈ 1.4e-15` — effectively
+                    // impossible. Quarter-layer keyframes (~20 KB =
+                    // ~17 packets) have `0.92^17 ≈ 24 %` intact
+                    // probability and recover within seconds. Loss-
+                    // tolerance dominates resolution for "stream
+                    // remains usable under loss" — full-resolution
+                    // single-RID federated was empirically frozen
+                    // (~0.4 fps decoded at 8 % loss before this
+                    // tuning).
+                    //
+                    // The local `DisplaySlot` path is unaffected: it
+                    // injects `a=simulcast:recv f;h;q` into its offer,
+                    // so it hits the `Some(offer_rids)` branch below
+                    // and gets the full multi-RID set as before.
+                    //
+                    // Robust against partial-layer pools: if pool
+                    // dropped the quarter layer because the source is
+                    // too small (`MIN_LAYER_DIM` filter in
+                    // `vp8_simulcast`), `pool_rids.last()` becomes
+                    // `h` or `f` — degrades to "best available floor"
+                    // rather than failing.
+                    vec![select_single_rid_for_federated_offer(&pool_rids)]
                 }
                 Some(offer_rids) => {
                     let intersected: Vec<SimulcastRid> = pool_rids
