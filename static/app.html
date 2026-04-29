@@ -12408,7 +12408,45 @@ class PeerDisplayConnection {
         `intendant.toml to enable the only verified-working path.`);
     }
     this.pc = new RTCPeerConnection(pcConfig);
-    this.pc.addTransceiver('video', { direction: 'recvonly' });
+    const videoTransceiver = this.pc.addTransceiver('video', { direction: 'recvonly' });
+
+    // **#67 (federated VP8 A/B)**: pin codec preference to VP8 only.
+    // Distinct from the local DisplaySlot path (#58) which deliberately
+    // lets WKWebView default H.264 first to get the hardware-accelerated
+    // VideoToolbox encoder on the macOS Mac viewing its own display.
+    //
+    // Federation's encoder is the *peer's* libx264 (software) — there
+    // is no hardware-accel argument for H.264 here. And the H.264 path
+    // is currently broken end-to-end on the federated smoke topology
+    // (browser → host coturn → Debian UTM peer, all on one MacBook):
+    // 13-22 % local TURN/virtio loss combined with full-res H.264 IDRs
+    // of ~291 RTP packets makes IDR reassembly statistically impossible
+    // (P(complete IDR) = 0.78^291 ≈ 1.5e-30). VP8 IDRs are smaller per
+    // packet and survive better; this A/B confirms whether the block is
+    // H.264-specific or lower in RTP/media.
+    //
+    // `RTCRtpReceiver.getCapabilities('video')` returns null on browsers
+    // that don't implement it (rare in 2026 — Safari/WebKit, Chrome,
+    // Firefox all support it); guard so a no-op fallback leaves the
+    // transceiver at its browser default.
+    if (videoTransceiver && typeof videoTransceiver.setCodecPreferences === 'function') {
+      const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities)
+        ? RTCRtpReceiver.getCapabilities('video')
+        : null;
+      const vp8 = caps && caps.codecs
+        ? caps.codecs.filter(c => c.mimeType && c.mimeType.toLowerCase() === 'video/vp8')
+        : [];
+      if (vp8.length > 0) {
+        try {
+          videoTransceiver.setCodecPreferences(vp8);
+          this._log('info', `codec preference pinned to VP8 (${vp8.length} variant(s))`);
+        } catch (e) {
+          this._log('warn', `setCodecPreferences(VP8) failed: ${e.message} — falling back to browser default`);
+        }
+      } else {
+        this._log('warn', 'no VP8 in RTCRtpReceiver capabilities — leaving codec order at browser default');
+      }
+    }
     this._log('debug', `connect: sessionKey=${this.sessionKey()} advertiseTcpViaUrl=${this.advertiseTcpViaUrl || '(none)'}`);
 
     this.pc.ontrack = (e) => {
