@@ -2951,18 +2951,24 @@ pub fn spawn_web_gateway(
                     // `unknown`.  Without this snapshot the chip would only
                     // resolve on the next authority transition, which may
                     // be never if no one ever takes control.
-                    // Compute the bootstrap snapshot once.  display_ready
-                    // events go out now (so the slots exist before any log
-                    // replay happens); the per-display
-                    // `display_input_authority_state` frames are deferred
-                    // until *after* log_replay below.  Replayed historical
-                    // events (display_ready / user_display_revoked from
-                    // earlier grant cycles) re-trigger `addDisplaySlot` on
-                    // the browser, which destroys the bootstrap slot and
-                    // creates a fresh one whose chip starts at `unknown`.
-                    // Sending the authority frame after replay guarantees
-                    // it lands on the *final* slot, so the chip never
-                    // stays at `unknown` for a late-connecting browser.
+                    //
+                    // Frame ordering: `display_ready` goes out now (so the
+                    // slot exists before any log replay happens); the
+                    // per-display `display_input_authority_state` frame is
+                    // deferred until *after* `log_replay` below. **#59**:
+                    // browser-side `addDisplaySlot` is now idempotent for
+                    // an existing live slot, so a replayed historical
+                    // `display_ready` no longer destroys the bootstrap
+                    // slot. The deferral here is therefore defense-in-
+                    // depth against message ordering and late-replay
+                    // state — for example a grant→revoke→grant cycle in
+                    // session.jsonl whose intermediate `user_display_revoked`
+                    // does tear the bootstrap slot down, after which the
+                    // replayed re-grant `display_ready` creates a fresh
+                    // slot that needs the authority frame to land on it
+                    // rather than on the destroyed predecessor. Sending
+                    // the authority frame after replay guarantees it lands
+                    // on the *final* slot in every replay shape.
                     let bootstrap_authority_snapshots: Vec<(u32, &'static str)> =
                         if let Some(ref sr) = session_registry {
                             let reg = sr.read().await;

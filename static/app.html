@@ -8511,9 +8511,30 @@ function addDisplaySlot(displayId, width, height) {
   displayId = Number(displayId);
   width = Number(width);
   height = Number(height);
-  // Remove stale slot if it exists (e.g. from a previous grant/revoke cycle)
+  // **#59**: idempotent re-entry. The server emits `display_ready`
+  // both on the bootstrap snapshot for currently-active displays
+  // (`web_gateway.rs` bootstrap path) and via `log_replay` of the
+  // historical `display_ready` from session.jsonl. Both arrive on the
+  // same WS connection, so this function gets called twice for one
+  // live grant. The slot's lifecycle is owned exclusively by:
+  //   - `user_display_revoked` (line 5408) → `removeDisplaySlot`
+  //   - explicit user close → `removeDisplaySlot`
+  //   - `display_capture_lost` (line 5417) → `slot.disconnect()`
+  // If a slot exists when a duplicate `display_ready` arrives, the
+  // live grant is still valid — return early. Destroying + recreating
+  // would spawn a second RTCPeerConnection, which the server treats
+  // as a second viewer (peers=2 transiently, second encoder spawn —
+  // observed as 2× `Using H264 (VideoToolbox)` per local viewer
+  // pre-fix).
+  //
+  // Resolution change: dimensions on `display_ready` come from the
+  // active grant; an X11/Wayland root resize during a live grant
+  // emits `display_metrics` (and a fresh capture pipeline), not
+  // `display_ready`. The "different dims for the same display_id"
+  // case therefore only fires on a real grant cycle, which the
+  // explicit revoke / capture-lost handlers above already serialize.
   if (displaySlots.has(displayId)) {
-    removeDisplaySlot(displayId);
+    return;
   }
   const slot = new DisplaySlot(displayId, width, height);
   displaySlots.set(displayId, slot);
