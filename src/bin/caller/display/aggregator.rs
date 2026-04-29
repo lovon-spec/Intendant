@@ -1149,8 +1149,11 @@ mod tests {
     fn active_with_peers_stays_active_no_action() {
         // "fresh session, first peer connects" lives here:
         // session starts in Active; peers stay >= 1; nothing fires.
-        // Confirms 4d.2 doesn't perturb the "all simulcast layers
-        // active by default" behavior the encoder pool starts in.
+        // Confirms 4d.2 doesn't perturb the encoder pool's
+        // 'all-layers-Active' starting state for the policy state
+        // machine. Whether layers actually emit frames is a separate
+        // question owned by the demand-bound (#48); this test
+        // exercises only the per-policy transition.
         let s = transition(AggregatorState::Active, 3, Instant::now());
         assert_eq!(s, AggregatorState::Active);
     }
@@ -2479,11 +2482,14 @@ mod tests {
         );
     }
 
-    /// **#48 acceptance #2**: local DisplaySlot demands `{f,h,q}`.
-    /// All three layers stay active (assuming no loss) — local
-    /// simulcast behavior unchanged.
+    /// **#48 acceptance #2**: an opt-in multi-RID peer (offer carries
+    /// `a=simulcast:recv f;h;q`) demands `{f,h,q}`. All three layers
+    /// stay active (assuming no loss). Default single-RID viewers
+    /// (local DisplaySlot post-#58 demands `f` only; federated
+    /// post-#48 demands `q` only) exercise the narrower-demand
+    /// scenarios in adjacent tests.
     #[test]
-    fn compose_demand_full_simulcast_keeps_all_layers() {
+    fn compose_demand_multi_rid_opt_in_keeps_all_layers() {
         let current = vp8_three_layer_set();
         let no_loss = full_three_layer_union();
         let no_pin: HashSet<SimulcastRid> = HashSet::new();

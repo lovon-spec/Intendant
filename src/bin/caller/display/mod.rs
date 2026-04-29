@@ -607,12 +607,25 @@ impl DisplaySession {
         });
         *self.capture_handle.lock().await = Some(capture_handle);
 
-        // Construct the shared encoder pool with VP8 simulcast layers
-        // (full / half / quarter, dropping any below MIN_LAYER_DIM).
-        // The pool spawns one VP8 encoder thread per surviving layer
-        // immediately; each thread blocks in `blocking_recv` until
-        // the pool-feed bridge below starts publishing I420 frames.
-        // Idle cost is negligible per layer.
+        // Construct the shared encoder pool with a VP8 simulcast-capable
+        // layer factory (full / half / quarter, dropping any below
+        // MIN_LAYER_DIM). The pool spawns one VP8 encoder thread per
+        // surviving layer immediately; each thread blocks in
+        // `blocking_recv` until the pool-feed bridge below starts
+        // publishing I420 frames. Idle cost is negligible per layer.
+        //
+        // Whether each layer actually emits frames is governed by the
+        // demand-bound (#48) and capacity policies (4d.3b). Default
+        // demand is shaped by the connecting peer:
+        //   - local DisplaySlot single-RID viewer (post-#58 default):
+        //     demands `f` only → upper layers stay paused;
+        //   - federated single-encoding/no-recv-simulcast viewer
+        //     (post-#48 floor pick): demands `q` only → upper layers
+        //     stay paused;
+        //   - opt-in multi-RID viewer (offer carries
+        //     `a=simulcast:recv f;h;q`): demands `{f,h,q}` → all
+        //     layers emit. This is the experimental adaptive-bandwidth
+        //     path, not the standard configuration.
         //
         // `get_or_init` swallows concurrent initializations cheaply;
         // in practice `start()` is called at most once per session.
@@ -621,26 +634,25 @@ impl DisplaySession {
                 width,
                 height,
                 fps,
-                // Phase 4b: VP8 simulcast (full / half / quarter).
-                // The factory receives the (possibly resized) source
-                // dims and re-derives the canonical layout from them
-                // — so a runtime resize regenerates the layer set at
-                // the new dims rather than rescaling (and accumulating
-                // rounding drift on) the previous epoch's handles.
-                // This is the contract from 4a-fix-#3: every
-                // construction site (initial spawn AND on_resize) goes
-                // through `vp8_simulcast`'s `normalize_layer_dims`
-                // filter, so resize-down dropping the quarter layer
-                // and resize-up restoring it both work cleanly.
+                // VP8 layer factory (up to full / half / quarter). The
+                // factory receives the (possibly resized) source dims
+                // and re-derives the layout from them — so a runtime
+                // resize regenerates the layer set at the new dims
+                // rather than rescaling (and accumulating rounding
+                // drift on) the previous epoch's handles. This is the
+                // contract from 4a-fix-#3: every construction site
+                // (initial spawn AND on_resize) goes through
+                // `vp8_simulcast`'s `normalize_layer_dims` filter, so
+                // resize-down dropping the quarter layer and resize-up
+                // restoring it both work cleanly.
                 //
-                // Phase 4c lights up multi-RID simulcast end-to-end:
-                // the pool produces `vp8_simulcast`'s 3 layers
-                // simultaneously, the answer SDP carries
-                // `a=simulcast:send f;h;q` + per-rid lines, and the
-                // multi-forwarder intake feeds each rid's frames to
-                // the driver's per-rid SSRC packetizer. Phase 4d
-                // (TWCC-driven layer pick) and 4e (per-layer PLI)
-                // build on top of this baseline.
+                // The multi-RID end-to-end machinery (answer SDP
+                // carrying `a=simulcast:send f;h;q` + per-rid lines,
+                // multi-forwarder intake feeding each rid's frames to
+                // a per-rid SSRC packetizer, TWCC-driven per-layer
+                // pick) lights up only when a peer offers the matching
+                // `a=simulcast:recv f;h;q` hint. The default DisplaySlot
+                // and federated paths leave it dormant.
                 move |w, h| encode::pool::LayerSpec::vp8_simulcast(w, h, fps),
                 // Pool encoders feed the same metrics counters as the
                 // capture bridge so DisplayMetricsSnapshot continues to

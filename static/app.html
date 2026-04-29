@@ -7902,24 +7902,26 @@ class DisplaySlot {
 
     // Create offer and send to server.
     //
-    // Phase 4c follow-up: inject `a=rid:* recv` + `a=simulcast:recv`
-    // into the m=video section before setLocalDescription so the
-    // server's answer can carry a multi-encoding sendonly track
-    // (VP8 simulcast f;h;q). Munge BEFORE setLocalDescription so the
-    // localDescription matches what's sent on the wire — server-side
-    // SDP-validation tests assume the offer/local-description
-    // contains the simulcast hint.
+    // Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into
+    // the m=video section before setLocalDescription. `<rids>` is
+    // `DISPLAY_SIMULCAST_RIDS` (default `['f']` — single-RID receive
+    // post-#58; opt-in `['f','h','q']` for the experimental
+    // multi-encoding adaptive-bandwidth path). Munge BEFORE
+    // setLocalDescription so the localDescription matches what's sent
+    // on the wire — server-side SDP-validation tests parse the
+    // received offer/local-description and assume the recv-RID list
+    // matches the configured constant.
     this.pc.createOffer().then(offer => {
       const munged = {
         type: offer.type,
         sdp: injectRecvSimulcastIntoVideoOffer(offer.sdp, DISPLAY_SIMULCAST_RIDS),
       };
-      // Diagnostic: confirm VP8 is the first video codec in the
-      // emitted offer. After setCodecPreferences above, the m=video
-      // PT list and the corresponding rtpmap order should put VP8
-      // before H.264. If this log shows H.264 first, the codec
-      // preference path didn't take and we'll need the SDP-munging
-      // compatibility shim.
+      // Diagnostic: log the first video codec in the emitted offer.
+      // Codec order is intentionally left to the browser — WKWebView
+      // typically negotiates H.264 (and the server then spawns a
+      // hardware-accelerated VideoToolbox encoder), Chrome/Chromium
+      // typically negotiates VP8. Any codec the browser put first is
+      // valid; this log just makes the negotiated outcome visible.
       const firstCodec = (() => {
         const lines = munged.sdp.split(/\r?\n/);
         const mLine = lines.find(l => l.startsWith('m=video'));
@@ -7951,12 +7953,14 @@ class DisplaySlot {
   handleAnswer(sdp) {
     if (!this.pc) return;
     this.statusEl.textContent = 'Answer received, applying...';
-    // Diagnostic: confirm the negotiated codec + simulcast direction.
-    // After setCodecPreferences pushes VP8 to the front of the offer,
-    // the answer's m=video PT must map to VP8 and the answer must
-    // carry `a=simulcast:send f;h;q` (multi-RID). H.264 negotiated
-    // here means setCodecPreferences didn't take and we need the SDP
-    // munge fallback.
+    // Diagnostic: log the negotiated codec + simulcast direction.
+    // With single-RID receive (post-#58 default), the answer is
+    // plain sendonly and `(no a=simulcast)` is expected. WKWebView
+    // typically lands on H.264 (hardware VideoToolbox on macOS);
+    // Chrome typically lands on VP8 (single software encoder). An
+    // `a=simulcast:send f;h;q` line here is the signature of the
+    // opt-in multi-RID path — only expected when
+    // `DISPLAY_SIMULCAST_RIDS` has been switched to `['f','h','q']`.
     {
       const lines = sdp.split(/\r?\n/);
       const mLine = lines.find(l => l.startsWith('m=video'));
@@ -11420,32 +11424,34 @@ function isLoopbackUrl(url) {
   }
 }
 
-// VP8 simulcast RIDs the server-side encoder pool produces, in
-// preference order (full → half → quarter). Browser-side Offer SDPs
-// must advertise these as `a=rid:<rid> recv` + `a=simulcast:recv f;h;q`
-// so the server's answer can carry a multi-encoding sendonly track —
-// rtc 0.9 (and previously str0m) only emits `a=simulcast:send` in the
-// answer when the offer side has declared the matching `recv`
-// counterpart. Without the offer hint the negotiation drops back to a
-// single VP8 encoding and the encoder pool's lower simulcast layers
-// are produced-but-never-sent.
+// Configured receive-RID list for browser-side DisplaySlot Offer SDPs.
+// The server-side encoder pool advertises `a=rid:<rid> recv` +
+// `a=simulcast:recv <rids>` here; the server's answer then carries
+// `a=simulcast:send <rids>` (one or many). RIDs are part of the wire
+// contract — values here MUST be drawn from the set
+// `LayerSpec::vp8_simulcast` produces server-side
+// (display/encode/pool.rs); drift between this constant and the
+// encoder pool means the answer SDP advertises RIDs the browser
+// doesn't recognize and the track never wires up.
 //
-// MUST stay in sync with `LayerSpec::vp8_simulcast` server-side
-// (display/encode/pool.rs) — RIDs are part of the wire contract,
-// drift here vs the encoder pool means the answer SDP advertises
-// RIDs the browser doesn't recognize and the track never wires up.
-// **#58**: single-RID receive. Pre-#58 this was `['f', 'h', 'q']` —
-// three-layer simulcast receive — which forced the encoder pool to
-// run all three software VP8 encoders for any local DisplaySlot
-// viewer. Demanded-bound from #48 correctly registered that demand
-// and kept all three running, but with one local viewer the cost is
-// 245 %+ CPU on a UTM macOS guest (three full-resolution software
-// VP8 streams). Single-RID receive collapses this to one encoder
-// (hardware H.264 on macOS via VideoToolbox when WKWebView
-// negotiates H.264, or one software VP8 stream when the browser
-// prefers VP8). Multi-encoding receive is reintroducible behind a
-// per-deployment policy switch when adaptive bandwidth across
-// multiple viewers becomes a real concern again.
+// **Default (post-#58): single-RID `['f']`.** WKWebView typically
+// negotiates H.264 → hardware VideoToolbox encoder on macOS; Chrome
+// typically negotiates VP8 → one software encoder. The answer is
+// plain sendonly with no `a=simulcast:send` line. CPU stays low
+// (one encoder, hardware where available) and the path is robust
+// across the browser fleet. This is the standard configuration for
+// Intendant's remote-control / agentic computer-use workload, where
+// crisp, high-resolution, low-latency pixels matter more than
+// multi-viewer adaptive bandwidth.
+//
+// **Experimental / opt-in: multi-RID `['f','h','q']`.** Lights up
+// the encoder pool's three-layer adaptive-bandwidth path — three
+// software VP8 encoders running concurrently, with TWCC-driven
+// per-peer layer selection. Worth it only when multiple viewers
+// with diverse bandwidth share the same display and the per-deployment
+// CPU budget can afford parallel encoders (pre-#58 this was the
+// default; on a UTM macOS guest one local viewer cost 245 %+ CPU).
+// Switch by editing this constant; no other code change required.
 const DISPLAY_SIMULCAST_RIDS = ['f'];
 
 // Inject `a=rid:<rid> recv` lines + `a=simulcast:recv <rids>` into

@@ -1,15 +1,15 @@
 # Local DisplaySlot smoke recipe
 
 Canonical end-to-end smoke for the local display path: capture → VP8
-simulcast → WebRTC → browser, plus the per-display input-authority chip.
-Run this after any change to `src/bin/caller/display/`,
-`src/bin/caller/web_gateway.rs`'s display/authority code, or
-`static/app.html`'s `DisplaySlot` / `pendingAuthorityStates` /
-`set_on_display_input_authority_change`.
+or H.264 (single-RID by default) → WebRTC → browser, plus the
+per-display input-authority chip. Run this after any change to
+`src/bin/caller/display/`, `src/bin/caller/web_gateway.rs`'s
+display/authority code, or `static/app.html`'s `DisplaySlot` /
+`pendingAuthorityStates` / `set_on_display_input_authority_change`.
 
 This is the local path only. Federated display (peer-to-peer over
-`PeerOp::WebRtcSignal`) is out of scope — it has its own known-broken
-behavior tracked under task #46.
+`PeerOp::WebRtcSignal`) is out of scope here — it has its own
+operational path with separate smoke coverage.
 
 **Pass = every signal in §3 matches verbatim. Anything else is a
 regression in 5a.1 / 5c / 5c.1 / 5c.2.**
@@ -160,20 +160,23 @@ grep '\[display/metrics\]' ~/.intendant/app-backend.log | tail -5
 Expect:
 
 ```
-[display/metrics] id=0 capture=N.Nfps encode=~3×capture drops=cap:0/enc:0/peer:0 peers=2 latency_avg=~20ms res=WxH
+[display/metrics] id=0 capture=N.Nfps encode≈capture drops=cap:0/enc:0/peer:0 peers=2 latency_avg=~20ms res=WxH
 ```
 
 - `peers=2` while both browsers viewing; `peers=1` after one closes.
-- `encode ≈ 3× capture` — simulcast emits a frame per layer per capture
-  tick. Off by a small amount with throttling; off by an integer factor
-  → simulcast layer count drift.
+- `encode ≈ capture` — single-RID single-encoding (post-#58 default).
+  An integer factor (e.g. `encode ≈ 3 × capture`) on this path is a
+  regression to the multi-encoding default, OR — if intentional — the
+  signature of an opt-in multi-RID configuration that should be called
+  out explicitly by the change adopting it.
 - `drops=peer:0` is the only drop counter that matters here (`enc:N`
   during burst is fine; `peer:N` is back-pressure).
 - `latency_avg ≤ 50ms` for an idle desktop on macOS / VideoToolbox.
 
 ## 4. Out of scope
 
-- **Federated display** (peer-to-peer): broken, see task #46.
+- **Federated display** (peer-to-peer): separate operational path
+  with its own smoke coverage.
 - **Loss shaping / TWCC capacity adaptation**: covered by separate
   baseline tasks #50 (4d.3a) and #48 (4d.3b). Re-running those needs
   netem on Linux or Network Link Conditioner on macOS, deliberately

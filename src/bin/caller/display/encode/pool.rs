@@ -42,14 +42,25 @@
 //!
 //! Each [`EncoderPool`] holds two kinds of encoders:
 //!
-//! - **Always-on** (constructed at pool creation): VP8 simulcast layers,
-//!   typically three at full / half / quarter resolution. VP8 is the
-//!   universal codec — Safari, Firefox, Chrome, Edge all decode it
-//!   reliably and it has long history of working well for screen
-//!   content. Always-on means VP8 frames are produced unconditionally
-//!   so that any browser can subscribe instantly without waiting for
-//!   encoder spin-up. The cost is small; one VP8 encoder at idle is
-//!   ~5% of a core.
+//! - **Always-on** (constructed at pool creation): VP8 layers from
+//!   `LayerSpec::vp8_simulcast` (up to three at full / half / quarter).
+//!   VP8 is the universal codec — Safari, Firefox, Chrome, Edge all
+//!   decode it reliably and it has a long history of working well for
+//!   screen content. The layers exist as a *capability*; which ones
+//!   actually emit frames is governed by the demand-bound (#48) and
+//!   capacity policies. By default:
+//!     - a local DisplaySlot viewer (single-RID, post-#58) demands `f`
+//!       only — only the full layer emits;
+//!     - a federated viewer (single-encoding floor pick, post-#48)
+//!       demands `q` only — only the quarter layer emits;
+//!     - an opt-in multi-RID viewer (offer carries
+//!       `a=simulcast:recv f;h;q`) demands all three — the experimental
+//!       adaptive-bandwidth path that fans out f / h / q simultaneously.
+//!   "Always-on" thus means the encoder *threads* are spawned eagerly
+//!   so any browser can subscribe instantly without waiting for spin-up;
+//!   it does NOT mean every layer is producing frames. Idle cost per
+//!   spawned-but-paused VP8 encoder is negligible (~5 % of a core for
+//!   the active layer; paused threads block in `blocking_recv`).
 //! - **On-demand** (spawned when first matching peer joins, torn down
 //!   when last leaves): H.264, AV1, VP9. These exist for browsers that
 //!   prefer or only support a non-VP8 codec — Safari shipped H.264 long
