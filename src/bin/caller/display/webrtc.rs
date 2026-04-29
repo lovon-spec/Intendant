@@ -699,6 +699,23 @@ pub struct WebRtcPeer {
     /// sustained loss. Per-layer adaptation is a 4d.3c concern,
     /// dependent on receivers that emit per-RID TLC.
     twcc_health_rx: watch::Receiver<Option<crate::display::twcc_tap::TwccHealth>>,
+    /// **#57**: the negotiated active RID set for this peer, frozen at
+    /// construction time. The layer-policy coordinator
+    /// ([`crate::display::aggregator::spawn_layer_policy_coordinator`])
+    /// reads this each tick to compute the per-display "pinned"
+    /// layer set: a peer with `active_rids.len() == 1` MUST keep its
+    /// only RID active or it gets no frames at all (its WebRTC track
+    /// only declares one encoding; pausing that layer in the encoder
+    /// pool starves the peer rather than degrading it). Multi-RID
+    /// peers (`len() > 1`) don't pin — the policy is free to pause
+    /// upper layers because they have the floor as fallback.
+    ///
+    /// Stable for the peer's lifetime: WebRTC re-negotiation (mid-call
+    /// SDP renegotiate) would change this, but the pool's
+    /// peer-rebuild path drops + recreates the WebRtcPeer, so a fresh
+    /// `active_rids` snapshot is always in lockstep with the
+    /// negotiated answer SDP.
+    active_rids: Vec<SimulcastRid>,
     shutdown: CancellationToken,
 }
 
@@ -867,6 +884,19 @@ impl WebRtcPeer {
         &self,
     ) -> HashMap<SimulcastRid, PeerLayerHealth> {
         self.remote_inbound_health_rx.borrow().clone()
+    }
+
+    /// **#57**: this peer's negotiated active RID set, frozen at
+    /// construction. The layer-policy coordinator
+    /// ([`crate::display::aggregator::spawn_layer_policy_coordinator`])
+    /// reads this each tick to compute the per-display "pinned" layer
+    /// set: a peer with `active_rids().len() == 1` MUST keep its only
+    /// RID active or it gets no frames at all (its WebRTC track only
+    /// declares one encoding; pausing that layer in the encoder pool
+    /// starves the peer rather than degrading it). See the
+    /// `active_rids` field doc on [`Self`] for the full rationale.
+    pub fn active_rids(&self) -> &[SimulcastRid] {
+        &self.active_rids
     }
 
     /// **Phase 4d.3b**: subscribe to this peer's aggregate TWCC
@@ -1712,6 +1742,7 @@ impl WebRtcPeer {
                 observed_send_bitrate_rx,
                 remote_inbound_health_rx,
                 twcc_health_rx,
+                active_rids: active_rids.to_vec(),
                 shutdown,
             },
             encoded_frame_tx,

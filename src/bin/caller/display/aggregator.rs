@@ -780,20 +780,57 @@ pub fn diff_wanted_aggregate(
 /// when it has no peers to evaluate (no restriction), so the
 /// intersection during a no-peers tick reduces to whatever the
 /// presence policy decided.
+///
+/// **#57 — `pinned_layers` overrides intersection narrowing.** Each
+/// peer with exactly one negotiated RID
+/// ([`crate::display::webrtc::WebRtcPeer::active_rids`]) contributes
+/// that RID to `pinned_layers`. After computing the regular
+/// presence × twcc × rr intersection, those pinned RIDs are
+/// unconditionally unioned into the effective wanted set (still
+/// bounded by `current_rids` — pinning a RID the pool isn't
+/// producing right now is silently dropped). Rationale: a peer that
+/// negotiated a single RID can't fall back to the floor — its
+/// WebRTC track only has one encoding, so pausing that layer
+/// starves the peer rather than degrading it. The pin is bounded
+/// per-peer (a multi-RID peer pins nothing) and per-tick (joins +
+/// disconnects re-derive the set), so a single-RID peer
+/// disconnecting immediately removes its pin and restores the
+/// policy's full pause authority. `presence_active = false` still
+/// short-circuits to empty — the pin only overrides loss-driven
+/// pauses, not the zero-peers idle case.
+///
+/// **The pin is intentionally narrow.** It does NOT override
+/// `presence_active=false` (idle-pause still wins; no peers means
+/// no pin anyway), and it does NOT introduce layers the pool isn't
+/// producing (the post-resize bounding by `current_rids` is the
+/// safety net). It only protects against *loss-driven* pauses
+/// starving a peer with no fallback — the exact case that
+/// triggered #46's federated post-fix freeze.
 pub fn compose_effective_wanted(
     presence_active: bool,
     twcc_union: &HashSet<SimulcastRid>,
     rr_union: &HashSet<SimulcastRid>,
     current_rids: &[SimulcastRid],
+    pinned_layers: &HashSet<SimulcastRid>,
 ) -> HashSet<SimulcastRid> {
     if !presence_active {
         return HashSet::new();
     }
-    current_rids
+    let mut effective: HashSet<SimulcastRid> = current_rids
         .iter()
         .filter(|rid| twcc_union.contains(*rid) && rr_union.contains(*rid))
         .cloned()
-        .collect()
+        .collect();
+    // #57: union in pinned RIDs (single-negotiated-RID peers must
+    // keep their layer active regardless of TWCC/RR loss). Bounded
+    // by current_rids so a stale pin from a since-resized pool
+    // never resurrects a vanished layer.
+    for rid in pinned_layers {
+        if current_rids.contains(rid) {
+            effective.insert(rid.clone());
+        }
+    }
+    effective
 }
 
 /// Spawn the single layer-policy coordinator for one display.
@@ -921,6 +958,25 @@ pub fn spawn_layer_policy_coordinator(
 
                     let peer_ids: Vec<PeerId> =
                         current_peers.keys().cloned().collect();
+                    // #57: per-tick pinned-layer set. Each peer with
+                    // exactly one negotiated RID contributes that RID
+                    // to the pin set, which `compose_effective_wanted`
+                    // unions into the result regardless of TWCC/RR
+                    // loss. Multi-RID peers (`len() > 1`) don't pin —
+                    // they have the floor as fallback. Computed before
+                    // `drop(current_peers)` so we don't re-acquire the
+                    // peers lock just to read this.
+                    let pinned_layers: HashSet<SimulcastRid> = current_peers
+                        .values()
+                        .filter_map(|peer| {
+                            let rids = peer.active_rids();
+                            if rids.len() == 1 {
+                                Some(rids[0].clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     drop(current_peers);
 
                     // ---- Refresh current_rids; derive floor + upper ----
@@ -1029,6 +1085,7 @@ pub fn spawn_layer_policy_coordinator(
                         &twcc_union,
                         &rr_union,
                         &current_rids,
+                        &pinned_layers,
                     );
 
                     let actual_active: HashSet<SimulcastRid> = current_rids
@@ -2026,7 +2083,7 @@ mod tests {
         // Wanted, so peer wants all layers; union is the full set.
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
 
         assert!(
             !effective.contains(&SimulcastRid::full()),
@@ -2051,7 +2108,7 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(false, &twcc_union, &rr_union, &current);
+        let effective = compose_effective_wanted(false, &twcc_union, &rr_union, &current, &HashSet::new());
 
         assert_eq!(
             effective,
@@ -2078,7 +2135,7 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
 
         assert_eq!(
             effective,
@@ -2116,7 +2173,7 @@ mod tests {
                 .collect();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
 
         assert!(
             !effective.contains(&SimulcastRid::full()),
@@ -2148,7 +2205,7 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
 
         assert!(
             !effective.contains(&SimulcastRid::quarter()),
@@ -2175,7 +2232,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current);
+        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new());
 
         assert!(!effective.contains(&SimulcastRid::half()));
         assert!(effective.contains(&SimulcastRid::full()));
@@ -2196,12 +2253,173 @@ mod tests {
         let full = full_three_layer_union();
 
         assert_eq!(
-            compose_effective_wanted(true, &empty, &full, &current),
+            compose_effective_wanted(true, &empty, &full, &current, &HashSet::new()),
             HashSet::new(),
         );
         assert_eq!(
-            compose_effective_wanted(true, &full, &empty, &current),
+            compose_effective_wanted(true, &full, &empty, &current, &HashSet::new()),
             HashSet::new(),
+        );
+    }
+
+    // ----- #57: pinned-layer regression tests --------------------------------
+
+    /// Acceptance #57.1: a single-RID `[f]` peer pinning `f` keeps
+    /// `f` in the effective wanted set even when the TWCC policy
+    /// has voted to drop it under high loss.
+    ///
+    /// Setup: TWCC union excludes `f` (only `h;q` survive, the
+    /// classic post-cascade state); RR union is full (no per-RID
+    /// signal). Without the pin the intersection drops `f` →
+    /// `[h, q]` → `PauseLayer(f)` would fire. With the pin, `f`
+    /// is unioned back in.
+    #[test]
+    fn compose_pinned_full_overrides_twcc_pause() {
+        let current = vp8_three_layer_set();
+        let twcc_union: HashSet<SimulcastRid> =
+            [SimulcastRid::half(), SimulcastRid::quarter()]
+                .into_iter()
+                .collect();
+        let rr_union = full_three_layer_union();
+        let pinned: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::full()).collect();
+
+        let effective = compose_effective_wanted(
+            true, &twcc_union, &rr_union, &current, &pinned,
+        );
+        assert!(
+            effective.contains(&SimulcastRid::full()),
+            "pinned `f` must survive TWCC pause vote, got {effective:?}",
+        );
+        assert!(effective.contains(&SimulcastRid::half()));
+        assert!(effective.contains(&SimulcastRid::quarter()));
+    }
+
+    /// Acceptance #57.2: a multi-RID local peer (no entries in
+    /// the pin set) still allows cascade pause `f` then `h`. This
+    /// is the "no regression for the common local DisplaySlot
+    /// path" check — the pin set is empty when no single-RID
+    /// peers exist, so the standard intersection result holds
+    /// verbatim.
+    #[test]
+    fn compose_no_pin_allows_cascade_pause() {
+        let current = vp8_three_layer_set();
+        // TWCC has cascaded `f`, then `h` — only floor `q` survives.
+        let twcc_union: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::quarter()).collect();
+        let rr_union = full_three_layer_union();
+        let no_pin: HashSet<SimulcastRid> = HashSet::new();
+
+        let effective = compose_effective_wanted(
+            true, &twcc_union, &rr_union, &current, &no_pin,
+        );
+        let expected: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::quarter()).collect();
+        assert_eq!(
+            effective, expected,
+            "without pin, cascaded TWCC pauses both `f` and `h`",
+        );
+    }
+
+    /// Acceptance #57.3: when a single-RID peer disconnects,
+    /// the pin is gone (the coordinator re-derives the pin set
+    /// each tick from `current_peers.values()`), and the policy
+    /// can pause the previously-pinned layer normally.
+    ///
+    /// Tick 1: pin = {f}, TWCC says drop f → effective contains f
+    /// (from #57.1). Tick 2 (peer disconnected): pin = {}, same
+    /// TWCC vote → effective drops f. The compose function is
+    /// pure — this test just confirms the empty-pin case behaves
+    /// like the pre-#57 baseline.
+    #[test]
+    fn compose_pin_removed_on_disconnect_restores_pause_authority() {
+        let current = vp8_three_layer_set();
+        let twcc_union: HashSet<SimulcastRid> =
+            [SimulcastRid::half(), SimulcastRid::quarter()]
+                .into_iter()
+                .collect();
+        let rr_union = full_three_layer_union();
+
+        // While pinned: f survives TWCC drop.
+        let with_pin: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::full()).collect();
+        let pinned_effective = compose_effective_wanted(
+            true, &twcc_union, &rr_union, &current, &with_pin,
+        );
+        assert!(pinned_effective.contains(&SimulcastRid::full()));
+
+        // After the peer disconnects, pin set is empty. Same
+        // TWCC vote → f drops normally. This is identical to the
+        // baseline `compose_twcc_pauses_rr_no_signal_full_stays_paused`
+        // expectation; restated here to make the disconnect
+        // semantic explicit.
+        let no_pin: HashSet<SimulcastRid> = HashSet::new();
+        let unpinned_effective = compose_effective_wanted(
+            true, &twcc_union, &rr_union, &current, &no_pin,
+        );
+        assert!(
+            !unpinned_effective.contains(&SimulcastRid::full()),
+            "after pin removal, TWCC pause authority restored — \
+             `f` must drop, got {unpinned_effective:?}",
+        );
+        assert_eq!(
+            unpinned_effective,
+            [SimulcastRid::half(), SimulcastRid::quarter()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        );
+    }
+
+    /// Defensive: pinning a RID the pool isn't producing right now
+    /// (e.g. stale pin from before a `pool.on_resize` shrunk the
+    /// layer set) is silently bounded by `current_rids` — it does
+    /// not resurrect a vanished layer in the wanted set.
+    #[test]
+    fn compose_pin_bounded_by_current_rids() {
+        // current_rids = [h, q] only (full removed by hypothetical
+        // resize). Pin still says {f}. Should NOT include f.
+        let current = vec![SimulcastRid::half(), SimulcastRid::quarter()];
+        let twcc_union = full_three_layer_union();
+        let rr_union = full_three_layer_union();
+        let stale_pin: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::full()).collect();
+
+        let effective = compose_effective_wanted(
+            true, &twcc_union, &rr_union, &current, &stale_pin,
+        );
+        assert!(
+            !effective.contains(&SimulcastRid::full()),
+            "stale pin must be bounded by current_rids, got {effective:?}",
+        );
+        assert_eq!(
+            effective,
+            [SimulcastRid::half(), SimulcastRid::quarter()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        );
+    }
+
+    /// Defensive: presence_active=false short-circuits to empty,
+    /// pin set notwithstanding. Idle pause is the strongest
+    /// signal in the composer — a pinned single-RID peer that
+    /// disconnects cleanly enters the pin removal path (above);
+    /// the idle short-circuit only fires after every peer is
+    /// gone, so there's no real conflict, but the contract
+    /// should be explicit.
+    #[test]
+    fn compose_idle_pause_overrides_even_pinned_layer() {
+        let current = vp8_three_layer_set();
+        let full_union = full_three_layer_union();
+        let pinned: HashSet<SimulcastRid> =
+            std::iter::once(SimulcastRid::full()).collect();
+
+        let effective = compose_effective_wanted(
+            false, &full_union, &full_union, &current, &pinned,
+        );
+        assert!(
+            effective.is_empty(),
+            "presence_active=false must short-circuit even with pin, \
+             got {effective:?}",
         );
     }
 
