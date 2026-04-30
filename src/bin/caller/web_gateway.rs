@@ -47,10 +47,26 @@ struct ActivePresence {
 ///   data channel.
 ///
 /// - **`FederatedWebRtc`**: holder is a federated `PeerDisplayConnection`
-///   on a peer primary. Identified by `(peer_id, session_id)` —
-///   `peer_id` scopes to the requesting primary (federation `PeerId`,
-///   e.g. `intendant:nicks-mac`); `session_id` distinguishes multiple
-///   `PeerDisplayConnection` tabs from the same primary.
+///   on a peer primary. Identified by `(federation_connection_id,
+///   session_id)`. `federation_connection_id` is the gateway-WS
+///   `connection_id` of the federation transport (one per primary's
+///   federation client); `session_id` distinguishes multiple
+///   `PeerDisplayConnection` tabs from the same primary. Field name
+///   spelled out so it's not confused with the local-browser
+///   `LocalWs::connection_id`.
+///
+///   The design doc originally specified `peer_id: PeerId`, but the
+///   stable federation `PeerId` isn't carried in the
+///   `ControlMsg::WebRtcSignal` wire format — it's implicit in which
+///   `/ws` connection delivered the message. F-1.3b uses the federation
+///   WS `connection_id` as the holder identity instead; it's
+///   authenticated by the federation WS connection, unique per
+///   primary's federation transport, and already covered by WS-close
+///   cleanup. `connection_id` changes across federation WS reconnect
+///   (a stable `PeerId` would survive); WS-close cleanup releases any
+///   held authority on each disconnect, so the trade-off is a UX
+///   nicety, not correctness. See
+///   `docs/design-federated-input-authority.md` for the full note.
 ///
 /// The map is `HashMap<u32, DisplayInputHolder>` — no `Option`, no
 /// wrapper struct. Entry absence = unclaimed; that's the pre-phase-5
@@ -70,7 +86,7 @@ enum DisplayInputHolder {
         direct_tx: mpsc::UnboundedSender<String>,
     },
     FederatedWebRtc {
-        peer_id: crate::peer::PeerId,
+        federation_connection_id: String,
         session_id: String,
     },
 }
@@ -89,17 +105,19 @@ impl DisplayInputHolder {
     }
 
     /// True iff this holder is `FederatedWebRtc` with the given
-    /// `(peer_id, session_id)` pair. Used by the federated input gate
-    /// (in F-2) and the federated close-cleanup path.
+    /// `(federation_connection_id, session_id)` pair. Used by the
+    /// federated input gate (in F-2) and the federated close-cleanup
+    /// path.
     fn matches_federated(
         &self,
-        peer_id: &crate::peer::PeerId,
+        federation_connection_id: &str,
         session_id: &str,
     ) -> bool {
         match self {
-            Self::FederatedWebRtc { peer_id: p, session_id: s } => {
-                p == peer_id && s == session_id
-            }
+            Self::FederatedWebRtc {
+                federation_connection_id: c,
+                session_id: s,
+            } => c == federation_connection_id && s == session_id,
             Self::LocalWs { .. } => false,
         }
     }
@@ -123,9 +141,9 @@ impl DisplayInputHolder {
                 Self::LocalWs { connection_id: b, .. },
             ) => a == b,
             (
-                Self::FederatedWebRtc { peer_id: pa, session_id: sa },
-                Self::FederatedWebRtc { peer_id: pb, session_id: sb },
-            ) => pa == pb && sa == sb,
+                Self::FederatedWebRtc { federation_connection_id: ca, session_id: sa },
+                Self::FederatedWebRtc { federation_connection_id: cb, session_id: sb },
+            ) => ca == cb && sa == sb,
             _ => false,
         }
     }

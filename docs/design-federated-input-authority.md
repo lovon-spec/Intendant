@@ -126,7 +126,7 @@ holder-identity enum with provenance:
 ```rust
 enum DisplayInputHolder {
     LocalWs { connection_id: String },
-    FederatedWebRtc { peer_id: PeerId, session_id: String },
+    FederatedWebRtc { federation_connection_id: String, session_id: String },
 }
 
 struct DisplayInputAuthority {
@@ -137,16 +137,36 @@ struct DisplayInputAuthority {
 - `LocalWs::connection_id` — the WebSocket connection id from the
   local gateway, exactly what the existing 5a/5c registry stores
   today.
-- `FederatedWebRtc::peer_id` — the federation `PeerId` of the
-  requesting primary (e.g. `intendant:nicks-mac`). Provides
-  multi-primary scoping for future per-primary policies.
+- `FederatedWebRtc::federation_connection_id` — the gateway-WS
+  connection id of the federation transport (one per primary's
+  federation client). See the F-1 implementation note below on why
+  this is used instead of a stable federation `PeerId`.
 - `FederatedWebRtc::session_id` — the federated `PeerDisplayConnection`
   session id, which uniquely identifies one browser tab's view
   (multiple tabs from the same primary get distinct session ids).
 
-Combined `(peer_id, session_id)` uniquely identifies one federated
-browser holder. **Provenance is explicit, not inferred from string
-shape.**
+Combined `(federation_connection_id, session_id)` uniquely identifies
+one federated browser holder. **Provenance is explicit, not inferred
+from string shape.** Field name is deliberately spelled out as
+`federation_connection_id` so it is not confused with the local-browser
+connection id stored in `LocalWs::connection_id`.
+
+> **F-1 implementation note**: the design originally specified
+> `peer_id: PeerId` (the federation `PeerId` of the requesting
+> primary, e.g. `intendant:nicks-mac`), but the stable federation
+> `PeerId` is not currently carried in the `ControlMsg::WebRtcSignal`
+> wire format — it is implicit in which `/ws` connection delivered
+> the message. F-1.3b uses the federation WS `connection_id` as the
+> holder identity instead; it is authenticated by the federation WS
+> connection, unique per primary's federation transport, and already
+> covered by WS-close cleanup. The trade-off is that
+> `connection_id` changes across federation WS reconnect (a stable
+> `PeerId` would survive); WS-close cleanup releases any held
+> authority on each disconnect, so this is a UX nicety, not a
+> correctness issue. A future slice could add a federation hello
+> protocol that carries the primary's `PeerId` over the wire and
+> switch this identity to it without changing the surrounding
+> arbitration code.
 
 **Absence = unclaimed.** The map does NOT carry an `Option`. A
 display with no entry in `by_display` is unclaimed; release is
@@ -163,7 +183,7 @@ The federated input handler — same code path that currently calls
 `build_federated_input_authorizer() → || false` — instead consults the
 registry:
 
-> Holder for `display_id` is `Some(DisplayInputHolder::FederatedWebRtc { peer_id, session_id })`
+> Holder for `display_id` is `Some(DisplayInputHolder::FederatedWebRtc { federation_connection_id, session_id })`
 > matching this WebRtcPeer's identity?
 
 Match → inject. No match → drop silently. Same shape as the local path
@@ -210,7 +230,7 @@ iterates local WS subscribers for a display) extends to also iterate
 federated WebRtcPeers subscribed to that display, calling
 `peer.send_authority_state(display_id, state)` on each one's
 authority data channel. State personalization: each WebRtcPeer's
-broadcast computes `state` from "is this peer's `(peer_id, session_id)`
+broadcast computes `state` from "is this peer's `(federation_connection_id, session_id)`
 the current holder?" → `you` if yes, `other` if someone else holds,
 `unclaimed` if nobody holds.
 
@@ -236,7 +256,7 @@ arbitration treats `LocalWs` and `FederatedWebRtc` holders identically:
   distinct session ids, only one holds at a time.
 - **Two federated browsers from different primaries** → peer doesn't
   conceptualize "primary" — sees two distinct `FederatedWebRtc`
-  holders with different `peer_id` values. Same arbitration.
+  holders with different `federation_connection_id` values. Same arbitration.
 
 ## Browser UX on the federated peer-display panel
 
@@ -265,10 +285,10 @@ not surfaced in the UI for slice F-1.
 
 Replace `build_federated_input_authorizer() → || false` with a real
 predicate that consults the registry. The federated input handler
-knows its requesting WebRtcPeer's `(peer_id, session_id)` and asks
+knows its requesting WebRtcPeer's `(federation_connection_id, session_id)` and asks
 the registry:
 
-> `by_display.get(&display_id) == Some(DisplayInputHolder::FederatedWebRtc { peer_id: req_peer_id, session_id: req_session_id })`?
+> `by_display.get(&display_id) == Some(DisplayInputHolder::FederatedWebRtc { federation_connection_id: req_conn, session_id: req_session_id })`?
 
 Match → inject. No match → drop silently (no error response — input
 is fire-and-forget). The browser's "if state != 'you' don't send"
@@ -278,7 +298,7 @@ check is UX courtesy only.
 
 **Unit (peer-side authority registry):**
 
-- `DisplayInputHolder::FederatedWebRtc { peer_id, session_id }`
+- `DisplayInputHolder::FederatedWebRtc { federation_connection_id, session_id }`
   arbitrates same as `LocalWs`.
 - Take/release/handover cross-provenance (Local takes from Federated,
   Federated takes from Local).
@@ -290,10 +310,10 @@ check is UX courtesy only.
 
 - Federated input dropped when registry has no entry for `display_id`.
 - Federated input dropped when holder is wrong
-  `FederatedWebRtc { peer_id, session_id }`.
+  `FederatedWebRtc { federation_connection_id, session_id }`.
 - Federated input dropped when holder is `LocalWs`.
 - Federated input accepted when holder matches request's
-  `(peer_id, session_id)`.
+  `(federation_connection_id, session_id)`.
 
 **Integration:**
 
