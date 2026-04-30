@@ -1628,6 +1628,24 @@ impl DisplaySession {
         }
     }
 
+    /// F-1.3b3: fetch a clone of the per-peer
+    /// [`self::webrtc::WebRtcPeer`] handle for gateway-side wiring
+    /// after [`Self::handle_offer`]. Returns `None` if the peer has
+    /// been removed since the offer was processed (e.g., a fast
+    /// `WebRtcSignal::Close` raced the post-offer registration).
+    ///
+    /// Used by the federated authority subscriber registration to
+    /// bind the per-peer authority data-channel push target. The
+    /// `Arc` clone is cheap; callers should not hold the returned
+    /// handle across awaits in latency-sensitive paths because it
+    /// keeps the peer alive past `remove_peer`.
+    pub async fn get_peer(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<Arc<self::webrtc::WebRtcPeer>> {
+        self.peers.read().await.get(&peer_id).cloned()
+    }
+
     /// Inject an input event into the display backend.
     pub async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
         self.backend.inject_input(event).await

@@ -134,6 +134,16 @@ impl DisplayInputHolder {
     /// at call sites makes intent explicit and prevents accidental
     /// equality-comparison pitfalls in collections / `.contains()` /
     /// pattern guards.
+    ///
+    /// Production callers don't need this yet — every F-1 / F-2
+    /// release-or-preempt site already knows which provenance kind it's
+    /// matching against and uses `matches_local_ws` /
+    /// `matches_federated` directly. The method is pinned by unit
+    /// tests as the documented identity-equality contract for future
+    /// arbitration work (e.g. F-2's per-primary multi-operator
+    /// scoping, where the comparison is against an opaque
+    /// `DisplayInputHolder` snapshot).
+    #[allow(dead_code)]
     fn same_identity(&self, other: &DisplayInputHolder) -> bool {
         match (self, other) {
             (
@@ -466,6 +476,298 @@ fn apply_federated_ws_close_input_authority(
             holder: None,
         });
     }
+    released
+}
+
+// ---------------------------------------------------------------------------
+// F-1.3b3: federated authority subscriber registry + helpers
+//
+// The federated counterpart to local 5c's per-WS subscriber model.
+// Local 5c has no shared subscriber registry — each WS outbound task
+// subscribes to `authority_change_tx` directly and personalizes for
+// its own `connection_id`. Federated needs a registry because the
+// send target is `WebRtcPeer::send_authority_state`, not a WS
+// `direct_tx`: the gateway must hold an `Arc<WebRtcPeer>` to push to,
+// and that handle isn't available until `handle_offer` returns and
+// the peer is stored in the session.
+//
+// One entry per `(federation_connection_id, session_id, display_id)` —
+// uniquely identifies one federated `PeerDisplayConnection`'s
+// subscription to one display's authority state. Each entry owns a
+// fanout task + a `CancellationToken` for clean teardown on the two
+// distinct cleanup edges:
+//
+// 1. `WebRtcSignal::Close` / `DisplaySession::remove_peer(peer_id)`:
+//    unregister this exact `(federation_connection_id, session_id,
+//    display_id)` entry. Identity-matched authority release runs
+//    alongside via `apply_release_input_authority_federated`.
+// 2. Federation WS close: unregister all entries for that
+//    `federation_connection_id`. Bulk authority release runs
+//    alongside via `apply_federated_ws_close_input_authority`.
+// ---------------------------------------------------------------------------
+
+/// One federated authority subscriber. Pairs the per-peer
+/// `WebRtcPeer` handle (the push target) with the cancellation token
+/// that terminates the per-subscriber fanout task on cleanup.
+struct FederatedAuthoritySubscriber {
+    peer: Arc<crate::display::webrtc::WebRtcPeer>,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// Gateway-side registry of federated authority subscribers, keyed by
+/// `(federation_connection_id, session_id, display_id)`. Owned by the
+/// gateway listener task; cloned per-WS for the inbound handler so
+/// every per-connection branch can register/unregister without
+/// passing the registry through every helper signature.
+type FederatedAuthoritySubscribers = Arc<
+    StdRwLock<
+        HashMap<
+            (String, String, u32),
+            FederatedAuthoritySubscriber,
+        >,
+    >,
+>;
+
+/// Compute the personalized authority state for one federated
+/// subscriber from a `Option<&DisplayInputHolder>`. Returns `You` if
+/// the holder is a `FederatedWebRtc` matching this subscriber's
+/// `(federation_connection_id, session_id)`, `Other` if any other
+/// holder exists, `Unclaimed` if no one holds. Mirrors the local 5c
+/// outbound personalization logic at the per-WS subscriber loop.
+fn personalize_authority_for_federated(
+    holder: Option<&DisplayInputHolder>,
+    federation_connection_id: &str,
+    session_id: &str,
+) -> crate::display::webrtc::DisplayInputAuthorityState {
+    use crate::display::webrtc::DisplayInputAuthorityState;
+    match holder {
+        Some(h) if h.matches_federated(federation_connection_id, session_id) => {
+            DisplayInputAuthorityState::You
+        }
+        Some(_) => DisplayInputAuthorityState::Other,
+        None => DisplayInputAuthorityState::Unclaimed,
+    }
+}
+
+/// Build the federated authority data-channel handler closure.
+///
+/// The handler is invoked by the WebRTC driver on every parsed
+/// [`crate::display::webrtc::AuthorityChannelMessage`] received on the
+/// `display_input_authority` channel. Identity is captured at
+/// construction time, so messages from this peer always apply
+/// authority changes against this peer's
+/// `(federation_connection_id, session_id)` — there's no way for one
+/// federated session to act on behalf of another, even from the same
+/// primary.
+///
+/// Display-ID mismatches are silently dropped: the federated peer's
+/// `PeerDisplayConnection` is bound to one display, so a request for
+/// any other display is a protocol bug on the browser side rather
+/// than a recoverable condition. Authority gating still applies on
+/// the input-injection path (F-2's job), so a misdirected message
+/// here can't bypass anything.
+fn build_federated_authority_handler(
+    display_id: u32,
+    federation_connection_id: String,
+    session_id: String,
+    authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
+) -> crate::display::webrtc::AuthorityChannelHandler {
+    use crate::display::webrtc::AuthorityChannelMessage;
+    Arc::new(move |msg| match msg {
+        AuthorityChannelMessage::Request { display_id: req_did }
+            if req_did == display_id =>
+        {
+            apply_grant_input_authority_federated(
+                display_id,
+                federation_connection_id.clone(),
+                session_id.clone(),
+                &authority,
+                &authority_change_tx,
+            );
+        }
+        AuthorityChannelMessage::Release { display_id: req_did }
+            if req_did == display_id =>
+        {
+            apply_release_input_authority_federated(
+                display_id,
+                &federation_connection_id,
+                &session_id,
+                &authority,
+                &authority_change_tx,
+            );
+        }
+        AuthorityChannelMessage::Request { .. }
+        | AuthorityChannelMessage::Release { .. } => {
+            // Display-ID mismatch — drop silently. See doc comment.
+        }
+    })
+}
+
+/// Register a federated authority subscriber and start its fanout
+/// task. Called from the federated `Offer` arm after a successful
+/// `DisplaySession::handle_offer` and `get_peer` lookup.
+///
+/// Behavior:
+/// 1. Compute the initial personalized snapshot from the current
+///    registry state and send it via `peer.send_authority_state`.
+///    F-1.2's pending-authority queue absorbs the case where the
+///    `display_input_authority` data channel hasn't opened yet on
+///    the federated browser side — the queued state flushes on
+///    `OnDataChannel(OnOpen)` so the chip cannot start stuck on
+///    `unknown`.
+/// 2. Spawn a fanout task that subscribes to `authority_change_tx`,
+///    personalizes each event for this subscriber's identity, and
+///    pushes via `peer.send_authority_state`. Lagged subscribers
+///    re-snapshot from the registry — same recovery pattern as the
+///    local 5c lagged path so a momentary catch-up cannot leave the
+///    chip on stale state.
+/// 3. Insert the entry into `subscribers` keyed by
+///    `(federation_connection_id, session_id, display_id)` so
+///    cleanup edges can reach it.
+fn register_federated_authority_subscriber(
+    federation_connection_id: String,
+    session_id: String,
+    display_id: u32,
+    peer: Arc<crate::display::webrtc::WebRtcPeer>,
+    authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
+    subscribers: FederatedAuthoritySubscribers,
+) {
+    // 1. Initial snapshot. F-1.2's queue handles "channel not open yet."
+    let initial_state = {
+        let map = authority.read().unwrap_or_else(|e| e.into_inner());
+        personalize_authority_for_federated(
+            map.get(&display_id),
+            &federation_connection_id,
+            &session_id,
+        )
+    };
+    let peer_for_initial = Arc::clone(&peer);
+    tokio::spawn(async move {
+        let _ = peer_for_initial
+            .send_authority_state(display_id, initial_state)
+            .await;
+    });
+
+    // 2. Fanout task.
+    let mut auth_rx = authority_change_tx.subscribe();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let task_authority = Arc::clone(&authority);
+    let task_fcid = federation_connection_id.clone();
+    let task_sid = session_id.clone();
+    let task_did = display_id;
+    let task_peer = Arc::clone(&peer);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = task_shutdown.cancelled() => break,
+                msg = auth_rx.recv() => match msg {
+                    Ok(change) if change.display_id == task_did => {
+                        let state = personalize_authority_for_federated(
+                            change.holder.as_ref(),
+                            &task_fcid,
+                            &task_sid,
+                        );
+                        let _ = task_peer
+                            .send_authority_state(task_did, state)
+                            .await;
+                    }
+                    Ok(_) => {} // change for a different display
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Re-snapshot from registry — same recovery
+                        // pattern as the local 5c lagged subscriber so
+                        // the chip is never left stuck on stale state.
+                        let state = {
+                            let map = task_authority
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner());
+                            personalize_authority_for_federated(
+                                map.get(&task_did),
+                                &task_fcid,
+                                &task_sid,
+                            )
+                        };
+                        let _ = task_peer
+                            .send_authority_state(task_did, state)
+                            .await;
+                    }
+                }
+            }
+        }
+    });
+
+    // 3. Insert into the registry. Replace-on-collision: a duplicate
+    //    `(fcid, sid, did)` would mean a renegotiated peer for the
+    //    same identity; the prior entry's fanout task gets cancelled
+    //    via Drop on shutdown and the new entry takes over.
+    if let Some(prior) = subscribers
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            (federation_connection_id, session_id, display_id),
+            FederatedAuthoritySubscriber { peer, shutdown },
+        )
+    {
+        prior.shutdown.cancel();
+    }
+}
+
+/// Unregister one federated authority subscriber by exact identity.
+/// Called from the federated `Close` arm. Cancels the fanout task
+/// and removes the entry. Returns `true` if an entry was removed.
+///
+/// Does NOT release authority — that's
+/// `apply_release_input_authority_federated`'s responsibility, called
+/// alongside this function. Splitting the two keeps each helper
+/// single-purpose: this one manages subscriber lifecycle, the other
+/// manages the holder map.
+fn unregister_federated_authority_subscriber(
+    federation_connection_id: &str,
+    session_id: &str,
+    display_id: u32,
+    subscribers: &FederatedAuthoritySubscribers,
+) -> bool {
+    if let Some(sub) = subscribers
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(
+            federation_connection_id.to_string(),
+            session_id.to_string(),
+            display_id,
+        ))
+    {
+        sub.shutdown.cancel();
+        true
+    } else {
+        false
+    }
+}
+
+/// Unregister every federated authority subscriber for a dropping
+/// federation transport. Called from the WS-close cleanup hook
+/// alongside [`apply_federated_ws_close_input_authority`]. Returns
+/// the `(session_id, display_id)` pairs that were unregistered, for
+/// caller logging.
+fn unregister_all_federated_subscribers_for_connection(
+    federation_connection_id: &str,
+    subscribers: &FederatedAuthoritySubscribers,
+) -> Vec<(String, u32)> {
+    let mut released = Vec::new();
+    let mut map = subscribers
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    map.retain(|(fcid, sid, did), sub| {
+        if fcid == federation_connection_id {
+            released.push((sid.clone(), *did));
+            sub.shutdown.cancel();
+            false
+        } else {
+            true
+        }
+    });
     released
 }
 
@@ -2675,6 +2977,17 @@ pub fn spawn_web_gateway(
     let (authority_change_tx, _authority_change_rx0) =
         broadcast::channel::<DisplayInputAuthorityChange>(AUTHORITY_CHANGE_CAPACITY);
 
+    // F-1.3b3 federated authority subscribers. Federated counterpart
+    // to local 5c's per-WS subscriber loop: federated browsers don't
+    // share the local 5c WS path, so the gateway needs an explicit
+    // registry of `(federation_connection_id, session_id, display_id)`
+    // → `WebRtcPeer` to fan personalized state out to. Owned here at
+    // gateway scope so cleanup edges (federated `Close`, federation
+    // WS close) can locate entries by either single-identity or
+    // bulk-by-connection key. See the F-1.3b3 helpers above.
+    let federated_authority_subscribers: FederatedAuthoritySubscribers =
+        Arc::new(StdRwLock::new(HashMap::new()));
+
     // Spawn a listener that fires an "unclaimed" authority change for
     // every newly-created display session so already-connected browsers'
     // chips flip from `unknown` to `unclaimed` without waiting for the
@@ -2937,6 +3250,7 @@ pub fn spawn_web_gateway(
             let active_presence = active_presence.clone();
             let display_input_authority = display_input_authority.clone();
             let authority_change_tx = authority_change_tx.clone();
+            let federated_authority_subscribers = federated_authority_subscribers.clone();
             let last_usage_json = last_usage_json.clone();
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
@@ -3338,6 +3652,8 @@ pub fn spawn_web_gateway(
                     let active_presence_inbound = active_presence.clone();
                     let display_input_authority_inbound = display_input_authority.clone();
                     let authority_change_tx_inbound = authority_change_tx.clone();
+                    let federated_authority_subscribers_inbound =
+                        federated_authority_subscribers.clone();
                     let connection_id_inbound = connection_id.clone();
                     let web_tui_tx_inbound = web_tui_tx.clone();
                     let frame_registry_inbound = frame_registry.clone();
@@ -4596,6 +4912,16 @@ pub fn spawn_web_gateway(
                                                         Arc::clone(&tcp_peer_registry),
                                                         direct_tx_inbound.clone(),
                                                         &bus_inbound,
+                                                        // F-1.3b3 federated authority context.
+                                                        // `connection_id_inbound` is this WS's
+                                                        // id, which doubles as the federation
+                                                        // transport's `federation_connection_id`
+                                                        // when this connection is acting as a
+                                                        // federation transport.
+                                                        connection_id_inbound.clone(),
+                                                        Arc::clone(&display_input_authority_inbound),
+                                                        authority_change_tx_inbound.clone(),
+                                                        Arc::clone(&federated_authority_subscribers_inbound),
                                                     ).await;
                                                 }
                                                 Ok(ControlMsg::RequestDisplayInputAuthority { display_id }) => {
@@ -4701,6 +5027,25 @@ pub fn spawn_web_gateway(
                         // `apply_ws_close_input_authority` for the
                         // semantics + tests.
                         apply_ws_close_input_authority(
+                            connection_id_inbound.as_str(),
+                            &display_input_authority_inbound,
+                            &authority_change_tx_inbound,
+                        );
+                        // F-1.3b3: federation-transport WS-close
+                        // cleanup. Two disjoint registry entries can
+                        // belong to one connection_id — `LocalWs` from
+                        // direct-browser use or `FederatedWebRtc` from
+                        // federation-transport use — so both apply_*
+                        // helpers fire from the same WS-close hook.
+                        // The single WS in practice acts in only one
+                        // role at a time, so the second helper is a
+                        // no-op in the typical case; the cost of
+                        // running both is the bookkeeping above.
+                        unregister_all_federated_subscribers_for_connection(
+                            connection_id_inbound.as_str(),
+                            &federated_authority_subscribers_inbound,
+                        );
+                        apply_federated_ws_close_input_authority(
                             connection_id_inbound.as_str(),
                             &display_input_authority_inbound,
                             &authority_change_tx_inbound,
@@ -7176,6 +7521,17 @@ async fn handle_federated_webrtc_signal(
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     direct_tx: tokio::sync::mpsc::UnboundedSender<String>,
     bus: &EventBus,
+    // F-1.3b3 federated authority context. The caller's
+    // `connection_id` is the federation transport's WS id, which the
+    // peer-side authority registry uses as `federation_connection_id`
+    // (see [`DisplayInputHolder::FederatedWebRtc`]). The remaining
+    // refs route to the same shared registry + broadcast the local 5c
+    // path uses, so cross-provenance arbitration (local takes from
+    // federated and vice versa) goes through one source of truth.
+    federation_connection_id: String,
+    display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
+    federated_authority_subscribers: FederatedAuthoritySubscribers,
 ) {
     // Short tag used as the `source` on every log line this handler
     // emits, so the operator can filter the session log to just the
@@ -7303,19 +7659,26 @@ async fn handle_federated_webrtc_signal(
             let (ice_tx, mut ice_rx) =
                 tokio::sync::mpsc::channel::<(crate::display::PeerId, String)>(64);
             // Phase 5a.1: federated paths deny WebRTC data-channel input
-            // by default until federation authority lands as its own slice.
-            // See [`build_federated_input_authorizer`] for the rationale +
-            // its dedicated test that pins the deny-by-default policy.
+            // by default until F-2 lands the input gate. F-1.3b3 only
+            // wires the AUTHORITY data channel (claim/release + state
+            // broadcast); the input data channels (`control` /
+            // `pointer`) and the gate flip are F-2's job. Keeping the
+            // deny-by-default authorizer pinned here is asserted by
+            // `federated_input_still_deny_by_default_in_f1`.
             let input_authorized = build_federated_input_authorizer();
-            // F-1.3b2 transport plumbing: federated authority data channel
-            // handler. No-op for this slice — the federated wiring slice
-            // (next) replaces this single line with a real handler that
-            // consults the per-display authority registry via the helpers
-            // landed in F-1.3b1. Pinning the no-op here keeps
-            // deny-by-default unchanged (asserted by
-            // `federated_input_still_deny_by_default_in_f1`).
-            let authority_handler =
-                crate::display::webrtc::noop_authority_handler();
+            // F-1.3b3: real federated authority handler. Identity is
+            // captured at construction so messages from this peer
+            // always arbitrate against this peer's
+            // `(federation_connection_id, session_id)`. Display-ID
+            // mismatches drop silently (the federated peer is bound
+            // to one display).
+            let authority_handler = build_federated_authority_handler(
+                display_id,
+                federation_connection_id.clone(),
+                session_id.clone(),
+                Arc::clone(&display_input_authority),
+                authority_change_tx.clone(),
+            );
             let answer_result = session
                 .handle_offer(
                     peer_id,
@@ -7339,6 +7702,27 @@ async fn handle_federated_webrtc_signal(
                         ),
                         turn: None,
                     });
+                    // F-1.3b3: register the federated peer as an
+                    // authority subscriber. Sends the initial
+                    // personalized snapshot (queue-or-send via
+                    // F-1.2's pending_authority_state) and spawns
+                    // the per-subscriber fanout task. If the peer
+                    // was removed since handle_offer returned (race
+                    // with a fast Close), `get_peer` returns None
+                    // and we skip registration — the Close arm's
+                    // unregister is a no-op for an entry that was
+                    // never inserted, so the asymmetry is safe.
+                    if let Some(peer_arc) = session.get_peer(peer_id).await {
+                        register_federated_authority_subscriber(
+                            federation_connection_id.clone(),
+                            session_id.clone(),
+                            display_id,
+                            peer_arc,
+                            Arc::clone(&display_input_authority),
+                            authority_change_tx.clone(),
+                            Arc::clone(&federated_authority_subscribers),
+                        );
+                    }
                     let answer = crate::types::OutboundEvent::WebRtcSignal {
                         display_id,
                         session_id: session_id.clone(),
@@ -7466,6 +7850,31 @@ async fn handle_federated_webrtc_signal(
         }
         crate::peer::WebRtcSignal::Close => {
             session.remove_peer(peer_id).await;
+            // F-1.3b3: matched-identity authority release + matched
+            // subscriber unregister. The release helper is a no-op
+            // unless this exact `(federation_connection_id,
+            // session_id)` currently holds the slot — distinct tabs
+            // from the same primary have distinct session_ids and
+            // can't unclaim each other (the F-1.3b1 helper enforces
+            // this). The unregister tears down this peer's authority
+            // fanout task; remaining federated subscribers and local
+            // 5c subscribers see the (possible) `unclaimed` broadcast
+            // through their own subscriber loops. Federation WS-close
+            // does the bulk variant of both at the gateway WS-close
+            // hook.
+            apply_release_input_authority_federated(
+                display_id,
+                &federation_connection_id,
+                &session_id,
+                &display_input_authority,
+                &authority_change_tx,
+            );
+            unregister_federated_authority_subscriber(
+                &federation_connection_id,
+                &session_id,
+                display_id,
+                &federated_authority_subscribers,
+            );
             bus.send(AppEvent::LogEntry {
                 level: "debug".to_string(),
                 source: LOG_SOURCE.to_string(),
@@ -11674,6 +12083,394 @@ mod tests {
         for _ in 0..5 {
             assert!(!authz(), "stable across calls");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // F-1.3b3: federated authority handler + subscriber registry
+    // ---------------------------------------------------------------
+
+    /// Test helper: build a stub `WebRtcPeer` via the existing
+    /// `new_for_test` constructor. Send-authority-state calls against
+    /// the returned peer will fail (its command_rx is dropped) but
+    /// the registry-level tests below only inspect the subscriber
+    /// map, never await on delivery.
+    fn make_test_peer(
+        peer_id: u64,
+    ) -> Arc<crate::display::webrtc::WebRtcPeer> {
+        use crate::display::encode::pool::SimulcastRid;
+        use crate::display::webrtc::WebRtcPeer;
+        Arc::new(WebRtcPeer::new_for_test(
+            peer_id,
+            vec![SimulcastRid::full()],
+        ))
+    }
+
+    /// Build an empty subscriber registry of the production shape.
+    fn empty_subscribers() -> FederatedAuthoritySubscribers {
+        Arc::new(StdRwLock::new(HashMap::new()))
+    }
+
+    /// `personalize_authority_for_federated` returns `You` when the
+    /// holder's identity matches this subscriber's
+    /// `(federation_connection_id, session_id)`. Mirrors the local
+    /// 5c outbound personalization at the per-WS subscriber loop.
+    #[test]
+    fn personalize_authority_for_federated_returns_you_on_match() {
+        let holder = DisplayInputHolder::FederatedWebRtc {
+            federation_connection_id: "fed-1".to_string(),
+            session_id: "sess-A".to_string(),
+        };
+        let state = personalize_authority_for_federated(
+            Some(&holder),
+            "fed-1",
+            "sess-A",
+        );
+        assert_eq!(state, crate::display::webrtc::DisplayInputAuthorityState::You);
+    }
+
+    /// `personalize_authority_for_federated` returns `Other` when
+    /// any holder exists that isn't this subscriber's identity. The
+    /// "wrong session, same connection" case (two tabs from one
+    /// primary) also resolves to `Other` — distinct session IDs
+    /// don't collapse.
+    #[test]
+    fn personalize_authority_for_federated_returns_other_when_someone_else_holds() {
+        let other_federated = DisplayInputHolder::FederatedWebRtc {
+            federation_connection_id: "fed-1".to_string(),
+            session_id: "sess-B".to_string(),
+        };
+        assert_eq!(
+            personalize_authority_for_federated(Some(&other_federated), "fed-1", "sess-A"),
+            crate::display::webrtc::DisplayInputAuthorityState::Other,
+            "same connection, different session must be 'other'",
+        );
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let local = DisplayInputHolder::LocalWs {
+            connection_id: "local-conn".to_string(),
+            direct_tx: tx,
+        };
+        assert_eq!(
+            personalize_authority_for_federated(Some(&local), "fed-1", "sess-A"),
+            crate::display::webrtc::DisplayInputAuthorityState::Other,
+            "LocalWs holder must surface as 'other' to a federated subscriber",
+        );
+    }
+
+    /// `personalize_authority_for_federated` returns `Unclaimed` when
+    /// no holder is in the registry. Map absence is the canonical
+    /// "no one holds" signal — no `Option` in the value type.
+    #[test]
+    fn personalize_authority_for_federated_returns_unclaimed_when_no_holder() {
+        let state = personalize_authority_for_federated(None, "fed-1", "sess-A");
+        assert_eq!(state, crate::display::webrtc::DisplayInputAuthorityState::Unclaimed);
+    }
+
+    /// The handler closure built by `build_federated_authority_handler`
+    /// dispatches a `Request` to `apply_grant_input_authority_federated`,
+    /// resulting in a holder bound to this peer's identity in the
+    /// registry. Pins that the handler closure carries the right
+    /// identity and that the dispatch shape is correct.
+    #[test]
+    fn build_federated_authority_handler_dispatches_request_to_grant() {
+        use crate::display::webrtc::AuthorityChannelMessage;
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let handler = build_federated_authority_handler(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            Arc::clone(&map),
+            change_tx.clone(),
+        );
+
+        handler(AuthorityChannelMessage::Request { display_id: 0 });
+
+        let guard = map.read().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&0) {
+            Some(DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id,
+                session_id,
+            }) => {
+                assert_eq!(federation_connection_id, "fed-1");
+                assert_eq!(session_id, "sess-A");
+            }
+            other => panic!("expected FederatedWebRtc holder, got {other:?}"),
+        }
+    }
+
+    /// `Release` against a holder of this same identity removes the
+    /// entry from the registry. Pins the wire→registry round-trip.
+    #[test]
+    fn build_federated_authority_handler_dispatches_release_to_apply_release() {
+        use crate::display::webrtc::AuthorityChannelMessage;
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        // Seed a federated holder with the identity the handler was
+        // built for.
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            0,
+            DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: "fed-1".to_string(),
+                session_id: "sess-A".to_string(),
+            },
+        );
+
+        let handler = build_federated_authority_handler(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            Arc::clone(&map),
+            change_tx.clone(),
+        );
+        handler(AuthorityChannelMessage::Release { display_id: 0 });
+
+        assert!(
+            map.read().unwrap_or_else(|e| e.into_inner()).get(&0).is_none(),
+            "release with matching identity must remove the holder"
+        );
+    }
+
+    /// `Release` on a holder of a DIFFERENT identity is a silent
+    /// no-op — the F-1.3b1 helper enforces identity matching at the
+    /// registry layer, and the handler can't bypass it. Two tabs from
+    /// the same primary can't unclaim each other.
+    #[test]
+    fn build_federated_authority_handler_release_noop_on_wrong_identity() {
+        use crate::display::webrtc::AuthorityChannelMessage;
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        // Seed with a holder of a DIFFERENT session id.
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            0,
+            DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: "fed-1".to_string(),
+                session_id: "sess-OTHER".to_string(),
+            },
+        );
+
+        let handler = build_federated_authority_handler(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            Arc::clone(&map),
+            change_tx.clone(),
+        );
+        handler(AuthorityChannelMessage::Release { display_id: 0 });
+
+        let guard = map.read().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&0) {
+            Some(DisplayInputHolder::FederatedWebRtc { session_id, .. }) => {
+                assert_eq!(session_id, "sess-OTHER", "wrong-identity release must not remove the slot");
+            }
+            other => panic!("expected slot to remain held by sess-OTHER, got {other:?}"),
+        }
+    }
+
+    /// Display-ID mismatches drop silently. The federated peer's
+    /// `PeerDisplayConnection` is bound to one display; a `Request`
+    /// targeting any other display must not mutate the registry.
+    #[test]
+    fn build_federated_authority_handler_ignores_display_id_mismatch() {
+        use crate::display::webrtc::AuthorityChannelMessage;
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let handler = build_federated_authority_handler(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            Arc::clone(&map),
+            change_tx.clone(),
+        );
+
+        handler(AuthorityChannelMessage::Request { display_id: 99 });
+        handler(AuthorityChannelMessage::Release { display_id: 99 });
+
+        assert!(
+            map.read().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "display-id mismatch must not mutate the registry"
+        );
+    }
+
+    /// `unregister_federated_authority_subscriber` removes the entry
+    /// when the identity tuple matches and returns true. Cancellation
+    /// of the spawned fanout task is a side effect of the cancel call
+    /// on the stored token; not directly observable in this test, but
+    /// the broadcast channel close on test exit reaps any orphaned
+    /// task cleanly.
+    #[tokio::test]
+    async fn unregister_federated_authority_subscriber_removes_matching() {
+        let subscribers = empty_subscribers();
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        register_federated_authority_subscriber(
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            0,
+            make_test_peer(1),
+            Arc::clone(&map),
+            change_tx,
+            Arc::clone(&subscribers),
+        );
+        assert_eq!(
+            subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "register must insert one entry"
+        );
+
+        let removed = unregister_federated_authority_subscriber(
+            "fed-1",
+            "sess-A",
+            0,
+            &subscribers,
+        );
+
+        assert!(removed, "matching unregister returns true");
+        assert!(
+            subscribers.read().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "registry must be empty after unregister"
+        );
+    }
+
+    /// `unregister_federated_authority_subscriber` returns false (and
+    /// leaves the registry untouched) when no entry matches.
+    #[tokio::test]
+    async fn unregister_federated_authority_subscriber_noop_on_miss() {
+        let subscribers = empty_subscribers();
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        register_federated_authority_subscriber(
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            0,
+            make_test_peer(1),
+            Arc::clone(&map),
+            change_tx,
+            Arc::clone(&subscribers),
+        );
+
+        let removed = unregister_federated_authority_subscriber(
+            "fed-1",
+            "sess-OTHER",
+            0,
+            &subscribers,
+        );
+        assert!(!removed, "non-matching unregister returns false");
+        assert_eq!(
+            subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "registry must be unchanged after non-matching unregister"
+        );
+    }
+
+    /// Federation WS-close cleanup releases every subscriber whose
+    /// `federation_connection_id` matches the dropping connection,
+    /// regardless of `session_id` or `display_id`. Counterpart to
+    /// `apply_federated_ws_close_input_authority`.
+    #[tokio::test]
+    async fn unregister_all_federated_subscribers_for_connection_releases_matching() {
+        let subscribers = empty_subscribers();
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        // Three subscribers: two on fed-1 (different sessions, same
+        // display), one on fed-2 (the survivor).
+        register_federated_authority_subscriber(
+            "fed-1".to_string(), "sess-A".to_string(), 0,
+            make_test_peer(1),
+            Arc::clone(&map), change_tx.clone(), Arc::clone(&subscribers),
+        );
+        register_federated_authority_subscriber(
+            "fed-1".to_string(), "sess-B".to_string(), 0,
+            make_test_peer(2),
+            Arc::clone(&map), change_tx.clone(), Arc::clone(&subscribers),
+        );
+        register_federated_authority_subscriber(
+            "fed-2".to_string(), "sess-C".to_string(), 0,
+            make_test_peer(3),
+            Arc::clone(&map), change_tx.clone(), Arc::clone(&subscribers),
+        );
+        assert_eq!(
+            subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
+            3
+        );
+
+        let released = unregister_all_federated_subscribers_for_connection(
+            "fed-1",
+            &subscribers,
+        );
+
+        assert_eq!(released.len(), 2, "two fed-1 entries released");
+        let remaining: Vec<(String, String, u32)> = subscribers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![("fed-2".to_string(), "sess-C".to_string(), 0)],
+            "only fed-2 entry must remain"
+        );
+    }
+
+    /// `unregister_all_federated_subscribers_for_connection` returns
+    /// an empty vec and leaves the registry untouched when no entries
+    /// match the dropping connection.
+    #[tokio::test]
+    async fn unregister_all_federated_subscribers_for_connection_noop_on_no_match() {
+        let subscribers = empty_subscribers();
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        register_federated_authority_subscriber(
+            "fed-2".to_string(), "sess-C".to_string(), 0,
+            make_test_peer(1),
+            Arc::clone(&map), change_tx, Arc::clone(&subscribers),
+        );
+
+        let released = unregister_all_federated_subscribers_for_connection(
+            "fed-1",
+            &subscribers,
+        );
+        assert!(released.is_empty(), "no matching entries → empty release list");
+        assert_eq!(
+            subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "registry unchanged"
+        );
+    }
+
+    /// `register_federated_authority_subscriber` replaces an existing
+    /// entry with the same `(fcid, sid, did)` key (renegotiated peer
+    /// for the same identity). Map size stays at 1; the prior entry's
+    /// shutdown token fires via the in-helper cancel path.
+    #[tokio::test]
+    async fn register_federated_authority_subscriber_replaces_on_collision() {
+        let subscribers = empty_subscribers();
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) =
+            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        register_federated_authority_subscriber(
+            "fed-1".to_string(), "sess-A".to_string(), 0,
+            make_test_peer(1),
+            Arc::clone(&map), change_tx.clone(), Arc::clone(&subscribers),
+        );
+        register_federated_authority_subscriber(
+            "fed-1".to_string(), "sess-A".to_string(), 0,
+            make_test_peer(2),
+            Arc::clone(&map), change_tx, Arc::clone(&subscribers),
+        );
+        assert_eq!(
+            subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "duplicate-key registration must replace, not append"
+        );
     }
 
     // ---------------------------------------------------------------
