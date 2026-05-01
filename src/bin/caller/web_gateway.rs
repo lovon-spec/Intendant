@@ -506,12 +506,47 @@ fn apply_federated_ws_close_input_authority(
 //    alongside via `apply_federated_ws_close_input_authority`.
 // ---------------------------------------------------------------------------
 
-/// One federated authority subscriber. Pairs the per-peer
-/// `WebRtcPeer` handle (the push target) with the cancellation token
+/// One federated authority subscriber. Holds the cancellation token
 /// that terminates the per-subscriber fanout task on cleanup.
+///
+/// The `Arc<WebRtcPeer>` push target lives entirely inside the
+/// fanout task spawned by [`register_federated_authority_subscriber`];
+/// the registry doesn't carry a second copy because nothing reads
+/// it back. The Drop chain is: cleanup edge calls `shutdown.cancel()`
+/// → fanout task exits → its captured peer Arc drops → reference
+/// count to the `WebRtcPeer` decrements. Any peer-teardown work that
+/// the registry needs (e.g. tearing down WebRtcPeers on federation
+/// WS-close) lives separately at the gateway level via
+/// [`peer_id_for_federated_session`] + `DisplaySession::remove_peer`,
+/// not by holding a duplicate Arc here.
 struct FederatedAuthoritySubscriber {
-    peer: Arc<crate::display::webrtc::WebRtcPeer>,
     shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// Stable mapping from a federated `session_id` (the
+/// browser-supplied per-`PeerDisplayConnection` id round-tripped in
+/// `ControlMsg::WebRtcSignal`) to the [`crate::display::PeerId`]
+/// (`u64`) used as the `WebRtcPeer` key inside `DisplaySession`.
+///
+/// Used in two places that must agree exactly:
+/// 1. [`handle_federated_webrtc_signal`] — derives the key on
+///    Offer/IceCandidate/Close so subsequent signals route to the
+///    same peer.
+/// 2. WS-close cleanup — derives the key from each `(session_id,
+///    display_id)` returned by
+///    [`unregister_all_federated_subscribers_for_connection`] so
+///    the federation WS-close can call `DisplaySession::remove_peer`
+///    on every WebRtcPeer owned by the dropping connection.
+///
+/// A divergence between the two callers would leak peers (cleanup
+/// would target a different key than was inserted on Offer), which
+/// is exactly the bug fixed by extracting this helper.
+fn peer_id_for_federated_session(session_id: &str) -> crate::display::PeerId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    session_id.hash(&mut h);
+    h.finish()
 }
 
 /// Gateway-side registry of federated authority subscribers, keyed by
@@ -608,23 +643,36 @@ fn build_federated_authority_handler(
 /// task. Called from the federated `Offer` arm after a successful
 /// `DisplaySession::handle_offer` and `get_peer` lookup.
 ///
-/// Behavior:
-/// 1. Compute the initial personalized snapshot from the current
+/// Behavior, in order:
+/// 1. Subscribe to `authority_change_tx` FIRST. Doing this before
+///    the snapshot read closes the race where a holder change
+///    arrives between the registry read and the subscribe — without
+///    this ordering, that change would land on neither the snapshot
+///    nor the fanout, and the chip would end up stale until the
+///    next change.
+/// 2. Compute the initial personalized snapshot from the current
 ///    registry state and send it via `peer.send_authority_state`.
 ///    F-1.2's pending-authority queue absorbs the case where the
 ///    `display_input_authority` data channel hasn't opened yet on
 ///    the federated browser side — the queued state flushes on
 ///    `OnDataChannel(OnOpen)` so the chip cannot start stuck on
 ///    `unknown`.
-/// 2. Spawn a fanout task that subscribes to `authority_change_tx`,
-///    personalizes each event for this subscriber's identity, and
-///    pushes via `peer.send_authority_state`. Lagged subscribers
-///    re-snapshot from the registry — same recovery pattern as the
-///    local 5c lagged path so a momentary catch-up cannot leave the
-///    chip on stale state.
-/// 3. Insert the entry into `subscribers` keyed by
+/// 3. Spawn the fanout task with the rx from step 1. It
+///    personalizes each inbound change for this subscriber's
+///    identity and pushes via `peer.send_authority_state`. Lagged
+///    subscribers re-snapshot from the registry — same recovery
+///    pattern as the local 5c lagged path so a momentary catch-up
+///    cannot leave the chip on stale state.
+/// 4. Insert the entry into `subscribers` keyed by
 ///    `(federation_connection_id, session_id, display_id)` so
 ///    cleanup edges can reach it.
+///
+/// Snapshot-vs-change ordering across the wire is FIFO via
+/// `WebRtcPeer::send_authority_state`'s underlying `Command`
+/// channel. If a change races the initial snapshot, both land on
+/// the channel in the order they were enqueued; the more recent
+/// one wins on the browser side, so the chip ends up correct
+/// regardless of which arrives last.
 fn register_federated_authority_subscriber(
     federation_connection_id: String,
     session_id: String,
@@ -634,7 +682,12 @@ fn register_federated_authority_subscriber(
     authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
     subscribers: FederatedAuthoritySubscribers,
 ) {
-    // 1. Initial snapshot. F-1.2's queue handles "channel not open yet."
+    // 1. Subscribe BEFORE snapshot — closes the race window where a
+    //    change between snapshot read and subscribe lands on neither
+    //    path.
+    let mut auth_rx = authority_change_tx.subscribe();
+
+    // 2. Initial snapshot. F-1.2's queue handles "channel not open yet."
     let initial_state = {
         let map = authority.read().unwrap_or_else(|e| e.into_inner());
         personalize_authority_for_federated(
@@ -650,15 +703,14 @@ fn register_federated_authority_subscriber(
             .await;
     });
 
-    // 2. Fanout task.
-    let mut auth_rx = authority_change_tx.subscribe();
+    // 3. Fanout task.
     let shutdown = tokio_util::sync::CancellationToken::new();
     let task_shutdown = shutdown.clone();
     let task_authority = Arc::clone(&authority);
     let task_fcid = federation_connection_id.clone();
     let task_sid = session_id.clone();
     let task_did = display_id;
-    let task_peer = Arc::clone(&peer);
+    let task_peer = peer; // moved — registry doesn't keep a copy.
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -699,16 +751,16 @@ fn register_federated_authority_subscriber(
         }
     });
 
-    // 3. Insert into the registry. Replace-on-collision: a duplicate
+    // 4. Insert into the registry. Replace-on-collision: a duplicate
     //    `(fcid, sid, did)` would mean a renegotiated peer for the
-    //    same identity; the prior entry's fanout task gets cancelled
-    //    via Drop on shutdown and the new entry takes over.
+    //    same identity; cancel the prior shutdown to terminate its
+    //    fanout task before the new entry takes over.
     if let Some(prior) = subscribers
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .insert(
             (federation_connection_id, session_id, display_id),
-            FederatedAuthoritySubscriber { peer, shutdown },
+            FederatedAuthoritySubscriber { shutdown },
         )
     {
         prior.shutdown.cancel();
@@ -746,11 +798,74 @@ fn unregister_federated_authority_subscriber(
     }
 }
 
+/// Tear down every federated `WebRtcPeer` listed in `released`.
+/// Called from the federation WS-close cleanup hook AFTER
+/// [`unregister_all_federated_subscribers_for_connection`] returns
+/// the surviving entries' `(session_id, display_id)` pairs. Without
+/// this, the WebRTC data channels on those peers would stay alive
+/// past the federation WS drop and could keep dispatching
+/// `display_input_authority_request` frames against the registry —
+/// the authority handler closure captures the
+/// `federation_connection_id` at construction time, so a request
+/// arriving after the WS-close would re-grant the (already-released)
+/// authority under a now-defunct identity.
+///
+/// Tearing the peers down here is the structural fix: the federation
+/// WS identity is the only thing tying these peers to a real user;
+/// once it's gone the peers must go too. `DisplaySession::remove_peer`
+/// closes the underlying WebRTC peer connection cleanly, which causes
+/// every data channel on it to close and the driver task to exit —
+/// no further authority frames can be processed.
+///
+/// Returns the count of peers actually removed. Missing displays
+/// (display session torn down between Offer and WS-close) and
+/// missing peers (already removed by an earlier `WebRtcSignal::Close`
+/// for the same session) both fall through silently as no-ops on
+/// `remove_peer`.
+async fn close_federated_peers_for_sessions(
+    released: &[(String, u32)],
+    session_registry: Option<
+        &Arc<tokio::sync::RwLock<crate::display::SessionRegistry>>,
+    >,
+) -> usize {
+    if released.is_empty() {
+        return 0;
+    }
+    let Some(sr) = session_registry else {
+        return 0;
+    };
+    // Snapshot Arcs out of the read guard first so per-peer awaits
+    // (remove_peer's `peer.close()` chain) don't hold the registry
+    // lock — same lock-discipline rationale as the local
+    // `display_ice` handler that fixed the original 5-20s mDNS
+    // starvation. The registry's RwLock is read-only here so a
+    // concurrent display deactivate isn't blocked by us either way,
+    // but keeping the pattern consistent prevents future regressions
+    // if the lock semantics change.
+    let mut targets: Vec<(Arc<crate::display::DisplaySession>, crate::display::PeerId)> =
+        Vec::with_capacity(released.len());
+    {
+        let reg = sr.read().await;
+        for (sid, did) in released {
+            if let Some(session) = reg.get(*did) {
+                targets.push((session, peer_id_for_federated_session(sid)));
+            }
+        }
+    }
+    let count = targets.len();
+    for (session, pid) in targets {
+        session.remove_peer(pid).await;
+    }
+    count
+}
+
 /// Unregister every federated authority subscriber for a dropping
 /// federation transport. Called from the WS-close cleanup hook
 /// alongside [`apply_federated_ws_close_input_authority`]. Returns
 /// the `(session_id, display_id)` pairs that were unregistered, for
-/// caller logging.
+/// caller logging and for the post-step
+/// [`close_federated_peers_for_sessions`] which actually tears down
+/// the WebRtcPeers.
 fn unregister_all_federated_subscribers_for_connection(
     federation_connection_id: &str,
     subscribers: &FederatedAuthoritySubscribers,
@@ -5041,15 +5156,34 @@ pub fn spawn_web_gateway(
                         // role at a time, so the second helper is a
                         // no-op in the typical case; the cost of
                         // running both is the bookkeeping above.
-                        unregister_all_federated_subscribers_for_connection(
-                            connection_id_inbound.as_str(),
-                            &federated_authority_subscribers_inbound,
-                        );
+                        //
+                        // Order: unregister subscribers first (stops
+                        // new fanout sends) → release authority (so
+                        // observers see `unclaimed`) → close
+                        // WebRtcPeers (so the data channels stop
+                        // accepting incoming `display_input_authority_request`
+                        // frames under the now-defunct federation
+                        // identity). Without the peer-teardown step,
+                        // the authority handler closure on each
+                        // surviving peer would keep mutating the
+                        // registry under an identity whose WS is
+                        // gone — the structural bug F-1.3b3 fix #2
+                        // closes.
+                        let released_federated_subs =
+                            unregister_all_federated_subscribers_for_connection(
+                                connection_id_inbound.as_str(),
+                                &federated_authority_subscribers_inbound,
+                            );
                         apply_federated_ws_close_input_authority(
                             connection_id_inbound.as_str(),
                             &display_input_authority_inbound,
                             &authority_change_tx_inbound,
                         );
+                        close_federated_peers_for_sessions(
+                            &released_federated_subs,
+                            session_registry_inbound.as_ref(),
+                        )
+                        .await;
                         if is_presence_connected && is_active {
                             bus_inbound.send(AppEvent::PresenceDisconnected);
                         }
@@ -7589,16 +7723,14 @@ async fn handle_federated_webrtc_signal(
         }
     };
 
-    // Stable PeerId per session_id via DefaultHasher. Same string
-    // hashes to the same u64, so subsequent IceCandidate and Close
-    // signals route to the same WebRtcPeer in the session's peer map.
-    let peer_id: crate::display::PeerId = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        session_id.hash(&mut h);
-        h.finish()
-    };
+    // Stable PeerId per session_id. Same string hashes to the same
+    // u64, so subsequent IceCandidate / Close signals — and the
+    // federation WS-close cleanup path — all route to the same
+    // WebRtcPeer in the session's peer map. Centralized via
+    // `peer_id_for_federated_session` so the cleanup path can't drift
+    // from this derivation.
+    let peer_id: crate::display::PeerId =
+        peer_id_for_federated_session(&session_id);
 
     match signal {
         crate::peer::WebRtcSignal::Offer {
@@ -12470,6 +12602,99 @@ mod tests {
             subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
             1,
             "duplicate-key registration must replace, not append"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // F-1.3b3 fix #2: WS-close peer teardown — peer_id helper
+    // determinism + close-helper edge cases. The actual
+    // session.remove_peer side effect requires a real
+    // DisplaySession (which needs a real backend) and is exercised
+    // by the F-3 smoke; these unit tests pin the contract that
+    // must hold for the smoke to be meaningful: the same session_id
+    // hashes to the same PeerId on both the Offer (insert) and the
+    // WS-close (cleanup) sides.
+    // ---------------------------------------------------------------
+
+    /// Same `session_id` → same `PeerId` on every call. The Offer
+    /// arm in `handle_federated_webrtc_signal` derives the
+    /// `WebRtcPeer` key from this; WS-close cleanup must derive
+    /// the same key to find the inserted peer. A divergence here
+    /// would leak peers (cleanup would target a different key than
+    /// the one Offer inserted), which is exactly the bug the helper
+    /// extraction prevents.
+    #[test]
+    fn peer_id_for_federated_session_is_deterministic() {
+        let a = peer_id_for_federated_session("sess-A");
+        let b = peer_id_for_federated_session("sess-A");
+        assert_eq!(
+            a, b,
+            "the same session id must hash to the same peer id"
+        );
+    }
+
+    /// Distinct `session_id`s map to distinct `PeerId`s in
+    /// practice. (`u64` hash collisions are theoretically possible
+    /// but vanishingly unlikely between any two real session ids
+    /// generated by the browser.) Without this property, two
+    /// federated tabs from one primary would alias to the same
+    /// `WebRtcPeer` slot — cleanup of one tab would tear down the
+    /// other.
+    #[test]
+    fn peer_id_for_federated_session_distinct_for_distinct_sessions() {
+        let a = peer_id_for_federated_session("sess-A");
+        let b = peer_id_for_federated_session("sess-B");
+        assert_ne!(
+            a, b,
+            "distinct session ids should produce distinct peer ids"
+        );
+    }
+
+    /// `close_federated_peers_for_sessions` short-circuits to 0 on
+    /// empty release input — covers the "WS-close fired but the
+    /// connection had no federated subscribers" no-op path
+    /// (typical: the connection was a local browser, not a
+    /// federation transport).
+    #[tokio::test]
+    async fn close_federated_peers_for_sessions_noop_on_empty_release() {
+        let reg = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let count = close_federated_peers_for_sessions(&[], Some(&reg)).await;
+        assert_eq!(count, 0, "empty release must short-circuit");
+    }
+
+    /// `close_federated_peers_for_sessions` short-circuits on a
+    /// `None` session_registry — the daemon may run without one
+    /// (e.g. presence-disabled startup), and the WS-close path
+    /// must not panic in that mode.
+    #[tokio::test]
+    async fn close_federated_peers_for_sessions_noop_on_no_registry() {
+        let count = close_federated_peers_for_sessions(
+            &[("sess-A".to_string(), 0)],
+            None,
+        )
+        .await;
+        assert_eq!(count, 0, "missing registry must short-circuit");
+    }
+
+    /// `close_federated_peers_for_sessions` returns 0 (and runs no
+    /// `remove_peer` calls) when the listed displays aren't in the
+    /// registry — covers the race where a display session gets
+    /// deactivated between Offer-time and WS-close.
+    #[tokio::test]
+    async fn close_federated_peers_for_sessions_noop_when_displays_missing() {
+        let reg = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let count = close_federated_peers_for_sessions(
+            &[("sess-A".to_string(), 0), ("sess-B".to_string(), 1)],
+            Some(&reg),
+        )
+        .await;
+        assert_eq!(
+            count, 0,
+            "missing displays in the registry must fall through silently",
         );
     }
 
