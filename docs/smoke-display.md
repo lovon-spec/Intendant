@@ -758,6 +758,24 @@ max_gap_ms         ≤ 200
 longest_freeze_ms  ≤ 200
 ```
 
+**First-frame warmup is excluded from freeze interpretation.**
+The sampler anchors its `lastTransitionMs` clock at the first
+*decoded* marker value, not at sampler instantiation — so the
+first emitted transition's `gap_ms` reflects steady-state encoder
+send cadence (~33ms at 30fps), not the ontrack→first-decoded-
+frame→peer-marker-propagation interval (~1s on a typical
+federated VP8-q path). Before this anchoring fix (transcript
+`b8e2b947` from the #83 acceptance run), the first transition
+carried a synthetic 1044ms gap_ms that propagated into the
+session-wide `max_gap_ms` and `longest_freeze_ms`; with the fix,
+the percentile triple is steady-state from the very first
+emitted record. If you see a single oversized first-transition
+`gap_ms` in older transcripts, that's the pre-fix artifact, not
+an in-motion freeze — the standing acceptance criterion in #80
+("no freeze interval > 1s **during continuous peer-side
+motion**") was always evaluated against the steady-state
+distribution, not the warmup interval.
+
 **The #81 jump-cut signature** (full-res VP8-f under the current
 loss profile — what we're measuring against):
 

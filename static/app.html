@@ -12446,6 +12446,19 @@ class VisualFreshnessSampler {
           gap_ms: Math.round(gap),
         });
         this.lastTransitionMs = nowMs;
+      } else if (this.lastValue === null) {
+        // First decoded marker value -- anchor `lastTransitionMs` HERE
+        // (at first sample) instead of leaving it pinned to startMs (the
+        // sampler-instantiation moment, which precedes ontrack→first-
+        // decoded-frame→peer-marker-propagation by ~1s on a typical
+        // federated VP8-q path). Without this, the first emitted
+        // transition's gap_ms would conflate stream-warmup time with
+        // actual frame-cadence -- which is exactly the 1044ms outlier
+        // observed in transcript b8e2b947 of the #83 acceptance run.
+        // After this fix, the first transition reports a gap_ms equal
+        // to the true encoder send cadence (~33ms at 30fps), and the
+        // session-percentile triple no longer carries a startup spike.
+        this.lastTransitionMs = performance.now();
       }
       this.lastValue = value;
     } catch (e) {
