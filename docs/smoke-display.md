@@ -8,13 +8,19 @@ Canonical end-to-end smoke for the display paths:
   `src/bin/caller/display/`, `src/bin/caller/web_gateway.rs`'s
   display/authority code, or `static/app.html`'s `DisplaySlot` /
   `pendingAuthorityStates` / `set_on_display_input_authority_change`.
-- **Federated path** (§6): browser → host coturn TURN → peer daemon
-  → peer's encoder. VP8 single-RID floor. Run this after any change to
-  `src/bin/caller/peer/`, `static/app.html`'s
-  `PeerDisplayConnection`, or peer-side encoder pool / layer policy.
+- **Federated path** (§6–§8): browser → host coturn TURN → peer
+  daemon → peer's encoder. VP8 single-RID floor (§6); F-1 visibility
+  + Take/Release chip (§7); F-2 input wiring + F-3 cross-primary
+  arbitration (§8). Run §6 after any change to `src/bin/caller/peer/`,
+  `static/app.html`'s `PeerDisplayConnection`, or peer-side encoder
+  pool / layer policy. Run §7–§8 after any change to the
+  `display_input_authority` / `control` / `pointer` data-channel
+  wiring or the federated input authorizer predicate.
 
-**Pass = every signal in §3 (local) and §6.2 (federated) matches
-verbatim. Anything else is a regression in the implicated phase.**
+**Pass = every signal in §3 (local), §6.2 (federated baseline), §7.2
+(federated authority chip), and §8.2 (federated input + handover)
+matches verbatim. Anything else is a regression in the implicated
+phase.**
 
 ## 1. Setup
 
@@ -412,11 +418,185 @@ fanout broadcasts personalized state to every subscribed peer.
   authority. Last-writer-wins. Open both browsers' consoles to
   see who clicked first.
 
-### 7.4 Out of scope (F-2 / F-3)
+### 7.4 Out of scope (handled in §8)
 
-- Actual keyboard / mouse / clipboard input on the federated path
-  (F-2 wires `control` / `pointer` data channels and flips the
-  authorizer).
-- Cross-primary handover (two Intendant.app instances both viewing
-  the same peer; F-3 verifies last-take-wins arbitrates correctly
-  across distinct primaries).
+- Actual keyboard / mouse input on the federated path — §8.1.1.
+- Close-while-holding teardown — §8.1.2.
+- Cross-primary handover (two Intendant.app instances) — §8.1.3.
+- Clipboard sync over federated path: separate channel, not yet
+  wired for federation.
+
+## 8. Federated input + multi-viewer arbitration — F-2 / F-3 smoke
+
+**Goal.** Verify (1) browser → peer real input injection over the
+federated `control` / `pointer` data channels; (2) close-while-holding
+cleans up authority + listeners; (3) cross-primary handover arbitrates
+last-writer-wins across two distinct Intendant.app instances viewing
+the same peer.
+
+**Prereq.** §6 federated path up (peer added with non-loopback
+`browser_tcp_via_url`, display granted, video stream rendering). §7
+chip + Take/Release smoke passing — F-2 inherits that wiring and only
+flips the input authorizer's predicate.
+
+### 8.1 Steps
+
+#### 8.1.1 Single viewer, real input (F-2 acceptance items 1-4)
+
+1. With the panel up and chip resolved to `Input: shared`, click
+   **Take Control**. Chip → `Input: you`. Console emits
+   `entered interactive mode — input listeners installed`.
+2. Move the mouse into the video area. The peer's X11 cursor mirrors
+   motion (visible directly on the X11 guest, or via SSH'd `xdotool
+   getmouselocation`). Each motion sends an `mm` frame on the
+   `pointer` channel.
+3. Click on a visible xterm inside the stream — its X11 focus follows.
+4. Type letters / digits into the xterm via keyboard. Characters
+   appear in the xterm, one per `kd` / `ku` pair on the `control`
+   channel. Modifier-bearing chords (Cmd+letter, Ctrl+letter) require
+   the dashboard's `_heldModifiers` set, exhaustively populated for
+   modifier keys (see §8.5 for the regular-key gap → #79).
+5. Click **Release**. Chip → `Input: shared`. Console emits
+   `exited interactive mode — input listeners removed`. Subsequent
+   browser input is silently dropped at the peer's predicate.
+
+#### 8.1.2 Close-while-holding (F-2 acceptance item 5)
+
+1. Take Control again (chip → `you`).
+2. Close the browser tab / `cmd+W` the panel / quit the Intendant.app
+   instance — any of the three tears the WebRtcPeer down.
+3. The peer's authority registry release fires on WebRtcPeer drop
+   (`by_display.remove(&display_id)`), not on data-channel close.
+   Within ~1s, any other viewer's chip flips to `Input: shared`.
+4. No leftover `xdotool` invocations from the closed browser's path
+   (modulo §8.5's stuck-key edge for held regular keys → #79).
+
+#### 8.1.3 Two primaries / cross-primary handover (F-3 acceptance items 6-7)
+
+1. Launch a second Intendant.app: `open -n -a Intendant`. Auto-discovery
+   picks a free `--web` port (e.g. 57014; do NOT pin to the historical
+   49575 — auto-discover reuses whatever's free). Verify both alive:
+   `pgrep -fa intendant-bin` shows two `--web N` lines.
+2. Add the same peer to the second primary via curl, OR via its
+   dashboard's Add Peer form. Same `card_url` / `via_urls` /
+   `browser_tcp_via_url` as the first. Persistent grant (§6.1) keeps
+   capture alive for both subscribers — `peers=2` in
+   `[display/metrics]` confirms both attached.
+
+   ```sh
+   curl -s -X POST -H 'Content-Type: application/json' \
+     http://127.0.0.1:<port2>/api/peers -d '{
+       "card_url":"http://<mac-lan-ip>:<tunnel-port>/.well-known/agent-card.json",
+       "via_urls":["ws://<mac-lan-ip>:<tunnel-port>/ws"],
+       "browser_tcp_via_url":"ws://<mac-lan-ip>:<tunnel-port>/ws"
+     }'
+   ```
+3. In each primary: Settings → Network → expand peer row → click
+   **View display**.
+4. With first primary holding, second primary's chip = `Input:
+   another viewer`, **Take Control** button visible.
+5. From second primary's Web Inspector console:
+   `document.querySelector('.take-control-btn[data-host-id="intendant:host"]').click()`.
+   Console emits `sent display_input_authority_request (display_id=0)`
+   → `authority granted: you` → `entered interactive mode — input
+   listeners installed`. Chip flips to `Input: you`.
+6. First primary's console emits `exited interactive mode — input
+   listeners removed`. Chip flips to `Input: another viewer`.
+7. From first primary: click Take Control. First primary returns to
+   `Input: you`; second primary demotes to `Input: another viewer`.
+   Bidirectional arbitration confirmed.
+
+### 8.2 Expected signals (browser console, per peer-display panel)
+
+Filter `webrtc-peer`:
+
+| Event | Console line(s), in order |
+|---|---|
+| All 3 channels open | `authority data channel open` → `control data channel open` → `pointer data channel open` |
+| Take Control | `sent display_input_authority_request (display_id=N)` → `authority granted: you` → `entered interactive mode — input listeners installed` |
+| Release | `sent display_input_authority_release (display_id=N)` → `authority released` → `exited interactive mode — input listeners removed` |
+| Demoted by another viewer | `authority changed: other` → `exited interactive mode — input listeners removed` |
+| Promoted from other | `authority granted: you` → `entered interactive mode — input listeners installed` |
+
+Chip class + textContent vocabulary (matches §3.2 / §7):
+
+| Class | Text |
+|---|---|
+| `display-input-authority you` | `Input: you` |
+| `display-input-authority other` | `Input: another viewer` |
+| `display-input-authority unclaimed` | `Input: shared` |
+
+### 8.3 Two-Intendant.app harness setup
+
+Both `Intendant.app` instances share `com.intendant.app` bundle ID. Implications when driving them:
+
+- `cmd+\`` cycles only within one process — the second primary cannot
+  be raised from the first that way.
+- `open -n -a Intendant` spawns a fresh process; the new daemon
+  auto-discovers a free `--web` port. Find each via
+  `lsof -iTCP -sTCP:LISTEN -P -n | grep intendant-bin` or
+  `pgrep -fa intendant-bin`.
+- To switch between the two main windows: Mission Control (Ctrl+Up),
+  Dock right-click → window list, or open both Web Inspectors and
+  address them by their distinct titles ("Web Inspector — backend"
+  for both, but each one's coordinates differ).
+- Tunnel: same `ssh -L *:18765:<peer>:8765 -o GatewayPorts=yes`
+  serves both primaries — peer's URL uses the Mac's LAN IP, not
+  loopback, so any browser on the host can reach it.
+
+### 8.4 Synthetic-event caveats (test-driver artifacts only)
+
+When driving from a CDP-style harness (Playwright,
+`mcp__claude-in-chrome`, etc.):
+
+- WKWebView silently rejects `setPointerCapture` from synthetic
+  PointerEvents. Real OS-level `mousedown` / `mouseup` works fine,
+  as does Web Inspector console JS. Inject native clicks via the
+  driver's primitives, or call into the dashboard's already-bound
+  handlers via console expressions — do NOT dispatch synthetic
+  PointerEvents from outside the page.
+- Synthetic click y-coordinates inside Intendant.app's WKWebView
+  carry a `-142px` offset relative to the screenshot frame
+  (titlebar + status bar geometry). Documented in
+  `project_macos_smoke_quirks.md`.
+
+### 8.5 Failure modes / known caveats
+
+- **Stuck X11 auto-repeat after closing tab while a key was held.**
+  Closing the panel mid-keypress can drop the `keyup`. X11 then
+  auto-repeats the held key indefinitely. Recovery from peer:
+  `ssh ... 'DISPLAY=:0 xdotool keyup <keyname>'`. Root cause:
+  browser's `_heldModifiers` set tracks only modifiers, not regular
+  keys, so a dropped `ku` for a letter never gets a synthetic
+  release-on-close. Tracked as #79; mirror local DisplaySlot's
+  exhaustive `_held` set + emit `release-all` on tab-close.
+- **Take Control fires but chip doesn't flip.** Console warn
+  `dropped — authority channel not open`. Wait for §7.2 channel-open
+  signals (chip resolves to `Input: shared`) before clicking.
+- **Take Control click missed entirely (no console line).** The
+  click handler is bound at `attachToDom` time; if a daemons-list
+  re-render rebuilt the panel WHILE this connection held authority,
+  F-2 follow-up at `5f6a1dd` (commit) re-binds — but if you're on a
+  pre-`5f6a1dd` build, `attachToDom`'s old `interactive=true` guard
+  could leave listeners detached. Verify worktree HEAD includes
+  `5f6a1dd` before triaging.
+- **One primary's panel stays black while authority arbitrates
+  fine.** Black means a separate WebRTC issue (codec / ICE), not an
+  authority bug — chip + button transitions still arbitrate
+  correctly. Re-View display to reset that primary's
+  RTCPeerConnection if stuck. If `[encoder/pool] h264:*` lines
+  appear in `/tmp/intendant.out` during federation, see #71 (stale
+  H.264 spawn).
+- **`peers=N` in `[display/metrics]` doesn't match the number of
+  open primaries.** Confirms #61 / encoder lifecycle leak signature.
+  Re-check via `pgrep -fa intendant-bin` and the peer's
+  `/tmp/intendant.out` for capture-thread duplication.
+
+### 8.6 Out of scope (handled elsewhere)
+
+- Per-RID layer policy + TWCC capacity adaptation: §6 baseline +
+  #48 / #51.
+- H.264 federation (broken in reference topology): §6.3 + #69.
+- Stuck-key proper fix: #79.
+- Federated clipboard sync: separate channel, not in F-2 / F-3
+  scope.
