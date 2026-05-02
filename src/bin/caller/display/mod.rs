@@ -20,7 +20,7 @@
 //! - `latest_frame`: always overwritten, latest-wins.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -446,6 +446,30 @@ pub struct DisplaySession {
     /// BGRA→I420 conversion and `pool.push_i420_frame` loop. Drained
     /// on `stop()` for deterministic teardown ordering.
     pool_feed_bridge_handle: Mutex<Option<JoinHandle<()>>>,
+    /// **Phase 0 visual-freshness diagnostic marker.** When `true`, the
+    /// pool-feed bridge stamps a 32-bit binary timestamp into the top-left
+    /// 128×64 px of each I420 Y plane before forwarding it to the encoder
+    /// pool. The browser-side sampler in `PeerDisplayConnection` reads
+    /// the marker per video frame to measure visual-freshness (effective
+    /// fps, freeze intervals, transition gap p50/p95/max) without relying
+    /// on getStats counters that proved misleading on task #81.
+    ///
+    /// **Off by default.** Toggled at runtime via
+    /// `ControlMsg::SetDiagnosticsVisualMarker { display_id, enabled }`.
+    /// Visible to ALL viewers of this display when on (the marker is
+    /// stamped pre-encoder so it lands in every encoded layer);
+    /// acceptable for an opt-in diagnostic flag. See task #80's standing
+    /// quality bar (visual freshness, not packet counters) and task #83
+    /// (Phase 0 scaffold) for context. The encoded marker value is the
+    /// lower 32 bits of `(arrived - session_epoch).as_millis()`, so each
+    /// frame carries its capture-time timestamp without a side channel.
+    diagnostics_visual_marker: Arc<AtomicBool>,
+    /// Reference instant for the diagnostic marker's 32-bit timestamp.
+    /// Set once in [`Self::new`]; the bridge computes
+    /// `arrived.duration_since(session_epoch).as_millis() as u32` per
+    /// frame so the wrap horizon is ~49.7 days from session start
+    /// (effectively irrelevant for any realistic smoke run).
+    session_epoch: Instant,
     /// **Phase 4d.3b** layer-policy coordinator handle. `Some` for
     /// the lifetime of a started session: spawned eagerly by
     /// [`Self::start`] after the pool-feed bridge, awaited in
@@ -479,6 +503,54 @@ pub struct DisplaySession {
     layer_policy_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Convert one BGRA frame to I420 and, when the Phase 0 visual-freshness
+/// diagnostic flag is set, stamp the lower 32 bits of the
+/// `arrived - session_epoch` millisecond delta into the top-left 128×64 px
+/// of the Y plane. Run from inside `spawn_blocking` on the pool-feed
+/// bridge's hot path so the CPU-bound `bgra_to_i420` (and the optional
+/// stamp pass) stays off the tokio executor.
+///
+/// When `marker_flag` is `false`, the function is exactly equivalent to a
+/// bare [`encode::bgra_to_i420`] call — the per-frame branch is one
+/// Relaxed atomic load, no allocations, no extra writes. When `true`, the
+/// stamp adds ~512 byte writes into the Y plane (32 tiles × 16 px wide),
+/// dominated by the existing Y-plane construction cost so the throughput
+/// hit on a busy stream is well under one percent.
+///
+/// Co-located with the bridge rather than in [`visual_marker`] because
+/// the helper is specific to this caller's BGRA→I420→optional-stamp
+/// shape; the marker module stays at the pure-data-stamp layer.
+fn convert_and_maybe_stamp(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    marker_flag: &AtomicBool,
+    arrived: Instant,
+    session_epoch: Instant,
+) -> Vec<u8> {
+    let mut i420 = encode::bgra_to_i420(bgra, width, height, stride);
+    if marker_flag.load(Ordering::Relaxed) {
+        // Lower 32 bits of millis since session start. Wrap horizon is
+        // ~49.7 days — irrelevant for any realistic smoke run; the
+        // browser sampler treats it as a monotonic per-frame token, not
+        // a wall-clock value (clock-sync is Phase 0 Level 2).
+        let value = arrived
+            .saturating_duration_since(session_epoch)
+            .as_millis() as u32;
+        let y_len = (width as usize) * (height as usize);
+        if let Some(y) = i420.get_mut(0..y_len) {
+            visual_marker::stamp_y_plane(
+                y,
+                width as usize,
+                height as usize,
+                value,
+            );
+        }
+    }
+    i420
+}
+
 impl DisplaySession {
     /// Create a new display session.  Does NOT start capture -- call `start()`.
     pub fn new(display_id: u32, backend: Arc<dyn DisplayBackend>) -> Self {
@@ -498,8 +570,29 @@ impl DisplaySession {
             pool_feed_keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
+            diagnostics_visual_marker: Arc::new(AtomicBool::new(false)),
+            session_epoch: Instant::now(),
             layer_policy_handle: Mutex::new(None),
         }
+    }
+
+    /// Toggle the Phase 0 visual-freshness diagnostic marker on or off.
+    /// Idempotent. Effective on the next encoder-tick after the store
+    /// (Relaxed ordering is sufficient — this is a diagnostic flag, no
+    /// happens-before requirement against the marker's pixel writes).
+    ///
+    /// Visible to ALL viewers of this display when on, since the marker
+    /// is stamped pre-encoder. Operators enable it for a smoke run and
+    /// disable it after collecting the NDJSON transcript.
+    pub fn set_diagnostics_visual_marker(&self, enabled: bool) {
+        self.diagnostics_visual_marker
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Read the current state of the diagnostic marker flag. Used by the
+    /// runtime toggle handler for idempotency reporting.
+    pub fn diagnostics_visual_marker_enabled(&self) -> bool {
+        self.diagnostics_visual_marker.load(Ordering::Relaxed)
     }
 
     /// Start the capture and encoding pipeline.
@@ -1300,6 +1393,16 @@ impl DisplaySession {
         let (initial_w, initial_h) = self.backend.resolution();
         let shutdown = self.shutdown.clone();
         let display_id = self.display_id;
+        // Phase 0 visual-freshness diagnostic plumbing. Cloned out of
+        // self here so the spawned async block (and its inner
+        // spawn_blocking closures) can read the flag without
+        // re-borrowing self after move. The flag is checked once per
+        // converted frame; when off, the cost is a single Relaxed
+        // atomic load. When on, the marker stamp adds ~512 byte writes
+        // into the Y plane (32 tiles × 16 px wide), dominated by the
+        // existing Y-plane construction cost from `bgra_to_i420`.
+        let marker_flag = Arc::clone(&self.diagnostics_visual_marker);
+        let session_epoch = self.session_epoch;
         let frame_interval = std::time::Duration::from_millis(
             if fps > 0 { 1000 / fps as u64 } else { 33 },
         );
@@ -1427,12 +1530,16 @@ impl DisplaySession {
                     // dimension desync (silent black-screen class).
                     // Cropping the rightmost column / bottom row at
                     // this stage is invisible at display.
-                    let i420_result = tokio::task::spawn_blocking(move || {
-                        encode::bgra_to_i420(
+                    let i420_result = tokio::task::spawn_blocking({
+                        let marker_flag = Arc::clone(&marker_flag);
+                        move || convert_and_maybe_stamp(
                             &frame_arc.data,
                             frame_w,
                             frame_h,
                             frame_arc.stride,
+                            &marker_flag,
+                            arrived,
+                            session_epoch,
                         )
                     })
                     .await;
@@ -1516,12 +1623,16 @@ impl DisplaySession {
                         // this branch) so I420 dims match what
                         // `downscale_i420` and the pool's encoders
                         // expect.
-                        let i420_result = tokio::task::spawn_blocking(move || {
-                            encode::bgra_to_i420(
+                        let i420_result = tokio::task::spawn_blocking({
+                            let marker_flag = Arc::clone(&marker_flag);
+                            move || convert_and_maybe_stamp(
                                 &frame_arc.data,
                                 frame_w,
                                 frame_h,
                                 frame_arc.stride,
+                                &marker_flag,
+                                arrived,
+                                session_epoch,
                             )
                         })
                         .await;
