@@ -5154,6 +5154,36 @@ pub fn spawn_web_gateway(
                                                         });
                                                     }
                                                 }
+                                                Ok(ControlMsg::SetDiagnosticsVisualMarker { display_id, enabled }) => {
+                                                    // Accept the documented ControlMsg wire form
+                                                    // (`{"action":"set_diagnostics_visual_marker", ...}`)
+                                                    // in addition to the low-level `t` form
+                                                    // handled above. The smoke script uses
+                                                    // ControlMsg JSON so the toggle must be
+                                                    // applied here instead of falling through to
+                                                    // the generic bus path, where this variant is
+                                                    // intentionally a no-op for TUI/MCP parity.
+                                                    let display_id = display_id.unwrap_or(0);
+                                                    let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
+                                                        Some(sr) => sr.read().await.get(display_id),
+                                                        None => None,
+                                                    };
+                                                    match session {
+                                                        Some(session) => {
+                                                            session.set_diagnostics_visual_marker(enabled);
+                                                            eprintln!(
+                                                                "[web_gateway] phase-0 visual marker for display {} = {}",
+                                                                display_id, enabled,
+                                                            );
+                                                        }
+                                                        None => {
+                                                            eprintln!(
+                                                                "[web_gateway] phase-0 visual marker request for unknown display {} ({}); display not granted yet?",
+                                                                display_id, enabled,
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                                 Ok(ctrl) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!("[ws] ControlMsg: {:?}",
