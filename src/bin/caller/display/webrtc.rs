@@ -47,6 +47,7 @@ use super::encode::pool::{
     SimulcastRid,
 };
 use super::tile::backpressure::{TileDeltaBackpressure, TileDeltaSendDecision};
+use super::tile::transport as tile_transport;
 use super::{EncodedFrame, IceConfig, InputEvent, PeerId};
 use crate::error::CallerError;
 use bytes::{Bytes, BytesMut};
@@ -1060,6 +1061,33 @@ pub fn noop_authority_handler() -> AuthorityChannelHandler {
     Arc::new(|_| {})
 }
 
+/// D-4d2: Browser-originated recovery/control messages on the
+/// `tile-control` data channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileControlMessage {
+    Subscribe { client_id: u32 },
+    SnapshotRequest {
+        epoch: u32,
+        reason: tile_transport::SnapshotRequestReason,
+    },
+    GapReport {
+        epoch: u32,
+        last_seen_seq: u32,
+        expected_seq: u32,
+    },
+}
+
+/// Opaque transport callback for parsed tile-control frames.
+///
+/// The driver task invokes this synchronously; production handlers
+/// must spawn any async recovery work rather than blocking the RTC
+/// pump.
+pub type TileControlHandler = Arc<dyn Fn(TileControlMessage) + Send + Sync>;
+
+pub fn noop_tile_control_handler() -> TileControlHandler {
+    Arc::new(|_| {})
+}
+
 /// D-3b: Tile-stream data-channel labels.
 ///
 /// Browser-side `PeerDisplayConnection` creates these channels before
@@ -1575,6 +1603,7 @@ impl WebRtcPeer {
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         authority_handler: AuthorityChannelHandler,
+        tile_control_handler: TileControlHandler,
         _ice_tx: mpsc::Sender<(PeerId, String)>,
         keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     ) -> Result<(Self, mpsc::Sender<OutboundEncodedFrame>, String), CallerError> {
@@ -1980,6 +2009,7 @@ impl WebRtcPeer {
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             keyframe_request_tx,
             observed_send_bitrate_tx,
             remote_inbound_health_tx,
@@ -2045,6 +2075,7 @@ impl WebRtcPeer {
         input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         authority_handler: AuthorityChannelHandler,
+        tile_control_handler: TileControlHandler,
         ice_tx: mpsc::Sender<(PeerId, String)>,
         pool: Arc<EncoderPool>,
         subscriptions: Vec<EncoderSubscription>,
@@ -2214,6 +2245,7 @@ impl WebRtcPeer {
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             ice_tx,
             keyframe_request_tx,
         )
@@ -2531,6 +2563,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     authority_handler: AuthorityChannelHandler,
+    tile_control_handler: TileControlHandler,
     keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     observed_send_bitrate_tx: watch::Sender<Option<u64>>,
     remote_inbound_health_tx: watch::Sender<HashMap<SimulcastRid, PeerLayerHealth>>,
@@ -2687,6 +2720,7 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
             &input_handler,
             &clipboard_handler,
             &authority_handler,
+            &tile_control_handler,
             &keyframe_request_tx,
         )
         .await
@@ -2961,6 +2995,7 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     authority_handler: &AuthorityChannelHandler,
+    tile_control_handler: &TileControlHandler,
     keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) -> Result<Instant, DriverExit> {
     while let Some(t) = rtc.poll_write() {
@@ -3016,6 +3051,7 @@ async fn drain_outputs<I: rtc::interceptor::Interceptor>(
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             keyframe_request_tx,
         );
     }
@@ -3403,6 +3439,7 @@ fn handle_message(
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
     authority_handler: &AuthorityChannelHandler,
+    tile_control_handler: &TileControlHandler,
     keyframe_request_tx: &mpsc::Sender<SimulcastRid>,
 ) {
     if let RTCMessage::RtcpPacket(_track_id, packets) = &message {
@@ -3451,6 +3488,11 @@ fn handle_message(
                 if let Some(msg) = parse_authority_channel_message(text) {
                     authority_handler(msg);
                 }
+            }
+        }
+        Some(label) if label == TILE_CONTROL_CHANNEL_LABEL => {
+            if let Some(msg) = parse_tile_control_message(&data) {
+                tile_control_handler(msg);
             }
         }
         _ => {}
@@ -3792,6 +3834,27 @@ fn parse_authority_channel_message(text: &str) -> Option<AuthorityChannelMessage
         "display_input_authority_release" => {
             Some(AuthorityChannelMessage::Release { display_id })
         }
+        _ => None,
+    }
+}
+
+fn parse_tile_control_message(bytes: &[u8]) -> Option<TileControlMessage> {
+    match tile_transport::decode_frame(bytes).ok()? {
+        tile_transport::TileFrame::Subscribe { client_id } => {
+            Some(TileControlMessage::Subscribe { client_id })
+        }
+        tile_transport::TileFrame::SnapshotRequest { epoch, reason } => {
+            Some(TileControlMessage::SnapshotRequest { epoch, reason })
+        }
+        tile_transport::TileFrame::GapReport {
+            epoch,
+            last_seen_seq,
+            expected_seq,
+        } => Some(TileControlMessage::GapReport {
+            epoch,
+            last_seen_seq,
+            expected_seq,
+        }),
         _ => None,
     }
 }
@@ -5681,6 +5744,7 @@ mod tests {
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
+        let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -5695,6 +5759,7 @@ mod tests {
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             ice_tx,
             kf_tx,
         )
@@ -5797,6 +5862,7 @@ mod tests {
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
+        let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -5811,6 +5877,7 @@ mod tests {
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             ice_tx,
             kf_tx,
         )
@@ -5854,6 +5921,7 @@ mod tests {
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
+        let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -5868,6 +5936,7 @@ mod tests {
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             ice_tx,
             kf_tx,
         )
@@ -5910,6 +5979,7 @@ mod tests {
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
+        let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -5924,6 +5994,7 @@ mod tests {
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             ice_tx,
             kf_tx,
         )
@@ -6624,6 +6695,7 @@ mod tests {
         let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
             Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
+        let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
         let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
 
@@ -6638,6 +6710,7 @@ mod tests {
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             ice_tx,
             kf_tx,
         )
@@ -6905,6 +6978,60 @@ mod tests {
             r#"{ "display_id": 0 }"#,
         )
         .is_none());
+    }
+
+    #[test]
+    fn parse_tile_control_message_round_trip() {
+        let subscribe = tile_transport::encode_frame(&tile_transport::TileFrame::Subscribe {
+            client_id: 99,
+        })
+        .unwrap();
+        assert_eq!(
+            parse_tile_control_message(&subscribe),
+            Some(TileControlMessage::Subscribe { client_id: 99 })
+        );
+
+        let snapshot = tile_transport::encode_frame(
+            &tile_transport::TileFrame::SnapshotRequest {
+                epoch: 7,
+                reason: tile_transport::SnapshotRequestReason::Gap,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            parse_tile_control_message(&snapshot),
+            Some(TileControlMessage::SnapshotRequest {
+                epoch: 7,
+                reason: tile_transport::SnapshotRequestReason::Gap,
+            })
+        );
+
+        let gap = tile_transport::encode_frame(&tile_transport::TileFrame::GapReport {
+            epoch: 3,
+            last_seen_seq: 10,
+            expected_seq: 14,
+        })
+        .unwrap();
+        assert_eq!(
+            parse_tile_control_message(&gap),
+            Some(TileControlMessage::GapReport {
+                epoch: 3,
+                last_seen_seq: 10,
+                expected_seq: 14,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_tile_control_message_rejects_non_control_frames() {
+        let update = tile_transport::encode_frame(&tile_transport::TileFrame::TileUpdate {
+            epoch: 1,
+            seq: 1,
+            records: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(parse_tile_control_message(&update), None);
+        assert_eq!(parse_tile_control_message(b"not tile wire"), None);
     }
 
     /// `drain_pending_authority_for_label` is a no-op (returns empty,

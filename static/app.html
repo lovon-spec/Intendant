@@ -12644,6 +12644,10 @@ const TILE_FRAME_SUBSCRIBE = 0x10;
 const TILE_FRAME_SNAPSHOT_REQUEST = 0x11;
 const TILE_FRAME_GAP_REPORT = 0x12;
 const TILE_FRAME_ERROR = 0xff;
+const TILE_SNAPSHOT_REASON_STARTUP = 0;
+const TILE_SNAPSHOT_REASON_RESIZE = 1;
+const TILE_SNAPSHOT_REASON_GAP = 2;
+const TILE_SNAPSHOT_REASON_MANUAL = 3;
 
 class TileWireReader {
   constructor(bytes) {
@@ -12821,8 +12825,31 @@ function encodeTileSubscribeFrame(clientId) {
   return buf;
 }
 
+function encodeTileSnapshotRequestFrame(epoch, reason) {
+  const buf = new ArrayBuffer(9);
+  const v = new DataView(buf);
+  v.setUint8(0, TILE_WIRE_VERSION);
+  v.setUint8(1, TILE_FRAME_SNAPSHOT_REQUEST);
+  v.setUint16(2, 0, true); // flags
+  v.setUint32(4, epoch >>> 0, true);
+  v.setUint8(8, reason & 0xff);
+  return buf;
+}
+
+function encodeTileGapReportFrame(epoch, lastSeenSeq, expectedSeq) {
+  const buf = new ArrayBuffer(16);
+  const v = new DataView(buf);
+  v.setUint8(0, TILE_WIRE_VERSION);
+  v.setUint8(1, TILE_FRAME_GAP_REPORT);
+  v.setUint16(2, 0, true); // flags
+  v.setUint32(4, epoch >>> 0, true);
+  v.setUint32(8, lastSeenSeq >>> 0, true);
+  v.setUint32(12, expectedSeq >>> 0, true);
+  return buf;
+}
+
 class TileCompositor {
-  constructor(container, { tileSize, gridW, gridH }) {
+  constructor(container, { tileSize, gridW, gridH, sendControlFrame = null }) {
     this.container = container;
     this.frameEl = document.createElement('div');
     this.frameEl.className = 'tile-compositor-frame';
@@ -12847,6 +12874,10 @@ class TileCompositor {
     this.gridW = gridW;
     this.gridH = gridH;
     this.epoch = 0;
+    this.lastSeenSeq = null;
+    this.lastGapReportKey = null;
+    this.sendControlFrame =
+      typeof sendControlFrame === 'function' ? sendControlFrame : null;
     // tileMap key: (tile_y << 16) | tile_x ; value: { epoch, seq }
     this.tileMap = new Map();
     // snapshotChunkBuffers key: snapshot_id ; value: { chunks Map, expected, ... }
@@ -12859,6 +12890,8 @@ class TileCompositor {
       tilesDroppedStaleEpoch: 0,
       tilesDroppedStaleSeq: 0,
       gapDetections: 0,
+      gapReportsSent: 0,
+      snapshotRequestsSent: 0,
       resizes: 0,
     };
   }
@@ -12877,7 +12910,9 @@ class TileCompositor {
         break;
       case 'epoch_advance':
         this.epoch = frame.new_epoch;
+        this.lastSeenSeq = null;
         this.tileMap.clear();
+        this._sendSnapshotRequest(TILE_SNAPSHOT_REASON_GAP);
         break;
       case 'fallback_to_video':
         this.onFallbackToVideo(frame);
@@ -12940,6 +12975,7 @@ class TileCompositor {
     this.ctx.fillStyle = '#222';
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     this.epoch = buf.epoch;
+    this.lastSeenSeq = null;
     this.tileMap.clear();
     // Apply chunks in chunk_index order so tile-record dependencies
     // (none today, but design preserves ordering) are deterministic.
@@ -12960,11 +12996,8 @@ class TileCompositor {
       return;
     }
     if (frame.epoch > this.epoch) {
-      // In real D-3 this would emit GapReport / SnapshotRequest.
-      // For D-2 we just count and warn — the synthetic stream is
-      // expected to immediately follow an EpochAdvance with a
-      // matching snapshot, so we shouldn't see this in normal flow.
       this.metrics.gapDetections++;
+      this._sendSnapshotRequest(TILE_SNAPSHOT_REASON_GAP);
       console.warn(
         '[tile-compositor] TileUpdate from epoch',
         frame.epoch,
@@ -12973,6 +13006,13 @@ class TileCompositor {
         '— dropping; expecting snapshot',
       );
       return;
+    }
+    if (this.lastSeenSeq !== null && frame.seq > this.lastSeenSeq + 1) {
+      this.metrics.gapDetections++;
+      this._sendGapReport(this.lastSeenSeq, frame.seq);
+    }
+    if (this.lastSeenSeq === null || frame.seq > this.lastSeenSeq) {
+      this.lastSeenSeq = frame.seq;
     }
     for (const r of frame.records) {
       const key = (r.tile_y << 16) | r.tile_x;
@@ -12993,18 +13033,18 @@ class TileCompositor {
     this.gridH = grid_h_tiles;
     this.tileSize = tile_size_px;
     this.epoch = new_epoch;
+    this.lastSeenSeq = null;
     this.tileMap.clear();
     this.ctx.fillStyle = '#222';
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     this.metrics.resizes++;
-    // Real client emits SnapshotRequest here. In D-2 the synthetic
-    // stream is the source of resize events and emits the followup
-    // snapshot itself.
+    this._sendSnapshotRequest(TILE_SNAPSHOT_REASON_RESIZE);
   }
 
   onFallbackToVideo({ new_epoch }) {
     if (new_epoch >= this.epoch) {
       this.epoch = new_epoch;
+      this.lastSeenSeq = null;
       this.tileMap.clear();
       this.snapshotChunkBuffers.clear();
     }
@@ -13015,12 +13055,30 @@ class TileCompositor {
   onFallbackToTile({ new_epoch }) {
     if (new_epoch >= this.epoch) {
       this.epoch = new_epoch;
+      this.lastSeenSeq = null;
       this.tileMap.clear();
       this.snapshotChunkBuffers.clear();
     }
     this.ctx.fillStyle = '#222';
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     this._showTileSurface();
+  }
+
+  _sendSnapshotRequest(reason) {
+    if (!this.sendControlFrame) return;
+    this.metrics.snapshotRequestsSent++;
+    this.sendControlFrame(encodeTileSnapshotRequestFrame(this.epoch, reason));
+  }
+
+  _sendGapReport(lastSeenSeq, expectedSeq) {
+    if (!this.sendControlFrame) return;
+    const key = `${this.epoch}:${lastSeenSeq}:${expectedSeq}`;
+    if (key === this.lastGapReportKey) return;
+    this.lastGapReportKey = key;
+    this.metrics.gapReportsSent++;
+    this.sendControlFrame(
+      encodeTileGapReportFrame(this.epoch, lastSeenSeq, expectedSeq),
+    );
   }
 
   onCursorState(frame) {
@@ -14275,6 +14333,7 @@ class PeerDisplayConnection {
             tileSize: parsed.tile_size_px,
             gridW: parsed.grid_w_tiles,
             gridH: parsed.grid_h_tiles,
+            sendControlFrame: (bytes) => this._sendTileControlFrame(bytes),
           },
         );
         const video = container.querySelector('.peer-display-video');
@@ -14285,6 +14344,15 @@ class PeerDisplayConnection {
     } catch (err) {
       this._log('warn', `${label} tile frame failed: ${err.message}`);
     }
+  }
+
+  _sendTileControlFrame(bytes) {
+    if (!this.tileControlChannel || this.tileControlChannel.readyState !== 'open') {
+      this._log('debug', 'tile-control frame dropped before channel open');
+      return false;
+    }
+    this.tileControlChannel.send(bytes);
+    return true;
   }
 
   // F-1.3c: peer-side authority state callback. Called from the

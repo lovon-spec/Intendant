@@ -673,6 +673,28 @@ async fn send_tile_control_to_peers(
     }
 }
 
+async fn send_latest_tile_snapshot_to_peer_id(
+    peers: Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
+    latest_frame: Arc<RwLock<Option<Arc<Frame>>>>,
+    tile_epoch: Arc<AtomicU32>,
+    tile_snapshot_id: Arc<AtomicU32>,
+    peer_id: PeerId,
+    context: &'static str,
+) {
+    let peer = peers.read().await.get(&peer_id).cloned();
+    let Some(peer) = peer else {
+        return;
+    };
+    let frame = latest_frame.read().await.clone();
+    let Some(frame) = frame else {
+        eprintln!("[display/tile] {context}: no latest frame available for snapshot");
+        return;
+    };
+    let epoch = tile_epoch.load(Ordering::Relaxed);
+    let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
+    send_tile_snapshot_to_peer(peer, frame, epoch, snapshot_id).await;
+}
+
 async fn tile_subscriber_peer_handles(
     peers: &Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
     subscribers: &Arc<RwLock<HashSet<PeerId>>>,
@@ -1206,6 +1228,96 @@ impl DisplaySession {
         self.tile_subscribers.write().await.remove(&peer_id);
     }
 
+    fn build_tile_control_handler(&self, peer_id: PeerId) -> self::webrtc::TileControlHandler {
+        let peers = Arc::clone(&self.peers);
+        let subscribers = Arc::clone(&self.tile_subscribers);
+        let latest_frame = Arc::clone(&self.latest_frame);
+        let tile_epoch = Arc::clone(&self.tile_epoch);
+        let tile_snapshot_id = Arc::clone(&self.tile_snapshot_id);
+        let tile_replay = Arc::clone(&self.tile_replay);
+
+        Arc::new(move |msg| {
+            let peers = Arc::clone(&peers);
+            let subscribers = Arc::clone(&subscribers);
+            let latest_frame = Arc::clone(&latest_frame);
+            let tile_epoch = Arc::clone(&tile_epoch);
+            let tile_snapshot_id = Arc::clone(&tile_snapshot_id);
+            let tile_replay = Arc::clone(&tile_replay);
+
+            tokio::spawn(async move {
+                match msg {
+                    self::webrtc::TileControlMessage::Subscribe { .. } => {
+                        subscribers.write().await.insert(peer_id);
+                        send_latest_tile_snapshot_to_peer_id(
+                            peers,
+                            latest_frame,
+                            tile_epoch,
+                            tile_snapshot_id,
+                            peer_id,
+                            "subscribe",
+                        )
+                        .await;
+                    }
+                    self::webrtc::TileControlMessage::SnapshotRequest { .. } => {
+                        send_latest_tile_snapshot_to_peer_id(
+                            peers,
+                            latest_frame,
+                            tile_epoch,
+                            tile_snapshot_id,
+                            peer_id,
+                            "snapshot-request",
+                        )
+                        .await;
+                    }
+                    self::webrtc::TileControlMessage::GapReport {
+                        epoch,
+                        last_seen_seq,
+                        expected_seq,
+                    } => {
+                        let decision = {
+                            let mut replay = tile_replay.write().await;
+                            replay.replay_gap(
+                                epoch,
+                                last_seen_seq,
+                                expected_seq,
+                                Instant::now(),
+                            )
+                        };
+                        match decision {
+                            tile::recovery::ReplayDecision::Frames(frames) => {
+                                let peer = peers.read().await.get(&peer_id).cloned();
+                                let Some(peer) = peer else {
+                                    return;
+                                };
+                                for frame in frames {
+                                    if let Err(e) =
+                                        peer.send_tile_delta_frame(frame.bytes).await
+                                    {
+                                        eprintln!(
+                                            "[display/tile] gap replay send failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            tile::recovery::ReplayDecision::SnapshotRequired => {
+                                send_latest_tile_snapshot_to_peer_id(
+                                    peers,
+                                    latest_frame,
+                                    tile_epoch,
+                                    tile_snapshot_id,
+                                    peer_id,
+                                    "gap-recovery",
+                                )
+                                .await;
+                            }
+                            tile::recovery::ReplayDecision::NoGap => {}
+                        }
+                    }
+                }
+            });
+        })
+    }
+
     /// Encode the latest frame as a PNG screenshot.
     pub async fn screenshot(&self) -> Result<Vec<u8>, CallerError> {
         let frame = self
@@ -1405,6 +1517,7 @@ impl DisplaySession {
                     }
                 });
             });
+        let tile_control_handler = self.build_tile_control_handler(peer_id);
 
         // Per-peer forwarder drops feed the session's `peer_drops`
         // counter so `DisplayMetricsSnapshot.peer_drops` reflects
@@ -1420,6 +1533,7 @@ impl DisplaySession {
             input_handler,
             clipboard_handler,
             authority_handler,
+            tile_control_handler,
             ice_tx,
             Arc::clone(pool),
             subs,
