@@ -19,5 +19,6 @@
 
 pub mod grid;
 pub mod encode;
+pub mod policy;
 pub mod synthetic_dirty;
 pub mod transport;
