@@ -590,6 +590,13 @@ html, body {
   border-radius: 3px;
   object-fit: contain;
 }
+.tile-compositor-canvas {
+  width: 100%;
+  max-height: 480px;
+  background: black;
+  border-radius: 3px;
+  object-fit: contain;
+}
 .peer-display-controls {
   display: flex;
   align-items: center;
@@ -12783,6 +12790,16 @@ function parseTileWireFrame(bytes) {
   return frame;
 }
 
+function encodeTileSubscribeFrame(clientId) {
+  const buf = new ArrayBuffer(8);
+  const v = new DataView(buf);
+  v.setUint8(0, TILE_WIRE_VERSION);
+  v.setUint8(1, TILE_FRAME_SUBSCRIBE);
+  v.setUint16(2, 0, true); // flags
+  v.setUint32(4, clientId >>> 0, true);
+  return buf;
+}
+
 class TileCompositor {
   constructor(container, { tileSize, gridW, gridH }) {
     this.canvas = document.createElement('canvas');
@@ -12791,7 +12808,12 @@ class TileCompositor {
       'display:block; image-rendering:pixelated; background:#222;';
     this.canvas.width = tileSize * gridW;
     this.canvas.height = tileSize * gridH;
-    container.appendChild(this.canvas);
+    const controls = container.querySelector && container.querySelector('.peer-display-controls');
+    if (controls) {
+      container.insertBefore(this.canvas, controls);
+    } else {
+      container.appendChild(this.canvas);
+    }
     this.ctx = this.canvas.getContext('2d', { alpha: false, willReadFrequently: true });
     this.tileSize = tileSize;
     this.gridW = gridW;
@@ -13937,7 +13959,13 @@ class PeerDisplayConnection {
       ['tile-deltas', this.tileDeltasChannel],
     ]) {
       channel.binaryType = 'arraybuffer';
-      channel.onopen = () => this._log('info', `${label} data channel open`);
+      channel.onopen = () => {
+        this._log('info', `${label} data channel open`);
+        if (label === 'tile-control') {
+          const clientId = Math.floor(Math.random() * 0xffffffff) >>> 0;
+          channel.send(encodeTileSubscribeFrame(clientId));
+        }
+      };
       channel.onclose = () => this._log('debug', `${label} data channel closed`);
       channel.onmessage = (e) => this._handleTileWireMessage(label, e);
     }
@@ -14146,12 +14174,23 @@ class PeerDisplayConnection {
         data = await data.arrayBuffer();
       }
       if (!this.tileCompositor) {
-        // D-3b only negotiates the channels. D-3c attaches the real
-        // compositor; until then, parse for early protocol smoke and
-        // drop successfully parsed frames.
         const parsed = parseTileWireFrame(data);
-        this._log('debug', `${label} tile frame received before compositor: ${parsed.type}`);
-        return;
+        if (parsed.type !== 'snapshot_chunk') {
+          this._log('debug', `${label} tile frame before snapshot: ${parsed.type}`);
+          return;
+        }
+        const container = document.getElementById(`peer-display-${this.hostId}`);
+        if (!container) return;
+        this.tileCompositor = new TileCompositor(
+          container.querySelector('.peer-display-pane') || container,
+          {
+            tileSize: parsed.tile_size_px,
+            gridW: parsed.grid_w_tiles,
+            gridH: parsed.grid_h_tiles,
+          },
+        );
+        const video = container.querySelector('.peer-display-video');
+        if (video) video.style.display = 'none';
       }
       const parsed = this.tileCompositor.onWireFrame(data);
       this._log('debug', `${label} tile frame applied: ${parsed.type}`);

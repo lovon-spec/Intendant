@@ -19,8 +19,8 @@
 //! - Per-peer encoded frame queue: `mpsc(8)`, encoder drops via `try_send`.
 //! - `latest_frame`: always overwritten, latest-wins.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -448,6 +448,18 @@ pub struct DisplaySession {
     /// BGRA→I420 conversion and `pool.push_i420_frame` loop. Drained
     /// on `stop()` for deterministic teardown ordering.
     pool_feed_bridge_handle: Mutex<Option<JoinHandle<()>>>,
+    /// D-3c: federated peers that opted into dirty-region tile
+    /// streaming. Local DisplaySlot peers do not create tile data
+    /// channels yet, so subscribers are registered explicitly by the
+    /// federated offer path instead of inferred from `peers`.
+    tile_subscribers: Arc<RwLock<HashSet<PeerId>>>,
+    /// D-3c: capture-damage-to-tile bridge task. Sends initial
+    /// snapshots and XDamage-driven tile updates to `tile_subscribers`
+    /// over WebRTC data channels while leaving the VP8 video track alive
+    /// as the current fallback.
+    tile_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    tile_epoch: Arc<AtomicU32>,
+    tile_snapshot_id: Arc<AtomicU32>,
     /// **Phase 0 visual-freshness diagnostic marker.** When `true`, the
     /// pool-feed bridge stamps a 32-bit binary timestamp into the top-left
     /// 128×64 px of each I420 Y plane before forwarding it to the encoder
@@ -520,6 +532,132 @@ fn convert_for_pool_feed(
     encode::bgra_to_i420(bgra, width, height, stride)
 }
 
+const TILE_STREAM_TILE_SIZE_PX: u16 = 64;
+
+fn tile_pixel_format(format: FrameFormat) -> tile::encode::TilePixelFormat {
+    match format {
+        FrameFormat::Bgra => tile::encode::TilePixelFormat::Bgra,
+        FrameFormat::Rgba => tile::encode::TilePixelFormat::Rgba,
+    }
+}
+
+fn tile_grid_for_frame(frame: &Frame) -> Option<tile::grid::TileGrid> {
+    tile::grid::TileGrid::new(frame.width, frame.height, TILE_STREAM_TILE_SIZE_PX)
+}
+
+fn all_tile_ids(grid: &tile::grid::TileGrid) -> Vec<tile::grid::TileId> {
+    let mut out = Vec::with_capacity(grid.total_tiles());
+    for y in 0..grid.height_tiles {
+        for x in 0..grid.width_tiles {
+            out.push(tile::grid::TileId::new(x, y));
+        }
+    }
+    out
+}
+
+fn encode_tile_records(
+    frame: &Frame,
+    tiles: Vec<tile::grid::TileId>,
+) -> Result<Vec<tile::transport::TileRecord>, tile::encode::TileEncodeError> {
+    let src = tile::encode::TileSource {
+        data: &frame.data,
+        width: frame.width,
+        height: frame.height,
+        stride: frame.stride,
+        format: tile_pixel_format(frame.format),
+        tile_size_px: TILE_STREAM_TILE_SIZE_PX,
+    };
+    tiles
+        .into_iter()
+        .map(|tile| tile::encode::encode_tile(&src, tile))
+        .collect()
+}
+
+fn make_damage_backend(width: u32, height: u32) -> Box<dyn capture::damage::DamageBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        match capture::x11_damage::X11DamageBackend::new(&display) {
+            Ok(backend) => {
+                eprintln!("[display/tile] XDamage backend enabled on DISPLAY={display}");
+                return Box::new(backend);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[display/tile] XDamage unavailable on DISPLAY={display}: {e}; \
+                     tile stream will snapshot-only until a damage backend is available"
+                );
+            }
+        }
+    }
+
+    Box::new(capture::damage::NullDamageBackend::new(width, height))
+}
+
+async fn send_tile_snapshot_to_peer(
+    peer: Arc<webrtc::WebRtcPeer>,
+    frame: Arc<Frame>,
+    epoch: u32,
+    snapshot_id: u32,
+) {
+    let Some(grid) = tile_grid_for_frame(&frame) else {
+        return;
+    };
+    let encode_result = tokio::task::spawn_blocking({
+        let frame = Arc::clone(&frame);
+        move || {
+            let records = encode_tile_records(&frame, all_tile_ids(&grid))?;
+            Ok::<_, tile::encode::TileEncodeError>((grid, records))
+        }
+    })
+    .await;
+
+    let Ok(Ok((grid, records))) = encode_result else {
+        eprintln!("[display/tile] snapshot tile encode failed");
+        return;
+    };
+
+    let frames = match tile::transport::pack_snapshot_chunks(
+        epoch,
+        snapshot_id,
+        grid.width_tiles,
+        grid.height_tiles,
+        grid.tile_size_px,
+        records,
+    ) {
+        Ok(frames) => frames,
+        Err(e) => {
+            eprintln!("[display/tile] snapshot pack failed: {e}");
+            return;
+        }
+    };
+
+    for frame in frames {
+        match tile::transport::encode_frame(&frame) {
+            Ok(bytes) => {
+                if let Err(e) = peer.send_tile_snapshot_frame(bytes).await {
+                    eprintln!("[display/tile] send snapshot failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("[display/tile] snapshot wire encode failed: {e}"),
+        }
+    }
+}
+
+async fn tile_subscriber_peer_handles(
+    peers: &Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
+    subscribers: &Arc<RwLock<HashSet<PeerId>>>,
+) -> Vec<Arc<webrtc::WebRtcPeer>> {
+    let ids: Vec<PeerId> = subscribers.read().await.iter().copied().collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let peers = peers.read().await;
+    ids.into_iter()
+        .filter_map(|id| peers.get(&id).cloned())
+        .collect()
+}
+
 impl DisplaySession {
     /// Create a new display session.  Does NOT start capture -- call `start()`.
     pub fn new(display_id: u32, backend: Arc<dyn DisplayBackend>) -> Self {
@@ -539,6 +677,10 @@ impl DisplaySession {
             pool_feed_keyframe_tx: Mutex::new(None),
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
+            tile_subscribers: Arc::new(RwLock::new(HashSet::new())),
+            tile_stream_handle: Mutex::new(None),
+            tile_epoch: Arc::new(AtomicU32::new(1)),
+            tile_snapshot_id: Arc::new(AtomicU32::new(1)),
             diagnostics_visual_marker: Arc::new(AtomicBool::new(false)),
             session_epoch: Instant::now(),
             layer_policy_handle: Mutex::new(None),
@@ -734,6 +876,7 @@ impl DisplaySession {
         // [`Self::spawn_pool_feed_bridge`] for the rationale.
         self.spawn_pool_feed_bridge(Arc::clone(&pool_arc), fps, event_bus_for_encoder)
             .await;
+        self.spawn_tile_stream_bridge(fps).await;
 
         // 4d.3b: spawn the single layer-policy coordinator. One task
         // owns `pool.pause_layer` / `pool.resume_layer` decisions
@@ -983,6 +1126,9 @@ impl DisplaySession {
         if let Some(h) = self.pool_feed_bridge_handle.lock().await.take() {
             let _ = h.await;
         }
+        if let Some(h) = self.tile_stream_handle.lock().await.take() {
+            let _ = h.await;
+        }
         // 4d.3b: layer-policy coordinator observes the same
         // `shutdown` token and exits its tick loop on its own. Take
         // + await for deterministic teardown ordering (parity with
@@ -1006,6 +1152,28 @@ impl DisplaySession {
     /// Get the most recently captured frame, or `None` if no frame yet.
     pub async fn latest_frame(&self) -> Option<Arc<Frame>> {
         self.latest_frame.read().await.clone()
+    }
+
+    /// D-3c: register a federated WebRtcPeer for tile streaming and
+    /// queue/send an initial snapshot when a captured frame is already
+    /// available. Local DisplaySlot peers are not registered in D-3.
+    pub async fn register_tile_subscriber(&self, peer_id: PeerId) {
+        self.tile_subscribers.write().await.insert(peer_id);
+        let Some(peer) = self.get_peer(peer_id).await else {
+            return;
+        };
+        let Some(frame) = self.latest_frame().await else {
+            return;
+        };
+        let epoch = self.tile_epoch.load(Ordering::Relaxed);
+        let snapshot_id = self.tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
+        send_tile_snapshot_to_peer(peer, frame, epoch, snapshot_id).await;
+    }
+
+    /// D-3c: unregister a tile subscriber. Safe to call even when the
+    /// peer was never registered.
+    pub async fn unregister_tile_subscriber(&self, peer_id: PeerId) {
+        self.tile_subscribers.write().await.remove(&peer_id);
     }
 
     /// Encode the latest frame as a PNG screenshot.
@@ -1298,6 +1466,139 @@ impl DisplaySession {
         if let Some(tx) = self.pool_feed_keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
         }
+    }
+
+    async fn spawn_tile_stream_bridge(&self, _fps: u32) {
+        if self.tile_stream_handle.lock().await.is_some() {
+            return;
+        }
+
+        let mut broadcast_rx = self.frame_tx.subscribe();
+        let peers = Arc::clone(&self.peers);
+        let subscribers = Arc::clone(&self.tile_subscribers);
+        let shutdown = self.shutdown.clone();
+        let tile_epoch = Arc::clone(&self.tile_epoch);
+        let tile_snapshot_id = Arc::clone(&self.tile_snapshot_id);
+        let display_id = self.display_id;
+        let (initial_w, initial_h) = self.backend.resolution();
+
+        let task = tokio::spawn(async move {
+            let mut damage = make_damage_backend(initial_w, initial_h);
+            let mut grid: Option<tile::grid::TileGrid> = None;
+            let mut seq: u32 = 1;
+
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    result = broadcast_rx.recv() => {
+                        let frame = match result {
+                            Ok(frame) => frame,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
+
+                        let Some(next_grid) = tile_grid_for_frame(&frame) else {
+                            continue;
+                        };
+
+                        let peers_now = tile_subscriber_peer_handles(&peers, &subscribers).await;
+                        if peers_now.is_empty() {
+                            grid = Some(next_grid);
+                            continue;
+                        }
+
+                        let resized = grid.map_or(true, |g| g != next_grid);
+                        if resized {
+                            let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                            seq = 1;
+                            grid = Some(next_grid);
+                            let resize = tile::transport::TileFrame::Resize {
+                                new_epoch: epoch,
+                                grid_w_tiles: next_grid.width_tiles,
+                                grid_h_tiles: next_grid.height_tiles,
+                                tile_size_px: next_grid.tile_size_px,
+                            };
+                            match tile::transport::encode_frame(&resize) {
+                                Ok(bytes) => {
+                                    for peer in &peers_now {
+                                        if let Err(e) = peer.send_tile_control_frame(bytes.clone()).await {
+                                            eprintln!("[display/tile] resize send failed: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("[display/tile] resize encode failed: {e}"),
+                            }
+                            let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
+                            for peer in peers_now {
+                                send_tile_snapshot_to_peer(
+                                    peer,
+                                    Arc::clone(&frame),
+                                    epoch,
+                                    snapshot_id,
+                                ).await;
+                            }
+                            continue;
+                        }
+
+                        let rects = match damage.poll_damage() {
+                            Ok(rects) => rects,
+                            Err(e) => {
+                                eprintln!(
+                                    "[display/tile] display {display_id} damage poll failed: {e}"
+                                );
+                                Vec::new()
+                            }
+                        };
+                        if rects.is_empty() {
+                            continue;
+                        }
+
+                        let dirty: Vec<_> = next_grid.dirty_tiles(&rects).into_iter().collect();
+                        if dirty.is_empty() {
+                            continue;
+                        }
+                        let epoch = tile_epoch.load(Ordering::Relaxed);
+                        let encode_result = tokio::task::spawn_blocking({
+                            let frame = Arc::clone(&frame);
+                            move || encode_tile_records(&frame, dirty)
+                        }).await;
+
+                        let Ok(Ok(records)) = encode_result else {
+                            eprintln!("[display/tile] update tile encode failed");
+                            continue;
+                        };
+
+                        let frames = match tile::transport::pack_tile_updates(epoch, seq, records) {
+                            Ok(frames) => frames,
+                            Err(e) => {
+                                eprintln!("[display/tile] update pack failed: {e}");
+                                continue;
+                            }
+                        };
+                        seq = seq.wrapping_add(frames.len() as u32);
+
+                        let mut encoded = Vec::with_capacity(frames.len());
+                        for frame in frames {
+                            match tile::transport::encode_frame(&frame) {
+                                Ok(bytes) => encoded.push(bytes),
+                                Err(e) => eprintln!("[display/tile] update wire encode failed: {e}"),
+                            }
+                        }
+
+                        let peers_now = tile_subscriber_peer_handles(&peers, &subscribers).await;
+                        for peer in peers_now {
+                            for bytes in &encoded {
+                                if let Err(e) = peer.send_tile_delta_frame(bytes.clone()).await {
+                                    eprintln!("[display/tile] delta send failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        *self.tile_stream_handle.lock().await = Some(task);
     }
 
     /// Spawn the pool-feed bridge — the BGRA→I420 conversion task that
@@ -1715,6 +2016,7 @@ impl DisplaySession {
 
     /// Remove and close a peer.
     pub async fn remove_peer(&self, peer_id: PeerId) {
+        self.unregister_tile_subscriber(peer_id).await;
         if let Some(peer) = self.peers.write().await.remove(&peer_id) {
             self.counters.peer_count.fetch_sub(1, Ordering::Relaxed);
             peer.close().await;

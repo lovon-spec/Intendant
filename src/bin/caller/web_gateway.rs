@@ -8043,6 +8043,12 @@ async fn handle_federated_webrtc_signal(
                             Arc::clone(&federated_authority_subscribers),
                         );
                     }
+                    // D-3c: federated PeerDisplayConnection creates
+                    // tile-stream data channels; local DisplaySlot
+                    // peers do not. Register only this federated peer
+                    // so snapshots/updates are not queued forever on
+                    // local peers without tile channels.
+                    session.register_tile_subscriber(peer_id).await;
                     let answer = crate::types::OutboundEvent::WebRtcSignal {
                         display_id,
                         session_id: session_id.clone(),
