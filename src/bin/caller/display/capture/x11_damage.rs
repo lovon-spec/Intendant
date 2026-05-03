@@ -25,7 +25,7 @@
 //! Damage subscriptions on the same drawable.
 
 use super::damage::{DamageBackend, DamageCapability, DamageError, Rect};
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::damage::{self, ConnectionExt as DamageExt, ReportLevel};
 use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesExt};
 use x11rb::protocol::Event;
