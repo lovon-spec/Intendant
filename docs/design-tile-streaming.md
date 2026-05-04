@@ -480,6 +480,22 @@ D-1 ships X11 only on the source side. The `DamageBackend` trait + `DamageCapabi
 | **D-4** | `tile/policy.rs` enabled (real fallback) + `FallbackToVideo`/`FallbackToTile` control messages + browser canvas/video toggle + WebP encoding (entropy-dispatched) + `GapReport` + ringbuffer recovery + explicit backpressure metrics/watermarks + Wayland/macOS frame-diff backend. Optional VP8-intra encoding gated behind a feature flag if browser support proves out. | Switching workloads on the peer (idle ↔ window drag ↔ video playback) triggers visible mode transitions; transitions stay below 1/sec under normal load. Snapshot recovery works after simulated channel drop. WebP encoded tiles render correctly when entropy threshold trips. |
 | **D-5** | Visual-freshness comparison runs (q baseline / VP8-f baseline / tile-mode at full res) using the §9 harness. Use the `INTENDANT_DIAG=1` env hook + the run-script pattern from this session. Tune `ENTER_VIDEO_THRESHOLD`, `EXIT_VIDEO_THRESHOLD`, `MIN_DWELL_MS`, `MAX_DATACHANNEL_MESSAGE_SIZE`, watermark constants based on D-4 measurements. | Tile-mode passes #80 at full resolution: p50 ≤ 200ms, p95 ≤ 500ms, no freeze >1s, fps ≥ 15. **Tile-mode beats VP8-q on subjective usability (cursor latency, scroll latency, text editor responsiveness) while preserving VP8-q as the fallback baseline** — no regression to authority/input/federation work. smoke-display.md §9.5 updated with the comparison table. |
 
+## Post-D5 Product Hardening
+
+D-5 proved the X11 tile stream can satisfy the full-resolution freshness
+bar. The remaining work is product hardening: make the path robust across
+platforms and failure modes before treating tiles as the default display
+experience everywhere.
+
+| track | scope | success signal |
+|---|---|---|
+| **W-0/W-1: Wayland compatibility** | Run tile mode on the GNOME Wayland peer. Native Wayland should use the frame-diff damage path first; do not accidentally select XDamage from Xwayland. Portal approval may remain manual for the smoke. | Wayland peer reaches live full-resolution tile rendering after portal approval, or produces a clear portal/permission blocker with logs. |
+| **M-0: macOS compatibility** | Decide whether ScreenCaptureKit exposes useful dirty rects. If not, use the same frame-diff fallback as Wayland. | macOS local DisplaySlot can run tile mode without losing the existing H.264 baseline. |
+| **Defaulting and policy** | Decide when the dashboard should prefer tile canvas vs VP8-q video. Preserve VP8-q as fallback for high-motion or unsupported platforms. | Normal desktop work opens in full-resolution tile mode; high-motion content falls back without flapping. |
+| **Observability** | Surface tile mode, dirty fraction, update bytes, dropped superseded deltas, snapshot sends, and fallback transitions in display metrics. | Operators can explain stutter or fallback from logs/metrics without attaching a debugger. |
+| **Recovery drills** | Exercise snapshot throttling, GapReport replay, data-channel close/reopen, resize, and peer disconnect. | Corrupt or missing tiles self-heal within the bounded recovery window; no runaway snapshot loop. |
+| **UX polish** | Make the canvas/video switch visually seamless; keep input coordinate mapping identical across modes; avoid diagnostic marker leaks when `?diag=1` is off. | A user cannot tell which rendering path is active except via debug metrics. |
+
 ## Open questions for review
 
 1. **Tile size.** 64×64 vs 32×32 vs 128×128. Smaller = finer granularity but more per-frame overhead (more TileRecords, more decode calls). Larger = coarser (small dirty regions over-include surrounding pixels). 64 feels right; D-5 can re-tune if measurements suggest.
