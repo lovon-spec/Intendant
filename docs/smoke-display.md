@@ -1025,3 +1025,88 @@ Acceptance:
 - `display/metrics` remains at drops `cap:0/enc:0/peer:0`.
 - Cursor-only motion does **not** trigger fallback; the policy is fed
   by OS damage only, not synthetic cursor dirty rectangles.
+
+## 12. Wayland tile-mode smoke (#82 W-0/W-1)
+
+This smoke validates the GNOME Wayland path after the tile-mode work:
+portal approval, PipeWire capture, frame-diff tile damage, browser
+canvas rendering, and the visual-freshness sampler on the canvas path.
+
+Setup used for the May 3 Wayland runs:
+
+- Wayland peer: `user@192.168.64.2`, reached through
+  `ssh -J user@192.168.1.197`.
+- Peer daemon launched inside the graphical session:
+  `XDG_RUNTIME_DIR=/run/user/1000`, `WAYLAND_DISPLAY=wayland-0`,
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`,
+  `XDG_SESSION_TYPE=wayland`.
+- GNOME Remote Desktop exposed through the FreeRDP wrapper so the real
+  XDG portal prompt could be approved.
+- Primary dashboard launched with `INTENDANT_DIAG=1`; marker enabled
+  before display creation.
+
+Harness:
+
+```bash
+# Hold the peer display grant and marker open.
+python3 /tmp/wayland-grant-marker.py
+
+# Approve the GNOME portal through the RDP window.
+# Then open Settings -> Network -> View display on the primary.
+
+# Drive terminal/content motion in the Wayland session.
+ssh -J user@192.168.1.197 user@192.168.64.2 'bash -lc '"'"'
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=wayland-0
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+export XDG_SESSION_TYPE=wayland
+gnome-terminal --geometry=100x30 -- bash -lc \
+  "for i in \$(seq 1 2400); do
+     printf \"WAYLAND_TILE_SMOKE_%04d %s\\n\" \"\$i\" \"\$(date +%s%N)\";
+     sleep 0.025;
+   done; sleep 10"
+'"'"'
+```
+
+Expected peer log:
+
+```text
+[display/wayland] Portal granted stream: node_id=..., 1920x1080, 1 stream(s) available
+[display/wayland] requesting PipeWire format BGRx 1920x1080 @ 30fps
+[display/tile] backend=wayland uses frame-diff tile damage fallback
+[display/webrtc] data channel open: tile-control
+[display/webrtc] data channel open: tile-snapshot
+[display/webrtc] data channel open: tile-deltas
+```
+
+Result from the May 3 runs: **Wayland reaches live full-resolution tile
+rendering after portal approval, but does not yet meet the #80
+freshness bar at full-HD frame-diff load.** Capture itself is healthy:
+the peer reports roughly 30fps encode, no capture/encoder/peer drops,
+and stable WebRTC connection state. The limiter is tile-delta
+backpressure on the data channel.
+
+Representative transcripts:
+
+| Variant | Transcript | p50 | p95 | Max / longest freeze | Effective fps | Verdict |
+|---|---|---:|---:|---:|---:|---|
+| 64px tiles + 15fps cadence | `dde93509-65c2-469a-8976-bcf17a3e8988` @ 75s | 83ms | 146ms | 2068ms | 9.87 | Fail |
+| 48px tiles experiment | `b4fc0921-385d-4287-8faa-b97ba0f7be8f` @ 75s | 83ms | 121ms | 2943ms | 10.30 | Fail |
+| 80px tiles experiment | `fa430e1e-3244-4c29-8737-d7612d26ce72` @ 75s | 83ms | 191ms | 2157ms | 9.06 | Fail |
+
+Tile-size tuning alone is not sufficient. Smaller tiles increase tile
+count and message overhead; larger tiles reduce record count but
+over-include more unchanged pixels and still hit backpressure. The next
+Wayland hardening slice should be byte/backpressure-aware, not another
+constant tweak. Candidate directions:
+
+- prioritize marker/cursor/control state separately from bulk dirty
+  tiles so diagnostics and pointer feedback do not freeze under tile
+  pressure;
+- coalesce dirty tiles while throttled and send only the latest state
+  per tile once the delta channel drains;
+- add tile byte/record counters to `display/metrics` so backpressure is
+  explainable without reading peer logs;
+- tune fallback policy for `DamageCapability::FrameDiff` separately
+  from OS-damage backends, because full-frame comparison on Wayland can
+  generate larger dirty sets than XDamage for the same desktop action.

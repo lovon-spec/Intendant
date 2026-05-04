@@ -12422,6 +12422,7 @@ class VisualFreshnessSampler {
       video_height: this.videoEl.videoHeight || 0,
       ua: navigator.userAgent,
       uses_rvfc: this._useRVFC,
+      source: 'video',
     });
     this._scheduleFrame();
     this.flushTimer = setInterval(() => this._flush(), 5000);
@@ -14411,9 +14412,56 @@ class PeerDisplayConnection {
         if (video) video.style.display = 'none';
       }
       const parsed = this.tileCompositor.onWireFrame(data);
+      this._syncDiagSamplerForTileSurface(parsed);
       this._log('debug', `${label} tile frame applied: ${parsed.type}`);
     } catch (err) {
       this._log('warn', `${label} tile frame failed: ${err.message}`);
+    }
+  }
+
+  _stopDiagSampler() {
+    if (!this._diagSampler) return;
+    try { this._diagSampler.stop(); } catch (e) {
+      this._log('warn', `[diag-vf] sampler stop failed: ${e.message}`);
+    }
+    this._diagSampler = null;
+  }
+
+  _startVideoDiagSampler() {
+    if (!diagModeEnabled()) return;
+    const container = document.getElementById(`peer-display-${this.hostId}`);
+    const videoEl = container && container.querySelector('.peer-display-video');
+    if (!videoEl) return;
+    this._stopDiagSampler();
+    this._diagSampler = new VisualFreshnessSampler(videoEl, this.hostId, this.displayId);
+    this._diagSampler.start();
+    this._log(
+      'info',
+      `[diag-vf video] sampler started (browser_session_id=${this._diagSampler.browserSessionId})`,
+    );
+  }
+
+  _startCanvasDiagSampler() {
+    if (!diagModeEnabled() || !this.tileCompositor) return;
+    this._stopDiagSampler();
+    this._diagSampler = new CanvasFreshnessSampler(
+      this.tileCompositor.canvas,
+      this.hostId,
+      this.displayId,
+    );
+    this._diagSampler.start();
+    this._log(
+      'info',
+      `[diag-vf canvas] sampler started (browser_session_id=${this._diagSampler.browserSessionId})`,
+    );
+  }
+
+  _syncDiagSamplerForTileSurface(parsed) {
+    if (!diagModeEnabled() || !parsed) return;
+    if (parsed.type === 'fallback_to_video') {
+      this._startVideoDiagSampler();
+    } else if (parsed.type === 'fallback_to_tile') {
+      this._startCanvasDiagSampler();
     }
   }
 

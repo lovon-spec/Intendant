@@ -78,7 +78,7 @@ impl WaylandBackend {
 impl DisplayBackend for WaylandBackend {
     async fn start_capture(
         &self,
-        _fps: u32,
+        fps: u32,
     ) -> Result<mpsc::Receiver<Frame>, CallerError> {
         // Defensive: matching the x11.rs pattern — teardown any previous
         // capture (portal session + pipewire stream) before starting a new
@@ -186,7 +186,17 @@ impl DisplayBackend for WaylandBackend {
         let shared_w = Arc::clone(&self.shared_width);
         let shared_h = Arc::clone(&self.shared_height);
         let pw_thread = std::thread::spawn(move || {
-            run_pipewire_capture(pw_fd, node_id, tx, shutdown_flag, width, height, shared_w, shared_h);
+            run_pipewire_capture(
+                pw_fd,
+                node_id,
+                tx,
+                shutdown_flag,
+                width,
+                height,
+                target_pipewire_framerate(fps),
+                shared_w,
+                shared_h,
+            );
         });
 
         // Wake Mutter's screencast pipeline by injecting a 1-pixel cursor
@@ -427,6 +437,7 @@ fn run_pipewire_capture(
     shutdown: Arc<AtomicBool>,
     width: u32,
     height: u32,
+    framerate: u32,
     shared_width: Arc<AtomicU32>,
     shared_height: Arc<AtomicU32>,
 ) {
@@ -435,7 +446,7 @@ fn run_pipewire_capture(
     use pipewire::spa::param::ParamType;
     use pipewire::spa::pod::{Object, Property, PropertyFlags, Value};
     use pipewire::spa::sys as spa_sys;
-    use pipewire::spa::utils::{Id, SpaTypes};
+    use pipewire::spa::utils::{Fraction, Rectangle, SpaTypes};
 
     pipewire::init();
 
@@ -666,29 +677,57 @@ fn run_pipewire_capture(
         .expect("pipewire stream listener");
 
     // Build format parameters for the stream.
+    let format = pipewire::spa::pod::object!(
+        SpaTypes::ObjectParamFormat,
+        ParamType::EnumFormat,
+        pipewire::spa::pod::property!(
+            FormatProperties::MediaType,
+            Id,
+            MediaType::Video
+        ),
+        pipewire::spa::pod::property!(
+            FormatProperties::MediaSubtype,
+            Id,
+            MediaSubtype::Raw
+        ),
+        pipewire::spa::pod::property!(
+            FormatProperties::VideoFormat,
+            Id,
+            VideoFormat::BGRx
+        ),
+        pipewire::spa::pod::property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            Rectangle { width, height },
+            Rectangle { width: 1, height: 1 },
+            Rectangle {
+                width: width.max(8192),
+                height: height.max(8192),
+            }
+        ),
+        pipewire::spa::pod::property!(
+            FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            Fraction {
+                num: framerate,
+                denom: 1,
+            },
+            Fraction { num: 0, denom: 1 },
+            Fraction { num: 60, denom: 1 }
+        ),
+    );
+    eprintln!(
+        "[display/wayland] requesting PipeWire format BGRx {}x{} @ {}fps",
+        width, height, framerate
+    );
+
     let format_pod_bytes = pipewire::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(vec![0u8; 1024]),
-        &Value::Object(Object {
-            type_: SpaTypes::ObjectParamFormat.as_raw(),
-            id: ParamType::EnumFormat.as_raw(),
-            properties: vec![
-                Property {
-                    key: FormatProperties::MediaType.as_raw(),
-                    flags: PropertyFlags::empty(),
-                    value: Value::Id(Id(MediaType::Video.as_raw())),
-                },
-                Property {
-                    key: FormatProperties::MediaSubtype.as_raw(),
-                    flags: PropertyFlags::empty(),
-                    value: Value::Id(Id(MediaSubtype::Raw.as_raw())),
-                },
-                Property {
-                    key: FormatProperties::VideoFormat.as_raw(),
-                    flags: PropertyFlags::empty(),
-                    value: Value::Id(Id(VideoFormat::BGRx.as_raw())),
-                },
-            ],
-        }),
+        &Value::Object(format),
     )
     .expect("pipewire format pod serialization")
     .0
@@ -721,3 +760,18 @@ fn run_pipewire_capture(
     mainloop.run();
 }
 
+fn target_pipewire_framerate(fps: u32) -> u32 {
+    fps.clamp(1, 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_pipewire_framerate;
+
+    #[test]
+    fn target_pipewire_framerate_clamps_to_supported_range() {
+        assert_eq!(target_pipewire_framerate(0), 1);
+        assert_eq!(target_pipewire_framerate(30), 30);
+        assert_eq!(target_pipewire_framerate(120), 60);
+    }
+}

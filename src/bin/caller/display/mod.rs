@@ -538,6 +538,22 @@ fn convert_for_pool_feed(
 }
 
 const TILE_STREAM_TILE_SIZE_PX: u16 = 64;
+const TILE_DELTA_TARGET_FPS: u32 = 15;
+
+fn tile_delta_min_interval() -> Duration {
+    Duration::from_millis(1_000 / TILE_DELTA_TARGET_FPS as u64)
+}
+
+fn should_emit_tile_delta(
+    now: Instant,
+    last_sent_at: Option<Instant>,
+    min_interval: Duration,
+) -> bool {
+    match last_sent_at {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= min_interval,
+    }
+}
 
 fn tile_snapshot_period(mode: tile::policy::TileMode) -> Duration {
     match mode {
@@ -1751,6 +1767,7 @@ impl DisplaySession {
             let mut tile_policy = tile::policy::TilePolicy::new(Instant::now());
             let mut tile_mode = tile::policy::TileMode::Tiles;
             let mut next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
+            let mut last_delta_sent_at: Option<Instant> = None;
             let mut seq: u32 = 1;
 
             loop {
@@ -1773,6 +1790,7 @@ impl DisplaySession {
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
+                            last_delta_sent_at = None;
                             continue;
                         }
 
@@ -1786,6 +1804,7 @@ impl DisplaySession {
                             grid = Some(next_grid);
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
+                            last_delta_sent_at = None;
                             synthetic_dirty.reset_cursor();
                             last_cursor = None;
                             let resize = tile::transport::TileFrame::Resize {
@@ -1864,6 +1883,7 @@ impl DisplaySession {
                             let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             seq = 1;
                             tile_mode = next_mode;
+                            last_delta_sent_at = None;
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             match tile_mode {
                                 tile::policy::TileMode::Video => {
@@ -1954,6 +1974,17 @@ impl DisplaySession {
                         if dirty.is_empty() {
                             continue;
                         }
+
+                        let now = Instant::now();
+                        if !should_emit_tile_delta(
+                            now,
+                            last_delta_sent_at,
+                            tile_delta_min_interval(),
+                        ) {
+                            continue;
+                        }
+                        last_delta_sent_at = Some(now);
+
                         let epoch = tile_epoch.load(Ordering::Relaxed);
                         let encode_result = tokio::task::spawn_blocking({
                             let frame = Arc::clone(&frame);
@@ -2765,7 +2796,7 @@ mod tests {
 
     #[test]
     fn session_registry_display_ids() {
-        let mut reg = SessionRegistry::new();
+        let reg = SessionRegistry::new();
         assert!(reg.display_ids().is_empty());
     }
 
@@ -2889,17 +2920,35 @@ mod tests {
             let i = (y * tile_size + x) * 4;
             [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
         };
+        let bit_center = |tile: tile::grid::TileId, bit_idx: usize| -> Option<(usize, usize)> {
+            let col = bit_idx % visual_marker::COLS;
+            let row = bit_idx / visual_marker::COLS;
+            let global_x = col * visual_marker::TILE_PX + (visual_marker::TILE_PX / 2);
+            let global_y = row * visual_marker::TILE_PX + (visual_marker::TILE_PX / 2);
+            let tile_x0 = tile.x as usize * tile_size;
+            let tile_y0 = tile.y as usize * tile_size;
+            if global_x < tile_x0
+                || global_x >= tile_x0 + tile_size
+                || global_y < tile_y0
+                || global_y >= tile_y0 + tile_size
+            {
+                return None;
+            }
+            Some((global_x - tile_x0, global_y - tile_y0))
+        };
 
         let mut tile0 = vec![0u8; tile_size * tile_size * 4];
-        let value = (1u32 << 0) | (1u32 << 9);
+        let value = 1u32 << 0;
+        let tile0_id = tile::grid::TileId::new(0, 0);
         stamp_visual_marker_bgra_tile(
             &mut tile0,
-            tile::grid::TileId::new(0, 0),
+            tile0_id,
             TILE_STREAM_TILE_SIZE_PX,
             value,
         );
+        let (bit0_x, bit0_y) = bit_center(tile0_id, 0).expect("bit 0 in tile 0");
         assert_eq!(
-            sample(&tile0, 8, 8),
+            sample(&tile0, bit0_x, bit0_y),
             [
                 visual_marker::LUMA_HIGH,
                 visual_marker::LUMA_HIGH,
@@ -2908,8 +2957,9 @@ mod tests {
             ],
             "bit 0 center should stamp high luma in tile 0"
         );
+        let (bit1_x, bit1_y) = bit_center(tile0_id, 1).expect("bit 1 in tile 0");
         assert_eq!(
-            sample(&tile0, 24, 8),
+            sample(&tile0, bit1_x, bit1_y),
             [
                 visual_marker::LUMA_LOW,
                 visual_marker::LUMA_LOW,
@@ -2918,33 +2968,43 @@ mod tests {
             ],
             "bit 1 center should stamp low luma in tile 0"
         );
-        assert_eq!(
-            sample(&tile0, 24, 24),
-            [
-                visual_marker::LUMA_HIGH,
-                visual_marker::LUMA_HIGH,
-                visual_marker::LUMA_HIGH,
-                255,
-            ],
-            "bit 9 center should stamp high luma in tile 0"
-        );
-
         let mut tile1 = vec![0u8; tile_size * tile_size * 4];
+        let tile1_id = tile::grid::TileId::new(1, 0);
+        let tile1_bits: Vec<_> = (0..visual_marker::COLS * visual_marker::ROWS)
+            .filter(|bit| bit_center(tile1_id, *bit).is_some())
+            .collect();
+        assert!(tile1_bits.len() >= 2);
+        let first_tile1_bit = tile1_bits[0];
+        let second_tile1_bit = tile1_bits[1];
         stamp_visual_marker_bgra_tile(
             &mut tile1,
-            tile::grid::TileId::new(1, 0),
+            tile1_id,
             TILE_STREAM_TILE_SIZE_PX,
-            1u32 << 4,
+            (1u32 << first_tile1_bit) | (1u32 << second_tile1_bit),
         );
+        let (first_x, first_y) =
+            bit_center(tile1_id, first_tile1_bit).expect("first tile 1 bit in tile 1");
         assert_eq!(
-            sample(&tile1, 8, 8),
+            sample(&tile1, first_x, first_y),
             [
                 visual_marker::LUMA_HIGH,
                 visual_marker::LUMA_HIGH,
                 visual_marker::LUMA_HIGH,
                 255,
             ],
-            "bit 4 center should stamp high luma in tile 1"
+            "first covered marker bit should stamp high luma in tile 1"
+        );
+        let (second_x, second_y) =
+            bit_center(tile1_id, second_tile1_bit).expect("second tile 1 bit in tile 1");
+        assert_eq!(
+            sample(&tile1, second_x, second_y),
+            [
+                visual_marker::LUMA_HIGH,
+                visual_marker::LUMA_HIGH,
+                visual_marker::LUMA_HIGH,
+                255,
+            ],
+            "second covered marker bit should stamp high luma in tile 1"
         );
 
         let mut tile2 = vec![0u8; tile_size * tile_size * 4];
@@ -2958,6 +3018,24 @@ mod tests {
             tile2.iter().all(|&b| b == 0),
             "tile outside marker bounds should remain untouched"
         );
+    }
+
+    #[test]
+    fn tile_delta_cadence_caps_to_target_interval() {
+        let now = Instant::now();
+        let min = Duration::from_millis(66);
+
+        assert!(should_emit_tile_delta(now, None, min));
+        assert!(!should_emit_tile_delta(
+            now + Duration::from_millis(65),
+            Some(now),
+            min
+        ));
+        assert!(should_emit_tile_delta(
+            now + Duration::from_millis(66),
+            Some(now),
+            min
+        ));
     }
 
     #[test]
