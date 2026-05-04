@@ -663,21 +663,38 @@ fn stamp_visual_marker_bgra_tile(
     }
 }
 
-fn make_damage_backend(width: u32, height: u32) -> Box<dyn capture::damage::DamageBackend> {
+fn should_try_xdamage_for_tile_stream(backend_kind: &str) -> bool {
+    backend_kind == "x11"
+}
+
+fn make_damage_backend(
+    width: u32,
+    height: u32,
+    backend_kind: &'static str,
+) -> Box<dyn capture::damage::DamageBackend> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = backend_kind;
+
     #[cfg(target_os = "linux")]
     {
-        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-        match capture::x11_damage::X11DamageBackend::new(&display) {
-            Ok(backend) => {
-                eprintln!("[display/tile] XDamage backend enabled on DISPLAY={display}");
-                return Box::new(backend);
+        if should_try_xdamage_for_tile_stream(backend_kind) {
+            let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+            match capture::x11_damage::X11DamageBackend::new(&display) {
+                Ok(backend) => {
+                    eprintln!("[display/tile] XDamage backend enabled on DISPLAY={display}");
+                    return Box::new(backend);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[display/tile] XDamage unavailable on DISPLAY={display}: {e}; \
+                         tile stream will use frame-diff fallback"
+                    );
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "[display/tile] XDamage unavailable on DISPLAY={display}: {e}; \
-                     tile stream will use frame-diff fallback"
-                );
-            }
+        } else {
+            eprintln!(
+                "[display/tile] backend={backend_kind} uses frame-diff tile damage fallback"
+            );
         }
     }
 
@@ -1721,9 +1738,10 @@ impl DisplaySession {
         let marker_flag = Arc::clone(&self.diagnostics_visual_marker);
         let session_epoch = self.session_epoch;
         let (initial_w, initial_h) = self.backend.resolution();
+        let backend_kind = self.backend.kind();
 
         let task = tokio::spawn(async move {
-            let mut damage = make_damage_backend(initial_w, initial_h);
+            let mut damage = make_damage_backend(initial_w, initial_h, backend_kind);
             let mut frame_diff =
                 capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX);
             let mut grid: Option<tile::grid::TileGrid> = None;
@@ -2561,6 +2579,14 @@ pub(crate) fn gated_input_handler(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn tile_damage_uses_xdamage_only_for_x11_backend() {
+        assert!(should_try_xdamage_for_tile_stream("x11"));
+        assert!(!should_try_xdamage_for_tile_stream("wayland"));
+        assert!(!should_try_xdamage_for_tile_stream("macos"));
+        assert!(!should_try_xdamage_for_tile_stream("stub"));
+    }
 
     #[test]
     fn input_event_deserialize_key_down() {
