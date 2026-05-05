@@ -35,6 +35,7 @@ pub struct TilePolicyConfig {
     pub enter_video_threshold: f32,
     pub exit_video_threshold: f32,
     pub min_dwell: Duration,
+    pub allow_video_fallback: bool,
 }
 
 impl Default for TilePolicyConfig {
@@ -44,6 +45,7 @@ impl Default for TilePolicyConfig {
             enter_video_threshold: ENTER_VIDEO_THRESHOLD,
             exit_video_threshold: EXIT_VIDEO_THRESHOLD,
             min_dwell: MIN_DWELL,
+            allow_video_fallback: true,
         }
     }
 }
@@ -96,7 +98,9 @@ impl TilePolicy {
 
         let next = match self.state {
             TileMode::Tiles
-                if dwell_ok && avg >= self.config.enter_video_threshold =>
+                if self.config.allow_video_fallback
+                    && dwell_ok
+                    && avg >= self.config.enter_video_threshold =>
             {
                 TileMode::Video
             }
@@ -135,6 +139,7 @@ mod tests {
             enter_video_threshold: 0.25,
             exit_video_threshold: 0.15,
             min_dwell: Duration::from_millis(500),
+            allow_video_fallback: true,
         }
     }
 
@@ -184,6 +189,24 @@ mod tests {
         assert_eq!(policy.mode(), TileMode::Tiles);
         assert_eq!(policy.evaluate(0.40, later), TileMode::Video);
         assert!(policy.rolling_dirty_fraction() >= 0.25);
+    }
+
+    #[test]
+    fn can_disable_video_fallback_for_lossless_tile_mode() {
+        let now = t0();
+        let mut policy = TilePolicy::with_config(
+            now,
+            TilePolicyConfig {
+                allow_video_fallback: false,
+                ..cfg()
+            },
+        );
+
+        assert_eq!(
+            policy.evaluate(1.0, now + Duration::from_secs(1)),
+            TileMode::Tiles
+        );
+        assert_eq!(policy.mode(), TileMode::Tiles);
     }
 
     #[test]

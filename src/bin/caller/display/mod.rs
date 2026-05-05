@@ -667,6 +667,16 @@ fn tile_delta_min_interval_for_damage(_capability: capture::damage::DamageCapabi
     tile_delta_min_interval()
 }
 
+fn lossless_tile_policy(now: Instant) -> tile::policy::TilePolicy {
+    tile::policy::TilePolicy::with_config(
+        now,
+        tile::policy::TilePolicyConfig {
+            allow_video_fallback: false,
+            ..tile::policy::TilePolicyConfig::default()
+        },
+    )
+}
+
 fn damage_uses_frame_diff(capability: capture::damage::DamageCapability) -> bool {
     matches!(
         capability,
@@ -1949,7 +1959,7 @@ impl DisplaySession {
             let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new()
                 .with_marker((0, 0), visual_marker::MARKER_W as u32);
             let mut last_cursor: Option<(i32, i32)> = None;
-            let mut tile_policy = tile::policy::TilePolicy::new(Instant::now());
+            let mut tile_policy = lossless_tile_policy(Instant::now());
             let mut tile_mode = tile::policy::TileMode::Tiles;
             let mut next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
             let mut last_delta_sent_at: Option<Instant> = None;
@@ -1973,7 +1983,7 @@ impl DisplaySession {
                         let peers_now = tile_subscriber_peer_handles(&peers, &subscribers).await;
                         if peers_now.is_empty() {
                             grid = Some(next_grid);
-                            tile_policy = tile::policy::TilePolicy::new(Instant::now());
+                            tile_policy = lossless_tile_policy(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
                             tile_video_fallback_active.store(false, Ordering::SeqCst);
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -1990,7 +2000,7 @@ impl DisplaySession {
                             let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             seq = 1;
                             grid = Some(next_grid);
-                            tile_policy = tile::policy::TilePolicy::new(Instant::now());
+                            tile_policy = lossless_tile_policy(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
                             tile_video_fallback_active.store(false, Ordering::SeqCst);
                             last_delta_sent_at = None;
