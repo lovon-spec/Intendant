@@ -2585,7 +2585,9 @@ pub struct SettingsPayload {
     pub external_agent: Option<String>,
     // Codex runtime config (persisted to `[agent.codex]`). Mirrored here so
     // the Activity → Control sub-tab can load in one fetch.
+    #[serde(default = "default_settings_codex_sandbox")]
     pub codex_sandbox: String,
+    #[serde(default = "default_settings_codex_approval_policy")]
     pub codex_approval_policy: String,
     #[serde(default)]
     pub codex_model: Option<String>,
@@ -2601,6 +2603,7 @@ pub struct SettingsPayload {
     // the Codex fields above for the Activity → Control sub-tab.
     #[serde(default)]
     pub gemini_model: Option<String>,
+    #[serde(default = "default_settings_gemini_approval_mode")]
     pub gemini_approval_mode: String,
     #[serde(default)]
     pub gemini_sandbox: bool,
@@ -2615,6 +2618,18 @@ pub struct SettingsPayload {
     // Env var overrides (read-only, shown in UI)
     #[serde(default)]
     pub env_overrides: std::collections::HashMap<String, String>,
+}
+
+fn default_settings_codex_sandbox() -> String {
+    crate::project::normalize_sandbox_mode("")
+}
+
+fn default_settings_codex_approval_policy() -> String {
+    crate::project::normalize_approval_policy("")
+}
+
+fn default_settings_gemini_approval_mode() -> String {
+    crate::project::normalize_gemini_approval_mode("")
 }
 
 fn settings_payload_from_config(
@@ -8917,6 +8932,47 @@ mod tests {
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
+    }
+
+    #[test]
+    fn settings_payload_accepts_settings_tab_save_without_agent_runtime_fields() {
+        let body = serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": "codex"
+        })
+        .to_string();
+
+        let payload: SettingsPayload = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload.external_agent.as_deref(), Some("codex"));
+        assert_eq!(payload.codex_sandbox, "workspace-write");
+        assert_eq!(payload.codex_approval_policy, "on-request");
+        assert_eq!(payload.gemini_approval_mode, "default");
+
+        let mut config = crate::project::ProjectConfig::default();
+        config.agent.codex.sandbox = "danger-full-access".to_string();
+        config.agent.gemini_cli.approval_mode = "yolo".to_string();
+        apply_settings_payload(&mut config, &payload);
+
+        assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
+        assert_eq!(config.agent.codex.sandbox, "danger-full-access");
+        assert_eq!(config.agent.gemini_cli.approval_mode, "yolo");
     }
 
     /// A specific bind address is preserved verbatim in the
