@@ -2926,36 +2926,15 @@ async fn handle_mcp_http_request(
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
             match server.call_tool_by_name(name, args).await {
-                Ok(result_text) => {
-                    // Split screenshot data URIs into MCP image content blocks
-                    let mut content = Vec::new();
-                    let mut text_lines = Vec::new();
-                    for line in result_text.lines() {
-                        if let Some(data_uri) = line.strip_prefix("screenshot: data:image/png;base64,") {
-                            // Flush accumulated text
-                            if !text_lines.is_empty() {
-                                content.push(serde_json::json!({"type": "text", "text": text_lines.join("\n")}));
-                                text_lines.clear();
-                            }
-                            content.push(serde_json::json!({"type": "image", "data": data_uri, "mimeType": "image/png"}));
-                        } else if let Some(data_uri) = line.strip_prefix("data:image/png;base64,") {
-                            if !text_lines.is_empty() {
-                                content.push(serde_json::json!({"type": "text", "text": text_lines.join("\n")}));
-                                text_lines.clear();
-                            }
-                            content.push(serde_json::json!({"type": "image", "data": data_uri, "mimeType": "image/png"}));
-                        } else {
-                            text_lines.push(line.to_string());
-                        }
-                    }
-                    if !text_lines.is_empty() {
-                        content.push(serde_json::json!({"type": "text", "text": text_lines.join("\n")}));
-                    }
-                    if content.is_empty() {
-                        content.push(serde_json::json!({"type": "text", "text": result_text}));
-                    }
-                    Ok(serde_json::json!({ "content": content }))
-                }
+                Ok(result) => Ok(serde_json::to_value(result).unwrap_or_else(|e| {
+                    serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": format!("Failed to serialize MCP tool result: {}", e),
+                        }],
+                        "isError": true,
+                    })
+                })),
                 Err(e) => Err(McpHttpError {
                     code: -32603,
                     message: e,

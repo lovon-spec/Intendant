@@ -15573,6 +15573,28 @@ async function saveSettings() {
     live_audio_timeout_secs: parseInt(g('set-live-audio-timeout').value) || 300,
     // Persisted to intendant.toml so it survives daemon restart.
     external_agent: g('set-external-agent').value || null,
+    codex_sandbox: controlCodexConfig.sandbox || 'workspace-write',
+    codex_approval_policy: controlCodexConfig.approval_policy || 'on-request',
+    codex_model: controlCodexConfig.model || null,
+    codex_reasoning_effort: controlCodexConfig.reasoning_effort || null,
+    codex_web_search: !!controlCodexConfig.web_search,
+    codex_network_access: !!controlCodexConfig.network_access,
+    codex_writable_roots: Array.isArray(controlCodexConfig.writable_roots)
+      ? controlCodexConfig.writable_roots
+      : [],
+    gemini_model: controlGeminiConfig.model || null,
+    gemini_approval_mode: controlGeminiConfig.approval_mode || 'default',
+    gemini_sandbox: !!controlGeminiConfig.sandbox,
+    gemini_extensions: Array.isArray(controlGeminiConfig.extensions)
+      ? controlGeminiConfig.extensions
+      : [],
+    gemini_allowed_mcp_servers: Array.isArray(controlGeminiConfig.allowed_mcp_servers)
+      ? controlGeminiConfig.allowed_mcp_servers
+      : [],
+    gemini_include_directories: Array.isArray(controlGeminiConfig.include_directories)
+      ? controlGeminiConfig.include_directories
+      : [],
+    gemini_debug: !!controlGeminiConfig.debug,
   };
   try {
     const resp = await fetch('/api/settings', {

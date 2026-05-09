@@ -18,8 +18,8 @@ use std::sync::Arc;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        Implementation, ListResourcesResult, PaginatedRequestParams, RawResource,
-        ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+        CallToolResult, Content, Implementation, ListResourcesResult, PaginatedRequestParams,
+        RawResource, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
         ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
         UnsubscribeRequestParams,
     },
@@ -2888,100 +2888,122 @@ impl IntendantServer {
     }
 
     /// Dispatch a tool call by name for the HTTP transport.
-    pub async fn call_tool_by_name(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
+    pub async fn call_tool_by_name(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<CallToolResult, String> {
+        fn parse_params<T: serde::de::DeserializeOwned>(
+            args: serde_json::Value,
+        ) -> Result<Parameters<T>, String> {
+            serde_json::from_value(args)
+                .map(Parameters)
+                .map_err(|e| e.to_string())
+        }
+
         match name {
-            "get_status" => Ok(self.get_status().await),
+            "get_status" => Ok(text_tool_result(self.get_status().await)),
             "get_logs" => {
-                let params: GetLogsParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.get_logs(Parameters(params)).await)
+                let params = parse_params::<GetLogsParams>(args)?;
+                Ok(text_tool_result(self.get_logs(params).await))
             }
-            "get_pending_approval" => Ok(self.get_pending_approval().await),
-            "get_pending_input" => Ok(self.get_pending_input().await),
+            "get_pending_approval" => Ok(text_tool_result(self.get_pending_approval().await)),
+            "get_pending_input" => Ok(text_tool_result(self.get_pending_input().await)),
             "approve" => {
-                let params: ApproveParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.approve(Parameters(params)).await)
+                let params = parse_params::<ApproveParams>(args)?;
+                Ok(text_tool_result(self.approve(params).await))
             }
             "deny" => {
-                let params: DenyParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.deny(Parameters(params)).await)
+                let params = parse_params::<DenyParams>(args)?;
+                Ok(text_tool_result(self.deny(params).await))
             }
             "skip" => {
-                let params: SkipParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.skip(Parameters(params)).await)
+                let params = parse_params::<SkipParams>(args)?;
+                Ok(text_tool_result(self.skip(params).await))
             }
             "approve_all" => {
-                let params: ApproveAllParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.approve_all(Parameters(params)).await)
+                let params = parse_params::<ApproveAllParams>(args)?;
+                Ok(text_tool_result(self.approve_all(params).await))
             }
             "respond" => {
-                let params: RespondParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.respond(Parameters(params)).await)
+                let params = parse_params::<RespondParams>(args)?;
+                Ok(text_tool_result(self.respond(params).await))
             }
             "set_autonomy" => {
-                let params: SetAutonomyParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.set_autonomy(Parameters(params)).await)
+                let params = parse_params::<SetAutonomyParams>(args)?;
+                Ok(text_tool_result(self.set_autonomy(params).await))
             }
             "set_verbosity" => {
-                let params: SetVerbosityParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.set_verbosity(Parameters(params)).await)
+                let params = parse_params::<SetVerbosityParams>(args)?;
+                Ok(text_tool_result(self.set_verbosity(params).await))
             }
-            "quit" => Ok(self.quit().await),
+            "quit" => Ok(text_tool_result(self.quit().await)),
             "start_task" => {
-                let params: StartTaskParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.start_task(Parameters(params)).await)
+                let params = parse_params::<StartTaskParams>(args)?;
+                Ok(text_tool_result(self.start_task(params).await))
             }
             "schedule_controller_restart" => {
-                let params: ScheduleControllerRestartParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.schedule_controller_restart(Parameters(params)).await)
+                let params = parse_params::<ScheduleControllerRestartParams>(args)?;
+                Ok(text_tool_result(
+                    self.schedule_controller_restart(params).await,
+                ))
             }
             "controller_turn_complete" => {
-                let params: ControllerTurnCompleteParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.controller_turn_complete(Parameters(params)).await)
+                let params = parse_params::<ControllerTurnCompleteParams>(args)?;
+                Ok(text_tool_result(self.controller_turn_complete(params).await))
             }
-            "get_restart_status" => Ok(self.get_restart_status().await),
+            "get_restart_status" => Ok(text_tool_result(self.get_restart_status().await)),
             "cancel_controller_restart" => {
-                let params: CancelControllerRestartParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.cancel_controller_restart(Parameters(params)).await)
+                let params = parse_params::<CancelControllerRestartParams>(args)?;
+                Ok(text_tool_result(self.cancel_controller_restart(params).await))
             }
             "request_controller_loop_halt" => {
-                let params: RequestControllerLoopHaltParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.request_controller_loop_halt(Parameters(params)).await)
+                let params = parse_params::<RequestControllerLoopHaltParams>(args)?;
+                Ok(text_tool_result(
+                    self.request_controller_loop_halt(params).await,
+                ))
             }
-            "clear_controller_loop_halt" => Ok(self.clear_controller_loop_halt().await),
+            "clear_controller_loop_halt" => {
+                Ok(text_tool_result(self.clear_controller_loop_halt().await))
+            }
             "intervene_controller_loop" => {
-                let params: InterveneControllerLoopParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.intervene_controller_loop(Parameters(params)).await)
+                let params = parse_params::<InterveneControllerLoopParams>(args)?;
+                Ok(text_tool_result(self.intervene_controller_loop(params).await))
             }
-            "get_controller_loop_status" => Ok(self.get_controller_loop_status().await),
-            "reload" => Ok(self.reload().await),
-            "list_displays" => Ok(self.list_displays().await),
+            "get_controller_loop_status" => {
+                Ok(text_tool_result(self.get_controller_loop_status().await))
+            }
+            "reload" => Ok(text_tool_result(self.reload().await)),
+            "list_displays" => Ok(text_tool_result(self.list_displays().await)),
             "take_display" => {
-                let params: TakeDisplayParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.take_display(Parameters(params)).await)
+                let params = parse_params::<TakeDisplayParams>(args)?;
+                Ok(text_tool_result(self.take_display(params).await))
             }
             "release_display" => {
-                let params: ReleaseDisplayParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.release_display(Parameters(params)).await)
+                let params = parse_params::<ReleaseDisplayParams>(args)?;
+                Ok(text_tool_result(self.release_display(params).await))
             }
             "take_screenshot" => {
-                let params: TakeScreenshotParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.take_screenshot(Parameters(params)).await)
+                let params = parse_params::<TakeScreenshotParams>(args)?;
+                self.take_screenshot(params).await.map_err(|e| e.to_string())
             }
             "execute_cu_actions" => {
-                let params: ExecuteCuActionsParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.execute_cu_actions(Parameters(params)).await)
+                let params = parse_params::<ExecuteCuActionsParams>(args)?;
+                self.execute_cu_actions(params)
+                    .await
+                    .map_err(|e| e.to_string())
             }
             "list_frames" => {
-                let params: ListFramesParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.list_frames(Parameters(params)).await)
+                let params = parse_params::<ListFramesParams>(args)?;
+                Ok(text_tool_result(self.list_frames(params).await))
             }
             "read_frame" => {
-                let params: ReadFrameParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.read_frame(Parameters(params)).await)
+                let params = parse_params::<ReadFrameParams>(args)?;
+                Ok(text_tool_result(self.read_frame(params).await))
             }
             "spawn_live_audio" => {
-                let params: SpawnLiveAudioParams = serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(self.spawn_live_audio(Parameters(params)).await)
+                let params = parse_params::<SpawnLiveAudioParams>(args)?;
+                Ok(text_tool_result(self.spawn_live_audio(params).await))
             }
             _ => Err(format!("Unknown tool: {}", name)),
         }
@@ -3105,6 +3127,21 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
+
+fn text_tool_result(text: impl Into<String>) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(text.into())])
+}
+
+fn text_tool_error(text: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(text.into())])
+}
+
+fn image_tool_result(text: impl Into<String>, base64_png: impl Into<String>) -> CallToolResult {
+    CallToolResult::success(vec![
+        Content::text(text.into()),
+        Content::image(base64_png.into(), "image/png"),
+    ])
+}
 
 #[tool_router]
 impl IntendantServer {
@@ -3727,24 +3764,30 @@ impl IntendantServer {
         format!("Released control of :{}", params.display_id)
     }
 
-    #[tool(description = "Take a screenshot of a display. Returns base64-encoded image data.")]
+    #[tool(description = "Take a screenshot of a display. Returns an MCP image content block.")]
     async fn take_screenshot(
         &self,
         Parameters(params): Parameters<TakeScreenshotParams>,
-    ) -> String {
+    ) -> Result<CallToolResult, McpError> {
         use crate::computer_use::{CuAction, DisplayBackend, execute_actions};
 
         let target = resolve_display_target(params.display_target.as_deref());
         let backend = DisplayBackend::detect();
 
         let state = self.state.read().await;
-        let screenshot_dir = state.screenshot_dir.clone()
+        let screenshot_dir = state
+            .screenshot_dir
+            .clone()
             .unwrap_or_else(|| state.log_dir.join("screenshots"));
         let session_registry = state.session_registry.clone();
         drop(state);
 
         let _ = std::fs::create_dir_all(&screenshot_dir);
-        let mut counter = self.state.read().await.screenshot_counter
+        let mut counter = self
+            .state
+            .read()
+            .await
+            .screenshot_counter
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
         let results = execute_actions(
             &[CuAction::Screenshot],
@@ -3754,39 +3797,44 @@ impl IntendantServer {
             &mut counter,
             &session_registry,
             None,
-        ).await;
+        )
+        .await;
 
         if let Some(result) = results.first() {
             if let Some(ref screenshot) = result.screenshot {
-                // screenshot.base64_png is already base64-encoded
-                return format!("data:image/png;base64,{}", screenshot.base64_png);
+                return Ok(image_tool_result(
+                    "screenshot captured",
+                    screenshot.base64_png.clone(),
+                ));
             }
             if let Some(ref err) = result.error {
-                return format!("Screenshot error: {}", err);
+                return Ok(text_tool_error(format!("Screenshot error: {}", err)));
             }
         }
 
-        "No screenshot result".to_string()
+        Ok(text_tool_error("No screenshot result"))
     }
 
-    #[tool(description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns results. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid.")]
+    #[tool(description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid.")]
     async fn execute_cu_actions(
         &self,
         Parameters(params): Parameters<ExecuteCuActionsParams>,
-    ) -> String {
+    ) -> Result<CallToolResult, McpError> {
         use crate::computer_use::{DisplayBackend, execute_actions};
 
         let mut actions = params.actions;
 
         if actions.is_empty() {
-            return "No actions provided".to_string();
+            return Ok(text_tool_error("No actions provided"));
         }
 
         let target = resolve_display_target(params.display_target.as_deref());
         let backend = DisplayBackend::detect();
 
         let state = self.state.read().await;
-        let screenshot_dir = state.screenshot_dir.clone()
+        let screenshot_dir = state
+            .screenshot_dir
+            .clone()
             .unwrap_or_else(|| state.log_dir.join("screenshots"));
         let session_registry = state.session_registry.clone();
         drop(state);
@@ -3801,8 +3849,7 @@ impl IntendantServer {
         // the same divisor for re-normalization — this prevents a TOCTOU
         // race if the portal stream resizes between the two reads.
         let denorm_ref = if params.coordinate_space.as_deref() == Some("normalized_1000") {
-            let size =
-                crate::computer_use::target_pixel_size(target, &session_registry).await;
+            let size = crate::computer_use::target_pixel_size(target, &session_registry).await;
             for action in &mut actions {
                 denormalize_action(action, size.0, size.1);
             }
@@ -3812,7 +3859,11 @@ impl IntendantServer {
         };
 
         let _ = std::fs::create_dir_all(&screenshot_dir);
-        let mut counter = self.state.read().await.screenshot_counter
+        let mut counter = self
+            .state
+            .read()
+            .await
+            .screenshot_counter
             .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
         let results = execute_actions(
             &actions,
@@ -3822,7 +3873,8 @@ impl IntendantServer {
             &mut counter,
             &session_registry,
             denorm_ref,
-        ).await;
+        )
+        .await;
 
         // Format results with action details (type, coordinates) for debugging.
         let mut summaries = Vec::new();
@@ -3850,13 +3902,11 @@ impl IntendantServer {
             ) {
                 let _ = std::fs::write(&ss.path, &bytes);
             }
-            summaries.push(format!(
-                "screenshot: data:image/png;base64,{}",
-                annotated
-            ));
+            summaries.push("post-action screenshot captured".to_string());
+            return Ok(image_tool_result(summaries.join("\n"), annotated));
         }
 
-        summaries.join("\n")
+        Ok(text_tool_result(summaries.join("\n")))
     }
 
     #[tool(description = "List available display frames with metadata. Frames are captured from display streams.")]

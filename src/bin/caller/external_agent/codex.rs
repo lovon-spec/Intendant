@@ -446,8 +446,8 @@ You have access to these tools through the `intendant` MCP server.\n\
 \n\
 ### Computer Use (always available)\n\
 Direct capture and interaction with displays.\n\
-- **take_screenshot(display_target?)**: On-demand capture. Returns base64 PNG image.\n\
-- **execute_cu_actions(actions, display_target?)**: Execute actions AND return a screenshot.\n\
+- **take_screenshot(display_target?)**: On-demand capture. Returns an MCP image.\n\
+- **execute_cu_actions(actions, display_target?)**: Execute actions AND return a post-action MCP image.\n\
   A screenshot is automatically taken after the last action.\n\
   Actions is a JSON array. Action types:\n\
   - `{\"type\": \"click\", \"x\": 100, \"y\": 200, \"button\": \"left\"}` — button: left/right/middle\n\
