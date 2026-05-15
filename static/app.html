@@ -4774,8 +4774,14 @@ html, body {
   </div>
 </div>
 
-<!-- xterm.js (loaded lazily for Terminal tab) -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.css" id="xterm-css" disabled>
+<!-- xterm.js (loaded lazily for Terminal tab). Pinned + SRI-verified —
+     bump version and hashes together. Generator: scripts/refresh-xterm-sri.sh
+     (or just re-fetch from jsdelivr and run `openssl dgst -sha384 -binary | openssl base64 -A`). -->
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css"
+      integrity="sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP"
+      crossorigin="anonymous"
+      id="xterm-css" disabled>
 
 <script type="module">
 'use strict';
@@ -7407,10 +7413,14 @@ function initTerminal() {
   termInitialized = true;
   document.getElementById('xterm-css').removeAttribute('disabled');
   const script = document.createElement('script');
-  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
+  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js';
+  script.integrity = 'sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9';
+  script.crossOrigin = 'anonymous';
   script.onload = () => {
     const fitScript = document.createElement('script');
-    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
+    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js';
+    fitScript.integrity = 'sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6';
+    fitScript.crossOrigin = 'anonymous';
     fitScript.onload = () => {
       term = new Terminal({
         theme: {
@@ -7524,10 +7534,14 @@ function initShell() {
     return;
   }
   const script = document.createElement('script');
-  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js';
+  script.src = 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js';
+  script.integrity = 'sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9';
+  script.crossOrigin = 'anonymous';
   script.onload = () => {
     const fitScript = document.createElement('script');
-    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js';
+    fitScript.src = 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js';
+    fitScript.integrity = 'sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6';
+    fitScript.crossOrigin = 'anonymous';
     fitScript.onload = start;
     document.head.appendChild(fitScript);
   };
