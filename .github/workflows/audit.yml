@@ -1,0 +1,36 @@
+name: Cargo audit
+
+# Runs `cargo audit` against the RustSec advisory DB so vulnerable transitive
+# deps surface on every PR rather than only when someone notices.
+#
+# Also runs weekly on a schedule — new advisories land continuously, and the
+# committed Cargo.lock can drift from "clean" without any code change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+  schedule:
+    # Mondays at 08:00 UTC.
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
