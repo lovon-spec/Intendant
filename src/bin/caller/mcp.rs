@@ -41,6 +41,7 @@ use crate::frontend::{
 };
 use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg, EventBus};
 use crate::types::{LogLevel, Phase, Verbosity};
+use crate::FollowUpMessage;
 
 // ---------------------------------------------------------------------------
 // Task launcher: allows MCP to start agent loops on demand
@@ -96,7 +97,7 @@ pub struct McpAppState {
     /// Current round number (for multi-round support).
     pub round: usize,
     /// Sender for follow-up messages (multi-round support).
-    pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    pub follow_up_tx: Option<tokio::sync::mpsc::Sender<FollowUpMessage>>,
     // Presence layer usage tracking
     pub presence_provider_name: Option<String>,
     pub presence_model_name: Option<String>,
@@ -492,7 +493,7 @@ async fn start_task_with_state(
                     format!("Follow-up submitted via {}: {}", source, task),
                 );
                 drop(s);
-                tx.send(task_clone)
+                tx.send(FollowUpMessage::text(task_clone))
                     .await
                     .map_err(|_| "follow-up channel closed".to_string())?;
                 return Ok(());
@@ -1815,7 +1816,7 @@ async fn handle_control_command_mcp(
                 s.set_phase(Phase::Thinking);
                 s.push_log(LogLevel::Info, format!("Follow-up via socket: {}", text));
                 drop(s);
-                if tx.send(text).await.is_err() {
+                if tx.send(FollowUpMessage::text(text)).await.is_err() {
                     emit_control_result(
                         control_tx,
                         "follow_up",

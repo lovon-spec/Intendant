@@ -2709,6 +2709,7 @@ const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
 /// stream pattern, but sinks to disk instead of a UTF-8 `String`.
 async fn stream_body_to_tempfile(
     header_text: &str,
+    initial_request_bytes: &[u8],
     stream: &mut tokio::net::TcpStream,
     max_bytes: usize,
 ) -> Result<(tempfile::NamedTempFile, usize), String> {
@@ -2731,11 +2732,7 @@ async fn stream_body_to_tempfile(
         ));
     }
 
-    let peeked_body = header_text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .as_bytes();
+    let peeked_body = initial_body_bytes(initial_request_bytes)?;
     let mut tmp = tempfile::NamedTempFile::new()
         .map_err(|e| format!("create tempfile: {e}"))?;
 
@@ -2774,6 +2771,14 @@ async fn stream_body_to_tempfile(
         .flush()
         .map_err(|e| format!("flush tempfile: {e}"))?;
     Ok((tmp, written))
+}
+
+fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], String> {
+    initial_request_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|idx| &initial_request_bytes[idx + 4..])
+        .ok_or_else(|| "incomplete HTTP headers".to_string())
 }
 
 /// Parse a query-string value by key out of a full `request_line`
@@ -6748,9 +6753,15 @@ pub fn spawn_web_gateway(
                                 .and_then(crate::upload_store::UploadDestination::from_str)
                                 .unwrap_or(crate::upload_store::UploadDestination::Task);
                             let mime = content_type_header(&header_text);
+                            if header_text.lines().any(|l| {
+                                l.trim().eq_ignore_ascii_case("expect: 100-continue")
+                            }) {
+                                let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                            }
 
                             match stream_body_to_tempfile(
                                 &header_text,
+                                &discard,
                                 &mut stream,
                                 UPLOAD_MAX_BYTES,
                             )
@@ -9588,6 +9599,24 @@ mod tests {
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
+    }
+
+    #[test]
+    fn initial_body_bytes_preserves_non_utf8_upload_prefix() {
+        let mut request =
+            b"POST /api/session/current/uploads HTTP/1.1\r\nContent-Length: 4\r\n\r\n".to_vec();
+        request.extend_from_slice(&[0xff, 0x00, 0x80, b'a']);
+
+        assert_eq!(
+            initial_body_bytes(&request).unwrap(),
+            &[0xff, 0x00, 0x80, b'a']
+        );
+    }
+
+    #[test]
+    fn initial_body_bytes_rejects_incomplete_headers() {
+        let request = b"POST /api/session/current/uploads HTTP/1.1\r\nContent-Length: 4\r\n";
+        assert!(initial_body_bytes(request).is_err());
     }
 
     #[test]

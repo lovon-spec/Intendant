@@ -250,6 +250,42 @@ pub fn find_upload(
     list_uploads(session_dir, project_root)
         .into_iter()
         .find(|u| u.id == id)
+        .or_else(|| find_task_upload_in_sibling_sessions(id, session_dir))
+}
+
+fn find_task_upload_in_sibling_sessions(
+    id: &str,
+    session_dir: &Path,
+) -> Option<UploadDescriptor> {
+    let sessions_root = session_dir.parent()?;
+    let entries = fs::read_dir(sessions_root).ok()?;
+    for entry in entries.flatten() {
+        let sibling_dir = entry.path();
+        if sibling_dir == session_dir || !sibling_dir.is_dir() {
+            continue;
+        }
+        let uploads_dir = task_uploads_dir(&sibling_dir);
+        let uploads = match fs::read_dir(&uploads_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for upload_entry in uploads.flatten() {
+            let path = upload_entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(descriptor) = serde_json::from_str::<UploadDescriptor>(&content) else {
+                continue;
+            };
+            if descriptor.id == id {
+                return Some(descriptor);
+            }
+        }
+    }
+    None
 }
 
 /// Remove an upload and its sidecar. Returns `Ok(false)` if no descriptor
@@ -327,6 +363,35 @@ mod tests {
         assert_eq!(listed[0].id, descriptor.id);
         assert_eq!(listed[0].name, "notes.txt");
         assert_eq!(listed[0].destination, UploadDestination::Task);
+    }
+
+    #[test]
+    fn find_upload_falls_back_to_sibling_task_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_session_dir = tmp.path().join("sessions").join("session-1");
+        let second_session_dir = tmp.path().join("sessions").join("session-2");
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&first_session_dir).unwrap();
+        std::fs::create_dir_all(&second_session_dir).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let pending = mk_tempfile(b"from old active session");
+        let descriptor = commit_upload(
+            pending,
+            "handoff.txt",
+            "text/plain",
+            23,
+            UploadDestination::Task,
+            &first_session_dir,
+            "session-1",
+            &project_root,
+        )
+        .unwrap();
+
+        let found = find_upload(&descriptor.id, &second_session_dir, &project_root).unwrap();
+        assert_eq!(found.id, descriptor.id);
+        assert_eq!(found.path, descriptor.path);
+        assert_eq!(found.destination, UploadDestination::Task);
     }
 
     #[test]

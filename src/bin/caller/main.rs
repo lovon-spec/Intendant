@@ -1367,7 +1367,75 @@ struct LoopStats {
     last_response: Option<String>,
 }
 
-type FollowUpReceiver = tokio::sync::mpsc::Receiver<String>;
+#[derive(Debug, Clone, Default)]
+struct UserAttachments {
+    items: Vec<external_agent::AgentAttachment>,
+}
+
+impl UserAttachments {
+    fn from_items(items: Vec<external_agent::AgentAttachment>) -> Self {
+        Self { items }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn conversation_images(&self) -> Vec<conversation::ImageData> {
+        self.items
+            .iter()
+            .filter_map(|att| match att {
+                external_agent::AgentAttachment::Image(img) => Some(conversation::ImageData {
+                    media_type: img.mime_type.clone(),
+                    data: img.base64.clone(),
+                }),
+                external_agent::AgentAttachment::File(_) => None,
+            })
+            .collect()
+    }
+
+    fn text_with_file_prelude(&self, text: &str) -> String {
+        let files: Vec<&external_agent::AgentFileAttachment> = self
+            .items
+            .iter()
+            .filter_map(|att| match att {
+                external_agent::AgentAttachment::File(file) => Some(file),
+                external_agent::AgentAttachment::Image(_) => None,
+            })
+            .collect();
+        let prelude = external_agent::format_file_attachments_prelude(&files);
+        if prelude.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}{}", prelude, text)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FollowUpMessage {
+    text: String,
+    attachments: UserAttachments,
+}
+
+impl FollowUpMessage {
+    fn text(text: String) -> Self {
+        Self {
+            text,
+            attachments: UserAttachments::default(),
+        }
+    }
+
+    fn with_attachments(text: String, attachments: UserAttachments) -> Self {
+        Self { text, attachments }
+    }
+}
+
+type FollowUpReceiver = tokio::sync::mpsc::Receiver<FollowUpMessage>;
 
 /// CLI flags parsed from command-line arguments.
 struct CliFlags {
@@ -2519,6 +2587,77 @@ mod tests {
             auth.application,
             Some(peer::ApplicationAuth::Bearer { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn resolve_attachments_includes_uploaded_files_and_images() {
+        use std::io::Write as _;
+
+        fn upload_tempfile(bytes: &[u8]) -> tempfile::NamedTempFile {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(bytes).unwrap();
+            file.flush().unwrap();
+            file
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let file_upload = upload_store::commit_upload(
+            upload_tempfile(b"a,b\n1,2\n"),
+            "data.csv",
+            "text/csv",
+            8,
+            upload_store::UploadDestination::Workspace,
+            &session_dir,
+            "sess-1",
+            &project_root,
+        )
+        .unwrap();
+        let image_upload = upload_store::commit_upload(
+            upload_tempfile(b"not-really-a-png"),
+            "screen.png",
+            "image/png",
+            16,
+            upload_store::UploadDestination::Task,
+            &session_dir,
+            "sess-1",
+            &project_root,
+        )
+        .unwrap();
+
+        let registry = Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(
+            &session_dir,
+        )));
+        let ids = vec![
+            format!("upload:{}", file_upload.id),
+            format!("upload:{}", image_upload.id),
+        ];
+        let attachments = resolve_attachments(&ids, &registry, &session_dir, &project_root).await;
+
+        assert_eq!(attachments.len(), 2);
+        match &attachments[0] {
+            external_agent::AgentAttachment::File(file) => {
+                assert_eq!(file.name, "data.csv");
+                assert_eq!(file.mime_type, "text/csv");
+                assert_eq!(file.size, 8);
+                assert!(file
+                    .local_path
+                    .starts_with(project_root.join("workspace_files")));
+            }
+            other => panic!("expected file upload attachment, got {other:?}"),
+        }
+        match &attachments[1] {
+            external_agent::AgentAttachment::Image(image) => {
+                assert_eq!(image.mime_type, "image/png");
+                assert_eq!(image.local_path.as_ref(), Some(&image_upload.path));
+                assert!(!image.base64.is_empty());
+            }
+            other => panic!("expected image upload attachment, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5054,10 +5193,26 @@ async fn run_round_loop(
                 match follow_up_rx.recv().await {
                     Some(message) => {
                         round += 1;
+                        let followup_text =
+                            message.attachments.text_with_file_prelude(&message.text);
+                        let followup_images = message.attachments.conversation_images();
                         slog(&session_log, |l| {
-                            l.info(&format!("Round {} follow-up: {}", round, &message))
+                            l.info(&format!(
+                                "Round {} follow-up: {}{}",
+                                round,
+                                &message.text,
+                                if message.attachments.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({} attachment(s))", message.attachments.len())
+                                }
+                            ))
                         });
-                        conversation.add_user(message);
+                        if followup_images.is_empty() {
+                            conversation.add_user(followup_text);
+                        } else {
+                            conversation.add_user_with_images(followup_text, followup_images);
+                        }
                     }
                     None => {
                         // Channel closed — user quit or sender dropped
@@ -6185,7 +6340,8 @@ async fn run_with_presence(
             }
 
             // Run one round (agent loop until done/budget/error)
-            let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+            let (follow_up_tx, mut follow_up_rx) =
+                tokio::sync::mpsc::channel::<FollowUpMessage>(1);
             drop(follow_up_tx); // single-round per task dispatch
 
             let result = run_round_loop(
@@ -6532,7 +6688,7 @@ async fn run_direct_mode(
     approval_registry: event::ApprovalRegistry,
     context_injection: event::ContextInjectionQueue,
     headless: bool,
-    attachment_images: Vec<conversation::ImageData>,
+    attachments: UserAttachments,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -6558,6 +6714,7 @@ async fn run_direct_mode(
 
     // Try to resume from saved conversation if it exists in this session dir
     let conv_path = log_dir.join("conversation.jsonl");
+    let attachment_images = attachments.conversation_images();
     let mut conversation = if conv_path.exists() {
         match Conversation::load_from_file(&conv_path, provider.context_window()) {
             Ok(mut conv) => {
@@ -6569,7 +6726,8 @@ async fn run_direct_mode(
                     ))
                 });
                 // Append the new task as a continuation message
-                let resume_msg = format!("[Session resumed] Continue with: {}", task);
+                let resume_msg = attachments
+                    .text_with_file_prelude(&format!("[Session resumed] Continue with: {}", task));
                 if attachment_images.is_empty() {
                     conv.add_user(resume_msg);
                 } else {
@@ -6588,7 +6746,7 @@ async fn run_direct_mode(
                 setup_fresh_conversation_with_attachments(
                     &mut conv,
                     &project,
-                    &task,
+                    &attachments.text_with_file_prelude(&task),
                     attachment_images.clone(),
                 );
                 conv
@@ -6599,12 +6757,11 @@ async fn run_direct_mode(
         setup_fresh_conversation_with_attachments(
             &mut conv,
             &project,
-            &task,
+            &attachments.text_with_file_prelude(&task),
             attachment_images.clone(),
         );
         conv
     };
-    let _ = attachment_images; // moved into setup; declare consumed
 
     // Register MCP tools so providers include them in API requests
     if let Some(ref mgr) = mcp_mgr {
@@ -6654,7 +6811,7 @@ async fn run_external_agent_mode(
     context_injection: event::ContextInjectionQueue,
     headless: bool,
     web_port: Option<u16>,
-    attachment_images: Vec<conversation::ImageData>,
+    attachments: UserAttachments,
     resume_session: Option<String>,
     control_session_id: Option<String>,
 ) -> Result<LoopStats, CallerError> {
@@ -6672,15 +6829,11 @@ async fn run_external_agent_mode(
         create_external_agent(&backend, &project, &session_log, web_port, resume_session).await?;
 
     emit_user_message_log(&bus, &session_log, &task);
-    if attachment_images.is_empty() {
+    if attachments.is_empty() {
         agent.send_message(&thread, &task).await?;
     } else {
-        let attachments: Vec<external_agent::AgentImageAttachment> = attachment_images
-            .iter()
-            .map(external_agent::AgentImageAttachment::from_image_data)
-            .collect();
         agent
-            .send_message_with_images(&thread, &task, &attachments)
+            .send_message_with_attachments(&thread, &task, &attachments.items)
             .await?;
         slog(&session_log, |l| {
             l.info(&format!(
@@ -6689,7 +6842,7 @@ async fn run_external_agent_mode(
             ))
         });
     }
-    if attachment_images.is_empty() {
+    if attachments.is_empty() {
         slog(&session_log, |l| l.info("Initial task sent to external agent"));
     }
 
@@ -6737,18 +6890,39 @@ async fn run_external_agent_mode(
                     Some(followup) => {
                         round += 1;
                         stats.turns = 0;
-                        emit_user_message_log(&bus, &session_log, &followup);
+                        let attachment_count = followup.attachments.len();
+                        emit_user_message_log(&bus, &session_log, &followup.text);
                         let merged = drain_steer_queue_as_followup(
                             &context_injection,
-                            &followup,
+                            &followup.text,
                             &bus,
                             live_session_id.as_deref(),
                         )
-                        .unwrap_or(followup);
+                        .unwrap_or_else(|| followup.text.clone());
                         slog(&session_log, |l| {
-                            l.info(&format!("Follow-up round {}: {}", round, merged));
+                            l.info(&format!(
+                                "Follow-up round {}: {}{}",
+                                round,
+                                merged,
+                                if attachment_count == 0 {
+                                    String::new()
+                                } else {
+                                    format!(" ({} attachment(s))", attachment_count)
+                                }
+                            ));
                         });
-                        if let Err(e) = agent.send_message(&thread, &merged).await {
+                        let send_result = if followup.attachments.is_empty() {
+                            agent.send_message(&thread, &merged).await
+                        } else {
+                            agent
+                                .send_message_with_attachments(
+                                    &thread,
+                                    &merged,
+                                    &followup.attachments.items,
+                                )
+                                .await
+                        };
+                        if let Err(e) = send_result {
                             bus.send(AppEvent::LoopError(format!(
                                 "Failed to send follow-up: {}",
                                 e
@@ -6782,18 +6956,39 @@ async fn run_external_agent_mode(
                     Some(followup) => {
                         round += 1;
                         stats.turns = 0;
-                        emit_user_message_log(&bus, &session_log, &followup);
+                        let attachment_count = followup.attachments.len();
+                        emit_user_message_log(&bus, &session_log, &followup.text);
                         let merged = drain_steer_queue_as_followup(
                             &context_injection,
-                            &followup,
+                            &followup.text,
                             &bus,
                             session_log_id(&session_log).as_deref(),
                         )
-                        .unwrap_or(followup);
+                        .unwrap_or_else(|| followup.text.clone());
                         slog(&session_log, |l| {
-                            l.info(&format!("Follow-up round {}: {}", round, merged));
+                            l.info(&format!(
+                                "Follow-up round {}: {}{}",
+                                round,
+                                merged,
+                                if attachment_count == 0 {
+                                    String::new()
+                                } else {
+                                    format!(" ({} attachment(s))", attachment_count)
+                                }
+                            ));
                         });
-                        if let Err(e) = agent.send_message(&thread, &merged).await {
+                        let send_result = if followup.attachments.is_empty() {
+                            agent.send_message(&thread, &merged).await
+                        } else {
+                            agent
+                                .send_message_with_attachments(
+                                    &thread,
+                                    &merged,
+                                    &followup.attachments.items,
+                                )
+                                .await
+                        };
+                        if let Err(e) = send_result {
                             bus.send(AppEvent::LoopError(format!(
                                 "Failed to send follow-up: {}",
                                 e
@@ -7013,7 +7208,6 @@ async fn resolve_attachments(
         return Vec::new();
     }
     let mut out: Vec<external_agent::AgentAttachment> = Vec::with_capacity(ids.len());
-    let reg = registry.read().await;
     for raw in ids {
         if let Some(upload_id) = raw.strip_prefix("upload:") {
             let Some(d) = upload_store::find_upload(upload_id, session_dir, project_root)
@@ -7056,10 +7250,15 @@ async fn resolve_attachments(
         // backward compatibility with dashboards that predate the upload
         // feature.
         let fid = raw.strip_prefix("frame:").unwrap_or(raw);
-        let Ok(data) = reg.read_hq(fid) else { continue };
+        let (data, path) = {
+            let reg = registry.read().await;
+            let Ok(data) = reg.read_hq(fid) else {
+                continue;
+            };
+            (data, reg.path_for(fid))
+        };
         use base64::Engine;
         let base64 = base64::engine::general_purpose::STANDARD.encode(&data);
-        let path = reg.path_for(fid);
         out.push(external_agent::AgentAttachment::Image(
             external_agent::AgentImageAttachment::from_frame_path(
                 path,
@@ -8717,7 +8916,8 @@ async fn main() -> Result<(), CallerError> {
                 };
 
                 // Create follow-up channel for multi-round support
-                let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+                let (follow_up_tx, follow_up_rx) =
+                    tokio::sync::mpsc::channel::<FollowUpMessage>(1);
                 {
                     let mut s = mcp_state.write().await;
                     s.follow_up_tx = Some(follow_up_tx);
@@ -8750,7 +8950,7 @@ async fn main() -> Result<(), CallerError> {
                             event::ContextInjectionQueue::default(),
                             false,
                             web_port_for_agent,
-                            vec![],
+                            UserAttachments::default(),
                             None,
                             None,
                         )
@@ -8780,7 +8980,7 @@ async fn main() -> Result<(), CallerError> {
                             approval_registry,
                             event::ContextInjectionQueue::default(),
                             false, // not headless — MCP has interactive approval
-                            vec![],
+                            UserAttachments::default(),
                         )
                         .await
                     };
@@ -8993,7 +9193,8 @@ async fn main() -> Result<(), CallerError> {
         // the very first task from the input panel. Owned by the task
         // dispatcher (spawned below), not the TUI — the TUI emits
         // ControlCommand on the bus, the dispatcher routes.
-        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (follow_up_tx, mut follow_up_rx) =
+            tokio::sync::mpsc::channel::<FollowUpMessage>(4);
 
         // If no task was provided, start in follow-up mode so the user sees
         // the input panel immediately.
@@ -9339,14 +9540,14 @@ async fn main() -> Result<(), CallerError> {
                     match follow_up_rx.recv().await {
                         Some(first_task) => {
                             slog(&session_log_clone, |l| {
-                                l.info(&format!("Task (from input): {}", first_task))
+                                l.info(&format!("Task (from input): {}", first_task.text))
                             });
                             bus_clone.send(AppEvent::TurnStarted {
                                 turn: 0,
                                 budget_pct: 0.0,
                                 remaining: 0,
                             });
-                            (first_task, follow_up_rx)
+                            (first_task.text, follow_up_rx)
                         }
                         None => return, // channel closed before a task arrived
                     }
@@ -9367,7 +9568,7 @@ async fn main() -> Result<(), CallerError> {
                         context_injection_clone.clone(),
                         false, // not headless — TUI handles approval
                         web_port_for_agent,
-                        vec![],
+                        UserAttachments::default(),
                         None,
                         None,
                     )
@@ -9399,7 +9600,7 @@ async fn main() -> Result<(), CallerError> {
                             approval_registry_clone,
                             context_injection_clone,
                             false, // not headless — TUI handles approval
-                            vec![],
+                            UserAttachments::default(),
                         )
                         .await
                     } else {
@@ -9647,7 +9848,8 @@ async fn main() -> Result<(), CallerError> {
         // Create follow-up channel. In JSON mode, spawn a stdin reader to enable
         // follow-up via stdin lines and JSON commands (approve, deny, input, etc.).
         // Otherwise, drop the sender immediately so recv() returns None → single-round.
-        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (follow_up_tx, follow_up_rx) =
+            tokio::sync::mpsc::channel::<FollowUpMessage>(1);
         let json_approval_slot = if flags.json_output {
             Some(new_json_approval_slot())
         } else {
@@ -9706,7 +9908,11 @@ async fn main() -> Result<(), CallerError> {
                                     // the headless `--json` path where
                                     // there's no presence layer, so the
                                     // direct bit is implicitly always on.
-                                    if follow_up_tx.send(text).await.is_err() {
+                                    if follow_up_tx
+                                        .send(FollowUpMessage::text(text))
+                                        .await
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
@@ -9718,7 +9924,11 @@ async fn main() -> Result<(), CallerError> {
                         }
                     }
                     // Plain text → follow-up message
-                    if follow_up_tx.send(line).await.is_err() {
+                    if follow_up_tx
+                        .send(FollowUpMessage::text(line))
+                        .await
+                        .is_err()
+                    {
                         break; // receiver dropped
                     }
                 }
@@ -9801,7 +10011,7 @@ async fn main() -> Result<(), CallerError> {
                 event::ContextInjectionQueue::default(),
                 true, // headless mode
                 web_port_for_agent,
-                vec![],
+                UserAttachments::default(),
                 None,
                 None,
             )
@@ -9825,7 +10035,7 @@ async fn main() -> Result<(), CallerError> {
                     event::ApprovalRegistry::default(),
                     event::ContextInjectionQueue::default(),
                     true, // headless mode
-                    vec![],
+                    UserAttachments::default(),
                 )
                 .await
             } else {

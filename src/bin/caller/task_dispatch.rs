@@ -16,7 +16,7 @@
 //!   2. Else if `task_tx` is available: wrap in `TaskEnvelope` and send.
 //!      `force_direct` is derived from the `direct` flag (plus legacy
 //!      `orchestrate == Some(false)` for StartTask).
-//!   3. Else if `follow_up_tx` is available: send text only. Metadata is
+//!   3. Else if `follow_up_tx` is available: send a follow-up message. Metadata is
 //!      dropped (non-presence mode has no CU-first routing anyway).
 //!   4. Else: warn and drop.
 //!
@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::event::{AppEvent, ControlMsg, EventBus};
+use crate::FollowUpMessage;
 
 /// Senders the dispatcher owns. Clone to populate these from the channels
 /// already created in `main.rs` (e.g. for presence task loop / agent loop).
@@ -41,9 +42,9 @@ pub struct Dispatcher {
     /// Task envelope channel consumed by `run_with_presence`. When `Some`,
     /// direct tasks go here (full metadata preserved).
     pub task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
-    /// Text follow-up channel consumed by `run_direct_mode` /
+    /// Follow-up channel consumed by `run_direct_mode` /
     /// `run_external_agent_mode` in non-presence mode.
-    pub follow_up_tx: Option<mpsc::Sender<String>>,
+    pub follow_up_tx: Option<mpsc::Sender<FollowUpMessage>>,
 }
 
 impl Dispatcher {
@@ -118,7 +119,7 @@ impl Dispatcher {
                 }
 
                 if let Some(ref tx) = self.follow_up_tx {
-                    if tx.try_send(task.clone()).is_ok() {
+                    if tx.try_send(FollowUpMessage::text(task.clone())).is_ok() {
                         return;
                     }
                 }
@@ -157,7 +158,7 @@ impl Dispatcher {
                 }
 
                 if let Some(ref tx) = self.follow_up_tx {
-                    if tx.try_send(text.clone()).is_ok() {
+                    if tx.try_send(FollowUpMessage::text(text.clone())).is_ok() {
                         return;
                     }
                 }
@@ -225,7 +226,7 @@ mod tests {
     async fn start_task_with_metadata_prefers_task_tx() {
         let (task_tx, mut task_rx) = mpsc::channel::<presence_core::TaskEnvelope>(4);
         let (presence_tx, mut presence_rx) = mpsc::channel::<String>(4);
-        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<String>(4);
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
         let bus = make_test_bus();
 
         let dispatcher = Dispatcher {
@@ -358,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn follow_up_non_presence_goes_to_follow_up_tx() {
-        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<String>(4);
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
         let bus = make_test_bus();
 
         let dispatcher = Dispatcher {
@@ -375,12 +376,13 @@ mod tests {
             direct: None,
         }));
 
-        let text =
+        let msg =
             tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(text, "keep going");
+        assert_eq!(msg.text, "keep going");
+        assert!(msg.attachments.is_empty());
     }
 
     #[tokio::test]

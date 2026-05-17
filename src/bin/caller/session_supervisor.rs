@@ -44,7 +44,8 @@ struct ManagedSession {
     session_id: String,
     source: String,
     project_root: PathBuf,
-    follow_up_tx: mpsc::Sender<String>,
+    session_dir: PathBuf,
+    follow_up_tx: mpsc::Sender<FollowUpMessage>,
     approval_registry: event::ApprovalRegistry,
 }
 
@@ -88,16 +89,13 @@ impl SessionSupervisor {
                 attachments,
                 ..
             } => {
-                if !reference_frame_ids.is_empty()
-                    || display_target.is_some()
-                    || !attachments.is_empty()
-                {
+                if !reference_frame_ids.is_empty() || display_target.is_some() {
                     self.warn(&format!(
-                        "Targeted StartTask for {} dropped frame/display metadata; routing text only",
+                        "Targeted StartTask for {} dropped reference frame/display metadata; routing text as follow-up",
                         short_session(&session_id)
                     ));
                 }
-                self.route_follow_up(Some(session_id), task, direct).await;
+                self.route_follow_up(Some(session_id), task, direct, attachments).await;
             }
             event::ControlMsg::StartTask {
                 session_id: None,
@@ -134,7 +132,7 @@ impl SessionSupervisor {
                 text,
                 direct,
             } => {
-                self.route_follow_up(session_id, text, direct).await;
+                self.route_follow_up(session_id, text, direct, vec![]).await;
             }
             event::ControlMsg::Interrupt {
                 session_id,
@@ -242,7 +240,25 @@ impl SessionSupervisor {
                 return;
             }
         };
-        let attachment_images = resolve_frame_ids(&attachments, &self.config.frame_registry).await;
+        let session_dir = session_log
+            .lock()
+            .map(|log| log.dir().to_path_buf())
+            .unwrap_or_else(|_| log_dir.clone());
+        let resolved_attachments = resolve_attachments(
+            &attachments,
+            &self.config.frame_registry,
+            &session_dir,
+            &project.root,
+        )
+        .await;
+        if resolved_attachments.len() < attachments.len() {
+            self.warn(&format!(
+                "Only resolved {} of {} requested attachment(s) for new session",
+                resolved_attachments.len(),
+                attachments.len()
+            ));
+        }
+        let attachments_for_agent = UserAttachments::from_items(resolved_attachments);
 
         emit_task_dispatched_log(&self.config.bus, &session_log, &task, attachments.len());
         self.spawn_agent_session(
@@ -254,7 +270,7 @@ impl SessionSupervisor {
             log_dir,
             backend,
             use_direct,
-            attachment_images,
+            attachments_for_agent,
             None,
         )
         .await;
@@ -383,7 +399,7 @@ impl SessionSupervisor {
             log_dir,
             external_backend,
             direct.unwrap_or(true),
-            vec![],
+            UserAttachments::default(),
             Some(resume_token),
         )
         .await;
@@ -416,16 +432,17 @@ impl SessionSupervisor {
         log_dir: PathBuf,
         backend: Option<external_agent::AgentBackend>,
         use_direct: bool,
-        attachment_images: Vec<conversation::ImageData>,
+        attachments: UserAttachments,
         resume_token: Option<String>,
     ) {
-        let (follow_up_tx, follow_up_rx) = mpsc::channel::<String>(16);
+        let (follow_up_tx, follow_up_rx) = mpsc::channel::<FollowUpMessage>(16);
         let approval_registry = event::ApprovalRegistry::default();
         let context_injection = event::ContextInjectionQueue::default();
         self.register_session(
             session_id.clone(),
             source.clone(),
             project.root.clone(),
+            log_dir.clone(),
             follow_up_tx,
             approval_registry.clone(),
         )
@@ -451,7 +468,7 @@ impl SessionSupervisor {
                     context_injection,
                     true,
                     web_port,
-                    attachment_images,
+                    attachments,
                     resume_token,
                     Some(session_id.clone()),
                 )
@@ -480,7 +497,7 @@ impl SessionSupervisor {
                         approval_registry,
                         context_injection,
                         true,
-                        attachment_images,
+                        attachments,
                     )
                     .await
                 } else {
@@ -592,6 +609,7 @@ impl SessionSupervisor {
         session_id: Option<String>,
         text: String,
         _direct: Option<bool>,
+        attachments: Vec<String>,
     ) {
         let (target_id, entry) = {
             let state = self.state.lock().await;
@@ -606,6 +624,7 @@ impl SessionSupervisor {
                     s.session_id.clone(),
                     s.source.clone(),
                     s.project_root.clone(),
+                    s.session_dir.clone(),
                     s.follow_up_tx.clone(),
                 )
             });
@@ -613,8 +632,32 @@ impl SessionSupervisor {
         };
 
         match entry {
-            Some((managed_id, source, project_root, tx)) => {
-                if tx.send(text).await.is_err() {
+            Some((managed_id, source, project_root, session_dir, tx)) => {
+                let resolved_attachments = if attachments.is_empty() {
+                    Vec::new()
+                } else {
+                    resolve_attachments(
+                        &attachments,
+                        &self.config.frame_registry,
+                        &session_dir,
+                        &project_root,
+                    )
+                    .await
+                };
+                if resolved_attachments.len() < attachments.len() {
+                    self.warn(&format!(
+                        "Only resolved {} of {} requested attachment(s) for {} session {}",
+                        resolved_attachments.len(),
+                        attachments.len(),
+                        source,
+                        short_session(&managed_id)
+                    ));
+                }
+                let msg = FollowUpMessage::with_attachments(
+                    text,
+                    UserAttachments::from_items(resolved_attachments),
+                );
+                if tx.send(msg).await.is_err() {
                     self.warn(&format!(
                         "FollowUp dropped: {} session {} in {} is not accepting input",
                         source,
@@ -728,7 +771,8 @@ impl SessionSupervisor {
         session_id: String,
         source: String,
         project_root: PathBuf,
-        follow_up_tx: mpsc::Sender<String>,
+        session_dir: PathBuf,
+        follow_up_tx: mpsc::Sender<FollowUpMessage>,
         approval_registry: event::ApprovalRegistry,
     ) {
         let mut state = self.state.lock().await;
@@ -739,6 +783,7 @@ impl SessionSupervisor {
                 session_id,
                 source,
                 project_root,
+                session_dir,
                 follow_up_tx,
                 approval_registry,
             },

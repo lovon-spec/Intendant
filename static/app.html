@@ -9905,7 +9905,8 @@ function clearPendingAttachments() {
 // each file to POST /api/session/current/uploads → the server replies
 // with an UploadDescriptor, broadcasts UploadReady to all connected
 // browsers →
-// every browser's `onUploadReady` drops a chip into pendingAttachments.
+// the POST response immediately adds a chip in this browser; the UploadReady
+// broadcast lets any other connected browser mirror the same pending chip.
 // Submitting a task maps the chip's `frameId` (of the form "upload:<id>")
 // directly into the `attachments` array — the server's `resolve_attachments`
 // understands the prefix.
@@ -9914,6 +9915,7 @@ function clearPendingAttachments() {
 // (the server bails with 413 even if the browser lies); nicer to catch it
 // before the network round-trip.
 const UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
+let activeUploadFlows = 0;
 
 /// Short human-readable file-size string, matches the server's formatter.
 function humanBytes(n) {
@@ -9930,25 +9932,34 @@ async function uploadOneFile(file, destination) {
   }
   const mime = file.type || 'application/octet-stream';
   const q = `destination=${encodeURIComponent(destination)}&name=${encodeURIComponent(file.name || 'upload.bin')}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
   try {
     const resp = await fetch(`/api/session/current/uploads?${q}`, {
       method: 'POST',
       headers: { 'Content-Type': mime },
       body: file,
+      signal: controller.signal,
     });
     const json = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       logErrorToActivity(`Upload failed (${file.name}): ${json.error || resp.statusText}`);
       return null;
     }
-    // We do NOT add to pendingAttachments here — the server's UploadReady
-    // broadcast arrives a moment later via WS and onUploadReady handles it.
-    // Going through the broadcast means a second browser open to the same
-    // daemon sees the new attachment too.
+    // Add immediately from the POST response so this browser is not dependent
+    // on the WebSocket broadcast round-trip. The broadcast still updates any
+    // other open dashboard, and addPendingAttachment de-dupes this one.
+    onUploadReady(json);
     return json;
   } catch (e) {
-    logErrorToActivity(`Upload failed (${file.name}): ${e}`);
+    if (e && e.name === 'AbortError') {
+      logErrorToActivity(`Upload timed out (${file.name}).`);
+    } else {
+      logErrorToActivity(`Upload failed (${file.name}): ${e}`);
+    }
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -9969,14 +9980,19 @@ async function triggerUploadFlow(files) {
     ? 'task'
     : 'workspace';
   const btn = document.getElementById('upload-attach-btn');
+  activeUploadFlows += 1;
   if (btn) btn.classList.add('uploading');
   // Fire uploads sequentially to avoid hammering the gateway — it's a
   // hand-rolled server, not multiplexed. Can parallelise later if it
   // becomes a bottleneck.
-  for (const f of files) {
-    await uploadOneFile(f, dest);
+  try {
+    for (const f of files) {
+      await uploadOneFile(f, dest);
+    }
+  } finally {
+    activeUploadFlows = Math.max(0, activeUploadFlows - 1);
+    if (btn && activeUploadFlows === 0) btn.classList.remove('uploading');
   }
-  if (btn) btn.classList.remove('uploading');
 }
 
 function onUploadReady(descriptor) {
