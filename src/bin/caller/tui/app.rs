@@ -1344,6 +1344,16 @@ impl App {
                 self.current_phase = Phase::Thinking;
                 self.round += 1;
             }
+            ControlMsg::ResumeSession { ref source, ref session_id, .. } => {
+                self.follow_up_textarea = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Thinking;
+                self.round += 1;
+                self.log(
+                    LogLevel::Info,
+                    format!("Resume {} session {}", source, truncate_str(session_id, 12)),
+                );
+            }
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
             | ControlMsg::GetRestartStatus

@@ -1761,6 +1761,16 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::ResumeSession { source, session_id, .. } => {
+            emit_control_result(
+                control_tx,
+                "resume_session",
+                true,
+                format!("resume dispatched: {} {}", source, session_id),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::FollowUp { text, direct: _ } => {
             // MCP has a single follow-up channel and no presence layer,
             // so the `direct` bit is a no-op here — follow-ups already

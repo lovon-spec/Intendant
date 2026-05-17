@@ -860,6 +860,26 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
     },
+    ResumeSession {
+        /// Session source: "intendant", "codex", "claude-code", or "gemini".
+        source: String,
+        /// Display id from the Sessions tab. For Intendant this is the
+        /// session log id; for external backends it is the native session id.
+        session_id: String,
+        /// Backend-specific resume token. Defaults to `session_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_id: Option<String>,
+        /// Directory to use when launching the resumed session. External CLIs
+        /// resolve session history relative to their project roots.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        /// Prompt to send after the session is attached.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        /// Bypass presence/orchestration, matching StartTask.direct.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct: Option<bool>,
+    },
     FollowUp {
         text: String,
         /// When true, bypass the presence layer for this follow-up and

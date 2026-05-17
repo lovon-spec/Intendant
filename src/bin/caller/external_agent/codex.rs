@@ -560,6 +560,7 @@ pub struct CodexAgent {
     /// Extra writable roots beyond the project. Absolute paths.
     writable_roots: Vec<String>,
     web_port: Option<u16>,
+    resume_session: Option<String>,
     prompt_sent: bool,
     /// Working directory where .codex/config.toml was written (for cleanup).
     config_working_dir: Option<PathBuf>,
@@ -634,6 +635,7 @@ impl CodexAgent {
             network_access: opts.network_access,
             writable_roots: opts.writable_roots,
             web_port,
+            resume_session: None,
             prompt_sent: false,
             config_working_dir: None,
             request_trace_root: None,
@@ -1493,6 +1495,7 @@ impl ExternalAgent for CodexAgent {
         self.network_access = config.network_access;
         self.writable_roots = config.writable_roots;
         self.request_trace_root = config.request_trace_dir;
+        self.resume_session = config.resume_session;
 
         // Write .codex/config.toml for MCP-over-HTTP access to Intendant.
         // Backup any existing config and restore on shutdown.
@@ -1670,8 +1673,15 @@ impl ExternalAgent for CodexAgent {
             serde_json::Value::String(self.sandbox.clone()),
         );
 
+        let method = if let Some(ref thread_id) = self.resume_session {
+            params.insert("threadId".into(), serde_json::Value::String(thread_id.clone()));
+            "thread/resume"
+        } else {
+            "thread/start"
+        };
+
         let result = self
-            .send_request("thread/start", Some(serde_json::Value::Object(params)))
+            .send_request(method, Some(serde_json::Value::Object(params)))
             .await?;
 
         let thread_id = result

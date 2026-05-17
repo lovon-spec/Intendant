@@ -1796,6 +1796,20 @@ html, body {
   background: color-mix(in srgb, var(--peach) 15%, transparent);
   color: var(--peach);
 }
+.session-card .sc-status.external {
+  background: color-mix(in srgb, var(--sapphire) 15%, transparent);
+  color: var(--sapphire);
+}
+.session-card .sc-source {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--teal) 15%, transparent);
+  color: var(--teal);
+  font-weight: 600;
+}
 .session-card .sc-role {
   font-size: 10px;
   text-transform: uppercase;
@@ -1869,6 +1883,20 @@ html, body {
 .sc-delete-btn:hover {
   border-color: var(--red);
   color: var(--red);
+}
+.sc-resume-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  color: var(--green);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.sc-resume-btn:hover {
+  background: color-mix(in srgb, var(--green) 20%, transparent);
+  border-color: var(--green);
 }
 .sc-delete-menu {
   position: absolute;
@@ -16293,6 +16321,7 @@ document.getElementById('sort-sessions')?.addEventListener('change', _refilterSe
 
 function renderSessionsAggregate(sessions, el) {
   const totalSessions = sessions.length;
+  const externalSessions = sessions.filter(s => (s.source || 'intendant') !== 'intendant').length;
   const totalTokens = sessions.reduce((sum, s) => sum + (s.total_tokens || 0), 0);
   const totalInput = sessions.reduce((sum, s) => sum + (s.prompt_tokens || 0), 0);
   const totalOutput = sessions.reduce((sum, s) => sum + (s.completion_tokens || 0), 0);
@@ -16304,7 +16333,7 @@ function renderSessionsAggregate(sessions, el) {
   const totalDiskBytes = sessions.reduce((sum, s) => sum + (s.total_bytes || 0), 0);
 
   const cards = [
-    { label: 'Sessions', value: totalSessions.toLocaleString() + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
+    { label: 'Sessions', value: totalSessions.toLocaleString() + (externalSessions > 0 ? ` (${externalSessions} external)` : '') + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
     { label: 'Total Tokens', value: totalTokens.toLocaleString() },
     { label: 'Input', value: totalInput.toLocaleString() },
     { label: 'Cached', value: totalCached.toLocaleString() },
@@ -16370,8 +16399,10 @@ function renderSessionsList(sessions, el) {
   const showIdle = document.getElementById('filter-idle')?.checked ?? true;
 
   for (const s of sorted) {
+    const source = s.source || 'intendant';
     const shortId = (s.session_id || '').substring(0, 8);
-    const isCurrent = currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
+    const isExternal = source !== 'intendant';
+    const isCurrent = !isExternal && currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
 
     // Override status for current session — never show as abandoned/idle
     let displayStatus = s.status || 'in_progress';
@@ -16401,6 +16432,13 @@ function renderSessionsList(sessions, el) {
     statusEl.className = 'sc-status ' + displayStatus;
     statusEl.textContent = displayStatus.replace('_', ' ');
     top.appendChild(statusEl);
+
+    if (isExternal) {
+      const sourceEl = document.createElement('span');
+      sourceEl.className = 'sc-source';
+      sourceEl.textContent = s.source_label || prettyAgentName(source) || source;
+      top.appendChild(sourceEl);
+    }
 
     if (s.role) {
       const roleEl = document.createElement('span');
@@ -16540,10 +16578,23 @@ function renderSessionsList(sessions, el) {
       card.appendChild(mediaMeta);
     }
 
-    // Delete actions row
-    if (s.total_bytes > 0 || !isCurrent) {
+    // Actions row
+    if (s.can_resume || s.can_delete || ((s.total_bytes > 0 || !isCurrent) && !isExternal)) {
       const actions = document.createElement('div');
       actions.className = 'sc-actions';
+
+      if (s.can_resume !== false) {
+        const resumeBtn = document.createElement('button');
+        resumeBtn.className = 'sc-resume-btn';
+        resumeBtn.textContent = 'Resume';
+        resumeBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          resumeSession(s);
+        });
+        actions.appendChild(resumeBtn);
+      }
+
+      if (!isExternal && s.can_delete !== false) {
       const btn = document.createElement('button');
       btn.className = 'sc-delete-btn';
       btn.textContent = 'Delete...';
@@ -16588,13 +16639,30 @@ function renderSessionsList(sessions, el) {
         }
       });
       actions.appendChild(btn);
+      }
       card.appendChild(actions);
     }
 
     card.appendChild(meta);
-    card.addEventListener('click', () => openSessionDetail(s.session_id, s.task || '(no task)'));
+    card.addEventListener('click', () => openSessionDetail(s));
     el.appendChild(card);
   }
+}
+
+function resumeSession(s) {
+  if (!app || !s || !s.session_id) return;
+  const source = s.source || 'intendant';
+  const task = 'Continue where this session left off.';
+  app.send_server_action({
+    action: 'resume_session',
+    source,
+    session_id: s.session_id,
+    resume_id: s.resume_id || s.session_id,
+    project_root: s.project_root || null,
+    task,
+    direct: true,
+  });
+  switchTab('activity');
 }
 
 function deleteSessionData(sessionId, target, label) {
@@ -16631,7 +16699,13 @@ function deleteSessionData(sessionId, target, label) {
     .catch(e => alert('Delete failed: ' + e.message));
 }
 
-function openSessionDetail(sessionId, task) {
+function openSessionDetail(sessionOrId, taskArg) {
+  const session = typeof sessionOrId === 'object'
+    ? sessionOrId
+    : { session_id: sessionOrId, task: taskArg, source: 'intendant' };
+  const sessionId = session.session_id;
+  const source = session.source || 'intendant';
+  const task = session.task || '(no task)';
   const listEl = document.getElementById('sessions-list');
   const aggEl = document.getElementById('sessions-aggregate');
   const headerEl = document.querySelector('.sessions-header');
@@ -16643,7 +16717,8 @@ function openSessionDetail(sessionId, task) {
   aggEl.style.display = 'none';
   headerEl.style.display = 'none';
   detailEl.style.display = 'flex';
-  titleEl.textContent = task + ' (' + sessionId.substring(0, 8) + ')';
+  const sourceLabel = session.source_label || (source === 'intendant' ? 'Intendant' : prettyAgentName(source) || source);
+  titleEl.textContent = `${task} (${sourceLabel} ${sessionId.substring(0, 8)})`;
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
 
   // Reset sections
@@ -16651,7 +16726,7 @@ function openSessionDetail(sessionId, task) {
   document.getElementById('sd-frames').style.display = 'none';
   document.getElementById('session-detail-frames').innerHTML = '';
 
-  fetch('/api/session/' + sessionId)
+  fetch('/api/session/' + encodeURIComponent(sessionId) + '?source=' + encodeURIComponent(source))
     .then(r => r.json())
     .then(data => {
       if (data.error) {
@@ -16672,8 +16747,11 @@ function openSessionDetail(sessionId, task) {
       logsEl.innerHTML = '<div class="empty-state">Failed to load</div>';
     });
 
-  // Lazy-load recordings for this session
-  loadSessionRecordings(sessionId);
+  // Lazy-load recordings for Intendant sessions. External CLI histories do not
+  // have Intendant media directories.
+  if (source === 'intendant') {
+    loadSessionRecordings(sessionId);
+  }
 }
 
 function closeSessionDetail() {

@@ -383,6 +383,7 @@ async fn create_external_agent(
     project: &Project,
     session_log: &SharedSessionLog,
     web_port: Option<u16>,
+    resume_session: Option<String>,
 ) -> Result<
     (
         Box<dyn external_agent::ExternalAgent>,
@@ -430,6 +431,7 @@ async fn create_external_agent(
                 network_access: cfg.network_access,
                 writable_roots: cfg.writable_roots.clone(),
                 web_port,
+                resume_session: resume_session.clone(),
             };
             (agent, config)
         }
@@ -466,6 +468,7 @@ async fn create_external_agent(
                 network_access: false,
                 writable_roots: Vec::new(),
                 web_port,
+                resume_session: resume_session.clone(),
             };
             (agent, config)
         }
@@ -489,6 +492,7 @@ async fn create_external_agent(
                 network_access: false,
                 writable_roots: Vec::new(),
                 web_port,
+                resume_session: resume_session.clone(),
             };
             (agent, config)
         }
@@ -1409,6 +1413,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
                                     event::ContextInjectionQueue::default(),
                                     true, web_port_for_spawn,
                                     attachment_images.clone(),
+                                    None,
                                 ).await
                             } else {
                                 let new_provider = match provider::select_provider() {
@@ -1461,6 +1466,194 @@ async fn run_daemon_loop(config: DaemonConfig) {
                             });
 
                             // Clear session state (headless mode)
+                            if let Some(ref ss) = shared_cleanup {
+                                let mut state = ss.write().await;
+                                state.session_log = None;
+                                state.query_ctx = None;
+                            }
+                        });
+                    }
+                    Ok(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                        source,
+                        session_id,
+                        resume_id,
+                        project_root,
+                        task,
+                        direct,
+                    })) => {
+                        let source_norm = source.trim().to_lowercase();
+                        let resume_task = task.unwrap_or_else(|| {
+                            format!("Continue the resumed {} session.", source_norm)
+                        });
+                        let resume_task_preview =
+                            resume_task.chars().take(80).collect::<String>();
+                        eprintln!(
+                            "Resume session {} from {}: {}",
+                            session_id,
+                            source_norm,
+                            resume_task_preview
+                        );
+
+                        let project_root = project_root
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| config.project_root.clone());
+                        let new_project = match Project::from_root(project_root.clone()) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                config.bus.send(AppEvent::LoopError(format!("Project load failed: {}", e)));
+                                continue;
+                            }
+                        };
+
+                        let external_backend = if source_norm == "intendant" {
+                            None
+                        } else {
+                            match external_agent::AgentBackend::from_str_loose(&source_norm) {
+                                Some(b) => Some(b),
+                                None => {
+                                    config.bus.send(AppEvent::LoopError(format!(
+                                        "Unsupported session source: {}",
+                                        source
+                                    )));
+                                    continue;
+                                }
+                            }
+                        };
+
+                        let new_log_dir = if external_backend.is_none() {
+                            match session_log::SessionLog::find_session_by_id(&session_id) {
+                                Some(dir) => dir,
+                                None => {
+                                    config.bus.send(AppEvent::LoopError(format!(
+                                        "Session '{}' was not found",
+                                        session_id
+                                    )));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            session_log::SessionLog::resolve_path(None)
+                        };
+
+                        let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
+                            Ok(l) => Arc::new(Mutex::new(l)),
+                            Err(e) => {
+                                config.bus.send(AppEvent::LoopError(format!("Session open failed: {}", e)));
+                                continue;
+                            }
+                        };
+
+                        if let Some(ref shared_session) = config.shared_session {
+                            let mut ss = shared_session.write().await;
+                            ss.session_log = Some(new_session_log.clone());
+                        }
+
+                        let new_session_id = new_session_log
+                            .lock()
+                            .map(|l| l.session_id().to_string())
+                            .unwrap_or_else(|_| {
+                                new_log_dir
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("unknown")
+                                    .to_string()
+                            });
+                        config.bus.send(AppEvent::SessionStarted {
+                            session_id: new_session_id.clone(),
+                            task: Some(resume_task.clone()),
+                        });
+
+                        let bus_spawn = config.bus.clone();
+                        let autonomy_spawn = config.autonomy.clone();
+                        let session_log_spawn = new_session_log.clone();
+                        let shared_cleanup = config.shared_session.clone();
+                        let web_port_for_spawn = config.web_port;
+                        let resume_token = resume_id.unwrap_or(session_id);
+
+                        tokio::spawn(async move {
+                            let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+                            let result = if let Some(backend) = external_backend {
+                                run_external_agent_mode(
+                                    backend,
+                                    resume_task.clone(),
+                                    new_project,
+                                    bus_spawn.clone(),
+                                    autonomy_spawn,
+                                    session_log_spawn.clone(),
+                                    new_log_dir,
+                                    follow_up_rx,
+                                    None,
+                                    event::ApprovalRegistry::default(),
+                                    event::ContextInjectionQueue::default(),
+                                    true,
+                                    web_port_for_spawn,
+                                    vec![],
+                                    Some(resume_token),
+                                )
+                                .await
+                            } else {
+                                let provider = match provider::select_provider() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        return bus_spawn.send(AppEvent::LoopError(
+                                            format!("Provider failed: {}", e),
+                                        ));
+                                    }
+                                };
+                                if direct.unwrap_or(true) {
+                                    run_direct_mode(
+                                        provider,
+                                        resume_task.clone(),
+                                        new_project,
+                                        bus_spawn.clone(),
+                                        autonomy_spawn,
+                                        session_log_spawn.clone(),
+                                        new_log_dir,
+                                        None,
+                                        follow_up_rx,
+                                        None,
+                                        event::ApprovalRegistry::default(),
+                                        event::ContextInjectionQueue::default(),
+                                        true,
+                                        vec![],
+                                    )
+                                    .await
+                                } else {
+                                    run_user_mode(
+                                        provider,
+                                        resume_task.clone(),
+                                        new_project,
+                                        bus_spawn.clone(),
+                                        autonomy_spawn,
+                                        session_log_spawn.clone(),
+                                    )
+                                    .await
+                                }
+                            };
+
+                            let reason = match &result {
+                                Ok(stats) => {
+                                    slog(&session_log_spawn, |l| {
+                                        l.write_summary_with_rounds(
+                                            &resume_task, "completed",
+                                            stats.turns, Some(stats.rounds),
+                                        )
+                                    });
+                                    "completed".to_string()
+                                }
+                                Err(e) => {
+                                    slog(&session_log_spawn, |l| {
+                                        l.write_summary(&resume_task, &format!("error: {}", e), 0)
+                                    });
+                                    format!("error: {}", e)
+                                }
+                            };
+
+                            bus_spawn.send(AppEvent::SessionEnded {
+                                session_id: new_session_id,
+                                reason,
+                            });
+
                             if let Some(ref ss) = shared_cleanup {
                                 let mut state = ss.write().await;
                                 state.session_log = None;
@@ -6042,7 +6235,7 @@ async fn run_with_presence(
                     gm.debug = current_gemini_config.debug;
                 }
                 let (agent, thread, event_rx) =
-                    match create_external_agent(backend, &proj, &session_log, web_port).await {
+                    match create_external_agent(backend, &proj, &session_log, web_port, None).await {
                         Ok(result) => result,
                         Err(e) => {
                             bus.send(AppEvent::PresenceLog {
@@ -6747,6 +6940,7 @@ async fn run_external_agent_mode(
     headless: bool,
     web_port: Option<u16>,
     attachment_images: Vec<conversation::ImageData>,
+    resume_session: Option<String>,
 ) -> Result<LoopStats, CallerError> {
     slog(&session_log, |l| {
         l.info(&format!("Mode: external agent ({})", backend));
@@ -6759,7 +6953,7 @@ async fn run_external_agent_mode(
 
     // Construct, initialize, and start a thread for the external agent
     let (mut agent, thread, mut event_rx) =
-        create_external_agent(&backend, &project, &session_log, web_port).await?;
+        create_external_agent(&backend, &project, &session_log, web_port, resume_session).await?;
 
     if attachment_images.is_empty() {
         agent.send_message(&thread, &task).await?;
@@ -8666,6 +8860,7 @@ async fn main() -> Result<(), CallerError> {
                             false,
                             web_port_for_agent,
                             vec![],
+                            None,
                         )
                         .await
                     } else if use_orchestration {
@@ -9281,6 +9476,7 @@ async fn main() -> Result<(), CallerError> {
                         false, // not headless — TUI handles approval
                         web_port_for_agent,
                         vec![],
+                        None,
                     )
                     .await
                 } else {
@@ -9711,6 +9907,7 @@ async fn main() -> Result<(), CallerError> {
                 true, // headless mode
                 web_port_for_agent,
                 vec![],
+                None,
             )
             .await
         } else {

@@ -3,7 +3,8 @@ use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,13 +17,18 @@ use std::sync::{Arc, Mutex};
 // to remain poison-tolerant, matching the rest of the file's std-lock idiom.
 use std::sync::RwLock as StdRwLock;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
 /// connections.  Used for WebRTC signaling so that each browser tab gets a
 /// stable identity within a display session.
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
+
+const EXTERNAL_SESSION_SCAN_LIMIT: usize = 100;
+const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
+const SESSION_LIST_LIMIT: usize = 500;
+const SESSION_SOURCE_FLOOR: usize = 25;
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
 /// Only one connection can be active at a time; all others are "passive" (TUI-only).
@@ -1568,11 +1574,592 @@ fn get_session_detail(session_id: &str) -> String {
     }).to_string()
 }
 
+fn value_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+fn compact_text(s: &str, max: usize) -> String {
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max {
+        one_line
+    } else {
+        let mut out = one_line.chars().take(max.saturating_sub(1)).collect::<String>();
+        out.push_str("...");
+        out
+    }
+}
+
+fn message_content_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item.get("content").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            if parts.is_empty() { None } else { Some(parts.join("\n")) }
+        }
+        _ => None,
+    }
+}
+
+fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+        return None;
+    }
+    let role = payload
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("message")
+        .to_string();
+    let content = payload.get("content")?;
+    message_content_text(content).map(|text| (role, text))
+}
+
+fn collect_files(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, suffix, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(suffix))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn file_mtime_secs(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn collect_recent_files(root: &Path, suffix: &str, limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_files(root, suffix, &mut files);
+    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.truncate(limit);
+    files
+}
+
+fn read_text_prefix(path: &Path, max_bytes: u64) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(max_bytes).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+fn file_mtime_string(path: &Path) -> Option<String> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            dt.format("%Y-%m-%d %H:%M:%S").to_string()
+        })
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn external_session_json(
+    source: &str,
+    label: &str,
+    session_id: String,
+    resume_id: String,
+    created_at: Option<String>,
+    task: Option<String>,
+    provider: &str,
+    model: Option<String>,
+    turns: u64,
+    project_root: Option<String>,
+    path: Option<String>,
+    bytes: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "source": source,
+        "source_label": label,
+        "session_id": session_id,
+        "resume_id": resume_id,
+        "created_at": created_at.unwrap_or_default(),
+        "task": task,
+        "provider": provider,
+        "model": model,
+        "turns": turns,
+        "status": "external",
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cached_tokens": 0,
+        "estimated_cost": 0.0,
+        "role": null,
+        "recordings": 0,
+        "recording_bytes": 0,
+        "annotations": 0,
+        "clips": 0,
+        "frames_bytes": 0,
+        "turns_bytes": bytes,
+        "logs_bytes": bytes,
+        "total_bytes": bytes,
+        "project_root": project_root,
+        "path": path,
+        "can_delete": false,
+        "can_resume": true,
+    })
+}
+
+fn session_sort_key(session: &serde_json::Value) -> &str {
+    session
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+fn sort_sessions_newest_first(sessions: &mut Vec<serde_json::Value>) {
+    sessions.sort_by(|a, b| session_sort_key(b).cmp(session_sort_key(a)));
+}
+
+fn session_source(session: &serde_json::Value) -> &str {
+    session
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("intendant")
+}
+
+fn session_unique_key(session: &serde_json::Value) -> String {
+    let source = session_source(session);
+    let session_id = session
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!("{source}:{session_id}")
+}
+
+fn push_unique_session(
+    out: &mut Vec<serde_json::Value>,
+    seen: &mut HashSet<String>,
+    session: &serde_json::Value,
+) {
+    if seen.insert(session_unique_key(session)) {
+        out.push(session.clone());
+    }
+}
+
+fn truncate_sessions_preserving_sources(sessions: &mut Vec<serde_json::Value>) {
+    if sessions.len() <= SESSION_LIST_LIMIT {
+        return;
+    }
+
+    let mut out = Vec::with_capacity(SESSION_LIST_LIMIT);
+    let mut seen = HashSet::new();
+    for source in ["intendant", "codex", "claude-code", "gemini"] {
+        for session in sessions
+            .iter()
+            .filter(|session| session_source(session) == source)
+            .take(SESSION_SOURCE_FLOOR)
+        {
+            push_unique_session(&mut out, &mut seen, session);
+        }
+    }
+
+    for session in sessions.iter() {
+        if out.len() >= SESSION_LIST_LIMIT {
+            break;
+        }
+        push_unique_session(&mut out, &mut seen, session);
+    }
+
+    sort_sessions_newest_first(&mut out);
+    *sessions = out;
+}
+
+fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
+    let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
+    let index_path = home.join(".codex").join("session_index.jsonl");
+    if let Ok(contents) = std::fs::read_to_string(&index_path) {
+        for line in contents.lines() {
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+            let Some(id) = value_str(&obj, "id") else { continue; };
+            rows.insert(id.clone(), external_session_json(
+                "codex",
+                "Codex",
+                id.clone(),
+                id,
+                value_str(&obj, "updated_at"),
+                value_str(&obj, "thread_name"),
+                "Codex",
+                None,
+                0,
+                None,
+                Some(index_path.to_string_lossy().to_string()),
+                file_size(&index_path),
+            ));
+        }
+    }
+
+    let mut files = collect_recent_files(
+        &home.join(".codex").join("sessions"),
+        ".jsonl",
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    );
+    files.extend(collect_recent_files(
+        &home.join(".codex").join("archived_sessions"),
+        ".jsonl",
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    ));
+    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.truncate(EXTERNAL_SESSION_SCAN_LIMIT);
+    for path in files {
+        let Some(contents) = read_text_prefix(&path, EXTERNAL_SESSION_READ_LIMIT) else { continue; };
+        let mut id = None;
+        let mut created_at = None;
+        let mut cwd = None;
+        let mut task = None;
+        let mut model = None;
+        let mut provider = Some("Codex".to_string());
+        let mut turns = 0u64;
+        for line in contents.lines() {
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+            match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "session_meta" => {
+                    if let Some(payload) = obj.get("payload") {
+                        id = id.or_else(|| value_str(payload, "id"));
+                        created_at = created_at.or_else(|| value_str(payload, "timestamp"));
+                        cwd = cwd.or_else(|| value_str(payload, "cwd"));
+                        model = model.or_else(|| value_str(payload, "model"));
+                        provider = value_str(payload, "model_provider").or(provider);
+                    }
+                }
+                "turn_context" => {
+                    if let Some(payload) = obj.get("payload") {
+                        cwd = cwd.or_else(|| value_str(payload, "cwd"));
+                        model = model.or_else(|| value_str(payload, "model"));
+                    }
+                }
+                "event_msg" => {
+                    if obj.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_started") {
+                        turns += 1;
+                    }
+                }
+                "response_item" => {
+                    if let Some(payload) = obj.get("payload") {
+                        if task.is_none() {
+                            if let Some((role, text)) = codex_payload_text(payload) {
+                                if role == "user" {
+                                    task = Some(compact_text(&text, 180));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(id) = id else { continue; };
+        let existing_task = rows
+            .get(&id)
+            .and_then(|v| value_str(v, "task"));
+        rows.insert(id.clone(), external_session_json(
+            "codex",
+            "Codex",
+            id.clone(),
+            id,
+            created_at.or_else(|| file_mtime_string(&path)),
+            existing_task.or(task),
+            provider.as_deref().unwrap_or("Codex"),
+            model,
+            turns,
+            cwd,
+            Some(path.to_string_lossy().to_string()),
+            file_size(&path),
+        ));
+    }
+
+    rows.into_values().collect()
+}
+
+fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
+    let files = collect_recent_files(
+        &home.join(".claude").join("projects"),
+        ".jsonl",
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    );
+    let mut rows = Vec::new();
+    for path in files {
+        let session_id = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if session_id.is_empty() {
+            continue;
+        }
+        let Some(contents) = read_text_prefix(&path, EXTERNAL_SESSION_READ_LIMIT) else { continue; };
+        let mut created_at = None;
+        let mut updated_at = None;
+        let mut cwd = None;
+        let mut task = None;
+        let mut model = None;
+        let mut turns = 0u64;
+        for line in contents.lines() {
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+            created_at = created_at.or_else(|| value_str(&obj, "timestamp"));
+            updated_at = value_str(&obj, "timestamp").or(updated_at);
+            cwd = cwd.or_else(|| value_str(&obj, "cwd"));
+            if obj.get("type").and_then(|v| v.as_str()) == Some("user") {
+                turns += 1;
+                if task.is_none() {
+                    if let Some(msg) = obj.get("message") {
+                        if let Some(content) = msg.get("content").and_then(message_content_text) {
+                            task = Some(compact_text(&content, 180));
+                        }
+                    }
+                }
+            }
+            if model.is_none() {
+                model = obj
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+        }
+        rows.push(external_session_json(
+            "claude-code",
+            "Claude Code",
+            session_id.clone(),
+            session_id,
+            created_at.or(updated_at).or_else(|| file_mtime_string(&path)),
+            task,
+            "Claude Code",
+            model,
+            turns,
+            cwd,
+            Some(path.to_string_lossy().to_string()),
+            file_size(&path),
+        ));
+    }
+    rows
+}
+
+fn gemini_project_roots(home: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let path = home.join(".gemini").join("projects.json");
+    let Ok(contents) = std::fs::read_to_string(path) else { return out; };
+    let Ok(obj) = serde_json::from_str::<serde_json::Value>(&contents) else { return out; };
+    let Some(projects) = obj.get("projects").and_then(|v| v.as_object()) else { return out; };
+    for (root, alias) in projects {
+        if let Some(alias) = alias.as_str() {
+            out.insert(alias.to_string(), root.to_string());
+        }
+    }
+    out
+}
+
+fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
+    let roots = gemini_project_roots(home);
+    let files = collect_recent_files(
+        &home.join(".gemini").join("tmp"),
+        ".json",
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    );
+    let mut rows = Vec::new();
+    for path in files {
+        if path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) != Some("chats") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else { continue; };
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&contents) else { continue; };
+        let Some(session_id) = value_str(&obj, "sessionId") else { continue; };
+        let alias = path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        let mut task = None;
+        let mut turns = 0u64;
+        if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
+            for msg in messages {
+                let role = msg
+                    .get("role")
+                    .or_else(|| msg.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if role == "user" {
+                    turns += 1;
+                    if task.is_none() {
+                        let text = msg
+                            .get("text")
+                            .or_else(|| msg.get("message"))
+                            .or_else(|| msg.get("content"))
+                            .and_then(message_content_text);
+                        if let Some(text) = text {
+                            task = Some(compact_text(&text, 180));
+                        }
+                    }
+                }
+            }
+        }
+        let project_root = alias.as_ref().and_then(|a| roots.get(a).cloned());
+        rows.push(external_session_json(
+            "gemini",
+            "Gemini CLI",
+            session_id.clone(),
+            session_id,
+            value_str(&obj, "startTime").or_else(|| file_mtime_string(&path)),
+            task,
+            "Gemini CLI",
+            value_str(&obj, "model"),
+            turns,
+            project_root,
+            Some(path.to_string_lossy().to_string()),
+            file_size(&path),
+        ));
+    }
+    rows
+}
+
+fn external_session_detail(source: &str, session_id: &str) -> Option<String> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    let mut entries = Vec::new();
+
+    match source {
+        "codex" => {
+            let mut files = Vec::new();
+            collect_files(&home.join(".codex").join("sessions"), ".jsonl", &mut files);
+            collect_files(&home.join(".codex").join("archived_sessions"), ".jsonl", &mut files);
+            for path in files {
+                let Ok(contents) = std::fs::read_to_string(&path) else { continue; };
+                if !contents.contains(session_id) {
+                    continue;
+                }
+                for line in contents.lines() {
+                    let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+                    let ts = value_str(&obj, "timestamp").unwrap_or_default();
+                    if let Some(payload) = obj.get("payload") {
+                        if let Some((role, text)) = codex_payload_text(payload) {
+                            entries.push(serde_json::json!({
+                                "ts": ts,
+                                "level": if role == "assistant" { "model" } else { "info" },
+                                "source": "codex",
+                                "content": text,
+                            }));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        "claude-code" => {
+            let mut files = Vec::new();
+            collect_files(&home.join(".claude").join("projects"), ".jsonl", &mut files);
+            for path in files {
+                if path.file_stem().and_then(|n| n.to_str()) != Some(session_id) {
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(&path) else { continue; };
+                for line in contents.lines() {
+                    let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+                    let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if typ != "user" && typ != "assistant" {
+                        continue;
+                    }
+                    let text = obj
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(message_content_text)
+                        .unwrap_or_default();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    entries.push(serde_json::json!({
+                        "ts": value_str(&obj, "timestamp").unwrap_or_default(),
+                        "level": if typ == "assistant" { "model" } else { "info" },
+                        "source": "claude",
+                        "content": text,
+                    }));
+                }
+                break;
+            }
+        }
+        "gemini" => {
+            let mut files = Vec::new();
+            collect_files(&home.join(".gemini").join("tmp"), ".json", &mut files);
+            for path in files {
+                if path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) != Some("chats") {
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(&path) else { continue; };
+                let Ok(obj) = serde_json::from_str::<serde_json::Value>(&contents) else { continue; };
+                if value_str(&obj, "sessionId").as_deref() != Some(session_id) {
+                    continue;
+                }
+                if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
+                    for msg in messages {
+                        let role = msg
+                            .get("role")
+                            .or_else(|| msg.get("type"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("message");
+                        let text = msg
+                            .get("text")
+                            .or_else(|| msg.get("message"))
+                            .or_else(|| msg.get("content"))
+                            .and_then(message_content_text)
+                            .unwrap_or_default();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        entries.push(serde_json::json!({
+                            "ts": value_str(msg, "timestamp").unwrap_or_default(),
+                            "level": if role == "assistant" || role == "model" { "model" } else { "info" },
+                            "source": "gemini",
+                            "content": text,
+                        }));
+                    }
+                }
+                break;
+            }
+        }
+        _ => return None,
+    }
+
+    Some(serde_json::json!({
+        "session_id": session_id,
+        "entries": entries,
+        "frames": [],
+    }).to_string())
+}
+
 fn list_sessions() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home_path = PathBuf::from(&home);
     let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
     if !logs_dir.is_dir() {
-        return "[]".to_string();
+        let mut sessions = Vec::new();
+        sessions.extend(list_codex_sessions(&home_path));
+        sessions.extend(list_claude_sessions(&home_path));
+        sessions.extend(list_gemini_sessions(&home_path));
+        sort_sessions_newest_first(&mut sessions);
+        truncate_sessions_preserving_sources(&mut sessions);
+        return serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string());
     }
 
     let mut sessions: Vec<serde_json::Value> = Vec::new();
@@ -1799,7 +2386,10 @@ fn list_sessions() -> String {
             .unwrap_or(0.0);
 
         sessions.push(serde_json::json!({
+            "source": "intendant",
+            "source_label": "Intendant",
             "session_id": session_id,
+            "resume_id": session_id,
             "created_at": created_at.unwrap_or_default(),
             "task": task,
             "provider": provider,
@@ -1820,18 +2410,19 @@ fn list_sessions() -> String {
             "turns_bytes": turns_bytes,
             "logs_bytes": logs_bytes,
             "total_bytes": total_bytes,
+            "project_root": null,
+            "path": dir.to_string_lossy().to_string(),
+            "can_delete": true,
+            "can_resume": true,
         }));
     }
 
-    // Sort newest first by created_at
-    sessions.sort_by(|a, b| {
-        let a_ts = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-        let b_ts = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-        b_ts.cmp(a_ts)
-    });
+    sessions.extend(list_codex_sessions(&home_path));
+    sessions.extend(list_claude_sessions(&home_path));
+    sessions.extend(list_gemini_sessions(&home_path));
 
-    // Cap at 100
-    sessions.truncate(100);
+    sort_sessions_newest_first(&mut sessions);
+    truncate_sessions_preserving_sources(&mut sessions);
 
     serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
 }
@@ -6723,8 +7314,22 @@ pub fn spawn_web_gateway(
                             }
                         } else {
                             // GET /api/session/{id} — session detail
-                            let session_id = rest_parts[0].split('?').next().unwrap_or(rest_parts[0]);
-                            let body = get_session_detail(session_id);
+                            let raw_id = rest_parts[0];
+                            let session_id = raw_id.split('?').next().unwrap_or(raw_id);
+                            let query = raw_id.split_once('?').map(|(_, q)| q).unwrap_or("");
+                            let source = query
+                                .split('&')
+                                .find_map(|part| {
+                                    let (k, v) = part.split_once('=')?;
+                                    if k == "source" { Some(v) } else { None }
+                                })
+                                .unwrap_or("intendant");
+                            let body = if source == "intendant" {
+                                get_session_detail(session_id)
+                            } else {
+                                external_session_detail(source, session_id)
+                                    .unwrap_or_else(|| serde_json::json!({"error": "session not found"}).to_string())
+                            };
                             let response = format!(
                                 "HTTP/1.1 200 OK\r\n\
                                  Content-Type: application/json\r\n\

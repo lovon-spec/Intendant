@@ -365,6 +365,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
         self.working_dir = Some(config.working_dir.clone());
+        self.session_id = config.resume_session;
 
         // Build command args
         let mut args = vec![
@@ -379,6 +380,11 @@ impl ExternalAgent for ClaudeCodeAgent {
         if let Some(ref model) = self.model.as_ref().or(config.model.as_ref()) {
             args.push("--model".into());
             args.push(model.to_string());
+        }
+
+        if let Some(ref session_id) = self.session_id {
+            args.push("--resume".into());
+            args.push(session_id.clone());
         }
 
         if !self.permission_mode.is_empty() && self.permission_mode != "default" {

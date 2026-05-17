@@ -122,6 +122,7 @@ pub struct GeminiAgent {
     /// Whether to pass `--debug` (Gemini's DevTools console). Off by default.
     debug: bool,
     web_port: Option<u16>,
+    resume_session: Option<String>,
     prompt_sent: bool,
     config_working_dir: Option<std::path::PathBuf>,
     /// Tracks whether we've merged our entry into `$HOME/.gemini/settings.json`
@@ -240,6 +241,7 @@ impl GeminiAgent {
             include_directories: launch.include_directories,
             debug: launch.debug,
             web_port,
+            resume_session: None,
             prompt_sent: false,
             config_working_dir: None,
             prior_home_intendant_mcp: None,
@@ -866,6 +868,7 @@ impl ExternalAgent for GeminiAgent {
             }
         }
         self.config_working_dir = Some(config.working_dir.clone());
+        self.resume_session = config.resume_session;
 
         // Spawn the gemini CLI process in ACP mode, plus every config
         // knob the user has flipped. Gemini latches these at process start
@@ -1009,19 +1012,25 @@ impl ExternalAgent for GeminiAgent {
             params["model"] = serde_json::Value::String(model.clone());
         }
 
-        let result = self
-            .send_request("session/new", Some(params))
-            .await?;
+        let session_id = if let Some(resume_id) = self.resume_session.clone() {
+            params["sessionId"] = serde_json::Value::String(resume_id.clone());
+            self.send_request("session/load", Some(params)).await?;
+            resume_id
+        } else {
+            let result = self
+                .send_request("session/new", Some(params))
+                .await?;
 
-        let session_id = result
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                CallerError::ExternalAgent(
-                    "session/new response missing 'sessionId' field".into(),
-                )
-            })?
-            .to_string();
+            result
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    CallerError::ExternalAgent(
+                        "session/new response missing 'sessionId' field".into(),
+                    )
+                })?
+                .to_string()
+        };
 
         // Cache for interrupt_turn — the trait method doesn't take a thread.
         self.session_id = Some(session_id.clone());

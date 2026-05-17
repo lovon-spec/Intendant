@@ -430,6 +430,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 params: params.clone(),
             });
         }
+        ControlMsg::ResumeSession { .. } => {
+            // Routed by the daemon loop; there is no persistent config state
+            // to update here.
+        }
         ControlMsg::GrantUserDisplay { display_id } => {
             // Moved out of `tui/app.rs::handle_control_command` — the TUI is
             // now display-only and the display-control path shouldn't depend

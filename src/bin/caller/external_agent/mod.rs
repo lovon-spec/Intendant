@@ -286,6 +286,9 @@ pub struct AgentConfig {
     pub writable_roots: Vec<String>,
     /// Web gateway port for MCP-over-HTTP config generation.
     pub web_port: Option<u16>,
+    /// Persisted backend-native session/thread id to resume instead of
+    /// starting a fresh external conversation.
+    pub resume_session: Option<String>,
 }
 
 /// Handle to a conversation thread within an external agent.

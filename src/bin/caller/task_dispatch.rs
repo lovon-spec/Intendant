@@ -125,6 +125,11 @@ impl Dispatcher {
                 self.warn_drop(bus, "StartTask", &task);
             }
 
+            ControlMsg::ResumeSession { .. } => {
+                // The daemon loop owns session reattachment because it needs
+                // to choose the log dir, project root, and backend-native id.
+            }
+
             ControlMsg::FollowUp { text, direct } => {
                 let is_direct = direct.unwrap_or(false);
 
