@@ -1621,6 +1621,12 @@ fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
     message_content_text(content).map(|text| (role, text))
 }
 
+fn is_codex_injected_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions for ")
+        || trimmed.starts_with("<turn_aborted>")
+}
+
 fn collect_files(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -1869,10 +1875,12 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         let mut id = None;
         let mut created_at = None;
         let mut cwd = None;
-        let mut task = None;
         let mut model = None;
         let mut provider = Some("Codex".to_string());
-        let mut turns = 0u64;
+        let mut task_started_turns = 0u64;
+        let mut saw_user_message_event = false;
+        let mut event_user_turns: Vec<Option<String>> = Vec::new();
+        let mut fallback_user_turns: Vec<Option<String>> = Vec::new();
         for line in contents.lines() {
             let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
             match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
@@ -1892,17 +1900,38 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
                     }
                 }
                 "event_msg" => {
-                    if obj.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_started") {
-                        turns += 1;
+                    if let Some(payload) = obj.get("payload") {
+                        match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                            "task_started" => {
+                                task_started_turns += 1;
+                            }
+                            "user_message" => {
+                                saw_user_message_event = true;
+                                let text = value_str(payload, "message")
+                                    .filter(|s| !s.trim().is_empty())
+                                    .map(|s| compact_text(&s, 180));
+                                event_user_turns.push(text);
+                            }
+                            "thread_rolled_back" => {
+                                let num_turns = payload
+                                    .get("num_turns")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                for _ in 0..num_turns {
+                                    let _ = event_user_turns.pop();
+                                    let _ = fallback_user_turns.pop();
+                                }
+                                task_started_turns = task_started_turns.saturating_sub(num_turns);
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 "response_item" => {
                     if let Some(payload) = obj.get("payload") {
-                        if task.is_none() {
-                            if let Some((role, text)) = codex_payload_text(payload) {
-                                if role == "user" {
-                                    task = Some(compact_text(&text, 180));
-                                }
+                        if let Some((role, text)) = codex_payload_text(payload) {
+                            if role == "user" && !is_codex_injected_user_text(&text) {
+                                fallback_user_turns.push(Some(compact_text(&text, 180)));
                             }
                         }
                     }
@@ -1912,13 +1941,28 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         }
         let Some(id) = id else { continue; };
         let existing = rows.get(&id);
-        let existing_task = existing.and_then(|v| value_str(v, "task"));
+        let existing_task = existing
+            .and_then(|v| value_str(v, "task"))
+            .filter(|s| !is_codex_injected_user_text(s));
         let existing_updated_at = existing.and_then(|v| value_str(v, "updated_at"));
         let file_updated_at = file_mtime_string(&path);
         let created_at = created_at.or_else(|| file_updated_at.clone());
         let updated_at = file_updated_at
             .or(existing_updated_at)
             .or_else(|| created_at.clone());
+        let task = event_user_turns
+            .iter()
+            .find_map(|t| t.clone())
+            .or_else(|| fallback_user_turns.iter().find_map(|t| t.clone()));
+        let turns = if saw_user_message_event {
+            event_user_turns.len() as u64
+        } else if task_started_turns > 0 {
+            task_started_turns
+        } else if !fallback_user_turns.is_empty() {
+            fallback_user_turns.len() as u64
+        } else {
+            0
+        };
         rows.insert(id.clone(), external_session_json(
             "codex",
             "Codex",
@@ -1926,7 +1970,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
             id,
             created_at,
             updated_at,
-            existing_task.or(task),
+            task.or(existing_task),
             provider.as_deref().unwrap_or("Codex"),
             model,
             turns,
@@ -9741,6 +9785,173 @@ mod tests {
 
         assert_eq!(session["created_at"], "2026-05-17T10:00:00Z");
         assert_eq!(session["updated_at"], "2026-05-17T10:00:00Z");
+    }
+
+    #[test]
+    fn list_codex_sessions_uses_first_real_user_message() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        let sessions_dir = codex_dir.join("sessions").join("2026").join("05").join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-f523-73b0-8bb4-01be02f30ebd";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": id,
+                "updated_at": "2026-05-17T20:44:33Z",
+                "thread_name": "# AGENTS.md instructions for /Users/vm/projects/intendant <INSTRUCTIONS>"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/Users/vm/projects/intendant",
+                    "model": "gpt-5.5",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-1"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /Users/vm/projects/intendant <INSTRUCTIONS>"}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Fix the Sessions tab"}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fix the Sessions tab"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Fix the Sessions tab")
+        );
+        assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn list_codex_sessions_applies_thread_rollback_to_turns_and_task() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37b2-e756-7461-9946-34b639448717";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:48:52Z",
+                "type": "session_meta",
+                "payload": {"id": id, "timestamp": "2026-05-17T20:48:52Z"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "old-turn"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Old prompt"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Old prompt"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "turn_id": "old-turn"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "thread_rolled_back", "num_turns": 1}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "new-turn"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "New prompt"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "New prompt"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-48-52-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("New prompt")
+        );
+        assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
     }
 
     #[test]
