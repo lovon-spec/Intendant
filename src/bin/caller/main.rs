@@ -3873,13 +3873,26 @@ async fn run_agent_loop(
                 l.messages_input(&json);
             }
         });
-        let raw_context = serde_json::to_value(conversation.messages())
-            .unwrap_or_else(|_| serde_json::json!([]));
+        let (context_format, raw_context) = provider
+            .request_snapshot(conversation.messages(), true)
+            .unwrap_or_else(|e| {
+                slog(&session_log, |l| {
+                    l.warn(&format!(
+                        "Failed to build provider request context snapshot: {}",
+                        e
+                    ))
+                });
+                (
+                    "intendant.conversation.messages.v1".to_string(),
+                    serde_json::to_value(conversation.messages())
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                )
+            });
         bus.send(AppEvent::ContextSnapshot {
             source: "native".to_string(),
-            label: "Internal agent messages".to_string(),
+            label: "Internal agent request".to_string(),
             turn: Some(turn),
-            format: "intendant.conversation.messages.v1".to_string(),
+            format: context_format,
             token_count: conversation.last_usage().map(|u| u.total_tokens),
             context_window: Some(conversation.context_window()),
             item_count: Some(conversation.messages().len()),

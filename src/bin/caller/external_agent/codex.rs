@@ -745,19 +745,83 @@ impl CodexAgent {
         let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
         let context_window = usage.as_ref().and_then(codex_usage_context_window);
         let item_count = codex_context_item_count(&thread);
+        let session_jsonl = read_codex_session_jsonl(&thread).await;
         Ok(AgentContextSnapshot {
             source: "codex".to_string(),
-            label: "Codex thread".to_string(),
-            format: "codex.thread.read.v2".to_string(),
+            label: "Codex context".to_string(),
+            format: "codex.thread-read+session-jsonl.v1".to_string(),
             token_count,
             context_window,
             item_count: Some(item_count),
             raw: serde_json::json!({
-                "thread": thread,
-                "tokenUsage": usage,
+                "threadRead": {
+                    "thread": thread,
+                    "tokenUsage": usage,
+                },
+                "sessionJsonl": session_jsonl,
+                "note": "Codex app-server exposes the thread transcript via thread/read. The session JSONL is parsed from the thread path and includes session_meta/turn_context entries such as base_instructions, developer_instructions, user_instructions, and the per-turn environment that Codex recorded before the model request.",
             }),
         })
     }
+}
+
+async fn read_codex_session_jsonl(thread: &serde_json::Value) -> serde_json::Value {
+    let Some(path) = thread.get("path").and_then(|v| v.as_str()) else {
+        return serde_json::json!({
+            "available": false,
+            "reason": "thread/read did not include a session path",
+        });
+    };
+
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(e) => {
+            return serde_json::json!({
+                "available": false,
+                "path": path,
+                "readError": e.to_string(),
+            });
+        }
+    };
+
+    let mut entries = Vec::new();
+    let mut model_context_entries = Vec::new();
+    let mut session_meta = serde_json::Value::Null;
+    let mut latest_turn_context = serde_json::Value::Null;
+
+    for (line_idx, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => value,
+            Err(e) => serde_json::json!({
+                "parseError": e.to_string(),
+                "line": line_idx + 1,
+                "raw": line,
+            }),
+        };
+        let entry_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if entry_type == "session_meta" {
+            session_meta = parsed.clone();
+        }
+        if entry_type == "turn_context" {
+            latest_turn_context = parsed.clone();
+        }
+        if matches!(entry_type, "session_meta" | "turn_context" | "response_item") {
+            model_context_entries.push(parsed.clone());
+        }
+        entries.push(parsed);
+    }
+
+    serde_json::json!({
+        "available": true,
+        "path": path,
+        "sessionMeta": session_meta,
+        "latestTurnContext": latest_turn_context,
+        "modelContextEntries": model_context_entries,
+        "entries": entries,
+    })
 }
 
 fn first_u64_at(value: &serde_json::Value, paths: &[&str]) -> Option<u64> {

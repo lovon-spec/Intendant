@@ -162,6 +162,21 @@ pub trait ChatProvider: Send + Sync {
         vec![]
     }
 
+    /// Build the provider-specific request shape that will be sent for this
+    /// message slice. Used by the dashboard Context tab to show the payload
+    /// closest to the model boundary, including provider role conversion,
+    /// system/developer fields, tools, and native computer-use blocks.
+    fn request_snapshot(
+        &self,
+        messages: &[Message],
+        _stream: bool,
+    ) -> Result<(String, serde_json::Value), CallerError> {
+        Ok((
+            "intendant.conversation.messages.v1".to_string(),
+            serde_json::to_value(messages).map_err(CallerError::Json)?,
+        ))
+    }
+
     /// Stream a chat response, emitting deltas via the callback.
     /// Default implementation falls back to non-streaming `chat()`.
     async fn chat_stream(
@@ -449,6 +464,32 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl ChatProvider for OpenAIProvider {
+    fn request_snapshot(
+        &self,
+        messages: &[Message],
+        stream: bool,
+    ) -> Result<(String, serde_json::Value), CallerError> {
+        let (instructions, input, text, tools) = build_openai_request_parts(messages, self);
+        let request = OpenAIResponsesRequest {
+            model: self.model.clone(),
+            input,
+            instructions,
+            max_output_tokens: Some(self.max_output_tokens),
+            reasoning: self.reasoning.clone(),
+            text,
+            tools,
+            stream,
+        };
+        Ok((
+            "openai.responses.request.v1".to_string(),
+            serde_json::json!({
+                "method": "POST",
+                "url": "https://api.openai.com/v1/responses",
+                "body": serde_json::to_value(&request).map_err(CallerError::Json)?,
+            }),
+        ))
+    }
+
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
         let (instructions, input, text, tools) = build_openai_request_parts(messages, self);
 
@@ -1207,6 +1248,57 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl ChatProvider for AnthropicProvider {
+    fn request_snapshot(
+        &self,
+        messages: &[Message],
+        stream: bool,
+    ) -> Result<(String, serde_json::Value), CallerError> {
+        let (system, api_messages) = build_anthropic_messages(messages);
+
+        let mut tools_vec: Vec<serde_json::Value> = Vec::new();
+        if self.use_tools {
+            let defs = self.tools();
+            tools_vec.extend(defs.iter().map(|t| t.to_anthropic()));
+        }
+        if self.cu_enabled {
+            if let Some((w, h)) = self.cu_display {
+                tools_vec.push(serde_json::json!({
+                    "type": "computer_20251124",
+                    "name": "computer",
+                    "display_width_px": w,
+                    "display_height_px": h
+                }));
+            }
+        }
+        let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
+
+        let request = AnthropicChatRequest {
+            model: self.model.clone(),
+            system,
+            messages: api_messages,
+            max_tokens: self.max_output_tokens,
+            tools,
+            stream,
+        };
+        let beta_header = if self.cu_enabled {
+            "prompt-caching-2024-07-31,computer-use-2025-11-24"
+        } else {
+            "prompt-caching-2024-07-31"
+        };
+        Ok((
+            "anthropic.messages.request.v1".to_string(),
+            serde_json::json!({
+                "method": "POST",
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": {
+                    "anthropic-version": "2023-06-01",
+                    "anthropic-beta": beta_header,
+                },
+                "body": serde_json::to_value(&request).map_err(CallerError::Json)?,
+            }),
+        ))
+    }
+
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
         let (system, api_messages) = build_anthropic_messages(messages);
 
@@ -1872,6 +1964,42 @@ fn gemini_role(role: &str) -> &str {
 
 #[async_trait]
 impl ChatProvider for GeminiProvider {
+    fn request_snapshot(
+        &self,
+        messages: &[Message],
+        stream: bool,
+    ) -> Result<(String, serde_json::Value), CallerError> {
+        let (system_text, _contents, mut request_body) =
+            build_gemini_request_parts(messages, self);
+
+        if let Some(ref sys) = system_text {
+            request_body["systemInstruction"] = serde_json::json!({
+                "parts": [{"text": sys}]
+            });
+        }
+
+        let endpoint = if stream {
+            format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.endpoint, self.model
+            )
+        } else {
+            format!(
+                "{}/v1beta/models/{}:generateContent",
+                self.endpoint, self.model
+            )
+        };
+
+        Ok((
+            "gemini.generate-content.request.v1".to_string(),
+            serde_json::json!({
+                "method": "POST",
+                "url": endpoint,
+                "body": request_body,
+            }),
+        ))
+    }
+
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
         let (system_text, _contents, mut request_body) = build_gemini_request_parts(messages, self);
 
