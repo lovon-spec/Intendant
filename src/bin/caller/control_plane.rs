@@ -89,6 +89,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             let new_level = AutonomyLevel::from_str_loose(level);
             let mut guard = state.autonomy.write().await;
             guard.level = new_level;
+            drop(guard);
+            state.bus.send(AppEvent::AutonomyChanged {
+                autonomy: new_level.to_string(),
+            });
         }
         ControlMsg::SetExternalAgent { agent } => {
             let parsed = agent
@@ -640,6 +644,7 @@ mod tests {
         let bus = EventBus::new();
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
+        let mut events = bus.subscribe();
 
         let handle = spawn(
             bus.subscribe(),
@@ -665,6 +670,17 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert_eq!(autonomy.read().await.level, AutonomyLevel::High);
+        let mut saw_autonomy_changed = false;
+        for _ in 0..4 {
+            if let Ok(Ok(AppEvent::AutonomyChanged { autonomy })) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await
+            {
+                assert_eq!(autonomy, "High");
+                saw_autonomy_changed = true;
+                break;
+            }
+        }
+        assert!(saw_autonomy_changed);
 
         handle.abort();
     }

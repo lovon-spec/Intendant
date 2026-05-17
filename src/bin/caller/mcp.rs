@@ -2089,7 +2089,7 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::UsageSnapshot { .. } | AppEvent::ContextSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::CodexConfigChanged { .. } | AppEvent::CodexThreadActionRequested { .. } | AppEvent::CodexThreadActionResult { .. } | AppEvent::GeminiConfigChanged { .. } | AppEvent::GeminiThreadActionRequested { .. } | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::UsageSnapshot { .. } | AppEvent::ContextSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::AutonomyChanged { .. } | AppEvent::CodexConfigChanged { .. } | AppEvent::CodexThreadActionRequested { .. } | AppEvent::CodexThreadActionResult { .. } | AppEvent::GeminiConfigChanged { .. } | AppEvent::GeminiThreadActionRequested { .. } | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::Tick => {
                         // Detect stuck phases — warn every 30s after 120s
                         if matches!(

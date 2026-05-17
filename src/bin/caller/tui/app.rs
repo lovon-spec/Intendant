@@ -2162,6 +2162,9 @@ impl App {
             AppEvent::Key(key) => {
                 self.handle_key(key);
             }
+            AppEvent::AutonomyChanged { autonomy } => {
+                self.autonomy_display = autonomy;
+            }
             AppEvent::ApprovalResolved { .. }
             | AppEvent::UsageSnapshot { .. } | AppEvent::ContextSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
             | AppEvent::DisplayMetrics { .. } | AppEvent::DisplayResize { .. }

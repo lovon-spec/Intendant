@@ -5517,6 +5517,10 @@ async function main() {
       if (d.event === 'approval_required' && d.id !== undefined && d.session_id) {
         approvalSessionIds.set(String(d.id), d.session_id);
       }
+      if (d.event === 'autonomy_changed') {
+        updateStatusBar({ autonomy: d.autonomy });
+        return;
+      }
       if (d.t === 'annotation_saved' && d.path) {
         showAnnotationResult(d.path);
         return;
@@ -7175,9 +7179,10 @@ function updateStatusBar(d) {
   }
   if (d.autonomy) {
     const el = document.getElementById('sb-autonomy');
-    el.textContent = d.autonomy;
+    const autonomy = normalizeAutonomyLabel(d.autonomy);
+    el.textContent = autonomy;
     const colors = { Low: '#f38ba8', Medium: '#f9e2af', High: '#94e2d5', Full: '#a6e3a1' };
-    el.style.color = colors[d.autonomy] || '#f9e2af';
+    el.style.color = colors[autonomy] || '#f9e2af';
   }
   if (d.session_id) {
     currentSessionFullId = d.session_id;
@@ -7238,6 +7243,14 @@ function prettyAgentName(shortId) {
     'claude-code': 'Claude Code',
     'gemini': 'Gemini CLI',
   }[shortId] || shortId;
+}
+
+function normalizeAutonomyLabel(raw) {
+  const v = String(raw || '').toLowerCase().trim();
+  if (v === 'low' || v === 'l' || v === '0') return 'Low';
+  if (v === 'high' || v === 'h' || v === '2') return 'High';
+  if (v === 'full' || v === 'f' || v === '3') return 'Full';
+  return 'Medium';
 }
 
 function setPhase(phase) {
@@ -16435,7 +16448,7 @@ function renderSessionsList(sessions, el) {
     const source = s.source || 'intendant';
     const shortId = (s.session_id || '').substring(0, 8);
     const isExternal = source !== 'intendant';
-    const isCurrent = !isExternal && currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
+    const isCurrent = currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
 
     // Override status for current session — never show as abandoned/idle
     let displayStatus = s.status || 'in_progress';
@@ -17273,12 +17286,11 @@ function showDisplayPicker(displays) {
 window.cycleAutonomy = function() {
   const levels = ['Low', 'Medium', 'High', 'Full'];
   const el = document.getElementById('sb-autonomy');
-  const current = el.textContent.trim();
+  const current = normalizeAutonomyLabel(el.textContent.trim());
   const idx = levels.indexOf(current);
   const next = levels[(idx + 1) % levels.length];
-  if (app) {
-    app.send_raw(JSON.stringify({action: 'set_autonomy', level: next.toLowerCase()}));
-  }
+  updateStatusBar({ autonomy: next });
+  sendRawMessage({ action: 'set_autonomy', level: next.toLowerCase() });
 };
 
 window.toggleUserDisplay = function() {

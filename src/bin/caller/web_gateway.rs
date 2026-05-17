@@ -3766,6 +3766,9 @@ pub fn spawn_web_gateway(
     let last_live_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest status event (has autonomy, session_id, task).
     let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache standalone autonomy changes so reconnecting dashboards do not
+    // fall back to the stale autonomy value in the latest status event.
+    let last_autonomy_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest external_agent_changed event so a refreshed
     // browser learns the current value without having to re-fetch
     // settings. Without this the dashboard dropdown snaps back to
@@ -3786,6 +3789,7 @@ pub fn spawn_web_gateway(
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
         let status_cache = last_status_json.clone();
+        let autonomy_cache = last_autonomy_json.clone();
         let external_agent_cache = last_external_agent_json.clone();
         let user_display_cache = last_user_display_json.clone();
         let display_cache = display_ready_cache.clone();
@@ -3842,6 +3846,11 @@ pub fn spawn_web_gateway(
                         }
                         if line.contains("\"event\":\"status\"") {
                             if let Ok(mut guard) = status_cache.lock() {
+                                *guard = Some(line.clone());
+                            }
+                        }
+                        if line.contains("\"event\":\"autonomy_changed\"") {
+                            if let Ok(mut guard) = autonomy_cache.lock() {
                                 *guard = Some(line.clone());
                             }
                         }
@@ -3978,6 +3987,7 @@ pub fn spawn_web_gateway(
             let last_usage_json = last_usage_json.clone();
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
+            let last_autonomy_json = last_autonomy_json.clone();
             let last_external_agent_json = last_external_agent_json.clone();
             let last_user_display_json = last_user_display_json.clone();
             let display_ready_cache = display_ready_cache.clone();
@@ -4213,6 +4223,15 @@ pub fn spawn_web_gateway(
                     if let Ok(guard) = last_status_json.lock() {
                         if let Some(ref status_json) = *guard {
                             let _ = direct_tx.send(status_json.clone());
+                        }
+                    }
+
+                    // Send cached autonomy after cached status so it wins
+                    // when the latest status event is older than the user's
+                    // most recent autonomy switch.
+                    if let Ok(guard) = last_autonomy_json.lock() {
+                        if let Some(ref autonomy_json) = *guard {
+                            let _ = direct_tx.send(autonomy_json.clone());
                         }
                     }
 

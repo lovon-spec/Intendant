@@ -309,6 +309,12 @@ impl SessionSupervisor {
             .lock()
             .map(|log| log.session_id().to_string())
             .unwrap_or_else(|_| path_file_name(&log_dir));
+        let resume_token = resume_id.unwrap_or_else(|| session_id.clone());
+        let live_session_id = if external_backend.is_some() {
+            resume_token.clone()
+        } else {
+            intendant_session_id.clone()
+        };
         let project = match self
             .project_with_runtime_config(project_root.clone(), external_backend.as_ref())
             .await
@@ -322,13 +328,13 @@ impl SessionSupervisor {
 
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
-            session_id: intendant_session_id.clone(),
+            session_id: live_session_id.clone(),
             task: Some(resume_task.clone()),
         });
 
         emit_task_dispatched_log(&self.config.bus, &session_log, &resume_task, 0);
         self.spawn_agent_session(
-            intendant_session_id,
+            live_session_id,
             source_norm,
             resume_task,
             project,
@@ -337,7 +343,7 @@ impl SessionSupervisor {
             external_backend,
             direct.unwrap_or(true),
             vec![],
-            Some(resume_id.unwrap_or(session_id)),
+            Some(resume_token),
         )
         .await;
     }
@@ -389,6 +395,7 @@ impl SessionSupervisor {
                     web_port,
                     attachment_images,
                     resume_token,
+                    Some(session_id.clone()),
                 )
                 .await
             } else {
@@ -725,9 +732,16 @@ impl SessionSupervisor {
             let matches_current = state
                 .session_log
                 .as_ref()
-                .and_then(|log| log.lock().ok().map(|log| log.session_id().to_string()))
-                .as_deref()
-                == Some(&session_id);
+                .map(|log| {
+                    Arc::ptr_eq(log, &session_log)
+                        || log
+                            .lock()
+                            .ok()
+                            .map(|log| log.session_id().to_string())
+                            .as_deref()
+                            == Some(&session_id)
+                })
+                .unwrap_or(false);
             if matches_current {
                 state.session_log = None;
                 state.query_ctx = None;

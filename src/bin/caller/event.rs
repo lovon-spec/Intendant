@@ -463,6 +463,11 @@ pub enum AppEvent {
         agent: Option<String>,
     },
 
+    /// Emitted when the daemon-level autonomy switch changes.
+    AutonomyChanged {
+        autonomy: String,
+    },
+
     /// Emitted by the control plane when a `ControlMsg::CodexThreadAction`
     /// arrives, so the daemon-side action watcher (which owns the
     /// persistent agent) can pick it up. Carries the dispatched action and
@@ -1364,6 +1369,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         }),
         AppEvent::ExternalAgentChanged { agent } => Some(OutboundEvent::ExternalAgentChanged {
             agent: agent.clone(),
+        }),
+        AppEvent::AutonomyChanged { autonomy } => Some(OutboundEvent::AutonomyChanged {
+            autonomy: autonomy.clone(),
         }),
         AppEvent::CodexThreadActionResult {
             action,
@@ -2646,6 +2654,17 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         assert!(app_event_to_outbound(&event).is_none());
+    }
+
+    #[test]
+    fn outbound_autonomy_changed() {
+        let event = AppEvent::AutonomyChanged {
+            autonomy: "High".to_string(),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"autonomy_changed\""));
+        assert!(json.contains("\"autonomy\":\"High\""));
     }
 
     #[test]

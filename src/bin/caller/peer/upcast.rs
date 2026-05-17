@@ -903,6 +903,12 @@ impl AppEventUpcaster {
                 ),
             )],
 
+            AppEvent::AutonomyChanged { autonomy } => vec![log_event(
+                LogLevel::Info,
+                "config",
+                format!("autonomy changed → {autonomy}"),
+            )],
+
             AppEvent::CodexConfigChanged {
                 sandbox,
                 approval_policy,
@@ -1796,6 +1802,12 @@ impl WireEventUpcaster {
                     "external agent changed → {}",
                     agent.as_deref().unwrap_or("none")
                 ),
+            )],
+
+            OutboundEvent::AutonomyChanged { autonomy } => vec![log_event(
+                LogLevel::Info,
+                "config",
+                format!("autonomy changed → {autonomy}"),
             )],
 
             OutboundEvent::CodexConfigChanged {
@@ -3008,6 +3020,13 @@ mod tests {
     fn parity_external_agent_changed() {
         assert_parity(AppEvent::ExternalAgentChanged {
             agent: Some("codex".into()),
+        });
+    }
+
+    #[test]
+    fn parity_autonomy_changed() {
+        assert_parity(AppEvent::AutonomyChanged {
+            autonomy: "High".into(),
         });
     }
 

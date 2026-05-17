@@ -6642,6 +6642,7 @@ async fn run_external_agent_mode(
     web_port: Option<u16>,
     attachment_images: Vec<conversation::ImageData>,
     resume_session: Option<String>,
+    control_session_id: Option<String>,
 ) -> Result<LoopStats, CallerError> {
     slog(&session_log, |l| {
         l.info(&format!("Mode: external agent ({})", backend));
@@ -6680,10 +6681,11 @@ async fn run_external_agent_mode(
     // Event loop
     let mut round = 1usize;
     let mut stats = LoopStats::default();
+    let live_session_id = control_session_id.or_else(|| session_log_id(&session_log));
 
     let drain_config = DrainConfig {
         bus: &bus,
-        session_id: session_log_id(&session_log),
+        session_id: live_session_id.clone(),
         autonomy: autonomy.clone(),
         session_log: &session_log,
         log_dir: &_log_dir,
@@ -6724,7 +6726,7 @@ async fn run_external_agent_mode(
                             &context_injection,
                             &followup,
                             &bus,
-                            session_log_id(&session_log).as_deref(),
+                            live_session_id.as_deref(),
                         )
                         .unwrap_or(followup);
                         slog(&session_log, |l| {
@@ -8733,6 +8735,7 @@ async fn main() -> Result<(), CallerError> {
                             web_port_for_agent,
                             vec![],
                             None,
+                            None,
                         )
                         .await
                     } else if use_orchestration {
@@ -9349,6 +9352,7 @@ async fn main() -> Result<(), CallerError> {
                         web_port_for_agent,
                         vec![],
                         None,
+                        None,
                     )
                     .await
                 } else {
@@ -9781,6 +9785,7 @@ async fn main() -> Result<(), CallerError> {
                 true, // headless mode
                 web_port_for_agent,
                 vec![],
+                None,
                 None,
             )
             .await
