@@ -1047,6 +1047,20 @@ html, body {
   opacity: 0.6;
   cursor: progress;
 }
+.global-pending-attachments {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: min(360px, 32vw);
+  overflow-x: auto;
+  flex-shrink: 1;
+  scrollbar-width: thin;
+}
+.global-pending-attachments.hidden { display: none; }
+.global-pending-attachments .pending-attachment-chip {
+  max-width: 180px;
+  flex: 0 0 auto;
+}
 .global-send-btn {
   padding: 4px 12px;
   border: 1px solid var(--green);
@@ -3790,6 +3804,12 @@ html, body {
   .video-btn { width: 40px; height: 40px; font-size: 16px; }
   .video-preview { width: 120px; height: 90px; }
   .video-preview-wrap { bottom: 70px; right: 8px; }
+  .global-task-bar { flex-wrap: wrap; }
+  .global-pending-attachments {
+    order: 3;
+    width: 100%;
+    max-width: none;
+  }
   .annotation-toolbar { gap: 6px; padding: 4px 8px; }
   .ann-btn, .ann-thick, .ann-act, .ann-close { width: 44px; height: 44px; font-size: 18px; }
   .ann-color { width: 28px; height: 28px; }
@@ -3884,6 +3904,7 @@ html, body {
       <option value="task">Task</option>
     </select>
     <button id="upload-attach-btn" class="global-attach-btn" title="Attach file(s). Saved to the workspace or task scope picked in the dropdown. Images are attached to the next task as images; other files get a stage-and-point message prelude the agent can follow with its file-read tool.">&#x1F4CE;</button>
+    <div id="global-pending-attachments" class="global-pending-attachments hidden" aria-live="polite"></div>
     <label class="global-direct-toggle" title="Skip the presence AI and send the task straight to the worker agent (internal or external). Use this for testing, automation, or when you don't need conversational mediation."><input type="checkbox" id="direct-mode-toggle" />Direct</label>
     <button id="activity-submit-btn" class="global-send-btn" onclick="submitActivityOrSteer()" title="Start a new task or send a follow-up.">Send</button>
   </div>
@@ -10292,10 +10313,59 @@ if (document.readyState === 'loading') {
   wireUploadControls();
 }
 
+function buildPendingAttachmentChip(att) {
+  const chip = document.createElement('span');
+  chip.className = 'pending-attachment-chip';
+  chip.title = att.note ? `${att.frameId} — ${att.note}` : att.frameId;
+  if (att.dataUrl) {
+    const img = document.createElement('img');
+    img.className = 'chip-thumb';
+    img.src = att.dataUrl;
+    img.alt = '';
+    chip.appendChild(img);
+  }
+  const label = document.createElement('span');
+  // Upload chips get a paperclip + filename; frame chips keep the ID
+  // (it's already short — `ann-*`, `clip-*`, `display_*`).
+  if (att.uploadName) {
+    const name = att.uploadName;
+    label.textContent = '📎 ' + (name.length > 24 ? name.slice(0, 22) + '…' : name);
+  } else {
+    label.textContent = att.frameId.length > 24 ? '…' + att.frameId.slice(-22) : att.frameId;
+  }
+  chip.appendChild(label);
+  const x = document.createElement('button');
+  x.className = 'chip-remove';
+  x.title = 'Remove from attachments';
+  x.textContent = '×';
+  x.addEventListener('click', (e) => {
+    e.stopPropagation();
+    removePendingAttachment(att.frameId);
+  });
+  chip.appendChild(x);
+  return chip;
+}
+
+function renderAttachmentList(list) {
+  if (!list) return;
+  list.innerHTML = '';
+  for (const att of pendingAttachments) {
+    list.appendChild(buildPendingAttachmentChip(att));
+  }
+}
+
 function renderPendingAttachments() {
   const bar = document.getElementById('pending-attachments-bar');
   const list = document.getElementById('pending-attachments-list');
   const count = document.getElementById('pending-attachments-count');
+  const globalList = document.getElementById('global-pending-attachments');
+  if (globalList) {
+    globalList.classList.toggle('hidden', pendingAttachments.length === 0);
+    globalList.title = pendingAttachments.length === 0
+      ? ''
+      : `${pendingAttachments.length} pending attachment${pendingAttachments.length === 1 ? '' : 's'}`;
+    renderAttachmentList(globalList);
+  }
   if (!bar || !list || !count) return;
   if (pendingAttachments.length === 0) {
     bar.classList.add('hidden');
@@ -10312,39 +10382,7 @@ function renderPendingAttachments() {
   } else {
     count.title = `${pendingAttachments.length} pending attachment${pendingAttachments.length === 1 ? '' : 's'}`;
   }
-  list.innerHTML = '';
-  for (const att of pendingAttachments) {
-    const chip = document.createElement('span');
-    chip.className = 'pending-attachment-chip';
-    chip.title = att.note ? `${att.frameId} — ${att.note}` : att.frameId;
-    if (att.dataUrl) {
-      const img = document.createElement('img');
-      img.className = 'chip-thumb';
-      img.src = att.dataUrl;
-      img.alt = '';
-      chip.appendChild(img);
-    }
-    const label = document.createElement('span');
-    // Upload chips get a paperclip + filename; frame chips keep the ID
-    // (it's already short — `ann-*`, `clip-*`, `display_*`).
-    if (att.uploadName) {
-      const name = att.uploadName;
-      label.textContent = '📎 ' + (name.length > 24 ? name.slice(0, 22) + '…' : name);
-    } else {
-      label.textContent = att.frameId.length > 24 ? '…' + att.frameId.slice(-22) : att.frameId;
-    }
-    chip.appendChild(label);
-    const x = document.createElement('button');
-    x.className = 'chip-remove';
-    x.title = 'Remove from attachments';
-    x.textContent = '×';
-    x.addEventListener('click', (e) => {
-      e.stopPropagation();
-      removePendingAttachment(att.frameId);
-    });
-    chip.appendChild(x);
-    list.appendChild(chip);
-  }
+  renderAttachmentList(list);
 }
 
 window.addPendingAttachment = addPendingAttachment;

@@ -2800,6 +2800,21 @@ fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], String> {
         .ok_or_else(|| "incomplete HTTP headers".to_string())
 }
 
+fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::PathBuf {
+    project_root.join(".intendant").join("pending_uploads")
+}
+
+fn effective_upload_destination(
+    requested: crate::upload_store::UploadDestination,
+    has_active_session: bool,
+) -> crate::upload_store::UploadDestination {
+    if has_active_session {
+        requested
+    } else {
+        crate::upload_store::UploadDestination::Workspace
+    }
+}
+
 /// Parse a query-string value by key out of a full `request_line`
 /// (e.g. `POST /api/session/current/uploads?name=foo.pdf&destination=task HTTP/1.1`).
 /// Returns the URL-decoded value, or `None` if the key isn't present.
@@ -6785,12 +6800,6 @@ pub fn spawn_web_gateway(
                         // protect uploads, gate the whole family at once.
                         use tokio::io::AsyncWriteExt;
                         let response = 'upload: {
-                            let Some(ref slog) = session_log else {
-                                break 'upload upload_error_response(
-                                    "400 Bad Request",
-                                    "no active session",
-                                );
-                            };
                             let Some(ref root) = project_root_for_changes else {
                                 break 'upload upload_error_response(
                                     "400 Bad Request",
@@ -6800,7 +6809,7 @@ pub fn spawn_web_gateway(
 
                             let name = query_param(&request_line, "name")
                                 .unwrap_or_else(|| "upload.bin".to_string());
-                            let destination = query_param(&request_line, "destination")
+                            let requested_destination = query_param(&request_line, "destination")
                                 .as_deref()
                                 .and_then(crate::upload_store::UploadDestination::from_str)
                                 .unwrap_or(crate::upload_store::UploadDestination::Task);
@@ -6829,19 +6838,30 @@ pub fn spawn_web_gateway(
                                 }
                                 Ok((tmp, size)) => {
                                     let (session_dir, session_id) = {
-                                        match slog.lock() {
-                                            Ok(l) => (
-                                                l.dir().to_path_buf(),
-                                                l.session_id().to_string(),
-                                            ),
-                                            Err(_) => {
-                                                break 'upload upload_error_response(
-                                                    "500 Internal Server Error",
-                                                    "session log lock poisoned",
-                                                );
+                                        if let Some(ref slog) = session_log {
+                                            match slog.lock() {
+                                                Ok(l) => (
+                                                    l.dir().to_path_buf(),
+                                                    l.session_id().to_string(),
+                                                ),
+                                                Err(_) => {
+                                                    break 'upload upload_error_response(
+                                                        "500 Internal Server Error",
+                                                        "session log lock poisoned",
+                                                    );
+                                                }
                                             }
+                                        } else {
+                                            (
+                                                pending_upload_session_dir(root),
+                                                "pending".to_string(),
+                                            )
                                         }
                                     };
+                                    let destination = effective_upload_destination(
+                                        requested_destination,
+                                        session_log.is_some(),
+                                    );
                                     match crate::upload_store::commit_upload(
                                         tmp,
                                         &name,
@@ -6885,26 +6905,24 @@ pub fn spawn_web_gateway(
                         // GET /api/session/current/uploads/<id>/raw  — stream bytes of one upload
                         use tokio::io::AsyncWriteExt;
                         let response = 'get_upload: {
-                            let Some(ref slog) = session_log else {
-                                break 'get_upload upload_error_response(
-                                    "404 Not Found",
-                                    "no active session",
-                                );
-                            };
                             let Some(ref root) = project_root_for_changes else {
                                 break 'get_upload upload_error_response(
                                     "404 Not Found",
                                     "no project root",
                                 );
                             };
-                            let session_dir = match slog.lock() {
-                                Ok(l) => l.dir().to_path_buf(),
-                                Err(_) => {
-                                    break 'get_upload upload_error_response(
-                                        "500 Internal Server Error",
-                                        "session log lock poisoned",
-                                    );
+                            let session_dir = if let Some(ref slog) = session_log {
+                                match slog.lock() {
+                                    Ok(l) => l.dir().to_path_buf(),
+                                    Err(_) => {
+                                        break 'get_upload upload_error_response(
+                                            "500 Internal Server Error",
+                                            "session log lock poisoned",
+                                        );
+                                    }
                                 }
+                            } else {
+                                pending_upload_session_dir(root)
                             };
                             // Path after /api/session/current/uploads
                             let path_and_q = request_line
@@ -6982,26 +7000,24 @@ pub fn spawn_web_gateway(
                         // DELETE /api/session/current/uploads/<id> — remove the file + sidecar.
                         use tokio::io::AsyncWriteExt;
                         let response = 'del_upload: {
-                            let Some(ref slog) = session_log else {
-                                break 'del_upload upload_error_response(
-                                    "404 Not Found",
-                                    "no active session",
-                                );
-                            };
                             let Some(ref root) = project_root_for_changes else {
                                 break 'del_upload upload_error_response(
                                     "404 Not Found",
                                     "no project root",
                                 );
                             };
-                            let session_dir = match slog.lock() {
-                                Ok(l) => l.dir().to_path_buf(),
-                                Err(_) => {
-                                    break 'del_upload upload_error_response(
-                                        "500 Internal Server Error",
-                                        "session log lock poisoned",
-                                    );
+                            let session_dir = if let Some(ref slog) = session_log {
+                                match slog.lock() {
+                                    Ok(l) => l.dir().to_path_buf(),
+                                    Err(_) => {
+                                        break 'del_upload upload_error_response(
+                                            "500 Internal Server Error",
+                                            "session log lock poisoned",
+                                        );
+                                    }
                                 }
+                            } else {
+                                pending_upload_session_dir(root)
                             };
                             let path_and_q = request_line
                                 .split_whitespace()
@@ -9669,6 +9685,40 @@ mod tests {
     fn initial_body_bytes_rejects_incomplete_headers() {
         let request = b"POST /api/session/current/uploads HTTP/1.1\r\nContent-Length: 4\r\n";
         assert!(initial_body_bytes(request).is_err());
+    }
+
+    #[test]
+    fn upload_destination_falls_back_to_workspace_without_active_session() {
+        assert_eq!(
+            effective_upload_destination(
+                crate::upload_store::UploadDestination::Task,
+                false,
+            ),
+            crate::upload_store::UploadDestination::Workspace
+        );
+        assert_eq!(
+            effective_upload_destination(
+                crate::upload_store::UploadDestination::Workspace,
+                false,
+            ),
+            crate::upload_store::UploadDestination::Workspace
+        );
+        assert_eq!(
+            effective_upload_destination(
+                crate::upload_store::UploadDestination::Task,
+                true,
+            ),
+            crate::upload_store::UploadDestination::Task
+        );
+    }
+
+    #[test]
+    fn pending_upload_session_dir_is_project_scoped() {
+        let root = std::path::PathBuf::from("/tmp/project");
+        assert_eq!(
+            pending_upload_session_dir(&root),
+            root.join(".intendant").join("pending_uploads")
+        );
     }
 
     #[test]
