@@ -2039,73 +2039,161 @@ html, body {
 
 /* ── Changes sub-tab ── */
 .changes-container {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  background: var(--base);
 }
 .changes-sidebar {
-  width: 260px;
-  min-width: 200px;
   border-right: 1px solid var(--surface1);
   overflow-y: auto;
-  padding: 4px 0;
+  padding: 6px;
+  background: var(--mantle);
 }
 .changes-file-entry {
-  display: flex;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
   align-items: center;
-  padding: 4px 8px;
+  column-gap: 8px;
+  row-gap: 2px;
+  width: 100%;
+  min-height: 42px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
   cursor: pointer;
   font-size: 12px;
   font-family: var(--font-mono);
-  gap: 6px;
+  text-align: left;
 }
 .changes-file-entry:hover { background: var(--surface0); }
-.changes-file-entry.active { background: var(--surface1); }
+.changes-file-entry.active {
+  background: var(--surface0);
+  border-color: var(--surface2);
+}
 .changes-file-entry .kind-badge {
+  grid-row: 1 / span 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-size: 10px;
-  padding: 1px 4px;
-  border-radius: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
   font-weight: 600;
-  min-width: 14px;
-  text-align: center;
 }
 .kind-badge.created { color: var(--green); border: 1px solid var(--green); }
 .kind-badge.modified { color: var(--yellow); border: 1px solid var(--yellow); }
 .kind-badge.deleted { color: var(--red); border: 1px solid var(--red); }
+.changes-file-name,
+.changes-file-dir {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.changes-file-name {
+  color: var(--text);
+  font-weight: 600;
+}
+.changes-file-dir {
+  grid-column: 2 / span 2;
+  color: var(--overlay0);
+  font-size: 10px;
+}
 .changes-stats {
   color: var(--subtext0);
   font-size: 10px;
-  margin-left: auto;
   white-space: nowrap;
+  justify-self: end;
 }
 .changes-diff-viewer {
-  flex: 1;
   overflow: auto;
   font-family: var(--font-mono);
   font-size: 12px;
-  padding: 12px;
+  padding: 0;
+  min-width: 0;
+  background: var(--base);
 }
 .changes-diff-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   font-weight: 600;
-  padding: 4px 0 8px;
+  padding: 9px 12px;
   border-bottom: 1px solid var(--surface0);
-  margin-bottom: 8px;
+  background: var(--base);
   color: var(--text);
 }
-.changes-diff-content {
-  white-space: pre;
-  line-height: 1.5;
+.changes-diff-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.diff-line-add { color: var(--green); background: rgba(166,227,161,0.08); display: block; }
-.diff-line-del { color: var(--red); background: rgba(243,139,168,0.08); display: block; }
-.diff-line-hunk { color: var(--blue); display: block; font-weight: 600; }
-.diff-line-ctx { display: block; }
+.changes-diff-meta {
+  color: var(--subtext0);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.changes-diff-content {
+  display: block;
+  margin: 0;
+  padding: 8px 0 16px;
+  white-space: normal;
+  line-height: 1.45;
+}
+.diff-line {
+  display: grid;
+  grid-template-columns: 42px 42px minmax(max-content, 1fr);
+  min-width: 100%;
+}
+.diff-old,
+.diff-new {
+  color: var(--overlay0);
+  border-right: 1px solid var(--surface0);
+  padding: 0 8px;
+  text-align: right;
+  user-select: none;
+}
+.diff-code {
+  white-space: pre;
+  padding: 0 12px;
+}
+.diff-line-add { color: var(--green); background: rgba(166,227,161,0.09); }
+.diff-line-del { color: var(--red); background: rgba(243,139,168,0.10); }
+.diff-line-hunk { color: var(--blue); background: rgba(137,180,250,0.09); font-weight: 600; }
+.diff-line-file { color: var(--subtext1); background: var(--mantle); }
+.diff-line-ctx { color: var(--text); }
 .changes-empty {
   color: var(--overlay0);
   text-align: center;
   padding: 40px;
   font-size: 13px;
+}
+.changes-sidebar .changes-empty {
+  text-align: left;
+  padding: 18px 10px;
+}
+@media (max-width: 700px) {
+  .changes-container {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(140px, 34vh) minmax(0, 1fr);
+  }
+  .changes-sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--surface1);
+  }
 }
 #badge-changes {
   font-size: 10px;
@@ -5500,6 +5588,7 @@ async function main() {
         return;
       }
       if (d.t === 'log_replay' && Array.isArray(d.entries)) {
+        resetChangesPane();
         const snapshots = d.entries
           .filter(entry => entry && entry.event === 'context_snapshot');
         const latest = snapshots.length ? snapshots[snapshots.length - 1] : null;
@@ -6163,23 +6252,46 @@ function processCommands(cmds) {
 
 const changedFiles = new Map(); // path -> {kind, lines_added, lines_removed}
 let activeChangesFile = null;
+let changesRefreshTimer = null;
+let changesRefreshSeq = 0;
 
 function onFileChanged(path, kind, linesAdded, linesRemoved) {
   changedFiles.set(path, { kind, lines_added: linesAdded, lines_removed: linesRemoved });
   renderChangesFileList();
-  // Show badge if not on Changes sub-tab
+  updateChangesBadge();
+
+  if (isChangesSubtabActive() && !activeChangesFile) {
+    selectChangesFile(path);
+  }
+  scheduleChangesRefresh();
+}
+
+function isChangesSubtabActive() {
   const activeBtn = document.querySelector('#activity-subtabs .subtab-btn.active');
-  if (!activeBtn || activeBtn.dataset.activityTab !== 'changes') {
-    const badge = document.getElementById('badge-changes');
-    if (badge) { badge.textContent = changedFiles.size; badge.style.display = ''; }
+  return !!activeBtn && activeBtn.dataset.activityTab === 'changes';
+}
+
+function updateChangesBadge() {
+  const badge = document.getElementById('badge-changes');
+  if (!badge) return;
+  if (changedFiles.size > 0 && !isChangesSubtabActive()) {
+    badge.textContent = changedFiles.size;
+    badge.style.display = '';
+  } else {
+    badge.textContent = '';
+    badge.style.display = 'none';
   }
 }
 
-function renderChangesFileList() {
+function changesStatsHtml(info) {
+  return `<span class="changes-stats">+${info.lines_added} &minus;${info.lines_removed}</span>`;
+}
+
+function renderChangesFileList(emptyMessage = 'No file changes yet') {
   const container = document.getElementById('changes-file-list');
   if (!container) return;
   if (changedFiles.size === 0) {
-    container.innerHTML = '<div class="changes-empty">No file changes yet</div>';
+    container.innerHTML = `<div class="changes-empty">${escapeHtml(emptyMessage)}</div>`;
     return;
   }
   const sorted = [...changedFiles.entries()].sort((a, b) => a[0].localeCompare(b[0]));
@@ -6187,30 +6299,135 @@ function renderChangesFileList() {
     const active = path === activeChangesFile ? ' active' : '';
     const initial = info.kind === 'created' ? 'A' : info.kind === 'deleted' ? 'D' : 'M';
     const badge = `<span class="kind-badge ${info.kind}">${initial}</span>`;
-    const stats = `<span class="changes-stats">+${info.lines_added} \u2212${info.lines_removed}</span>`;
+    const stats = changesStatsHtml(info);
     const parts = path.split('/');
     const name = parts.pop();
     const dir = parts.length > 0 ? parts.join('/') + '/' : '';
-    return `<div class="changes-file-entry${active}" onclick="selectChangesFile('${path.replace(/'/g, "\\'")}')">`
-      + `${badge}<span style="color:var(--overlay0);font-size:11px">${escapeHtml(dir)}</span>${escapeHtml(name)}${stats}</div>`;
+    return `<button type="button" class="changes-file-entry${active}" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">`
+      + `${badge}<span class="changes-file-name">${escapeHtml(name)}</span>${stats}`
+      + `<span class="changes-file-dir">${escapeHtml(dir)}</span></button>`;
   }).join('');
+  container.querySelectorAll('.changes-file-entry').forEach(entry => {
+    entry.addEventListener('click', () => selectChangesFile(entry.dataset.path || ''));
+  });
 }
 
-async function selectChangesFile(path) {
-  activeChangesFile = path;
-  renderChangesFileList();
-  const header = document.getElementById('changes-diff-header');
+function resetChangesPane(message = 'No file changes yet') {
+  changedFiles.clear();
+  activeChangesFile = null;
+  renderChangesFileList(message);
+  renderChangesDiffHeader(null);
   const content = document.getElementById('changes-diff-content');
-  if (!header || !content) return;
-  header.textContent = path;
-  content.textContent = 'Loading...';
+  if (content) content.innerHTML = `<span class="changes-empty">${escapeHtml(message)}</span>`;
+  updateChangesBadge();
+}
+
+function renderChangesDiffHeader(path, info, stateText = '') {
+  const header = document.getElementById('changes-diff-header');
+  if (!header) return;
+  if (!path) {
+    header.textContent = 'Select a file to view changes';
+    return;
+  }
+  const meta = info ? `+${info.lines_added} / -${info.lines_removed}` : stateText;
+  header.innerHTML = `<span class="changes-diff-path" title="${escapeHtml(path)}">${escapeHtml(path)}</span>`
+    + (meta ? `<span class="changes-diff-meta">${escapeHtml(meta)}</span>` : '');
+}
+
+function encodeChangePath(path) {
+  return String(path).split('/').map(part => encodeURIComponent(part)).join('/');
+}
+
+async function parseChangesResponse(resp) {
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.error) {
+    throw new Error(data.error || resp.statusText || `HTTP ${resp.status}`);
+  }
+  return data;
+}
+
+async function refreshChangesList(options = {}) {
+  const { selectFirst = false, refreshActive = false, quiet = false } = options;
+  const seq = ++changesRefreshSeq;
   try {
-    const resp = await fetch(`/api/session/current/changes/${encodeURIComponent(path)}`);
-    if (!resp.ok) throw new Error(resp.statusText);
-    const data = await resp.json();
+    const resp = await fetch('/api/session/current/changes');
+    const data = await parseChangesResponse(resp);
+    if (seq !== changesRefreshSeq) return;
+    changedFiles.clear();
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        if (!item || !item.path) continue;
+        changedFiles.set(item.path, {
+          kind: item.kind || 'modified',
+          lines_added: item.lines_added || 0,
+          lines_removed: item.lines_removed || 0,
+        });
+      }
+    }
+
+    if (activeChangesFile && !changedFiles.has(activeChangesFile)) {
+      activeChangesFile = null;
+    }
+    renderChangesFileList();
+    updateChangesBadge();
+
+    if (activeChangesFile && refreshActive) {
+      await selectChangesFile(activeChangesFile, { skipListRender: true });
+    } else if (!activeChangesFile && selectFirst && changedFiles.size > 0) {
+      const first = [...changedFiles.keys()].sort((a, b) => a.localeCompare(b))[0];
+      await selectChangesFile(first);
+    } else if (!activeChangesFile) {
+      renderChangesDiffHeader(null);
+      const content = document.getElementById('changes-diff-content');
+      if (content) {
+        const msg = changedFiles.size ? 'Select a file to view changes' : 'No file changes yet';
+        content.innerHTML = `<span class="changes-empty">${escapeHtml(msg)}</span>`;
+      }
+    }
+  } catch (e) {
+    if (!quiet) {
+      resetChangesPane(e.message === 'file watcher not active'
+        ? 'Change tracking unavailable'
+        : `Unable to load changes: ${e.message}`);
+    }
+  }
+}
+
+function scheduleChangesRefresh() {
+  if (changesRefreshTimer) clearTimeout(changesRefreshTimer);
+  changesRefreshTimer = setTimeout(() => {
+    changesRefreshTimer = null;
+    refreshChangesList({ refreshActive: !!activeChangesFile, quiet: true });
+  }, 250);
+}
+
+async function selectChangesFile(path, options = {}) {
+  if (!path) return;
+  activeChangesFile = path;
+  if (!options.skipListRender) renderChangesFileList();
+  const content = document.getElementById('changes-diff-content');
+  if (!content) return;
+  renderChangesDiffHeader(path, changedFiles.get(path), 'Loading');
+  content.innerHTML = '<span class="changes-empty">Loading...</span>';
+  try {
+    const resp = await fetch(`/api/session/current/changes/${encodeChangePath(path)}`);
+    const data = await parseChangesResponse(resp);
+    if (path !== activeChangesFile) return;
+    if (changedFiles.has(path)) {
+      const prev = changedFiles.get(path);
+      changedFiles.set(path, {
+        kind: prev.kind,
+        lines_added: data.lines_added || 0,
+        lines_removed: data.lines_removed || 0,
+      });
+      renderChangesFileList();
+    }
+    renderChangesDiffHeader(path, changedFiles.get(path));
     content.innerHTML = renderDiffLines(data.diff || '');
   } catch (e) {
-    content.textContent = `Error: ${e.message}`;
+    if (path !== activeChangesFile) return;
+    renderChangesDiffHeader(path, changedFiles.get(path), 'Error');
+    content.innerHTML = `<span class="changes-empty">Error: ${escapeHtml(e.message)}</span>`;
   }
 }
 window.selectChangesFile = selectChangesFile;
@@ -7027,16 +7244,35 @@ if (document.readyState === 'loading') {
 
 function renderDiffLines(diffText) {
   if (!diffText) return '<span class="changes-empty">No changes</span>';
-  return diffText.split('\n').map(line => {
-    if (line.startsWith('+++') || line.startsWith('---'))
-      return `<span class="diff-line-ctx">${escapeHtml(line)}</span>`;
-    if (line.startsWith('+'))
-      return `<span class="diff-line-add">${escapeHtml(line)}</span>`;
-    if (line.startsWith('-'))
-      return `<span class="diff-line-del">${escapeHtml(line)}</span>`;
-    if (line.startsWith('@@'))
-      return `<span class="diff-line-hunk">${escapeHtml(line)}</span>`;
-    return `<span class="diff-line-ctx">${escapeHtml(line)}</span>`;
+  let oldLine = null;
+  let newLine = null;
+  const lines = diffText.endsWith('\n') ? diffText.slice(0, -1).split('\n') : diffText.split('\n');
+  return lines.map(line => {
+    let cls = 'diff-line diff-line-ctx';
+    let oldNo = '';
+    let newNo = '';
+
+    if (line.startsWith('@@')) {
+      cls = 'diff-line diff-line-hunk';
+      const m = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) {
+        oldLine = Number(m[1]);
+        newLine = Number(m[2]);
+      }
+    } else if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff --git')) {
+      cls = 'diff-line diff-line-file';
+    } else if (line.startsWith('+')) {
+      cls = 'diff-line diff-line-add';
+      if (newLine !== null) newNo = String(newLine++);
+    } else if (line.startsWith('-')) {
+      cls = 'diff-line diff-line-del';
+      if (oldLine !== null) oldNo = String(oldLine++);
+    } else {
+      if (oldLine !== null) oldNo = String(oldLine++);
+      if (newLine !== null) newNo = String(newLine++);
+    }
+
+    return `<span class="${cls}"><span class="diff-old">${oldNo}</span><span class="diff-new">${newNo}</span><span class="diff-code">${escapeHtml(line)}</span></span>`;
   }).join('');
 }
 
@@ -11570,6 +11806,7 @@ function switchActivitySubtab(name) {
   if (name === 'changes') {
     const badge = document.getElementById('badge-changes');
     if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
+    refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
     // Populate the timeline on first view in case the user opened the
     // Changes tab after a session had already racked up history
     // (refreshHistory is a no-op when the endpoint 404s).
@@ -16123,7 +16360,9 @@ function renderDiskUsage(sessions) {
 function onSessionStarted(sessionId, task) {
   currentSessionFullId = sessionId || '';
   document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
+  resetChangesPane();
   switchTab('activity');
+  refreshChangesList({ selectFirst: activeActivitySubtab === 'changes', quiet: true });
   // New session: clear any stale timeline and let the first
   // `snapshot_created` event populate it, or populate from the current
   // server state if the session already has rounds recorded (reconnect
@@ -16134,7 +16373,9 @@ function onSessionStarted(sessionId, task) {
 function onSessionAttached(sessionId, source) {
   currentSessionFullId = sessionId || '';
   document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
+  resetChangesPane();
   switchTab('activity');
+  refreshChangesList({ selectFirst: activeActivitySubtab === 'changes', quiet: true });
   if (typeof refreshHistory === 'function') refreshHistory();
 }
 

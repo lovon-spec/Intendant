@@ -345,6 +345,23 @@ impl FileWatcher {
                 if is_binary(&content) {
                     continue;
                 }
+                let baseline_path = baseline_dir.join(&rel);
+                if let Some(parent) = baseline_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        CallerError::Config(format!(
+                            "create baseline parent {}: {}",
+                            parent.display(),
+                            e
+                        ))
+                    })?;
+                }
+                std::fs::write(&baseline_path, &content).map_err(|e| {
+                    CallerError::Config(format!(
+                        "write baseline {}: {}",
+                        baseline_path.display(),
+                        e
+                    ))
+                })?;
                 let hash = sha256_hash(&content);
                 baselines.insert(rel.clone(), content);
                 hashes.insert(rel, hash);
@@ -1162,6 +1179,20 @@ mod tests {
         let (added, removed) = diff_stats("a\nb\nc\n", "");
         assert_eq!(added, 0);
         assert_eq!(removed, 3);
+    }
+
+    #[test]
+    fn new_persists_initial_baselines_for_http_diff() {
+        let root = TempDir::new().unwrap();
+        let snap = TempDir::new().unwrap();
+        let src_dir = root.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let _watcher = make_watcher(root.path(), snap.path());
+
+        let baseline = snap.path().join("baseline").join("src").join("main.rs");
+        assert_eq!(std::fs::read_to_string(baseline).unwrap(), "fn main() {}\n");
     }
 
     #[test]

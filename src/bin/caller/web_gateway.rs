@@ -2488,17 +2488,20 @@ fn handle_changes_request(
     request_line: &str,
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,
-) -> String {
+) -> (&'static str, String) {
     let (snapshot_dir, project_root) = match (snapshot_dir, project_root) {
         (Some(s), Some(p)) => (s, p),
         _ => {
-            return serde_json::json!({"error": "file watcher not active"}).to_string();
+            return (
+                "503 Service Unavailable",
+                serde_json::json!({"error": "file watcher not active"}).to_string(),
+            );
         }
     };
 
     let baseline_dir = snapshot_dir.join("baseline");
     if !baseline_dir.exists() {
-        return serde_json::json!([]).to_string();
+        return ("200 OK", serde_json::json!([]).to_string());
     }
 
     // Extract the path after /api/session/current/changes
@@ -2507,11 +2510,14 @@ fn handle_changes_request(
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
         .trim_start_matches('/');
 
     if file_path.is_empty() {
         // List all changed files.
-        handle_changes_list(&baseline_dir, project_root)
+        ("200 OK", handle_changes_list(&baseline_dir, project_root))
     } else {
         // Single-file diff.
         handle_changes_file_diff(file_path, &baseline_dir, project_root)
@@ -2589,12 +2595,16 @@ fn handle_changes_file_diff(
     file_path: &str,
     baseline_dir: &Path,
     project_root: &Path,
-) -> String {
+) -> (&'static str, String) {
+    let decoded = url_path_decode(file_path);
     // Reject path traversal.
-    let rel = Path::new(file_path);
+    let rel = Path::new(&decoded);
     for component in rel.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return serde_json::json!({"error": "invalid path"}).to_string();
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": "invalid path"}).to_string(),
+            );
         }
     }
 
@@ -2607,7 +2617,10 @@ fn handle_changes_file_diff(
         baseline_dir.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_dir.to_path_buf())),
     ) {
         if !resolved_baseline.starts_with(&resolved_root) {
-            return serde_json::json!({"error": "invalid path"}).to_string();
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": "invalid path"}).to_string(),
+            );
         }
     }
     if let (Ok(resolved_current), Ok(resolved_root)) = (
@@ -2615,7 +2628,10 @@ fn handle_changes_file_diff(
         project_root.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(project_root.to_path_buf())),
     ) {
         if !resolved_current.starts_with(&resolved_root) {
-            return serde_json::json!({"error": "invalid path"}).to_string();
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": "invalid path"}).to_string(),
+            );
         }
     }
 
@@ -2626,7 +2642,7 @@ fn handle_changes_file_diff(
         String::new()
     };
 
-    let diff = crate::file_watcher::compute_unified_diff(&baseline, &current, file_path);
+    let diff = crate::file_watcher::compute_unified_diff(&baseline, &current, &decoded);
     let (lines_added, lines_removed) = {
         let text_diff = similar::TextDiff::from_lines(baseline.as_str(), current.as_str());
         let mut added = 0u32;
@@ -2641,13 +2657,16 @@ fn handle_changes_file_diff(
         (added, removed)
     };
 
-    serde_json::json!({
-        "path": file_path,
-        "diff": diff,
-        "lines_added": lines_added,
-        "lines_removed": lines_removed,
-    })
-    .to_string()
+    (
+        "200 OK",
+        serde_json::json!({
+            "path": decoded,
+            "diff": diff,
+            "lines_added": lines_added,
+            "lines_removed": lines_removed,
+        })
+        .to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2806,6 +2825,39 @@ fn url_decode(s: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
+            b'%' if i + 2 < bytes.len() => {
+                let h = &bytes[i + 1..i + 3];
+                match std::str::from_utf8(h)
+                    .ok()
+                    .and_then(|hs| u8::from_str_radix(hs, 16).ok())
+                {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decode percent escapes in an HTTP path segment. Unlike query-string
+/// decoding, `+` is a literal plus in paths.
+fn url_path_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
                 let h = &bytes[i + 1..i + 3];
                 match std::str::from_utf8(h)
@@ -6985,13 +7037,13 @@ pub fn spawn_web_gateway(
                         //   GET /api/session/current/changes        — list all changed files
                         //   GET /api/session/current/changes/{path} — unified diff for one file
                         use tokio::io::AsyncWriteExt;
-                        let body = handle_changes_request(
+                        let (status, body) = handle_changes_request(
                             &request_line,
                             snapshot_dir.as_deref(),
                             project_root_for_changes.as_deref(),
                         );
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
+                            "HTTP/1.1 {}\r\n\
                              Content-Type: application/json\r\n\
                              Content-Length: {}\r\n\
                              Cache-Control: no-cache\r\n\
@@ -6999,7 +7051,7 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            status, body.len(), body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("GET") && request_line.contains("/api/session/current/history") {
@@ -9951,6 +10003,71 @@ mod tests {
         assert!(APP_HTML.contains("tab-stats"));
         assert!(APP_HTML.contains("tab-terminal"));
         assert!(APP_HTML.contains("tab-displays"));
+    }
+
+    #[test]
+    fn changes_request_decodes_nested_file_path() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/src/main.rs");
+        let current_path = project.path().join("src/main.rs");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "old\nsame\n").unwrap();
+        std::fs::write(&current_path, "new\nsame\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/src%2Fmain.rs HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "src/main.rs");
+        assert!(json["diff"].as_str().unwrap().contains("-old"));
+        assert!(json["diff"].as_str().unwrap().contains("+new"));
+    }
+
+    #[test]
+    fn changes_request_decodes_segment_escaped_file_path() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/src/file name.rs");
+        let current_path = project.path().join("src/file name.rs");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "before\n").unwrap();
+        std::fs::write(&current_path, "after\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/src/file%20name.rs HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "src/file name.rs");
+        assert!(json["diff"].as_str().unwrap().contains("-before"));
+        assert!(json["diff"].as_str().unwrap().contains("+after"));
+    }
+
+    #[test]
+    fn changes_request_rejects_decoded_path_traversal() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/%2E%2E/Cargo.toml HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(json["error"], "invalid path");
     }
 
     #[test]
