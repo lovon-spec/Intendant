@@ -840,9 +840,9 @@ fn codex_inference_request_ref(
     event: &serde_json::Value,
     line_idx: u64,
 ) -> Option<CodexRequestPayloadRef> {
-    if event.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
-        return None;
-    }
+    // Codex trace schema v1 writes the event kind under `payload.type`.
+    // Older traces wrapped the same payload in `{ type: "event_msg", ... }`;
+    // both shapes are intentionally accepted here.
     let payload = event.get("payload")?;
     if payload.get("type").and_then(|v| v.as_str()) != Some("inference_started") {
         return None;
@@ -857,12 +857,17 @@ fn codex_inference_request_ref(
     Some(CodexRequestPayloadRef {
         bundle_dir: bundle_dir.to_path_buf(),
         relative_path,
-        provider_name: request_payload
+        provider_name: payload
             .get("provider_name")
             .and_then(|v| v.as_str())
+            .or_else(|| request_payload.get("provider_name").and_then(|v| v.as_str()))
             .map(ToString::to_string),
         order: (
-            event.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
+            event
+                .get("wall_time_unix_ms")
+                .and_then(|v| v.as_i64())
+                .or_else(|| event.get("ts").and_then(|v| v.as_i64()))
+                .unwrap_or(0),
             line_idx,
         ),
     })
@@ -2077,8 +2082,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let first = tmp.path().join("trace-a");
         let second = tmp.path().join("trace-b");
+        let current = tmp.path().join("trace-current");
         std::fs::create_dir_all(first.join("payloads")).unwrap();
         std::fs::create_dir_all(second.join("payloads")).unwrap();
+        std::fs::create_dir_all(current.join("payloads")).unwrap();
 
         std::fs::write(
             first.join("payloads/0.json"),
@@ -2127,9 +2134,41 @@ mod tests {
         )
         .unwrap();
 
+        std::fs::write(
+            current.join("payloads/2.json"),
+            serde_json::json!({
+                "input": [
+                    {"role": "developer"},
+                    {"role": "user"},
+                    {"type": "function_call_output"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            current.join("trace.jsonl"),
+            serde_json::json!({
+                "schema_version": 1,
+                "seq": 1,
+                "wall_time_unix_ms": 3,
+                "payload": {
+                    "type": "inference_started",
+                    "provider_name": "OpenAI",
+                    "request_payload": {
+                        "raw_payload_id": "raw_payload:2",
+                        "kind": {"type": "inference_request"},
+                        "path": "payloads/2.json"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
         let snapshot = read_latest_codex_request_payload(tmp.path()).await.unwrap();
         assert_eq!(snapshot.format, "openai.responses.request.v1");
-        assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 3);
     }
 
     #[test]
