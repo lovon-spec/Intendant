@@ -265,6 +265,9 @@ pub use crate::approval::ApprovalDecision;
 pub struct AgentConfig {
     pub model: Option<String>,
     pub working_dir: PathBuf,
+    /// Directory where a backend can write exact model request payload traces.
+    /// Backends that cannot capture provider-bound request bodies ignore it.
+    pub request_trace_dir: Option<PathBuf>,
     pub approval_policy: String,
     /// Sandbox mode for Codex: `"read-only"`, `"workspace-write"`, or
     /// `"danger-full-access"`. Ignored by backends that don't model a
@@ -290,7 +293,7 @@ pub struct AgentThread {
     pub thread_id: String,
 }
 
-/// Parsed raw context snapshot exposed by an external agent backend.
+/// Exact model request payload exposed by an external agent backend.
 #[derive(Debug, Clone)]
 pub struct AgentContextSnapshot {
     pub source: String,
@@ -340,9 +343,9 @@ pub trait ExternalAgent: Send + Sync {
         self.send_message(thread, message).await
     }
 
-    /// Return the backend's current parsed raw model context when the
-    /// backend exposes a native read API. Backends without such an API
-    /// return `None` rather than synthesizing an inexact transcript.
+    /// Return the latest exact model request payload captured at the provider
+    /// boundary. Backends without such a payload return `None`; callers should
+    /// not synthesize transcript-shaped replacements.
     async fn context_snapshot(&mut self) -> Result<Option<AgentContextSnapshot>, CallerError> {
         Ok(None)
     }

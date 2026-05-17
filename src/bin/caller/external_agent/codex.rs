@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -561,7 +562,10 @@ pub struct CodexAgent {
     web_port: Option<u16>,
     prompt_sent: bool,
     /// Working directory where .codex/config.toml was written (for cleanup).
-    config_working_dir: Option<std::path::PathBuf>,
+    config_working_dir: Option<PathBuf>,
+    /// Root directory where Codex rollout traces exact provider request
+    /// payloads for the dashboard Context tab.
+    request_trace_root: Option<PathBuf>,
     child: Option<Child>,
     writer: Option<BufWriter<ChildStdin>>,
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
@@ -578,7 +582,7 @@ pub struct CodexAgent {
     /// `Terminated`.
     active_turn_id: Arc<Mutex<Option<String>>>,
     /// Latest token-usage notification from Codex app-server. Joined with
-    /// thread/read snapshots so the dashboard can show current context usage.
+    /// request payload snapshots so the dashboard can show current context usage.
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
@@ -632,6 +636,7 @@ impl CodexAgent {
             web_port,
             prompt_sent: false,
             config_working_dir: None,
+            request_trace_root: None,
             child: None,
             writer: None,
             event_tx: None,
@@ -726,102 +731,150 @@ impl CodexAgent {
     }
 
     async fn read_context_snapshot(&mut self) -> Result<AgentContextSnapshot, CallerError> {
-        let thread_id = self.require_active_thread().await?;
-        let response = self
-            .send_request(
-                "thread/read",
-                Some(serde_json::json!({
-                    "threadId": thread_id,
-                    "includeTurns": true,
-                })),
+        let root = self.request_trace_root.as_deref().ok_or_else(|| {
+            CallerError::ExternalAgent(
+                "Codex request payload tracing was not configured".to_string(),
             )
-            .await
-            .map_err(|e| CallerError::ExternalAgent(format!("thread/read: {e}")))?;
-        let thread = response
-            .get("thread")
-            .cloned()
-            .unwrap_or_else(|| response.clone());
+        })?;
+        let trace = read_latest_codex_request_payload(root).await?;
         let usage = self.latest_token_usage.lock().await.clone();
         let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
         let context_window = usage.as_ref().and_then(codex_usage_context_window);
-        let item_count = codex_context_item_count(&thread);
-        let session_jsonl = read_codex_session_jsonl(&thread).await;
         Ok(AgentContextSnapshot {
             source: "codex".to_string(),
-            label: "Codex context".to_string(),
-            format: "codex.thread-read+session-jsonl.v1".to_string(),
+            label: "Codex request payload".to_string(),
+            format: trace.format,
             token_count,
             context_window,
-            item_count: Some(item_count),
-            raw: serde_json::json!({
-                "threadRead": {
-                    "thread": thread,
-                    "tokenUsage": usage,
-                },
-                "sessionJsonl": session_jsonl,
-                "note": "Codex app-server exposes the thread transcript via thread/read. The session JSONL is parsed from the thread path and includes session_meta/turn_context entries such as base_instructions, developer_instructions, user_instructions, and the per-turn environment that Codex recorded before the model request.",
-            }),
+            item_count: codex_request_item_count(&trace.payload),
+            raw: trace.payload,
         })
     }
 }
 
-async fn read_codex_session_jsonl(thread: &serde_json::Value) -> serde_json::Value {
-    let Some(path) = thread.get("path").and_then(|v| v.as_str()) else {
-        return serde_json::json!({
-            "available": false,
-            "reason": "thread/read did not include a session path",
-        });
-    };
+struct CodexRequestPayloadSnapshot {
+    format: String,
+    payload: serde_json::Value,
+}
 
-    let contents = match tokio::fs::read_to_string(path).await {
-        Ok(contents) => contents,
-        Err(e) => {
-            return serde_json::json!({
-                "available": false,
-                "path": path,
-                "readError": e.to_string(),
-            });
-        }
-    };
+struct CodexRequestPayloadRef {
+    bundle_dir: PathBuf,
+    relative_path: String,
+    provider_name: Option<String>,
+    order: (i64, u64),
+}
 
-    let mut entries = Vec::new();
-    let mut model_context_entries = Vec::new();
-    let mut session_meta = serde_json::Value::Null;
-    let mut latest_turn_context = serde_json::Value::Null;
+async fn read_latest_codex_request_payload(
+    root: &Path,
+) -> Result<CodexRequestPayloadSnapshot, CallerError> {
+    let mut dirs = tokio::fs::read_dir(root).await.map_err(|e| {
+        CallerError::ExternalAgent(format!("read Codex request trace root {}: {e}", root.display()))
+    })?;
+    let mut latest: Option<CodexRequestPayloadRef> = None;
 
-    for (line_idx, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
+    while let Some(entry) = dirs.next_entry().await.map_err(|e| {
+        CallerError::ExternalAgent(format!("read Codex request trace entry: {e}"))
+    })? {
+        let file_type = match entry.file_type().await {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
             continue;
         }
-        let parsed = match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(value) => value,
-            Err(e) => serde_json::json!({
-                "parseError": e.to_string(),
-                "line": line_idx + 1,
-                "raw": line,
-            }),
+
+        let bundle_dir = entry.path();
+        let trace_path = bundle_dir.join("trace.jsonl");
+        let contents = match tokio::fs::read_to_string(&trace_path).await {
+            Ok(contents) => contents,
+            Err(_) => continue,
         };
-        let entry_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if entry_type == "session_meta" {
-            session_meta = parsed.clone();
+
+        for (line_idx, line) in contents.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(candidate) =
+                codex_inference_request_ref(&bundle_dir, &event, line_idx as u64)
+            else {
+                continue;
+            };
+            if latest
+                .as_ref()
+                .map(|current| candidate.order > current.order)
+                .unwrap_or(true)
+            {
+                latest = Some(candidate);
+            }
         }
-        if entry_type == "turn_context" {
-            latest_turn_context = parsed.clone();
-        }
-        if matches!(entry_type, "session_meta" | "turn_context" | "response_item") {
-            model_context_entries.push(parsed.clone());
-        }
-        entries.push(parsed);
     }
 
-    serde_json::json!({
-        "available": true,
-        "path": path,
-        "sessionMeta": session_meta,
-        "latestTurnContext": latest_turn_context,
-        "modelContextEntries": model_context_entries,
-        "entries": entries,
+    let latest = latest.ok_or_else(|| {
+        CallerError::ExternalAgent(format!(
+            "no Codex inference request payload found in {}",
+            root.display()
+        ))
+    })?;
+    let payload_path = latest.bundle_dir.join(&latest.relative_path);
+    let contents = tokio::fs::read_to_string(&payload_path).await.map_err(|e| {
+        CallerError::ExternalAgent(format!(
+            "read Codex request payload {}: {e}",
+            payload_path.display()
+        ))
+    })?;
+    let payload = serde_json::from_str::<serde_json::Value>(&contents)
+        .map_err(CallerError::Json)?;
+    Ok(CodexRequestPayloadSnapshot {
+        format: codex_request_format(latest.provider_name.as_deref()),
+        payload,
     })
+}
+
+fn codex_inference_request_ref(
+    bundle_dir: &Path,
+    event: &serde_json::Value,
+    line_idx: u64,
+) -> Option<CodexRequestPayloadRef> {
+    if event.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+        return None;
+    }
+    let payload = event.get("payload")?;
+    if payload.get("type").and_then(|v| v.as_str()) != Some("inference_started") {
+        return None;
+    }
+    let request_payload = payload.get("request_payload")?;
+    if request_payload.get("kind")?.get("type").and_then(|v| v.as_str())?
+        != "inference_request"
+    {
+        return None;
+    }
+    let relative_path = request_payload.get("path")?.as_str()?.to_string();
+    Some(CodexRequestPayloadRef {
+        bundle_dir: bundle_dir.to_path_buf(),
+        relative_path,
+        provider_name: request_payload
+            .get("provider_name")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        order: (
+            event.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
+            line_idx,
+        ),
+    })
+}
+
+fn codex_request_format(provider_name: Option<&str>) -> String {
+    let normalized = provider_name.map(|provider| provider.to_ascii_lowercase());
+    match normalized.as_deref() {
+        Some("openai") => "openai.responses.request.v1".to_string(),
+        Some("anthropic") => "anthropic.messages.request.v1".to_string(),
+        Some("gemini") => "gemini.generate-content.request.v1".to_string(),
+        Some(provider) => format!("codex.{}.inference_request_payload.v1", provider),
+        None => "codex.inference_request_payload.v1".to_string(),
+    }
 }
 
 fn first_u64_at(value: &serde_json::Value, paths: &[&str]) -> Option<u64> {
@@ -856,22 +909,11 @@ fn codex_usage_context_window(value: &serde_json::Value) -> Option<u64> {
     )
 }
 
-fn codex_context_item_count(thread: &serde_json::Value) -> usize {
-    thread
-        .get("turns")
+fn codex_request_item_count(payload: &serde_json::Value) -> Option<usize> {
+    payload
+        .get("input")
         .and_then(|v| v.as_array())
-        .map(|turns| {
-            turns
-                .iter()
-                .map(|turn| {
-                    turn.get("items")
-                        .and_then(|v| v.as_array())
-                        .map(|items| items.len())
-                        .unwrap_or(0)
-                })
-                .sum()
-        })
-        .unwrap_or(0)
+        .map(Vec::len)
 }
 
 // ---------------------------------------------------------------------------
@@ -1450,6 +1492,7 @@ impl ExternalAgent for CodexAgent {
         self.web_search = config.web_search;
         self.network_access = config.network_access;
         self.writable_roots = config.writable_roots;
+        self.request_trace_root = config.request_trace_dir;
 
         // Write .codex/config.toml for MCP-over-HTTP access to Intendant.
         // Backup any existing config and restore on shutdown.
@@ -1526,19 +1569,20 @@ impl ExternalAgent for CodexAgent {
                 quoted.join(", ")
             ));
         }
-        let mut child = Command::new(&self.command)
+        let mut command = Command::new(&self.command);
+        command
             .args(&args)
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .map_err(|e| {
-                CallerError::ExternalAgent(format!(
-                    "Failed to spawn '{}': {}",
-                    self.command, e
-                ))
-            })?;
+            .stderr(std::process::Stdio::inherit());
+        if let Some(root) = &self.request_trace_root {
+            std::fs::create_dir_all(root)?;
+            command.env("CODEX_ROLLOUT_TRACE_ROOT", root);
+        }
+        let mut child = command.spawn().map_err(|e| {
+            CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
+        })?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             CallerError::ExternalAgent("Failed to capture child stdin".into())
@@ -2007,15 +2051,75 @@ mod tests {
     }
 
     #[test]
-    fn codex_context_item_count_counts_turn_items() {
-        let thread = serde_json::json!({
-            "turns": [
-                {"items": [{"type": "userMessage"}, {"type": "agentMessage"}]},
-                {"items": [{"type": "commandExecution"}]},
-                {"status": "completed"}
+    fn codex_request_item_count_counts_input_items() {
+        let payload = serde_json::json!({
+            "input": [
+                {"role": "developer"},
+                {"role": "user"},
+                {"type": "function_call_output"}
             ]
         });
-        assert_eq!(codex_context_item_count(&thread), 3);
+        assert_eq!(codex_request_item_count(&payload), Some(3));
+    }
+
+    #[tokio::test]
+    async fn codex_request_trace_reads_latest_inference_request_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("trace-a");
+        let second = tmp.path().join("trace-b");
+        std::fs::create_dir_all(first.join("payloads")).unwrap();
+        std::fs::create_dir_all(second.join("payloads")).unwrap();
+
+        std::fs::write(
+            first.join("payloads/0.json"),
+            serde_json::json!({"input": [{"role": "old"}]}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            first.join("trace.jsonl"),
+            serde_json::json!({
+                "type": "event_msg",
+                "ts": 1,
+                "payload": {
+                    "type": "inference_started",
+                    "request_payload": {
+                        "kind": {"type": "inference_request"},
+                        "provider_name": "OpenAI",
+                        "path": "payloads/0.json"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            second.join("payloads/1.json"),
+            serde_json::json!({"input": [{"role": "developer"}, {"role": "user"}]})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            second.join("trace.jsonl"),
+            serde_json::json!({
+                "type": "event_msg",
+                "ts": 2,
+                "payload": {
+                    "type": "inference_started",
+                    "request_payload": {
+                        "kind": {"type": "inference_request"},
+                        "provider_name": "OpenAI",
+                        "path": "payloads/1.json"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let snapshot = read_latest_codex_request_payload(tmp.path()).await.unwrap();
+        assert_eq!(snapshot.format, "openai.responses.request.v1");
+        assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 2);
     }
 
     #[test]

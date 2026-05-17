@@ -393,6 +393,11 @@ async fn create_external_agent(
 > {
     use external_agent::{AgentBackend, AgentConfig};
 
+    let request_trace_dir = session_log
+        .lock()
+        .ok()
+        .map(|log| log.dir().join("model-request-traces"));
+
     let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend
     {
         AgentBackend::Codex => {
@@ -417,6 +422,7 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
+                request_trace_dir: request_trace_dir.clone(),
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: sandbox_mode,
                 reasoning_effort,
@@ -447,6 +453,7 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
+                request_trace_dir: request_trace_dir.clone(),
                 // `AgentConfig.approval_policy` is Codex's `-a` flag; for
                 // Gemini we reuse the field as the ACP approval hint so the
                 // sandbox/prompt layer can adjust if needed. Storing the
@@ -474,6 +481,7 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
+                request_trace_dir: request_trace_dir.clone(),
                 approval_policy: cfg.permission_mode.clone(),
                 sandbox: String::new(),
                 reasoning_effort: None,
@@ -570,6 +578,15 @@ async fn emit_external_context_snapshot(
             });
         }
     }
+}
+
+fn provider_request_item_count(raw: &serde_json::Value) -> Option<usize> {
+    for key in ["input", "messages", "contents"] {
+        if let Some(items) = raw.get(key).and_then(|v| v.as_array()) {
+            return Some(items.len());
+        }
+    }
+    None
 }
 
 /// Drain external agent events until a turn completes, the agent terminates,
@@ -3873,31 +3890,28 @@ async fn run_agent_loop(
                 l.messages_input(&json);
             }
         });
-        let (context_format, raw_context) = provider
-            .request_snapshot(conversation.messages(), true)
-            .unwrap_or_else(|e| {
+        match provider.request_snapshot(conversation.messages(), true) {
+            Ok((context_format, raw_context)) => {
+                bus.send(AppEvent::ContextSnapshot {
+                    source: "native".to_string(),
+                    label: "Internal agent request payload".to_string(),
+                    turn: Some(turn),
+                    format: context_format,
+                    token_count: conversation.last_usage().map(|u| u.total_tokens),
+                    context_window: Some(conversation.context_window()),
+                    item_count: provider_request_item_count(&raw_context),
+                    raw: raw_context,
+                });
+            }
+            Err(e) => {
                 slog(&session_log, |l| {
                     l.warn(&format!(
                         "Failed to build provider request context snapshot: {}",
                         e
                     ))
                 });
-                (
-                    "intendant.conversation.messages.v1".to_string(),
-                    serde_json::to_value(conversation.messages())
-                        .unwrap_or_else(|_| serde_json::json!([])),
-                )
-            });
-        bus.send(AppEvent::ContextSnapshot {
-            source: "native".to_string(),
-            label: "Internal agent request".to_string(),
-            turn: Some(turn),
-            format: context_format,
-            token_count: conversation.last_usage().map(|u| u.total_tokens),
-            context_window: Some(conversation.context_window()),
-            item_count: Some(conversation.messages().len()),
-            raw: raw_context,
-        });
+            }
+        }
 
         // Streaming API call — wrapped in select! so an interrupt cancels
         // mid-stream without waiting for the provider to finish. The

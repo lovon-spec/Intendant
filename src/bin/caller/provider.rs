@@ -162,18 +162,17 @@ pub trait ChatProvider: Send + Sync {
         vec![]
     }
 
-    /// Build the provider-specific request shape that will be sent for this
-    /// message slice. Used by the dashboard Context tab to show the payload
-    /// closest to the model boundary, including provider role conversion,
-    /// system/developer fields, tools, and native computer-use blocks.
+    /// Build the provider-specific request body that will be sent for this
+    /// message slice. Used by the dashboard Context tab to show the exact
+    /// model request payload after provider role conversion, system/developer
+    /// fields, tools, and native computer-use blocks are applied.
     fn request_snapshot(
         &self,
-        messages: &[Message],
+        _messages: &[Message],
         _stream: bool,
     ) -> Result<(String, serde_json::Value), CallerError> {
-        Ok((
-            "intendant.conversation.messages.v1".to_string(),
-            serde_json::to_value(messages).map_err(CallerError::Json)?,
+        Err(CallerError::Provider(
+            "provider does not expose a request payload snapshot".to_string(),
         ))
     }
 
@@ -482,11 +481,7 @@ impl ChatProvider for OpenAIProvider {
         };
         Ok((
             "openai.responses.request.v1".to_string(),
-            serde_json::json!({
-                "method": "POST",
-                "url": "https://api.openai.com/v1/responses",
-                "body": serde_json::to_value(&request).map_err(CallerError::Json)?,
-            }),
+            serde_json::to_value(&request).map_err(CallerError::Json)?,
         ))
     }
 
@@ -1280,22 +1275,9 @@ impl ChatProvider for AnthropicProvider {
             tools,
             stream,
         };
-        let beta_header = if self.cu_enabled {
-            "prompt-caching-2024-07-31,computer-use-2025-11-24"
-        } else {
-            "prompt-caching-2024-07-31"
-        };
         Ok((
             "anthropic.messages.request.v1".to_string(),
-            serde_json::json!({
-                "method": "POST",
-                "url": "https://api.anthropic.com/v1/messages",
-                "headers": {
-                    "anthropic-version": "2023-06-01",
-                    "anthropic-beta": beta_header,
-                },
-                "body": serde_json::to_value(&request).map_err(CallerError::Json)?,
-            }),
+            serde_json::to_value(&request).map_err(CallerError::Json)?,
         ))
     }
 
@@ -1969,6 +1951,7 @@ impl ChatProvider for GeminiProvider {
         messages: &[Message],
         stream: bool,
     ) -> Result<(String, serde_json::Value), CallerError> {
+        let _ = stream;
         let (system_text, _contents, mut request_body) =
             build_gemini_request_parts(messages, self);
 
@@ -1978,25 +1961,9 @@ impl ChatProvider for GeminiProvider {
             });
         }
 
-        let endpoint = if stream {
-            format!(
-                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
-                self.endpoint, self.model
-            )
-        } else {
-            format!(
-                "{}/v1beta/models/{}:generateContent",
-                self.endpoint, self.model
-            )
-        };
-
         Ok((
             "gemini.generate-content.request.v1".to_string(),
-            serde_json::json!({
-                "method": "POST",
-                "url": endpoint,
-                "body": request_body,
-            }),
+            request_body,
         ))
     }
 

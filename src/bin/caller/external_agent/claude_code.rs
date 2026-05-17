@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentContextSnapshot, AgentEvent, AgentThread, ApprovalCategory, ApprovalDecision,
-    ExternalAgent, ToolCompletionStatus,
+    AgentConfig, AgentEvent, AgentThread, ApprovalCategory, ApprovalDecision, ExternalAgent,
+    ToolCompletionStatus,
 };
 
 use super::codex::DISPLAY_TOOLS_PROMPT;
@@ -119,7 +119,6 @@ pub struct ClaudeCodeAgent {
     writer: Option<SharedWriter>,
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     pending_approvals: PendingApprovals,
-    context_items: Arc<Mutex<Vec<serde_json::Value>>>,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
     /// Session ID from the first result message, used for multi-turn.
     session_id: Option<String>,
@@ -145,7 +144,6 @@ impl ClaudeCodeAgent {
             writer: None,
             event_tx: None,
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-            context_items: Arc::new(Mutex::new(Vec::new())),
             reader_handle: None,
             session_id: None,
         }
@@ -161,7 +159,6 @@ async fn reader_task(
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     writer: SharedWriter,
     pending_approvals: PendingApprovals,
-    context_items: Arc<Mutex<Vec<serde_json::Value>>>,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -190,11 +187,6 @@ async fn reader_task(
             Ok(v) => v,
             Err(_) => continue,
         };
-        context_items.lock().await.push(serde_json::json!({
-            "direction": "stdout",
-            "message": raw_msg.clone(),
-        }));
-
         let msg: CcMessage = match serde_json::from_value(raw_msg) {
             Ok(m) => m,
             Err(_) => continue,
@@ -444,14 +436,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         self.event_tx = Some(event_tx.clone());
 
         let pending_approvals = Arc::clone(&self.pending_approvals);
-        let context_items = Arc::clone(&self.context_items);
-        let handle = tokio::spawn(reader_task(
-            stdout,
-            event_tx,
-            writer,
-            pending_approvals,
-            context_items,
-        ));
+        let handle = tokio::spawn(reader_task(stdout, event_tx, writer, pending_approvals));
         self.reader_handle = Some(handle);
 
         // No handshake needed — Claude Code starts immediately.
@@ -494,11 +479,6 @@ impl ExternalAgent for ClaudeCodeAgent {
             parent_tool_use_id: None,
         };
 
-        let raw_user_msg = serde_json::to_value(&user_msg)?;
-        self.context_items.lock().await.push(serde_json::json!({
-            "direction": "stdin",
-            "message": raw_user_msg,
-        }));
         let line = serde_json::to_string(&user_msg)?;
         let writer = self.writer.as_ref().ok_or_else(|| {
             CallerError::ExternalAgent("Not initialized".into())
@@ -561,23 +541,6 @@ impl ExternalAgent for ClaudeCodeAgent {
         w.flush().await?;
 
         Ok(())
-    }
-
-    async fn context_snapshot(&mut self) -> Result<Option<AgentContextSnapshot>, CallerError> {
-        let items = self.context_items.lock().await.clone();
-        if items.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(AgentContextSnapshot {
-            source: "claude-code".to_string(),
-            label: "Claude Code JSONL transcript".to_string(),
-            format: "claude-code.stream-json.transcript.v1".to_string(),
-            token_count: None,
-            context_window: None,
-            item_count: Some(items.len()),
-            raw: serde_json::json!({ "items": items }),
-        }))
     }
 
     async fn shutdown(&mut self) -> Result<(), CallerError> {
@@ -659,34 +622,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_code_context_snapshot_returns_transcript() {
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "auto".into(),
-            vec![],
-            None,
-        );
-        agent.context_items.lock().await.push(serde_json::json!({
-            "direction": "stdin",
-            "message": {
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{ "type": "text", "text": "hello" }]
-                }
-            }
-        }));
+    async fn context_snapshot_has_no_transcript_fallback() {
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), vec![], None);
 
-        let snapshot = agent
-            .context_snapshot()
-            .await
-            .unwrap()
-            .expect("snapshot");
-        assert_eq!(snapshot.source, "claude-code");
-        assert_eq!(snapshot.format, "claude-code.stream-json.transcript.v1");
-        assert_eq!(snapshot.item_count, Some(1));
-        assert_eq!(snapshot.raw["items"][0]["direction"], "stdin");
+        let snapshot = agent.context_snapshot().await.unwrap();
+        assert!(snapshot.is_none());
     }
 
     #[test]
