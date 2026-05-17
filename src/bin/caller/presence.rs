@@ -31,6 +31,7 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
             let orchestrate = if envelope.force_direct { Some(false) } else { None };
             Some((
                 ControlMsg::StartTask {
+                    session_id: None,
                     task: envelope.task.clone(),
                     orchestrate,
                     direct: if envelope.force_direct { Some(true) } else { None },

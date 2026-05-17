@@ -33,6 +33,7 @@ mod provider;
 mod sandbox;
 mod schema_validator;
 mod session_log;
+mod session_supervisor;
 mod skills;
 mod sub_agent;
 mod task_dispatch;
@@ -1247,6 +1248,8 @@ struct DaemonConfig {
     project_root: PathBuf,
     autonomy: SharedAutonomy,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
+    shared_codex_config: control_plane::SharedCodexConfig,
+    shared_gemini_config: control_plane::SharedGeminiConfig,
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     web_port: Option<u16>,
     flags_direct: bool,
@@ -1264,415 +1267,20 @@ struct DaemonConfig {
 /// deliberately do not also listen for it here because racing two handlers
 /// risked the loop `break`ing before the meta update ran.
 async fn run_daemon_loop(config: DaemonConfig) {
-    let mut event_rx = config.bus.subscribe();
-    loop {
-        tokio::select! {
-            event = event_rx.recv() => {
-                match event {
-                    Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask {
-                        task: new_task,
-                        orchestrate,
-                        direct,
-                        reference_frame_ids,
-                        display_target,
-                        attachments,
-                    })) => {
-                        eprintln!(
-                            "New session{}: {}",
-                            if direct.unwrap_or(false) { " (direct)" } else { "" },
-                            &new_task[..new_task.len().min(80)]
-                        );
-
-                        // Create fresh session resources
-                        let new_log_dir = session_log::SessionLog::resolve_path(None);
-                        let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
-                            Ok(l) => Arc::new(Mutex::new(l)),
-                            Err(e) => {
-                                config.bus.send(AppEvent::LoopError(format!("Session create failed: {}", e)));
-                                continue;
-                            }
-                        };
-                        let new_project = match Project::from_root(config.project_root.clone()) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                config.bus.send(AppEvent::LoopError(format!("Project load failed: {}", e)));
-                                continue;
-                            }
-                        };
-
-                        // CU path: when reference_frame_ids are present, run ephemeral CU task
-                        if !reference_frame_ids.is_empty() {
-                            let reference_images = resolve_frame_ids(
-                                &reference_frame_ids, &config.frame_registry,
-                            ).await;
-                            if !reference_images.is_empty() {
-                                let cu_provider = match provider::select_cu_provider(
-                                    &new_project.config.computer_use,
-                                ) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        config.bus.send(AppEvent::LoopError(format!("CU provider failed: {}", e)));
-                                        continue;
-                                    }
-                                };
-                                config.bus.send(AppEvent::PresenceLog {
-                                    message: format!("Starting CU task: {}", new_task),
-                                    level: None,
-                                    turn: None,
-                                });
-                                let bus_cu = config.bus.clone();
-                                let session_log_cu = new_session_log.clone();
-                                let cu_config = new_project.config.computer_use.clone();
-                                tokio::spawn(async move {
-                                    let cu_target = display_target.as_deref()
-                                        .map(parse_display_target_str);
-                                    match run_cu_task(
-                                        cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                        &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
-                                    ).await {
-                                        Ok(CuTaskResult::Completed(stats)) => {
-                                            bus_cu.send(AppEvent::PresenceLog {
-                                                message: format!("CU task complete ({} turns)", stats.turns),
-                                                level: None, turn: None,
-                                            });
-                                        }
-                                        Ok(CuTaskResult::Escalate { task }) => {
-                                            bus_cu.send(AppEvent::PresenceLog {
-                                                message: format!(
-                                                    "CU escalated (not a display task): {}",
-                                                    &task[..task.len().min(80)]
-                                                ),
-                                                level: None, turn: None,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            bus_cu.send(AppEvent::PresenceLog {
-                                                message: format!("CU task error: {}", e),
-                                                level: Some(types::LogLevel::Error), turn: None,
-                                            });
-                                        }
-                                    }
-                                });
-                                continue;
-                            }
-                        }
-
-                        // Update shared session state (headless mode)
-                        if let Some(ref shared_session) = config.shared_session {
-                            let mut ss = shared_session.write().await;
-                            ss.session_log = Some(new_session_log.clone());
-                        }
-
-                        let new_session_id = new_log_dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        config.bus.send(AppEvent::SessionStarted {
-                            session_id: new_session_id.clone(),
-                            task: Some(new_task.clone()),
-                        });
-
-                        let bus_spawn = config.bus.clone();
-                        let autonomy_spawn = config.autonomy.clone();
-                        let session_log_spawn = new_session_log.clone();
-                        let shared_cleanup = config.shared_session.clone();
-                        let use_direct = direct.unwrap_or(false)
-                            || orchestrate
-                                .map(|o| !o)
-                                .unwrap_or_else(|| config.flags_direct || is_simple_task(&new_task));
-                        // Read shared state (web UI may have changed it)
-                        let restart_agent_backend = resolve_agent_backend(
-                            &config.shared_external_agent, &new_project,
-                        ).await;
-                        let web_port_for_spawn = config.web_port;
-                        // Resolve attachments → image data once, before the spawn.
-                        // The daemon path creates a fresh session per task, so we
-                        // don't have to worry about clobbering pending attachments.
-                        let attachment_images = resolve_frame_ids(
-                            &attachments, &config.frame_registry,
-                        ).await;
-                        // Backend-side dispatch log: emitted once the daemon
-                        // has accepted the task envelope and resolved its
-                        // session resources, just before spawning the agent.
-                        emit_task_dispatched_log(
-                            &config.bus,
-                            &new_session_log,
-                            &new_task,
-                            attachments.len(),
-                        );
-
-                        tokio::spawn(async move {
-                            let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-                            let result = if let Some(backend) = restart_agent_backend {
-                                run_external_agent_mode(
-                                    backend, new_task.clone(), new_project,
-                                    bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                    new_log_dir, follow_up_rx, None,
-                                    event::ApprovalRegistry::default(),
-                                    event::ContextInjectionQueue::default(),
-                                    true, web_port_for_spawn,
-                                    attachment_images.clone(),
-                                    None,
-                                ).await
-                            } else {
-                                let new_provider = match provider::select_provider() {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        return bus_spawn.send(AppEvent::LoopError(
-                                            format!("Provider failed: {}", e),
-                                        ));
-                                    }
-                                };
-                                if use_direct {
-                                    run_direct_mode(
-                                        new_provider, new_task.clone(), new_project,
-                                        bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                        new_log_dir, None, follow_up_rx, None,
-                                        event::ApprovalRegistry::default(),
-                                        event::ContextInjectionQueue::default(),
-                                        true,
-                                        attachment_images,
-                                    ).await
-                                } else {
-                                    run_user_mode(
-                                        new_provider, new_task.clone(), new_project,
-                                        bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                    ).await
-                                }
-                            };
-
-                            let reason = match &result {
-                                Ok(stats) => {
-                                    slog(&session_log_spawn, |l| {
-                                        l.write_summary_with_rounds(
-                                            &new_task, "completed",
-                                            stats.turns, Some(stats.rounds),
-                                        )
-                                    });
-                                    "completed".to_string()
-                                }
-                                Err(e) => {
-                                    slog(&session_log_spawn, |l| {
-                                        l.write_summary(&new_task, &format!("error: {}", e), 0)
-                                    });
-                                    format!("error: {}", e)
-                                }
-                            };
-
-                            bus_spawn.send(AppEvent::SessionEnded {
-                                session_id: new_session_id,
-                                reason,
-                            });
-
-                            // Clear session state (headless mode)
-                            if let Some(ref ss) = shared_cleanup {
-                                let mut state = ss.write().await;
-                                state.session_log = None;
-                                state.query_ctx = None;
-                            }
-                        });
-                    }
-                    Ok(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
-                        source,
-                        session_id,
-                        resume_id,
-                        project_root,
-                        task,
-                        direct,
-                    })) => {
-                        let source_norm = source.trim().to_lowercase();
-                        let resume_task = task.unwrap_or_else(|| {
-                            format!("Continue the resumed {} session.", source_norm)
-                        });
-                        let resume_task_preview =
-                            resume_task.chars().take(80).collect::<String>();
-                        eprintln!(
-                            "Resume session {} from {}: {}",
-                            session_id,
-                            source_norm,
-                            resume_task_preview
-                        );
-
-                        let project_root = project_root
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| config.project_root.clone());
-                        let new_project = match Project::from_root(project_root.clone()) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                config.bus.send(AppEvent::LoopError(format!("Project load failed: {}", e)));
-                                continue;
-                            }
-                        };
-
-                        let external_backend = if source_norm == "intendant" {
-                            None
-                        } else {
-                            match external_agent::AgentBackend::from_str_loose(&source_norm) {
-                                Some(b) => Some(b),
-                                None => {
-                                    config.bus.send(AppEvent::LoopError(format!(
-                                        "Unsupported session source: {}",
-                                        source
-                                    )));
-                                    continue;
-                                }
-                            }
-                        };
-
-                        let new_log_dir = if external_backend.is_none() {
-                            match session_log::SessionLog::find_session_by_id(&session_id) {
-                                Some(dir) => dir,
-                                None => {
-                                    config.bus.send(AppEvent::LoopError(format!(
-                                        "Session '{}' was not found",
-                                        session_id
-                                    )));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            session_log::SessionLog::resolve_path(None)
-                        };
-
-                        let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
-                            Ok(l) => Arc::new(Mutex::new(l)),
-                            Err(e) => {
-                                config.bus.send(AppEvent::LoopError(format!("Session open failed: {}", e)));
-                                continue;
-                            }
-                        };
-
-                        if let Some(ref shared_session) = config.shared_session {
-                            let mut ss = shared_session.write().await;
-                            ss.session_log = Some(new_session_log.clone());
-                        }
-
-                        let new_session_id = new_session_log
-                            .lock()
-                            .map(|l| l.session_id().to_string())
-                            .unwrap_or_else(|_| {
-                                new_log_dir
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("unknown")
-                                    .to_string()
-                            });
-                        config.bus.send(AppEvent::SessionStarted {
-                            session_id: new_session_id.clone(),
-                            task: Some(resume_task.clone()),
-                        });
-
-                        let bus_spawn = config.bus.clone();
-                        let autonomy_spawn = config.autonomy.clone();
-                        let session_log_spawn = new_session_log.clone();
-                        let shared_cleanup = config.shared_session.clone();
-                        let web_port_for_spawn = config.web_port;
-                        let resume_token = resume_id.unwrap_or(session_id);
-
-                        tokio::spawn(async move {
-                            let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-                            let result = if let Some(backend) = external_backend {
-                                run_external_agent_mode(
-                                    backend,
-                                    resume_task.clone(),
-                                    new_project,
-                                    bus_spawn.clone(),
-                                    autonomy_spawn,
-                                    session_log_spawn.clone(),
-                                    new_log_dir,
-                                    follow_up_rx,
-                                    None,
-                                    event::ApprovalRegistry::default(),
-                                    event::ContextInjectionQueue::default(),
-                                    true,
-                                    web_port_for_spawn,
-                                    vec![],
-                                    Some(resume_token),
-                                )
-                                .await
-                            } else {
-                                let provider = match provider::select_provider() {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        return bus_spawn.send(AppEvent::LoopError(
-                                            format!("Provider failed: {}", e),
-                                        ));
-                                    }
-                                };
-                                if direct.unwrap_or(true) {
-                                    run_direct_mode(
-                                        provider,
-                                        resume_task.clone(),
-                                        new_project,
-                                        bus_spawn.clone(),
-                                        autonomy_spawn,
-                                        session_log_spawn.clone(),
-                                        new_log_dir,
-                                        None,
-                                        follow_up_rx,
-                                        None,
-                                        event::ApprovalRegistry::default(),
-                                        event::ContextInjectionQueue::default(),
-                                        true,
-                                        vec![],
-                                    )
-                                    .await
-                                } else {
-                                    run_user_mode(
-                                        provider,
-                                        resume_task.clone(),
-                                        new_project,
-                                        bus_spawn.clone(),
-                                        autonomy_spawn,
-                                        session_log_spawn.clone(),
-                                    )
-                                    .await
-                                }
-                            };
-
-                            let reason = match &result {
-                                Ok(stats) => {
-                                    slog(&session_log_spawn, |l| {
-                                        l.write_summary_with_rounds(
-                                            &resume_task, "completed",
-                                            stats.turns, Some(stats.rounds),
-                                        )
-                                    });
-                                    "completed".to_string()
-                                }
-                                Err(e) => {
-                                    slog(&session_log_spawn, |l| {
-                                        l.write_summary(&resume_task, &format!("error: {}", e), 0)
-                                    });
-                                    format!("error: {}", e)
-                                }
-                            };
-
-                            bus_spawn.send(AppEvent::SessionEnded {
-                                session_id: new_session_id,
-                                reason,
-                            });
-
-                            if let Some(ref ss) = shared_cleanup {
-                                let mut state = ss.write().await;
-                                state.session_log = None;
-                                state.query_ctx = None;
-                            }
-                        });
-                    }
-                    Ok(AppEvent::ControlCommand(event::ControlMsg::SetExternalAgent { agent })) => {
-                        let label = agent.as_deref().unwrap_or("none");
-                        eprintln!("External agent set to {} (takes effect on next task)", label);
-                        // Shared state updated by ControlPlane
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
+    session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
+        bus: config.bus,
+        project_root: config.project_root,
+        autonomy: config.autonomy,
+        shared_external_agent: config.shared_external_agent,
+        shared_codex_config: config.shared_codex_config,
+        shared_gemini_config: config.shared_gemini_config,
+        frame_registry: config.frame_registry,
+        web_port: config.web_port,
+        flags_direct: config.flags_direct,
+        shared_session: config.shared_session,
+    })
+    .run()
+    .await;
 }
 
 const SAFETY_CAP: usize = 500;
@@ -8543,16 +8151,27 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Determine whether to use TUI (needed early for task resolution).
-    // Web gateway forces TUI mode (served via web) even without a real terminal.
-    let use_tui = use_web
-        || (!flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal());
+    // `--web --no-tui` without an initial task is a true daemon: start the
+    // dashboard idle and let the session supervisor own all launches.
+    let web_daemon_requested = use_web
+        && flags.no_tui
+        && !flags.mcp
+        && flags.task.as_ref().map(|t| t.is_empty()).unwrap_or(true);
+    let use_tui = !web_daemon_requested
+        && (use_web
+            || (!flags.no_tui
+                && !flags.mcp
+                && io::stdin().is_terminal()
+                && io::stdout().is_terminal()));
 
     // Task resolution: MCP and TUI modes allow starting without a task.
     // MCP mode must NOT call get_task_from_flags_or_env() because it would
     // print to stdout and read from stdin, both reserved for JSON-RPC.
     // TUI mode can accept a task later via the follow-up input panel.
     // Headless mode still requires a task upfront.
-    let task = if flags.mcp {
+    let task = if web_daemon_requested {
+        None
+    } else if flags.mcp {
         flags.task.clone().filter(|t| !t.is_empty())
     } else if use_tui {
         flags.task.clone().filter(|t| !t.is_empty())
@@ -8571,6 +8190,163 @@ async fn main() -> Result<(), CallerError> {
     // Build autonomy state from project config + CLI flags
     let autonomy_state = AutonomyState::new(flags.autonomy, project.config.approval.clone());
     let autonomy = autonomy::shared_autonomy(autonomy_state);
+
+    if web_daemon_requested {
+        let bus = EventBus::new();
+        let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
+        let _recording_listener = recording::spawn_recording_listener(
+            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
+        );
+        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
+        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
+        let _debug_handler = Some(debug::spawn_debug_screen_handler(
+            bus.subscribe(),
+            project.config.recording.clone(),
+            web_port,
+            bus.clone(),
+        ));
+
+        let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+        let _outbound_broadcaster =
+            event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
+        let _session_log_writer =
+            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
+
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+            let snapshot_dir = log_dir.join("file_snapshots");
+            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
+                Ok(watcher) => {
+                    let (fw, wh, rh) = watcher.start_shared();
+                    (Some(fw), Some(wh), Some(rh))
+                }
+                Err(e) => {
+                    eprintln!("[file_watcher] Failed to start: {}", e);
+                    (None, None, None)
+                }
+            }
+        };
+
+        let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
+            if project.config.transcription.enabled {
+                match transcription::WhisperTranscriber::new(&project.config.transcription) {
+                    Ok(t) => Some(std::sync::Arc::new(t)),
+                    Err(e) => {
+                        eprintln!("Transcription init failed: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        let web_config = web_gateway::build_config(
+            project.config.presence.live_provider.as_deref(),
+            project.config.presence.live_model.as_deref(),
+            project.config.transcription.enabled,
+            project.config.webrtc.to_ice_config(),
+        );
+        let shared_session = Arc::new(tokio::sync::RwLock::new(
+            web_gateway::ActiveSessionState {
+                query_ctx: None,
+                frame_registry: Some(frame_registry.clone()),
+                session_log: None,
+                recording_registry: Some(recording_registry.clone()),
+                session_registry: Some(session_registry.clone()),
+                snapshot_dir: Some(log_dir.join("file_snapshots")),
+                project_root_for_changes: Some(project.root.clone()),
+                file_watcher: shared_file_watcher.clone(),
+            },
+        ));
+        let mut mcp_http_state =
+            mcp::McpAppState::new("none".into(), "none".into(), autonomy.clone(), log_dir.clone());
+        mcp_http_state.frame_registry = Some(frame_registry.clone());
+        mcp_http_state.session_registry = Some(session_registry.clone());
+        mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
+        let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
+            Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+        )));
+        let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
+        let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
+        let _web_handle = web_gateway::spawn_web_gateway(
+            web_listener.take().expect("web listener must exist when use_web"),
+            bus.clone(),
+            outbound_tx.clone(),
+            web_config,
+            shared_session.clone(),
+            transcriber,
+            None,
+            None,
+            Some(project.root.clone()),
+            mcp_http_server,
+            Some(peer_registry),
+            advertise_urls,
+            project.config.server.auth.bearer_token.clone(),
+            build_local_advertised_auth(
+                &project.config.server.auth,
+                &lan::backend::select_backend().cert_dir(),
+            )?,
+        );
+        eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
+
+        let agent_backend =
+            resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
+        let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
+            Arc::new(tokio::sync::RwLock::new(agent_backend));
+        let shared_codex_config: control_plane::SharedCodexConfig = {
+            let cfg = &project.config.agent.codex;
+            Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
+                sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                model: cfg.model.clone(),
+                reasoning_effort: project::normalize_reasoning_effort(
+                    cfg.reasoning_effort.as_deref(),
+                ),
+                web_search: cfg.web_search,
+                network_access: cfg.network_access,
+                writable_roots: cfg.writable_roots.clone(),
+            }))
+        };
+        let shared_gemini_config: control_plane::SharedGeminiConfig = {
+            let cfg = &project.config.agent.gemini_cli;
+            Arc::new(tokio::sync::RwLock::new(control_plane::GeminiRuntimeConfig {
+                model: cfg.model.clone(),
+                approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                sandbox: cfg.sandbox,
+                extensions: cfg.extensions.clone(),
+                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                include_directories: cfg.include_directories.clone(),
+                debug: cfg.debug,
+            }))
+        };
+        let _control_plane_handle = control_plane::spawn(
+            bus.subscribe(),
+            control_plane::ControlPlaneState {
+                autonomy: autonomy.clone(),
+                external_agent: shared_external_agent.clone(),
+                codex_config: shared_codex_config.clone(),
+                gemini_config: shared_gemini_config.clone(),
+                bus: bus.clone(),
+                project_root: Some(project.root.clone()),
+            },
+        );
+
+        session_supervisor::SessionSupervisor::new(
+            session_supervisor::SessionSupervisorConfig {
+                bus,
+                project_root: project.root.clone(),
+                autonomy,
+                shared_external_agent,
+                shared_codex_config,
+                shared_gemini_config,
+                frame_registry,
+                web_port: web_port_for_agent,
+                flags_direct: flags.direct,
+                shared_session: Some(shared_session),
+            },
+        )
+        .run()
+        .await;
+        return Ok(());
+    }
 
     if flags.mcp {
         // MCP mode — speaks Model Context Protocol on stdio.
@@ -9592,6 +9368,8 @@ async fn main() -> Result<(), CallerError> {
                 project_root: project_root.clone(),
                 autonomy: autonomy.clone(),
                 shared_external_agent: shared_external_agent.clone(),
+                shared_codex_config: shared_codex_config.clone(),
+                shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry_for_events.clone(),
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
@@ -9806,7 +9584,7 @@ async fn main() -> Result<(), CallerError> {
                                         log_dir_for_stdin.join("human_response");
                                     let _ = std::fs::write(&resp_path, text.as_bytes());
                                 }
-                                event::ControlMsg::FollowUp { text, direct: _ } => {
+                                event::ControlMsg::FollowUp { text, direct: _, .. } => {
                                     // This stdin handler only exists in
                                     // the headless `--json` path where
                                     // there's no presence layer, so the
@@ -9983,6 +9761,8 @@ async fn main() -> Result<(), CallerError> {
                 project_root: project_root.clone(),
                 autonomy: autonomy_for_daemon.clone(),
                 shared_external_agent: shared_external_agent.clone(),
+                shared_codex_config: shared_codex_config.clone(),
+                shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry.clone(),
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,

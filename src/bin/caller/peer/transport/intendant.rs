@@ -506,6 +506,7 @@ impl PeerTransport for IntendantWsTransport {
             PeerOp::SendMessage { message } => {
                 let text = message_text(&message.content)?;
                 self.write_control_msg(&ControlMsg::FollowUp {
+                    session_id: None,
                     text,
                     direct: None,
                 })
@@ -515,6 +516,7 @@ impl PeerTransport for IntendantWsTransport {
             }
             PeerOp::DelegateTask { task } => {
                 self.write_control_msg(&ControlMsg::StartTask {
+                    session_id: None,
                     task: task.instructions,
                     orchestrate: None,
                     direct: None,

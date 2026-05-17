@@ -835,6 +835,11 @@ pub enum ControlMsg {
     },
     GetControllerLoopStatus,
     StartTask {
+        /// Optional target session. When omitted, daemon supervisors start a
+        /// new managed session; when present, they route the text as a new
+        /// turn in that session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         task: String,
         #[serde(default)]
         orchestrate: Option<bool>,
@@ -881,6 +886,10 @@ pub enum ControlMsg {
         direct: Option<bool>,
     },
     FollowUp {
+        /// Optional target session. Omitted means "current active session"
+        /// for legacy single-session frontends.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         text: String,
         /// When true, bypass the presence layer for this follow-up and
         /// dispatch it directly to the agent — mirrors `direct: true`
@@ -2092,6 +2101,7 @@ mod tests {
             },
             ControlMsg::GetControllerLoopStatus,
             ControlMsg::StartTask {
+                session_id: None,
                 task: "fix bug".to_string(),
                 orchestrate: None,
                 direct: None,
@@ -2100,6 +2110,7 @@ mod tests {
                 attachments: vec![],
             },
             ControlMsg::FollowUp {
+                session_id: None,
                 text: "continue working".to_string(),
                 direct: None,
             },
@@ -2228,6 +2239,7 @@ mod tests {
     #[test]
     fn control_msg_start_task_roundtrip() {
         let msg = ControlMsg::StartTask {
+            session_id: None,
             task: "deploy app".to_string(),
             orchestrate: Some(true),
             direct: None,
@@ -2247,6 +2259,39 @@ mod tests {
                 assert_eq!(attachments[0], "ann-recording-1");
             }
             _ => panic!("expected StartTask"),
+        }
+    }
+
+    #[test]
+    fn control_msg_session_target_roundtrip() {
+        let start_json = r#"{"action":"start_task","session_id":"sess-123","task":"continue"}"#;
+        let start: ControlMsg = serde_json::from_str(start_json).unwrap();
+        match start {
+            ControlMsg::StartTask { session_id, task, .. } => {
+                assert_eq!(session_id.as_deref(), Some("sess-123"));
+                assert_eq!(task, "continue");
+            }
+            _ => panic!("expected StartTask"),
+        }
+
+        let follow = ControlMsg::FollowUp {
+            session_id: Some("sess-123".to_string()),
+            text: "more detail".to_string(),
+            direct: Some(true),
+        };
+        let follow_json = serde_json::to_string(&follow).unwrap();
+        let parsed: ControlMsg = serde_json::from_str(&follow_json).unwrap();
+        match parsed {
+            ControlMsg::FollowUp {
+                session_id,
+                text,
+                direct,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-123"));
+                assert_eq!(text, "more detail");
+                assert_eq!(direct, Some(true));
+            }
+            _ => panic!("expected FollowUp"),
         }
     }
 

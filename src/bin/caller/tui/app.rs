@@ -1015,7 +1015,11 @@ impl App {
                     }
 
                     self.pending_derived.push(AppEvent::ControlCommand(
-                        ControlMsg::FollowUp { text: text.clone(), direct: None },
+                        ControlMsg::FollowUp {
+                            session_id: None,
+                            text: text.clone(),
+                            direct: None,
+                        },
                     ));
                     self.log(LogLevel::Info, format!("Follow-up: {}", truncate_str(&text, 80)));
                 }
@@ -1367,7 +1371,7 @@ impl App {
                     "Controller control commands are only supported in MCP mode".to_string(),
                 );
             }
-            ControlMsg::FollowUp { text, direct } => {
+            ControlMsg::FollowUp { text, direct, .. } => {
                 // Routing handled by `task_dispatch::Dispatcher`. The TUI
                 // observes the ControlCommand for display purposes only.
                 if self.current_phase == Phase::WaitingFollowUp
@@ -1532,6 +1536,7 @@ impl App {
                     Ok(task_text) => {
                         // Dispatch as a StartTask
                         self.handle_control_command(ControlMsg::StartTask {
+                            session_id: None,
                             task: task_text,
                             orchestrate: Some(false),
                             direct: None,

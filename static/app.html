@@ -16081,6 +16081,7 @@ function renderDiskUsage(sessions) {
 
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
+  currentSessionFullId = sessionId || '';
   document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
   switchTab('activity');
   // New session: clear any stale timeline and let the first
@@ -16091,6 +16092,10 @@ function onSessionStarted(sessionId, task) {
 }
 
 function onSessionEnded(sessionId, reason) {
+  if (!sessionId || sessionId === currentSessionFullId) {
+    currentSessionFullId = '';
+    document.getElementById('sb-session').textContent = '';
+  }
   // Refresh sessions list if already loaded
   if (sessionsLoaded) loadSessions();
   // Switch to sessions tab so user sees past sessions + new session input
@@ -16112,6 +16117,7 @@ window.submitActivityTask = function() {
   const attachments = pendingAttachments.map(a => a.frameId);
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   const msg = { action: 'start_task', task: text };
+  if (currentSessionFullId) msg.session_id = currentSessionFullId;
   if (direct) msg.direct = true;
   if (attachments.length > 0) msg.attachments = attachments;
   app.send_server_action(msg);

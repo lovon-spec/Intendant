@@ -1771,7 +1771,7 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::FollowUp { text, direct: _ } => {
+        ControlMsg::FollowUp { text, direct: _, .. } => {
             // MCP has a single follow-up channel and no presence layer,
             // so the `direct` bit is a no-op here — follow-ups already
             // go straight to the agent loop in this mode.
@@ -1901,6 +1901,7 @@ async fn handle_control_command_mcp(
             match crate::skills::resolve_skill_as_task(&discovered, &skill_name, args) {
                 Ok(task_text) => {
                     bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                        session_id: None,
                         task: task_text,
                         orchestrate: Some(false),
                         direct: None,
@@ -3345,6 +3346,7 @@ impl IntendantServer {
         // so the main loop can route it to the ephemeral CU runner.
         if !params.reference_frame_ids.is_empty() || params.display_target.is_some() {
             self.bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                session_id: None,
                 task: params.task,
                 orchestrate: params.orchestrate,
                 direct: None,

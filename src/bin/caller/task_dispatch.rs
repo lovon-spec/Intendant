@@ -76,6 +76,7 @@ impl Dispatcher {
     async fn route(&self, msg: ControlMsg, bus: &EventBus) {
         match msg {
             ControlMsg::StartTask {
+                session_id: _,
                 task,
                 orchestrate,
                 direct,
@@ -130,7 +131,7 @@ impl Dispatcher {
                 // to choose the log dir, project root, and backend-native id.
             }
 
-            ControlMsg::FollowUp { text, direct } => {
+            ControlMsg::FollowUp { text, direct, .. } => {
                 let is_direct = direct.unwrap_or(false);
 
                 if !is_direct {
@@ -228,6 +229,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
             task: "do thing".into(),
             orchestrate: None,
             direct: None,
@@ -265,6 +267,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
             task: "chat with me".into(),
             orchestrate: None,
             direct: None,
@@ -297,6 +300,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
             task: "code thing".into(),
             orchestrate: None,
             direct: Some(true),
@@ -330,6 +334,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::FollowUp {
+            session_id: None,
             text: "more please".into(),
             direct: Some(true),
         }));
@@ -357,6 +362,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::FollowUp {
+            session_id: None,
             text: "keep going".into(),
             direct: None,
         }));
@@ -384,6 +390,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
             task: "legacy direct".into(),
             orchestrate: Some(false),
             direct: None,
