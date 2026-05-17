@@ -1642,7 +1642,13 @@ fn collect_files(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
 
 fn file_mtime_secs(path: &Path) -> u64 {
     std::fs::metadata(path)
-        .and_then(|m| m.modified())
+        .map(|m| metadata_mtime_secs(&m))
+        .unwrap_or(0)
+}
+
+fn metadata_mtime_secs(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
@@ -1665,13 +1671,16 @@ fn read_text_prefix(path: &Path, max_bytes: u64) -> Option<String> {
 }
 
 fn file_mtime_string(path: &Path) -> Option<String> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .map(|t| {
-            let dt: chrono::DateTime<chrono::Local> = t.into();
-            dt.format("%Y-%m-%d %H:%M:%S").to_string()
-        })
+    mtime_secs_to_string(file_mtime_secs(path))
+}
+
+fn mtime_secs_to_string(secs: u64) -> Option<String> {
+    if secs == 0 {
+        return None;
+    }
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -1684,6 +1693,7 @@ fn external_session_json(
     session_id: String,
     resume_id: String,
     created_at: Option<String>,
+    updated_at: Option<String>,
     task: Option<String>,
     provider: &str,
     model: Option<String>,
@@ -1692,12 +1702,15 @@ fn external_session_json(
     path: Option<String>,
     bytes: u64,
 ) -> serde_json::Value {
+    let created_at = created_at.unwrap_or_default();
+    let updated_at = updated_at.unwrap_or_else(|| created_at.clone());
     serde_json::json!({
         "source": source,
         "source_label": label,
         "session_id": session_id,
         "resume_id": resume_id,
-        "created_at": created_at.unwrap_or_default(),
+        "created_at": created_at,
+        "updated_at": updated_at,
         "task": task,
         "provider": provider,
         "model": model,
@@ -1724,15 +1737,39 @@ fn external_session_json(
     })
 }
 
-fn session_sort_key(session: &serde_json::Value) -> &str {
+fn timestamp_sort_secs(value: &str) -> i64 {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return dt.timestamp();
+    }
+    for format in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(value, format) {
+            if let Some(dt) = dt.and_local_timezone(chrono::Local).single() {
+                return dt.timestamp();
+            }
+        }
+    }
+    0
+}
+
+fn session_created_sort_key(session: &serde_json::Value) -> i64 {
     session
         .get("created_at")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
+        .map(timestamp_sort_secs)
+        .unwrap_or(0)
+}
+
+fn session_changed_sort_key(session: &serde_json::Value) -> i64 {
+    session
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(timestamp_sort_secs)
+        .unwrap_or_else(|| session_created_sort_key(session))
 }
 
 fn sort_sessions_newest_first(sessions: &mut Vec<serde_json::Value>) {
-    sessions.sort_by(|a, b| session_sort_key(b).cmp(session_sort_key(a)));
+    sessions.sort_by(|a, b| session_changed_sort_key(b).cmp(session_changed_sort_key(a)));
 }
 
 fn session_source(session: &serde_json::Value) -> &str {
@@ -1796,12 +1833,14 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         for line in contents.lines() {
             let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
             let Some(id) = value_str(&obj, "id") else { continue; };
+            let updated_at = value_str(&obj, "updated_at");
             rows.insert(id.clone(), external_session_json(
                 "codex",
                 "Codex",
                 id.clone(),
                 id,
-                value_str(&obj, "updated_at"),
+                None,
+                updated_at,
                 value_str(&obj, "thread_name"),
                 "Codex",
                 None,
@@ -1872,15 +1911,21 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
             }
         }
         let Some(id) = id else { continue; };
-        let existing_task = rows
-            .get(&id)
-            .and_then(|v| value_str(v, "task"));
+        let existing = rows.get(&id);
+        let existing_task = existing.and_then(|v| value_str(v, "task"));
+        let existing_updated_at = existing.and_then(|v| value_str(v, "updated_at"));
+        let file_updated_at = file_mtime_string(&path);
+        let created_at = created_at.or_else(|| file_updated_at.clone());
+        let updated_at = file_updated_at
+            .or(existing_updated_at)
+            .or_else(|| created_at.clone());
         rows.insert(id.clone(), external_session_json(
             "codex",
             "Codex",
             id.clone(),
             id,
-            created_at.or_else(|| file_mtime_string(&path)),
+            created_at,
+            updated_at,
             existing_task.or(task),
             provider.as_deref().unwrap_or("Codex"),
             model,
@@ -1945,7 +1990,8 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
             "Claude Code",
             session_id.clone(),
             session_id,
-            created_at.or(updated_at).or_else(|| file_mtime_string(&path)),
+            created_at.or_else(|| updated_at.clone()).or_else(|| file_mtime_string(&path)),
+            file_mtime_string(&path).or(updated_at),
             task,
             "Claude Code",
             model,
@@ -2024,6 +2070,7 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
             session_id.clone(),
             session_id,
             value_str(&obj, "startTime").or_else(|| file_mtime_string(&path)),
+            file_mtime_string(&path),
             task,
             "Gemini CLI",
             value_str(&obj, "model"),
@@ -2192,6 +2239,7 @@ fn list_sessions() -> String {
         let mut completion_tokens: u64 = 0;
         let mut cached_tokens: u64 = 0;
         let mut role: Option<String> = None;
+        let mut updated_at_secs = file_mtime_secs(&dir);
 
         if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
             if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
@@ -2295,7 +2343,10 @@ fn list_sessions() -> String {
                                 let name = f.file_name().to_string_lossy().to_string();
                                 if name.starts_with("seg_") {
                                     if let Ok(m) = f.metadata() {
-                                        recording_bytes += m.len();
+                                        if m.is_file() {
+                                            updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
+                                            recording_bytes += m.len();
+                                        }
                                     }
                                 }
                             }
@@ -2320,6 +2371,7 @@ fn list_sessions() -> String {
                     }
                     if let Ok(m) = fe.metadata() {
                         if m.is_file() {
+                            updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
                             frames_bytes += m.len();
                         }
                     }
@@ -2335,6 +2387,7 @@ fn list_sessions() -> String {
                 for te in td.flatten() {
                     if let Ok(m) = te.metadata() {
                         if m.is_file() {
+                            updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
                             turns_bytes += m.len();
                         }
                     }
@@ -2346,6 +2399,7 @@ fn list_sessions() -> String {
         for name in &["session.jsonl", "session_meta.json", "summary.json", "conversation.jsonl"] {
             if let Ok(m) = std::fs::metadata(dir.join(name)) {
                 if m.is_file() {
+                    updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
                     logs_bytes += m.len();
                 }
             }
@@ -2372,12 +2426,7 @@ fn list_sessions() -> String {
 
         // Fall back to directory mtime for created_at
         if created_at.is_none() {
-            if let Ok(metadata) = std::fs::metadata(&dir) {
-                if let Ok(modified) = metadata.modified() {
-                    let dt: chrono::DateTime<chrono::Local> = modified.into();
-                    created_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
-                }
-            }
+            created_at = mtime_secs_to_string(file_mtime_secs(&dir));
         }
 
         // Estimate cost using the model's pricing (blended rate without cache info)
@@ -2385,12 +2434,16 @@ fn list_sessions() -> String {
             .and_then(|m| crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens))
             .unwrap_or(0.0);
 
+        let created_at = created_at.unwrap_or_default();
+        let updated_at = mtime_secs_to_string(updated_at_secs).unwrap_or_else(|| created_at.clone());
+
         sessions.push(serde_json::json!({
             "source": "intendant",
             "source_label": "Intendant",
             "session_id": session_id,
             "resume_id": session_id,
-            "created_at": created_at.unwrap_or_default(),
+            "created_at": created_at,
+            "updated_at": updated_at,
             "task": task,
             "provider": provider,
             "model": model,
@@ -9535,6 +9588,56 @@ mod tests {
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
+    }
+
+    #[test]
+    fn external_session_json_falls_back_to_created_at_for_updated_at() {
+        let session = external_session_json(
+            "codex",
+            "Codex",
+            "session-1".to_string(),
+            "session-1".to_string(),
+            Some("2026-05-17T10:00:00Z".to_string()),
+            None,
+            Some("task".to_string()),
+            "Codex",
+            None,
+            1,
+            None,
+            None,
+            0,
+        );
+
+        assert_eq!(session["created_at"], "2026-05-17T10:00:00Z");
+        assert_eq!(session["updated_at"], "2026-05-17T10:00:00Z");
+    }
+
+    #[test]
+    fn sort_sessions_newest_first_uses_updated_at() {
+        let mut sessions = vec![
+            serde_json::json!({
+                "session_id": "newer-created",
+                "created_at": "2026-05-17T11:00:00Z",
+                "updated_at": "2026-05-17T11:00:00Z",
+            }),
+            serde_json::json!({
+                "session_id": "recently-changed",
+                "created_at": "2026-05-17T08:00:00Z",
+                "updated_at": "2026-05-17T12:00:00Z",
+            }),
+            serde_json::json!({
+                "session_id": "fallback-created",
+                "created_at": "2026-05-17T10:30:00Z",
+            }),
+        ];
+
+        sort_sessions_newest_first(&mut sessions);
+        let ids: Vec<_> = sessions
+            .iter()
+            .filter_map(|s| s.get("session_id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert_eq!(ids, vec!["recently-changed", "newer-created", "fallback-created"]);
     }
 
     #[test]

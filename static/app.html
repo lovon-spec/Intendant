@@ -4341,8 +4341,10 @@ html, body {
           <div class="sessions-sort">
             <label>Sort
               <select id="sort-sessions">
-                <option value="date-desc" selected>Date (newest)</option>
-                <option value="date-asc">Date (oldest)</option>
+                <option value="updated-desc" selected>Date changed (newest)</option>
+                <option value="updated-asc">Date changed (oldest)</option>
+                <option value="created-desc">Creation date (newest)</option>
+                <option value="created-asc">Creation date (oldest)</option>
                 <option value="cost-desc">Cost (highest)</option>
                 <option value="cost-asc">Cost (lowest)</option>
                 <option value="size-desc">Size (largest)</option>
@@ -16365,6 +16367,16 @@ document.getElementById('filter-abandoned')?.addEventListener('change', _refilte
 document.getElementById('filter-idle')?.addEventListener('change', _refilterSessions);
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
 
+function sessionDateSortValue(session, field) {
+  const raw = session[field] || (field === 'updated_at' ? session.created_at : '');
+  if (!raw) return 0;
+  const normalized = typeof raw === 'string' && raw.includes(' ') && !raw.includes('T')
+    ? raw.replace(' ', 'T')
+    : raw;
+  const parsed = Date.parse(normalized);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
 function renderSessionsAggregate(sessions, el) {
   const totalSessions = sessions.length;
   const externalSessions = sessions.filter(s => (s.source || 'intendant') !== 'intendant').length;
@@ -16411,17 +16423,21 @@ function renderSessionsList(sessions, el) {
   }
 
   // Sort sessions based on dropdown
-  const sortVal = document.getElementById('sort-sessions')?.value || 'date-desc';
+  const sortVal = document.getElementById('sort-sessions')?.value || 'updated-desc';
   const sorted = [...sessions];
   const [field, dir] = sortVal.split('-');
   const asc = dir === 'asc';
   sorted.sort((a, b) => {
     let va, vb;
     switch (field) {
-      case 'date':
-        va = a.created_at || '';
-        vb = b.created_at || '';
-        return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+      case 'created':
+        va = sessionDateSortValue(a, 'created_at');
+        vb = sessionDateSortValue(b, 'created_at');
+        break;
+      case 'updated':
+        va = sessionDateSortValue(a, 'updated_at');
+        vb = sessionDateSortValue(b, 'updated_at');
+        break;
       case 'cost':
         va = a.estimated_cost || 0;
         vb = b.estimated_cost || 0;
@@ -16522,6 +16538,20 @@ function renderSessionsList(sessions, el) {
       const tsVal = document.createElement('span');
       tsVal.className = 'value';
       tsVal.textContent = s.created_at;
+      ts.appendChild(tsLabel);
+      ts.appendChild(tsVal);
+      meta.appendChild(ts);
+    }
+
+    const changedAt = s.updated_at || s.changed_at;
+    if (changedAt) {
+      const ts = document.createElement('span');
+      const tsLabel = document.createElement('span');
+      tsLabel.className = 'label';
+      tsLabel.textContent = 'changed';
+      const tsVal = document.createElement('span');
+      tsVal.className = 'value';
+      tsVal.textContent = changedAt;
       ts.appendChild(tsLabel);
       ts.appendChild(tsVal);
       meta.appendChild(ts);
