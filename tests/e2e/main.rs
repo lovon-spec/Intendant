@@ -7,5 +7,3 @@
 //!
 //! Run:
 //!   cargo test --test e2e -- --nocapture
-
-mod webrtc_signaling;
