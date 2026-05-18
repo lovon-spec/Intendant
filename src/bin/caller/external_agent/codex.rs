@@ -1894,6 +1894,7 @@ fn translate_notification(
         | "thread/started"
         | "thread/tokenUsage/updated"
         | "account/rateLimits/updated"
+        | "item/commandExecution/terminalInteraction"
         | "configWarning"
         | "remoteControl/status/changed" => {}
 
@@ -3098,6 +3099,23 @@ mod tests {
     }
 
     #[test]
+    fn translate_terminal_interaction_is_silent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "call_123",
+            "processId": "62701",
+            "stdin": "secret input\n",
+            "threadId": "thread-1",
+            "turnId": "turn-1"
+        });
+        translate_notification("item/commandExecution/terminalInteraction", &params, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "terminal stdin interactions should not emit activity events"
+        );
+    }
+
+    #[test]
     fn translate_item_completed_success() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
@@ -3526,6 +3544,7 @@ mod tests {
             "thread/started",
             "thread/tokenUsage/updated",
             "account/rateLimits/updated",
+            "item/commandExecution/terminalInteraction",
             "mcpServer/startupStatus/updated",
             "configWarning",
         ];
