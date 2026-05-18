@@ -1528,6 +1528,80 @@ fn codex_file_change_preview(params: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn codex_web_search_preview(params: &serde_json::Value) -> String {
+    if let Some(query) = non_empty_string_at(
+        params,
+        &[
+            "/item/query",
+            "/item/searchQuery",
+            "/item/search_query",
+            "/item/userQuery",
+            "/item/user_query",
+            "/item/text",
+            "/item/action/query",
+            "/item/action/searchQuery",
+            "/item/action/search_query",
+            "/item/input/query",
+            "/item/input/searchQuery",
+            "/item/input/search_query",
+            "/item/arguments/query",
+            "/item/arguments/searchQuery",
+            "/item/arguments/search_query",
+            "/item/args/query",
+            "/item/args/searchQuery",
+            "/item/args/search_query",
+            "/query",
+            "/searchQuery",
+            "/search_query",
+        ],
+    ) {
+        return query;
+    }
+
+    let item = params.get("item").unwrap_or(params);
+    for key in ["queries", "searchQueries", "search_queries"] {
+        if let Some(values) = item.get(key).and_then(|v| v.as_array()) {
+            let mut queries = Vec::new();
+            for value in values {
+                if let Some(query) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        non_empty_string_at(
+                            value,
+                            &["/query", "/searchQuery", "/search_query", "/text"],
+                        )
+                    })
+                {
+                    queries.push(query);
+                }
+            }
+            if !queries.is_empty() {
+                return queries.join(", ");
+            }
+        }
+    }
+
+    if let Some(url) = non_empty_string_at(
+        params,
+        &[
+            "/item/url",
+            "/item/source",
+            "/item/action/url",
+            "/item/input/url",
+            "/item/arguments/url",
+            "/item/args/url",
+            "/url",
+        ],
+    ) {
+        return url;
+    }
+
+    "web search".to_string()
+}
+
 /// Translate a Codex notification into one or more `AgentEvent`s.
 fn translate_notification(
     method: &str,
@@ -1623,6 +1697,13 @@ fn translate_notification(
                         item_id,
                         tool_name: "mcp".to_string(),
                         preview,
+                    });
+                }
+                "webSearch" => {
+                    let _ = event_tx.send(AgentEvent::ToolStarted {
+                        item_id,
+                        tool_name: "web_search".to_string(),
+                        preview: codex_web_search_preview(params),
                     });
                 }
                 other => {
@@ -2803,6 +2884,79 @@ mod tests {
                 assert_eq!(preview, "ls -la");
             }
             other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_started_web_search() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-web-1",
+            "item": {
+                "type": "webSearch",
+                "query": "OpenAI API pricing gpt-5.5"
+            }
+        });
+        translate_notification("item/started", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolStarted {
+                item_id,
+                tool_name,
+                preview,
+            } => {
+                assert_eq!(item_id, "item-web-1");
+                assert_eq!(tool_name, "web_search");
+                assert_eq!(preview, "OpenAI API pricing gpt-5.5");
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_started_web_search_nested_query() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "item-web-2",
+                "type": "webSearch",
+                "arguments": {"search_query": "Anthropic Claude Opus pricing"}
+            }
+        });
+        translate_notification("item/started", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolStarted {
+                item_id,
+                tool_name,
+                preview,
+            } => {
+                assert_eq!(item_id, "item-web-2");
+                assert_eq!(tool_name, "web_search");
+                assert_eq!(preview, "Anthropic Claude Opus pricing");
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_completed_web_search() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "item-web-3",
+                "type": "webSearch",
+                "status": "completed"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "item-web-3");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
         }
     }
 
