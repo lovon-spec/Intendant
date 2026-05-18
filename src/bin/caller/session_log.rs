@@ -1,7 +1,7 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -24,6 +24,22 @@ struct LogEvent {
     /// Second file reference (e.g., stderr).
     #[serde(skip_serializing_if = "Option::is_none")]
     file2: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TurnFileSpan {
+    relative: String,
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentOutputChunk {
+    pub output_id: String,
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Metadata persisted in `session_meta.json` inside each session directory.
@@ -643,6 +659,10 @@ impl SessionLog {
     /// reference from the session-log event so downstream readers don't chase
     /// a phantom path.
     fn append_turn_file(&self, suffix: &str, content: &str) -> Option<String> {
+        self.append_turn_file_span(suffix, content).map(|span| span.relative)
+    }
+
+    fn append_turn_file_span(&self, suffix: &str, content: &str) -> Option<TurnFileSpan> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
         let already_has_content = fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
@@ -654,8 +674,13 @@ impl SessionLog {
         if already_has_content {
             let _ = file.write_all(b"\n");
         }
+        let offset = file.metadata().ok()?.len();
         if file.write_all(content.as_bytes()).is_ok() {
-            Some(relative)
+            Some(TurnFileSpan {
+                relative,
+                offset,
+                len: content.len() as u64,
+            })
         } else {
             None
         }
@@ -1880,13 +1905,23 @@ impl SessionLog {
     /// chunk; we append so the file reflects the full turn history rather
     /// than only the last chunk.
     pub fn agent_output(&mut self, stdout: &str, stderr: &str, source: Option<&str>) {
-        let file = if !stdout.is_empty() {
-            self.append_turn_file("stdout.txt", stdout)
+        self.agent_output_with_id(stdout, stderr, source, None);
+    }
+
+    pub fn agent_output_with_id(
+        &mut self,
+        stdout: &str,
+        stderr: &str,
+        source: Option<&str>,
+        output_id: Option<&str>,
+    ) {
+        let stdout_span = if !stdout.is_empty() {
+            self.append_turn_file_span("stdout.txt", stdout)
         } else {
             None
         };
-        let file2 = if !stderr.is_empty() {
-            self.append_turn_file("stderr.txt", stderr)
+        let stderr_span = if !stderr.is_empty() {
+            self.append_turn_file_span("stderr.txt", stderr)
         } else {
             None
         };
@@ -1896,8 +1931,19 @@ impl SessionLog {
             "stdout_length": stdout.len(),
             "stderr_length": stderr.len(),
         });
+        if let Some(id) = output_id {
+            data["output_id"] = serde_json::Value::String(id.to_string());
+        }
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());
+        }
+        if let Some(span) = stdout_span.as_ref() {
+            data["stdout_offset"] = serde_json::Value::from(span.offset);
+            data["stdout_bytes"] = serde_json::Value::from(span.len);
+        }
+        if let Some(span) = stderr_span.as_ref() {
+            data["stderr_offset"] = serde_json::Value::from(span.offset);
+            data["stderr_bytes"] = serde_json::Value::from(span.len);
         }
         self.emit(LogEvent {
             ts: Self::ts(),
@@ -1914,8 +1960,8 @@ impl SessionLog {
                 Some(preview)
             },
             data: Some(data),
-            file,
-            file2,
+            file: stdout_span.map(|span| span.relative),
+            file2: stderr_span.map(|span| span.relative),
         });
     }
 
@@ -2117,6 +2163,93 @@ fn u32_from_data(data: Option<&serde_json::Value>, key: &str) -> Option<u32> {
     data?.get(key)?.as_u64().map(|v| v as u32)
 }
 
+fn read_event_file_span(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    file_key: &str,
+    offset_key: Option<&str>,
+    len_key: Option<&str>,
+) -> Option<String> {
+    let rel = entry.get(file_key)?.as_str()?;
+    let path = log_dir.join(rel);
+    let data = entry.get("data");
+    let offset = offset_key.and_then(|key| data?.get(key)?.as_u64());
+    let len = len_key.and_then(|key| data?.get(key)?.as_u64());
+
+    match (offset, len) {
+        (Some(offset), Some(len)) => {
+            let mut file = File::open(path).ok()?;
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            let mut buf = vec![0_u8; len as usize];
+            file.read_exact(&mut buf).ok()?;
+            String::from_utf8(buf).ok()
+        }
+        _ => fs::read_to_string(path).ok(),
+    }
+}
+
+pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOutputChunk> {
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(contents) = fs::read_to_string(log_dir.join("session.jsonl")) else {
+        return Vec::new();
+    };
+    let mut found: std::collections::HashMap<String, AgentOutputChunk> =
+        std::collections::HashMap::new();
+
+    for line in contents.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if entry.get("event").and_then(|v| v.as_str()) != Some("agent_output") {
+            continue;
+        }
+        let Some(data) = entry.get("data") else {
+            continue;
+        };
+        let Some(output_id) = data.get("output_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !wanted.contains(output_id) || found.contains_key(output_id) {
+            continue;
+        }
+        let stdout = read_event_file_span(
+            &entry,
+            log_dir,
+            "file",
+            Some("stdout_offset"),
+            Some("stdout_bytes"),
+        )
+        .unwrap_or_default();
+        let stderr = read_event_file_span(
+            &entry,
+            log_dir,
+            "file2",
+            Some("stderr_offset"),
+            Some("stderr_bytes"),
+        )
+        .unwrap_or_default();
+        let source = data
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        found.insert(
+            output_id.to_string(),
+            AgentOutputChunk {
+                output_id: output_id.to_string(),
+                stdout,
+                stderr,
+                source,
+            },
+        );
+    }
+
+    ids.iter().filter_map(|id| found.remove(id)).collect()
+}
+
 /// Reconstruct an `AppEvent` from a parsed `session.jsonl` entry.
 ///
 /// Inverse of the typed writer methods above.  Used during replay to drive
@@ -2153,12 +2286,12 @@ pub fn session_log_entry_to_app_event(
         .map(|t| t as usize);
     let data = entry.get("data");
 
-    // Helper: read full content from a file-reference field, relative to log_dir.
+    // Helper: read content from a file-reference field, relative to log_dir.
+    // Newer agent_output events include byte spans so replay can recover the
+    // exact chunk from the aggregate per-turn stdout/stderr files. Older logs
+    // do not, so they fall back to the historical full-file read.
     let read_file = |key: &str| -> Option<String> {
-        entry
-            .get(key)
-            .and_then(|f| f.as_str())
-            .and_then(|f| fs::read_to_string(log_dir.join(f)).ok())
+        read_event_file_span(entry, log_dir, key, None, None)
     };
 
     // Helper: parse LogLevel from persisted string.
@@ -2336,16 +2469,35 @@ pub fn session_log_entry_to_app_event(
             })
         }
         "agent_output" => {
-            let stdout = read_file("file").unwrap_or_else(|| message.to_string());
-            let stderr = read_file("file2").unwrap_or_default();
+            let stdout = read_event_file_span(
+                entry,
+                log_dir,
+                "file",
+                Some("stdout_offset"),
+                Some("stdout_bytes"),
+            )
+            .unwrap_or_else(|| message.to_string());
+            let stderr = read_event_file_span(
+                entry,
+                log_dir,
+                "file2",
+                Some("stderr_offset"),
+                Some("stderr_bytes"),
+            )
+            .unwrap_or_default();
             let source = data
                 .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let output_id = data
+                .and_then(|d| d.get("output_id"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
             Some(AppEvent::AgentOutput {
                 stdout,
                 stderr,
                 source,
+                output_id,
             })
         }
 
@@ -3889,6 +4041,7 @@ mod tests {
                 stdout,
                 stderr,
                 source,
+                ..
             } => {
                 // Full content read from turn file, not truncated preview.
                 assert_eq!(stdout.len(), 600);
@@ -3898,6 +4051,29 @@ mod tests {
             }
             other => panic!("expected AgentOutput, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn agent_output_chunks_by_id_reads_spans_not_full_turn_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.agent_output_with_id("first", "", Some("Codex"), Some("out-1"));
+        log.agent_output_with_id("second", "warn", Some("Codex"), Some("out-2"));
+        drop(log);
+
+        let chunks = agent_output_chunks_by_id(
+            &log_dir,
+            &["out-2".to_string(), "out-1".to_string()],
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].output_id, "out-2");
+        assert_eq!(chunks[0].stdout, "second");
+        assert_eq!(chunks[0].stderr, "warn");
+        assert_eq!(chunks[1].output_id, "out-1");
+        assert_eq!(chunks[1].stdout, "first");
+        assert_eq!(chunks[1].stderr, "");
     }
 
     #[test]

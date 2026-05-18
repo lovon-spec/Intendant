@@ -1291,6 +1291,50 @@ fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
     )
 }
 
+fn current_agent_output_response(request_line: &str, log_dir: &Path) -> String {
+    let ids_param = query_param(request_line, "ids").unwrap_or_default();
+    let ids: Vec<String> = ids_param
+        .split(',')
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+        })
+        .map(str::to_string)
+        .collect();
+    if ids.is_empty() {
+        return upload_error_response("400 Bad Request", "missing output ids");
+    }
+
+    let chunks = crate::session_log::agent_output_chunks_by_id(log_dir, &ids);
+    let found: HashSet<&str> = chunks.iter().map(|chunk| chunk.output_id.as_str()).collect();
+    let missing: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !found.contains(id))
+        .collect();
+    let body = serde_json::json!({
+        "outputs": chunks,
+        "missing": missing,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    )
+}
+
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     if session_id.contains('/') {
         let dir = PathBuf::from(session_id);
@@ -8048,6 +8092,23 @@ pub fn spawn_web_gateway(
                             body.len(),
                             body
                         );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/session/current/agent-output")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let log_dir = if let Some(ref slog) = session_log {
+                            match slog.lock() {
+                                Ok(l) => Some(l.dir().to_path_buf()),
+                                Err(_) => None,
+                            }
+                        } else {
+                            query_ctx.as_ref().map(|ctx| ctx.log_dir.clone())
+                        };
+                        let response = match log_dir {
+                            Some(dir) => current_agent_output_response(&request_line, &dir),
+                            None => upload_error_response("404 Not Found", "no active session log"),
+                        };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
                         && request_line.contains(" /api/session/current/uploads")

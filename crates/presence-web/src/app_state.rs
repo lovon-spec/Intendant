@@ -18,6 +18,10 @@ pub enum UiCommand {
         level: String,
         source: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
         #[serde(default)]
         collapsible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -697,6 +701,8 @@ struct LogEntry {
     level: String,
     source: String,
     content: String,
+    kind: Option<String>,
+    output_id: Option<String>,
     collapsible: bool,
     turn: Option<u64>,
 }
@@ -818,6 +824,8 @@ impl AppState {
                 level: entry.level.clone(),
                 source: entry.source.clone(),
                 content: entry.content.clone(),
+                kind: entry.kind.clone(),
+                output_id: entry.output_id.clone(),
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
                 images: vec![],
@@ -1115,21 +1123,34 @@ impl AppState {
 
             "agent_output" => {
                 let source = msg["source"].as_str().unwrap_or("agent");
+                let output_id = msg["output_id"].as_str().map(str::to_string);
                 if let Some(stdout) = msg["stdout"].as_str() {
                     if !stdout.is_empty() {
                         let out = format_agent_output(stdout);
                         if !out.text.is_empty() || !out.images.is_empty() {
-                            cmds.extend(
-                                self.add_log_with_images(
-                                    "agent", &out.text, None, source, out.images,
-                                ),
-                            );
+                            cmds.extend(self.add_log_with_metadata(
+                                "agent",
+                                &out.text,
+                                None,
+                                source,
+                                out.images,
+                                Some("agent_output"),
+                                output_id.clone(),
+                            ));
                         }
                     }
                 }
                 if let Some(stderr) = msg["stderr"].as_str() {
                     if !stderr.is_empty() {
-                        cmds.extend(self.add_log("warn", stderr, None, "agent"));
+                        cmds.extend(self.add_log_with_metadata(
+                            "warn",
+                            stderr,
+                            None,
+                            source,
+                            Vec::new(),
+                            Some("agent_output"),
+                            output_id.clone(),
+                        ));
                     }
                 }
                 cmds.push(UiCommand::SetPhase {
@@ -2099,6 +2120,19 @@ impl AppState {
         source: &str,
         images: Vec<String>,
     ) -> Vec<UiCommand> {
+        self.add_log_with_metadata(level, content, turn, source, images, None, None)
+    }
+
+    fn add_log_with_metadata(
+        &mut self,
+        level: &str,
+        content: &str,
+        turn: Option<u64>,
+        source: &str,
+        images: Vec<String>,
+        kind: Option<&str>,
+        output_id: Option<String>,
+    ) -> Vec<UiCommand> {
         // Trim replay timestamps to HH:MM:SS so they render identically to
         // the old replay path (which truncated via `ts[..8.min(ts.len())]`).
         let ts = match &self.replay_ts {
@@ -2112,12 +2146,21 @@ impl AppState {
         let is_collapsible = !images.is_empty()
             || content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
             || content.len() > COLLAPSE_CHAR_THRESHOLD;
+        let kind_string = kind.map(str::to_string);
+        let discardable_output = kind == Some("agent_output") && output_id.is_some();
+        let buffered_content = if discardable_output {
+            String::new()
+        } else {
+            content.to_string()
+        };
 
         let entry = LogEntry {
             ts: ts.clone(),
             level: level.to_string(),
             source: source_str.clone(),
-            content: content.to_string(),
+            content: buffered_content,
+            kind: kind_string.clone(),
+            output_id: output_id.clone(),
             collapsible: is_collapsible,
             turn,
         };
@@ -2142,6 +2185,8 @@ impl AppState {
             level: level.to_string(),
             source: source_str,
             content: content.to_string(),
+            kind: kind_string,
+            output_id,
             collapsible: is_collapsible,
             turn: None, // separator already emitted
             images,
@@ -3498,6 +3543,8 @@ mod tests {
             level: "info".into(),
             source: "Agent".into(),
             content: "hello".into(),
+            kind: None,
+            output_id: None,
             collapsible: false,
             turn: None,
             images: vec![],

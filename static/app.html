@@ -1317,6 +1317,73 @@ html, body {
 .syntax-op { color: var(--red); font-weight: 700; }
 .syntax-path { color: var(--sapphire); }
 .syntax-comment { color: var(--overlay1); font-style: italic; }
+.log-entry.command-output-group {
+  background: rgba(24, 24, 37, 0.42);
+}
+.command-output-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.command-output-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--subtext1);
+  font-size: 11px;
+}
+.command-output-summary .status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--teal);
+  box-shadow: 0 0 0 2px rgba(148, 226, 213, 0.12);
+}
+.command-output-summary .output-warn {
+  color: var(--yellow);
+}
+.command-output-body {
+  min-width: 0;
+}
+.command-output-pre {
+  margin: 2px 0 4px;
+  padding: 7px 9px;
+  max-height: 360px;
+  color: var(--subtext0);
+  background: rgba(17, 17, 27, 0.82);
+  border: 1px solid var(--surface0);
+  border-radius: 5px;
+  overflow: auto;
+  white-space: pre;
+}
+.command-output-pre code {
+  display: block;
+}
+.command-output-group.finalized:not(.expanded) .command-output-body {
+  display: none;
+}
+.command-output-group .collapse-toggle {
+  color: var(--blue);
+  font-size: 11px;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.command-output-group.expanded .collapse-toggle .arrow { display: none; }
+.command-output-group:not(.expanded) .collapse-toggle .arrow-up { display: none; }
+.output-line { display: block; min-height: 1.35em; }
+.output-line-error { color: var(--red); }
+.output-line-warn { color: var(--yellow); }
+.output-line-success { color: var(--green); }
+.output-line-diff-add { color: var(--green); }
+.output-line-diff-del { color: var(--red); }
+.output-line-prompt { color: var(--mauve); }
+.output-url { color: var(--sapphire); text-decoration: underline; text-decoration-color: rgba(116,199,236,0.45); }
+.output-path { color: var(--blue); }
+.output-number { color: var(--peach); }
+.output-json-key { color: var(--mauve); }
+.output-ansi-dim { color: var(--overlay1); }
 /* Collapsible long entries */
 .log-entry.collapsible {
   cursor: pointer;
@@ -3353,6 +3420,32 @@ html, body {
   border-radius: 2px;
   margin-right: 2px;
 }
+.log-attachment-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+}
+.log-attachment-thumb {
+  width: 76px;
+  height: 52px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--surface1);
+  background: var(--mantle);
+}
+.log-attachment-file {
+  display: inline-flex;
+  align-items: center;
+  max-width: 180px;
+  min-height: 28px;
+  padding: 4px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--subtext1);
+  font-size: 11px;
+}
 .pending-attachment-chip .chip-remove {
   width: 14px;
   height: 14px;
@@ -5209,6 +5302,9 @@ let app = null;
 let activeTab = 'activity';
 let autoScroll = true;
 let logEntryCount = 0;
+let commandOutputGroupSeq = 0;
+let activeCommandOutputGroup = null;
+const commandOutputGroups = new Map();
 let currentPhase = 'idle';
 let currentSessionFullId = '';
 let pendingApprovalId = null;
@@ -5731,6 +5827,7 @@ async function main() {
         };
         const cmds = app.handle_server_message(filtered);
         if (cmds) processCommands(cmds);
+        finalizeActiveCommandOutputGroup();
         // Historical replay can emit lifecycle commands such as session_ended
         // that move the live dashboard to Sessions. The URL remains the
         // navigation source of truth, so re-apply it after replay settles.
@@ -7429,9 +7526,12 @@ function renderDiffLines(diffText) {
 function clearLogs() {
   document.getElementById('log-stream').innerHTML = '';
   logEntryCount = 0;
+  activeCommandOutputGroup = null;
+  commandOutputGroups.clear();
 }
 
 function renderTurnSeparator(turn) {
+  finalizeActiveCommandOutputGroup();
   const stream = document.getElementById('log-stream');
   const sep = document.createElement('div');
   sep.className = 'log-turn-sep';
@@ -7632,6 +7732,242 @@ function highlightShellCommand(command) {
   return html;
 }
 
+function stripAnsi(text) {
+  return String(text || '').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+}
+
+function highlightCommandOutput(text) {
+  const src = stripAnsi(text);
+  if (!src) return '';
+  return src.split('\n').map((line) => {
+    let cls = 'output-line';
+    if (/^\s*(error|failed|panic|fatal)\b/i.test(line) || /\b(ERROR|Error:|failed|panic)\b/.test(line)) {
+      cls += ' output-line-error';
+    } else if (/^\s*(warn|warning)\b/i.test(line) || /\b(WARN|warning)\b/i.test(line)) {
+      cls += ' output-line-warn';
+    } else if (/^\s*(ok|pass|passed|success|done)\b/i.test(line)) {
+      cls += ' output-line-success';
+    } else if (/^\+/.test(line) && !/^\+\+\+/.test(line)) {
+      cls += ' output-line-diff-add';
+    } else if (/^-/.test(line) && !/^---/.test(line)) {
+      cls += ' output-line-diff-del';
+    } else if (/^\s*(\$|>|#)\s/.test(line)) {
+      cls += ' output-line-prompt';
+    }
+
+    let html = escapeHtml(line);
+    html = html.replace(/(&quot;[A-Za-z0-9_.-]+&quot;)(\s*:)/g, '<span class="output-json-key">$1</span>$2');
+    html = html.replace(/\b(https?:\/\/[^\s<>"']+)/g, '<span class="output-url">$1</span>');
+    html = html.replace(/(^|[\s([,{])((?:~|\.{1,2}|\/)[A-Za-z0-9_./:@%+=,-]+)/g, '$1<span class="output-path">$2</span>');
+    html = html.replace(/\b(\d+(?:\.\d+)?(?:ms|s|KiB|MiB|KB|MB|GB|%)?)\b/g, '<span class="output-number">$1</span>');
+    return `<span class="${cls}">${html || ' '}</span>`;
+  }).join('');
+}
+
+function commandOutputStats(text) {
+  const s = String(text || '');
+  if (!s) return { lines: 0, bytes: 0 };
+  const lines = s.endsWith('\n') ? s.split('\n').length - 1 : s.split('\n').length;
+  return { lines, bytes: new Blob([s]).size };
+}
+
+function formatCompactBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+function isCommandOutputLog(c) {
+  if (!c) return false;
+  if (c.kind === 'agent_output' || c.output_id) return true;
+  const level = String(c.level || '').toLowerCase();
+  if (level !== 'agent' && level !== 'warn') return false;
+  if (detectCommandLog(c.content)) return false;
+  if (shouldRenderMarkdownLog(c)) return false;
+  return level === 'agent';
+}
+
+function createLogScaffold(c, extraClass) {
+  const entry = document.createElement('div');
+  entry.className = 'log-entry level-' + c.level + (extraClass ? ' ' + extraClass : '');
+  entry.dataset.level = c.level;
+  const sourceClass = String(c.source || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  if (sourceClass) entry.classList.add('source-' + sourceClass);
+
+  const hostId = c.host_id || selfPeerId;
+  entry.dataset.hostId = hostId;
+  if (activeHostFilter && activeHostFilter !== hostId) {
+    entry.classList.add('hidden-by-filter');
+  }
+
+  const icon = document.createElement('span');
+  icon.className = 'log-icon';
+  icon.textContent = LEVEL_ICONS[c.level] || '\u2022';
+  icon.title = LEVEL_TOOLTIPS[c.level] || c.level;
+
+  const ts = document.createElement('span');
+  ts.className = 'log-ts';
+  ts.textContent = (c.ts || '').substring(0, 8);
+
+  const host = document.createElement('span');
+  host.className = 'log-host';
+  host.textContent = hostId;
+  host.style.background = hostBadgeColor(hostId);
+  host.title = `source host: ${hostId}`;
+
+  const lvl = document.createElement('span');
+  lvl.className = 'log-level';
+  lvl.textContent = c.source || '\u2139';
+
+  entry.appendChild(icon);
+  entry.appendChild(ts);
+  entry.appendChild(host);
+  entry.appendChild(lvl);
+  return { entry, hostId };
+}
+
+function appendLogEntryElement(entry) {
+  const stream = document.getElementById('log-stream');
+  stream.appendChild(entry);
+  logEntryCount++;
+  if (logEntryCount > 10000) {
+    const first = stream.querySelector('.log-entry, .log-turn-sep');
+    if (first) { stream.removeChild(first); logEntryCount--; }
+  }
+  if (autoScroll) stream.scrollTop = stream.scrollHeight;
+}
+
+function updateCommandOutputSummary(group) {
+  const parts = [];
+  if (group.chunks > 0) parts.push(group.chunks + ' chunk' + (group.chunks === 1 ? '' : 's'));
+  if (group.lines > 0) parts.push(group.lines + ' line' + (group.lines === 1 ? '' : 's'));
+  if (group.bytes > 0) parts.push(formatCompactBytes(group.bytes));
+  if (group.warns > 0) parts.push(`<span class="output-warn">${group.warns} warning${group.warns === 1 ? '' : 's'}</span>`);
+  const detail = parts.length ? parts.join(' · ') : 'ready';
+  group.summary.innerHTML = `<span class="status-dot"></span><span>output · ${detail}</span>`;
+}
+
+function appendCommandOutputChunk(group, c) {
+  const text = c.content || '';
+  if (c.output_id && !group.outputIdSet.has(c.output_id)) {
+    group.outputIdSet.add(c.output_id);
+    group.outputIds.push(c.output_id);
+  }
+  const stats = commandOutputStats(text);
+  group.lines += stats.lines;
+  group.bytes += stats.bytes;
+  group.chunks += 1;
+  if ((c.level || '').toLowerCase() === 'warn') group.warns += 1;
+  updateCommandOutputSummary(group);
+  if (!group.finalized && text) {
+    const pre = document.createElement('pre');
+    pre.className = 'command-output-pre';
+    const code = document.createElement('code');
+    code.innerHTML = highlightCommandOutput(text);
+    pre.appendChild(code);
+    group.body.appendChild(pre);
+  }
+}
+
+function renderCommandOutputEntry(c) {
+  if (!activeCommandOutputGroup || activeCommandOutputGroup.finalized) {
+    const groupId = 'cmdout-' + (++commandOutputGroupSeq);
+    const { entry } = createLogScaffold(c, 'command-output-group expanded');
+    entry.dataset.outputGroupId = groupId;
+    const wrap = document.createElement('span');
+    wrap.className = 'log-content command-output-wrap';
+    const summary = document.createElement('span');
+    summary.className = 'command-output-summary';
+    const body = document.createElement('span');
+    body.className = 'command-output-body';
+    wrap.appendChild(summary);
+    wrap.appendChild(body);
+    const toggle = document.createElement('span');
+    toggle.className = 'collapse-toggle';
+    toggle.innerHTML = '<span class="arrow">\u25B8 output</span><span class="arrow-up">\u25BE hide</span>';
+    entry.appendChild(wrap);
+    entry.appendChild(toggle);
+
+    const group = {
+      id: groupId,
+      entry,
+      summary,
+      body,
+      outputIds: [],
+      outputIdSet: new Set(),
+      chunks: 0,
+      lines: 0,
+      bytes: 0,
+      warns: 0,
+      finalized: false,
+      loaded: false,
+      loading: false,
+    };
+    entry.addEventListener('click', () => toggleCommandOutputGroup(group));
+    commandOutputGroups.set(groupId, group);
+    activeCommandOutputGroup = group;
+    updateCommandOutputSummary(group);
+    appendLogEntryElement(entry);
+  }
+  appendCommandOutputChunk(activeCommandOutputGroup, c);
+  const stream = document.getElementById('log-stream');
+  if (autoScroll) stream.scrollTop = stream.scrollHeight;
+}
+
+function finalizeActiveCommandOutputGroup() {
+  const group = activeCommandOutputGroup;
+  if (!group || group.finalized) return;
+  group.finalized = true;
+  group.entry.classList.add('finalized');
+  group.entry.classList.remove('expanded');
+  group.body.innerHTML = '';
+  group.loaded = false;
+  activeCommandOutputGroup = null;
+}
+
+async function toggleCommandOutputGroup(group) {
+  if (!group.finalized) return;
+  const expanding = !group.entry.classList.contains('expanded');
+  group.entry.classList.toggle('expanded', expanding);
+  if (!expanding) {
+    group.body.innerHTML = '';
+    group.loaded = false;
+    return;
+  }
+  if (group.loaded || group.loading) return;
+  group.loading = true;
+  group.body.textContent = 'Loading output...';
+  try {
+    if (!group.outputIds.length) {
+      group.body.textContent = 'Output is not available for lazy loading.';
+      return;
+    }
+    const resp = await fetch('/api/session/current/agent-output?ids=' + encodeURIComponent(group.outputIds.join(',')));
+    const json = await resp.json();
+    if (!resp.ok) throw new Error(json.error || resp.statusText);
+    group.body.innerHTML = '';
+    for (const out of (json.outputs || [])) {
+      const text = [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : '');
+      if (!text) continue;
+      const pre = document.createElement('pre');
+      pre.className = 'command-output-pre';
+      const code = document.createElement('code');
+      code.innerHTML = highlightCommandOutput(text);
+      pre.appendChild(code);
+      group.body.appendChild(pre);
+    }
+    if (!group.body.childElementCount) {
+      group.body.textContent = 'No persisted output found.';
+    }
+    group.loaded = true;
+  } catch (e) {
+    group.body.textContent = 'Could not load output: ' + e;
+  } finally {
+    group.loading = false;
+  }
+}
+
 function shouldRenderMarkdownLog(c) {
   const level = (c.level || '').toLowerCase();
   const source = (c.source || '').toLowerCase();
@@ -7659,57 +7995,48 @@ function renderLogContentElement(cnt, c) {
 }
 
 function renderLogEntry(c) {
-  const stream = document.getElementById('log-stream');
-  const entry = document.createElement('div');
-  entry.className = 'log-entry level-' + c.level;
-  entry.dataset.level = c.level;
-  const sourceClass = String(c.source || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
-  if (sourceClass) entry.classList.add('source-' + sourceClass);
-
-  // Multi-host: tag entry with its source host so the host filter
-  // dropdown can hide entries from other hosts. Primary entries get
-  // `selfPeerId` injected by the caller path in processCommands.
-  const hostId = c.host_id || selfPeerId;
-  entry.dataset.hostId = hostId;
-  if (activeHostFilter && activeHostFilter !== hostId) {
-    entry.classList.add('hidden-by-filter');
+  if (isCommandOutputLog(c)) {
+    renderCommandOutputEntry(c);
+    return;
   }
+  finalizeActiveCommandOutputGroup();
 
-  const icon = document.createElement('span');
-  icon.className = 'log-icon';
-  icon.textContent = LEVEL_ICONS[c.level] || '\u2022';
-  icon.title = LEVEL_TOOLTIPS[c.level] || c.level;
-
-  const ts = document.createElement('span');
-  ts.className = 'log-ts';
-  ts.textContent = (c.ts || '').substring(0, 8);
-
-  const host = document.createElement('span');
-  host.className = 'log-host';
-  host.textContent = hostId;
-  host.style.background = hostBadgeColor(hostId);
-  host.title = `source host: ${hostId}`;
-
-  const lvl = document.createElement('span');
-  lvl.className = 'log-level';
-  lvl.textContent = c.source || '\u2139';
+  const { entry } = createLogScaffold(c, '');
 
   const cnt = document.createElement('span');
   cnt.className = 'log-content';
   renderLogContentElement(cnt, c);
 
   const hasImages = c.images && c.images.length > 0;
+  const attachmentPreviews = Array.isArray(c.attachment_previews) ? c.attachment_previews : [];
   if (hasImages) {
     const badge = document.createElement('span');
     badge.className = 'log-image-badge';
     badge.textContent = c.images.length === 1 ? '[screenshot]' : '[' + c.images.length + ' screenshots]';
     cnt.appendChild(badge);
   }
+  if (attachmentPreviews.length > 0) {
+    const strip = document.createElement('div');
+    strip.className = 'log-attachment-strip';
+    for (const att of attachmentPreviews) {
+      if (att && att.dataUrl) {
+        const img = document.createElement('img');
+        img.className = 'log-attachment-thumb';
+        img.loading = 'lazy';
+        img.src = att.dataUrl;
+        img.alt = '';
+        img.title = att.note || att.name || att.frameId || 'attachment';
+        strip.appendChild(img);
+      } else {
+        const chip = document.createElement('span');
+        chip.className = 'log-attachment-file';
+        chip.textContent = (att && (att.name || att.frameId)) || 'attachment';
+        strip.appendChild(chip);
+      }
+    }
+    cnt.appendChild(strip);
+  }
 
-  entry.appendChild(icon);
-  entry.appendChild(ts);
-  entry.appendChild(host);
-  entry.appendChild(lvl);
   entry.appendChild(cnt);
 
   if (c.collapsible || hasImages) {
@@ -7740,16 +8067,7 @@ function renderLogEntry(c) {
     });
   }
 
-  stream.appendChild(entry);
-  logEntryCount++;
-
-  // Cap entries in DOM
-  if (logEntryCount > 10000) {
-    const first = stream.querySelector('.log-entry, .log-turn-sep');
-    if (first) { stream.removeChild(first); logEntryCount--; }
-  }
-
-  if (autoScroll) stream.scrollTop = stream.scrollHeight;
+  appendLogEntryElement(entry);
 }
 
 function updateStatusBar(d) {
@@ -10558,6 +10876,30 @@ function logErrorToActivity(text) {
     } catch (_) { /* fall through */ }
   }
   console.warn('[upload]', text);
+}
+
+function currentLogTime() {
+  return new Date().toTimeString().slice(0, 8);
+}
+
+function renderAttachmentReceipt(text, attachments, verb) {
+  if (!attachments || attachments.length === 0 || typeof renderLogEntry !== 'function') return;
+  const previews = attachments.map((att) => ({
+    frameId: att.frameId,
+    name: att.uploadName || att.frameId,
+    note: att.note || att.uploadName || att.frameId,
+    dataUrl: att.dataUrl || null,
+  }));
+  const count = attachments.length;
+  const label = count === 1 ? '1 attachment' : count + ' attachments';
+  const content = `${verb || 'Sent'} ${label}${text ? `: ${text}` : ''}`;
+  renderLogEntry({
+    ts: currentLogTime(),
+    level: 'info',
+    source: 'user',
+    content,
+    attachment_previews: previews,
+  });
 }
 
 async function triggerUploadFlow(files) {
@@ -17070,6 +17412,7 @@ window.submitActivityTask = function() {
   // artifact — all agents (native, Codex, Claude Code, Gemini CLI) treat
   // subsequent messages as new turns in the existing conversation.
   const attachments = pendingAttachments.map(a => a.frameId);
+  const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   const msg = { action: 'start_task', task: text };
   if (currentSessionFullId) msg.session_id = currentSessionFullId;
@@ -17077,6 +17420,7 @@ window.submitActivityTask = function() {
   if (attachments.length > 0) msg.attachments = attachments;
   app.send_server_action(msg);
   if (attachments.length > 0) {
+    renderAttachmentReceipt(text, attachmentReceipt, 'Sent');
     clearPendingAttachments();
   }
 };
@@ -17109,6 +17453,7 @@ window.submitActivityOrSteer = function() {
     steerCounter = (steerCounter + 1) >>> 0;
     const id = 'steer-' + Date.now() + '-' + steerCounter;
     const attachments = pendingAttachments.map(a => a.frameId);
+    const attachmentReceipt = pendingAttachments.slice();
     const msg = { action: 'steer', text, id };
     if (currentSessionFullId) msg.session_id = currentSessionFullId;
     if (attachments.length > 0) msg.attachments = attachments;
@@ -17120,6 +17465,7 @@ window.submitActivityOrSteer = function() {
       null
     );
     if (attachments.length > 0) {
+      renderAttachmentReceipt(text, attachmentReceipt, 'Steered');
       clearPendingAttachments();
     }
     input.value = '';
@@ -17211,11 +17557,13 @@ function startNewSession() {
   if (app) {
     const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const attachments = pendingAttachments.map(a => a.frameId);
+    const attachmentReceipt = pendingAttachments.slice();
     const msg = { action: 'start_task', task: task };
     if (direct) msg.direct = true;
     if (attachments.length > 0) msg.attachments = attachments;
     app.send_server_action(msg);
     if (attachments.length > 0) {
+      renderAttachmentReceipt(task, attachmentReceipt, 'Sent');
       clearPendingAttachments();
     }
   }

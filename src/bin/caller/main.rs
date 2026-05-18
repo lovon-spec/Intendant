@@ -1077,6 +1077,7 @@ async fn drain_external_agent_events(
                         stdout,
                         stderr: String::new(),
                         source: config.agent_source.clone(),
+                        output_id: Some(event::next_agent_output_id()),
                     });
                 }
             }
@@ -4937,16 +4938,18 @@ async fn run_agent_loop(
             });
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
+            let output_id = event::next_agent_output_id();
 
             // Log agent output
             slog(&session_log, |l| {
-                l.agent_output(&output.stdout, &output.stderr, None)
+                l.agent_output_with_id(&output.stdout, &output.stderr, None, Some(&output_id))
             });
 
             bus.send(AppEvent::AgentOutput {
                 stdout: output.stdout.clone(),
                 stderr: output.stderr.clone(),
                 source: None,
+                output_id: Some(output_id),
             });
 
             // Map results back to individual tool responses
@@ -5350,16 +5353,18 @@ Proceed with explicit assumptions and continue without additional questions."
             });
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
+            let output_id = event::next_agent_output_id();
 
             // Log agent output
             slog(&session_log, |l| {
-                l.agent_output(&output.stdout, &output.stderr, None)
+                l.agent_output_with_id(&output.stdout, &output.stderr, None, Some(&output_id))
             });
 
             bus.send(AppEvent::AgentOutput {
                 stdout: output.stdout.clone(),
                 stderr: output.stderr.clone(),
                 source: None,
+                output_id: Some(output_id),
             });
 
             // Check for completed sub-agent results

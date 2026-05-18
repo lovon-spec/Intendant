@@ -128,6 +128,8 @@ pub enum OutboundEvent {
         stderr: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
     },
     ApprovalRequired {
         #[serde(skip_serializing_if = "Option::is_none")]

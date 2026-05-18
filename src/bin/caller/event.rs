@@ -10,7 +10,20 @@ use crate::types::LogLevel;
 use crossterm::event::KeyEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_AGENT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_agent_output_id() -> String {
+    let seq = NEXT_AGENT_OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    format!("ao-{millis:x}-{seq:x}")
+}
 
 /// Source of a context injection item.
 ///
@@ -135,6 +148,7 @@ pub enum AppEvent {
         stdout: String,
         stderr: String,
         source: Option<String>,
+        output_id: Option<String>,
     },
     SubAgentResult {
         formatted: String,
@@ -1167,10 +1181,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             stdout,
             stderr,
             source,
+            output_id,
         } => Some(OutboundEvent::AgentOutput {
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             source: source.clone(),
+            output_id: output_id.clone(),
         }),
         AppEvent::DoneSignal { message } => Some(OutboundEvent::DoneSignal {
             message: message.clone(),
@@ -1876,8 +1892,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             stdout,
             stderr,
             source,
+            output_id,
         } => {
-            log.agent_output(stdout, stderr, source.as_deref());
+            log.agent_output_with_id(stdout, stderr, source.as_deref(), output_id.as_deref());
         }
         AppEvent::ModelResponse {
             content,
@@ -2840,6 +2857,7 @@ mod tests {
             stdout: "hello".to_string(),
             stderr: "".to_string(),
             source: None,
+            output_id: None,
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();

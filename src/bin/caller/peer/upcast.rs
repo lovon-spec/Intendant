@@ -464,6 +464,7 @@ impl AppEventUpcaster {
                 stdout,
                 stderr,
                 source: _,
+                ..
             } => {
                 let mut out = vec![];
                 if !stdout.is_empty() {
@@ -1467,6 +1468,7 @@ impl WireEventUpcaster {
                 stdout,
                 stderr,
                 source: _,
+                ..
             } => {
                 let mut out = vec![];
                 if !stdout.is_empty() {
@@ -2465,6 +2467,7 @@ mod tests {
             stdout: "file1\nfile2".into(),
             stderr: String::new(),
             source: None,
+            output_id: None,
         });
         let progress_id = output
             .iter()
@@ -2548,6 +2551,7 @@ mod tests {
             stdout: "file1".into(),
             stderr: String::new(),
             source: None,
+            output_id: None,
         });
         let progress_id = output
             .iter()

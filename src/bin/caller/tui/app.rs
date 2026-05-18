@@ -2818,6 +2818,7 @@ mod tests {
             stdout: "line1\nline2".to_string(),
             stderr: "warn".to_string(),
             source: None,
+            output_id: None,
         });
         // format_agent_output_for_tui produces one combined entry
         assert_eq!(app.log_entries.len(), 1);
@@ -3469,6 +3470,7 @@ mod tests {
             stdout: "hello".to_string(),
             stderr: String::new(),
             source: None,
+            output_id: None,
         });
         assert_eq!(
             count_log_entries(&derived),
