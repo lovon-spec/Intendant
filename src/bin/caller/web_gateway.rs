@@ -1070,6 +1070,7 @@ const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
+const EXTERNAL_ACTIVITY_REPLAY_LIMIT: usize = 80;
 
 /// Session-specific state that changes when a new agent session starts.
 /// Wrapped in `Arc<tokio::sync::RwLock<...>>` so the web gateway can observe
@@ -1276,6 +1277,18 @@ fn replay_jsonl_to_outbound_entries(
     }
 
     entries
+}
+
+fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
+    let session_jsonl = log_dir.join("session.jsonl");
+    let contents = std::fs::read_to_string(&session_jsonl).ok()?;
+    Some(
+        serde_json::json!({
+            "t": "log_replay",
+            "entries": replay_jsonl_to_outbound_entries(&contents, log_dir),
+        })
+        .to_string(),
+    )
 }
 
 /// Compute a short content hash for cache-busting embedded static assets.
@@ -2530,6 +2543,23 @@ fn external_session_detail_from_home(
     source: &str,
     session_id: &str,
 ) -> Option<String> {
+    let entries = external_session_entries_from_home(home, source, session_id)?;
+
+    Some(
+        serde_json::json!({
+            "session_id": session_id,
+            "entries": entries,
+            "frames": [],
+        })
+        .to_string(),
+    )
+}
+
+fn external_session_entries_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Option<Vec<serde_json::Value>> {
     let mut entries = Vec::new();
 
     match source {
@@ -2642,14 +2672,82 @@ fn external_session_detail_from_home(
         _ => return None,
     }
 
+    Some(entries)
+}
+
+fn external_session_activity_replay(
+    source: &str,
+    session_id: &str,
+    limit: usize,
+) -> Option<String> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    external_session_activity_replay_from_home(&home, source, session_id, limit)
+}
+
+fn external_session_activity_replay_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    limit: usize,
+) -> Option<String> {
+    let mut transcript = external_session_entries_from_home(home, source, session_id)?;
+    if limit > 0 && transcript.len() > limit {
+        transcript = transcript.split_off(transcript.len() - limit);
+    }
+
+    let mut entries = Vec::with_capacity(transcript.len() + 2);
+    entries.push(serde_json::json!({ "event": "replay_start" }));
+    entries.push(serde_json::json!({
+        "event": "session_attached",
+        "session_id": session_id,
+        "source": source,
+    }));
+
+    for entry in transcript {
+        let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "event": "log_entry",
+            "ts": entry.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
+            "level": entry.get("level").and_then(|v| v.as_str()).unwrap_or("info"),
+            "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(source),
+            "content": content,
+        }));
+    }
+
     Some(
         serde_json::json!({
-            "session_id": session_id,
+            "t": "log_replay",
             "entries": entries,
-            "frames": [],
         })
         .to_string(),
     )
+}
+
+fn external_attached_session_from_wire(line: &str) -> Option<(String, String)> {
+    let parsed = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if parsed.get("event").and_then(|v| v.as_str()) != Some("session_attached") {
+        return None;
+    }
+    let session_id = parsed.get("session_id").and_then(|v| v.as_str())?;
+    let source = parsed.get("source").and_then(|v| v.as_str())?;
+    if source == "intendant" {
+        return None;
+    }
+    Some((session_id.to_string(), source.to_string()))
+}
+
+fn session_ended_id_from_wire(line: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if parsed.get("event").and_then(|v| v.as_str()) != Some("session_ended") {
+        return None;
+    }
+    parsed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
 }
 
 fn list_sessions() -> String {
@@ -4401,6 +4499,10 @@ pub fn spawn_web_gateway(
     // "None (internal agent)" on every page refresh even though the
     // daemon still has the value in memory.
     let last_external_agent_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache the current externally-attached session so refreshed browsers
+    // can rehydrate Activity with the same compact transcript shown in the
+    // Sessions tab instead of coming back empty.
+    let last_session_attached_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest user_display_granted event. The authoritative
     // state lives in AutonomyState.user_display_granted on the server,
     // but the dashboard only learns about it via the broadcast; without
@@ -4418,6 +4520,7 @@ pub fn spawn_web_gateway(
         let status_cache = last_status_json.clone();
         let autonomy_cache = last_autonomy_json.clone();
         let external_agent_cache = last_external_agent_json.clone();
+        let session_attached_cache = last_session_attached_json.clone();
         let user_display_cache = last_user_display_json.clone();
         let display_cache = display_ready_cache.clone();
         let mut usage_rx = broadcast_tx.subscribe();
@@ -4483,7 +4586,32 @@ pub fn spawn_web_gateway(
                         }
                         if line.contains("\"event\":\"external_agent_changed\"") {
                             if let Ok(mut guard) = external_agent_cache.lock() {
-                                *guard = Some(line);
+                                *guard = Some(line.clone());
+                            }
+                        }
+                        if line.contains("\"event\":\"session_attached\"") {
+                            if let Ok(mut guard) = session_attached_cache.lock() {
+                                *guard = external_attached_session_from_wire(&line)
+                                    .map(|_| line.clone());
+                            }
+                        }
+                        if line.contains("\"event\":\"session_started\"") {
+                            if let Ok(mut guard) = session_attached_cache.lock() {
+                                *guard = None;
+                            }
+                        }
+                        if line.contains("\"event\":\"session_ended\"") {
+                            if let Some(ended_id) = session_ended_id_from_wire(&line) {
+                                if let Ok(mut guard) = session_attached_cache.lock() {
+                                    let should_clear = guard
+                                        .as_deref()
+                                        .and_then(external_attached_session_from_wire)
+                                        .map(|(session_id, _)| session_id == ended_id)
+                                        .unwrap_or(false);
+                                    if should_clear {
+                                        *guard = None;
+                                    }
+                                }
                             }
                         }
                     }
@@ -4613,6 +4741,7 @@ pub fn spawn_web_gateway(
             let last_status_json = last_status_json.clone();
             let last_autonomy_json = last_autonomy_json.clone();
             let last_external_agent_json = last_external_agent_json.clone();
+            let last_session_attached_json = last_session_attached_json.clone();
             let last_user_display_json = last_user_display_json.clone();
             let display_ready_cache = display_ready_cache.clone();
             let web_tui_tx = web_tui_tx.clone();
@@ -4963,14 +5092,33 @@ pub fn spawn_web_gateway(
                     // Each JSONL entry is converted to an OutboundEvent via
                     // session_log_entry_to_app_event → app_event_to_outbound
                     // so replay drives the same rendering path as live.
-                    if let Some(ref ctx) = query_ctx {
-                        let session_jsonl = ctx.log_dir.join("session.jsonl");
-                        if let Ok(contents) = std::fs::read_to_string(&session_jsonl) {
-                            let replay = serde_json::json!({
-                                "t": "log_replay",
-                                "entries": replay_jsonl_to_outbound_entries(&contents, &ctx.log_dir),
+                    let replay_log_dir =
+                        query_ctx
+                            .as_ref()
+                            .map(|ctx| ctx.log_dir.clone())
+                            .or_else(|| {
+                                session_log.as_ref().and_then(|sl| {
+                                    sl.lock().ok().map(|log| log.dir().to_path_buf())
+                                })
                             });
-                            let _ = direct_tx.send(replay.to_string());
+                    if let Some(ref log_dir) = replay_log_dir {
+                        if let Some(replay) = session_log_replay_from_dir(log_dir) {
+                            let _ = direct_tx.send(replay);
+                        }
+                    }
+
+                    let active_external_session = last_session_attached_json
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .and_then(|line| external_attached_session_from_wire(&line));
+                    if let Some((session_id, source)) = active_external_session {
+                        if let Some(replay) = external_session_activity_replay(
+                            &source,
+                            &session_id,
+                            EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+                        ) {
+                            let _ = direct_tx.send(replay);
                         }
                     }
 
@@ -11323,6 +11471,146 @@ mod tests {
     }
 
     #[test]
+    fn external_activity_replay_uses_compact_session_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-e756-7461-9946-34b639448717";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "What happens on refresh?" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "The task keeps running." }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        assert_eq!(replay["t"], "log_replay");
+
+        let entries = replay["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["event"], "replay_start");
+        assert_eq!(entries[1]["event"], "session_attached");
+        assert_eq!(entries[1]["session_id"], session_id);
+        assert_eq!(entries[1]["source"], "codex");
+
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry"
+                && entry["level"] == "info"
+                && entry["source"] == "codex"
+                && entry["content"] == "What happens on refresh?"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry"
+                && entry["level"] == "model"
+                && entry["source"] == "codex"
+                && entry["content"] == "The task keeps running."
+        }));
+    }
+
+    #[test]
+    fn external_activity_replay_limits_transcript_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-e756-7461-9946-34b639448717";
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        })];
+        for n in 1..=3 {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-05-17T16:49:0{n}Z"),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": format!("message {n}") }]
+                }
+            }));
+        }
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            lines
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let replay = external_session_activity_replay_from_home(dir.path(), "codex", session_id, 2)
+            .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let contents: Vec<_> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "log_entry")
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(contents, vec!["message 2", "message 3"]);
+    }
+
+    #[test]
+    fn external_attached_session_cache_ignores_internal_sessions() {
+        assert_eq!(
+            external_attached_session_from_wire(
+                &serde_json::json!({
+                    "event": "session_attached",
+                    "session_id": "internal",
+                    "source": "intendant"
+                })
+                .to_string()
+            ),
+            None
+        );
+        assert_eq!(
+            external_attached_session_from_wire(
+                &serde_json::json!({
+                    "event": "session_attached",
+                    "session_id": "external",
+                    "source": "codex"
+                })
+                .to_string()
+            ),
+            Some(("external".to_string(), "codex".to_string()))
+        );
+    }
+
+    #[test]
     fn settings_payload_accepts_settings_tab_save_without_agent_runtime_fields() {
         let body = serde_json::json!({
             "cu_provider": null,
@@ -11928,6 +12216,24 @@ mod tests {
             round.get("turns_in_round").and_then(|v| v.as_u64()),
             Some(3)
         );
+    }
+
+    #[test]
+    fn test_session_log_replay_from_dir_reads_active_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.info("Provider: openai");
+        log.model_response("still here after refresh", 0, 0, 0, 0, None);
+        drop(log);
+
+        let replay = session_log_replay_from_dir(&log_dir).expect("session log should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+
+        assert_eq!(replay["t"], "log_replay");
+        assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["event"] == "model_response" && entry["summary"] == "still here after refresh"
+        }));
     }
 
     #[test]
