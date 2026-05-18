@@ -208,7 +208,10 @@ mod tests {
                 tainted,
             } => {
                 assert_eq!(max_length, Some(50));
-                assert_eq!(allowed_values, Some(vec!["yes".to_string(), "no".to_string()]));
+                assert_eq!(
+                    allowed_values,
+                    Some(vec!["yes".to_string(), "no".to_string()])
+                );
                 assert!(tainted);
             }
             _ => panic!("expected String variant"),

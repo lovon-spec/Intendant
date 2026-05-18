@@ -161,10 +161,7 @@ fn parse_inline(text: &str, base_style: Style) -> Vec<Span<'static>> {
                 }
                 if !found_end {
                     // No closing ` — treat as plain text
-                    spans.push(Span::styled(
-                        text[i..].to_string(),
-                        base_style,
-                    ));
+                    spans.push(Span::styled(text[i..].to_string(), base_style));
                     return spans;
                 }
             }
@@ -182,7 +179,7 @@ fn parse_inline(text: &str, base_style: Style) -> Vec<Span<'static>> {
                     let is_triple = chars.peek().map(|&(_, c)| c == '*').unwrap_or(false);
                     if is_triple {
                         chars.next(); // consume third *
-                        // Bold+italic: find closing ***
+                                      // Bold+italic: find closing ***
                         let content_start = i + 3;
                         if let Some(end) = find_closing_marker(&text[content_start..], "***") {
                             spans.push(Span::styled(
@@ -207,9 +204,7 @@ fn parse_inline(text: &str, base_style: Style) -> Vec<Span<'static>> {
                         if let Some(end) = find_closing_marker(&text[content_start..], "**") {
                             spans.push(Span::styled(
                                 text[content_start..content_start + end].to_string(),
-                                Style::default()
-                                    .fg(MD_BOLD_FG)
-                                    .add_modifier(Modifier::BOLD),
+                                Style::default().fg(MD_BOLD_FG).add_modifier(Modifier::BOLD),
                             ));
                             let skip_to = content_start + end + 2;
                             while chars.peek().map(|&(j, _)| j < skip_to).unwrap_or(false) {
@@ -401,10 +396,7 @@ mod tests {
     fn mixed_inline() {
         let lines = render_markdown("use **bold** and `code` together", plain_style());
         assert_eq!(lines.len(), 1);
-        assert_eq!(
-            spans_text(&lines[0].spans),
-            "use bold and code together"
-        );
+        assert_eq!(spans_text(&lines[0].spans), "use bold and code together");
     }
 
     #[test]
@@ -421,7 +413,10 @@ mod tests {
 
     #[test]
     fn header_levels() {
-        let lines = render_markdown("# H1\n## H2\n### H3\n#### H4\n##### not header", plain_style());
+        let lines = render_markdown(
+            "# H1\n## H2\n### H3\n#### H4\n##### not header",
+            plain_style(),
+        );
         assert_eq!(lines.len(), 5);
         // H1-H4 should be headers
         for l in &lines[..4] {

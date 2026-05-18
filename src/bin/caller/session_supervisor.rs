@@ -113,7 +113,8 @@ impl SessionSupervisor {
                         short_session(&session_id)
                     ));
                 }
-                self.route_follow_up(Some(session_id), task, direct, attachments).await;
+                self.route_follow_up(Some(session_id), task, direct, attachments)
+                    .await;
             }
             event::ControlMsg::StartTask {
                 session_id: None,
@@ -353,7 +354,10 @@ impl SessionSupervisor {
             } else if external_backend.is_none() {
                 match session_log::SessionLog::find_session_by_id(&session_id) {
                     Some(dir) => match session_log::SessionLog::open(dir) {
-                        Ok(log) => self.activate_shared_session(Arc::new(Mutex::new(log))).await,
+                        Ok(log) => {
+                            self.activate_shared_session(Arc::new(Mutex::new(log)))
+                                .await
+                        }
                         Err(e) => {
                             self.loop_error(format!("Session open failed: {}", e));
                             return;

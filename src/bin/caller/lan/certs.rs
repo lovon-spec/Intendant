@@ -60,11 +60,13 @@ pub fn ensure_certs(
     load_legacy_provider_if_needed();
 
     let ca_exists = cert_dir.join(CA_KEY).exists() && cert_dir.join(CA_CRT).exists();
-    let client_exists =
-        cert_dir.join(CLIENT_KEY).exists() && cert_dir.join(CLIENT_P12).exists();
+    let client_exists = cert_dir.join(CLIENT_KEY).exists() && cert_dir.join(CLIENT_P12).exists();
 
     if ca_exists && client_exists && !force {
-        println!(":: certs already exist in {} (use --force to regenerate)", cert_dir.display());
+        println!(
+            ":: certs already exist in {} (use --force to regenerate)",
+            cert_dir.display()
+        );
 
         if cert_needs_regen_for_ip(cert_dir, lan_ip)? {
             println!("!! IP changed — regenerating server cert");
@@ -94,8 +96,13 @@ pub fn ensure_certs(
     write_pem_private_key(&cert_dir.join(CLIENT_KEY), &client_key)?;
 
     let password = random_password(12);
-    let p12_bytes =
-        build_legacy_p12(&client_key, &client_cert, &[ca_cert.clone()], label, &password)?;
+    let p12_bytes = build_legacy_p12(
+        &client_key,
+        &client_cert,
+        &[ca_cert.clone()],
+        label,
+        &password,
+    )?;
     std::fs::write(cert_dir.join(CLIENT_P12), &p12_bytes)?;
     state::write_p12_password(cert_dir, &password)?;
 
@@ -116,7 +123,9 @@ pub fn recert(cert_dir: &Path, lan_ip: &str, force: bool) -> LanResult<()> {
     load_legacy_provider_if_needed();
 
     if !force && !cert_needs_regen_for_ip(cert_dir, lan_ip)? {
-        println!(":: server cert already matches {lan_ip} — nothing to do (use --force to regenerate)");
+        println!(
+            ":: server cert already matches {lan_ip} — nothing to do (use --force to regenerate)"
+        );
         return Ok(());
     }
 
@@ -442,8 +451,15 @@ mod tests {
     fn ensure_certs_produces_full_chain() {
         let tmp = TempDir::new().unwrap();
         let state = ensure_certs(tmp.path(), "192.168.1.100", "test-host", false).unwrap();
-        for name in ["ca.crt", "ca.key", "server.crt", "server.key",
-                     "client.crt", "client.key", "client.p12"] {
+        for name in [
+            "ca.crt",
+            "ca.key",
+            "server.crt",
+            "server.key",
+            "client.crt",
+            "client.key",
+            "client.p12",
+        ] {
             let p = tmp.path().join(name);
             assert!(p.exists(), "missing: {}", p.display());
         }
@@ -481,15 +497,14 @@ mod tests {
         let fp = read_server_cert_fingerprint(tmp.path()).expect("cert exists");
         assert_eq!(fp.len(), 64, "lowercase hex, no separators");
         assert!(
-            fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            fp.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "all chars must be lowercase hex, got: {fp}"
         );
         // Round-trips through the pinning parser — same byte sequence
         // a connecting peer's verifier consumes.
-        let parsed =
-            crate::peer::transport::pinning::parse_fingerprint(&fp).unwrap();
-        let reformatted =
-            crate::peer::transport::pinning::format_fingerprint(&parsed);
+        let parsed = crate::peer::transport::pinning::parse_fingerprint(&fp).unwrap();
+        let reformatted = crate::peer::transport::pinning::format_fingerprint(&parsed);
         assert_eq!(fp, reformatted);
     }
 
@@ -583,4 +598,3 @@ mod tests {
         assert_ne!(ca_before, ca_after, "force did not regenerate CA");
     }
 }
-

@@ -213,10 +213,7 @@ impl Dispatcher {
         bus.send(AppEvent::LogEntry {
             level: "warn".to_string(),
             source: "system".to_string(),
-            content: format!(
-                "{} dropped (no dispatch target available): {}",
-                kind, trunc
-            ),
+            content: format!("{} dropped (no dispatch target available): {}", kind, trunc),
             turn: None,
         });
     }
@@ -280,11 +277,10 @@ mod tests {
             attachments: vec![],
         }));
 
-        let envelope =
-            tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.task, "do thing");
         assert_eq!(envelope.reference_frame_ids, vec!["f1".to_string()]);
         assert!(!envelope.force_direct);
@@ -319,11 +315,10 @@ mod tests {
             attachments: vec![],
         }));
 
-        let text =
-            tokio::time::timeout(std::time::Duration::from_millis(200), presence_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let text = tokio::time::timeout(std::time::Duration::from_millis(200), presence_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(text, "chat with me");
         assert!(task_rx.try_recv().is_err());
     }
@@ -353,11 +348,10 @@ mod tests {
             attachments: vec![],
         }));
 
-        let envelope =
-            tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.task, "code thing");
         assert!(envelope.force_direct);
         assert!(presence_rx.try_recv().is_err());
@@ -384,11 +378,10 @@ mod tests {
             direct: Some(true),
         }));
 
-        let envelope =
-            tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.task, "more please");
         assert!(envelope.force_direct);
     }
@@ -413,11 +406,10 @@ mod tests {
             direct: None,
         }));
 
-        let msg =
-            tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.text, "keep going");
         assert!(msg.attachments.is_empty());
     }
@@ -474,11 +466,10 @@ mod tests {
             attachments: vec![],
         }));
 
-        let envelope =
-            tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(envelope.force_direct);
         assert!(presence_rx.try_recv().is_err());
     }

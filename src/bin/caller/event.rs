@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-
 /// Source of a context injection item.
 ///
 /// Used by the agent loop to decide which queued injections to discard between
@@ -1157,7 +1156,11 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             commands_preview: commands_preview.clone(),
             source: source.clone(),
         }),
-        AppEvent::AgentOutput { stdout, stderr, source } => Some(OutboundEvent::AgentOutput {
+        AppEvent::AgentOutput {
+            stdout,
+            stderr,
+            source,
+        } => Some(OutboundEvent::AgentOutput {
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             source: source.clone(),
@@ -1176,49 +1179,51 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             reason: reason.clone(),
         }),
-        AppEvent::SteerRequested { session_id, text, id } => Some(OutboundEvent::SteerRequested {
+        AppEvent::SteerRequested {
+            session_id,
+            text,
+            id,
+        } => Some(OutboundEvent::SteerRequested {
             session_id: session_id.clone(),
             text: text.clone(),
             id: id.clone(),
         }),
-        AppEvent::SteerQueued { session_id, id, reason } => Some(OutboundEvent::SteerQueued {
+        AppEvent::SteerQueued {
+            session_id,
+            id,
+            reason,
+        } => Some(OutboundEvent::SteerQueued {
             session_id: session_id.clone(),
             id: id.clone(),
             reason: reason.clone(),
         }),
-        AppEvent::SteerDelivered { session_id, id, mid_turn } => Some(OutboundEvent::SteerDelivered {
+        AppEvent::SteerDelivered {
+            session_id,
+            id,
+            mid_turn,
+        } => Some(OutboundEvent::SteerDelivered {
             session_id: session_id.clone(),
             id: id.clone(),
             mid_turn: *mid_turn,
         }),
-        AppEvent::SessionStarted { session_id, task } => {
-            Some(OutboundEvent::SessionStarted {
-                session_id: session_id.clone(),
-                task: task.clone(),
-            })
-        }
-        AppEvent::SessionAttached { session_id, source } => {
-            Some(OutboundEvent::SessionAttached {
-                session_id: session_id.clone(),
-                source: source.clone(),
-            })
-        }
-        AppEvent::SessionEnded { session_id, reason } => {
-            Some(OutboundEvent::SessionEnded {
-                session_id: session_id.clone(),
-                reason: reason.clone(),
-            })
-        }
-        AppEvent::DebugScreenReady { display_id } => {
-            Some(OutboundEvent::DebugScreenReady {
-                display_id: *display_id,
-            })
-        }
-        AppEvent::DebugScreenTornDown { display_id } => {
-            Some(OutboundEvent::DebugScreenTornDown {
-                display_id: *display_id,
-            })
-        }
+        AppEvent::SessionStarted { session_id, task } => Some(OutboundEvent::SessionStarted {
+            session_id: session_id.clone(),
+            task: task.clone(),
+        }),
+        AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
+            session_id: session_id.clone(),
+            source: source.clone(),
+        }),
+        AppEvent::SessionEnded { session_id, reason } => Some(OutboundEvent::SessionEnded {
+            session_id: session_id.clone(),
+            reason: reason.clone(),
+        }),
+        AppEvent::DebugScreenReady { display_id } => Some(OutboundEvent::DebugScreenReady {
+            display_id: *display_id,
+        }),
+        AppEvent::DebugScreenTornDown { display_id } => Some(OutboundEvent::DebugScreenTornDown {
+            display_id: *display_id,
+        }),
         AppEvent::ApprovalRequired {
             session_id,
             id,
@@ -1232,7 +1237,11 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::AutoApproved { preview } => Some(OutboundEvent::AutoApproved {
             preview: preview.clone(),
         }),
-        AppEvent::ApprovalResolved { session_id, id, action } => Some(OutboundEvent::ApprovalResolved {
+        AppEvent::ApprovalResolved {
+            session_id,
+            id,
+            action,
+        } => Some(OutboundEvent::ApprovalResolved {
             session_id: session_id.clone(),
             id: *id,
             action: action.clone(),
@@ -1270,20 +1279,20 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::DisplayTaken { display_id } => Some(OutboundEvent::DisplayTaken {
             display_id: *display_id,
         }),
-        AppEvent::DisplayReleased { display_id, note } => {
-            Some(OutboundEvent::DisplayReleased {
+        AppEvent::DisplayReleased { display_id, note } => Some(OutboundEvent::DisplayReleased {
+            display_id: *display_id,
+            note: note.clone(),
+        }),
+        AppEvent::UserDisplayGranted { .. } => Some(OutboundEvent::UserDisplayGranted),
+        AppEvent::UserDisplayRevoked { display_id, note } => {
+            Some(OutboundEvent::UserDisplayRevoked {
                 display_id: *display_id,
                 note: note.clone(),
             })
         }
-        AppEvent::UserDisplayGranted { .. } => Some(OutboundEvent::UserDisplayGranted),
-        AppEvent::UserDisplayRevoked { display_id, note } => Some(OutboundEvent::UserDisplayRevoked {
-            display_id: *display_id,
-            note: note.clone(),
-        }),
-        AppEvent::ContextManagement { turn } => Some(OutboundEvent::ContextManagement {
-            turn: *turn,
-        }),
+        AppEvent::ContextManagement { turn } => {
+            Some(OutboundEvent::ContextManagement { turn: *turn })
+        }
         AppEvent::BudgetWarning { pct, remaining } => Some(OutboundEvent::BudgetWarning {
             pct: *pct,
             remaining: *remaining,
@@ -1307,11 +1316,11 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             text: text.clone(),
             seq: *seq,
         }),
-        AppEvent::PresenceLog {
-            message, level, ..
-        } => Some(OutboundEvent::PresenceLog {
+        AppEvent::PresenceLog { message, level, .. } => Some(OutboundEvent::PresenceLog {
             message: message.clone(),
-            level: level.as_ref().map(|l| crate::frontend::log_level_to_str(l).to_string()),
+            level: level
+                .as_ref()
+                .map(|l| crate::frontend::log_level_to_str(l).to_string()),
         }),
         AppEvent::PresenceUsageUpdate {
             total_tokens,
@@ -1512,21 +1521,23 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 reason: reason.clone(),
             })
         }
-        AppEvent::DisplayApprovalPending { display_id, backend } => {
-            Some(OutboundEvent::DisplayApprovalPending {
-                display_id: *display_id,
-                backend: backend.to_string(),
-            })
-        }
-        AppEvent::UploadReady { descriptor } => {
-            Some(OutboundEvent::UploadReady {
-                descriptor: descriptor.clone(),
-            })
-        }
-        AppEvent::UploadDeleted { id } => {
-            Some(OutboundEvent::UploadDeleted { id: id.clone() })
-        }
-        AppEvent::FileChanged { path, kind, lines_added, lines_removed } => {
+        AppEvent::DisplayApprovalPending {
+            display_id,
+            backend,
+        } => Some(OutboundEvent::DisplayApprovalPending {
+            display_id: *display_id,
+            backend: backend.to_string(),
+        }),
+        AppEvent::UploadReady { descriptor } => Some(OutboundEvent::UploadReady {
+            descriptor: descriptor.clone(),
+        }),
+        AppEvent::UploadDeleted { id } => Some(OutboundEvent::UploadDeleted { id: id.clone() }),
+        AppEvent::FileChanged {
+            path,
+            kind,
+            lines_added,
+            lines_removed,
+        } => {
             let kind_str = serde_json::to_value(kind)
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
@@ -1538,23 +1549,26 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 lines_removed: *lines_removed,
             })
         }
-        AppEvent::SnapshotCreated { round_id } => {
-            Some(OutboundEvent::SnapshotCreated { round_id: *round_id })
-        }
-        AppEvent::RolledBack { from_id, to_id, files_reverted } => {
-            Some(OutboundEvent::RolledBack {
-                from_id: *from_id,
-                to_id: *to_id,
-                files_reverted: *files_reverted,
-            })
-        }
+        AppEvent::SnapshotCreated { round_id } => Some(OutboundEvent::SnapshotCreated {
+            round_id: *round_id,
+        }),
+        AppEvent::RolledBack {
+            from_id,
+            to_id,
+            files_reverted,
+        } => Some(OutboundEvent::RolledBack {
+            from_id: *from_id,
+            to_id: *to_id,
+            files_reverted: *files_reverted,
+        }),
         AppEvent::Redone { to_id } => Some(OutboundEvent::Redone { to_id: *to_id }),
-        AppEvent::HistoryPruned { branches_removed, bytes_freed } => {
-            Some(OutboundEvent::HistoryPruned {
-                branches_removed: *branches_removed,
-                bytes_freed: *bytes_freed,
-            })
-        }
+        AppEvent::HistoryPruned {
+            branches_removed,
+            bytes_freed,
+        } => Some(OutboundEvent::HistoryPruned {
+            branches_removed: *branches_removed,
+            bytes_freed: *bytes_freed,
+        }),
         AppEvent::ConversationRolledBack {
             round_id,
             turns_removed,
@@ -1641,10 +1655,7 @@ pub fn spawn_session_log_writer(
 
 /// Write a single AppEvent to the session log if it isn't already logged
 /// inline by the agent loop.
-fn write_event_to_session_log(
-    session_log: &crate::SharedSessionLog,
-    event: &AppEvent,
-) {
+fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &AppEvent) {
     let Ok(mut log) = session_log.lock() else {
         return;
     };
@@ -1653,7 +1664,11 @@ fn write_event_to_session_log(
         // ---- Events NOT logged inline — this writer is their only path to disk ----
 
         // Agent lifecycle
-        AppEvent::AgentStarted { turn, commands_preview, .. } => {
+        AppEvent::AgentStarted {
+            turn,
+            commands_preview,
+            ..
+        } => {
             log.agent_started(*turn, commands_preview);
         }
         AppEvent::DoneSignal { message } => {
@@ -1686,7 +1701,11 @@ fn write_event_to_session_log(
         AppEvent::OrchestratorProgress { status, .. } => {
             log.orchestrator_progress(status);
         }
-        AppEvent::RoundComplete { round, turns_in_round, .. } => {
+        AppEvent::RoundComplete {
+            round,
+            turns_in_round,
+            ..
+        } => {
             log.round_complete(*round, *turns_in_round);
         }
 
@@ -1705,10 +1724,18 @@ fn write_event_to_session_log(
         }
 
         // Display / vision
-        AppEvent::DisplayReady { display_id, width, height } => {
+        AppEvent::DisplayReady {
+            display_id,
+            width,
+            height,
+        } => {
             log.display_ready(*display_id, *width, *height);
         }
-        AppEvent::DisplayResize { display_id, width, height } => {
+        AppEvent::DisplayResize {
+            display_id,
+            width,
+            height,
+        } => {
             log.display_resize(*display_id, *width, *height);
         }
         AppEvent::DisplayTaken { display_id } => {
@@ -1718,23 +1745,29 @@ fn write_event_to_session_log(
             log.display_released(*display_id, note.as_deref());
         }
         AppEvent::DisplayCaptureLost { display_id, reason } => {
-            log.warn(&format!(
-                "Display :{} capture lost: {}",
-                display_id, reason
-            ));
+            log.warn(&format!("Display :{} capture lost: {}", display_id, reason));
         }
-        AppEvent::DisplayApprovalPending { display_id, backend } => {
+        AppEvent::DisplayApprovalPending {
+            display_id,
+            backend,
+        } => {
             log.info(&format!(
                 "Display :{} waiting for OS approval ({backend} portal)",
                 display_id
             ));
         }
         AppEvent::UserDisplayGranted { display_id } => {
-            log.info(&format!("User display access granted (display_id: {})", display_id));
+            log.info(&format!(
+                "User display access granted (display_id: {})",
+                display_id
+            ));
         }
         AppEvent::UserDisplayRevoked { display_id, note } => {
             let msg = if let Some(n) = note {
-                format!("User display access revoked (display_id: {}): {}", display_id, n)
+                format!(
+                    "User display access revoked (display_id: {}): {}",
+                    display_id, n
+                )
             } else {
                 format!("User display access revoked (display_id: {})", display_id)
             };
@@ -1754,7 +1787,10 @@ fn write_event_to_session_log(
         AppEvent::RecordingStopped { stream_name } => {
             log.recording_stopped(stream_name);
         }
-        AppEvent::RecordingError { stream_name, message } => {
+        AppEvent::RecordingError {
+            stream_name,
+            message,
+        } => {
             log.recording_error(stream_name, message);
         }
         AppEvent::RecordingDeleted { stream_name } => {
@@ -1763,18 +1799,24 @@ fn write_event_to_session_log(
 
         // Presence / voice
         AppEvent::PresenceLog { message, level, .. } => {
-            let level_str = level.as_ref().map(|l| {
-                crate::frontend::log_level_to_str(l)
-            });
+            let level_str = level.as_ref().map(|l| crate::frontend::log_level_to_str(l));
             log.presence_log(message, level_str);
         }
         AppEvent::PresenceUsageUpdate {
-            provider, model, total_tokens, context_window, usage_pct, ..
+            provider,
+            model,
+            total_tokens,
+            context_window,
+            usage_pct,
+            ..
         } => {
             log.presence_usage_update(provider, model, *total_tokens, *context_window, *usage_pct);
         }
         AppEvent::LiveUsageUpdate {
-            provider, model, total_tokens, ..
+            provider,
+            model,
+            total_tokens,
+            ..
         } => {
             log.live_usage_update(provider, model, *total_tokens);
         }
@@ -1804,19 +1846,39 @@ fn write_event_to_session_log(
         AppEvent::LiveAudioStarted { id, provider } => {
             log.live_audio_started(id, provider);
         }
-        AppEvent::LiveAudioProgress { id, state, elapsed_secs, transcript_preview } => {
+        AppEvent::LiveAudioProgress {
+            id,
+            state,
+            elapsed_secs,
+            transcript_preview,
+        } => {
             log.live_audio_progress(id, state, *elapsed_secs, transcript_preview);
         }
-        AppEvent::LiveAudioCompleted { id, status, quarantine_count, .. } => {
+        AppEvent::LiveAudioCompleted {
+            id,
+            status,
+            quarantine_count,
+            ..
+        } => {
             log.live_audio_completed(id, status, *quarantine_count);
         }
 
         // External agent paths emit these AppEvents without inline slog()
         // calls, so the EventBus writer is the only path to disk.
-        AppEvent::AgentOutput { stdout, stderr, source } => {
+        AppEvent::AgentOutput {
+            stdout,
+            stderr,
+            source,
+        } => {
             log.agent_output(stdout, stderr, source.as_deref());
         }
-        AppEvent::ModelResponse { content, usage, reasoning, source, .. } => {
+        AppEvent::ModelResponse {
+            content,
+            usage,
+            reasoning,
+            source,
+            ..
+        } => {
             if !content.is_empty() {
                 log.model_response(
                     content,
@@ -1833,23 +1895,38 @@ fn write_event_to_session_log(
         }
 
         // File watcher
-        AppEvent::FileChanged { path, kind, lines_added, lines_removed } => {
+        AppEvent::FileChanged {
+            path,
+            kind,
+            lines_added,
+            lines_removed,
+        } => {
             let kind_str = serde_json::to_value(kind)
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_else(|| "modified".to_string());
-            log.info(&format!("file_{}: {} (+{}/-{})", kind_str, path, lines_added, lines_removed));
+            log.info(&format!(
+                "file_{}: {} (+{}/-{})",
+                kind_str, path, lines_added, lines_removed
+            ));
         }
         AppEvent::SnapshotCreated { round_id } => {
             log.snapshot_created(*round_id);
         }
-        AppEvent::RolledBack { from_id, to_id, files_reverted } => {
+        AppEvent::RolledBack {
+            from_id,
+            to_id,
+            files_reverted,
+        } => {
             log.rolled_back(*from_id, *to_id, *files_reverted);
         }
         AppEvent::Redone { to_id } => {
             log.redone(*to_id);
         }
-        AppEvent::HistoryPruned { branches_removed, bytes_freed } => {
+        AppEvent::HistoryPruned {
+            branches_removed,
+            bytes_freed,
+        } => {
             log.history_pruned(*branches_removed, *bytes_freed);
         }
         AppEvent::ConversationRolledBack {
@@ -2333,7 +2410,13 @@ mod tests {
         let json = r#"{"action":"start_task","task":"fix bug"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target, .. } => {
+            ControlMsg::StartTask {
+                task,
+                orchestrate,
+                reference_frame_ids,
+                display_target,
+                ..
+            } => {
                 assert_eq!(task, "fix bug");
                 assert!(orchestrate.is_none());
                 assert!(reference_frame_ids.is_empty());
@@ -2357,7 +2440,14 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&json).unwrap();
         match parsed {
-            ControlMsg::StartTask { task, orchestrate, reference_frame_ids, display_target, attachments, .. } => {
+            ControlMsg::StartTask {
+                task,
+                orchestrate,
+                reference_frame_ids,
+                display_target,
+                attachments,
+                ..
+            } => {
                 assert_eq!(task, "deploy app");
                 assert_eq!(orchestrate, Some(true));
                 assert_eq!(reference_frame_ids.len(), 1);
@@ -2374,7 +2464,9 @@ mod tests {
         let start_json = r#"{"action":"start_task","session_id":"sess-123","task":"continue"}"#;
         let start: ControlMsg = serde_json::from_str(start_json).unwrap();
         match start {
-            ControlMsg::StartTask { session_id, task, .. } => {
+            ControlMsg::StartTask {
+                session_id, task, ..
+            } => {
                 assert_eq!(session_id.as_deref(), Some("sess-123"));
                 assert_eq!(task, "continue");
             }
@@ -2462,7 +2554,8 @@ mod tests {
 
     #[test]
     fn control_msg_recall_memory_deserialize() {
-        let json = r#"{"action":"recall_memory","keywords":["auth","login"],"channel":"project_state"}"#;
+        let json =
+            r#"{"action":"recall_memory","keywords":["auth","login"],"channel":"project_state"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::RecallMemory {
@@ -2470,7 +2563,10 @@ mod tests {
                 tags,
                 channel,
             } => {
-                assert_eq!(keywords, Some(vec!["auth".to_string(), "login".to_string()]));
+                assert_eq!(
+                    keywords,
+                    Some(vec!["auth".to_string(), "login".to_string()])
+                );
                 assert!(tags.is_none());
                 assert_eq!(channel.as_deref(), Some("project_state"));
             }
@@ -2532,12 +2628,20 @@ mod tests {
     fn control_msg_grant_user_display_deserialize() {
         let json = r#"{"action":"grant_user_display"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, ControlMsg::GrantUserDisplay { display_id: None }));
+        assert!(matches!(
+            msg,
+            ControlMsg::GrantUserDisplay { display_id: None }
+        ));
 
         // With explicit display_id
         let json = r#"{"action":"grant_user_display","display_id":2}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, ControlMsg::GrantUserDisplay { display_id: Some(2) }));
+        assert!(matches!(
+            msg,
+            ControlMsg::GrantUserDisplay {
+                display_id: Some(2)
+            }
+        ));
     }
 
     #[test]
@@ -2584,7 +2688,10 @@ mod tests {
         let json = r#"{"action":"set_diagnostics_visual_marker","enabled":true}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::SetDiagnosticsVisualMarker { display_id, enabled } => {
+            ControlMsg::SetDiagnosticsVisualMarker {
+                display_id,
+                enabled,
+            } => {
                 assert_eq!(display_id, None);
                 assert!(enabled);
             }
@@ -2594,11 +2701,13 @@ mod tests {
 
     #[test]
     fn control_msg_set_diagnostics_visual_marker_with_id_disable() {
-        let json =
-            r#"{"action":"set_diagnostics_visual_marker","display_id":2,"enabled":false}"#;
+        let json = r#"{"action":"set_diagnostics_visual_marker","display_id":2,"enabled":false}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
-            ControlMsg::SetDiagnosticsVisualMarker { display_id, enabled } => {
+            ControlMsg::SetDiagnosticsVisualMarker {
+                display_id,
+                enabled,
+            } => {
                 assert_eq!(display_id, Some(2));
                 assert!(!enabled);
             }

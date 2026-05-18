@@ -127,17 +127,12 @@ impl Coordinator {
     /// policy — the coordinator makes a single attempt at the
     /// first matching peer and does not internally retry against
     /// alternatives.
-    pub async fn route_task(
-        &self,
-        request: TaskRequest,
-    ) -> Result<RoutedTask, CoordinatorError> {
+    pub async fn route_task(&self, request: TaskRequest) -> Result<RoutedTask, CoordinatorError> {
         let handles = self.registry.list();
 
         let mut eligible: Vec<&PeerHandle> = handles
             .iter()
-            .filter(|h| {
-                matches!(h.connection_state(), ConnectionState::Connected)
-            })
+            .filter(|h| matches!(h.connection_state(), ConnectionState::Connected))
             .filter(|h| {
                 let card = h.card_snapshot();
                 request
@@ -150,10 +145,7 @@ impl Coordinator {
         if eligible.is_empty() {
             return Err(CoordinatorError::NoRoute {
                 required: request.required_capabilities,
-                considered: handles
-                    .iter()
-                    .map(|h| h.id().clone())
-                    .collect(),
+                considered: handles.iter().map(|h| h.id().clone()).collect(),
             });
         }
 
@@ -175,21 +167,14 @@ impl Coordinator {
     /// the given capabilities. Useful for UI that wants to show
     /// "which peers could handle this task?" without actually
     /// dispatching.
-    pub fn eligible_peers(
-        &self,
-        required: &[Capability],
-    ) -> Vec<PeerHandle> {
+    pub fn eligible_peers(&self, required: &[Capability]) -> Vec<PeerHandle> {
         self.registry
             .list()
             .into_iter()
-            .filter(|h| {
-                matches!(h.connection_state(), ConnectionState::Connected)
-            })
+            .filter(|h| matches!(h.connection_state(), ConnectionState::Connected))
             .filter(|h| {
                 let card = h.card_snapshot();
-                required
-                    .iter()
-                    .all(|req| card.capabilities.contains(req))
+                required.iter().all(|req| card.capabilities.contains(req))
             })
             .collect()
     }
@@ -198,23 +183,19 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::EventBus;
     use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
     use crate::peer::event::TaggedPeerEvent;
     use crate::peer::id::PeerKind;
     use crate::peer::transport::IntendantWsTransport;
-    use crate::web_gateway::{
-        spawn_web_gateway, ActiveSessionState, WebGatewayConfig,
-    };
-    use crate::event::EventBus;
+    use crate::web_gateway::{spawn_web_gateway, ActiveSessionState, WebGatewayConfig};
     use std::time::{Duration, Instant};
     use tokio::sync::{broadcast, mpsc};
 
     async fn spawn_gateway() -> (u16, tokio::task::JoinHandle<()>) {
         let bus = EventBus::new();
         let (tx, _) = broadcast::channel::<String>(16);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = spawn_web_gateway(
             listener,
@@ -242,11 +223,7 @@ mod tests {
         (registry, log_tx)
     }
 
-    fn fake_card(
-        label: &str,
-        ws_url: &str,
-        caps: Vec<Capability>,
-    ) -> AgentCard {
+    fn fake_card(label: &str, ws_url: &str, caps: Vec<Capability>) -> AgentCard {
         AgentCard {
             id: PeerId::new(PeerKind::Intendant, label),
             label: label.to_string(),
@@ -264,10 +241,7 @@ mod tests {
     async fn wait_connected(handle: &PeerHandle) -> bool {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            if matches!(
-                handle.connection_state(),
-                ConnectionState::Connected
-            ) {
+            if matches!(handle.connection_state(), ConnectionState::Connected) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -300,10 +274,7 @@ mod tests {
             &format!("ws://127.0.0.1:{port}/ws"),
             vec![Capability::ComputerUse, Capability::Knowledge],
         );
-        let peer_id = registry
-            .add_peer_with_card(card)
-            .await
-            .unwrap();
+        let peer_id = registry.add_peer_with_card(card).await.unwrap();
         let handle = registry.get(&peer_id).unwrap();
         assert!(wait_connected(&handle).await, "peer never connected");
 
@@ -332,9 +303,7 @@ mod tests {
     #[tokio::test]
     async fn route_skips_disconnected_peers() {
         // Probe-then-release an ephemeral port → definitely refused.
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_port = probe.local_addr().unwrap().port();
         drop(probe);
 
@@ -487,14 +456,12 @@ mod tests {
         let coordinator = Coordinator::new(registry.clone());
 
         // Matches.
-        let matches = coordinator
-            .eligible_peers(&[Capability::ComputerUse]);
+        let matches = coordinator.eligible_peers(&[Capability::ComputerUse]);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id(), &peer_id);
 
         // Doesn't match (Phone not advertised).
-        let no_match = coordinator
-            .eligible_peers(&[Capability::Phone]);
+        let no_match = coordinator.eligible_peers(&[Capability::Phone]);
         assert!(no_match.is_empty());
 
         registry.remove_peer(&peer_id).await.unwrap();

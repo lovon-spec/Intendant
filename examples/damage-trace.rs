@@ -50,8 +50,7 @@ fn main() {
     use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesExt};
     use x11rb::protocol::Event;
 
-    let mut display: String =
-        std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+    let mut display: String = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
     let mut tile_size_px: u32 = 64;
     let mut interval_ms: u64 = 33;
     let mut duration_secs: u64 = 60;
@@ -87,7 +86,10 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!("usage: damage-trace [--display :N] [--tile-size N] [--interval-ms N] [--duration SECS]");
-                eprintln!("defaults: DISPLAY={} tile_size=64 interval_ms=33 duration=60", display);
+                eprintln!(
+                    "defaults: DISPLAY={} tile_size=64 interval_ms=33 duration=60",
+                    display
+                );
                 std::process::exit(0);
             }
             other => {
@@ -126,13 +128,14 @@ fn main() {
 
     let setup = conn.setup();
     let screen = &setup.roots[screen_num];
-    let (sw, sh) = (screen.width_in_pixels as u32, screen.height_in_pixels as u32);
+    let (sw, sh) = (
+        screen.width_in_pixels as u32,
+        screen.height_in_pixels as u32,
+    );
 
     if !damage_present || !xfixes_present {
         let missing = if !damage_present { "DAMAGE" } else { "XFIXES" };
-        eprintln!(
-            "  capability=None  X11 extension '{missing}' missing — explicit degradation"
-        );
+        eprintln!("  capability=None  X11 extension '{missing}' missing — explicit degradation");
         eprintln!("  geometry={sw}x{sh}");
         eprintln!("  No further work; example exiting since there's nothing to trace.");
         std::process::exit(0);
@@ -142,17 +145,27 @@ fn main() {
     // type-check because the cookie's send error and reply error are
     // distinct types in x11rb; explicit match is cleaner here.
     match conn.damage_query_version(1, 1) {
-        Err(e) => { eprintln!("  fatal: damage_query_version send: {e}"); std::process::exit(4); }
-        Ok(c) => if let Err(e) = c.reply() {
-            eprintln!("  fatal: damage_query_version reply: {e}");
+        Err(e) => {
+            eprintln!("  fatal: damage_query_version send: {e}");
             std::process::exit(4);
+        }
+        Ok(c) => {
+            if let Err(e) = c.reply() {
+                eprintln!("  fatal: damage_query_version reply: {e}");
+                std::process::exit(4);
+            }
         }
     }
     match conn.xfixes_query_version(5, 0) {
-        Err(e) => { eprintln!("  fatal: xfixes_query_version send: {e}"); std::process::exit(4); }
-        Ok(c) => if let Err(e) = c.reply() {
-            eprintln!("  fatal: xfixes_query_version reply: {e}");
+        Err(e) => {
+            eprintln!("  fatal: xfixes_query_version send: {e}");
             std::process::exit(4);
+        }
+        Ok(c) => {
+            if let Err(e) = c.reply() {
+                eprintln!("  fatal: xfixes_query_version reply: {e}");
+                std::process::exit(4);
+            }
         }
     }
 
@@ -165,10 +178,15 @@ fn main() {
         }
     };
     match conn.damage_create(damage_id, root, ReportLevel::BOUNDING_BOX) {
-        Err(e) => { eprintln!("  fatal: damage_create send: {e}"); std::process::exit(4); }
-        Ok(c) => if let Err(e) = c.check() {
-            eprintln!("  fatal: damage_create check: {e}");
+        Err(e) => {
+            eprintln!("  fatal: damage_create send: {e}");
             std::process::exit(4);
+        }
+        Ok(c) => {
+            if let Err(e) = c.check() {
+                eprintln!("  fatal: damage_create check: {e}");
+                std::process::exit(4);
+            }
         }
     }
     let _ = conn.flush();

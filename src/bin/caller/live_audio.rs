@@ -1,6 +1,6 @@
+use crate::audio_routing::AudioBridge;
 use crate::error::CallerError;
 use crate::live_audio_types::*;
-use crate::audio_routing::AudioBridge;
 use crate::quarantine;
 use crate::schema_validator;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -56,7 +56,11 @@ fn build_live_audio_tools(schema: &ResponseSchema) -> (serde_json::Value, serde_
     let mut required = Vec::new();
     for field in &schema.fields {
         let prop = match &field.field_type {
-            FieldType::String { max_length, allowed_values, .. } => {
+            FieldType::String {
+                max_length,
+                allowed_values,
+                ..
+            } => {
                 let mut p = serde_json::json!({"type": "string"});
                 if let Some(max) = max_length {
                     p["maxLength"] = serde_json::json!(max);
@@ -68,12 +72,19 @@ fn build_live_audio_tools(schema: &ResponseSchema) -> (serde_json::Value, serde_
             }
             FieldType::Integer { min, max } => {
                 let mut p = serde_json::json!({"type": "integer"});
-                if let Some(min) = min { p["minimum"] = serde_json::json!(min); }
-                if let Some(max) = max { p["maximum"] = serde_json::json!(max); }
+                if let Some(min) = min {
+                    p["minimum"] = serde_json::json!(min);
+                }
+                if let Some(max) = max {
+                    p["maximum"] = serde_json::json!(max);
+                }
                 p
             }
             FieldType::Boolean => serde_json::json!({"type": "boolean"}),
-            FieldType::Array { element_type, max_items } => {
+            FieldType::Array {
+                element_type,
+                max_items,
+            } => {
                 let items = match element_type.as_ref() {
                     FieldType::String { .. } => serde_json::json!({"type": "string"}),
                     FieldType::Integer { .. } => serde_json::json!({"type": "integer"}),
@@ -81,7 +92,9 @@ fn build_live_audio_tools(schema: &ResponseSchema) -> (serde_json::Value, serde_
                     _ => serde_json::json!({"type": "string"}),
                 };
                 let mut p = serde_json::json!({"type": "array", "items": items});
-                if let Some(max) = max_items { p["maxItems"] = serde_json::json!(max); }
+                if let Some(max) = max_items {
+                    p["maxItems"] = serde_json::json!(max);
+                }
                 p
             }
         };
@@ -143,9 +156,7 @@ fn build_live_audio_tools(schema: &ResponseSchema) -> (serde_json::Value, serde_
 // ---------------------------------------------------------------------------
 
 type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
 >;
 
@@ -209,11 +220,9 @@ impl LiveAudioSession {
 
         // OpenAI requires an explicit response.create after sending content
         if self.provider == LiveAudioProvider::OpenAI {
-            sink.send(WsMessage::Text(
-                r#"{"type":"response.create"}"#.to_string(),
-            ))
-            .await
-            .map_err(|e| CallerError::Agent(format!("WebSocket send error: {}", e)))?;
+            sink.send(WsMessage::Text(r#"{"type":"response.create"}"#.to_string()))
+                .await
+                .map_err(|e| CallerError::Agent(format!("WebSocket send error: {}", e)))?;
         }
 
         Ok(())
@@ -300,9 +309,7 @@ pub async fn connect_gemini(
 }
 
 type WsReadStream = futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
 async fn gemini_read_loop(
@@ -346,7 +353,11 @@ async fn gemini_read_loop(
                     let args = fc.get("args").cloned().unwrap_or_default();
                     let call_id = fc["id"].as_str().unwrap_or("").to_string();
                     if name == FN_SUBMIT_RESPONSE || name == FN_END_CALL {
-                        let _ = event_tx.send(LiveAudioEvent::FunctionCall { name, call_id, args });
+                        let _ = event_tx.send(LiveAudioEvent::FunctionCall {
+                            name,
+                            call_id,
+                            args,
+                        });
                     } else {
                         let _ = event_tx.send(LiveAudioEvent::ToolCallAttempted { name, args });
                     }
@@ -392,12 +403,10 @@ async fn gemini_read_loop(
                         if let Some(inline) = part.get("inlineData") {
                             if let Some(mime) = inline.get("mimeType").and_then(|v| v.as_str()) {
                                 if mime.starts_with("audio/") {
-                                    if let Some(data) =
-                                        inline.get("data").and_then(|v| v.as_str())
+                                    if let Some(data) = inline.get("data").and_then(|v| v.as_str())
                                     {
                                         if let Ok(pcm) = BASE64.decode(data) {
-                                            let _ = event_tx
-                                                .send(LiveAudioEvent::AudioOut(pcm));
+                                            let _ = event_tx.send(LiveAudioEvent::AudioOut(pcm));
                                         }
                                     }
                                 }
@@ -405,20 +414,22 @@ async fn gemini_read_loop(
                         }
                         // Text output
                         if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                            let _ =
-                                event_tx.send(LiveAudioEvent::ModelText(text.to_string()));
+                            let _ = event_tx.send(LiveAudioEvent::ModelText(text.to_string()));
                         }
                         // Function call in model turn
                         if let Some(fc) = part.get("functionCall") {
-                            let name =
-                                fc["name"].as_str().unwrap_or("unknown").to_string();
+                            let name = fc["name"].as_str().unwrap_or("unknown").to_string();
                             let args = fc.get("args").cloned().unwrap_or_default();
                             let call_id = fc["id"].as_str().unwrap_or("").to_string();
                             if name == FN_SUBMIT_RESPONSE || name == FN_END_CALL {
-                                let _ = event_tx.send(LiveAudioEvent::FunctionCall { name, call_id, args });
+                                let _ = event_tx.send(LiveAudioEvent::FunctionCall {
+                                    name,
+                                    call_id,
+                                    args,
+                                });
                             } else {
-                                let _ = event_tx
-                                    .send(LiveAudioEvent::ToolCallAttempted { name, args });
+                                let _ =
+                                    event_tx.send(LiveAudioEvent::ToolCallAttempted { name, args });
                             }
                         }
                     }
@@ -450,20 +461,28 @@ pub async fn connect_openai(
     use tokio_tungstenite::tungstenite::http;
     let request = http::Request::builder()
         .uri(&url)
-        .header("Sec-WebSocket-Protocol", format!(
-            "realtime, openai-insecure-api-key.{}, openai-beta.realtime-v1",
-            api_key
-        ))
+        .header(
+            "Sec-WebSocket-Protocol",
+            format!(
+                "realtime, openai-insecure-api-key.{}, openai-beta.realtime-v1",
+                api_key
+            ),
+        )
         .header("Host", "api.openai.com")
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+        .header(
+            "Sec-WebSocket-Key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
         .body(())
         .map_err(|e| CallerError::Agent(format!("failed to build request: {}", e)))?;
 
     let (ws_stream, _): (
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
         _,
     ) = tokio_tungstenite::connect_async(request)
         .await
@@ -560,7 +579,11 @@ async fn openai_read_loop(
                 )
                 .unwrap_or_default();
                 if name == FN_SUBMIT_RESPONSE || name == FN_END_CALL {
-                    let _ = event_tx.send(LiveAudioEvent::FunctionCall { name, call_id, args });
+                    let _ = event_tx.send(LiveAudioEvent::FunctionCall {
+                        name,
+                        call_id,
+                        args,
+                    });
                 } else {
                     let _ = event_tx.send(LiveAudioEvent::ToolCallAttempted { name, args });
                 }
@@ -613,16 +636,18 @@ async fn vortex_read_msg(
     reader: &mut (impl AsyncReadExt + Unpin),
 ) -> Result<(u32, Vec<u8>), CallerError> {
     let mut hdr = [0u8; 8];
-    reader.read_exact(&mut hdr).await.map_err(|e| {
-        CallerError::Agent(format!("vortex: read header: {}", e))
-    })?;
+    reader
+        .read_exact(&mut hdr)
+        .await
+        .map_err(|e| CallerError::Agent(format!("vortex: read header: {}", e)))?;
     let msg_type = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
     let payload_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
     let mut payload = vec![0u8; payload_len];
     if payload_len > 0 {
-        reader.read_exact(&mut payload).await.map_err(|e| {
-            CallerError::Agent(format!("vortex: read payload: {}", e))
-        })?;
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| CallerError::Agent(format!("vortex: read payload: {}", e)))?;
     }
     Ok((msg_type, payload))
 }
@@ -640,9 +665,10 @@ async fn vortex_write_msg(
     msg.extend_from_slice(&msg_type.to_le_bytes());
     msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     msg.extend_from_slice(payload);
-    writer.write_all(&msg).await.map_err(|e| {
-        CallerError::Agent(format!("vortex: write msg: {}", e))
-    })?;
+    writer
+        .write_all(&msg)
+        .await
+        .map_err(|e| CallerError::Agent(format!("vortex: write msg: {}", e)))?;
     Ok(())
 }
 
@@ -694,10 +720,7 @@ fn vortex_playback_convert(pcm16_mono_24k: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(num_samples * 16);
 
     for i in 0..num_samples {
-        let sample = i16::from_le_bytes([
-            pcm16_mono_24k[i * 2],
-            pcm16_mono_24k[i * 2 + 1],
-        ]);
+        let sample = i16::from_le_bytes([pcm16_mono_24k[i * 2], pcm16_mono_24k[i * 2 + 1]]);
         let f = sample as f32 / 32768.0;
         let bytes = f.to_le_bytes();
         // Duplicate sample for 2:1 upsample, stereo (L=R)
@@ -818,8 +841,12 @@ async fn start_vortex_shm_bridge(
     let base = ptr as *mut u8;
 
     // Verify magic
-    let magic = unsafe { (base.add(OFF_MAGIC) as *const std::sync::atomic::AtomicU32).as_ref().unwrap() }
-        .load(std::sync::atomic::Ordering::Acquire);
+    let magic = unsafe {
+        (base.add(OFF_MAGIC) as *const std::sync::atomic::AtomicU32)
+            .as_ref()
+            .unwrap()
+    }
+    .load(std::sync::atomic::Ordering::Acquire);
     if magic != VORTEX_SHM_MAGIC {
         return Err(CallerError::Agent(format!(
             "vortex shm magic mismatch: expected 0x{:08X}, got 0x{:08X}",
@@ -902,7 +929,11 @@ async fn start_vortex_shm_bridge(
                 let _ = tee.send(pcm16);
             }
             let mut sink = capture_write.lock().await;
-            if sink.send(WsMessage::Text(ws_msg.to_string())).await.is_err() {
+            if sink
+                .send(WsMessage::Text(ws_msg.to_string()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -961,17 +992,14 @@ async fn start_vortex_audio_bridge(
 ) -> Result<AudioStreamBridge, CallerError> {
     // Clean up stale socket and bind
     let _ = std::fs::remove_file(socket_path);
-    let listener = tokio::net::UnixListener::bind(socket_path).map_err(|e| {
-        CallerError::Agent(format!("vortex: bind {}: {}", socket_path, e))
-    })?;
+    let listener = tokio::net::UnixListener::bind(socket_path)
+        .map_err(|e| CallerError::Agent(format!("vortex: bind {}: {}", socket_path, e)))?;
     eprintln!("live_audio: vortex bridge listening on {}", socket_path);
 
     // Wait for daemon to connect (it retries every 2s)
     let stream = tokio::time::timeout(Duration::from_secs(30), listener.accept())
         .await
-        .map_err(|_| {
-            CallerError::Agent("vortex: daemon did not connect within 30s".into())
-        })?
+        .map_err(|_| CallerError::Agent("vortex: daemon did not connect within 30s".into()))?
         .map_err(|e| CallerError::Agent(format!("vortex: accept: {}", e)))?
         .0;
     eprintln!("live_audio: vortex daemon connected");
@@ -1060,7 +1088,11 @@ async fn start_vortex_audio_bridge(
                 let _ = tee.send(pcm16);
             }
             let mut sink = capture_write.lock().await;
-            if sink.send(WsMessage::Text(ws_msg.to_string())).await.is_err() {
+            if sink
+                .send(WsMessage::Text(ws_msg.to_string()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -1148,7 +1180,10 @@ async fn start_network_audio_bridge(
                 Err(_) => break,
             }
         }
-        eprintln!("live_audio: network capture ended after {} chunks", chunks_sent);
+        eprintln!(
+            "live_audio: network capture ended after {} chunks",
+            chunks_sent
+        );
     });
 
     // Playback task: model audio → write PCM to TCP (host plays to app mic)
@@ -1316,8 +1351,7 @@ fn extract_json_object(text: &str) -> Option<String> {
                         depth -= 1;
                         if depth == 0 {
                             let candidate = &text[start..=j];
-                            if let Ok(parsed) =
-                                serde_json::from_str::<serde_json::Value>(candidate)
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(candidate)
                             {
                                 if parsed.is_object() {
                                     return Some(candidate.to_string());
@@ -1569,7 +1603,9 @@ pub async fn run_session(
         let time_since_output = last_model_output.elapsed();
         if time_since_output >= silence_limit && !silence_nudged {
             silence_nudged = true;
-            let _ = session.send_text("Are you still there? Please continue the conversation.").await;
+            let _ = session
+                .send_text("Are you still there? Please continue the conversation.")
+                .await;
         }
 
         match tokio::time::timeout(remaining.min(silence_limit), session.event_rx.recv()).await {
@@ -1588,35 +1624,41 @@ pub async fn run_session(
                     // Emit progress (throttled to ~2s intervals to avoid
                     // flooding the event bus with 100+ near-identical events)
                     if let Some(bus) = event_bus {
-                    if last_progress_emit.elapsed() >= Duration::from_secs(2) {
-                    last_progress_emit = Instant::now();
-                        let preview = if model_transcript_buf.len() > 200 {
-                            {
-                                let start = model_transcript_buf.len() - 200;
-                                let start = model_transcript_buf.ceil_char_boundary(start);
-                                model_transcript_buf[start..].to_string()
-                            }
-                        } else {
-                            model_transcript_buf.clone()
-                        };
-                        bus.send(crate::event::AppEvent::LiveAudioProgress {
-                            id: spec.id.clone(),
-                            state: "speaking".into(),
-                            elapsed_secs: start.elapsed().as_secs_f64(),
-                            transcript_preview: preview,
-                        });
-                    } // throttle
+                        if last_progress_emit.elapsed() >= Duration::from_secs(2) {
+                            last_progress_emit = Instant::now();
+                            let preview = if model_transcript_buf.len() > 200 {
+                                {
+                                    let start = model_transcript_buf.len() - 200;
+                                    let start = model_transcript_buf.ceil_char_boundary(start);
+                                    model_transcript_buf[start..].to_string()
+                                }
+                            } else {
+                                model_transcript_buf.clone()
+                            };
+                            bus.send(crate::event::AppEvent::LiveAudioProgress {
+                                id: spec.id.clone(),
+                                state: "speaking".into(),
+                                elapsed_secs: start.elapsed().as_secs_f64(),
+                                transcript_preview: preview,
+                            });
+                        } // throttle
                     } // bus
                 }
                 LiveAudioEvent::ModelText(text) => {
                     model_text.push_str(&text);
                 }
-                LiveAudioEvent::FunctionCall { name, call_id, args } => {
+                LiveAudioEvent::FunctionCall {
+                    name,
+                    call_id,
+                    args,
+                } => {
                     if name == FN_SUBMIT_RESPONSE {
                         // Reject null/empty submissions — the voice model sometimes
                         // calls submit_response with no arguments. Keep the session
                         // alive so it can try again.
-                        if args.is_null() || (args.is_object() && args.as_object().unwrap().is_empty()) {
+                        if args.is_null()
+                            || (args.is_object() && args.as_object().unwrap().is_empty())
+                        {
                             continue;
                         }
                         // The model submitted structured response via function call.
@@ -1639,12 +1681,23 @@ pub async fn run_session(
                         // Drain: keep playing audio for up to 5s waiting for end_call
                         let drain_deadline = Instant::now() + Duration::from_secs(5);
                         loop {
-                            let remaining = drain_deadline.saturating_duration_since(Instant::now());
-                            if remaining.is_zero() { break; }
+                            let remaining =
+                                drain_deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
                             match tokio::time::timeout(remaining, session.event_rx.recv()).await {
-                                Ok(Some(LiveAudioEvent::FunctionCall { name, .. })) if name == FN_END_CALL => break,
-                                Ok(Some(LiveAudioEvent::AudioOut(pcm))) => { let _ = audio_out_tx.send(pcm); }
-                                Ok(Some(LiveAudioEvent::Disconnected(_))) | Ok(None) | Err(_) => break,
+                                Ok(Some(LiveAudioEvent::FunctionCall { name, .. }))
+                                    if name == FN_END_CALL =>
+                                {
+                                    break
+                                }
+                                Ok(Some(LiveAudioEvent::AudioOut(pcm))) => {
+                                    let _ = audio_out_tx.send(pcm);
+                                }
+                                Ok(Some(LiveAudioEvent::Disconnected(_))) | Ok(None) | Err(_) => {
+                                    break
+                                }
                                 Ok(Some(_)) => {} // keep draining other events
                             }
                         }
@@ -1720,8 +1773,8 @@ pub async fn run_session(
     // Final attempt to extract JSON from accumulated buffers (covers timeout/disconnect
     // cases where no TurnComplete fired after the model produced JSON).
     if model_text.is_empty() || serde_json::from_str::<serde_json::Value>(&model_text).is_err() {
-        if let Some(json_str) = extract_json_object(&model_text)
-            .or_else(|| extract_json_object(&model_transcript_buf))
+        if let Some(json_str) =
+            extract_json_object(&model_text).or_else(|| extract_json_object(&model_transcript_buf))
         {
             model_text = json_str;
             if status == LiveAudioStatus::TimedOut {
@@ -1765,7 +1818,10 @@ pub async fn run_session(
                 {
                     quarantine_ids.push(payload.payload_id);
                 }
-                (None, LiveAudioStatus::SchemaError("model output was not valid JSON".into()))
+                (
+                    None,
+                    LiveAudioStatus::SchemaError("model output was not valid JSON".into()),
+                )
             }
         }
     } else {
@@ -1819,7 +1875,12 @@ mod tests {
         // Frame 2: L=-1.0, R=-1.0 → mono=-1.0 → kept
         // Frame 3: L=0.0, R=0.0 → mono=0.0 → skipped
         let mut input = Vec::new();
-        for &(l, r) in &[(0.5f32, 0.5f32), (0.25f32, 0.75f32), (-1.0f32, -1.0f32), (0.0f32, 0.0f32)] {
+        for &(l, r) in &[
+            (0.5f32, 0.5f32),
+            (0.25f32, 0.75f32),
+            (-1.0f32, -1.0f32),
+            (0.0f32, 0.0f32),
+        ] {
             input.extend_from_slice(&l.to_le_bytes());
             input.extend_from_slice(&r.to_le_bytes());
         }
@@ -1878,7 +1939,9 @@ mod tests {
             assert!(
                 (orig - rt).abs() <= 1,
                 "sample {}: orig={} round_trip={}",
-                i, orig, rt
+                i,
+                orig,
+                rt
             );
         }
     }
@@ -2034,10 +2097,7 @@ mod tests {
     #[test]
     fn extract_json_from_transcript_with_prose() {
         let text = r#"Test complete. {"status": "ok"}"#;
-        assert_eq!(
-            extract_json_object(text).unwrap(),
-            r#"{"status": "ok"}"#
-        );
+        assert_eq!(extract_json_object(text).unwrap(), r#"{"status": "ok"}"#);
     }
 
     #[test]
@@ -2140,7 +2200,10 @@ mod tests {
         }
 
         session.close().await;
-        assert!(got_setup, "did not receive SetupComplete from OpenAI Realtime");
+        assert!(
+            got_setup,
+            "did not receive SetupComplete from OpenAI Realtime"
+        );
     }
 
     /// Layer 2: Send text, receive audio + transcript + turn_complete.
@@ -2476,9 +2539,7 @@ mod tests {
         let capture_arg = format!("--capture-dev={}", dev_idx);
         let playback_arg = format!("--playback-dev={}", dev_idx);
 
-        let sip_password = match std::fs::read_to_string(
-            dirs::home_dir().unwrap().join("lin"),
-        ) {
+        let sip_password = match std::fs::read_to_string(dirs::home_dir().unwrap().join("lin")) {
             Ok(p) => p.trim().to_string(),
             Err(_) => {
                 eprintln!("~/lin not found (SIP password), skipping");
@@ -2520,9 +2581,7 @@ mod tests {
             if let Some(ref mut stdin) = pjsua.stdin {
                 let _ = stdin.write_all(b"m\n").await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                let _ = stdin
-                    .write_all(b"sip:intendant8@sip.linphone.org\n")
-                    .await;
+                let _ = stdin.write_all(b"sip:intendant8@sip.linphone.org\n").await;
             }
             eprintln!("  pjsua calling intendant8 — ANSWER YOUR PHONE!");
             pjsua
@@ -2621,7 +2680,10 @@ mod tests {
             LiveAudioStatus::Completed => {
                 let data = result.response_data.as_ref().unwrap();
                 eprintln!("  Summary: {}", data["summary"].as_str().unwrap_or("?"));
-                eprintln!("  Caller mood: {}", data["caller_mood"].as_str().unwrap_or("?"));
+                eprintln!(
+                    "  Caller mood: {}",
+                    data["caller_mood"].as_str().unwrap_or("?")
+                );
             }
             LiveAudioStatus::TimedOut => {
                 eprintln!("  Session timed out — model did not produce JSON response");

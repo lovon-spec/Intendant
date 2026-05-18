@@ -294,8 +294,8 @@ mod tests {
         // produce each tile once.
         let g = grid64(1024, 768);
         let dirty = g.dirty_tiles(&[
-            Rect::new(0, 0, 128, 128),  // tiles (0..2, 0..2) = 4
-            Rect::new(50, 50, 50, 50),  // tiles (0..2, 0..2) subset
+            Rect::new(0, 0, 128, 128), // tiles (0..2, 0..2) = 4
+            Rect::new(50, 50, 50, 50), // tiles (0..2, 0..2) subset
         ]);
         assert_eq!(dirty.len(), 4);
     }

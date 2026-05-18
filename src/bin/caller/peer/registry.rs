@@ -159,7 +159,8 @@ impl PeerRegistry {
     /// [`PeerError::Rejected`] — idempotent re-registration is a
     /// follow-up concern.
     pub async fn add_peer(&self, card_url: &str) -> Result<PeerId, PeerError> {
-        self.add_peer_with_via_and_auth(card_url, Vec::new(), None).await
+        self.add_peer_with_via_and_auth(card_url, Vec::new(), None)
+            .await
     }
 
     /// Variant of [`add_peer`] that lets the connecting operator
@@ -170,7 +171,8 @@ impl PeerRegistry {
         card_url: &str,
         via_urls: Vec<String>,
     ) -> Result<PeerId, PeerError> {
-        self.add_peer_with_via_and_auth(card_url, via_urls, None).await
+        self.add_peer_with_via_and_auth(card_url, via_urls, None)
+            .await
     }
 
     /// Wrapper over [`add_peer_with_credentials`] that doesn't pass
@@ -183,14 +185,8 @@ impl PeerRegistry {
         via_urls: Vec<String>,
         bearer_token: Option<String>,
     ) -> Result<PeerId, PeerError> {
-        self.add_peer_with_credentials(
-            card_url,
-            via_urls,
-            bearer_token,
-            Vec::new(),
-            None,
-        )
-        .await
+        self.add_peer_with_credentials(card_url, via_urls, bearer_token, Vec::new(), None)
+            .await
     }
 
     /// Full add-peer entry point: card_url + optional via override +
@@ -338,8 +334,8 @@ impl PeerRegistry {
         // fingerprint list (when the card doesn't require pinning)
         // is the no-op case — transports treat empty as "default
         // TLS verification."
-        let pinned_fingerprints = parse_card_pinned_fingerprints(&card.auth.transport)
-            .map_err(|e| {
+        let pinned_fingerprints =
+            parse_card_pinned_fingerprints(&card.auth.transport).map_err(|e| {
                 PeerError::Auth(format!(
                     "peer {} card has invalid pinned fingerprint: {e}",
                     card.id
@@ -356,12 +352,11 @@ impl PeerRegistry {
             browser_tcp_via_url,
             log_sink,
             move |events_tx| {
-            // Build one concrete transport per supported spec (each
-            // gets its own clone of `events_tx`, `bearer_token`, and
-            // `pinned_fingerprints`) and wrap them in a
-            // `MultiTransport` that probes them in order on connect.
-            let candidates: Vec<Box<dyn crate::peer::traits::PeerTransport>> =
-                supported_specs
+                // Build one concrete transport per supported spec (each
+                // gets its own clone of `events_tx`, `bearer_token`, and
+                // `pinned_fingerprints`) and wrap them in a
+                // `MultiTransport` that probes them in order on connect.
+                let candidates: Vec<Box<dyn crate::peer::traits::PeerTransport>> = supported_specs
                     .iter()
                     .map(|spec| {
                         build_transport(
@@ -372,8 +367,9 @@ impl PeerRegistry {
                         )
                     })
                     .collect();
-            Box::new(crate::peer::transport::MultiTransport::new(candidates))
-        });
+                Box::new(crate::peer::transport::MultiTransport::new(candidates))
+            },
+        );
 
         self.inner
             .peers
@@ -429,10 +425,7 @@ impl PeerRegistry {
 /// (via explicit disconnect or transport-level shutdown). No cancellation
 /// token is needed; the lifetime is tied to the handle's lifetime via
 /// the watch channels.
-fn spawn_state_observer(
-    handle: PeerHandle,
-    events: broadcast::Sender<RegistryEvent>,
-) {
+fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEvent>) {
     tokio::spawn(async move {
         let mut conn_rx = handle.connection_updates();
         let mut status_rx = handle.status_updates();
@@ -485,10 +478,7 @@ fn spawn_state_observer(
 /// never see `Closed` even after the peer actor exits and the registry
 /// drops its handle. The result would be one stuck task per peer-add
 /// over the lifetime of the registry.
-fn spawn_event_forwarder(
-    handle: PeerHandle,
-    events: broadcast::Sender<RegistryEvent>,
-) {
+fn spawn_event_forwarder(handle: PeerHandle, events: broadcast::Sender<RegistryEvent>) {
     let peer_id = handle.id().clone();
     let mut peer_events = handle.subscribe();
     // Drop the handle before the spawn so its inner broadcast Sender
@@ -525,10 +515,7 @@ fn spawn_event_forwarder(
 /// (as provided by a user adding a peer). Small duplication; kept
 /// here so the registry doesn't depend on a specific transport
 /// implementation for its discovery step.
-async fn fetch_card(
-    card_url: &str,
-    bearer_token: Option<&str>,
-) -> Result<AgentCard, PeerError> {
+async fn fetch_card(card_url: &str, bearer_token: Option<&str>) -> Result<AgentCard, PeerError> {
     let client = reqwest::Client::builder()
         .timeout(CARD_FETCH_TIMEOUT)
         .build()
@@ -629,10 +616,10 @@ fn parse_card_pinned_fingerprints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::EventBus;
     use crate::peer::card::{AuthRequirements, Capability};
     use crate::peer::id::PeerKind;
     use crate::web_gateway::{spawn_web_gateway, ActiveSessionState, WebGatewayConfig};
-    use crate::event::EventBus;
     use tokio::sync::{broadcast, mpsc};
     use tokio::time::Duration;
 
@@ -642,9 +629,7 @@ mod tests {
     async fn spawn_test_peer() -> (u16, tokio::task::JoinHandle<()>) {
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(64);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = spawn_web_gateway(
             listener,
@@ -1273,17 +1258,10 @@ mod tests {
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
         // Operator-supplied override — must end up in the stored card's
         // auth.transport regardless of what the fetched card claimed.
-        let override_pinned = vec![
-            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string(),
-        ];
+        let override_pinned =
+            vec!["11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string()];
         let peer_id = reg
-            .add_peer_with_credentials(
-                &card_url,
-                Vec::new(),
-                None,
-                override_pinned.clone(),
-                None,
-            )
+            .add_peer_with_credentials(&card_url, Vec::new(), None, override_pinned.clone(), None)
             .await
             .expect("add_peer_with_credentials with valid override succeeds");
 
@@ -1445,7 +1423,10 @@ mod tests {
             }
             other => panic!("expected PeerError::Auth, got {other:?}"),
         }
-        assert!(reg.is_empty(), "failed registration should not store the peer");
+        assert!(
+            reg.is_empty(),
+            "failed registration should not store the peer"
+        );
     }
 
     /// End-to-end: a well-formed pinned card registers cleanly.
@@ -1516,10 +1497,7 @@ mod tests {
         let picked = pick_supported_transports(&transports);
         assert_eq!(picked.len(), 2);
         match (&picked[0], &picked[1]) {
-            (
-                TransportSpec::IntendantWs { url: a },
-                TransportSpec::IntendantWs { url: b },
-            ) => {
+            (TransportSpec::IntendantWs { url: a }, TransportSpec::IntendantWs { url: b }) => {
                 assert_eq!(a, "ws://lan/ws");
                 assert_eq!(b, "ws://tail/ws");
             }

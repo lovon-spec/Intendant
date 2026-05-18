@@ -90,7 +90,9 @@ fn print_chrome_linux(lan_ip: &str, port: u16) {
     println!("      certutil -d sql:$HOME/.pki/nssdb -A -t \"C,,\" \\");
     println!("        -n \"Intendant CA\" -i <(curl -s http://{lan_ip}:{port}/ca.crt)");
     println!();
-    println!("      (Install libnss3-tools if certutil is missing: sudo apt install libnss3-tools)");
+    println!(
+        "      (Install libnss3-tools if certutil is missing: sudo apt install libnss3-tools)"
+    );
     println!();
     println!("    Step 2 — Install client certificate (run in terminal):");
     println!("      curl -so /tmp/client.p12 http://{lan_ip}:{port}/client.p12");

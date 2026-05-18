@@ -91,7 +91,13 @@ pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
     for sc_display in content.displays() {
         let cg = CGDisplay::new(sc_display.display_id());
         let is_primary = sc_display.display_id() == main_id;
-        let id = if is_primary { 0 } else { let id = next_id; next_id += 1; id };
+        let id = if is_primary {
+            0
+        } else {
+            let id = next_id;
+            next_id += 1;
+            id
+        };
         let width = cg.pixels_wide() as u32;
         let height = cg.pixels_high() as u32;
 
@@ -120,10 +126,7 @@ pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
 
 #[async_trait]
 impl DisplayBackend for MacOSBackend {
-    async fn start_capture(
-        &self,
-        fps: u32,
-    ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+    async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
         // Defensive: matching the x11.rs pattern — teardown any previous
         // capture before starting a new one, so a double-start doesn't
         // leak the ScreenCaptureKit stream. `stop_capture` is idempotent
@@ -276,7 +279,14 @@ impl DisplayBackend for MacOSBackend {
             .map_err(|()| CallerError::Display("failed to create CGEventSource".into()))?;
 
         match event {
-            InputEvent::KeyDown { ref code, shift, ctrl, alt, meta, .. } => {
+            InputEvent::KeyDown {
+                ref code,
+                shift,
+                ctrl,
+                alt,
+                meta,
+                ..
+            } => {
                 if let Some(keycode) = super::macos_keymap::dom_code_to_macos_keycode(code) {
                     let ev = CGEvent::new_keyboard_event(source, keycode, true)
                         .map_err(|()| CallerError::Display("CGEvent keyboard failed".into()))?;
@@ -285,7 +295,14 @@ impl DisplayBackend for MacOSBackend {
                     ev.post(CGEventTapLocation::HID);
                 }
             }
-            InputEvent::KeyUp { ref code, shift, ctrl, alt, meta, .. } => {
+            InputEvent::KeyUp {
+                ref code,
+                shift,
+                ctrl,
+                alt,
+                meta,
+                ..
+            } => {
                 if let Some(keycode) = super::macos_keymap::dom_code_to_macos_keycode(code) {
                     let ev = CGEvent::new_keyboard_event(source, keycode, false)
                         .map_err(|()| CallerError::Display("CGEvent keyboard failed".into()))?;
@@ -344,7 +361,7 @@ impl DisplayBackend for MacOSBackend {
                     let ev = CGEvent::new_scroll_event(
                         source,
                         ScrollEventUnit::LINE,
-                        2,     // wheel_count
+                        2, // wheel_count
                         wheel1,
                         wheel2,
                         0,

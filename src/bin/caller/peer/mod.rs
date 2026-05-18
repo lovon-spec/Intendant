@@ -105,6 +105,7 @@ pub use card::{
     AgentCard, ApplicationAuth, AuthRequirements, Capability, McpTransportKind, OpenClawRole,
     TransportAuth, TransportSpec,
 };
+pub use coordinator::{Coordinator, CoordinatorError, RoutedTask, TaskRequest};
 pub use event::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, LogLevel,
     MessageContent, MessageId, MessagePart, MessageRole, ModelUsage, PeerEvent, PeerMessage,
@@ -112,16 +113,13 @@ pub use event::{
     WebRtcSignal,
 };
 pub use handle::{
-    spawn_peer, ConnectionState, PeerHandle, PeerSnapshot, BROADCAST_CAPACITY,
-    COMMANDS_CAPACITY, EVENTS_CAPACITY,
+    spawn_peer, ConnectionState, PeerHandle, PeerSnapshot, BROADCAST_CAPACITY, COMMANDS_CAPACITY,
+    EVENTS_CAPACITY,
 };
-pub use coordinator::{Coordinator, CoordinatorError, RoutedTask, TaskRequest};
 pub use id::{PeerId, PeerKind};
 pub use log_writer::{spawn_peer_log_writer, LOG_CHANNEL_CAPACITY};
 pub use registry::{PeerRegistry, RegistryEvent, REGISTRY_BROADCAST_CAPACITY};
-pub use traits::{
-    check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures,
-};
+pub use traits::{check_feature, PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures};
 pub use upcast::{AppEventUpcaster, WireEventUpcaster};
 
 // ---------------------------------------------------------------------------
@@ -149,7 +147,10 @@ pub enum PeerError {
     /// Auth handshake failed.
     Auth(String),
     /// Peer rejected the operation with a structured error.
-    Rejected { code: String, message: String },
+    Rejected {
+        code: String,
+        message: String,
+    },
     Io(std::io::Error),
     Json(serde_json::Error),
 }

@@ -264,7 +264,8 @@ pub fn format_event(event: &PresenceEvent) -> String {
                 .to_string()
         }
         PresenceEvent::UserDisplayRevoked => {
-            "User display access REVOKED — do not target 'user_session', use virtual displays only".to_string()
+            "User display access REVOKED — do not target 'user_session', use virtual displays only"
+                .to_string()
         }
     }
 }
@@ -275,11 +276,7 @@ pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        let end = s
-            .char_indices()
-            .nth(max)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
+        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
         format!("{}...", &s[..end])
     }
 }
@@ -341,7 +338,10 @@ mod tests {
 
     #[test]
     fn format_agent_output_plain_text_passthrough() {
-        assert_eq!(format_agent_output("just plain text").text, "just plain text");
+        assert_eq!(
+            format_agent_output("just plain text").text,
+            "just plain text"
+        );
     }
 
     #[test]
@@ -367,7 +367,11 @@ mod tests {
         let raw = r#"{"content":[{"text":"action[0]: ok","type":"text"},{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==","type":"image","mimeType":"image/png"}]}"#;
         let result = format_agent_output(raw);
         assert!(result.text.contains("action[0]: ok"));
-        assert!(result.text.contains("[image/png"), "expected marker, got: {}", result.text);
+        assert!(
+            result.text.contains("[image/png"),
+            "expected marker, got: {}",
+            result.text
+        );
         assert!(
             !result.text.contains("iVBORw0KGgoAAAANSUhEUgAA"),
             "raw base64 must not appear in rendered text"
@@ -381,9 +385,16 @@ mod tests {
         // 13,700-char base64 → ~10 KB decoded. Verify the marker size is
         // computed from the decoded length, not the base64 length.
         let big_b64 = "A".repeat(13700);
-        let raw = format!(r#"{{"content":[{{"data":"{}","type":"image","mimeType":"image/jpeg"}}]}}"#, big_b64);
+        let raw = format!(
+            r#"{{"content":[{{"data":"{}","type":"image","mimeType":"image/jpeg"}}]}}"#,
+            big_b64
+        );
         let result = format_agent_output(&raw);
-        assert!(result.text.contains("[image/jpeg 10 KB]"), "got: {}", result.text);
+        assert!(
+            result.text.contains("[image/jpeg 10 KB]"),
+            "got: {}",
+            result.text
+        );
         assert_eq!(result.images.len(), 1);
     }
 
@@ -399,7 +410,11 @@ mod tests {
     fn format_agent_output_mime_type_fallback() {
         let raw = r#"{"content":[{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==","type":"image"}]}"#;
         let result = format_agent_output(raw);
-        assert!(result.text.contains("[image "), "expected generic marker, got: {}", result.text);
+        assert!(
+            result.text.contains("[image "),
+            "expected generic marker, got: {}",
+            result.text
+        );
     }
 
     #[test]

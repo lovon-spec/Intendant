@@ -109,8 +109,8 @@ impl OpenAIProvider {
     }
 
     fn build_setup_message(system_prompt: &str, tools: &JsValue) -> String {
-        let tools_val: serde_json::Value =
-            serde_wasm_bindgen::from_value(tools.clone()).unwrap_or(serde_json::Value::Array(vec![]));
+        let tools_val: serde_json::Value = serde_wasm_bindgen::from_value(tools.clone())
+            .unwrap_or(serde_json::Value::Array(vec![]));
 
         // Convert tool definitions to OpenAI format
         let openai_tools: Vec<serde_json::Value> = tools_val
@@ -187,7 +187,8 @@ impl OpenAIProvider {
                 // Extract usage from response.done event
                 if let Some(resp) = msg.get("response") {
                     if let Some(usage) = resp.get("usage") {
-                        let cached = usage.get("input_token_details")
+                        let cached = usage
+                            .get("input_token_details")
                             .and_then(|d| d["cached_tokens"].as_u64())
                             .unwrap_or(0);
                         let live_usage = crate::LiveUsage {

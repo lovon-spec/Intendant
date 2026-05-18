@@ -165,7 +165,13 @@ fn parse_xrandr_output(text: &str) -> Vec<super::DisplayInfo> {
             continue;
         }
 
-        let id = if is_primary { 0 } else { let id = next_id; next_id += 1; id };
+        let id = if is_primary {
+            0
+        } else {
+            let id = next_id;
+            next_id += 1;
+            id
+        };
 
         displays.push(super::DisplayInfo {
             id,
@@ -199,10 +205,7 @@ fn parse_mode_token(tok: &str) -> (u32, u32) {
 
 #[async_trait]
 impl DisplayBackend for X11Backend {
-    async fn start_capture(
-        &self,
-        fps: u32,
-    ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+    async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
         // Defensive: if a prior start_capture wasn't paired with a matching
         // stop_capture (double-grant, race between revoke-and-regrant, etc.)
         // the old thread would otherwise be silently leaked by the
@@ -226,7 +229,16 @@ impl DisplayBackend for X11Backend {
         let shared_h = Arc::clone(&self.height);
 
         let thread = std::thread::spawn(move || {
-            run_x11_capture(display_str, tx, shutdown_flag, fps, width, height, shared_w, shared_h);
+            run_x11_capture(
+                display_str,
+                tx,
+                shutdown_flag,
+                fps,
+                width,
+                height,
+                shared_w,
+                shared_h,
+            );
         });
 
         *self.capture.lock().await = Some(CaptureState { thread });
@@ -539,7 +551,8 @@ fn run_x11_capture(
     use x11rb::connection::Connection;
     use x11rb::protocol::shm;
 
-    let frame_interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
+    let frame_interval =
+        std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
 
     let (conn, screen_num) = match x11rb::connect(Some(&display_str)) {
         Ok(c) => c,
@@ -562,26 +575,55 @@ fn run_x11_capture(
         .is_some();
 
     if shm_available {
-        eprintln!("[display/x11] XShm available, using shared memory capture {}x{}", width, height);
-        run_shm_capture(&conn, root, depth, width, height, &tx, &shutdown, frame_interval, &shared_width, &shared_height);
+        eprintln!(
+            "[display/x11] XShm available, using shared memory capture {}x{}",
+            width, height
+        );
+        run_shm_capture(
+            &conn,
+            root,
+            depth,
+            width,
+            height,
+            &tx,
+            &shutdown,
+            frame_interval,
+            &shared_width,
+            &shared_height,
+        );
     } else {
-        eprintln!("[display/x11] XShm unavailable, falling back to XGetImage {}x{}", width, height);
-        run_getimage_capture(&conn, root, depth, width, height, &tx, &shutdown, frame_interval, &shared_width, &shared_height);
+        eprintln!(
+            "[display/x11] XShm unavailable, falling back to XGetImage {}x{}",
+            width, height
+        );
+        run_getimage_capture(
+            &conn,
+            root,
+            depth,
+            width,
+            height,
+            &tx,
+            &shutdown,
+            frame_interval,
+            &shared_width,
+            &shared_height,
+        );
     }
 }
 
 /// Re-query root window geometry and return the (even-aligned) dimensions.
 ///
 /// Returns `None` if the query fails (display disconnected, etc.).
-fn query_root_geometry(
-    conn: &impl x11rb::connection::Connection,
-    root: u32,
-) -> Option<(u32, u32)> {
+fn query_root_geometry(conn: &impl x11rb::connection::Connection, root: u32) -> Option<(u32, u32)> {
     use x11rb::protocol::xproto::ConnectionExt;
     let geo = conn.get_geometry(root).ok()?.reply().ok()?;
     let w = (geo.width as u32) & !1;
     let h = (geo.height as u32) & !1;
-    if w > 0 && h > 0 { Some((w, h)) } else { None }
+    if w > 0 && h > 0 {
+        Some((w, h))
+    } else {
+        None
+    }
 }
 
 /// XShm-based capture loop.
@@ -607,21 +649,21 @@ fn run_shm_capture(
     // 4 bytes per pixel (BGRA), full screen.
     let seg_size = (width as usize) * (height as usize) * 4;
 
-    let shm_id = unsafe {
-        libc::shmget(
-            libc::IPC_PRIVATE,
-            seg_size,
-            libc::IPC_CREAT | 0o600,
-        )
-    };
+    let shm_id = unsafe { libc::shmget(libc::IPC_PRIVATE, seg_size, libc::IPC_CREAT | 0o600) };
     if shm_id < 0 {
-        eprintln!("[display/x11] shmget failed: {}", std::io::Error::last_os_error());
+        eprintln!(
+            "[display/x11] shmget failed: {}",
+            std::io::Error::last_os_error()
+        );
         return;
     }
 
     let shm_addr = unsafe { libc::shmat(shm_id, std::ptr::null(), 0) };
     if shm_addr == (-1isize) as *mut libc::c_void {
-        eprintln!("[display/x11] shmat failed: {}", std::io::Error::last_os_error());
+        eprintln!(
+            "[display/x11] shmat failed: {}",
+            std::io::Error::last_os_error()
+        );
         unsafe { libc::shmctl(shm_id, libc::IPC_RMID, std::ptr::null_mut()) };
         return;
     }
@@ -639,7 +681,18 @@ fn run_shm_capture(
     if !attach_ok {
         eprintln!("[display/x11] ShmAttach failed, falling back to XGetImage");
         unsafe { libc::shmdt(shm_addr) };
-        run_getimage_capture(conn, root, _depth, width, height, tx, shutdown, frame_interval, shared_width, shared_height);
+        run_getimage_capture(
+            conn,
+            root,
+            _depth,
+            width,
+            height,
+            tx,
+            shutdown,
+            frame_interval,
+            shared_width,
+            shared_height,
+        );
         return;
     }
 
@@ -676,8 +729,16 @@ fn run_shm_capture(
                     shared_width.store(width, Ordering::SeqCst);
                     shared_height.store(height, Ordering::SeqCst);
                     run_getimage_capture(
-                        conn, root, _depth, width, height, tx, shutdown,
-                        frame_interval, shared_width, shared_height,
+                        conn,
+                        root,
+                        _depth,
+                        width,
+                        height,
+                        tx,
+                        shutdown,
+                        frame_interval,
+                        shared_width,
+                        shared_height,
                     );
                     return;
                 }
@@ -717,9 +778,7 @@ fn run_shm_capture(
                 let stride = width * 4;
                 let data_len = stride as usize * height as usize;
 
-                let data = unsafe {
-                    std::slice::from_raw_parts(shm_addr as *const u8, data_len)
-                };
+                let data = unsafe { std::slice::from_raw_parts(shm_addr as *const u8, data_len) };
 
                 let frame = Frame {
                     data: data.to_vec(),
@@ -852,7 +911,11 @@ fn run_getimage_capture(
                 if frame_count == 1 || frame_count % 300 == 0 {
                     eprintln!(
                         "[display/x11] getimage frame #{} {}x{} stride={} size={}B",
-                        frame_count, width, height, stride, frame.data.len()
+                        frame_count,
+                        width,
+                        height,
+                        stride,
+                        frame.data.len()
                     );
                 }
 

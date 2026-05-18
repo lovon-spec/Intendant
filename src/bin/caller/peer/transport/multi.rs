@@ -308,9 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_clears_active() {
-        let mut multi = MultiTransport::new(vec![
-            Box::new(StubTransport::new("ws://a", true)),
-        ]);
+        let mut multi = MultiTransport::new(vec![Box::new(StubTransport::new("ws://a", true))]);
         multi.connect().await.unwrap();
         assert!(multi.is_connected());
         multi.disconnect().await.unwrap();
@@ -345,8 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_when_not_connected_errors() {
-        let mut multi =
-            MultiTransport::new(vec![Box::new(StubTransport::new("ws://a", true))]);
+        let mut multi = MultiTransport::new(vec![Box::new(StubTransport::new("ws://a", true))]);
         let err = multi.send(dummy_send_op()).await.unwrap_err();
         assert!(matches!(err, PeerError::NotConnected));
     }

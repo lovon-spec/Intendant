@@ -166,7 +166,10 @@ mod tests {
         let ReplayDecision::Frames(frames) = out else {
             panic!("expected replay frames");
         };
-        assert_eq!(frames.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![10, 11, 12]);
+        assert_eq!(
+            frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
         assert_eq!(frames[1].bytes, payload(11, 4));
     }
 

@@ -603,10 +603,7 @@ impl SessionLog {
             voice_provider: self.summary_builder.voice_provider.clone(),
             voice_model: self.summary_builder.voice_model.clone(),
             voice_connections: self.summary_builder.voice_connections,
-            voice_reconnects: self
-                .summary_builder
-                .voice_connections
-                .saturating_sub(1),
+            voice_reconnects: self.summary_builder.voice_connections.saturating_sub(1),
             model_turns,
             cu_tasks,
             frames_sent: self.summary_builder.frames_sent,
@@ -823,7 +820,9 @@ impl SessionLog {
     /// Protocol lifecycle: setupComplete, turnComplete, connected, interrupted, etc.
     pub fn voice_protocol(&mut self, kind: &str, detail: &str) {
         // Flush buffered voice tokens to transcript on turnComplete
-        if detail.starts_with("turnComplete") || kind == "gemini_msg" && detail.contains("turnComplete") {
+        if detail.starts_with("turnComplete")
+            || kind == "gemini_msg" && detail.contains("turnComplete")
+        {
             self.flush_voice_utterance();
         }
         self.emit_voice("voice_protocol", "debug", kind, detail);
@@ -1031,7 +1030,11 @@ impl SessionLog {
     pub fn done_signal(&mut self, message: Option<&str>) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "done_signal".to_string(),
             level: Some("info".to_string()),
             message: Some(message.unwrap_or("Agent signalled done").to_string()),
@@ -1110,7 +1113,11 @@ impl SessionLog {
     pub fn auto_approved(&mut self, preview: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "auto_approved".to_string(),
             level: Some("info".to_string()),
             message: Some(preview.to_string()),
@@ -1138,7 +1145,11 @@ impl SessionLog {
     pub fn human_question(&mut self, question: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "human_question".to_string(),
             level: Some("info".to_string()),
             message: Some(question.to_string()),
@@ -1152,7 +1163,11 @@ impl SessionLog {
     pub fn human_response_sent(&mut self) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "human_response_sent".to_string(),
             level: Some("info".to_string()),
             message: Some("Human response sent".to_string()),
@@ -1169,7 +1184,10 @@ impl SessionLog {
             turn: None,
             event: "round_complete".to_string(),
             level: Some("info".to_string()),
-            message: Some(format!("Round {} complete ({} turns)", round, turns_in_round)),
+            message: Some(format!(
+                "Round {} complete ({} turns)",
+                round, turns_in_round
+            )),
             data: Some(serde_json::json!({
                 "round": round,
                 "turns_in_round": turns_in_round,
@@ -1277,12 +1295,7 @@ impl SessionLog {
     }
 
     /// Log display ready.
-    pub fn display_ready(
-        &mut self,
-        display_id: u32,
-        width: u32,
-        height: u32,
-    ) {
+    pub fn display_ready(&mut self, display_id: u32, width: u32, height: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1303,12 +1316,7 @@ impl SessionLog {
     }
 
     /// Log display resolution change.
-    pub fn display_resize(
-        &mut self,
-        display_id: u32,
-        width: u32,
-        height: u32,
-    ) {
+    pub fn display_resize(&mut self, display_id: u32, width: u32, height: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1397,7 +1405,11 @@ impl SessionLog {
     pub fn safety_cap_reached(&mut self) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "safety_cap_reached".to_string(),
             level: Some("warn".to_string()),
             message: Some("Safety cap reached".to_string()),
@@ -1456,7 +1468,11 @@ impl SessionLog {
     pub fn sub_agent_result(&mut self, summary: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "sub_agent_result".to_string(),
             level: Some("info".to_string()),
             message: Some(summary.to_string()),
@@ -1528,12 +1544,7 @@ impl SessionLog {
     }
 
     /// Log live model (Gemini Live / OpenAI Realtime) usage update.
-    pub fn live_usage_update(
-        &mut self,
-        provider: &str,
-        model: &str,
-        total_tokens: u64,
-    ) {
+    pub fn live_usage_update(&mut self, provider: &str, model: &str, total_tokens: u64) {
         // Track cumulative live model tokens
         if total_tokens > self.summary_builder.total_tokens {
             self.summary_builder.total_tokens = total_tokens;
@@ -1602,12 +1613,7 @@ impl SessionLog {
     }
 
     /// Log live audio sub-agent completed.
-    pub fn live_audio_completed(
-        &mut self,
-        id: &str,
-        status: &str,
-        quarantine_count: usize,
-    ) {
+    pub fn live_audio_completed(&mut self, id: &str, status: &str, quarantine_count: usize) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1634,7 +1640,11 @@ impl SessionLog {
             turn: None,
             event: "tool_request".to_string(),
             level: Some("debug".to_string()),
-            message: Some(format!("{}({})", tool, serde_json::to_string(args).unwrap_or_default())),
+            message: Some(format!(
+                "{}({})",
+                tool,
+                serde_json::to_string(args).unwrap_or_default()
+            )),
             data: Some(serde_json::json!({
                 "tool": tool,
                 "args": args,
@@ -1646,7 +1656,11 @@ impl SessionLog {
 
     /// Log a tool response sent back to the browser presence model.
     pub fn tool_response(&mut self, tool: &str, result: &str) {
-        let preview = if result.len() > 200 { &result[..200] } else { result };
+        let preview = if result.len() > 200 {
+            &result[..200]
+        } else {
+            result
+        };
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1740,8 +1754,7 @@ impl SessionLog {
         item_count: Option<usize>,
         raw: &serde_json::Value,
     ) {
-        let rendered = serde_json::to_string_pretty(raw)
-            .unwrap_or_else(|_| raw.to_string());
+        let rendered = serde_json::to_string_pretty(raw).unwrap_or_else(|_| raw.to_string());
         let effective_turn = turn.or_else(|| {
             if self.current_turn > 0 {
                 Some(self.current_turn)
@@ -2445,11 +2458,7 @@ pub fn session_log_entry_to_app_event(
         "approval_resolved" => {
             // The writer formats the message as "Approval {action} (turn {id})".
             // Split on whitespace to recover the action; the id is `turn`.
-            let action = message
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("")
-                .to_string();
+            let action = message.split_whitespace().nth(1).unwrap_or("").to_string();
             Some(AppEvent::ApprovalResolved {
                 session_id: None,
                 id: turn.unwrap_or(0) as u64,
@@ -2897,7 +2906,11 @@ mod tests {
         log.agent_output("only\n", "", None);
         let body = fs::read_to_string(log_dir.join("turns/turn_002_stdout.txt")).unwrap();
         // No leading blank line before the first chunk.
-        assert!(!body.starts_with('\n'), "unexpected leading newline: {:?}", body);
+        assert!(
+            !body.starts_with('\n'),
+            "unexpected leading newline: {:?}",
+            body
+        );
     }
 
     #[test]
@@ -3011,7 +3024,14 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.model_response("Hello, I will help you.\nHere is my plan.", 100, 50, 150, 0, None);
+        log.model_response(
+            "Hello, I will help you.\nHere is my plan.",
+            100,
+            50,
+            150,
+            0,
+            None,
+        );
         drop(log);
 
         let model_file = log_dir.join("turns/turn_001_model.txt");
@@ -3300,7 +3320,8 @@ mod tests {
                 assert_eq!(context_window, Some(128_000));
                 assert_eq!(item_count, Some(1));
                 assert_eq!(
-                    raw.pointer("/thread/turns/0/items/0/type").and_then(|v| v.as_str()),
+                    raw.pointer("/thread/turns/0/items/0/type")
+                        .and_then(|v| v.as_str()),
                     Some("userMessage")
                 );
             }
@@ -3626,11 +3647,7 @@ mod tests {
         log.user_transcript("also check the database", 3);
         log.voice_log("[tool] check_status({})", 4, Some("check_status"));
 
-        let results = search_voice_entries(
-            &log_dir,
-            &["auth".to_string()],
-            10,
-        );
+        let results = search_voice_entries(&log_dir, &["auth".to_string()], 10);
         assert_eq!(results.len(), 2);
         assert!(results[0].starts_with("[User]"));
         assert!(results[1].starts_with("[Model]"));
@@ -3646,11 +3663,7 @@ mod tests {
             log.user_transcript(&format!("test message {}", i), i);
         }
 
-        let results = search_voice_entries(
-            &log_dir,
-            &["test".to_string()],
-            3,
-        );
+        let results = search_voice_entries(&log_dir, &["test".to_string()], 3);
         assert_eq!(results.len(), 3);
     }
 
@@ -3662,11 +3675,7 @@ mod tests {
 
         log.user_transcript("hello world", 1);
 
-        let results = search_voice_entries(
-            &log_dir,
-            &["nonexistent".to_string()],
-            10,
-        );
+        let results = search_voice_entries(&log_dir, &["nonexistent".to_string()], 10);
         assert!(results.is_empty());
     }
 
@@ -3681,10 +3690,7 @@ mod tests {
 
     /// Helper: drop `log`, read session.jsonl, and return the last entry
     /// whose `event` field matches `event_type`.
-    fn read_last_event(
-        log_dir: &std::path::Path,
-        event_type: &str,
-    ) -> serde_json::Value {
+    fn read_last_event(log_dir: &std::path::Path, event_type: &str) -> serde_json::Value {
         let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         content
             .lines()
@@ -4058,7 +4064,15 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.cu_task_start("click send button", "openai", "gpt-5-cu", true, None, 0);
-        log.cu_turn(1, 0, 2, 1, 50, 30, &["click(100,200)".to_string(), "type(hi)".to_string()]);
+        log.cu_turn(
+            1,
+            0,
+            2,
+            1,
+            50,
+            30,
+            &["click(100,200)".to_string(), "type(hi)".to_string()],
+        );
         log.cu_task_complete(3, true, "done");
         log.cu_task_error("display lost", None);
         drop(log);
@@ -4105,9 +4119,7 @@ mod tests {
 
         let err = read_last_event(&log_dir, "cu_task_error");
         match session_log_entry_to_app_event(&err, &log_dir).unwrap() {
-            AppEvent::LogEntry {
-                level, content, ..
-            } => {
+            AppEvent::LogEntry { level, content, .. } => {
                 assert_eq!(level, "warn");
                 assert!(content.contains("display lost"));
             }

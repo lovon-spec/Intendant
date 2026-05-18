@@ -74,8 +74,7 @@ pub fn spawn_control_server(
                                         if !trimmed.is_empty() {
                                             match serde_json::from_str::<ControlMsg>(trimmed) {
                                                 Ok(msg) => {
-                                                    bus_inbound
-                                                        .send(AppEvent::ControlCommand(msg));
+                                                    bus_inbound.send(AppEvent::ControlCommand(msg));
                                                 }
                                                 Err(e) => {
                                                     let err_json = serde_json::json!({
@@ -83,8 +82,7 @@ pub fn spawn_control_server(
                                                         "ok": false,
                                                         "message": format!("Invalid message: {}", e),
                                                     });
-                                                    let _ = error_tx
-                                                        .send(err_json.to_string());
+                                                    let _ = error_tx.send(err_json.to_string());
                                                 }
                                             }
                                         }

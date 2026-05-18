@@ -48,7 +48,13 @@ fn main() {
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
-        .and_then(|o| if o.status.success() { Some(o.stdout) } else { None })
+        .and_then(|o| {
+            if o.status.success() {
+                Some(o.stdout)
+            } else {
+                None
+            }
+        })
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -86,10 +92,7 @@ fn main() {
         return;
     }
 
-    let wasm_modified = wasm_bin
-        .metadata()
-        .and_then(|m| m.modified())
-        .ok();
+    let wasm_modified = wasm_bin.metadata().and_then(|m| m.modified()).ok();
 
     let src_modified = [src_dir, core_dir]
         .iter()
@@ -114,17 +117,23 @@ fn main() {
 
     let result = Command::new("wasm-pack")
         .args([
-            "build", "--target", "web",
-            "--out-dir", "../../static/wasm-web",
-            "--out-name", "presence_web",
+            "build",
+            "--target",
+            "web",
+            "--out-dir",
+            "../../static/wasm-web",
+            "--out-name",
+            "presence_web",
         ])
         .current_dir("crates/presence-web")
-        .env("CARGO_TARGET_DIR", std::fs::canonicalize(wasm_target)
-            .unwrap_or_else(|_| {
+        .env(
+            "CARGO_TARGET_DIR",
+            std::fs::canonicalize(wasm_target).unwrap_or_else(|_| {
                 // Create the directory if it doesn't exist
                 let _ = std::fs::create_dir_all(wasm_target);
                 wasm_target.to_path_buf()
-            }))
+            }),
+        )
         .status();
 
     match result {
@@ -189,7 +198,8 @@ fn newest_in_dir(dir: &Path) -> Option<std::time::SystemTime> {
                 }
             } else if let Ok(meta) = path.metadata() {
                 if let Ok(modified) = meta.modified() {
-                    newest = Some(newest.map_or(modified, |n: std::time::SystemTime| n.max(modified)));
+                    newest =
+                        Some(newest.map_or(modified, |n: std::time::SystemTime| n.max(modified)));
                 }
             }
         }

@@ -59,12 +59,7 @@ pub fn validate(
         }
 
         if let Some(val) = field_value {
-            match validate_field(
-                &field_spec.name,
-                &field_spec.field_type,
-                val,
-                quarantine_fn,
-            ) {
+            match validate_field(&field_spec.name, &field_spec.field_type, val, quarantine_fn) {
                 Ok((cleaned, mut q)) => {
                     result.insert(field_spec.name.clone(), cleaned);
                     quarantined.append(&mut q);
@@ -150,10 +145,7 @@ fn validate_field(
                 if !allowed.iter().any(|a| a == s) {
                     return Err(vec![ValidationError {
                         field: name.into(),
-                        message: format!(
-                            "value {:?} not in allowed values: {:?}",
-                            s, allowed
-                        ),
+                        message: format!("value {:?} not in allowed values: {:?}", s, allowed),
                     }]);
                 }
             }
@@ -161,8 +153,7 @@ fn validate_field(
             // Check max length — truncate and quarantine if exceeded
             let result_str = if let Some(max_len) = max_length {
                 if s.len() > *max_len {
-                    let payload =
-                        quarantine_fn(name, "string_overflow", s);
+                    let payload = quarantine_fn(name, "string_overflow", s);
                     quarantined.push(payload);
                     // Truncate to max_length
                     s.chars().take(*max_len).collect::<String>()
@@ -251,9 +242,10 @@ pub fn to_json_schema(schema: &ResponseSchema) -> serde_json::Value {
     for field in &schema.fields {
         let mut prop = field_type_to_json_schema(&field.field_type);
         if let Some(desc) = &field.description {
-            prop.as_object_mut()
-                .unwrap()
-                .insert("description".into(), serde_json::Value::String(desc.clone()));
+            prop.as_object_mut().unwrap().insert(
+                "description".into(),
+                serde_json::Value::String(desc.clone()),
+            );
         }
         properties.insert(field.name.clone(), prop);
         if field.required {
@@ -483,8 +475,7 @@ mod tests {
         }]);
 
         let value = serde_json::json!({"ref_number": "ABCDEFGHIJ"});
-        let (result, quarantined) =
-            validate(&schema, &value, &mut noop_quarantine).unwrap();
+        let (result, quarantined) = validate(&schema, &value, &mut noop_quarantine).unwrap();
         assert_eq!(result["ref_number"], "ABCDE");
         assert_eq!(quarantined.len(), 1);
         assert_eq!(quarantined[0].content_type, "string_overflow");

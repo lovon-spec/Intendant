@@ -21,10 +21,7 @@ pub enum PresenceAction {
     /// Change the autonomy level.
     SetAutonomy { level: String },
     /// Needs platform I/O — delegate to the platform's PresenceIO impl.
-    NeedsIO {
-        tool_name: String,
-        args: Value,
-    },
+    NeedsIO { tool_name: String, args: Value },
 }
 
 /// Human-readable confirmation text for an action that was dispatched.
@@ -44,11 +41,7 @@ pub fn action_confirmation(action: &PresenceAction) -> String {
 
 /// Dispatch a presence tool call. Pure-logic tools return immediately;
 /// I/O-dependent tools return `NeedsIO` for the platform to handle.
-pub fn dispatch_tool_call(
-    name: &str,
-    args: &Value,
-    state: &AgentStateSnapshot,
-) -> PresenceAction {
+pub fn dispatch_tool_call(name: &str, args: &Value, state: &AgentStateSnapshot) -> PresenceAction {
     match name {
         "submit_task" => handle_submit_task(args),
         "check_status" => PresenceAction::TextResult(handle_check_status(state)),
@@ -104,9 +97,7 @@ fn handle_submit_task(args: &Value) -> PresenceAction {
         })
         .unwrap_or_default();
 
-    let display_target = args["display_target"]
-        .as_str()
-        .map(String::from);
+    let display_target = args["display_target"].as_str().map(String::from);
 
     PresenceAction::SubmitTask(TaskEnvelope {
         task,
@@ -139,7 +130,9 @@ fn handle_check_status(state: &AgentStateSnapshot) -> String {
         ));
     }
     if state.last_task_result.is_some() {
-        parts.push("Task result: available (use query_detail scope 'task_result' for details)".to_string());
+        parts.push(
+            "Task result: available (use query_detail scope 'task_result' for details)".to_string(),
+        );
     }
     if !state.available_displays.is_empty() {
         parts.push(format!("Displays: {}", state.available_displays.join(", ")));
@@ -301,11 +294,7 @@ mod tests {
     #[test]
     fn dispatch_query_detail_needs_io() {
         let state = AgentStateSnapshot::default();
-        let action = dispatch_tool_call(
-            "query_detail",
-            &json!({"scope": "diff"}),
-            &state,
-        );
+        let action = dispatch_tool_call("query_detail", &json!({"scope": "diff"}), &state);
         match action {
             PresenceAction::NeedsIO { tool_name, .. } => {
                 assert_eq!(tool_name, "query_detail");
@@ -317,11 +306,7 @@ mod tests {
     #[test]
     fn dispatch_recall_memory_needs_io() {
         let state = AgentStateSnapshot::default();
-        let action = dispatch_tool_call(
-            "recall_memory",
-            &json!({"keywords": ["test"]}),
-            &state,
-        );
+        let action = dispatch_tool_call("recall_memory", &json!({"keywords": ["test"]}), &state);
         match action {
             PresenceAction::NeedsIO { tool_name, .. } => {
                 assert_eq!(tool_name, "recall_memory");
@@ -333,11 +318,8 @@ mod tests {
     #[test]
     fn dispatch_inspect_frame_needs_io() {
         let state = AgentStateSnapshot::default();
-        let action = dispatch_tool_call(
-            "inspect_frame",
-            &json!({"frame_id": "cam0-f00047"}),
-            &state,
-        );
+        let action =
+            dispatch_tool_call("inspect_frame", &json!({"frame_id": "cam0-f00047"}), &state);
         match action {
             PresenceAction::NeedsIO { tool_name, args } => {
                 assert_eq!(tool_name, "inspect_frame");
@@ -402,15 +384,28 @@ mod tests {
             })),
             "Task submitted: fix bug"
         );
-        assert_eq!(action_confirmation(&PresenceAction::Approve { id: 42 }), "Approved action 42");
-        assert_eq!(action_confirmation(&PresenceAction::Deny { id: 7 }), "Denied action 7");
-        assert_eq!(action_confirmation(&PresenceAction::Skip { id: 3 }), "Skipped action 3");
         assert_eq!(
-            action_confirmation(&PresenceAction::Respond { text: "yes".to_string() }),
+            action_confirmation(&PresenceAction::Approve { id: 42 }),
+            "Approved action 42"
+        );
+        assert_eq!(
+            action_confirmation(&PresenceAction::Deny { id: 7 }),
+            "Denied action 7"
+        );
+        assert_eq!(
+            action_confirmation(&PresenceAction::Skip { id: 3 }),
+            "Skipped action 3"
+        );
+        assert_eq!(
+            action_confirmation(&PresenceAction::Respond {
+                text: "yes".to_string()
+            }),
             "Sent response: yes"
         );
         assert_eq!(
-            action_confirmation(&PresenceAction::SetAutonomy { level: "full".to_string() }),
+            action_confirmation(&PresenceAction::SetAutonomy {
+                level: "full".to_string()
+            }),
             "Autonomy set to full"
         );
         assert_eq!(
@@ -431,7 +426,10 @@ mod tests {
         let actions = vec![
             PresenceAction::Approve { id: 1 },
             PresenceAction::TextResult("hello".to_string()),
-            PresenceAction::NeedsIO { tool_name: "q".to_string(), args: json!({"x": 1}) },
+            PresenceAction::NeedsIO {
+                tool_name: "q".to_string(),
+                args: json!({"x": 1}),
+            },
         ];
         for action in actions {
             let json = serde_json::to_string(&action).unwrap();

@@ -9,16 +9,15 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use agent_client_protocol_schema::{
-    ContentBlock, RequestPermissionOutcome, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, ToolCallContent,
-    ToolCallStatus,
+    ContentBlock, RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionNotification, SessionUpdate, ToolCallContent, ToolCallStatus,
 };
 
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentEvent, AgentImageAttachment, AgentThread, ApprovalCategory,
-    ApprovalDecision, ExternalAgent, ToolCompletionStatus,
+    AgentConfig, AgentEvent, AgentImageAttachment, AgentThread, ApprovalCategory, ApprovalDecision,
+    ExternalAgent, ToolCompletionStatus,
 };
 
 // Re-use the same display tools prompt as Codex — the MCP tools are identical.
@@ -153,10 +152,7 @@ fn read_settings_json(path: &std::path::Path) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
-fn write_settings_json(
-    path: &std::path::Path,
-    value: &serde_json::Value,
-) -> std::io::Result<()> {
+fn write_settings_json(path: &std::path::Path, value: &serde_json::Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -226,11 +222,7 @@ impl Default for GeminiLaunchConfig {
 }
 
 impl GeminiAgent {
-    pub fn new(
-        command: String,
-        launch: GeminiLaunchConfig,
-        web_port: Option<u16>,
-    ) -> Self {
+    pub fn new(command: String, launch: GeminiLaunchConfig, web_port: Option<u16>) -> Self {
         Self {
             command,
             model: launch.model,
@@ -633,7 +625,12 @@ fn extract_tool_content_text(block: &ToolCallContent) -> String {
         ToolCallContent::Diff(d) => {
             let old_len = d.old_text.as_ref().map(|t| t.len()).unwrap_or(0);
             let new_len = d.new_text.len();
-            format!("diff {}: {} -> {} bytes", d.path.display(), old_len, new_len)
+            format!(
+                "diff {}: {} -> {} bytes",
+                d.path.display(),
+                old_len,
+                new_len
+            )
         }
         ToolCallContent::Terminal(t) => {
             format!("[terminal {}]", t.terminal_id)
@@ -734,10 +731,7 @@ fn translate_session_update(update: &SessionUpdate) -> Vec<AgentEvent> {
                     }
                     _ => unreachable!(),
                 };
-                events.push(AgentEvent::ToolCompleted {
-                    item_id,
-                    status,
-                });
+                events.push(AgentEvent::ToolCompleted { item_id, status });
             }
         }
         SessionUpdate::ToolCallUpdate(tcu) => {
@@ -912,10 +906,7 @@ impl ExternalAgent for GeminiAgent {
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|e| {
-                CallerError::ExternalAgent(format!(
-                    "Failed to spawn '{}': {}",
-                    self.command, e
-                ))
+                CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
             })?;
 
         let stdin = child
@@ -1017,9 +1008,7 @@ impl ExternalAgent for GeminiAgent {
             self.send_request("session/load", Some(params)).await?;
             resume_id
         } else {
-            let result = self
-                .send_request("session/new", Some(params))
-                .await?;
+            let result = self.send_request("session/new", Some(params)).await?;
 
             result
                 .get("sessionId")
@@ -1083,7 +1072,9 @@ impl ExternalAgent for GeminiAgent {
         // fire the request and spawn a task that emits TurnCompleted when it resolves.
         let event_tx = self.event_tx.clone();
         let pending = Arc::clone(&self.pending_requests);
-        let writer = self.writer.as_ref()
+        let writer = self
+            .writer
+            .as_ref()
             .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?
             .clone();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1145,7 +1136,6 @@ impl ExternalAgent for GeminiAgent {
             })?
         };
 
-
         // Map our decision to an ACP option_id.
         // ACP agents use different option ID conventions:
         //   Standard ACP: allow_once, allow_always, reject_once, reject_always
@@ -1155,32 +1145,24 @@ impl ExternalAgent for GeminiAgent {
         let is_accept = |id: &&String| {
             id.contains("allow") || (id.contains("proceed") && !id.contains("cancel"))
         };
-        let is_reject = |id: &&String| {
-            id.contains("reject") || id.contains("cancel")
-        };
+        let is_reject = |id: &&String| id.contains("reject") || id.contains("cancel");
 
         let selected_option = match decision {
-            ApprovalDecision::Accept => {
-                option_ids
-                    .iter()
-                    .find(|id| is_accept(id) && id.contains("once"))
-                    .or_else(|| option_ids.iter().find(|id| is_accept(id)))
-                    .cloned()
-            }
-            ApprovalDecision::AcceptForSession => {
-                option_ids
-                    .iter()
-                    .find(|id| is_accept(id) && id.contains("always"))
-                    .or_else(|| option_ids.iter().find(|id| is_accept(id)))
-                    .cloned()
-            }
-            ApprovalDecision::Decline => {
-                option_ids
-                    .iter()
-                    .find(|id| is_reject(id) && id.contains("once"))
-                    .or_else(|| option_ids.iter().find(|id| is_reject(id)))
-                    .cloned()
-            }
+            ApprovalDecision::Accept => option_ids
+                .iter()
+                .find(|id| is_accept(id) && id.contains("once"))
+                .or_else(|| option_ids.iter().find(|id| is_accept(id)))
+                .cloned(),
+            ApprovalDecision::AcceptForSession => option_ids
+                .iter()
+                .find(|id| is_accept(id) && id.contains("always"))
+                .or_else(|| option_ids.iter().find(|id| is_accept(id)))
+                .cloned(),
+            ApprovalDecision::Decline => option_ids
+                .iter()
+                .find(|id| is_reject(id) && id.contains("once"))
+                .or_else(|| option_ids.iter().find(|id| is_reject(id)))
+                .cloned(),
             ApprovalDecision::Cancel => None,
         };
 
@@ -1211,7 +1193,8 @@ impl ExternalAgent for GeminiAgent {
         // `StopReason::Cancelled` after receiving it — the existing
         // pending-request path surfaces that as TurnCompleted regardless of
         // the stop reason string, so no special-case handling is needed.
-        self.send_notification("session/cancel", Some(params)).await?;
+        self.send_notification("session/cancel", Some(params))
+            .await?;
         // Clear pending approval mappings — any outstanding approval
         // requests will be abandoned by the agent anyway.
         self.pending_approvals.lock().await.clear();
@@ -1282,11 +1265,7 @@ mod tests {
         // Gemini inherits the default `rollback_turns` from the trait,
         // which returns "not supported" — the outer loop keys on this
         // typed error to fall back to a full session reset.
-        let mut agent = GeminiAgent::new(
-            "gemini".into(),
-            GeminiLaunchConfig::default(),
-            None,
-        );
+        let mut agent = GeminiAgent::new("gemini".into(), GeminiLaunchConfig::default(), None);
         let err = agent.rollback_turns(1).await.unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {
@@ -1316,9 +1295,15 @@ mod tests {
         assert_eq!(agent.model.as_deref(), Some("gemini-2.5-pro"));
         assert_eq!(agent.approval_mode, "yolo");
         assert!(agent.sandbox);
-        assert_eq!(agent.extensions, vec!["ext1".to_string(), "ext2".to_string()]);
+        assert_eq!(
+            agent.extensions,
+            vec!["ext1".to_string(), "ext2".to_string()]
+        );
         assert_eq!(agent.allowed_mcp_servers, vec!["intendant".to_string()]);
-        assert_eq!(agent.include_directories, vec!["/tmp/workspace".to_string()]);
+        assert_eq!(
+            agent.include_directories,
+            vec!["/tmp/workspace".to_string()]
+        );
         assert!(agent.debug);
         assert_eq!(agent.web_port, Some(8765));
     }
@@ -1326,9 +1311,9 @@ mod tests {
     #[test]
     fn translate_agent_message_chunk() {
         use agent_client_protocol_schema::{ContentChunk, TextContent};
-        let update = SessionUpdate::AgentMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new("hello world"))),
-        );
+        let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+            TextContent::new("hello world"),
+        )));
         let events = translate_session_update(&update);
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -1340,9 +1325,9 @@ mod tests {
     #[test]
     fn translate_agent_thought_chunk() {
         use agent_client_protocol_schema::{ContentChunk, TextContent};
-        let update = SessionUpdate::AgentThoughtChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new("Step 1: analyze the page layout"))),
-        );
+        let update = SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+            TextContent::new("Step 1: analyze the page layout"),
+        )));
         let events = translate_session_update(&update);
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -1355,9 +1340,21 @@ mod tests {
     fn translate_plan_update() {
         use agent_client_protocol_schema::{Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus};
         let plan = Plan::new(vec![
-            PlanEntry::new("Search for AI agents", PlanEntryPriority::High, PlanEntryStatus::Completed),
-            PlanEntry::new("Summarize findings", PlanEntryPriority::Medium, PlanEntryStatus::InProgress),
-            PlanEntry::new("Create presentation", PlanEntryPriority::Medium, PlanEntryStatus::Pending),
+            PlanEntry::new(
+                "Search for AI agents",
+                PlanEntryPriority::High,
+                PlanEntryStatus::Completed,
+            ),
+            PlanEntry::new(
+                "Summarize findings",
+                PlanEntryPriority::Medium,
+                PlanEntryStatus::InProgress,
+            ),
+            PlanEntry::new(
+                "Create presentation",
+                PlanEntryPriority::Medium,
+                PlanEntryStatus::Pending,
+            ),
         ]);
         let update = SessionUpdate::Plan(plan);
         let events = translate_session_update(&update);
@@ -1430,14 +1427,13 @@ mod tests {
 
     #[test]
     fn translate_tool_call_update_text_content_extracts_text() {
-        use agent_client_protocol_schema::{ToolCallUpdateFields, TextContent};
         use agent_client_protocol_schema::Content;
+        use agent_client_protocol_schema::{TextContent, ToolCallUpdateFields};
 
-        let text_block = ToolCallContent::Content(Content::new(
-            ContentBlock::Text(TextContent::new("command output here")),
-        ));
-        let fields = ToolCallUpdateFields::new()
-            .content(vec![text_block]);
+        let text_block = ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new("command output here"),
+        )));
+        let fields = ToolCallUpdateFields::new().content(vec![text_block]);
         let tcu = agent_client_protocol_schema::ToolCallUpdate::new("call-1", fields);
         let update = SessionUpdate::ToolCallUpdate(tcu);
         let events = translate_session_update(&update);
@@ -1453,12 +1449,12 @@ mod tests {
 
     #[test]
     fn translate_tool_call_update_failed_extracts_error_from_content() {
-        use agent_client_protocol_schema::{ToolCallUpdateFields, TextContent};
         use agent_client_protocol_schema::Content;
+        use agent_client_protocol_schema::{TextContent, ToolCallUpdateFields};
 
-        let error_block = ToolCallContent::Content(Content::new(
-            ContentBlock::Text(TextContent::new("permission denied")),
-        ));
+        let error_block = ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new("permission denied"),
+        )));
         let fields = ToolCallUpdateFields::new()
             .status(ToolCallStatus::Failed)
             .content(vec![error_block]);
@@ -1490,12 +1486,12 @@ mod tests {
 
     #[test]
     fn translate_tool_call_completed_status_emits_full_lifecycle() {
-        use agent_client_protocol_schema::{TextContent, ToolKind};
         use agent_client_protocol_schema::Content;
+        use agent_client_protocol_schema::{TextContent, ToolKind};
 
-        let text_block = ToolCallContent::Content(Content::new(
-            ContentBlock::Text(TextContent::new("file contents")),
-        ));
+        let text_block = ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new("file contents"),
+        )));
         let tc = agent_client_protocol_schema::ToolCall::new("call-1", "Read file: main.rs")
             .kind(ToolKind::Read)
             .status(ToolCallStatus::Completed)
@@ -1505,17 +1501,28 @@ mod tests {
 
         // Should emit: ToolStarted, ToolOutputDelta, ToolCompleted
         assert_eq!(events.len(), 3);
-        assert!(matches!(&events[0], AgentEvent::ToolStarted { tool_name, .. } if tool_name == "Read file: main.rs"));
-        assert!(matches!(&events[1], AgentEvent::ToolOutputDelta { text, .. } if text == "file contents"));
-        assert!(matches!(&events[2], AgentEvent::ToolCompleted { status: ToolCompletionStatus::Success, .. }));
+        assert!(
+            matches!(&events[0], AgentEvent::ToolStarted { tool_name, .. } if tool_name == "Read file: main.rs")
+        );
+        assert!(
+            matches!(&events[1], AgentEvent::ToolOutputDelta { text, .. } if text == "file contents")
+        );
+        assert!(matches!(
+            &events[2],
+            AgentEvent::ToolCompleted {
+                status: ToolCompletionStatus::Success,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn extract_tool_content_text_diff() {
         use agent_client_protocol_schema::Diff;
 
-        let diff = ToolCallContent::Diff(Diff::new("src/main.rs", "new content")
-            .old_text("old content".to_string()));
+        let diff = ToolCallContent::Diff(
+            Diff::new("src/main.rs", "new content").old_text("old content".to_string()),
+        );
         let text = extract_tool_content_text(&diff);
         assert!(text.contains("src/main.rs"));
         assert!(text.contains("11")); // old_text length
@@ -1524,11 +1531,12 @@ mod tests {
 
     #[test]
     fn extract_tool_content_text_image() {
-        use agent_client_protocol_schema::{ImageContent, Content};
+        use agent_client_protocol_schema::{Content, ImageContent};
 
-        let img = ToolCallContent::Content(Content::new(
-            ContentBlock::Image(ImageContent::new("base64data", "image/png")),
-        ));
+        let img = ToolCallContent::Content(Content::new(ContentBlock::Image(ImageContent::new(
+            "base64data",
+            "image/png",
+        ))));
         let text = extract_tool_content_text(&img);
         assert_eq!(text, "[image]");
     }
@@ -1545,8 +1553,7 @@ mod tests {
 
     #[test]
     fn approval_response_cancelled() {
-        let response =
-            RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
+        let response = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["outcome"]["outcome"], "cancelled");
     }
@@ -1598,10 +1605,7 @@ mod tests {
             .unwrap_or("unknown action");
         assert_eq!(title, "Run command: ls -la");
 
-        let kind = req
-            .tool_call
-            .get("kind")
-            .and_then(|v| v.as_str());
+        let kind = req.tool_call.get("kind").and_then(|v| v.as_str());
         assert_eq!(kind, Some("execute"));
 
         assert_eq!(req.options.len(), 2);

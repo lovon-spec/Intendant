@@ -378,14 +378,12 @@ mod tests {
         use crate::live_audio_types::*;
 
         let schema = ResponseSchema {
-            fields: vec![
-                FieldSpec {
-                    name: "confirmed".into(),
-                    field_type: FieldType::Boolean,
-                    required: true,
-                    description: Some("Whether confirmed".into()),
-                },
-            ],
+            fields: vec![FieldSpec {
+                name: "confirmed".into(),
+                field_type: FieldType::Boolean,
+                required: true,
+                description: Some("Whether confirmed".into()),
+            }],
         };
 
         let result = build_live_audio_prompt(

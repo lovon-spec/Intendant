@@ -182,8 +182,7 @@ pub const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never
 /// "default" as a menu choice without introducing a separate Option<String>
 /// juggling layer. All other values map straight to
 /// `-c model_reasoning_effort=...`.
-pub const CODEX_REASONING_EFFORTS: &[&str] =
-    &["", "minimal", "low", "medium", "high", "xhigh"];
+pub const CODEX_REASONING_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
 
 /// Normalize a user-supplied sandbox value to one of `CODEX_SANDBOX_MODES`.
 /// Unknown or empty values fall back to the safest real policy
@@ -217,7 +216,10 @@ pub fn normalize_reasoning_effort(input: Option<&str>) -> Option<String> {
     if s.is_empty() {
         return None;
     }
-    if CODEX_REASONING_EFFORTS.iter().any(|e| !e.is_empty() && *e == s) {
+    if CODEX_REASONING_EFFORTS
+        .iter()
+        .any(|e| !e.is_empty() && *e == s)
+    {
         Some(s.to_string())
     } else {
         None
@@ -851,9 +853,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     pinned_fingerprints: vec![
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
-                    browser_tcp_via_url: Some(
-                        "ws://192.168.1.42:8766/ws".into(),
-                    ),
+                    browser_tcp_via_url: Some("ws://192.168.1.42:8766/ws".into()),
                 },
             ],
             ..ProjectConfig::default()
@@ -1150,7 +1150,10 @@ live_context_window = 65536
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.presence.enabled);
         assert_eq!(config.presence.provider.as_deref(), Some("gemini"));
-        assert_eq!(config.presence.model.as_deref(), Some("gemini-3-flash-preview"));
+        assert_eq!(
+            config.presence.model.as_deref(),
+            Some("gemini-3-flash-preview")
+        );
         assert_eq!(config.presence.context_window, 1_048_576);
         assert_eq!(config.presence.live_provider.as_deref(), Some("openai"));
         assert_eq!(
@@ -1254,7 +1257,10 @@ ice_servers = [
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         let ice = config.webrtc.to_ice_config();
         assert_eq!(ice.ice_servers.len(), 2);
-        assert_eq!(ice.ice_servers[0].urls, vec!["stun:stun.l.google.com:19302"]);
+        assert_eq!(
+            ice.ice_servers[0].urls,
+            vec!["stun:stun.l.google.com:19302"]
+        );
         assert!(ice.ice_servers[0].username.is_none());
         assert_eq!(ice.ice_servers[1].username.as_deref(), Some("u"));
         assert_eq!(ice.ice_servers[1].credential.as_deref(), Some("p"));

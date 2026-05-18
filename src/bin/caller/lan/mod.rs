@@ -95,16 +95,12 @@ pub fn routable_local_addrs(include_loopback: bool) -> Vec<std::net::IpAddr> {
                         let _name = if ifa.ifa_name.is_null() {
                             String::new()
                         } else {
-                            CStr::from_ptr(ifa.ifa_name)
-                                .to_string_lossy()
-                                .into_owned()
+                            CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned()
                         };
                         if family == libc::AF_INET {
                             let sin = ifa.ifa_addr as *const libc::sockaddr_in;
                             let octets = (*sin).sin_addr.s_addr.to_ne_bytes();
-                            let ip = Ipv4Addr::new(
-                                octets[0], octets[1], octets[2], octets[3],
-                            );
+                            let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
                             if !ip.is_loopback() && !ip.is_unspecified() {
                                 out.push(IpAddr::V4(ip));
                             }
@@ -112,10 +108,7 @@ pub fn routable_local_addrs(include_loopback: bool) -> Vec<std::net::IpAddr> {
                             let sin6 = ifa.ifa_addr as *const libc::sockaddr_in6;
                             let segs = (*sin6).sin6_addr.s6_addr;
                             let ip = std::net::Ipv6Addr::from(segs);
-                            if !ip.is_loopback()
-                                && !ip.is_unspecified()
-                                && !is_link_local_v6(&ip)
-                            {
+                            if !ip.is_loopback() && !ip.is_unspecified() && !is_link_local_v6(&ip) {
                                 out.push(IpAddr::V6(ip));
                             }
                         }
@@ -254,7 +247,9 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--port" => {
-                let v = iter.next().ok_or_else(|| LanError("missing value for --port".into()))?;
+                let v = iter
+                    .next()
+                    .ok_or_else(|| LanError("missing value for --port".into()))?;
                 args.https_port = v
                     .parse()
                     .map_err(|_| LanError(format!("invalid --port value '{v}'")))?;
@@ -274,7 +269,9 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
                 args.lan_ip = Some(v.clone());
             }
             "--name" => {
-                let v = iter.next().ok_or_else(|| LanError("missing value for --name".into()))?;
+                let v = iter
+                    .next()
+                    .ok_or_else(|| LanError("missing value for --name".into()))?;
                 args.name = Some(v.clone());
             }
             "--backend" => {
@@ -376,16 +373,13 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     }
 
     // Start the cert distribution server (blocks until Ctrl+C).
-    println!("  Starting client cert distribution server on port {}...", args.cert_port);
+    println!(
+        "  Starting client cert distribution server on port {}...",
+        args.cert_port
+    );
     println!("  Press Ctrl+C when every client has imported the cert.");
     println!();
-    cert_server::serve(
-        &state,
-        args.cert_port,
-        &lan_ip,
-        args.https_port,
-    )
-    .await?;
+    cert_server::serve(&state, args.cert_port, &lan_ip, args.https_port).await?;
 
     Ok(())
 }

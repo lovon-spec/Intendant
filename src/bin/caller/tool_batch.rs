@@ -206,7 +206,11 @@ pub fn map_results_to_tool_responses(
             }
         }
 
-        if tool_name == "manage_context" || tool_name == "signal_done" || tool_name == "invoke_skill" || tool_name == "spawn_live_audio" {
+        if tool_name == "manage_context"
+            || tool_name == "signal_done"
+            || tool_name == "invoke_skill"
+            || tool_name == "spawn_live_audio"
+        {
             results.push((call_id.clone(), tool_name.clone(), "OK".to_string()));
             continue;
         }

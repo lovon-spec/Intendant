@@ -53,7 +53,11 @@ pub fn sanitize_session_id(raw: &str) -> Option<String> {
 /// already uses).
 pub fn visual_freshness_path(session_id: &str) -> Option<PathBuf> {
     let slug = sanitize_session_id(session_id)?;
-    Some(intendant_state_dir().join("diagnostics/visual-freshness").join(format!("{slug}.ndjson")))
+    Some(
+        intendant_state_dir()
+            .join("diagnostics/visual-freshness")
+            .join(format!("{slug}.ndjson")),
+    )
 }
 
 /// Append `body` verbatim to the visual-freshness transcript file for

@@ -95,10 +95,7 @@ impl ServerConnection {
     }
 
     /// Set a handler for parsed server messages.
-    pub fn set_message_handler(
-        &mut self,
-        handler: Rc<RefCell<Box<dyn FnMut(serde_json::Value)>>>,
-    ) {
+    pub fn set_message_handler(&mut self, handler: Rc<RefCell<Box<dyn FnMut(serde_json::Value)>>>) {
         self.on_message_handler = Some(handler);
     }
 
@@ -230,10 +227,15 @@ impl ServerConnection {
             if ws.ready_state() != 1 {
                 // WebSocket not in OPEN state — log and drop
                 web_sys::console::warn_1(
-                    &format!("[presence-web] send_json dropped (readyState={}): {}",
+                    &format!(
+                        "[presence-web] send_json dropped (readyState={}): {}",
                         ws.ready_state(),
-                        msg.get("t").and_then(|v| v.as_str()).or_else(|| msg.get("action").and_then(|v| v.as_str())).unwrap_or("?")
-                    ).into(),
+                        msg.get("t")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| msg.get("action").and_then(|v| v.as_str()))
+                            .unwrap_or("?")
+                    )
+                    .into(),
                 );
                 return false;
             }

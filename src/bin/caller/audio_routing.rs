@@ -139,10 +139,12 @@ pub async fn create_network_bridge(
     })?;
     drop(stream); // Just testing connectivity; the real connection is made by start_audio_bridge
 
-    let inner = PlatformBridge::create(session_id).await.unwrap_or_else(|_| {
-        // Network bridge doesn't need local audio devices
-        PlatformBridge::stub()
-    });
+    let inner = PlatformBridge::create(session_id)
+        .await
+        .unwrap_or_else(|_| {
+            // Network bridge doesn't need local audio devices
+            PlatformBridge::stub()
+        });
     Ok(AudioBridge {
         inner,
         prev_default_source: None,
@@ -206,8 +208,7 @@ impl PlatformBridge {
         let mic_sink_name = format!("intendant_mic_{}", session_id);
         let speaker_sink_name = format!("intendant_speaker_{}", session_id);
 
-        let mic_module_id =
-            load_null_sink(&mic_sink_name, "Intendant Virtual Mic").await?;
+        let mic_module_id = load_null_sink(&mic_sink_name, "Intendant Virtual Mic").await?;
 
         let speaker_module_id =
             match load_null_sink(&speaker_sink_name, "Intendant Virtual Speaker").await {
@@ -348,10 +349,7 @@ async fn load_null_sink(sink_name: &str, description: &str) -> Result<u32, Calle
             "load-module",
             "module-null-sink",
             &format!("sink_name={}", sink_name),
-            &format!(
-                "sink_properties=device.description=\"{}\"",
-                description
-            ),
+            &format!("sink_properties=device.description=\"{}\"", description),
             "rate=24000",
             "channels=1",
             "format=s16le",
@@ -371,21 +369,18 @@ async fn load_null_sink(sink_name: &str, description: &str) -> Result<u32, Calle
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .trim()
-        .parse::<u32>()
-        .map_err(|e| {
-            CallerError::Agent(format!(
-                "failed to parse module ID: {} (output: {:?})",
-                e, stdout
-            ))
-        })
+    stdout.trim().parse::<u32>().map_err(|e| {
+        CallerError::Agent(format!(
+            "failed to parse module ID: {} (output: {:?})",
+            e, stdout
+        ))
+    })
 }
 
 #[cfg(target_os = "linux")]
 async fn pactl_get_default(property: &str) -> Result<String, CallerError> {
     let output = tokio::process::Command::new("pactl")
-        .args(["get-" .to_string() + property])
+        .args(["get-".to_string() + property])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -416,10 +411,7 @@ async fn pactl_set_default(command: &str, name: &str) -> Result<(), CallerError>
 }
 
 #[cfg(target_os = "linux")]
-async fn find_stream_indices(
-    stream_type: &str,
-    app_name: &str,
-) -> Result<Vec<u32>, CallerError> {
+async fn find_stream_indices(stream_type: &str, app_name: &str) -> Result<Vec<u32>, CallerError> {
     let list_cmd = format!("list {}s", stream_type);
     let output = tokio::process::Command::new("pactl")
         .args(list_cmd.split_whitespace())
@@ -460,11 +452,7 @@ fn parse_stream_indices(pactl_output: &str, app_name: &str) -> Result<Vec<u32>, 
 }
 
 #[cfg(target_os = "linux")]
-async fn move_stream(
-    stream_type: &str,
-    index: u32,
-    target: &str,
-) -> Result<(), CallerError> {
+async fn move_stream(stream_type: &str, index: u32, target: &str) -> Result<(), CallerError> {
     let move_cmd = format!("move-{}", stream_type);
     let output = tokio::process::Command::new("pactl")
         .args([&move_cmd, &index.to_string(), target])
@@ -553,13 +541,19 @@ impl PlatformBridge {
         (
             "sox",
             vec![
-                "-t".into(), "coreaudio".into(),
+                "-t".into(),
+                "coreaudio".into(),
                 self.speaker_device_name.clone(),
-                "-t".into(), "raw".into(),
-                "-r".into(), sample_rate.to_string(),
-                "-e".into(), "signed-integer".into(),
-                "-b".into(), "16".into(),
-                "-c".into(), "1".into(),
+                "-t".into(),
+                "raw".into(),
+                "-r".into(),
+                sample_rate.to_string(),
+                "-e".into(),
+                "signed-integer".into(),
+                "-b".into(),
+                "16".into(),
+                "-c".into(),
+                "1".into(),
                 "-".into(),
             ],
         )
@@ -569,13 +563,19 @@ impl PlatformBridge {
         (
             "sox",
             vec![
-                "-t".into(), "raw".into(),
-                "-r".into(), sample_rate.to_string(),
-                "-e".into(), "signed-integer".into(),
-                "-b".into(), "16".into(),
-                "-c".into(), "1".into(),
+                "-t".into(),
+                "raw".into(),
+                "-r".into(),
+                sample_rate.to_string(),
+                "-e".into(),
+                "signed-integer".into(),
+                "-b".into(),
+                "16".into(),
+                "-c".into(),
+                "1".into(),
                 "-".into(),
-                "-t".into(), "coreaudio".into(),
+                "-t".into(),
+                "coreaudio".into(),
                 self.mic_device_name.clone(),
             ],
         )
@@ -717,15 +717,29 @@ struct PlatformBridge;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl PlatformBridge {
-    fn stub() -> Self { Self }
-    async fn is_available() -> bool { false }
-    async fn create(_session_id: &str) -> Result<Self, CallerError> {
-        Err(CallerError::Agent("virtual audio routing is not supported on this platform".into()))
+    fn stub() -> Self {
+        Self
     }
-    fn model_output_device(&self) -> &str { "" }
-    fn app_capture_device(&self) -> &str { "" }
-    fn capture_command(&self, _sample_rate: u32) -> (&'static str, Vec<String>) { ("false", vec![]) }
-    fn playback_command(&self, _sample_rate: u32) -> (&'static str, Vec<String>) { ("false", vec![]) }
+    async fn is_available() -> bool {
+        false
+    }
+    async fn create(_session_id: &str) -> Result<Self, CallerError> {
+        Err(CallerError::Agent(
+            "virtual audio routing is not supported on this platform".into(),
+        ))
+    }
+    fn model_output_device(&self) -> &str {
+        ""
+    }
+    fn app_capture_device(&self) -> &str {
+        ""
+    }
+    fn capture_command(&self, _sample_rate: u32) -> (&'static str, Vec<String>) {
+        ("false", vec![])
+    }
+    fn playback_command(&self, _sample_rate: u32) -> (&'static str, Vec<String>) {
+        ("false", vec![])
+    }
     async fn get_defaults(&self) -> Result<(String, String), CallerError> {
         Err(CallerError::Agent("not supported".into()))
     }
@@ -822,7 +836,9 @@ Source Output #7
         };
         let (cmd, args) = bridge.capture_command(24000);
         assert_eq!(cmd, "parec");
-        assert!(args.iter().any(|a| a.contains("intendant_speaker_test.monitor")));
+        assert!(args
+            .iter()
+            .any(|a| a.contains("intendant_speaker_test.monitor")));
         assert!(args.iter().any(|a| a.contains("24000")));
     }
 

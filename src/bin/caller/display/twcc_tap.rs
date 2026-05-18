@@ -85,7 +85,7 @@
 //! [`spawn_twcc_health_aggregator`] for symmetric shutdown with
 //! the rest of the display task tree.
 
-use rtc::interceptor::{Interceptor, Packet, StreamInfo, TaggedPacket, interceptor};
+use rtc::interceptor::{interceptor, Interceptor, Packet, StreamInfo, TaggedPacket};
 // `rtc` re-exports `sansio` from the webrtc-rs workspace
 // (rtc/lib.rs:656-659). The `#[interceptor]` attribute macro from
 // rtc-interceptor-derive expands to code that references it via
@@ -301,8 +301,7 @@ pub fn spawn_twcc_health_aggregator(
         let mut accumulator = WindowAccumulator::default();
         loop {
             let window_end = window_start + HEALTH_WINDOW;
-            let timeout =
-                tokio::time::sleep_until(tokio::time::Instant::from_std(window_end));
+            let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(window_end));
             tokio::pin!(timeout);
             tokio::select! {
                 biased;
@@ -517,13 +516,13 @@ mod tests {
     /// on the first window boundary, ~1 s after `tokio::time::pause()`
     /// is advanced; tests `tokio::time::advance` past the boundary
     /// before awaiting this.
-    async fn next_snapshot(
-        rx: &mut watch::Receiver<Option<TwccHealth>>,
-    ) -> TwccHealth {
+    async fn next_snapshot(rx: &mut watch::Receiver<Option<TwccHealth>>) -> TwccHealth {
         // `changed()` resolves when the value transitions; then read
         // and clone the new state. Returns the latest snapshot.
         rx.changed().await.expect("aggregator dropped sender");
-        rx.borrow_and_update().clone().expect("first snapshot is Some")
+        rx.borrow_and_update()
+            .clone()
+            .expect("first snapshot is Some")
     }
 
     #[tokio::test(start_paused = true)]

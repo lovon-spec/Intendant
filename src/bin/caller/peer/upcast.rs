@@ -137,9 +137,7 @@ pub(crate) fn action_category_wire(cat: &crate::autonomy::ActionCategory) -> Str
 pub(crate) fn approval_decision_from_action(action: &str) -> ApprovalDecision {
     match action {
         "approve" | "accept" => ApprovalDecision::Accept,
-        "approve_all" | "accept_for_session" | "approveall" => {
-            ApprovalDecision::AcceptForSession
-        }
+        "approve_all" | "accept_for_session" | "approveall" => ApprovalDecision::AcceptForSession,
         "deny" | "decline" => ApprovalDecision::Decline,
         "skip" | "cancel" => ApprovalDecision::Cancel,
         _ => ApprovalDecision::Decline,
@@ -224,23 +222,23 @@ impl AppEventUpcaster {
     /// task means the in-flight agent is failing too, so we don't
     /// want to stamp it Success alongside a failed turn.
     fn close_pending_agent(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
-        self.current_agent_turn.take().map(|turn| {
-            PeerEvent::ActivityCompleted {
+        self.current_agent_turn
+            .take()
+            .map(|turn| PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("agent-{turn}")),
                 outcome,
-            }
-        })
+            })
     }
 
     /// Drain any in-flight turn activity. Called from `DoneSignal`,
     /// `TaskComplete`, and the next `TurnStarted` (defensive).
     fn close_pending_turn(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
-        self.current_turn.take().map(|turn| {
-            PeerEvent::ActivityCompleted {
+        self.current_turn
+            .take()
+            .map(|turn| PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("turn-{turn}")),
                 outcome,
-            }
-        })
+            })
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -285,8 +283,16 @@ impl AppEventUpcaster {
             | AppEvent::ConversationRollbackRequested { .. }
             | AppEvent::ConversationRolledBack { .. } => vec![],
 
-            AppEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
-                if *success { LogLevel::Info } else { LogLevel::Warn },
+            AppEvent::CodexThreadActionResult {
+                action,
+                success,
+                message,
+            } => vec![log_event(
+                if *success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
                 "codex-action",
                 if *success {
                     format!("/{}: {}", action, message)
@@ -295,8 +301,16 @@ impl AppEventUpcaster {
                 },
             )],
 
-            AppEvent::GeminiThreadActionResult { action, success, message } => vec![log_event(
-                if *success { LogLevel::Info } else { LogLevel::Warn },
+            AppEvent::GeminiThreadActionResult {
+                action,
+                success,
+                message,
+            } => vec![log_event(
+                if *success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
                 "gemini-action",
                 if *success {
                     format!("/{}: {}", action, message)
@@ -317,8 +331,7 @@ impl AppEventUpcaster {
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
-                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
-                {
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 // Seed the shared message ID for this turn so subsequent
@@ -394,8 +407,7 @@ impl AppEventUpcaster {
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
-                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
-                {
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success) {
                     out.push(closed);
                 } else {
                     // No turn tracked — DoneSignal arrived without a
@@ -662,7 +674,10 @@ impl AppEventUpcaster {
                 detail: serde_json::json!({ "display_id": display_id, "state": "taken" }),
             }],
 
-            AppEvent::DisplayReleased { display_id: _, note } => vec![PeerEvent::CapabilityReleased {
+            AppEvent::DisplayReleased {
+                display_id: _,
+                note,
+            } => vec![PeerEvent::CapabilityReleased {
                 capability: Capability::Display,
                 reason: note.clone(),
             }],
@@ -1192,21 +1207,21 @@ impl WireEventUpcaster {
     /// failure down to the in-flight agent instead of contradicting
     /// it with Success.
     fn close_pending_agent(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
-        self.current_agent_turn.take().map(|turn| {
-            PeerEvent::ActivityCompleted {
+        self.current_agent_turn
+            .take()
+            .map(|turn| PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("agent-{turn}")),
                 outcome,
-            }
-        })
+            })
     }
 
     fn close_pending_turn(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
-        self.current_turn.take().map(|turn| {
-            PeerEvent::ActivityCompleted {
+        self.current_turn
+            .take()
+            .map(|turn| PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("turn-{turn}")),
                 outcome,
-            }
-        })
+            })
     }
 
     /// Map a wire-format [`OutboundEvent`] to zero or more
@@ -1264,8 +1279,16 @@ impl WireEventUpcaster {
                 signal: signal.clone(),
             }],
 
-            OutboundEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
-                if *success { LogLevel::Info } else { LogLevel::Warn },
+            OutboundEvent::CodexThreadActionResult {
+                action,
+                success,
+                message,
+            } => vec![log_event(
+                if *success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
                 "codex-action",
                 if *success {
                     format!("/{}: {}", action, message)
@@ -1274,8 +1297,16 @@ impl WireEventUpcaster {
                 },
             )],
 
-            OutboundEvent::GeminiThreadActionResult { action, success, message } => vec![log_event(
-                if *success { LogLevel::Info } else { LogLevel::Warn },
+            OutboundEvent::GeminiThreadActionResult {
+                action,
+                success,
+                message,
+            } => vec![log_event(
+                if *success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
                 "gemini-action",
                 if *success {
                     format!("/{}: {}", action, message)
@@ -1290,8 +1321,7 @@ impl WireEventUpcaster {
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
-                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
-                {
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 self.current_message_id = Some(MessageId(format!("msg-turn-{turn}")));
@@ -1389,8 +1419,7 @@ impl WireEventUpcaster {
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
-                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
-                {
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success) {
                     out.push(closed);
                 } else {
                     let seq = self.next_seq();
@@ -1634,7 +1663,10 @@ impl WireEventUpcaster {
                 detail: serde_json::json!({ "display_id": display_id, "state": "taken" }),
             }],
 
-            OutboundEvent::DisplayReleased { display_id: _, note } => {
+            OutboundEvent::DisplayReleased {
+                display_id: _,
+                note,
+            } => {
                 vec![PeerEvent::CapabilityReleased {
                     capability: Capability::Display,
                     reason: note.clone(),
@@ -1972,11 +2004,7 @@ impl WireEventUpcaster {
                 data: _,
             } => {
                 let level = if *ok { LogLevel::Info } else { LogLevel::Warn };
-                vec![log_event(
-                    level,
-                    "control",
-                    format!("{action}: {message}"),
-                )]
+                vec![log_event(level, "control", format!("{action}: {message}"))]
             }
 
             // ---- Interruption ----
@@ -2201,10 +2229,7 @@ mod tests {
         });
         assert_eq!(engaged.len(), 1);
         match &engaged[0] {
-            PeerEvent::CapabilityEngaged {
-                capability,
-                detail,
-            } => {
+            PeerEvent::CapabilityEngaged { capability, detail } => {
                 assert_eq!(*capability, Capability::Display);
                 assert_eq!(detail["width"], 1920);
                 assert_eq!(detail["height"], 1080);
@@ -2216,10 +2241,7 @@ mod tests {
             note: Some("user revoked".into()),
         });
         match &released[0] {
-            PeerEvent::CapabilityReleased {
-                capability,
-                reason,
-            } => {
+            PeerEvent::CapabilityReleased { capability, reason } => {
                 assert_eq!(*capability, Capability::Display);
                 assert_eq!(reason.as_deref(), Some("user revoked"));
             }
@@ -2366,9 +2388,7 @@ mod tests {
             reason: "done".into(),
         });
         match &end[0] {
-            PeerEvent::SessionEnded {
-                session_id, reason,
-            } => {
+            PeerEvent::SessionEnded { session_id, reason } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(reason, "done");
             }
@@ -2432,9 +2452,7 @@ mod tests {
         let start_id = started
             .iter()
             .find_map(|e| match e {
-                PeerEvent::ActivityStarted { id, kind, .. }
-                    if *kind == ActivityKind::ToolCall =>
-                {
+                PeerEvent::ActivityStarted { id, kind, .. } if *kind == ActivityKind::ToolCall => {
                     Some(id.clone())
                 }
                 _ => None,
@@ -2455,10 +2473,7 @@ mod tests {
                 _ => None,
             })
             .expect("AgentOutput with stdout must emit an ActivityProgress");
-        assert_eq!(
-            progress_id, start_id,
-            "progress id must match started id"
-        );
+        assert_eq!(progress_id, start_id, "progress id must match started id");
 
         // Close the turn → agent activity should close with the same id.
         let done = u.upcast(&AppEvent::DoneSignal { message: None });
@@ -2555,10 +2570,7 @@ mod tests {
     /// upcasters behave consistently on both failure and cancel.
     #[test]
     fn task_complete_failure_propagates_to_agent_and_turn() {
-        for (reason, expected) in &[
-            ("failed", "failed"),
-            ("cancelled", "cancelled"),
-        ] {
+        for (reason, expected) in &[("failed", "failed"), ("cancelled", "cancelled")] {
             let mut u = AppEventUpcaster::new();
             // Open turn + agent, then fail.
             let _ = u.upcast(&AppEvent::TurnStarted {
@@ -2625,9 +2637,7 @@ mod tests {
         let completions: Vec<_> = out
             .iter()
             .filter_map(|e| match e {
-                PeerEvent::ActivityCompleted { id, outcome } => {
-                    Some((id.clone(), outcome.clone()))
-                }
+                PeerEvent::ActivityCompleted { id, outcome } => Some((id.clone(), outcome.clone())),
                 _ => None,
             })
             .collect();
@@ -2765,9 +2775,7 @@ mod tests {
             turn: 5,
             budget_pct: 0.5,
         });
-        let delta = u.upcast(&OutboundEvent::ModelResponseDelta {
-            text: "Hel".into(),
-        });
+        let delta = u.upcast(&OutboundEvent::ModelResponseDelta { text: "Hel".into() });
         let final_ = u.upcast(&OutboundEvent::ModelResponse {
             turn: 5,
             summary: "Hello".into(),
@@ -3145,8 +3153,7 @@ mod tests {
         assert!(matches!(&path_a[0], PeerEvent::Message { .. }));
         assert!(matches!(&path_a[1], PeerEvent::Usage { .. }));
 
-        let outbound =
-            crate::event::app_event_to_outbound(&app_event).expect("ModelResponse maps");
+        let outbound = crate::event::app_event_to_outbound(&app_event).expect("ModelResponse maps");
         let mut wire_upcaster = WireEventUpcaster::new();
         let path_b = wire_upcaster.upcast(&outbound);
         // Path B: just Message — usage arrives in a separate event.
@@ -3242,8 +3249,8 @@ mod tests {
         };
         assert!(text_a.contains("analyzing") && text_a.contains("parsed response"));
 
-        let outbound = crate::event::app_event_to_outbound(&app_event)
-            .expect("OrchestratorProgress maps");
+        let outbound =
+            crate::event::app_event_to_outbound(&app_event).expect("OrchestratorProgress maps");
         let mut wire_upcaster = WireEventUpcaster::new();
         let path_b = wire_upcaster.upcast(&outbound);
         let text_b = match &path_b[0] {

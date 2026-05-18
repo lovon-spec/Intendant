@@ -76,10 +76,7 @@ impl WaylandBackend {
 
 #[async_trait]
 impl DisplayBackend for WaylandBackend {
-    async fn start_capture(
-        &self,
-        fps: u32,
-    ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+    async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
         // Defensive: matching the x11.rs pattern — teardown any previous
         // capture (portal session + pipewire stream) before starting a new
         // one, so a double-start doesn't leak the portal session. The
@@ -145,11 +142,9 @@ impl DisplayBackend for WaylandBackend {
             .map_err(|e| CallerError::Display(format!("start response: {e}")))?;
 
         // Extract PipeWire node ID from the screencast streams.
-        let streams = started
-            .streams()
-            .ok_or_else(|| {
-                CallerError::Display("no screencast streams returned by portal".to_string())
-            })?;
+        let streams = started.streams().ok_or_else(|| {
+            CallerError::Display("no screencast streams returned by portal".to_string())
+        })?;
         if streams.is_empty() {
             return Err(CallerError::Display(
                 "empty stream list from portal".to_string(),
@@ -165,7 +160,10 @@ impl DisplayBackend for WaylandBackend {
 
         eprintln!(
             "[display/wayland] Portal granted stream: node_id={}, {}x{}, {} stream(s) available",
-            node_id, width, height, streams.len(),
+            node_id,
+            width,
+            height,
+            streams.len(),
         );
 
         *self.resolution.write().await = (width, height);
@@ -344,9 +342,7 @@ impl DisplayBackend for WaylandBackend {
                     if steps != 0 {
                         rd.notify_pointer_axis_discrete(session, Axis::Vertical, steps)
                             .await
-                            .map_err(|e| {
-                                CallerError::Display(format!("scroll inject: {e}"))
-                            })?;
+                            .map_err(|e| CallerError::Display(format!("scroll inject: {e}")))?;
                     }
                 }
                 if dx.abs() > f64::EPSILON {
@@ -354,9 +350,7 @@ impl DisplayBackend for WaylandBackend {
                     if steps != 0 {
                         rd.notify_pointer_axis_discrete(session, Axis::Horizontal, steps)
                             .await
-                            .map_err(|e| {
-                                CallerError::Display(format!("scroll inject: {e}"))
-                            })?;
+                            .map_err(|e| CallerError::Display(format!("scroll inject: {e}")))?;
                     }
                 }
             }
@@ -554,23 +548,20 @@ fn run_pipewire_capture(
             //   MemPtr  = 1 → bit 1 = 0x02
             //   MemFd   = 2 → bit 2 = 0x04
             //   DmaBuf  = 3 → bit 3 = 0x08
-            let data_type_mask: i32 =
-                (1 << spa_sys::SPA_DATA_DmaBuf) |
-                (1 << spa_sys::SPA_DATA_MemFd) |
-                (1 << spa_sys::SPA_DATA_MemPtr);
+            let data_type_mask: i32 = (1 << spa_sys::SPA_DATA_DmaBuf)
+                | (1 << spa_sys::SPA_DATA_MemFd)
+                | (1 << spa_sys::SPA_DATA_MemPtr);
 
             let buffers_pod_bytes = pipewire::spa::pod::serialize::PodSerializer::serialize(
                 std::io::Cursor::new(vec![0u8; 1024]),
                 &Value::Object(Object {
                     type_: SpaTypes::ObjectParamBuffers.as_raw(),
                     id: ParamType::Buffers.as_raw(),
-                    properties: vec![
-                        Property {
-                            key: spa_sys::SPA_PARAM_BUFFERS_dataType,
-                            flags: PropertyFlags::empty(),
-                            value: Value::Int(data_type_mask),
-                        },
-                    ],
+                    properties: vec![Property {
+                        key: spa_sys::SPA_PARAM_BUFFERS_dataType,
+                        flags: PropertyFlags::empty(),
+                        value: Value::Int(data_type_mask),
+                    }],
                 }),
             );
             if let Ok((cursor, _)) = buffers_pod_bytes {
@@ -606,14 +597,15 @@ fn run_pipewire_capture(
                     let pixel_data: Option<Vec<u8>> = if let Some(data) = buf.data() {
                         // Apply chunk offset/size: the valid region may be a
                         // subset of the mapped buffer.
-                        let effective = if chunk_size > 0 && chunk_offset + chunk_size <= data.len() {
+                        let effective = if chunk_size > 0 && chunk_offset + chunk_size <= data.len()
+                        {
                             &data[chunk_offset..chunk_offset + chunk_size]
                         } else {
                             data
                         };
                         Some(effective.to_vec())
                     } else if buf_type == pipewire::spa::buffer::DataType::DmaBuf
-                           || buf_type == pipewire::spa::buffer::DataType::MemFd
+                        || buf_type == pipewire::spa::buffer::DataType::MemFd
                     {
                         // Fd-backed buffer without auto-mapping. Manually mmap
                         // the fd, copy the pixels, then munmap.
@@ -621,7 +613,13 @@ fn run_pipewire_capture(
                         let fd = raw.fd as std::os::raw::c_int;
                         let maxsize = raw.maxsize as usize;
                         if fd >= 0 && maxsize > 0 {
-                            mmap_fd_and_read(fd, raw.mapoffset as usize, maxsize, chunk_offset, chunk_size)
+                            mmap_fd_and_read(
+                                fd,
+                                raw.mapoffset as usize,
+                                maxsize,
+                                chunk_offset,
+                                chunk_size,
+                            )
                         } else {
                             None
                         }
@@ -634,7 +632,11 @@ fn run_pipewire_capture(
                         let data_len = pixels.len();
                         let frame_w = if stride > 0 {
                             let current_w = sw.load(Ordering::SeqCst);
-                            if current_w > 0 { current_w } else { stride / 4 }
+                            if current_w > 0 {
+                                current_w
+                            } else {
+                                stride / 4
+                            }
                         } else {
                             sw.load(Ordering::SeqCst)
                         };
@@ -645,9 +647,7 @@ fn run_pipewire_capture(
                         };
 
                         // Update shared atomics if dimensions changed.
-                        if frame_w > 0 && frame_h > 0
-                            && (frame_w != last_w || frame_h != last_h)
-                        {
+                        if frame_w > 0 && frame_h > 0 && (frame_w != last_w || frame_h != last_h) {
                             eprintln!(
                                 "[display/wayland] frame resize detected: {}x{} -> {}x{}",
                                 last_w, last_h, frame_w, frame_h,
@@ -680,28 +680,19 @@ fn run_pipewire_capture(
     let format = pipewire::spa::pod::object!(
         SpaTypes::ObjectParamFormat,
         ParamType::EnumFormat,
-        pipewire::spa::pod::property!(
-            FormatProperties::MediaType,
-            Id,
-            MediaType::Video
-        ),
-        pipewire::spa::pod::property!(
-            FormatProperties::MediaSubtype,
-            Id,
-            MediaSubtype::Raw
-        ),
-        pipewire::spa::pod::property!(
-            FormatProperties::VideoFormat,
-            Id,
-            VideoFormat::BGRx
-        ),
+        pipewire::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        pipewire::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        pipewire::spa::pod::property!(FormatProperties::VideoFormat, Id, VideoFormat::BGRx),
         pipewire::spa::pod::property!(
             FormatProperties::VideoSize,
             Choice,
             Range,
             Rectangle,
             Rectangle { width, height },
-            Rectangle { width: 1, height: 1 },
+            Rectangle {
+                width: 1,
+                height: 1
+            },
             Rectangle {
                 width: width.max(8192),
                 height: height.max(8192),

@@ -428,9 +428,7 @@ impl LayerSpec {
             (SimulcastRid::half(), 2, 400),
             (SimulcastRid::quarter(), 4, 125),
         ] {
-            let Some((w, h)) =
-                normalize_layer_dims(source_w / divisor, source_h / divisor)
-            else {
+            let Some((w, h)) = normalize_layer_dims(source_w / divisor, source_h / divisor) else {
                 continue;
             };
             out.push(LayerSpec {
@@ -773,10 +771,9 @@ impl PoolLease {
         }
         // Partition the lease's claims: the ones we're releasing
         // now, and the ones we keep for full-release later.
-        let (to_release, keep): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.on_demand_refs)
-                .into_iter()
-                .partition(|(id, _gen)| ids.contains(id));
+        let (to_release, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.on_demand_refs)
+            .into_iter()
+            .partition(|(id, _gen)| ids.contains(id));
         self.on_demand_refs = keep;
 
         if to_release.is_empty() {
@@ -1045,8 +1042,7 @@ struct EncoderPoolInner {
 ///     single full-source VP8 layer (used by tests that exercise
 ///     the on-demand path with a minimal always-on set).
 ///   - `|_, _| vec![]` — no always-on, on-demand-only flows.
-pub type LayerFactory =
-    Box<dyn Fn(u32, u32) -> Vec<LayerSpec> + Send + Sync>;
+pub type LayerFactory = Box<dyn Fn(u32, u32) -> Vec<LayerSpec> + Send + Sync>;
 
 /// Atomic snapshot of source dimensions + resize epoch. Stored
 /// behind a `RwLock` inside [`EncoderPoolInner`] so any caller that
@@ -1109,9 +1105,13 @@ impl EncoderPool {
         // reflects the pool's total throughput. Tests that don't
         // care about metrics pass `None`; production passes
         // `Some(Arc::clone(&self.counters))` from DisplaySession::start.
-        let counters = counters
-            .unwrap_or_else(|| Arc::new(crate::display::DisplayMetricsCounters::new()));
-        let duration_ms = if framerate > 0 { 1000 / framerate as u64 } else { 33 };
+        let counters =
+            counters.unwrap_or_else(|| Arc::new(crate::display::DisplayMetricsCounters::new()));
+        let duration_ms = if framerate > 0 {
+            1000 / framerate as u64
+        } else {
+            33
+        };
         let (i420_tx, _) = broadcast::channel::<I420Frame>(I420_BROADCAST_CAPACITY);
 
         let layer_factory: LayerFactory = Box::new(layer_factory);
@@ -1136,13 +1136,13 @@ impl EncoderPool {
                 &counters,
             )
             .unwrap_or_else(|e| {
-                        panic!(
-                            "always-on encoder {} construction failed at pool startup: {} — \
+                panic!(
+                    "always-on encoder {} construction failed at pool startup: {} — \
                              always-on codecs must always be constructable; a VP8 libvpx \
                              failure at startup is unrecoverable",
-                            id, e,
-                        )
-                    });
+                    id, e,
+                )
+            });
             always_on.push(handle);
         }
 
@@ -1365,8 +1365,7 @@ impl EncoderPool {
         // refcount=0 would be a CPU leak.
         {
             let mut on_demand = self.inner.on_demand.lock().unwrap();
-            let old_slots: HashMap<EncoderId, OnDemandSlot> =
-                std::mem::take(&mut *on_demand);
+            let old_slots: HashMap<EncoderId, OnDemandSlot> = std::mem::take(&mut *on_demand);
             for (_id, old_slot) in old_slots {
                 old_slot.handle.shutdown.cancel();
             }
@@ -1482,10 +1481,7 @@ impl EncoderPool {
         Err(SubscribeError::NoCompatibleCodec)
     }
 
-    fn subscribe_once(
-        &self,
-        prefs: &PeerCodecPreferences,
-    ) -> SubscribeAttemptOutcome {
+    fn subscribe_once(&self, prefs: &PeerCodecPreferences) -> SubscribeAttemptOutcome {
         let mut subs = Vec::new();
         let mut always_on_codecs: Vec<CodecKind> = Vec::new();
 
@@ -1637,8 +1633,7 @@ impl EncoderPool {
             // transient subscribe failure and retries on the next
             // offer/reconnect — same semantics as any other
             // encoder construction failure.
-            let stale_epoch =
-                self.snapshot_source().gen != source_at_start.gen;
+            let stale_epoch = self.snapshot_source().gen != source_at_start.gen;
             if stale_epoch {
                 for (id, handle, _layer) in &constructed {
                     eprintln!(
@@ -1695,8 +1690,7 @@ impl EncoderPool {
                         // Race win: no slot yet. Install ours with a
                         // fresh generation from the pool-level
                         // counter.
-                        let generation =
-                            self.inner.slot_gen_counter.fetch_add(1, Ordering::SeqCst);
+                        let generation = self.inner.slot_gen_counter.fetch_add(1, Ordering::SeqCst);
                         let slot = OnDemandSlot {
                             handle: handle.clone(),
                             refcount: 1,
@@ -1739,11 +1733,7 @@ impl EncoderPool {
     ///
     /// Called by the per-peer forwarder when inbound RTCP requests a
     /// keyframe for that peer.
-    pub fn request_keyframe(
-        &self,
-        codec: CodecKind,
-        rid: Option<SimulcastRid>,
-    ) -> bool {
+    pub fn request_keyframe(&self, codec: CodecKind, rid: Option<SimulcastRid>) -> bool {
         // Coalesce per (codec, rid). When rid is None we coalesce
         // against the full layer (callers using None typically mean
         // "any layer is fine, just give me a keyframe").
@@ -1989,11 +1979,7 @@ impl EncoderPool {
     /// Test-only access to on-demand slot counts. Lets tests verify
     /// refcount + teardown semantics without exposing the map.
     #[cfg(test)]
-    pub(crate) fn on_demand_refcount(
-        &self,
-        codec: CodecKind,
-        rid: SimulcastRid,
-    ) -> Option<usize> {
+    pub(crate) fn on_demand_refcount(&self, codec: CodecKind, rid: SimulcastRid) -> Option<usize> {
         let id = EncoderId::new(codec, rid);
         let map = self.inner.on_demand.lock().unwrap();
         map.get(&id).map(|slot| slot.refcount)
@@ -2089,7 +2075,14 @@ fn try_spawn_encoder_thread(
         layer.target_bitrate_kbps,
     )?;
     Ok(spawn_encoder_thread_with(
-        id, layer, source_w, source_h, encoder, i420_tx, duration_ms, counters,
+        id,
+        layer,
+        source_w,
+        source_h,
+        encoder,
+        i420_tx,
+        duration_ms,
+        counters,
     ))
 }
 
@@ -2230,8 +2223,7 @@ fn spawn_encoder_thread_with(
     duration_ms: u64,
     counters: &Arc<crate::display::DisplayMetricsCounters>,
 ) -> EncoderHandle {
-    let (frames_tx, _) =
-        broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
+    let (frames_tx, _) = broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
     let force_keyframe = Arc::new(AtomicBool::new(false));
     // Phase 4d.0: paused defaults to false. Layer-selection policy
     // flips this via [`EncoderPool::pause_layer`] /
@@ -2260,8 +2252,7 @@ fn spawn_encoder_thread_with(
     // `layer.height`. When they differ (simulcast: half/quarter
     // layers), each frame must be downscaled before encode or the
     // encoder will reject (size mismatch) or mis-encode.
-    let needs_downscale =
-        (layer.width, layer.height) != (source_w, source_h);
+    let needs_downscale = (layer.width, layer.height) != (source_w, source_h);
     let downscale_src_w = source_w;
     let downscale_src_h = source_h;
     let downscale_dst_w = layer.width;
@@ -2504,7 +2495,12 @@ mod tests {
 
     #[test]
     fn codec_kind_from_mime_round_trips_every_kind() {
-        for k in [CodecKind::Vp8, CodecKind::H264, CodecKind::Vp9, CodecKind::Av1] {
+        for k in [
+            CodecKind::Vp8,
+            CodecKind::H264,
+            CodecKind::Vp9,
+            CodecKind::Av1,
+        ] {
             assert_eq!(CodecKind::from_mime(k.mime()), Some(k));
         }
         assert_eq!(CodecKind::from_mime("video/HEVC"), None);
@@ -2767,10 +2763,7 @@ mod tests {
         // (128, 96) → new layer is (128, 96).
         assert_eq!(new_layer.width, 128);
         assert_eq!(new_layer.height, 96);
-        assert_eq!(
-            new_layer.rid, old_layer.rid,
-            "rid preserved across resize"
-        );
+        assert_eq!(new_layer.rid, old_layer.rid, "rid preserved across resize");
 
         // Old subscription must terminate. The mechanics:
         // - on_resize cancels the old handle's shutdown token, but the
@@ -2801,9 +2794,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         for _ in 0..3 {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let Ok(result) =
-                tokio::time::timeout(remaining, old_frames_rx.recv()).await
-            else {
+            let Ok(result) = tokio::time::timeout(remaining, old_frames_rx.recv()).await else {
                 break;
             };
             match result {
@@ -2924,13 +2915,7 @@ mod tests {
     /// (drift-free resize through odd intermediate dims).
     #[tokio::test]
     async fn on_resize_drops_simulcast_layers_below_min_dim() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Precondition: all 3 simulcast layers spawned cleanly.
         {
@@ -2946,8 +2931,7 @@ mod tests {
         pool.on_resize(60, 48);
 
         let always_on = pool.always_on();
-        let rids: Vec<SimulcastRid> =
-            always_on.iter().map(|h| h.layer.rid.clone()).collect();
+        let rids: Vec<SimulcastRid> = always_on.iter().map(|h| h.layer.rid.clone()).collect();
         assert_eq!(
             always_on.len(),
             2,
@@ -2993,8 +2977,7 @@ mod tests {
         // checked by both the resize and initial-construction paths
         // through `normalize_layer_dims`.
         let fresh = LayerSpec::vp8_simulcast(60, 48, 30);
-        let fresh_rids: Vec<SimulcastRid> =
-            fresh.iter().map(|l| l.rid.clone()).collect();
+        let fresh_rids: Vec<SimulcastRid> = fresh.iter().map(|l| l.rid.clone()).collect();
         let mut sorted_rids = rids.clone();
         sorted_rids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let mut sorted_fresh = fresh_rids.clone();
@@ -3025,13 +3008,7 @@ mod tests {
     ///   after  64×64: full(64×64), half(32×32), quarter(16×16)  [restored]
     #[tokio::test]
     async fn on_resize_grow_back_restores_dropped_simulcast_layers() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Start: 3 layers.
         assert_eq!(pool.always_on().len(), 3, "initial pool has 3 layers");
@@ -3053,10 +3030,12 @@ mod tests {
             "after 60×48 → 64×64 round-trip: quarter must be restored \
              (got {} layers, rids={:?})",
             always_on.len(),
-            always_on.iter().map(|h| h.layer.rid.as_str()).collect::<Vec<_>>(),
+            always_on
+                .iter()
+                .map(|h| h.layer.rid.as_str())
+                .collect::<Vec<_>>(),
         );
-        let rids: Vec<&str> =
-            always_on.iter().map(|h| h.layer.rid.as_str()).collect();
+        let rids: Vec<&str> = always_on.iter().map(|h| h.layer.rid.as_str()).collect();
         assert!(rids.contains(&RID_FULL), "full present");
         assert!(rids.contains(&RID_HALF), "half present");
         assert!(
@@ -3142,11 +3121,10 @@ mod tests {
             .collect();
         let mut actual_sorted = actual.clone();
         actual_sorted.sort();
-        let expected: Vec<(String, u32, u32)> =
-            LayerSpec::vp8_simulcast(1920, 1080, 30)
-                .iter()
-                .map(|l| (l.rid.as_str().to_string(), l.width, l.height))
-                .collect();
+        let expected: Vec<(String, u32, u32)> = LayerSpec::vp8_simulcast(1920, 1080, 30)
+            .iter()
+            .map(|l| (l.rid.as_str().to_string(), l.width, l.height))
+            .collect();
         let mut expected_sorted = expected.clone();
         expected_sorted.sort();
         assert_eq!(
@@ -3247,9 +3225,7 @@ mod tests {
         // giving us a VP8 slot to observe.
         let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let (_subs, _lease) = pool
-            .subscribe(&prefs)
-            .expect("on-demand VP8 spawn");
+        let (_subs, _lease) = pool.subscribe(&prefs).expect("on-demand VP8 spawn");
         assert_eq!(
             pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
             Some(1),
@@ -3522,8 +3498,7 @@ mod tests {
             None,
         );
 
-        let unsupported_prefs =
-            PeerCodecPreferences::new(vec![CodecKind::Vp9, CodecKind::Av1]);
+        let unsupported_prefs = PeerCodecPreferences::new(vec![CodecKind::Vp9, CodecKind::Av1]);
         let result = pool.subscribe(&unsupported_prefs);
         assert!(
             matches!(result, Err(SubscribeError::NoCompatibleCodec)),
@@ -3563,7 +3538,10 @@ mod tests {
 
         // Fire keyframe request → flag goes true.
         let fired = pool.request_keyframe(CodecKind::Vp8, Some(SimulcastRid::full()));
-        assert!(fired, "request_keyframe must return true when encoder matches");
+        assert!(
+            fired,
+            "request_keyframe must return true when encoder matches"
+        );
         assert!(handle.force_keyframe.load(Ordering::SeqCst));
 
         // Second request is coalesced (returns false) — flag stays
@@ -3586,13 +3564,7 @@ mod tests {
     async fn pool_request_keyframe_all_fires_all_active_encoders() {
         // Three always-on layers (full / half / quarter) — exercises
         // multi-encoder iteration, not just a single layer.
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Initial state: flags clear on every always-on encoder.
         {
@@ -3653,13 +3625,7 @@ mod tests {
     /// reflected without a separate refresh path.
     #[tokio::test]
     async fn pool_always_on_ids_returns_one_id_per_layer() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         let ids = pool.always_on_ids();
         assert_eq!(
@@ -3677,11 +3643,7 @@ mod tests {
             );
         }
         // Must match what `always_on()` (the internal accessor) sees.
-        let internal_ids: Vec<EncoderId> = pool
-            .always_on()
-            .iter()
-            .map(|h| h.id.clone())
-            .collect();
+        let internal_ids: Vec<EncoderId> = pool.always_on().iter().map(|h| h.id.clone()).collect();
         assert_eq!(
             ids, internal_ids,
             "always_on_ids must mirror the internal handle set \
@@ -3725,10 +3687,7 @@ mod tests {
         // Behavior 3: post-swap latch — never fires again, even on
         // continued silence well past the threshold.
         for _ in 0..(ENCODER_SILENT_FRAMES_THRESHOLD * 3) {
-            assert!(
-                !w.record(0),
-                "post-swap watchdog must never fire again",
-            );
+            assert!(!w.record(0), "post-swap watchdog must never fire again",);
         }
         // Even produced > 0 followed by silence stays latched.
         assert!(!w.record(2));
@@ -3811,7 +3770,10 @@ mod tests {
             .await
             .expect("encoded frame should arrive within 2s")
             .expect("broadcast should not be closed while pool is alive");
-        assert!(!ef.data.is_empty(), "encoded frame payload must be non-empty");
+        assert!(
+            !ef.data.is_empty(),
+            "encoded frame payload must be non-empty"
+        );
     }
 
     /// **Phase 4a regression test.** A pool with a half-resolution
@@ -3853,13 +3815,15 @@ mod tests {
             SRC_W,
             SRC_H,
             30,
-            |_w, _h| vec![LayerSpec {
-                rid: SimulcastRid::half(),
-                width: HALF_W,
-                height: HALF_H,
-                target_bitrate_kbps: 400,
-                framerate: 30,
-            }],
+            |_w, _h| {
+                vec![LayerSpec {
+                    rid: SimulcastRid::half(),
+                    width: HALF_W,
+                    height: HALF_H,
+                    target_bitrate_kbps: 400,
+                    framerate: 30,
+                }]
+            },
             None,
         );
 
@@ -4115,7 +4079,11 @@ mod tests {
         );
 
         let (subs, _lease) = pool.subscribe(&prefs).expect("subscribe must succeed");
-        assert_eq!(subs.len(), 1, "on-demand spawn must return one subscription");
+        assert_eq!(
+            subs.len(),
+            1,
+            "on-demand spawn must return one subscription"
+        );
         assert_eq!(subs[0].id.codec, CodecKind::Vp8);
 
         // Refcount = 1 after first subscribe.
@@ -4205,10 +4173,8 @@ mod tests {
         let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
-        let (_subs_a, mut lease_a) =
-            pool.subscribe(&prefs).expect("subscribe a");
-        let (_subs_b, lease_b) =
-            pool.subscribe(&prefs).expect("subscribe b");
+        let (_subs_a, mut lease_a) = pool.subscribe(&prefs).expect("subscribe a");
+        let (_subs_b, lease_b) = pool.subscribe(&prefs).expect("subscribe b");
         assert_eq!(
             pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
             Some(2),
@@ -4270,8 +4236,7 @@ mod tests {
         // VP8 is always-on; no on-demand claim. Subscribe still
         // returns the always-on sub but lease has empty on_demand_refs.
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let (_subs, mut lease) =
-            pool.subscribe(&prefs).expect("subscribe always-on VP8");
+        let (_subs, mut lease) = pool.subscribe(&prefs).expect("subscribe always-on VP8");
         assert_eq!(lease.on_demand_count(), 0);
 
         // Pass an always-on id and a never-claimed id; both should
@@ -4289,8 +4254,7 @@ mod tests {
     async fn release_on_demand_subset_empty_ids_is_noop() {
         let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let (_subs, mut lease) =
-            pool.subscribe(&prefs).expect("subscribe on-demand VP8");
+        let (_subs, mut lease) = pool.subscribe(&prefs).expect("subscribe on-demand VP8");
         assert_eq!(lease.on_demand_count(), 1);
 
         lease.release_on_demand_subset(&[]);
@@ -4387,7 +4351,10 @@ mod tests {
         // VP8 from always-on is guaranteed. H.264 on-demand is
         // best-effort — depends on platform backend availability.
         let codecs: Vec<CodecKind> = subs.iter().map(|s| s.id.codec).collect();
-        assert!(codecs.contains(&CodecKind::Vp8), "VP8 always-on must be present");
+        assert!(
+            codecs.contains(&CodecKind::Vp8),
+            "VP8 always-on must be present"
+        );
 
         // VP8 is in always_on, not on_demand — refcount tracking only
         // applies to on-demand slots.
@@ -4400,8 +4367,7 @@ mod tests {
         // slot. If not, refcount is None. Assert the condition is
         // consistent with what came back in the subscription set.
         let h264_in_subs = codecs.contains(&CodecKind::H264);
-        let h264_refcount =
-            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::full());
+        let h264_refcount = pool.on_demand_refcount(CodecKind::H264, SimulcastRid::full());
         assert_eq!(
             h264_in_subs,
             h264_refcount.is_some(),
@@ -4473,15 +4439,13 @@ mod tests {
     /// implicitly paused at construction).
     #[tokio::test]
     async fn pool_layer_paused_defaults_false() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
-        for rid in [SimulcastRid::full(), SimulcastRid::half(), SimulcastRid::quarter()] {
+        for rid in [
+            SimulcastRid::full(),
+            SimulcastRid::half(),
+            SimulcastRid::quarter(),
+        ] {
             assert_eq!(
                 pool.is_layer_paused(CodecKind::Vp8, rid.clone()),
                 Some(false),
@@ -4498,13 +4462,7 @@ mod tests {
     /// returns true since the slot exists).
     #[tokio::test]
     async fn pool_pause_resume_layer_toggles_flag() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Pause half — full and quarter stay active.
         let paused = pool.pause_layer(CodecKind::Vp8, SimulcastRid::half());
@@ -4525,7 +4483,10 @@ mod tests {
 
         // Idempotent pause: second call returns true, state unchanged.
         let paused_again = pool.pause_layer(CodecKind::Vp8, SimulcastRid::half());
-        assert!(paused_again, "pause_layer is idempotent on already-paused slot");
+        assert!(
+            paused_again,
+            "pause_layer is idempotent on already-paused slot"
+        );
         assert_eq!(
             pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::half()),
             Some(true)
@@ -4541,7 +4502,10 @@ mod tests {
 
         // Idempotent resume.
         let resumed_again = pool.resume_layer(CodecKind::Vp8, SimulcastRid::half());
-        assert!(resumed_again, "resume_layer is idempotent on already-active slot");
+        assert!(
+            resumed_again,
+            "resume_layer is idempotent on already-active slot"
+        );
     }
 
     /// Unknown `(codec, rid)` lookups return `false` from
@@ -4722,13 +4686,7 @@ mod tests {
     /// accidentally collapse layer state.
     #[tokio::test]
     async fn pool_pause_resume_targets_correct_layer_in_simulcast() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Pause full only.
         pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());

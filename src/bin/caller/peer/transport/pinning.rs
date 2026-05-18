@@ -42,9 +42,7 @@
 //! still can't impersonate the peer — they'd fail the handshake's
 //! signature step.
 
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
@@ -134,8 +132,7 @@ impl PinnedFingerprintVerifier {
         let mut pinned = Vec::new();
         for s in strings {
             let s = s.as_ref();
-            let fp = parse_fingerprint(s)
-                .map_err(|e| format!("invalid fingerprint {s:?}: {e}"))?;
+            let fp = parse_fingerprint(s).map_err(|e| format!("invalid fingerprint {s:?}: {e}"))?;
             pinned.push(fp);
         }
         Ok(Self::new(pinned))
@@ -222,7 +219,9 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -251,8 +250,7 @@ mod tests {
         let bytes = b"hello world";
         let fp = fingerprint_of_der(bytes);
         // Known SHA-256 of "hello world".
-        let expected =
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
         assert_eq!(format_fingerprint(&fp), expected);
     }
 
@@ -270,10 +268,9 @@ mod tests {
 
     #[test]
     fn parse_fingerprint_accepts_plain_hex() {
-        let fp = parse_fingerprint(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        )
-        .unwrap();
+        let fp =
+            parse_fingerprint("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+                .unwrap();
         assert_eq!(fp[0], 0xaa);
         assert_eq!(fp[1], 0xbb);
         assert_eq!(fp[31], 0x99);
@@ -285,10 +282,9 @@ mod tests {
             "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
         )
         .unwrap();
-        let without = parse_fingerprint(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        )
-        .unwrap();
+        let without =
+            parse_fingerprint("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+                .unwrap();
         assert_eq!(with, without);
     }
 
@@ -296,14 +292,12 @@ mod tests {
     fn parse_fingerprint_accepts_uppercase() {
         // u8::from_str_radix(..., 16) is case-insensitive, so this works
         // for both cases without an explicit `to_lowercase()` call.
-        let upper = parse_fingerprint(
-            "AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899",
-        )
-        .unwrap();
-        let lower = parse_fingerprint(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        )
-        .unwrap();
+        let upper =
+            parse_fingerprint("AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899")
+                .unwrap();
+        let lower =
+            parse_fingerprint("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+                .unwrap();
         assert_eq!(upper, lower);
     }
 
@@ -315,10 +309,9 @@ mod tests {
 
     #[test]
     fn parse_fingerprint_rejects_non_hex() {
-        let err = parse_fingerprint(
-            "zz0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap_err();
+        let err =
+            parse_fingerprint("zz0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap_err();
         // Could fail on length (65 chars) or non-hex; either is
         // acceptable diagnostic. Test the length path explicitly:
         assert!(err.contains("64 hex chars") || err.contains("non-hex"));
@@ -346,8 +339,7 @@ mod tests {
 
     #[test]
     fn from_strings_reports_offending_entry() {
-        let err = PinnedFingerprintVerifier::from_strings(["valid-but-wrong-length"])
-            .unwrap_err();
+        let err = PinnedFingerprintVerifier::from_strings(["valid-but-wrong-length"]).unwrap_err();
         assert!(err.contains("valid-but-wrong-length"));
     }
 
@@ -363,13 +355,7 @@ mod tests {
         let v = PinnedFingerprintVerifier::new(vec![fp]);
         let cert = CertificateDer::from(cert_bytes.to_vec());
         let server_name = ServerName::try_from("test.example").unwrap();
-        let result = v.verify_server_cert(
-            &cert,
-            &[],
-            &server_name,
-            &[],
-            UnixTime::now(),
-        );
+        let result = v.verify_server_cert(&cert, &[], &server_name, &[], UnixTime::now());
         assert!(result.is_ok(), "expected accept, got: {result:?}");
     }
 
@@ -382,19 +368,16 @@ mod tests {
         let v = PinnedFingerprintVerifier::new(vec![pinned_fp]);
         let cert = CertificateDer::from(b"different-bytes".to_vec());
         let server_name = ServerName::try_from("test.example").unwrap();
-        let result = v.verify_server_cert(
-            &cert,
-            &[],
-            &server_name,
-            &[],
-            UnixTime::now(),
-        );
+        let result = v.verify_server_cert(&cert, &[], &server_name, &[], UnixTime::now());
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("doesn't match"), "got: {msg}");
         // Presented fingerprint is in the error.
         let presented = format_fingerprint(&fingerprint_of_der(b"different-bytes"));
-        assert!(msg.contains(&presented), "presented fingerprint in error: {msg}");
+        assert!(
+            msg.contains(&presented),
+            "presented fingerprint in error: {msg}"
+        );
     }
 
     /// Empty pinned list rejects every cert (operator gave us no
@@ -404,13 +387,7 @@ mod tests {
         let v = PinnedFingerprintVerifier::new(vec![]);
         let cert = CertificateDer::from(b"any-bytes".to_vec());
         let server_name = ServerName::try_from("test.example").unwrap();
-        let result = v.verify_server_cert(
-            &cert,
-            &[],
-            &server_name,
-            &[],
-            UnixTime::now(),
-        );
+        let result = v.verify_server_cert(&cert, &[], &server_name, &[], UnixTime::now());
         assert!(result.is_err());
     }
 

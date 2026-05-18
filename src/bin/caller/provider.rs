@@ -155,7 +155,6 @@ pub trait ChatProvider: Send + Sync {
     /// differs from the default (e.g. user's real display vs virtual display).
     fn set_cu_display(&mut self, _dims: (u32, u32)) {}
 
-
     /// Return tool definitions when native tool calling is enabled.
     #[allow(dead_code)]
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -262,18 +261,25 @@ fn parse_openai_cu_action(action: &serde_json::Value) -> Option<super::computer_
                 Some("middle") => MouseButton::Middle,
                 _ => MouseButton::Left,
             };
-            Some(CuAction::Click { x: x()?, y: y()?, button })
+            Some(CuAction::Click {
+                x: x()?,
+                y: y()?,
+                button,
+            })
         }
-        "double_click" => {
-            Some(CuAction::DoubleClick { x: x()?, y: y()?, button: MouseButton::Left })
-        }
+        "double_click" => Some(CuAction::DoubleClick {
+            x: x()?,
+            y: y()?,
+            button: MouseButton::Left,
+        }),
         "type" => {
             let text = action.get("text")?.as_str()?.to_string();
             Some(CuAction::Type { text })
         }
         "keypress" => {
             let keys = action.get("keys")?.as_array()?;
-            let key = keys.iter()
+            let key = keys
+                .iter()
                 .filter_map(|v| v.as_str())
                 .collect::<Vec<_>>()
                 .join("+");
@@ -293,7 +299,12 @@ fn parse_openai_cu_action(action: &serde_json::Value) -> Option<super::computer_
             };
             // Convert pixel scroll to click counts (roughly 120px per notch)
             let clicks = (amount / 120).max(1);
-            Some(CuAction::Scroll { x: x()?, y: y()?, direction, amount: clicks })
+            Some(CuAction::Scroll {
+                x: x()?,
+                y: y()?,
+                direction,
+                amount: clicks,
+            })
         }
         "drag" => {
             let path = action.get("path")?.as_array()?;
@@ -554,7 +565,9 @@ impl ChatProvider for OpenAIProvider {
                     }
                     Some("computer_call") if self.cu_enabled => {
                         if let Some(call_id) = &item.call_id {
-                            let actions = item.actions.as_ref()
+                            let actions = item
+                                .actions
+                                .as_ref()
                                 .map(|arr| arr.iter().filter_map(parse_openai_cu_action).collect())
                                 .unwrap_or_default();
                             let safety = item.pending_safety_checks.clone().unwrap_or_default();
@@ -711,7 +724,9 @@ impl ChatProvider for OpenAIProvider {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         if self.use_tools {
-            self.custom_tools.clone().unwrap_or_else(|| crate::tools::all_tools())
+            self.custom_tools
+                .clone()
+                .unwrap_or_else(|| crate::tools::all_tools())
         } else {
             vec![]
         }
@@ -870,12 +885,20 @@ impl ChatProvider for OpenAIProvider {
                                         item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                     // Parse computer_call items
                                     if item_type == "computer_call" && self.cu_enabled {
-                                        if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
-                                            let actions = item.get("actions")
+                                        if let Some(call_id) =
+                                            item.get("call_id").and_then(|v| v.as_str())
+                                        {
+                                            let actions = item
+                                                .get("actions")
                                                 .and_then(|a| a.as_array())
-                                                .map(|arr| arr.iter().filter_map(parse_openai_cu_action).collect())
+                                                .map(|arr| {
+                                                    arr.iter()
+                                                        .filter_map(parse_openai_cu_action)
+                                                        .collect()
+                                                })
                                                 .unwrap_or_default();
-                                            let safety = item.get("pending_safety_checks")
+                                            let safety = item
+                                                .get("pending_safety_checks")
                                                 .and_then(|v| v.as_array())
                                                 .cloned()
                                                 .unwrap_or_default();
@@ -1114,7 +1137,11 @@ fn build_openai_request_parts(
             "type": "computer"
         }));
     }
-    let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
+    let tools = if tools_vec.is_empty() {
+        None
+    } else {
+        Some(tools_vec)
+    };
 
     (instructions, input, text, tools)
 }
@@ -1265,7 +1292,11 @@ impl ChatProvider for AnthropicProvider {
                 }));
             }
         }
-        let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
+        let tools = if tools_vec.is_empty() {
+            None
+        } else {
+            Some(tools_vec)
+        };
 
         let request = AnthropicChatRequest {
             model: self.model.clone(),
@@ -1299,7 +1330,11 @@ impl ChatProvider for AnthropicProvider {
                 }));
             }
         }
-        let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
+        let tools = if tools_vec.is_empty() {
+            None
+        } else {
+            Some(tools_vec)
+        };
 
         let request = AnthropicChatRequest {
             model: self.model.clone(),
@@ -1452,7 +1487,9 @@ impl ChatProvider for AnthropicProvider {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         if self.use_tools {
-            self.custom_tools.clone().unwrap_or_else(|| crate::tools::all_tools())
+            self.custom_tools
+                .clone()
+                .unwrap_or_else(|| crate::tools::all_tools())
         } else {
             vec![]
         }
@@ -1480,7 +1517,11 @@ impl ChatProvider for AnthropicProvider {
                 }));
             }
         }
-        let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
+        let tools = if tools_vec.is_empty() {
+            None
+        } else {
+            Some(tools_vec)
+        };
 
         let request = AnthropicChatRequest {
             model: self.model.clone(),
@@ -1600,8 +1641,11 @@ impl ChatProvider for AnthropicProvider {
                             "content_block_stop" => {
                                 if !current_tool_id.is_empty() {
                                     if current_tool_name == "computer" && self.cu_enabled {
-                                        if let Ok(input) = serde_json::from_str::<serde_json::Value>(&current_tool_json) {
-                                            if let Some(action) = parse_anthropic_cu_action(&input) {
+                                        if let Ok(input) = serde_json::from_str::<serde_json::Value>(
+                                            &current_tool_json,
+                                        ) {
+                                            if let Some(action) = parse_anthropic_cu_action(&input)
+                                            {
                                                 cu_calls.push(super::computer_use::CuToolCall {
                                                     call_id: current_tool_id.clone(),
                                                     actions: vec![action],
@@ -1684,19 +1728,35 @@ fn parse_anthropic_cu_action(input: &serde_json::Value) -> Option<super::compute
         "screenshot" => Some(CuAction::Screenshot),
         "left_click" => {
             let (x, y) = coord()?;
-            Some(CuAction::Click { x, y, button: MouseButton::Left })
+            Some(CuAction::Click {
+                x,
+                y,
+                button: MouseButton::Left,
+            })
         }
         "right_click" => {
             let (x, y) = coord()?;
-            Some(CuAction::Click { x, y, button: MouseButton::Right })
+            Some(CuAction::Click {
+                x,
+                y,
+                button: MouseButton::Right,
+            })
         }
         "middle_click" => {
             let (x, y) = coord()?;
-            Some(CuAction::Click { x, y, button: MouseButton::Middle })
+            Some(CuAction::Click {
+                x,
+                y,
+                button: MouseButton::Middle,
+            })
         }
         "double_click" => {
             let (x, y) = coord()?;
-            Some(CuAction::DoubleClick { x, y, button: MouseButton::Left })
+            Some(CuAction::DoubleClick {
+                x,
+                y,
+                button: MouseButton::Left,
+            })
         }
         "type" => {
             let text = input.get("text")?.as_str()?.to_string();
@@ -1720,18 +1780,34 @@ fn parse_anthropic_cu_action(input: &serde_json::Value) -> Option<super::compute
                 "right" => ScrollDirection::Right,
                 _ => return None,
             };
-            let amount = input.get("scroll_amount").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
-            Some(CuAction::Scroll { x, y, direction, amount })
+            let amount = input
+                .get("scroll_amount")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(3) as i32;
+            Some(CuAction::Scroll {
+                x,
+                y,
+                direction,
+                amount,
+            })
         }
         "left_click_drag" => {
             let (sx, sy) = coord()?;
             let end = input.get("end_coordinate")?.as_array()?;
             let ex = end.first()?.as_i64()? as i32;
             let ey = end.get(1)?.as_i64()? as i32;
-            Some(CuAction::Drag { start_x: sx, start_y: sy, end_x: ex, end_y: ey })
+            Some(CuAction::Drag {
+                start_x: sx,
+                start_y: sy,
+                end_x: ex,
+                end_y: ey,
+            })
         }
         "wait" => {
-            let ms = input.get("duration").and_then(|v| v.as_u64()).unwrap_or(1000);
+            let ms = input
+                .get("duration")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1000);
             Some(CuAction::Wait { ms })
         }
         _ => None,
@@ -1952,8 +2028,7 @@ impl ChatProvider for GeminiProvider {
         stream: bool,
     ) -> Result<(String, serde_json::Value), CallerError> {
         let _ = stream;
-        let (system_text, _contents, mut request_body) =
-            build_gemini_request_parts(messages, self);
+        let (system_text, _contents, mut request_body) = build_gemini_request_parts(messages, self);
 
         if let Some(ref sys) = system_text {
             request_body["systemInstruction"] = serde_json::json!({
@@ -2043,7 +2118,8 @@ impl ChatProvider for GeminiProvider {
                             });
                         }
                     } else {
-                        let args = serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                        let args =
+                            serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
                         let id = format!("gemini_call_{}", tool_calls.len());
                         tool_calls.push(ToolCall {
                             id: id.clone(),
@@ -2136,7 +2212,9 @@ impl ChatProvider for GeminiProvider {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         if self.use_tools {
-            self.custom_tools.clone().unwrap_or_else(|| crate::tools::all_tools())
+            self.custom_tools
+                .clone()
+                .unwrap_or_else(|| crate::tools::all_tools())
         } else {
             vec![]
         }
@@ -2231,20 +2309,25 @@ impl ChatProvider for GeminiProvider {
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let args_val = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                                let args_val =
+                                    fc.get("args").cloned().unwrap_or(serde_json::json!({}));
 
                                 if self.cu_enabled && GEMINI_CU_FUNCTIONS.contains(&name.as_str()) {
                                     let (dw, dh) = self.cu_display.unwrap_or((1440, 900));
-                                    if let Some(action) = parse_gemini_cu_action(&name, &args_val, dw, dh) {
+                                    if let Some(action) =
+                                        parse_gemini_cu_action(&name, &args_val, dw, dh)
+                                    {
                                         let id = format!("gemini_cu_{}", cu_calls.len());
                                         cu_calls.push(super::computer_use::CuToolCall {
                                             call_id: id,
                                             actions: vec![action],
-                                            metadata: super::computer_use::CuCallMetadata::default(),
+                                            metadata: super::computer_use::CuCallMetadata::default(
+                                            ),
                                         });
                                     }
                                 } else {
-                                    let args = serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                                    let args = serde_json::to_string(&args_val)
+                                        .unwrap_or_else(|_| "{}".to_string());
                                     let id = format!("gemini_call_{}", tool_calls.len());
                                     tool_calls.push(ToolCall {
                                         id: id.clone(),
@@ -2288,7 +2371,7 @@ impl ChatProvider for GeminiProvider {
 
         let content = text_parts.join("");
         let _ = (contents, system_text); // consumed above
-        // Store raw parts for echo-back (preserves thoughtSignature for Gemini CU)
+                                         // Store raw parts for echo-back (preserves thoughtSignature for Gemini CU)
         let raw_output = if !raw_model_parts.is_empty() {
             Some(raw_model_parts)
         } else {
@@ -2339,14 +2422,17 @@ fn build_gemini_request_parts(
                         }
                     });
                     if let Some(ref images) = m.images {
-                        let fr_parts: Vec<serde_json::Value> = images.iter().map(|img| {
-                            serde_json::json!({
-                                "inlineData": {
-                                    "mimeType": img.media_type,
-                                    "data": img.data,
-                                }
+                        let fr_parts: Vec<serde_json::Value> = images
+                            .iter()
+                            .map(|img| {
+                                serde_json::json!({
+                                    "inlineData": {
+                                        "mimeType": img.media_type,
+                                        "data": img.data,
+                                    }
+                                })
                             })
-                        }).collect();
+                            .collect();
                         if !fr_parts.is_empty() {
                             fr["functionResponse"]["parts"] = serde_json::Value::Array(fr_parts);
                         }
@@ -2356,8 +2442,8 @@ fn build_gemini_request_parts(
                         "parts": [fr],
                     }));
                 } else {
-                    let response_val: serde_json::Value =
-                        serde_json::from_str(&m.content).unwrap_or(serde_json::json!({
+                    let response_val: serde_json::Value = serde_json::from_str(&m.content)
+                        .unwrap_or(serde_json::json!({
                             "output": m.content,
                         }));
                     contents.push(serde_json::json!({
@@ -2481,9 +2567,19 @@ fn build_gemini_request_parts(
 
 /// CU function names used by Gemini's computer_use tool.
 const GEMINI_CU_FUNCTIONS: &[&str] = &[
-    "click_at", "type_text_at", "hover_at", "scroll_document", "scroll_at",
-    "key_combination", "navigate", "go_back", "go_forward", "search",
-    "open_web_browser", "wait_5_seconds", "drag_and_drop",
+    "click_at",
+    "type_text_at",
+    "hover_at",
+    "scroll_document",
+    "scroll_at",
+    "key_combination",
+    "navigate",
+    "go_back",
+    "go_forward",
+    "search",
+    "open_web_browser",
+    "wait_5_seconds",
+    "drag_and_drop",
 ];
 
 /// Parse a Gemini CU function call into a CuAction.
@@ -2505,12 +2601,19 @@ fn parse_gemini_cu_action(
     match name {
         "click_at" => {
             let (x, y) = coord("x", "y")?;
-            Some(CuAction::Click { x, y, button: MouseButton::Left })
+            Some(CuAction::Click {
+                x,
+                y,
+                button: MouseButton::Left,
+            })
         }
         "type_text_at" => {
             let (x, y) = coord("x", "y")?;
             let text = args.get("text")?.as_str()?.to_string();
-            let press_enter = args.get("press_enter").and_then(|v| v.as_bool()).unwrap_or(false);
+            let press_enter = args
+                .get("press_enter")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             // Click to focus, then type
             // We return just the Type action; the click is handled by the executor
             // Actually, return Click + Type as separate actions is complex.
@@ -2544,7 +2647,12 @@ fn parse_gemini_cu_action(
             } else {
                 (display_width as i32 / 2, display_height as i32 / 2)
             };
-            Some(CuAction::Scroll { x, y, direction, amount })
+            Some(CuAction::Scroll {
+                x,
+                y,
+                direction,
+                amount,
+            })
         }
         "key_combination" => {
             let keys = args.get("keys")?.as_str()?.to_string();
@@ -2554,21 +2662,37 @@ fn parse_gemini_cu_action(
         "drag_and_drop" => {
             let (sx, sy) = coord("x", "y")?;
             let (ex, ey) = coord("destination_x", "destination_y")?;
-            Some(CuAction::Drag { start_x: sx, start_y: sy, end_x: ex, end_y: ey })
+            Some(CuAction::Drag {
+                start_x: sx,
+                start_y: sy,
+                end_x: ex,
+                end_y: ey,
+            })
         }
         // Browser-like navigation actions — mapped to keyboard shortcuts / xdg-open
         "navigate" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("about:blank");
             // Type the URL into the address bar via xdg-open (best-effort)
-            Some(CuAction::Key { key: format!("xdg-open {}", url) })
+            Some(CuAction::Key {
+                key: format!("xdg-open {}", url),
+            })
         }
         "open_web_browser" => {
             // No-op screenshot — the model wants to see the screen
             Some(CuAction::Screenshot)
         }
-        "go_back" => Some(CuAction::Key { key: "alt+Left".to_string() }),
-        "go_forward" => Some(CuAction::Key { key: "alt+Right".to_string() }),
-        "search" => Some(CuAction::Key { key: "ctrl+l".to_string() }),
+        "go_back" => Some(CuAction::Key {
+            key: "alt+Left".to_string(),
+        }),
+        "go_forward" => Some(CuAction::Key {
+            key: "alt+Right".to_string(),
+        }),
+        "search" => Some(CuAction::Key {
+            key: "ctrl+l".to_string(),
+        }),
         _ => None,
     }
 }
@@ -2800,8 +2924,7 @@ pub fn select_provider_with_overrides(
                     "Presence provider=anthropic but no ANTHROPIC_API_KEY found.".into(),
                 )
             })?;
-            let model =
-                model_str.unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
+            let model = model_str.unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             Ok(Box::new(AnthropicProvider::new(key, model, ctx, max_out)))
@@ -2873,12 +2996,9 @@ pub fn select_cu_provider(
         }
         Some("anthropic") => {
             let key = anthropic_key.ok_or_else(|| {
-                CallerError::Config(
-                    "CU provider=anthropic but no ANTHROPIC_API_KEY found.".into(),
-                )
+                CallerError::Config("CU provider=anthropic but no ANTHROPIC_API_KEY found.".into())
             })?;
-            let model =
-                model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+            let model = model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
             let display = crate::vision::display_config_for_provider("anthropic");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
@@ -2928,8 +3048,7 @@ pub fn select_cu_provider(
                 p.cu_display = Some((display.width, display.height));
                 Ok(Box::new(p))
             } else if let Some(key) = anthropic_key {
-                let model =
-                    model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+                let model = model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
                 let display = crate::vision::display_config_for_provider("anthropic");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
@@ -2986,11 +3105,12 @@ pub fn select_presence_provider(
             let key = gemini_key.ok_or_else(|| {
                 CallerError::Config("Presence provider=gemini but no GEMINI_API_KEY found.".into())
             })?;
-            let model =
-                model_str.unwrap_or_else(|| presence::DEFAULT_TEXT_MODEL.to_string());
+            let model = model_str.unwrap_or_else(|| presence::DEFAULT_TEXT_MODEL.to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            Ok(Box::new(GeminiProvider::new_with_tools(key, model, ctx, max_out, tools)))
+            Ok(Box::new(GeminiProvider::new_with_tools(
+                key, model, ctx, max_out, tools,
+            )))
         }
         Some("anthropic") => {
             let key = anthropic_key.ok_or_else(|| {
@@ -2998,11 +3118,12 @@ pub fn select_presence_provider(
                     "Presence provider=anthropic but no ANTHROPIC_API_KEY found.".into(),
                 )
             })?;
-            let model =
-                model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+            let model = model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            Ok(Box::new(AnthropicProvider::new_with_tools(key, model, ctx, max_out, tools)))
+            Ok(Box::new(AnthropicProvider::new_with_tools(
+                key, model, ctx, max_out, tools,
+            )))
         }
         Some("openai") => {
             let key = openai_key.ok_or_else(|| {
@@ -3011,7 +3132,9 @@ pub fn select_presence_provider(
             let model = model_str.unwrap_or_else(|| "gpt-4.1-mini".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
-            Ok(Box::new(OpenAIProvider::new_with_tools(key, model, ctx, max_out, tools)))
+            Ok(Box::new(OpenAIProvider::new_with_tools(
+                key, model, ctx, max_out, tools,
+            )))
         }
         Some(other) => Err(CallerError::Config(format!(
             "Unknown presence provider: '{}'. Expected 'openai', 'anthropic', or 'gemini'.",
@@ -3020,22 +3143,26 @@ pub fn select_presence_provider(
         None => {
             // Auto-detect: prefer gemini (cheapest/fastest for presence)
             if let Some(key) = gemini_key {
-                let model =
-                    model_str.unwrap_or_else(|| presence::DEFAULT_TEXT_MODEL.to_string());
+                let model = model_str.unwrap_or_else(|| presence::DEFAULT_TEXT_MODEL.to_string());
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
-                Ok(Box::new(GeminiProvider::new_with_tools(key, model, ctx, max_out, tools)))
+                Ok(Box::new(GeminiProvider::new_with_tools(
+                    key, model, ctx, max_out, tools,
+                )))
             } else if let Some(key) = anthropic_key {
-                let model =
-                    model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+                let model = model_str.unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
-                Ok(Box::new(AnthropicProvider::new_with_tools(key, model, ctx, max_out, tools)))
+                Ok(Box::new(AnthropicProvider::new_with_tools(
+                    key, model, ctx, max_out, tools,
+                )))
             } else if let Some(key) = openai_key {
                 let model = model_str.unwrap_or_else(|| "gpt-4.1-mini".to_string());
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
-                Ok(Box::new(OpenAIProvider::new_with_tools(key, model, ctx, max_out, tools)))
+                Ok(Box::new(OpenAIProvider::new_with_tools(
+                    key, model, ctx, max_out, tools,
+                )))
             } else {
                 Err(CallerError::Config(
                     "No API key found for presence layer. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY.".into(),
@@ -3144,7 +3271,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
-        ..Default::default()
+            ..Default::default()
         };
         let json = serde_json::to_string(&usage).unwrap();
         let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();
@@ -4084,12 +4211,7 @@ mod tests {
 
     #[test]
     fn openai_builder_includes_image_after_tool_result() {
-        let provider = OpenAIProvider::new(
-            "key".to_string(),
-            "gpt-4".to_string(),
-            128_000,
-            16_384,
-        );
+        let provider = OpenAIProvider::new("key".to_string(), "gpt-4".to_string(), 128_000, 16_384);
         let messages = vec![
             Message {
                 role: "system".to_string(),
@@ -4112,12 +4234,7 @@ mod tests {
 
     #[test]
     fn openai_builder_no_image_without_images_field() {
-        let provider = OpenAIProvider::new(
-            "key".to_string(),
-            "gpt-4".to_string(),
-            128_000,
-            16_384,
-        );
+        let provider = OpenAIProvider::new("key".to_string(), "gpt-4".to_string(), 128_000, 16_384);
         let messages = vec![
             Message {
                 role: "system".to_string(),
@@ -4203,9 +4320,18 @@ mod tests {
         let img_msg = &contents[1];
         assert_eq!(img_msg["role"].as_str(), Some("user"));
         let parts = img_msg["parts"].as_array().unwrap();
-        assert_eq!(parts[0]["text"].as_str().unwrap(), "Screenshot from the previous tool call:");
-        assert_eq!(parts[1]["inlineData"]["mimeType"].as_str(), Some("image/png"));
-        assert_eq!(parts[1]["inlineData"]["data"].as_str(), Some("iVBORw0KGgo="));
+        assert_eq!(
+            parts[0]["text"].as_str().unwrap(),
+            "Screenshot from the previous tool call:"
+        );
+        assert_eq!(
+            parts[1]["inlineData"]["mimeType"].as_str(),
+            Some("image/png")
+        );
+        assert_eq!(
+            parts[1]["inlineData"]["data"].as_str(),
+            Some("iVBORw0KGgo=")
+        );
     }
 
     #[test]

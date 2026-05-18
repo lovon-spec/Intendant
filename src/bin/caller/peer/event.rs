@@ -44,14 +44,20 @@ use serde::{Deserialize, Serialize};
 pub enum PeerEvent {
     // ---- Connection lifecycle ----
     /// Peer just completed handshake and sent its (possibly updated) card.
-    Connected { card: AgentCard },
+    Connected {
+        card: AgentCard,
+    },
 
     /// Peer disconnected. The transport may auto-reconnect; if so, a
     /// follow-up `Connected` will arrive when the handshake completes.
-    Disconnected { reason: String },
+    Disconnected {
+        reason: String,
+    },
 
     /// Peer's overall status changed.
-    StatusChanged { status: PeerStatus },
+    StatusChanged {
+        status: PeerStatus,
+    },
 
     // ---- Activity stream — what the peer is doing right now ----
     /// A unit of work has begun (turn, tool call, sub-agent run, delegated
@@ -93,12 +99,17 @@ pub enum PeerEvent {
     /// federation coordinator initiated the work, peer is reporting back).
     /// Distinct from `ActivityStarted`/etc. which are the peer's own
     /// internal activities — task updates are scoped to delegated work.
-    TaskUpdate { task: TaskId, update: TaskUpdate },
+    TaskUpdate {
+        task: TaskId,
+        update: TaskUpdate,
+    },
 
     // ---- Approval flow (federated) ----
     /// Peer wants to do something that requires approval. May be forwarded
     /// to a human via the local presence layer or auto-resolved by policy.
-    ApprovalRequested { request: ApprovalRequest },
+    ApprovalRequested {
+        request: ApprovalRequest,
+    },
 
     /// Approval was resolved (locally or remotely). Echoed so observers
     /// can update UI consistently regardless of which side made the call.
@@ -126,10 +137,14 @@ pub enum PeerEvent {
     },
 
     // ---- Resource accounting ----
-    Usage { snapshot: UsageSnapshot },
+    Usage {
+        snapshot: UsageSnapshot,
+    },
 
     // ---- Session lifecycle ----
-    SessionStarted { session: SessionInfo },
+    SessionStarted {
+        session: SessionInfo,
+    },
     SessionEnded {
         session_id: String,
         reason: String,
@@ -394,11 +409,15 @@ impl<'de> Deserialize<'de> for ActivityKind {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ActivityOutcome {
     Success,
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
     Cancelled,
     /// Activity was paused mid-flight (e.g. waiting on an approval, or
     /// hit a budget cap that requires human resolution).
-    Suspended { reason: String },
+    Suspended {
+        reason: String,
+    },
     /// Forward-compat fallback for outcomes we don't recognize.
     /// Cannot be serialized.
     #[serde(other)]
@@ -413,8 +432,12 @@ pub enum TaskUpdate {
         pct: Option<f32>,
         message: Option<String>,
     },
-    Completed { result: serde_json::Value },
-    Failed { message: String },
+    Completed {
+        result: serde_json::Value,
+    },
+    Failed {
+        message: String,
+    },
     Cancelled,
     /// Forward-compat fallback for task update stages we don't
     /// recognize. Cannot be serialized.
@@ -437,13 +460,22 @@ pub enum MessageRole {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageContent {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// Reasoning / chain-of-thought trace from a model that emits one.
-    Reasoning { text: String },
+    Reasoning {
+        text: String,
+    },
     /// Image attachment.
-    Image { mime_type: String, base64: String },
+    Image {
+        mime_type: String,
+        base64: String,
+    },
     /// Multi-part content (mix of text + images + tool calls).
-    Parts { parts: Vec<MessagePart> },
+    Parts {
+        parts: Vec<MessagePart>,
+    },
     /// Forward-compat fallback for message content types we don't
     /// recognize. Cannot be serialized.
     #[serde(other)]
@@ -453,10 +485,21 @@ pub enum MessageContent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagePart {
-    Text { text: String },
-    Image { mime_type: String, base64: String },
-    ToolCall { name: String, args: serde_json::Value },
-    ToolResult { name: String, result: serde_json::Value },
+    Text {
+        text: String,
+    },
+    Image {
+        mime_type: String,
+        base64: String,
+    },
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    ToolResult {
+        name: String,
+        result: serde_json::Value,
+    },
     /// Forward-compat fallback for message part types we don't
     /// recognize. Cannot be serialized.
     #[serde(other)]
@@ -713,7 +756,12 @@ mod tests {
         }"#;
         let parsed: PeerEvent = serde_json::from_str(evt_json).unwrap();
         match parsed {
-            PeerEvent::Message { id, role, content, partial } => {
+            PeerEvent::Message {
+                id,
+                role,
+                content,
+                partial,
+            } => {
                 assert_eq!(id, MessageId("m1".into()));
                 assert_eq!(role, MessageRole::Assistant);
                 assert!(!partial);
@@ -765,8 +813,14 @@ mod tests {
         );
         let parsed: WebRtcSignal = serde_json::from_str(&json).unwrap();
         match parsed {
-            WebRtcSignal::Offer { advertise_tcp_via_url, .. } => {
-                assert_eq!(advertise_tcp_via_url.as_deref(), Some("ws://localhost:8766/ws"));
+            WebRtcSignal::Offer {
+                advertise_tcp_via_url,
+                ..
+            } => {
+                assert_eq!(
+                    advertise_tcp_via_url.as_deref(),
+                    Some("ws://localhost:8766/ws")
+                );
             }
             other => panic!("expected Offer, got {other:?}"),
         }
@@ -796,7 +850,10 @@ mod tests {
         let json = r#"{"kind":"offer","sdp":"v=0\r\n"}"#;
         let parsed: WebRtcSignal = serde_json::from_str(json).unwrap();
         match parsed {
-            WebRtcSignal::Offer { advertise_tcp_via_url, sdp } => {
+            WebRtcSignal::Offer {
+                advertise_tcp_via_url,
+                sdp,
+            } => {
                 assert_eq!(advertise_tcp_via_url, None);
                 assert_eq!(sdp, "v=0\r\n");
             }

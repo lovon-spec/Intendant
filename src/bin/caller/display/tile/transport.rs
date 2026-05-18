@@ -72,7 +72,12 @@ pub struct TileRecord {
 
 impl TileRecord {
     pub fn new(tile_x: u16, tile_y: u16, encoding: TileEncoding, payload: Vec<u8>) -> Self {
-        Self { tile_x, tile_y, encoding, payload }
+        Self {
+            tile_x,
+            tile_y,
+            encoding,
+            payload,
+        }
     }
 
     pub fn wire_len(&self) -> usize {
@@ -217,7 +222,11 @@ pub fn encode_frame(frame: &TileFrame) -> Result<Vec<u8>, TileWireError> {
             write_u32(&mut out, u32_count(records.len())?);
             write_records(&mut out, records)?;
         }
-        TileFrame::TileUpdate { epoch, seq, records } => {
+        TileFrame::TileUpdate {
+            epoch,
+            seq,
+            records,
+        } => {
             write_header(&mut out, TYPE_TILE_UPDATE);
             write_u32(&mut out, *epoch);
             write_u32(&mut out, *seq);
@@ -248,7 +257,13 @@ pub fn encode_frame(frame: &TileFrame) -> Result<Vec<u8>, TileWireError> {
             write_header(&mut out, TYPE_FALLBACK_TO_TILE);
             write_u32(&mut out, *new_epoch);
         }
-        TileFrame::CursorState { epoch, seq, x_px, y_px, visible } => {
+        TileFrame::CursorState {
+            epoch,
+            seq,
+            x_px,
+            y_px,
+            visible,
+        } => {
             write_header(&mut out, TYPE_CURSOR_STATE);
             write_u32(&mut out, *epoch);
             write_u32(&mut out, *seq);
@@ -265,7 +280,11 @@ pub fn encode_frame(frame: &TileFrame) -> Result<Vec<u8>, TileWireError> {
             write_u32(&mut out, *epoch);
             out.push(reason.as_wire());
         }
-        TileFrame::GapReport { epoch, last_seen_seq, expected_seq } => {
+        TileFrame::GapReport {
+            epoch,
+            last_seen_seq,
+            expected_seq,
+        } => {
             write_header(&mut out, TYPE_GAP_REPORT);
             write_u32(&mut out, *epoch);
             write_u32(&mut out, *last_seen_seq);
@@ -320,7 +339,11 @@ pub fn decode_frame(bytes: &[u8]) -> Result<TileFrame, TileWireError> {
             let seq = r.u32()?;
             let record_count = r.u16()? as usize;
             let records = r.records(record_count)?;
-            TileFrame::TileUpdate { epoch, seq, records }
+            TileFrame::TileUpdate {
+                epoch,
+                seq,
+                records,
+            }
         }
         TYPE_RESIZE => TileFrame::Resize {
             new_epoch: r.u32()?,
@@ -328,9 +351,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<TileFrame, TileWireError> {
             grid_h_tiles: r.u16()?,
             tile_size_px: r.u16()?,
         },
-        TYPE_EPOCH_ADVANCE => TileFrame::EpochAdvance { new_epoch: r.u32()? },
-        TYPE_FALLBACK_TO_VIDEO => TileFrame::FallbackToVideo { new_epoch: r.u32()? },
-        TYPE_FALLBACK_TO_TILE => TileFrame::FallbackToTile { new_epoch: r.u32()? },
+        TYPE_EPOCH_ADVANCE => TileFrame::EpochAdvance {
+            new_epoch: r.u32()?,
+        },
+        TYPE_FALLBACK_TO_VIDEO => TileFrame::FallbackToVideo {
+            new_epoch: r.u32()?,
+        },
+        TYPE_FALLBACK_TO_TILE => TileFrame::FallbackToTile {
+            new_epoch: r.u32()?,
+        },
         TYPE_CURSOR_STATE => TileFrame::CursorState {
             epoch: r.u32()?,
             seq: r.u32()?,
@@ -338,7 +367,9 @@ pub fn decode_frame(bytes: &[u8]) -> Result<TileFrame, TileWireError> {
             y_px: r.i32()?,
             visible: r.u8()? != 0,
         },
-        TYPE_SUBSCRIBE => TileFrame::Subscribe { client_id: r.u32()? },
+        TYPE_SUBSCRIBE => TileFrame::Subscribe {
+            client_id: r.u32()?,
+        },
         TYPE_SNAPSHOT_REQUEST => TileFrame::SnapshotRequest {
             epoch: r.u32()?,
             reason: SnapshotRequestReason::from_wire(r.u8()?)?,
@@ -372,7 +403,11 @@ pub fn pack_snapshot_chunks(
     tile_size_px: u16,
     records: Vec<TileRecord>,
 ) -> Result<Vec<TileFrame>, TileWireError> {
-    let chunks = pack_records(records, HEADER_LEN + SNAPSHOT_BODY_OVERHEAD, u32::MAX as usize)?;
+    let chunks = pack_records(
+        records,
+        HEADER_LEN + SNAPSHOT_BODY_OVERHEAD,
+        u32::MAX as usize,
+    )?;
     if chunks.is_empty() {
         return Ok(vec![TileFrame::SnapshotChunk {
             epoch,
@@ -407,7 +442,11 @@ pub fn pack_tile_updates(
     first_seq: u32,
     records: Vec<TileRecord>,
 ) -> Result<Vec<TileFrame>, TileWireError> {
-    let chunks = pack_records(records, HEADER_LEN + UPDATE_BODY_OVERHEAD, u16::MAX as usize)?;
+    let chunks = pack_records(
+        records,
+        HEADER_LEN + UPDATE_BODY_OVERHEAD,
+        u16::MAX as usize,
+    )?;
     let mut out = Vec::with_capacity(chunks.len());
     for (idx, records) in chunks.into_iter().enumerate() {
         out.push(TileFrame::TileUpdate {
@@ -433,9 +472,7 @@ fn pack_records(
         if fixed_overhead + record_len > MAX_DATACHANNEL_MESSAGE_SIZE {
             return Err(TileWireError::MessageTooLarge(fixed_overhead + record_len));
         }
-        if current_len + record_len > MAX_DATACHANNEL_MESSAGE_SIZE
-            || current.len() >= max_count
-        {
+        if current_len + record_len > MAX_DATACHANNEL_MESSAGE_SIZE || current.len() >= max_count {
             chunks.push(std::mem::take(&mut current));
             current_len = fixed_overhead;
         }
@@ -536,7 +573,12 @@ impl<'a> Reader<'a> {
             let encoding = TileEncoding::from_wire(self.u8()?)?;
             let payload_len = self.u32()? as usize;
             let payload = self.take(payload_len)?.to_vec();
-            records.push(TileRecord { tile_x, tile_y, encoding, payload });
+            records.push(TileRecord {
+                tile_x,
+                tile_y,
+                encoding,
+                payload,
+            });
         }
         Ok(records)
     }
@@ -565,7 +607,10 @@ mod tests {
             grid_w_tiles: 14,
             grid_h_tiles: 10,
             tile_size_px: 64,
-            records: vec![record(2, 3, 7), TileRecord::new(4, 5, TileEncoding::RleBgra, vec![1, 2, 3, 4, 9])],
+            records: vec![
+                record(2, 3, 7),
+                TileRecord::new(4, 5, TileEncoding::RleBgra, vec![1, 2, 3, 4, 9]),
+            ],
         };
         let encoded = encode_frame(&frame).unwrap();
         assert_eq!(encoded[0], WIRE_VERSION);
@@ -588,15 +633,36 @@ mod tests {
     #[test]
     fn control_frames_round_trip() {
         let frames = [
-            TileFrame::Resize { new_epoch: 2, grid_w_tiles: 3, grid_h_tiles: 4, tile_size_px: 64 },
+            TileFrame::Resize {
+                new_epoch: 2,
+                grid_w_tiles: 3,
+                grid_h_tiles: 4,
+                tile_size_px: 64,
+            },
             TileFrame::EpochAdvance { new_epoch: 3 },
             TileFrame::FallbackToVideo { new_epoch: 4 },
             TileFrame::FallbackToTile { new_epoch: 5 },
-            TileFrame::CursorState { epoch: 6, seq: 7, x_px: -8, y_px: 9, visible: true },
+            TileFrame::CursorState {
+                epoch: 6,
+                seq: 7,
+                x_px: -8,
+                y_px: 9,
+                visible: true,
+            },
             TileFrame::Subscribe { client_id: 10 },
-            TileFrame::SnapshotRequest { epoch: 11, reason: SnapshotRequestReason::Gap },
-            TileFrame::GapReport { epoch: 12, last_seen_seq: 13, expected_seq: 14 },
-            TileFrame::Error { code: 15, message: "tile failure".to_string() },
+            TileFrame::SnapshotRequest {
+                epoch: 11,
+                reason: SnapshotRequestReason::Gap,
+            },
+            TileFrame::GapReport {
+                epoch: 12,
+                last_seen_seq: 13,
+                expected_seq: 14,
+            },
+            TileFrame::Error {
+                code: 15,
+                message: "tile failure".to_string(),
+            },
         ];
         for frame in frames {
             assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
@@ -609,22 +675,33 @@ mod tests {
             epoch: 1,
             seq: 1,
             records: vec![record(0, 0, 1)],
-        }).unwrap();
+        })
+        .unwrap();
         encoded[0] = 2;
-        assert_eq!(decode_frame(&encoded), Err(TileWireError::UnsupportedVersion(2)));
+        assert_eq!(
+            decode_frame(&encoded),
+            Err(TileWireError::UnsupportedVersion(2))
+        );
 
         let mut encoded = encode_frame(&TileFrame::EpochAdvance { new_epoch: 1 }).unwrap();
         encoded[1] = 0x77;
-        assert_eq!(decode_frame(&encoded), Err(TileWireError::UnsupportedType(0x77)));
+        assert_eq!(
+            decode_frame(&encoded),
+            Err(TileWireError::UnsupportedType(0x77))
+        );
 
         let mut encoded = encode_frame(&TileFrame::TileUpdate {
             epoch: 1,
             seq: 1,
             records: vec![record(0, 0, 1)],
-        }).unwrap();
+        })
+        .unwrap();
         let encoding_offset = HEADER_LEN + UPDATE_BODY_OVERHEAD + 2 + 2;
         encoded[encoding_offset] = 99;
-        assert_eq!(decode_frame(&encoded), Err(TileWireError::UnsupportedEncoding(99)));
+        assert_eq!(
+            decode_frame(&encoded),
+            Err(TileWireError::UnsupportedEncoding(99))
+        );
     }
 
     #[test]
@@ -633,7 +710,8 @@ mod tests {
             epoch: 1,
             seq: 1,
             records: vec![record(0, 0, 8)],
-        }).unwrap();
+        })
+        .unwrap();
         encoded.truncate(encoded.len() - 1);
         assert_eq!(decode_frame(&encoded), Err(TileWireError::MessageTooShort));
 
@@ -645,7 +723,11 @@ mod tests {
     #[test]
     fn snapshot_packer_caps_messages() {
         let raw_tile_len = 64 * 64 * 4;
-        let records = vec![record(0, 0, raw_tile_len), record(1, 0, raw_tile_len), record(2, 0, 8)];
+        let records = vec![
+            record(0, 0, raw_tile_len),
+            record(1, 0, raw_tile_len),
+            record(2, 0, 8),
+        ];
         let chunks = pack_snapshot_chunks(1, 2, 3, 4, 64, records).unwrap();
         assert_eq!(
             chunks.len(),
@@ -657,7 +739,12 @@ mod tests {
             assert!(encoded.len() <= MAX_DATACHANNEL_MESSAGE_SIZE);
         }
         for (idx, chunk) in chunks.iter().enumerate() {
-            let TileFrame::SnapshotChunk { chunk_index, chunk_count, .. } = chunk else {
+            let TileFrame::SnapshotChunk {
+                chunk_index,
+                chunk_count,
+                ..
+            } = chunk
+            else {
                 panic!("expected snapshot chunk");
             };
             assert_eq!(*chunk_index, idx as u16);
@@ -672,7 +759,8 @@ mod tests {
             7,
             100,
             vec![record(0, 0, raw_tile_len), record(1, 0, raw_tile_len)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(updates.len(), 2);
         assert!(matches!(updates[0], TileFrame::TileUpdate { seq: 100, .. }));
         assert!(matches!(updates[1], TileFrame::TileUpdate { seq: 101, .. }));
@@ -709,29 +797,59 @@ mod tests {
 
     #[test]
     fn body_lengths_match_declared_shapes() {
-        assert_eq!(HEADER_LEN + RESIZE_BODY_LEN, encode_frame(&TileFrame::Resize {
-            new_epoch: 1,
-            grid_w_tiles: 2,
-            grid_h_tiles: 3,
-            tile_size_px: 64,
-        }).unwrap().len());
-        assert_eq!(HEADER_LEN + EPOCH_BODY_LEN, encode_frame(&TileFrame::EpochAdvance { new_epoch: 1 }).unwrap().len());
-        assert_eq!(HEADER_LEN + CURSOR_BODY_LEN, encode_frame(&TileFrame::CursorState {
-            epoch: 1,
-            seq: 2,
-            x_px: 3,
-            y_px: 4,
-            visible: false,
-        }).unwrap().len());
-        assert_eq!(HEADER_LEN + SUBSCRIBE_BODY_LEN, encode_frame(&TileFrame::Subscribe { client_id: 1 }).unwrap().len());
-        assert_eq!(HEADER_LEN + SNAPSHOT_REQUEST_BODY_LEN, encode_frame(&TileFrame::SnapshotRequest {
-            epoch: 1,
-            reason: SnapshotRequestReason::Startup,
-        }).unwrap().len());
-        assert_eq!(HEADER_LEN + GAP_REPORT_BODY_LEN, encode_frame(&TileFrame::GapReport {
-            epoch: 1,
-            last_seen_seq: 2,
-            expected_seq: 3,
-        }).unwrap().len());
+        assert_eq!(
+            HEADER_LEN + RESIZE_BODY_LEN,
+            encode_frame(&TileFrame::Resize {
+                new_epoch: 1,
+                grid_w_tiles: 2,
+                grid_h_tiles: 3,
+                tile_size_px: 64,
+            })
+            .unwrap()
+            .len()
+        );
+        assert_eq!(
+            HEADER_LEN + EPOCH_BODY_LEN,
+            encode_frame(&TileFrame::EpochAdvance { new_epoch: 1 })
+                .unwrap()
+                .len()
+        );
+        assert_eq!(
+            HEADER_LEN + CURSOR_BODY_LEN,
+            encode_frame(&TileFrame::CursorState {
+                epoch: 1,
+                seq: 2,
+                x_px: 3,
+                y_px: 4,
+                visible: false,
+            })
+            .unwrap()
+            .len()
+        );
+        assert_eq!(
+            HEADER_LEN + SUBSCRIBE_BODY_LEN,
+            encode_frame(&TileFrame::Subscribe { client_id: 1 })
+                .unwrap()
+                .len()
+        );
+        assert_eq!(
+            HEADER_LEN + SNAPSHOT_REQUEST_BODY_LEN,
+            encode_frame(&TileFrame::SnapshotRequest {
+                epoch: 1,
+                reason: SnapshotRequestReason::Startup,
+            })
+            .unwrap()
+            .len()
+        );
+        assert_eq!(
+            HEADER_LEN + GAP_REPORT_BODY_LEN,
+            encode_frame(&TileFrame::GapReport {
+                epoch: 1,
+                last_seen_seq: 2,
+                expected_seq: 3,
+            })
+            .unwrap()
+            .len()
+        );
     }
 }

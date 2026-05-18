@@ -537,7 +537,12 @@ mod tests {
 
     #[test]
     fn caller_tools_have_no_nonce() {
-        let caller_tools = ["manage_context", "signal_done", "invoke_skill", "spawn_live_audio"];
+        let caller_tools = [
+            "manage_context",
+            "signal_done",
+            "invoke_skill",
+            "spawn_live_audio",
+        ];
         let tools = all_tools();
         for name in &caller_tools {
             let tool = tools.iter().find(|t| t.name == *name).unwrap();

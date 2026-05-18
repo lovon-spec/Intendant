@@ -21,12 +21,11 @@ const NGINX_SITE_NAME: &str = "intendant-lan";
 
 impl MacOsBackend {
     fn brew_prefix(&self) -> LanResult<PathBuf> {
-        let out = Command::new("brew")
-            .arg("--prefix")
-            .output()
-            .map_err(|e| LanError(format!(
+        let out = Command::new("brew").arg("--prefix").output().map_err(|e| {
+            LanError(format!(
                 "brew --prefix: {e} (install Homebrew from https://brew.sh)"
-            )))?;
+            ))
+        })?;
         if !out.status.success() {
             return Err(LanError("brew --prefix failed".into()));
         }
@@ -52,9 +51,16 @@ impl LanBackend for MacOsBackend {
 
     fn nginx_site_path(&self) -> PathBuf {
         self.brew_prefix()
-            .map(|p| p.join("etc").join("nginx").join("servers").join(format!("{NGINX_SITE_NAME}.conf")))
+            .map(|p| {
+                p.join("etc")
+                    .join("nginx")
+                    .join("servers")
+                    .join(format!("{NGINX_SITE_NAME}.conf"))
+            })
             .unwrap_or_else(|_| {
-                PathBuf::from(format!("/opt/homebrew/etc/nginx/servers/{NGINX_SITE_NAME}.conf"))
+                PathBuf::from(format!(
+                    "/opt/homebrew/etc/nginx/servers/{NGINX_SITE_NAME}.conf"
+                ))
             })
     }
 
@@ -74,10 +80,7 @@ impl LanBackend for MacOsBackend {
             .arg("--version")
             .output()
             .map_err(|_| {
-                LanError(
-                    "Homebrew is required — install from https://brew.sh and re-run"
-                        .into(),
-                )
+                LanError("Homebrew is required — install from https://brew.sh and re-run".into())
             })?;
         Ok(())
     }

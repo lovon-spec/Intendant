@@ -61,6 +61,7 @@ use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent};
 use rtc::peer_connection::message::RTCMessage;
 use rtc::peer_connection::sdp::RTCSessionDescription;
+use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceProtocol};
 use rtc::peer_connection::RTCPeerConnection;
 use rtc::peer_connection::RTCPeerConnectionBuilder;
@@ -68,17 +69,16 @@ use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::packetizer::{self, Packetizer};
 use rtc::rtp::sequence;
-use rtc::statistics::report::RTCStatsReportEntry;
-use rtc::statistics::stats::RTCStatsType;
-use rtc::statistics::StatsSelector;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
-use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::rtp_transceiver::RTCRtpSenderId;
 use rtc::sansio::Protocol as RtcProtocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use rtc::statistics::report::RTCStatsReportEntry;
+use rtc::statistics::stats::RTCStatsType;
+use rtc::statistics::StatsSelector;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -882,9 +882,7 @@ impl WebRtcPeer {
     /// health snapshot without subscribing. Returns the empty map
     /// until the first RR has arrived. For change-driven consumers,
     /// prefer [`Self::subscribe_remote_inbound_health`].
-    pub fn current_remote_inbound_health(
-        &self,
-    ) -> HashMap<SimulcastRid, PeerLayerHealth> {
+    pub fn current_remote_inbound_health(&self) -> HashMap<SimulcastRid, PeerLayerHealth> {
         self.remote_inbound_health_rx.borrow().clone()
     }
 
@@ -918,10 +916,7 @@ impl WebRtcPeer {
     /// breaks tests that exercise the bridge → encoder → consumer
     /// pipeline directly.
     #[cfg(test)]
-    pub(crate) fn new_for_test(
-        peer_id: PeerId,
-        active_rids: Vec<SimulcastRid>,
-    ) -> Self {
+    pub(crate) fn new_for_test(peer_id: PeerId, active_rids: Vec<SimulcastRid>) -> Self {
         use std::collections::HashMap;
         let (command_tx, _command_rx) = mpsc::channel(1);
         let (_obs_tx, observed_send_bitrate_rx) = watch::channel(None);
@@ -1065,7 +1060,9 @@ pub fn noop_authority_handler() -> AuthorityChannelHandler {
 /// `tile-control` data channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileControlMessage {
-    Subscribe { client_id: u32 },
+    Subscribe {
+        client_id: u32,
+    },
     SnapshotRequest {
         epoch: u32,
         reason: tile_transport::SnapshotRequestReason,
@@ -1688,8 +1685,7 @@ impl WebRtcPeer {
         // write time via `state.rtp.by_rid` (populated below from
         // `encodings_by_rid`).
         let mut encodings = Vec::with_capacity(active_rids.len());
-        let mut encodings_by_rid: Vec<(SimulcastRid, u32)> =
-            Vec::with_capacity(active_rids.len());
+        let mut encodings_by_rid: Vec<(SimulcastRid, u32)> = Vec::with_capacity(active_rids.len());
         for rid in active_rids {
             let ssrc = new_ssrc();
             encodings_by_rid.push((rid.clone(), ssrc));
@@ -2168,63 +2164,62 @@ impl WebRtcPeer {
         //  - Offer requests RIDs the pool isn't producing right now
         //    (e.g. an on-demand layer construction failure) → silently
         //    drop those RIDs from the answer.
-        let active_rids: Vec<SimulcastRid> =
-            match parse_offer_simulcast_recv_rids(offer_sdp) {
-                None => {
-                    // Single-encoding offer → narrow to one layer.
-                    //
-                    // **#48 tuning**: pick the **floor** (last in
-                    // `pool_rids`, which is spec-ordered descending
-                    // bitrate per `LayerSpec::vp8_simulcast` — q
-                    // (125 kbps @ ¼ res) when all three layers are
-                    // present), not `pool_rids[0]` (the full layer at
-                    // 2.5 Mbps). Rationale: the federated path is the
-                    // only consumer of single-encoding negotiation
-                    // (`PeerDisplayConnection` post-#46/`e815bac`),
-                    // and runs over a TURN-relay where moderate (~5-
-                    // 10 %) sustained packet loss is the operational
-                    // baseline. At full-layer keyframe sizes (~500 KB
-                    // = ~420 RTP packets), 8 % loss makes intact
-                    // delivery `0.92^420 ≈ 1.4e-15` — effectively
-                    // impossible. Quarter-layer keyframes (~20 KB =
-                    // ~17 packets) have `0.92^17 ≈ 24 %` intact
-                    // probability and recover within seconds. Loss-
-                    // tolerance dominates resolution for "stream
-                    // remains usable under loss" — full-resolution
-                    // single-RID federated was empirically frozen
-                    // (~0.4 fps decoded at 8 % loss before this
-                    // tuning).
-                    //
-                    // The local `DisplaySlot` path is unaffected: it
-                    // injects `a=simulcast:recv f;h;q` into its offer,
-                    // so it hits the `Some(offer_rids)` branch below
-                    // and gets the full multi-RID set as before.
-                    //
-                    // Robust against partial-layer pools: if pool
-                    // dropped the quarter layer because the source is
-                    // too small (`MIN_LAYER_DIM` filter in
-                    // `vp8_simulcast`), `pool_rids.last()` becomes
-                    // `h` or `f` — degrades to "best available floor"
-                    // rather than failing.
-                    vec![select_single_rid_for_federated_offer(&pool_rids)]
-                }
-                Some(offer_rids) => {
-                    let intersected: Vec<SimulcastRid> = pool_rids
-                        .iter()
-                        .filter(|r| offer_rids.contains(r))
-                        .cloned()
-                        .collect();
-                    if intersected.is_empty() {
-                        return Err(CallerError::WebRtc(format!(
-                            "new: offer's a=simulcast:recv RIDs \
+        let active_rids: Vec<SimulcastRid> = match parse_offer_simulcast_recv_rids(offer_sdp) {
+            None => {
+                // Single-encoding offer → narrow to one layer.
+                //
+                // **#48 tuning**: pick the **floor** (last in
+                // `pool_rids`, which is spec-ordered descending
+                // bitrate per `LayerSpec::vp8_simulcast` — q
+                // (125 kbps @ ¼ res) when all three layers are
+                // present), not `pool_rids[0]` (the full layer at
+                // 2.5 Mbps). Rationale: the federated path is the
+                // only consumer of single-encoding negotiation
+                // (`PeerDisplayConnection` post-#46/`e815bac`),
+                // and runs over a TURN-relay where moderate (~5-
+                // 10 %) sustained packet loss is the operational
+                // baseline. At full-layer keyframe sizes (~500 KB
+                // = ~420 RTP packets), 8 % loss makes intact
+                // delivery `0.92^420 ≈ 1.4e-15` — effectively
+                // impossible. Quarter-layer keyframes (~20 KB =
+                // ~17 packets) have `0.92^17 ≈ 24 %` intact
+                // probability and recover within seconds. Loss-
+                // tolerance dominates resolution for "stream
+                // remains usable under loss" — full-resolution
+                // single-RID federated was empirically frozen
+                // (~0.4 fps decoded at 8 % loss before this
+                // tuning).
+                //
+                // The local `DisplaySlot` path is unaffected: it
+                // injects `a=simulcast:recv f;h;q` into its offer,
+                // so it hits the `Some(offer_rids)` branch below
+                // and gets the full multi-RID set as before.
+                //
+                // Robust against partial-layer pools: if pool
+                // dropped the quarter layer because the source is
+                // too small (`MIN_LAYER_DIM` filter in
+                // `vp8_simulcast`), `pool_rids.last()` becomes
+                // `h` or `f` — degrades to "best available floor"
+                // rather than failing.
+                vec![select_single_rid_for_federated_offer(&pool_rids)]
+            }
+            Some(offer_rids) => {
+                let intersected: Vec<SimulcastRid> = pool_rids
+                    .iter()
+                    .filter(|r| offer_rids.contains(r))
+                    .cloned()
+                    .collect();
+                if intersected.is_empty() {
+                    return Err(CallerError::WebRtc(format!(
+                        "new: offer's a=simulcast:recv RIDs \
                              {offer_rids:?} have no overlap with pool's \
                              active RIDs {pool_rids:?} for codec \
                              {active_codec:?}",
-                        )));
-                    }
-                    intersected
+                    )));
                 }
-            };
+                intersected
+            }
+        };
         // Phase 4e: keyframe-request channel from driver → intake.
         // Driver pushes a `SimulcastRid` to this channel for every
         // PLI / FIR whose target SSRC matches one of our outbound
@@ -2460,10 +2455,7 @@ struct DriverState {
     /// commit 2 lights up multi-encoding), the map has exactly one
     /// entry per active spec — same shape as the previous keying,
     /// just with the RID dimension along for the ride.
-    video_specs: HashMap<
-        (crate::display::encode::PayloadSpec, SimulcastRid),
-        SpecState,
-    >,
+    video_specs: HashMap<(crate::display::encode::PayloadSpec, SimulcastRid), SpecState>,
     /// Map of channel label → DataChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, RTCDataChannelId>,
     /// F-1.2: queued `display_input_authority_state` messages awaiting
@@ -3092,22 +3084,20 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                 .map(|channel| channel.label().to_string())
                 .unwrap_or_else(|| format!("channel-{cid}"));
             eprintln!("[display/webrtc] data channel open: {label}");
-            let queued = drain_pending_authority_for_label(
-                &label,
-                &mut state.pending_authority_state,
-            );
+            let queued =
+                drain_pending_authority_for_label(&label, &mut state.pending_authority_state);
             let queued_tile = drain_pending_tile_for_label(state, &label);
             state.channels.insert(label.clone(), cid);
             if label == TILE_DELTAS_CHANNEL_LABEL {
                 state.tile_delta_backpressure.reset();
                 if let Some(mut channel) = rtc.data_channel(cid) {
                     let cfg = state.tile_delta_backpressure.config();
-                    channel.set_buffered_amount_high_threshold(
-                        watermark_to_u32(cfg.high_watermark_bytes),
-                    );
-                    channel.set_buffered_amount_low_threshold(
-                        watermark_to_u32(cfg.low_watermark_bytes),
-                    );
+                    channel.set_buffered_amount_high_threshold(watermark_to_u32(
+                        cfg.high_watermark_bytes,
+                    ));
+                    channel.set_buffered_amount_low_threshold(watermark_to_u32(
+                        cfg.low_watermark_bytes,
+                    ));
                 }
             }
             // F-1.2: flush any authority states queued before the
@@ -3150,13 +3140,9 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                 state.tile_delta_backpressure.reset();
             }
         }
-        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountHigh(
-            cid,
-        )) => {
+        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountHigh(cid)) => {
             if state.channels.get(TILE_DELTAS_CHANNEL_LABEL).copied() == Some(cid)
-                && state
-                    .tile_delta_backpressure
-                    .on_buffered_amount_high()
+                && state.tile_delta_backpressure.on_buffered_amount_high()
             {
                 let stats = state.tile_delta_backpressure.stats();
                 eprintln!(
@@ -3166,9 +3152,7 @@ fn handle_event<I: rtc::interceptor::Interceptor>(
                 );
             }
         }
-        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(
-            cid,
-        )) => {
+        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(cid)) => {
             if state.channels.get(TILE_DELTAS_CHANNEL_LABEL).copied() == Some(cid)
                 && state.tile_delta_backpressure.on_buffered_amount_low()
             {
@@ -3227,13 +3211,8 @@ fn map_remote_inbound_to_rid_health(
     ssrc_table: &[(SimulcastRid, u32)],
 ) -> HashMap<SimulcastRid, PeerLayerHealth> {
     let mut out = HashMap::new();
-    for (
-        ssrc,
-        fraction_lost,
-        packets_lost_total,
-        round_trip_time_seconds,
-        rtt_measurements,
-    ) in remote_inbound
+    for (ssrc, fraction_lost, packets_lost_total, round_trip_time_seconds, rtt_measurements) in
+        remote_inbound
     {
         // Pre-RR default snapshot — see helper docstring.
         if rtt_measurements == 0 {
@@ -3311,8 +3290,7 @@ fn extract_recent_outbound_bitrate(
                     None
                 } else {
                     let delta_bytes = current_bytes - prev_bytes;
-                    let bps =
-                        (delta_bytes as f64 * 8.0) / elapsed.as_secs_f64();
+                    let bps = (delta_bytes as f64 * 8.0) / elapsed.as_secs_f64();
                     if !bps.is_finite() {
                         None
                     } else {
@@ -3349,10 +3327,7 @@ fn extract_recent_outbound_bitrate(
 /// H.264). Takes a flat slice instead of the production
 /// `HashMap<SimulcastRid, RidRtpState>` so tests can build the table
 /// inline without constructing real packetizers.
-fn rid_for_ssrc(
-    ssrc_table: &[(SimulcastRid, u32)],
-    ssrc: u32,
-) -> Option<SimulcastRid> {
+fn rid_for_ssrc(ssrc_table: &[(SimulcastRid, u32)], ssrc: u32) -> Option<SimulcastRid> {
     ssrc_table
         .iter()
         .find_map(|(rid, s)| (*s == ssrc).then(|| rid.clone()))
@@ -3563,7 +3538,12 @@ fn write_video_frame<I: rtc::interceptor::Interceptor>(
                 "[display/webrtc] frame for unknown rid {}; encoder/track \
                  contract divergence — driver only knows {:?}",
                 rid.as_str(),
-                state.rtp.by_rid.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
+                state
+                    .rtp
+                    .by_rid
+                    .keys()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>(),
             );
             return;
         }
@@ -3623,9 +3603,7 @@ fn write_video_frame<I: rtc::interceptor::Interceptor>(
     }
 
     if !keyframe_ready {
-        if let Some(SpecState::Ready { keyframe_seen }) =
-            state.video_specs.get_mut(&spec_key)
-        {
+        if let Some(SpecState::Ready { keyframe_seen }) = state.video_specs.get_mut(&spec_key) {
             // Only flip keyframe_seen for this (spec, rid) pair AFTER
             // a successful packet write. If the write is the first
             // keyframe on this (spec, rid), the gate opens for
@@ -3708,7 +3686,10 @@ fn handle_command<I: rtc::interceptor::Interceptor>(
                 eprintln!("[display/webrtc] clipboard channel write failed: {e:?}");
             }
         }
-        Command::SendAuthorityState { display_id, state: auth_state } => {
+        Command::SendAuthorityState {
+            display_id,
+            state: auth_state,
+        } => {
             // F-1.2: queue-or-send. If the federated browser's
             // `display_input_authority` data channel is open,
             // serialize and write immediately. If not, queue for
@@ -3721,15 +3702,11 @@ fn handle_command<I: rtc::interceptor::Interceptor>(
             // currently only calls send_authority_state for federated
             // subscribers, and (b) the queue is bounded by the
             // low-frequency take/release event rate, not per-frame.
-            if let Some(cid) =
-                state.channels.get(AUTHORITY_CHANNEL_LABEL).copied()
-            {
+            if let Some(cid) = state.channels.get(AUTHORITY_CHANNEL_LABEL).copied() {
                 if let Some(mut channel) = rtc.data_channel(cid) {
                     let json = serialize_authority_state(display_id, auth_state);
                     if let Err(e) = channel.send_text(json) {
-                        eprintln!(
-                            "[display/webrtc] authority channel write failed: {e:?}"
-                        );
+                        eprintln!("[display/webrtc] authority channel write failed: {e:?}");
                     }
                 }
             } else {
@@ -3753,9 +3730,7 @@ fn handle_command<I: rtc::interceptor::Interceptor>(
                              {label}: {e:?}"
                         );
                     } else if channel == TileDataChannel::Deltas {
-                        state
-                            .tile_delta_backpressure
-                            .record_delta_sent(data_len);
+                        state.tile_delta_backpressure.record_delta_sent(data_len);
                     }
                 }
             } else if channel.queues_before_open() {
@@ -3828,12 +3803,8 @@ fn parse_authority_channel_message(text: &str) -> Option<AuthorityChannelMessage
         .try_into()
         .ok()?;
     match t {
-        "display_input_authority_request" => {
-            Some(AuthorityChannelMessage::Request { display_id })
-        }
-        "display_input_authority_release" => {
-            Some(AuthorityChannelMessage::Release { display_id })
-        }
+        "display_input_authority_request" => Some(AuthorityChannelMessage::Request { display_id }),
+        "display_input_authority_release" => Some(AuthorityChannelMessage::Release { display_id }),
         _ => None,
     }
 }
@@ -3873,10 +3844,7 @@ const TILE_DELTAS_CHANNEL_LABEL: &str = "tile-deltas";
 /// `display_input_authority` data channel. Wire format matches the
 /// local 5c WS message exactly (same `t` discriminator, same `state`
 /// vocabulary) so browser handlers can stay symmetric.
-fn serialize_authority_state(
-    display_id: u32,
-    state: DisplayInputAuthorityState,
-) -> String {
+fn serialize_authority_state(display_id: u32, state: DisplayInputAuthorityState) -> String {
     serde_json::json!({
         "t": "display_input_authority_state",
         "display_id": display_id,
@@ -4081,8 +4049,7 @@ fn partition_subscriptions_by_codec(
     let (active_subs, inactive_subs): (Vec<_>, Vec<_>) = subscriptions
         .into_iter()
         .partition(|s| s.id.codec == active_codec);
-    let inactive_ids: Vec<EncoderId> =
-        inactive_subs.iter().map(|s| s.id.clone()).collect();
+    let inactive_ids: Vec<EncoderId> = inactive_subs.iter().map(|s| s.id.clone()).collect();
     drop(inactive_subs);
     (active_subs, inactive_ids)
 }
@@ -4278,8 +4245,7 @@ async fn pool_frame_intake(
         // Partition by codec, dropping inactive subs immediately and
         // collecting their ids for release. See
         // [`partition_subscriptions_by_codec`] for the contract.
-        let (active_subs, inactive_ids) =
-            partition_subscriptions_by_codec(subs_now, active_codec);
+        let (active_subs, inactive_ids) = partition_subscriptions_by_codec(subs_now, active_codec);
         // Release the inactive on-demand claims on the active lease.
         // For a peer with prefs [VP8, H264] against a pool that has
         // VP8 always-on + H264 on-demand, this is what tears down
@@ -4298,8 +4264,7 @@ async fn pool_frame_intake(
             }
         }
 
-        let active_ids: Vec<EncoderId> =
-            active_subs.iter().map(|s| s.id.clone()).collect();
+        let active_ids: Vec<EncoderId> = active_subs.iter().map(|s| s.id.clone()).collect();
         let active_rids_summary: Vec<String> = active_subs
             .iter()
             .map(|s| s.id.rid.as_str().to_string())
@@ -4333,8 +4298,7 @@ async fn pool_frame_intake(
         // forwarder's reason is preserved even if others race to
         // exit before we can drain.
         let fwd_shutdown = CancellationToken::new();
-        let (exit_tx, mut exit_rx) =
-            mpsc::channel::<ForwarderExit>(active_subs.len().max(1));
+        let (exit_tx, mut exit_rx) = mpsc::channel::<ForwarderExit>(active_subs.len().max(1));
         let mut forwarders = Vec::with_capacity(active_subs.len());
         for sub in active_subs {
             let rid = sub.id.rid.clone();
@@ -4452,7 +4416,9 @@ async fn pool_frame_intake(
                 // Peer is going away. Cancel all forwarders, await
                 // them, drop the lease, exit.
                 fwd_shutdown.cancel();
-                for f in forwarders { let _ = f.await; }
+                for f in forwarders {
+                    let _ = f.await;
+                }
                 drop(current_lease.take());
                 return;
             }
@@ -4462,7 +4428,9 @@ async fn pool_frame_intake(
                 // doesn't drift (e.g. one rid resubscribing while
                 // another keeps streaming the old epoch).
                 fwd_shutdown.cancel();
-                for f in forwarders { let _ = f.await; }
+                for f in forwarders {
+                    let _ = f.await;
+                }
                 let exit = recv.unwrap_or(ForwarderExit::DriverClosed);
                 match exit {
                     ForwarderExit::EncoderClosed => {
@@ -4956,16 +4924,11 @@ mod tests {
     /// pins the partition side, and `pool_frame_intake` passes the
     /// returned `inactive_ids` verbatim to `release_on_demand_subset`.
     #[test]
-    fn partition_subscriptions_by_codec_mixed_codec_separates_active_keeps_inactive_ids(
-    ) {
-        let vp8_full =
-            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::full());
-        let vp8_half =
-            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::half());
-        let vp8_quarter =
-            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::quarter());
-        let h264_full =
-            make_partition_test_subscription(CodecKind::H264, SimulcastRid::full());
+    fn partition_subscriptions_by_codec_mixed_codec_separates_active_keeps_inactive_ids() {
+        let vp8_full = make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::full());
+        let vp8_half = make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::half());
+        let vp8_quarter = make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::quarter());
+        let h264_full = make_partition_test_subscription(CodecKind::H264, SimulcastRid::full());
 
         let (active, inactive_ids) = partition_subscriptions_by_codec(
             vec![vp8_full, h264_full, vp8_half, vp8_quarter],
@@ -4982,8 +4945,7 @@ mod tests {
             active.iter().map(|s| s.id.clone()).collect();
         assert!(active_ids.contains(&EncoderId::new(CodecKind::Vp8, SimulcastRid::full())));
         assert!(active_ids.contains(&EncoderId::new(CodecKind::Vp8, SimulcastRid::half())));
-        assert!(active_ids
-            .contains(&EncoderId::new(CodecKind::Vp8, SimulcastRid::quarter())));
+        assert!(active_ids.contains(&EncoderId::new(CodecKind::Vp8, SimulcastRid::quarter())));
 
         // Inactive ids: ONLY the H.264 id. pool_frame_intake passes
         // this verbatim to lease.release_on_demand_subset, which is
@@ -5005,10 +4967,8 @@ mod tests {
     /// epochs always have inactive_ids empty.
     #[test]
     fn partition_subscriptions_by_codec_single_codec_returns_empty_inactive_ids() {
-        let vp8_full =
-            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::full());
-        let vp8_half =
-            make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::half());
+        let vp8_full = make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::full());
+        let vp8_half = make_partition_test_subscription(CodecKind::Vp8, SimulcastRid::half());
 
         let (active, inactive_ids) =
             partition_subscriptions_by_codec(vec![vp8_full, vp8_half], CodecKind::Vp8);
@@ -5030,10 +4990,8 @@ mod tests {
     /// inputs.
     #[test]
     fn partition_subscriptions_by_codec_no_active_match_keeps_all_inactive_ids() {
-        let h264_full =
-            make_partition_test_subscription(CodecKind::H264, SimulcastRid::full());
-        let h264_half =
-            make_partition_test_subscription(CodecKind::H264, SimulcastRid::half());
+        let h264_full = make_partition_test_subscription(CodecKind::H264, SimulcastRid::full());
+        let h264_half = make_partition_test_subscription(CodecKind::H264, SimulcastRid::half());
 
         let (active, inactive_ids) =
             partition_subscriptions_by_codec(vec![h264_full, h264_half], CodecKind::Vp8);
@@ -5532,7 +5490,10 @@ mod tests {
                  rids are {:?} — per-forwarder rid wrap leaked or \
                  stale rid persisted",
                 outbound.rid.as_str(),
-                subscribed_rids.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                subscribed_rids
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>(),
             );
             *rid_counts.entry(outbound.rid).or_insert(0) += 1;
             received += 1;
@@ -5551,10 +5512,7 @@ mod tests {
             "expected ≥2 rids in forwarded stream; got {} ({:?}) — \
              multi-forwarder pool intake regressed to single-rid",
             rid_counts.len(),
-            rid_counts
-                .keys()
-                .map(|r| r.as_str())
-                .collect::<Vec<_>>(),
+            rid_counts.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
         );
 
         shutdown.cancel();
@@ -5583,8 +5541,7 @@ mod tests {
     fn driver_state_video_specs_keys_by_spec_and_rid() {
         use crate::display::encode::PayloadSpec;
         let spec = PayloadSpec::vp8();
-        let mut specs: HashMap<(PayloadSpec, SimulcastRid), SpecState> =
-            HashMap::new();
+        let mut specs: HashMap<(PayloadSpec, SimulcastRid), SpecState> = HashMap::new();
         // Insert under three distinct rids with the same spec. They
         // must be three distinct entries — pre-fix keying by
         // `PayloadSpec` alone would have collapsed them to one.
@@ -5595,7 +5552,9 @@ mod tests {
         ] {
             specs.insert(
                 (spec.clone(), rid),
-                SpecState::Ready { keyframe_seen: false },
+                SpecState::Ready {
+                    keyframe_seen: false,
+                },
             );
         }
         assert_eq!(
@@ -5739,10 +5698,8 @@ mod tests {
             SimulcastRid::quarter(),
         ];
         let ice_config = crate::display::IceConfig::default();
-        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
-            Arc::new(|_| {});
-        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
-            Arc::new(|_| {});
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -5859,8 +5816,7 @@ mod tests {
         let active_rids = vec![SimulcastRid::full()];
         let ice_config = crate::display::IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
-        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
-            Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -5916,10 +5872,8 @@ mod tests {
         // Single rid → no simulcast in answer.
         let active_rids = vec![SimulcastRid::full()];
         let ice_config = crate::display::IceConfig::default();
-        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> =
-            Arc::new(|_| {});
-        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
-            Arc::new(|_| {});
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -5976,8 +5930,7 @@ mod tests {
         let active_rids = vec![SimulcastRid::full()];
         let ice_config = IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
-        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
-            Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -6104,10 +6057,12 @@ mod tests {
             media_ssrc: 0,
             fir: ssrcs
                 .iter()
-                .map(|s| rtc::rtcp::payload_feedbacks::full_intra_request::FirEntry {
-                    ssrc: *s,
-                    sequence_number: 0,
-                })
+                .map(
+                    |s| rtc::rtcp::payload_feedbacks::full_intra_request::FirEntry {
+                        ssrc: *s,
+                        sequence_number: 0,
+                    },
+                )
                 .collect(),
         })
     }
@@ -6283,11 +6238,8 @@ mod tests {
     fn extract_bitrate_first_poll_returns_none_seeds_prev() {
         let mut prev: HashMap<u32, (u64, Instant)> = HashMap::new();
         let now = Instant::now();
-        let result = extract_recent_outbound_bitrate(
-            vec![(0xAAAA_0001u32, 10_000u64)],
-            &mut prev,
-            now,
-        );
+        let result =
+            extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, 10_000u64)], &mut prev, now);
         assert_eq!(result, None, "first poll has no prev — must return None");
         assert_eq!(
             prev.get(&0xAAAA_0001),
@@ -6309,11 +6261,8 @@ mod tests {
         // Poll 1: seed.
         extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, 100_000u64)], &mut prev, t0);
         // Poll 2: 200 KB more in 1 second → 200_000 bytes * 8 = 1.6 Mbps.
-        let result = extract_recent_outbound_bitrate(
-            vec![(0xAAAA_0001u32, 300_000u64)],
-            &mut prev,
-            t1,
-        );
+        let result =
+            extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, 300_000u64)], &mut prev, t1);
         assert_eq!(result, Some(1_600_000));
         // Prev updated to the latest sample.
         assert_eq!(prev.get(&0xAAAA_0001), Some(&(300_000u64, t1)));
@@ -6366,11 +6315,7 @@ mod tests {
         let t1 = t0 + Duration::from_secs(1);
 
         // Seed at high value, then "wrap" to a low value (stream restart).
-        extract_recent_outbound_bitrate(
-            vec![(0xAAAA_0001u32, 1_000_000u64)],
-            &mut prev,
-            t0,
-        );
+        extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, 1_000_000u64)], &mut prev, t0);
         let result = extract_recent_outbound_bitrate(
             vec![(0xAAAA_0001u32, 500u64)], // restart, much smaller
             &mut prev,
@@ -6420,10 +6365,7 @@ mod tests {
         // SSRC appears with 50KB total but no prev to delta against.
         // Result: 1 Mbps from existing only; new SSRC seeded.
         let result = extract_recent_outbound_bitrate(
-            vec![
-                (0xAAAA_0001u32, 225_000u64),
-                (0xAAAA_0002u32, 50_000u64),
-            ],
+            vec![(0xAAAA_0001u32, 225_000u64), (0xAAAA_0002u32, 50_000u64)],
             &mut prev,
             t1,
         );
@@ -6461,11 +6403,8 @@ mod tests {
         for _ in 0..3 {
             t += Duration::from_secs(1);
             bytes += 125_000;
-            let result = extract_recent_outbound_bitrate(
-                vec![(0xAAAA_0001u32, bytes)],
-                &mut prev,
-                t,
-            );
+            let result =
+                extract_recent_outbound_bitrate(vec![(0xAAAA_0001u32, bytes)], &mut prev, t);
             assert_eq!(result, Some(1_000_000));
         }
     }
@@ -6525,10 +6464,8 @@ mod tests {
         // exercises the SSRC-table-drop path specifically, not the
         // pre-RR-filter path.
         let table = vp8_simulcast_ssrc_table();
-        let out = map_remote_inbound_to_rid_health(
-            vec![(0xDEAD_BEEFu32, 0.05, 42, 0.018, 5)],
-            &table,
-        );
+        let out =
+            map_remote_inbound_to_rid_health(vec![(0xDEAD_BEEFu32, 0.05, 42, 0.018, 5)], &table);
         assert!(out.is_empty());
     }
 
@@ -6586,7 +6523,7 @@ mod tests {
         let table = vp8_simulcast_ssrc_table();
         let out = map_remote_inbound_to_rid_health(
             vec![
-                (0xAAAA_0002u32, 0.07, 30, 0.020, 9), // half (known)
+                (0xAAAA_0002u32, 0.07, 30, 0.020, 9),   // half (known)
                 (0xCAFE_BABEu32, 0.50, 200, 0.100, 11), // unknown
             ],
             &table,
@@ -6692,8 +6629,7 @@ mod tests {
         let active_rids = vec![SimulcastRid::full()];
         let ice_config = IceConfig::default();
         let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
-        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> =
-            Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
         let authority_handler = noop_authority_handler();
         let tile_control_handler = noop_tile_control_handler();
         let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
@@ -6797,8 +6733,14 @@ mod tests {
              send`; got:\n{out}"
         );
         // Exactly one a=simulcast: line in the output.
-        let count = out.lines().filter(|l| l.starts_with("a=simulcast:")).count();
-        assert_eq!(count, 1, "exactly one a=simulcast: line; got {count}\n{out}");
+        let count = out
+            .lines()
+            .filter(|l| l.starts_with("a=simulcast:"))
+            .count();
+        assert_eq!(
+            count, 1,
+            "exactly one a=simulcast: line; got {count}\n{out}"
+        );
     }
 
     /// Already-clean SDP must pass through unchanged. Dedupe is
@@ -6889,8 +6831,8 @@ mod tests {
             (DisplayInputAuthorityState::Unclaimed, "unclaimed"),
         ] {
             let json = serialize_authority_state(7, state);
-            let parsed: serde_json::Value = serde_json::from_str(&json)
-                .expect("frame must parse as JSON");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).expect("frame must parse as JSON");
             assert_eq!(parsed["t"], "display_input_authority_state");
             assert_eq!(parsed["display_id"], 7);
             assert_eq!(parsed["state"], expected_state);
@@ -6953,10 +6895,10 @@ mod tests {
         .is_none());
 
         // Missing `display_id`.
-        assert!(parse_authority_channel_message(
-            r#"{ "t": "display_input_authority_request" }"#,
-        )
-        .is_none());
+        assert!(
+            parse_authority_channel_message(r#"{ "t": "display_input_authority_request" }"#,)
+                .is_none()
+        );
 
         // Non-numeric `display_id`.
         assert!(parse_authority_channel_message(
@@ -6974,29 +6916,23 @@ mod tests {
         assert!(parse_authority_channel_message("not json at all").is_none());
 
         // Missing `t` discriminator.
-        assert!(parse_authority_channel_message(
-            r#"{ "display_id": 0 }"#,
-        )
-        .is_none());
+        assert!(parse_authority_channel_message(r#"{ "display_id": 0 }"#,).is_none());
     }
 
     #[test]
     fn parse_tile_control_message_round_trip() {
-        let subscribe = tile_transport::encode_frame(&tile_transport::TileFrame::Subscribe {
-            client_id: 99,
-        })
-        .unwrap();
+        let subscribe =
+            tile_transport::encode_frame(&tile_transport::TileFrame::Subscribe { client_id: 99 })
+                .unwrap();
         assert_eq!(
             parse_tile_control_message(&subscribe),
             Some(TileControlMessage::Subscribe { client_id: 99 })
         );
 
-        let snapshot = tile_transport::encode_frame(
-            &tile_transport::TileFrame::SnapshotRequest {
-                epoch: 7,
-                reason: tile_transport::SnapshotRequestReason::Gap,
-            },
-        )
+        let snapshot = tile_transport::encode_frame(&tile_transport::TileFrame::SnapshotRequest {
+            epoch: 7,
+            reason: tile_transport::SnapshotRequestReason::Gap,
+        })
         .unwrap();
         assert_eq!(
             parse_tile_control_message(&snapshot),
@@ -7049,7 +6985,10 @@ mod tests {
 
         for label in ["clipboard", "control", "pointer", "random"] {
             let drained = drain_pending_authority_for_label(label, &mut pending);
-            assert!(drained.is_empty(), "non-authority label '{label}' must drain nothing");
+            assert!(
+                drained.is_empty(),
+                "non-authority label '{label}' must drain nothing"
+            );
             assert_eq!(
                 pending.len(),
                 2,
@@ -7071,10 +7010,7 @@ mod tests {
             (2, DisplayInputAuthorityState::Unclaimed),
         ];
 
-        let drained = drain_pending_authority_for_label(
-            AUTHORITY_CHANNEL_LABEL,
-            &mut pending,
-        );
+        let drained = drain_pending_authority_for_label(AUTHORITY_CHANNEL_LABEL, &mut pending);
         assert_eq!(drained.len(), 3, "must drain all queued entries");
         assert!(pending.is_empty(), "queue must be empty after drain");
 
@@ -7084,10 +7020,7 @@ mod tests {
         assert_eq!(drained[2], (2, DisplayInputAuthorityState::Unclaimed));
 
         // Second drain returns empty (no double-flush).
-        let again = drain_pending_authority_for_label(
-            AUTHORITY_CHANNEL_LABEL,
-            &mut pending,
-        );
+        let again = drain_pending_authority_for_label(AUTHORITY_CHANNEL_LABEL, &mut pending);
         assert!(again.is_empty(), "second drain must be empty");
     }
 
@@ -7097,10 +7030,7 @@ mod tests {
     #[test]
     fn drain_pending_authority_empty_queue_is_noop() {
         let mut pending: Vec<(u32, DisplayInputAuthorityState)> = Vec::new();
-        let drained = drain_pending_authority_for_label(
-            AUTHORITY_CHANNEL_LABEL,
-            &mut pending,
-        );
+        let drained = drain_pending_authority_for_label(AUTHORITY_CHANNEL_LABEL, &mut pending);
         assert!(drained.is_empty());
         assert!(pending.is_empty());
     }

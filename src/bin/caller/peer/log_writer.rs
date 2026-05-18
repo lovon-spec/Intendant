@@ -60,9 +60,7 @@ pub const LOG_CHANNEL_CAPACITY: usize = 2048;
 ///
 /// Dropping the `Sender` (and all its clones held inside peer
 /// actors) causes the writer task to drain the channel and exit.
-pub fn spawn_peer_log_writer(
-    log_path: PathBuf,
-) -> (mpsc::Sender<TaggedPeerEvent>, JoinHandle<()>) {
+pub fn spawn_peer_log_writer(log_path: PathBuf) -> (mpsc::Sender<TaggedPeerEvent>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<TaggedPeerEvent>(LOG_CHANNEL_CAPACITY);
     let handle = tokio::spawn(run_writer(log_path, rx));
     (tx, handle)
@@ -159,10 +157,15 @@ mod tests {
 
         tx.send(make_event(1, PeerStatus::Idle)).await.unwrap();
         tx.send(make_event(2, PeerStatus::Working)).await.unwrap();
-        tx.send(make_event(3, PeerStatus::NeedsApproval)).await.unwrap();
+        tx.send(make_event(3, PeerStatus::NeedsApproval))
+            .await
+            .unwrap();
 
         drop(tx);
-        timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
 
         let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = contents.lines().collect();
@@ -223,9 +226,7 @@ mod tests {
         // Wait for the write to land.
         timeout(Duration::from_secs(2), async {
             loop {
-                if log_path.exists()
-                    && tokio::fs::metadata(&log_path).await.unwrap().len() > 0
-                {
+                if log_path.exists() && tokio::fs::metadata(&log_path).await.unwrap().len() > 0 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -250,7 +251,10 @@ mod tests {
         let (tx, handle) = spawn_peer_log_writer(log_path.clone());
         tx.send(make_event(1, PeerStatus::Idle)).await.unwrap();
         drop(tx);
-        timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
 
         let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = contents.lines().collect();
@@ -276,7 +280,10 @@ mod tests {
         tx2.send(make_event(2, PeerStatus::Working)).await.unwrap();
         drop(tx2);
         // Now all senders gone, writer should exit.
-        timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
 
         let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = contents.lines().collect();

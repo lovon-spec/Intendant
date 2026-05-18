@@ -98,8 +98,8 @@ impl WasmPresence {
     /// - `{ type: "NeedsIO", data: { tool_name, args } }` — needs server round-trip
     #[wasm_bindgen]
     pub fn dispatch(&self, tool_name: &str, args: JsValue) -> JsValue {
-        let args_val: serde_json::Value =
-            serde_wasm_bindgen::from_value(args).unwrap_or(serde_json::Value::Object(Default::default()));
+        let args_val: serde_json::Value = serde_wasm_bindgen::from_value(args)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
         let action = dispatch_tool_call(tool_name, &args_val, &self.state);
         serde_wasm_bindgen::to_value(&action).unwrap_or(JsValue::NULL)
     }

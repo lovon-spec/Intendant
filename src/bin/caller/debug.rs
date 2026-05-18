@@ -181,13 +181,8 @@ pub fn spawn_debug_screen_handler(
                     match setup_debug_screen(web_port).await {
                         Ok(s) => {
                             let display_id = s.display_id;
-                            eprintln!(
-                                "[debug] Screen ready on :{}",
-                                display_id
-                            );
-                            bus.send(AppEvent::DebugScreenReady {
-                                display_id,
-                            });
+                            eprintln!("[debug] Screen ready on :{}", display_id);
+                            bus.send(AppEvent::DebugScreenReady { display_id });
                             screen = Some(s);
                         }
                         Err(e) => {

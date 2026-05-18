@@ -13,10 +13,8 @@ use crate::callbacks::Callbacks;
 /// (not ES6 Map). This is required because serde-wasm-bindgen 0.6+ defaults
 /// to Map, which makes Object.keys() return [] and property access fail.
 fn to_js_object(val: &serde_json::Value) -> JsValue {
-    val.serialize(
-        &serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true),
-    )
-    .unwrap_or(JsValue::NULL)
+    val.serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+        .unwrap_or(JsValue::NULL)
 }
 
 const DEFAULT_MODEL: &str = "gemini-2.5-flash-native-audio-preview-12-2025";
@@ -135,8 +133,10 @@ impl GeminiProvider {
             if let Some(text) = text {
                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
                     Self::handle_message_static(
-                        &callbacks, &msg,
-                        &turn_tool_calls_inner, &turn_has_speech_inner,
+                        &callbacks,
+                        &msg,
+                        &turn_tool_calls_inner,
+                        &turn_has_speech_inner,
                     );
                 }
             }
@@ -191,7 +191,10 @@ impl GeminiProvider {
             Err(e) => {
                 callbacks.invoke_diagnostic(
                     "gemini_setup",
-                    &format!("ERROR: tools deserialization failed: {:?} — sending empty tools", e),
+                    &format!(
+                        "ERROR: tools deserialization failed: {:?} — sending empty tools",
+                        e
+                    ),
                 );
                 serde_json::Value::Array(vec![])
             }
@@ -256,13 +259,16 @@ impl GeminiProvider {
         // Normalize Gemini-specific fields into provider-agnostic LiveUsage.
         if let Some(usage) = msg.get("usageMetadata") {
             let total = usage["totalTokenCount"].as_u64().unwrap_or(0);
-            callbacks.invoke_diagnostic("gemini_usage", &format!(
-                "tokens: total={} prompt={} response={} thinking={}",
-                total,
-                usage["promptTokenCount"].as_u64().unwrap_or(0),
-                usage["responseTokenCount"].as_u64().unwrap_or(0),
-                usage["thoughtsTokenCount"].as_u64().unwrap_or(0),
-            ));
+            callbacks.invoke_diagnostic(
+                "gemini_usage",
+                &format!(
+                    "tokens: total={} prompt={} response={} thinking={}",
+                    total,
+                    usage["promptTokenCount"].as_u64().unwrap_or(0),
+                    usage["responseTokenCount"].as_u64().unwrap_or(0),
+                    usage["thoughtsTokenCount"].as_u64().unwrap_or(0),
+                ),
+            );
             let live_usage = crate::LiveUsage {
                 input_tokens: usage["promptTokenCount"].as_u64().unwrap_or(0),
                 output_tokens: usage["responseTokenCount"].as_u64().unwrap_or(0),
@@ -286,10 +292,12 @@ impl GeminiProvider {
         if let Some(tool_call) = msg.get("toolCall") {
             if let Some(fcs) = tool_call.get("functionCalls").and_then(|v| v.as_array()) {
                 turn_tool_calls.set(turn_tool_calls.get() + fcs.len() as u32);
-                let names: Vec<&str> = fcs.iter()
+                let names: Vec<&str> = fcs
+                    .iter()
                     .filter_map(|fc| fc.get("name").and_then(|v| v.as_str()))
                     .collect();
-                callbacks.invoke_diagnostic("gemini_msg", &format!("toolCall: {}", names.join(", ")));
+                callbacks
+                    .invoke_diagnostic("gemini_msg", &format!("toolCall: {}", names.join(", ")));
                 for fc in fcs {
                     let call_js = to_js_object(fc);
                     callbacks.invoke_voice_tool_call(&call_js);
@@ -371,9 +379,15 @@ impl GeminiProvider {
                         }
                     }
                     let mut kinds = Vec::new();
-                    if has_audio { kinds.push("audio"); }
-                    if has_text { kinds.push("text"); }
-                    if has_tool { kinds.push("functionCall"); }
+                    if has_audio {
+                        kinds.push("audio");
+                    }
+                    if has_text {
+                        kinds.push("text");
+                    }
+                    if has_tool {
+                        kinds.push("functionCall");
+                    }
                     callbacks.invoke_diagnostic(
                         "gemini_msg",
                         &format!("serverContent({})", kinds.join("+")),
@@ -436,7 +450,8 @@ impl GeminiProvider {
                 &format!("chunk #{} ({}B)", count, base64_pcm.len()),
             );
         } else {
-            self.callbacks.invoke_diagnostic("audio_send", "DROPPED — no WebSocket");
+            self.callbacks
+                .invoke_diagnostic("audio_send", "DROPPED — no WebSocket");
         }
     }
 

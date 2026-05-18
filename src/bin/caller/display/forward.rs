@@ -91,8 +91,8 @@ use crate::display::encode::pool::{
 use crate::display::EncodedFrame;
 use crate::display::PeerId;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
 // ---------------------------------------------------------------------------
@@ -113,10 +113,7 @@ pub enum ForwarderError {
     /// peer-negotiated equivalent. Should be impossible if the pool
     /// subscription set matches the peer's negotiated codec set, so
     /// this represents a bug: fail loud.
-    PayloadTypeTranslationFailed {
-        codec: CodecKind,
-        rid: SimulcastRid,
-    },
+    PayloadTypeTranslationFailed { codec: CodecKind, rid: SimulcastRid },
     /// Subscriber channel lagged past recovery. WebRTC's NACK + PLI
     /// feedback handles transient losses, so the forwarder recovers
     /// naturally; this variant exists for logging / metrics not for
@@ -379,10 +376,7 @@ pub fn inject_recv_simulcast_into_video_offer(sdp: &str, rids: &[&str]) -> Strin
         }
     }
 
-    let mut inject: Vec<String> = rids
-        .iter()
-        .map(|rid| format!("a=rid:{rid} recv"))
-        .collect();
+    let mut inject: Vec<String> = rids.iter().map(|rid| format!("a=rid:{rid} recv")).collect();
     inject.push(format!("a=simulcast:recv {}", rids.join(";")));
 
     let tail = lines.split_off(insert_at);
@@ -432,9 +426,7 @@ pub fn ice_servers_to_rtc_peer_connection_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::encode::pool::{
-        EncoderId, EncoderSubscription, LayerSpec, SimulcastRid,
-    };
+    use crate::display::encode::pool::{EncoderId, EncoderSubscription, LayerSpec, SimulcastRid};
     use tokio::sync::broadcast;
 
     fn make_subscription(codec: CodecKind, rid: SimulcastRid) -> EncoderSubscription {
@@ -861,7 +853,10 @@ mod tests {
             .position(|l| l.starts_with("a=simulcast:"))
             .expect("a=simulcast: injected");
 
-        assert!(mid_idx < rid_idx, "rid line after pre-existing m=video attrs");
+        assert!(
+            mid_idx < rid_idx,
+            "rid line after pre-existing m=video attrs"
+        );
         assert!(rid_idx < simulcast_idx);
     }
 
@@ -881,10 +876,7 @@ mod tests {
                    a=simulcast:recv f;h;q\r\n";
 
         let out = inject_recv_simulcast_into_video_offer(sdp, &["f", "h", "q"]);
-        assert_eq!(
-            out, sdp,
-            "no-op on SDP that already declares a=simulcast"
-        );
+        assert_eq!(out, sdp, "no-op on SDP that already declares a=simulcast");
     }
 
     /// Empty `rids` slice → no-op. Caller bug if this is reached in
@@ -1015,11 +1007,7 @@ mod tests {
     /// username case.
     #[test]
     fn ice_servers_empty_string_credential_filtered_to_none_matches_js_truthy() {
-        let input = vec![srv(
-            &["turn:turn.example:3478"],
-            Some("user1"),
-            Some(""),
-        )];
+        let input = vec![srv(&["turn:turn.example:3478"], Some("user1"), Some(""))];
         let out = ice_servers_to_rtc_peer_connection_config(&input);
         assert_eq!(out[0].username.as_deref(), Some("user1"));
         assert!(
@@ -1034,10 +1022,7 @@ mod tests {
     #[test]
     fn ice_servers_multiple_urls_in_one_entry_preserved() {
         let input = vec![srv(
-            &[
-                "stun:stun.example:3478",
-                "stun:stun-backup.example:3478",
-            ],
+            &["stun:stun.example:3478", "stun:stun-backup.example:3478"],
             None,
             None,
         )];

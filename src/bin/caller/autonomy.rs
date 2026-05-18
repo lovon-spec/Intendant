@@ -256,21 +256,21 @@ impl AutonomyState {
 
     /// Check if a command was already approved this session.
     pub fn was_command_approved(&self, command: &str) -> bool {
-        self.approved_commands.contains(&Self::command_dedup_key(command))
+        self.approved_commands
+            .contains(&Self::command_dedup_key(command))
     }
 
     /// Record a command as approved.
     pub fn record_approved_command(&mut self, command: &str) {
-        self.approved_commands.insert(Self::command_dedup_key(command));
+        self.approved_commands
+            .insert(Self::command_dedup_key(command));
     }
 
     /// Determine whether approval is needed for a given action category.
     /// Returns true if the user must be prompted.
     pub fn needs_approval(&self, category: ActionCategory) -> bool {
         // HumanInput and LiveAudioSpawn always require human regardless of autonomy level
-        if category == ActionCategory::HumanInput
-            || category == ActionCategory::LiveAudioSpawn
-        {
+        if category == ActionCategory::HumanInput || category == ActionCategory::LiveAudioSpawn {
             return true;
         }
 
@@ -815,14 +815,16 @@ destructive = "deny"
     #[test]
     fn display_control_highest_severity() {
         assert!(
-            ActionCategory::DisplayControl.severity()
-                > ActionCategory::LiveAudioSpawn.severity()
+            ActionCategory::DisplayControl.severity() > ActionCategory::LiveAudioSpawn.severity()
         );
     }
 
     #[test]
     fn display_control_category_display() {
-        assert_eq!(ActionCategory::DisplayControl.to_string(), "display_control");
+        assert_eq!(
+            ActionCategory::DisplayControl.to_string(),
+            "display_control"
+        );
     }
 
     #[test]

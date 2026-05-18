@@ -95,18 +95,37 @@ pub struct TaskEnvelope {
 /// Filtered events pushed to the presence layer from the agent loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PresenceEvent {
-    PhaseChanged { phase: String },
+    PhaseChanged {
+        phase: String,
+    },
     TaskComplete {
         reason: String,
         #[serde(default)]
         summary: Option<String>,
     },
-    ApprovalNeeded { id: u64, preview: String, category: String },
-    ApprovalResolved { id: u64, action: String },
-    HumanQuestion { question: String },
-    BudgetWarning { pct: f64, remaining: u64 },
-    RoundComplete { round: usize, turns_in_round: usize },
-    Error { message: String },
+    ApprovalNeeded {
+        id: u64,
+        preview: String,
+        category: String,
+    },
+    ApprovalResolved {
+        id: u64,
+        action: String,
+    },
+    HumanQuestion {
+        question: String,
+    },
+    BudgetWarning {
+        pct: f64,
+        remaining: u64,
+    },
+    RoundComplete {
+        round: usize,
+        turns_in_round: usize,
+    },
+    Error {
+        message: String,
+    },
     /// A display became available.
     DisplayReady {
         display_id: u32,
@@ -258,7 +277,10 @@ impl AgentStateSnapshot {
                 })
             }
             "error" => {
-                let message = event["message"].as_str().unwrap_or("unknown error").to_string();
+                let message = event["message"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string();
                 Some(PresenceEvent::Error { message })
             }
             _ => None,
@@ -493,7 +515,11 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: PresenceEvent = serde_json::from_str(&json).unwrap();
         match back {
-            PresenceEvent::ApprovalNeeded { id, preview, category } => {
+            PresenceEvent::ApprovalNeeded {
+                id,
+                preview,
+                category,
+            } => {
                 assert_eq!(id, 42);
                 assert_eq!(preview, "exec: rm -rf /tmp");
                 assert_eq!(category, "Destructive");

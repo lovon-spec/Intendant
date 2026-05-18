@@ -85,8 +85,7 @@ fn tee_fd(target_fd: RawFd, file_fd: RawFd) -> io::Result<()> {
         // tester-submitted bundles are temporally analyzable later.
         let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
         loop {
-            let n =
-                unsafe { libc::read(pipe_read, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(pipe_read, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n <= 0 {
                 break;
             }

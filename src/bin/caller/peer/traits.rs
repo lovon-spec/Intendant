@@ -90,10 +90,18 @@ pub struct TransportFeatures {
 /// transport maps variants onto its wire protocol.
 #[derive(Clone, Debug)]
 pub enum PeerOp {
-    SendMessage { message: PeerMessage },
-    DelegateTask { task: PeerTask },
-    CancelTask { task: TaskId },
-    QueryTaskStatus { task: TaskId },
+    SendMessage {
+        message: PeerMessage,
+    },
+    DelegateTask {
+        task: PeerTask,
+    },
+    CancelTask {
+        task: TaskId,
+    },
+    QueryTaskStatus {
+        task: TaskId,
+    },
     InvokeCapability {
         name: String,
         args: serde_json::Value,

@@ -34,12 +34,12 @@ use uuid::Uuid;
 
 use crate::autonomy::{AutonomyLevel, SharedAutonomy};
 use crate::control;
-use crate::types::OutboundEvent;
+use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg, EventBus};
 use crate::frontend::{
     self, ActionOutcome, ApprovalSnapshot, HumanQuestionSnapshot, LogEntrySnapshot, StateResult,
     StatusSnapshot, UserAction,
 };
-use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg, EventBus};
+use crate::types::OutboundEvent;
 use crate::types::{LogLevel, Phase, Verbosity};
 use crate::FollowUpMessage;
 
@@ -646,7 +646,9 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
 
     let lock_dir = loop_dir.join("active.lock");
     let lock_owner_pid = parse_pid_file(&lock_dir.join("pid"));
-    let lock_owner_alive = lock_owner_pid.map(super::platform::process_alive).unwrap_or(false);
+    let lock_owner_alive = lock_owner_pid
+        .map(super::platform::process_alive)
+        .unwrap_or(false);
 
     let mut active_wrappers = Vec::new();
     let mut active_codex = Vec::new();
@@ -1102,14 +1104,18 @@ async fn handle_control_command_mcp(
             Some(RESOURCE_STATUS_URI)
         }
         ControlMsg::SetExternalAgent { agent } => {
-            let parsed = agent.as_deref()
+            let parsed = agent
+                .as_deref()
                 .filter(|s| !s.is_empty())
                 .and_then(crate::external_agent::AgentBackend::from_str_loose);
             {
                 let mut s = state.write().await;
                 s.external_agent = parsed.clone();
             }
-            let label = parsed.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
+            let label = parsed
+                .as_ref()
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "none".to_string());
             emit_control_result(
                 control_tx,
                 "set_external_agent",
@@ -1150,7 +1156,10 @@ async fn handle_control_command_mcp(
                 control_tx,
                 "set_codex_approval_policy",
                 true,
-                format!("Codex approval policy set to {} (applies on next task)", policy),
+                format!(
+                    "Codex approval policy set to {} (applies on next task)",
+                    policy
+                ),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -1178,7 +1187,10 @@ async fn handle_control_command_mcp(
                 control_tx,
                 "set_codex_reasoning_effort",
                 true,
-                format!("Codex reasoning effort set to {} (applies on next task)", label),
+                format!(
+                    "Codex reasoning effort set to {} (applies on next task)",
+                    label
+                ),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -1254,7 +1266,10 @@ async fn handle_control_command_mcp(
                 control_tx,
                 "set_gemini_approval_mode",
                 true,
-                format!("Gemini approval mode set to {} (applies on next task)", mode),
+                format!(
+                    "Gemini approval mode set to {} (applies on next task)",
+                    mode
+                ),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -1781,7 +1796,9 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_LOOP_URI)
         }
-        ControlMsg::StartTask { task, orchestrate, .. } => {
+        ControlMsg::StartTask {
+            task, orchestrate, ..
+        } => {
             match start_task_with_state(state, bus, task, "voice", orchestrate).await {
                 Ok(()) => {
                     emit_control_result(control_tx, "start_task", true, "ok".to_string(), None);
@@ -1792,8 +1809,18 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::ResumeSession { source, session_id, task, .. } => {
-            let action = if task.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()).is_some() {
+        ControlMsg::ResumeSession {
+            source,
+            session_id,
+            task,
+            ..
+        } => {
+            let action = if task
+                .as_ref()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .is_some()
+            {
                 "resume dispatched"
             } else {
                 "session attach requested"
@@ -1807,7 +1834,9 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::FollowUp { text, direct: _, .. } => {
+        ControlMsg::FollowUp {
+            text, direct: _, ..
+        } => {
             // MCP has a single follow-up channel and no presence layer,
             // so the `direct` bit is a no-op here — follow-ups already
             // go straight to the agent loop in this mode.
@@ -1839,13 +1868,7 @@ async fn handle_control_command_mcp(
                         None,
                     );
                 } else {
-                    emit_control_result(
-                        control_tx,
-                        "follow_up",
-                        true,
-                        "ok".to_string(),
-                        None,
-                    );
+                    emit_control_result(control_tx, "follow_up", true, "ok".to_string(), None);
                 }
             } else {
                 emit_control_result(
@@ -1861,37 +1884,44 @@ async fn handle_control_command_mcp(
         ControlMsg::QueryDetail { scope, target } => {
             // Log query detail requests; full handling via presence layer
             let msg = format!("query_detail: scope={}, target={:?}", scope, target);
-            emit_control_result(
-                control_tx,
-                "query_detail",
-                true,
-                msg,
-                None,
-            );
+            emit_control_result(control_tx, "query_detail", true, msg, None);
             None
         }
-        ControlMsg::RecallMemory { keywords, tags, channel } => {
+        ControlMsg::RecallMemory {
+            keywords,
+            tags,
+            channel,
+        } => {
             let msg = format!(
                 "recall_memory: keywords={:?}, tags={:?}, channel={:?}",
                 keywords, tags, channel
             );
-            emit_control_result(
-                control_tx,
-                "recall_memory",
-                true,
-                msg,
-                None,
-            );
+            emit_control_result(control_tx, "recall_memory", true, msg, None);
             None
         }
         ControlMsg::TakeDisplay { display_id } => {
             bus.send(AppEvent::DisplayTaken { display_id });
-            emit_control_result(control_tx, "take_display", true, format!("Took control of :{}", display_id), None);
+            emit_control_result(
+                control_tx,
+                "take_display",
+                true,
+                format!("Took control of :{}", display_id),
+                None,
+            );
             Some(RESOURCE_LOGS_URI)
         }
         ControlMsg::ReleaseDisplay { display_id, note } => {
-            bus.send(AppEvent::DisplayReleased { display_id, note: note.clone() });
-            emit_control_result(control_tx, "release_display", true, format!("Released control of :{}", display_id), None);
+            bus.send(AppEvent::DisplayReleased {
+                display_id,
+                note: note.clone(),
+            });
+            emit_control_result(
+                control_tx,
+                "release_display",
+                true,
+                format!("Released control of :{}", display_id),
+                None,
+            );
             Some(RESOURCE_LOGS_URI)
         }
         ControlMsg::GrantUserDisplay { display_id } => {
@@ -1905,7 +1935,13 @@ async fn handle_control_command_mcp(
             }
             std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
             bus.send(AppEvent::UserDisplayGranted { display_id: did });
-            emit_control_result(control_tx, "grant_user_display", true, format!("User display access granted (display_id: {})", did), None);
+            emit_control_result(
+                control_tx,
+                "grant_user_display",
+                true,
+                format!("User display access granted (display_id: {})", did),
+                None,
+            );
             Some(RESOURCE_LOGS_URI)
         }
         ControlMsg::ListDisplays => {
@@ -1926,11 +1962,23 @@ async fn handle_control_command_mcp(
                 a.user_display_granted = false;
             }
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-            bus.send(AppEvent::UserDisplayRevoked { display_id: did, note: note.clone() });
-            emit_control_result(control_tx, "revoke_user_display", true, format!("User display access revoked (display_id: {})", did), None);
+            bus.send(AppEvent::UserDisplayRevoked {
+                display_id: did,
+                note: note.clone(),
+            });
+            emit_control_result(
+                control_tx,
+                "revoke_user_display",
+                true,
+                format!("User display access revoked (display_id: {})", did),
+                None,
+            );
             Some(RESOURCE_LOGS_URI)
         }
-        ControlMsg::InvokeSkill { skill_name, arguments } => {
+        ControlMsg::InvokeSkill {
+            skill_name,
+            arguments,
+        } => {
             // In MCP mode, convert skill invocation to a StartTask
             let discovered = crate::skills::discover_skills(None);
             let args = arguments.as_deref().unwrap_or("");
@@ -1945,7 +1993,13 @@ async fn handle_control_command_mcp(
                         display_target: None,
                         attachments: vec![],
                     }));
-                    emit_control_result(control_tx, "invoke_skill", true, format!("Skill '{}' dispatched", skill_name), None);
+                    emit_control_result(
+                        control_tx,
+                        "invoke_skill",
+                        true,
+                        format!("Skill '{}' dispatched", skill_name),
+                        None,
+                    );
                 }
                 Err(e) => {
                     emit_control_result(control_tx, "invoke_skill", false, e, None);
@@ -1971,19 +2025,43 @@ async fn handle_control_command_mcp(
         | ControlMsg::TeardownDebugScreen
         | ControlMsg::StartDebugRecording
         | ControlMsg::StopDebugRecording => {
-            emit_control_result(control_tx, "debug_screen", true, "Dispatched".to_string(), None);
+            emit_control_result(
+                control_tx,
+                "debug_screen",
+                true,
+                "Dispatched".to_string(),
+                None,
+            );
             None
         }
         ControlMsg::StartRecording { ref stream_name } => {
-            emit_control_result(control_tx, "start_recording", true, format!("Starting {}", stream_name), None);
+            emit_control_result(
+                control_tx,
+                "start_recording",
+                true,
+                format!("Starting {}", stream_name),
+                None,
+            );
             None
         }
         ControlMsg::StopRecording { ref stream_name } => {
-            emit_control_result(control_tx, "stop_recording", true, format!("Stopping {}", stream_name), None);
+            emit_control_result(
+                control_tx,
+                "stop_recording",
+                true,
+                format!("Stopping {}", stream_name),
+                None,
+            );
             None
         }
         ControlMsg::DeleteRecording { ref stream_name } => {
-            emit_control_result(control_tx, "delete_recording", true, format!("Deleting {}", stream_name), None);
+            emit_control_result(
+                control_tx,
+                "delete_recording",
+                true,
+                format!("Deleting {}", stream_name),
+                None,
+            );
             None
         }
         ControlMsg::Interrupt {
@@ -1992,7 +2070,13 @@ async fn handle_control_command_mcp(
         } => {
             // Re-broadcast as an AppEvent so the dispatcher / agent loops pick it up.
             bus.send(AppEvent::InterruptRequested { session_id });
-            emit_control_result(control_tx, "interrupt", true, "Interrupt requested".to_string(), None);
+            emit_control_result(
+                control_tx,
+                "interrupt",
+                true,
+                "Interrupt requested".to_string(),
+                None,
+            );
             Some(RESOURCE_STATUS_URI)
         }
         ControlMsg::Steer {
@@ -2008,7 +2092,13 @@ async fn handle_control_command_mcp(
                 text,
                 id: id.unwrap_or_default(),
             });
-            emit_control_result(control_tx, "steer", true, "Steer requested".to_string(), None);
+            emit_control_result(
+                control_tx,
+                "steer",
+                true,
+                "Steer requested".to_string(),
+                None,
+            );
             Some(RESOURCE_STATUS_URI)
         }
         ControlMsg::WebRtcSignal { .. } => {
@@ -2109,7 +2199,18 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::UsageSnapshot { .. } | AppEvent::ContextSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::AutonomyChanged { .. } | AppEvent::CodexConfigChanged { .. } | AppEvent::CodexThreadActionRequested { .. } | AppEvent::CodexThreadActionResult { .. } | AppEvent::GeminiConfigChanged { .. } | AppEvent::GeminiThreadActionRequested { .. } | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::UsageSnapshot { .. }
+                    | AppEvent::ContextSnapshot { .. }
+                    | AppEvent::StatusUpdate { .. }
+                    | AppEvent::LogEntry { .. }
+                    | AppEvent::ExternalAgentChanged { .. }
+                    | AppEvent::AutonomyChanged { .. }
+                    | AppEvent::CodexConfigChanged { .. }
+                    | AppEvent::CodexThreadActionRequested { .. }
+                    | AppEvent::CodexThreadActionResult { .. }
+                    | AppEvent::GeminiConfigChanged { .. }
+                    | AppEvent::GeminiThreadActionRequested { .. }
+                    | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::Tick => {
                         // Detect stuck phases — warn every 30s after 120s
                         if matches!(
@@ -2201,9 +2302,14 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::AgentOutput { stdout, stderr, .. } => {
-                        let formatted = crate::tui::app::format_agent_output_for_tui(&stdout, &stderr);
+                        let formatted =
+                            crate::tui::app::format_agent_output_for_tui(&stdout, &stderr);
                         if !formatted.is_empty() {
-                            let level = if !stderr.is_empty() { LogLevel::Warn } else { LogLevel::Agent };
+                            let level = if !stderr.is_empty() {
+                                LogLevel::Warn
+                            } else {
+                                LogLevel::Agent
+                            };
                             s.push_log(level, formatted);
                         }
                         resource_changed = Some("intendant://logs");
@@ -2311,10 +2417,7 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://pending-approval");
                     }
 
-                    AppEvent::DisplayReady {
-                        display_id,
-                        ..
-                    } => {
+                    AppEvent::DisplayReady { display_id, .. } => {
                         s.push_log(LogLevel::Detail, format!("Display :{}", display_id));
                         resource_changed = Some("intendant://logs");
                     }
@@ -2326,10 +2429,7 @@ pub fn spawn_event_listener(
                     } => {
                         s.push_log(
                             LogLevel::Detail,
-                            format!(
-                                "Display :{} resized to {}x{}",
-                                display_id, width, height
-                            ),
+                            format!("Display :{} resized to {}x{}", display_id, width, height),
                         );
                         resource_changed = Some("intendant://logs");
                     }
@@ -2358,11 +2458,17 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::UserDisplayGranted { display_id } => {
-                        s.push_log(LogLevel::Warn, format!("User display access granted (display_id: {})", display_id));
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("User display access granted (display_id: {})", display_id),
+                        );
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::UserDisplayRevoked { display_id, ref note } => {
+                    AppEvent::UserDisplayRevoked {
+                        display_id,
+                        ref note,
+                    } => {
                         let msg = format!(
                             "User display access revoked (display_id: {}){}",
                             display_id,
@@ -2386,10 +2492,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::AutoApproved { ref preview } => {
-                        s.push_log(
-                            LogLevel::Detail,
-                            format!("auto-approved: {}", preview),
-                        );
+                        s.push_log(LogLevel::Detail, format!("auto-approved: {}", preview));
                         resource_changed = Some("intendant://logs");
                     }
 
@@ -2400,10 +2503,7 @@ pub fn spawn_event_listener(
                         } else {
                             s.set_phase(Phase::RunningAgent);
                         }
-                        s.push_log(
-                            LogLevel::Info,
-                            format!("Approval {} (turn {})", action, id),
-                        );
+                        s.push_log(LogLevel::Info, format!("Approval {} (turn {})", action, id));
                         resource_changed = Some(RESOURCE_APPROVAL_URI);
                     }
 
@@ -2442,7 +2542,10 @@ pub fn spawn_event_listener(
                         }
                     }
                     AppEvent::PresenceLog { message, level, .. } => {
-                        s.push_log(level.unwrap_or(LogLevel::Info), format!("[presence] {}", message));
+                        s.push_log(
+                            level.unwrap_or(LogLevel::Info),
+                            format!("[presence] {}", message),
+                        );
                     }
                     AppEvent::PresenceReady => {
                         if !matches!(s.phase, Phase::WaitingApproval) {
@@ -2450,13 +2553,22 @@ pub fn spawn_event_listener(
                         }
                     }
                     AppEvent::PresenceConnected { .. } => {
-                        s.push_log(LogLevel::Detail, "Browser presence connected — server presence paused".to_string());
+                        s.push_log(
+                            LogLevel::Detail,
+                            "Browser presence connected — server presence paused".to_string(),
+                        );
                     }
                     AppEvent::PresenceDisconnected => {
-                        s.push_log(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string());
+                        s.push_log(
+                            LogLevel::Detail,
+                            "Browser presence disconnected — server presence resumed".to_string(),
+                        );
                     }
                     AppEvent::VoiceLog { ref text, seq, .. } => {
-                        s.push_log(LogLevel::Detail, format!("[presence voice #{}] {}", seq, text));
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!("[presence voice #{}] {}", seq, text),
+                        );
                     }
                     AppEvent::PresenceCheckpointReceived { .. } => {
                         // Detail-level, no user-visible log
@@ -2471,41 +2583,106 @@ pub fn spawn_event_listener(
                         // Broadcast-only — handled by outbound event converter.
                     }
                     AppEvent::RecordingStarted { ref stream_name } => {
-                        s.push_log(LogLevel::Detail, format!("Recording started: {}", stream_name));
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!("Recording started: {}", stream_name),
+                        );
                     }
                     AppEvent::RecordingStopped { ref stream_name } => {
-                        s.push_log(LogLevel::Detail, format!("Recording stopped: {}", stream_name));
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!("Recording stopped: {}", stream_name),
+                        );
                     }
-                    AppEvent::RecordingError { ref stream_name, ref message } => {
-                        s.push_log(LogLevel::Warn, format!("Recording error ({}): {}", stream_name, message));
+                    AppEvent::RecordingError {
+                        ref stream_name,
+                        ref message,
+                    } => {
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("Recording error ({}): {}", stream_name, message),
+                        );
                     }
                     AppEvent::RecordingDeleted { ref stream_name } => {
-                        s.push_log(LogLevel::Info, format!("Recording deleted: {}", stream_name));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Recording deleted: {}", stream_name),
+                        );
                     }
-                    AppEvent::SessionStarted { ref session_id, ref task } => {
-                        s.push_log(LogLevel::Info, format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(no task)")));
+                    AppEvent::SessionStarted {
+                        ref session_id,
+                        ref task,
+                    } => {
+                        s.push_log(
+                            LogLevel::Info,
+                            format!(
+                                "Session started: {} — {}",
+                                session_id,
+                                task.as_deref().unwrap_or("(no task)")
+                            ),
+                        );
                     }
-                    AppEvent::SessionAttached { ref session_id, ref source } => {
-                        s.push_log(LogLevel::Info, format!("Session attached: {} ({})", session_id, source));
+                    AppEvent::SessionAttached {
+                        ref session_id,
+                        ref source,
+                    } => {
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Session attached: {} ({})", session_id, source),
+                        );
                     }
-                    AppEvent::SessionEnded { ref session_id, ref reason } => {
-                        s.push_log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
+                    AppEvent::SessionEnded {
+                        ref session_id,
+                        ref reason,
+                    } => {
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Session ended: {} — {}", session_id, reason),
+                        );
                     }
                     AppEvent::DebugScreenReady { display_id } => {
-                        s.push_log(LogLevel::Info, format!("Debug screen ready on :{}", display_id));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Debug screen ready on :{}", display_id),
+                        );
                     }
                     AppEvent::DebugScreenTornDown { display_id } => {
-                        s.push_log(LogLevel::Info, format!("Debug screen :{} torn down", display_id));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Debug screen :{} torn down", display_id),
+                        );
                     }
                     AppEvent::LiveAudioStarted { id, provider } => {
-                        s.push_log(LogLevel::Info, format!("Live audio '{}' started ({})", id, provider));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Live audio '{}' started ({})", id, provider),
+                        );
                     }
-                    AppEvent::LiveAudioProgress { id, state, elapsed_secs, .. } => {
-                        s.push_log(LogLevel::Detail, format!("Live audio '{}': {} ({:.0}s)", id, state, elapsed_secs));
+                    AppEvent::LiveAudioProgress {
+                        id,
+                        state,
+                        elapsed_secs,
+                        ..
+                    } => {
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!("Live audio '{}': {} ({:.0}s)", id, state, elapsed_secs),
+                        );
                     }
-                    AppEvent::LiveAudioCompleted { id, status, quarantine_count } => {
-                        let q_note = if quarantine_count > 0 { format!(" ({} quarantined)", quarantine_count) } else { String::new() };
-                        s.push_log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
+                    AppEvent::LiveAudioCompleted {
+                        id,
+                        status,
+                        quarantine_count,
+                    } => {
+                        let q_note = if quarantine_count > 0 {
+                            format!(" ({} quarantined)", quarantine_count)
+                        } else {
+                            String::new()
+                        };
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Live audio '{}': {}{}", id, status, q_note),
+                        );
                     }
                     AppEvent::DisplayMetrics { .. }
                     | AppEvent::FileChanged { .. }
@@ -2519,10 +2696,19 @@ pub fn spawn_event_listener(
                     | AppEvent::ConversationRolledBack { .. } => {
                         // Broadcast-only — handled by outbound event converter.
                     }
-                    AppEvent::DisplayCaptureLost { display_id, ref reason } => {
-                        s.push_log(LogLevel::Warn, format!("Display :{} capture lost: {}", display_id, reason));
+                    AppEvent::DisplayCaptureLost {
+                        display_id,
+                        ref reason,
+                    } => {
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("Display :{} capture lost: {}", display_id, reason),
+                        );
                     }
-                    AppEvent::DisplayApprovalPending { display_id, backend } => {
+                    AppEvent::DisplayApprovalPending {
+                        display_id,
+                        backend,
+                    } => {
                         s.push_log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
                     }
                     AppEvent::InterruptRequested { .. } => {
@@ -2535,7 +2721,9 @@ pub fn spawn_event_listener(
                         s.push_log(LogLevel::Info, format!("Interrupted: {}", reason));
                         resource_changed = Some("intendant://status");
                     }
-                    AppEvent::SteerRequested { ref text, ref id, .. } => {
+                    AppEvent::SteerRequested {
+                        ref text, ref id, ..
+                    } => {
                         let preview: String = text.chars().take(80).collect();
                         let suffix = if text.chars().count() > 80 { "..." } else { "" };
                         let id_part = if id.is_empty() {
@@ -2549,7 +2737,9 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
-                    AppEvent::SteerQueued { ref id, ref reason, .. } => {
+                    AppEvent::SteerQueued {
+                        ref id, ref reason, ..
+                    } => {
                         let id_part = if id.is_empty() {
                             String::new()
                         } else {
@@ -2561,7 +2751,9 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
-                    AppEvent::SteerDelivered { ref id, mid_turn, .. } => {
+                    AppEvent::SteerDelivered {
+                        ref id, mid_turn, ..
+                    } => {
                         let id_part = if id.is_empty() {
                             String::new()
                         } else {
@@ -2774,7 +2966,9 @@ pub enum McpArrayElement {
     Boolean,
 }
 
-fn default_timeout() -> u64 { 300 }
+fn default_timeout() -> u64 {
+    300
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeScreenshotParams {
@@ -2931,7 +3125,9 @@ impl IntendantServer {
     /// Schemas are flattened (all `$ref`/`$defs` inlined) for compatibility
     /// with clients that don't resolve JSON Schema references (e.g. Codex).
     pub fn list_tools_json(&self) -> serde_json::Value {
-        let tools: Vec<serde_json::Value> = self.tool_router.list_all()
+        let tools: Vec<serde_json::Value> = self
+            .tool_router
+            .list_all()
             .iter()
             .map(|tool| {
                 let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
@@ -3009,12 +3205,16 @@ impl IntendantServer {
             }
             "controller_turn_complete" => {
                 let params = parse_params::<ControllerTurnCompleteParams>(args)?;
-                Ok(text_tool_result(self.controller_turn_complete(params).await))
+                Ok(text_tool_result(
+                    self.controller_turn_complete(params).await,
+                ))
             }
             "get_restart_status" => Ok(text_tool_result(self.get_restart_status().await)),
             "cancel_controller_restart" => {
                 let params = parse_params::<CancelControllerRestartParams>(args)?;
-                Ok(text_tool_result(self.cancel_controller_restart(params).await))
+                Ok(text_tool_result(
+                    self.cancel_controller_restart(params).await,
+                ))
             }
             "request_controller_loop_halt" => {
                 let params = parse_params::<RequestControllerLoopHaltParams>(args)?;
@@ -3027,7 +3227,9 @@ impl IntendantServer {
             }
             "intervene_controller_loop" => {
                 let params = parse_params::<InterveneControllerLoopParams>(args)?;
-                Ok(text_tool_result(self.intervene_controller_loop(params).await))
+                Ok(text_tool_result(
+                    self.intervene_controller_loop(params).await,
+                ))
             }
             "get_controller_loop_status" => {
                 Ok(text_tool_result(self.get_controller_loop_status().await))
@@ -3044,7 +3246,9 @@ impl IntendantServer {
             }
             "take_screenshot" => {
                 let params = parse_params::<TakeScreenshotParams>(args)?;
-                self.take_screenshot(params).await.map_err(|e| e.to_string())
+                self.take_screenshot(params)
+                    .await
+                    .map_err(|e| e.to_string())
             }
             "execute_cu_actions" => {
                 let params = parse_params::<ExecuteCuActionsParams>(args)?;
@@ -3088,7 +3292,11 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
     match action {
         UserAction::Approve { id: _ } => {
             if let Some(pending) = state.pending_approval.take() {
-                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::Approve);
+                resolve_approval(
+                    &state.approval_registry,
+                    pending.id,
+                    ApprovalResponse::Approve,
+                );
                 state.set_phase(Phase::RunningAgent);
                 state.push_log(LogLevel::Info, "Approved by MCP agent".to_string());
                 ActionOutcome::Ok
@@ -3124,7 +3332,11 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
         }
         UserAction::ApproveAll { id: _ } => {
             if let Some(pending) = state.pending_approval.take() {
-                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::ApproveAll);
+                resolve_approval(
+                    &state.approval_registry,
+                    pending.id,
+                    ApprovalResponse::ApproveAll,
+                );
                 state.set_phase(Phase::RunningAgent);
                 state.push_log(
                     LogLevel::Info,
@@ -3409,15 +3621,16 @@ impl IntendantServer {
         // If reference_frame_ids are present, dispatch as a CU task via ControlMsg
         // so the main loop can route it to the ephemeral CU runner.
         if !params.reference_frame_ids.is_empty() || params.display_target.is_some() {
-            self.bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
-                session_id: None,
-                task: params.task,
-                orchestrate: params.orchestrate,
-                direct: None,
-                reference_frame_ids: params.reference_frame_ids,
-                display_target: params.display_target,
-                attachments: vec![],
-            }));
+            self.bus
+                .send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id: None,
+                    task: params.task,
+                    orchestrate: params.orchestrate,
+                    direct: None,
+                    reference_frame_ids: params.reference_frame_ids,
+                    display_target: params.display_target,
+                    attachments: vec![],
+                }));
             return "ok (CU task dispatched)".to_string();
         }
         match self
@@ -3812,16 +4025,14 @@ impl IntendantServer {
     #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
     async fn list_displays(&self) -> String {
         let session_registry = self.state.read().await.session_registry.clone();
-        let displays =
-            crate::display::enumerate_displays_with_sessions(&session_registry).await;
+        let displays = crate::display::enumerate_displays_with_sessions(&session_registry).await;
         serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string())
     }
 
-    #[tool(description = "Signal that you are using a display. Optional — notifies the dashboard UI but is NOT required before taking screenshots or executing CU actions.")]
-    async fn take_display(
-        &self,
-        Parameters(params): Parameters<TakeDisplayParams>,
-    ) -> String {
+    #[tool(
+        description = "Signal that you are using a display. Optional — notifies the dashboard UI but is NOT required before taking screenshots or executing CU actions."
+    )]
+    async fn take_display(&self, Parameters(params): Parameters<TakeDisplayParams>) -> String {
         self.bus.send(AppEvent::DisplayTaken {
             display_id: params.display_id,
         });
@@ -3845,7 +4056,7 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<TakeScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
-        use crate::computer_use::{CuAction, DisplayBackend, execute_actions};
+        use crate::computer_use::{execute_actions, CuAction, DisplayBackend};
 
         let target = resolve_display_target(params.display_target.as_deref());
         let backend = DisplayBackend::detect();
@@ -3891,12 +4102,14 @@ impl IntendantServer {
         Ok(text_tool_error("No screenshot result"))
     }
 
-    #[tool(description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid.")]
+    #[tool(
+        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
+    )]
     async fn execute_cu_actions(
         &self,
         Parameters(params): Parameters<ExecuteCuActionsParams>,
     ) -> Result<CallToolResult, McpError> {
-        use crate::computer_use::{DisplayBackend, execute_actions};
+        use crate::computer_use::{execute_actions, DisplayBackend};
 
         let mut actions = params.actions;
 
@@ -3955,13 +4168,20 @@ impl IntendantServer {
         // Format results with action details (type, coordinates) for debugging.
         let mut summaries = Vec::new();
         for (i, (action, result)) in actions.iter().zip(results.iter()).enumerate() {
-            let status = if result.error.is_some() { "failed" } else { "ok" };
+            let status = if result.error.is_some() {
+                "failed"
+            } else {
+                "ok"
+            };
             let action_desc = format_cu_action_brief(action);
             let detail = result.error.as_deref().unwrap_or("");
             if detail.is_empty() {
                 summaries.push(format!("action[{}] {}: {}", i, action_desc, status));
             } else {
-                summaries.push(format!("action[{}] {}: {}: {}", i, action_desc, status, detail));
+                summaries.push(format!(
+                    "action[{}] {}: {}: {}",
+                    i, action_desc, status, detail
+                ));
             }
         }
 
@@ -3972,10 +4192,9 @@ impl IntendantServer {
         if let Some(ss) = last_screenshot {
             let annotated = annotate_screenshot_with_clicks(&ss.base64_png, &actions);
             // Save annotated screenshot to disk (overwrite the raw one)
-            if let Ok(bytes) = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &annotated,
-            ) {
+            if let Ok(bytes) =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &annotated)
+            {
                 let _ = std::fs::write(&ss.path, &bytes);
             }
             summaries.push("post-action screenshot captured".to_string());
@@ -3985,11 +4204,10 @@ impl IntendantServer {
         Ok(text_tool_result(summaries.join("\n")))
     }
 
-    #[tool(description = "List available display frames with metadata. Frames are captured from display streams.")]
-    async fn list_frames(
-        &self,
-        Parameters(params): Parameters<ListFramesParams>,
-    ) -> String {
+    #[tool(
+        description = "List available display frames with metadata. Frames are captured from display streams."
+    )]
+    async fn list_frames(&self, Parameters(params): Parameters<ListFramesParams>) -> String {
         let state = self.state.read().await;
         let registry = match &state.frame_registry {
             Some(r) => r.clone(),
@@ -4006,17 +4224,19 @@ impl IntendantServer {
             if streams.is_empty() {
                 return "No frames available. No active display streams.".to_string();
             }
-            return format!("No frames matching filter. Active streams: {}", streams.join(", "));
+            return format!(
+                "No frames matching filter. Active streams: {}",
+                streams.join(", ")
+            );
         }
 
         crate::frames::FrameRegistry::format_frame_list(&frames)
     }
 
-    #[tool(description = "Read a specific frame's image data as base64-encoded JPEG. Use frame_id='latest' for the most recent.")]
-    async fn read_frame(
-        &self,
-        Parameters(params): Parameters<ReadFrameParams>,
-    ) -> String {
+    #[tool(
+        description = "Read a specific frame's image data as base64-encoded JPEG. Use frame_id='latest' for the most recent."
+    )]
+    async fn read_frame(&self, Parameters(params): Parameters<ReadFrameParams>) -> String {
         use base64::Engine;
 
         let state = self.state.read().await;
@@ -4046,12 +4266,14 @@ impl IntendantServer {
         }
     }
 
-    #[tool(description = "Spawn a live audio voice conversation. Connects to OpenAI Realtime or Gemini Live via WebSocket and routes audio through the virtual audio bridge (Vortex/PulseAudio). The voice model follows a playbook and returns structured data matching the response_schema. Blocks until the conversation completes or times out. The voice model has two functions: submit_response (with schema fields) and end_call.")]
+    #[tool(
+        description = "Spawn a live audio voice conversation. Connects to OpenAI Realtime or Gemini Live via WebSocket and routes audio through the virtual audio bridge (Vortex/PulseAudio). The voice model follows a playbook and returns structured data matching the response_schema. Blocks until the conversation completes or times out. The voice model has two functions: submit_response (with schema fields) and end_call."
+    )]
     async fn spawn_live_audio(
         &self,
         Parameters(params): Parameters<SpawnLiveAudioParams>,
     ) -> String {
-        use crate::{live_audio, live_audio_types, audio_routing, prompts};
+        use crate::{audio_routing, live_audio, live_audio_types, prompts};
 
         let spec_json = serde_json::to_value(&params).unwrap_or_default();
         let spec_result = serde_json::from_value::<live_audio_types::LiveAudioSpec>(spec_json);
@@ -4088,7 +4310,12 @@ impl IntendantServer {
                 libc::O_RDONLY,
                 0,
             );
-            if fd >= 0 { libc::close(fd); true } else { false }
+            if fd >= 0 {
+                libc::close(fd);
+                true
+            } else {
+                false
+            }
         };
         let mut bridge = if vortex_shm_available {
             audio_routing::create_vortex_bridge("shm")
@@ -4108,13 +4335,16 @@ impl IntendantServer {
         };
 
         self.bus.send(crate::event::AppEvent::PresenceLog {
-            message: format!("Live audio session '{}' starting ({:?})", spec.id, spec.provider),
-            level: None, turn: None,
+            message: format!(
+                "Live audio session '{}' starting ({:?})",
+                spec.id, spec.provider
+            ),
+            level: None,
+            turn: None,
         });
 
-        let result = live_audio::run_session(
-            &spec, &api_key, &bridge, &log_dir, Some(&self.bus),
-        ).await;
+        let result =
+            live_audio::run_session(&spec, &api_key, &bridge, &log_dir, Some(&self.bus)).await;
 
         drop(bridge);
 
@@ -4129,9 +4359,7 @@ impl IntendantServer {
 fn resolve_display_target(target: Option<&str>) -> crate::computer_use::DisplayTarget {
     use crate::computer_use::DisplayTarget;
     match target {
-        Some("user_session") | Some("user") | Some(":0") | Some("0") => {
-            DisplayTarget::UserSession
-        }
+        Some("user_session") | Some("user") | Some(":0") | Some("0") => DisplayTarget::UserSession,
         Some(s) if s.starts_with(':') => {
             let id: u32 = s[1..].parse().unwrap_or(99);
             DisplayTarget::Virtual { id }
@@ -4578,17 +4806,27 @@ fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32,
     let dn_y = |y: &mut i32| *y = (*y as f64 * screen_h as f64 / 1000.0) as i32;
     match action {
         CuAction::Click { x, y, .. } | CuAction::DoubleClick { x, y, .. } => {
-            dn_x(x); dn_y(y);
+            dn_x(x);
+            dn_y(y);
         }
         CuAction::Scroll { x, y, .. } => {
-            dn_x(x); dn_y(y);
+            dn_x(x);
+            dn_y(y);
         }
         CuAction::MoveMouse { x, y } => {
-            dn_x(x); dn_y(y);
+            dn_x(x);
+            dn_y(y);
         }
-        CuAction::Drag { start_x, start_y, end_x, end_y } => {
-            dn_x(start_x); dn_y(start_y);
-            dn_x(end_x); dn_y(end_y);
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => {
+            dn_x(start_x);
+            dn_y(start_y);
+            dn_x(end_x);
+            dn_y(end_y);
         }
         _ => {} // Type, Key, Screenshot, Wait — no coordinates
     }
@@ -4605,11 +4843,21 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
             format!("(type \"{}\")", preview)
         }
         CuAction::Key { key } => format!("(key {})", key),
-        CuAction::Scroll { x, y, direction, amount } => {
+        CuAction::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+        } => {
             format!("(scroll {},{} {:?} {})", x, y, direction, amount)
         }
         CuAction::MoveMouse { x, y } => format!("(move {},{})", x, y),
-        CuAction::Drag { start_x, start_y, end_x, end_y } => {
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => {
             format!("(drag {},{}->{},{})", start_x, start_y, end_x, end_y)
         }
         CuAction::Screenshot => "(screenshot)".to_string(),
@@ -4639,13 +4887,11 @@ fn annotate_screenshot_with_clicks(
     }
 
     // Decode PNG
-    let png_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        base64_png,
-    ) {
-        Ok(b) => b,
-        Err(_) => return base64_png.to_string(),
-    };
+    let png_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_png) {
+            Ok(b) => b,
+            Err(_) => return base64_png.to_string(),
+        };
 
     let mut img = match image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png) {
         Ok(i) => i.to_rgba8(),
@@ -4733,10 +4979,7 @@ fn inline_schema_refs(schema: &mut serde_json::Value) {
     // Extract $defs / definitions from the top level
     let defs = schema
         .as_object_mut()
-        .and_then(|obj| {
-            obj.remove("$defs")
-                .or_else(|| obj.remove("definitions"))
-        })
+        .and_then(|obj| obj.remove("$defs").or_else(|| obj.remove("definitions")))
         .and_then(|v| match v {
             serde_json::Value::Object(map) => Some(map),
             _ => None,

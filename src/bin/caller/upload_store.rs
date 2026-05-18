@@ -124,11 +124,7 @@ fn workspace_uploads_dir(project_root: &Path) -> PathBuf {
 }
 
 /// Pick the target directory for a given destination.
-fn target_dir(
-    destination: UploadDestination,
-    session_dir: &Path,
-    project_root: &Path,
-) -> PathBuf {
+fn target_dir(destination: UploadDestination, session_dir: &Path, project_root: &Path) -> PathBuf {
     match destination {
         UploadDestination::Task => task_uploads_dir(session_dir),
         UploadDestination::Workspace => workspace_uploads_dir(project_root),
@@ -190,7 +186,9 @@ pub fn commit_upload(
 
     // Write a sidecar .json next to each upload so we can rehydrate
     // descriptors after daemon restart without a central index.
-    let sidecar = descriptor.path.with_extension(descriptor_extension(&descriptor.path));
+    let sidecar = descriptor
+        .path
+        .with_extension(descriptor_extension(&descriptor.path));
     if let Ok(json) = serde_json::to_string_pretty(&descriptor) {
         let _ = fs::write(&sidecar, json);
     }
@@ -210,10 +208,7 @@ fn descriptor_extension(path: &Path) -> String {
 
 /// Read all descriptors currently stored for a session, across both Task
 /// and Workspace destinations. Order: newest first (by `created_at`).
-pub fn list_uploads(
-    session_dir: &Path,
-    project_root: &Path,
-) -> Vec<UploadDescriptor> {
+pub fn list_uploads(session_dir: &Path, project_root: &Path) -> Vec<UploadDescriptor> {
     let mut out: Vec<UploadDescriptor> = Vec::new();
     for dir in [
         task_uploads_dir(session_dir),
@@ -242,21 +237,14 @@ pub fn list_uploads(
 }
 
 /// Look up a single upload by id. `None` if no descriptor matches.
-pub fn find_upload(
-    id: &str,
-    session_dir: &Path,
-    project_root: &Path,
-) -> Option<UploadDescriptor> {
+pub fn find_upload(id: &str, session_dir: &Path, project_root: &Path) -> Option<UploadDescriptor> {
     list_uploads(session_dir, project_root)
         .into_iter()
         .find(|u| u.id == id)
         .or_else(|| find_task_upload_in_sibling_sessions(id, session_dir))
 }
 
-fn find_task_upload_in_sibling_sessions(
-    id: &str,
-    session_dir: &Path,
-) -> Option<UploadDescriptor> {
+fn find_task_upload_in_sibling_sessions(id: &str, session_dir: &Path) -> Option<UploadDescriptor> {
     let sessions_root = session_dir.parent()?;
     let entries = fs::read_dir(sessions_root).ok()?;
     for entry in entries.flatten() {
@@ -291,15 +279,13 @@ fn find_task_upload_in_sibling_sessions(
 /// Remove an upload and its sidecar. Returns `Ok(false)` if no descriptor
 /// matched (idempotent — the caller can treat "already gone" the same as
 /// "just deleted").
-pub fn delete_upload(
-    id: &str,
-    session_dir: &Path,
-    project_root: &Path,
-) -> io::Result<bool> {
+pub fn delete_upload(id: &str, session_dir: &Path, project_root: &Path) -> io::Result<bool> {
     let Some(descriptor) = find_upload(id, session_dir, project_root) else {
         return Ok(false);
     };
-    let sidecar = descriptor.path.with_extension(descriptor_extension(&descriptor.path));
+    let sidecar = descriptor
+        .path
+        .with_extension(descriptor_extension(&descriptor.path));
     let _ = fs::remove_file(&sidecar);
     match fs::remove_file(&descriptor.path) {
         Ok(()) => Ok(true),
@@ -416,7 +402,9 @@ mod tests {
         .unwrap();
 
         assert!(
-            descriptor.path.starts_with(project_root.join("workspace_files")),
+            descriptor
+                .path
+                .starts_with(project_root.join("workspace_files")),
             "workspace upload must land under workspace_files/, got {}",
             descriptor.path.display()
         );

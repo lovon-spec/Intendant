@@ -33,12 +33,19 @@ const CHUNK_SIZE: usize = 4800; // 100ms at 24kHz mono PCM16
 fn spawn_capture(rate: u32) -> std::io::Result<Child> {
     Command::new("sox")
         .args([
-            "-t", "coreaudio", CAPTURE_DEVICE,
-            "-t", "raw",
-            "-r", &rate.to_string(),
-            "-e", "signed-integer",
-            "-b", "16",
-            "-c", "1",
+            "-t",
+            "coreaudio",
+            CAPTURE_DEVICE,
+            "-t",
+            "raw",
+            "-r",
+            &rate.to_string(),
+            "-e",
+            "signed-integer",
+            "-b",
+            "16",
+            "-c",
+            "1",
             "-",
         ])
         .stdout(Stdio::piped())
@@ -49,13 +56,20 @@ fn spawn_capture(rate: u32) -> std::io::Result<Child> {
 fn spawn_playback(rate: u32) -> std::io::Result<Child> {
     Command::new("sox")
         .args([
-            "-t", "raw",
-            "-r", &rate.to_string(),
-            "-e", "signed-integer",
-            "-b", "16",
-            "-c", "1",
+            "-t",
+            "raw",
+            "-r",
+            &rate.to_string(),
+            "-e",
+            "signed-integer",
+            "-b",
+            "16",
+            "-c",
+            "1",
             "-",
-            "-t", "coreaudio", PLAYBACK_DEVICE,
+            "-t",
+            "coreaudio",
+            PLAYBACK_DEVICE,
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -93,7 +107,10 @@ fn handle_client(stream: TcpStream, rate: u32) {
     // audio routes through BlackHole on the host.
     let prev_output = get_default("output");
     let prev_input = get_default("input");
-    eprintln!("[*] Switching host audio: output -> {}, input -> {}", CAPTURE_DEVICE, PLAYBACK_DEVICE);
+    eprintln!(
+        "[*] Switching host audio: output -> {}, input -> {}",
+        CAPTURE_DEVICE, PLAYBACK_DEVICE
+    );
     set_default(CAPTURE_DEVICE, "output");
     set_default(PLAYBACK_DEVICE, "input");
 
@@ -206,14 +223,20 @@ fn main() {
             }
             "--help" | "-h" => {
                 eprintln!("Usage: bh-bridge [--port PORT] [--rate SAMPLE_RATE]");
-                eprintln!("  --port  TCP port to listen on (default: {})", DEFAULT_PORT);
+                eprintln!(
+                    "  --port  TCP port to listen on (default: {})",
+                    DEFAULT_PORT
+                );
                 eprintln!("  --rate  Sample rate in Hz (default: {})", DEFAULT_RATE);
                 eprintln!();
                 eprintln!("Listens on 127.0.0.1 only. To reach from a VM, use a reverse");
                 eprintln!("SSH tunnel from the host:");
                 eprintln!("  ssh -R 9900:127.0.0.1:9900 guest");
                 eprintln!();
-                eprintln!("Captures from '{}' and plays to '{}'.", CAPTURE_DEVICE, PLAYBACK_DEVICE);
+                eprintln!(
+                    "Captures from '{}' and plays to '{}'.",
+                    CAPTURE_DEVICE, PLAYBACK_DEVICE
+                );
                 eprintln!("Protocol: raw bidirectional PCM16 mono over TCP.");
                 std::process::exit(0);
             }
@@ -226,7 +249,12 @@ fn main() {
     }
 
     // Verify sox is available
-    match Command::new("sox").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status() {
+    match Command::new("sox")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("[!] sox not found. Install with: brew install sox");

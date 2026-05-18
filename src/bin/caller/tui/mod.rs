@@ -6,12 +6,12 @@ pub mod theme;
 pub mod web;
 pub mod widgets;
 
+use crate::event::AppEvent;
 use app::App;
 use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use crate::event::AppEvent;
 use ratatui::prelude::*;
 use std::io;
 /// Manages the terminal state and rendering.

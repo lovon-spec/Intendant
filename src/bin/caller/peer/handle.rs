@@ -166,10 +166,7 @@ impl PeerHandle {
     }
 
     pub fn is_connected(&self) -> bool {
-        matches!(
-            *self.inner.connection.borrow(),
-            ConnectionState::Connected
-        )
+        matches!(*self.inner.connection.borrow(), ConnectionState::Connected)
     }
 
     pub fn features(&self) -> TransportFeatures {
@@ -258,10 +255,7 @@ impl PeerHandle {
         if !self.features().task_cancel {
             return Err(PeerError::UnsupportedCapability("task_cancel".into()));
         }
-        match self
-            .exec(PeerOp::CancelTask { task: task.clone() })
-            .await?
-        {
+        match self.exec(PeerOp::CancelTask { task: task.clone() }).await? {
             PeerOpAck::Ok => Ok(()),
             other => Err(PeerError::Transport(format!(
                 "expected Ok ack, got {}",
@@ -343,9 +337,7 @@ impl PeerHandle {
         signal: WebRtcSignal,
     ) -> Result<(), PeerError> {
         if !self.features().webrtc_signal {
-            return Err(PeerError::UnsupportedCapability(
-                "webrtc_signal".into(),
-            ));
+            return Err(PeerError::UnsupportedCapability("webrtc_signal".into()));
         }
         match self
             .exec(PeerOp::WebRtcSignal {
@@ -559,10 +551,7 @@ mod tests {
         let a = ConnectionState::Reconnecting { attempt: 3 };
         let b = a; // Copy
         assert_eq!(a, b);
-        assert_ne!(
-            ConnectionState::Connecting,
-            ConnectionState::Connected
-        );
+        assert_ne!(ConnectionState::Connecting, ConnectionState::Connected);
     }
 
     #[test]
@@ -623,9 +612,7 @@ mod tests {
             Vec::new(),
             None,
             log_tx,
-            move |events_tx| {
-                Box::new(IntendantWsTransport::new(url_for_closure, events_tx))
-            },
+            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );
 
         // Wait until the actor fails the first connect and enters
@@ -655,11 +642,7 @@ mod tests {
         // attempts) or forever if the remote stayed down. With the
         // fix, it should return within the 2-second timeout.
         let start = Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            handle.disconnect(),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), handle.disconnect()).await;
         assert!(
             result.is_ok(),
             "disconnect timed out during reconnect backoff"
@@ -710,7 +693,9 @@ mod tests {
             label: "bp-test".into(),
             version: "0.0.0".into(),
             git_sha: None,
-            transports: vec![TransportSpec::IntendantWs { url: ws_url.clone() }],
+            transports: vec![TransportSpec::IntendantWs {
+                url: ws_url.clone(),
+            }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
         };
@@ -722,9 +707,7 @@ mod tests {
             Vec::new(),
             Some(browser_url.clone()),
             log_tx,
-            move |events_tx| {
-                Box::new(IntendantWsTransport::new(url_for_closure, events_tx))
-            },
+            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );
 
         let snap = handle.snapshot();
@@ -768,7 +751,9 @@ mod tests {
             label: "bp-none".into(),
             version: "0.0.0".into(),
             git_sha: None,
-            transports: vec![TransportSpec::IntendantWs { url: ws_url.clone() }],
+            transports: vec![TransportSpec::IntendantWs {
+                url: ws_url.clone(),
+            }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
         };
@@ -779,9 +764,7 @@ mod tests {
             Vec::new(),
             None,
             log_tx,
-            move |events_tx| {
-                Box::new(IntendantWsTransport::new(url_for_closure, events_tx))
-            },
+            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );
         assert!(handle.snapshot().browser_tcp_via_url.is_none());
         assert!(handle.browser_tcp_via_url().is_none());

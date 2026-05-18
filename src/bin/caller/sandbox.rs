@@ -44,16 +44,10 @@ impl SandboxConfig {
     /// Note: currently for documentation/future use. In-process live audio
     /// tasks use code-level isolation (zero tools, restricted write paths)
     /// rather than process-level Landlock.
-    pub fn untrusted_live_audio(
-        session_log_dir: &Path,
-        quarantine_dir: &Path,
-    ) -> Self {
+    pub fn untrusted_live_audio(session_log_dir: &Path, quarantine_dir: &Path) -> Self {
         Self {
             read_paths: vec![PathBuf::from("/")],
-            write_paths: vec![
-                session_log_dir.to_path_buf(),
-                quarantine_dir.to_path_buf(),
-            ],
+            write_paths: vec![session_log_dir.to_path_buf(), quarantine_dir.to_path_buf()],
             enabled: true,
         }
     }

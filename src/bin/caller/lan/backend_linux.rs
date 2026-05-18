@@ -134,7 +134,9 @@ impl LanBackend for LinuxBackend {
             .map(|s| s.success())
             .unwrap_or(false)
         {
-            let _ = Command::new("systemctl").args(["restart", "nginx"]).status();
+            let _ = Command::new("systemctl")
+                .args(["restart", "nginx"])
+                .status();
         }
         Ok(())
     }

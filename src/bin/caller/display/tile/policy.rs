@@ -95,14 +95,10 @@ impl TilePolicy {
         let dwell_ok = now.saturating_duration_since(self.last_transition) >= self.config.min_dwell;
 
         let next = match self.state {
-            TileMode::Tiles
-                if dwell_ok && avg >= self.config.enter_video_threshold =>
-            {
+            TileMode::Tiles if dwell_ok && avg >= self.config.enter_video_threshold => {
                 TileMode::Video
             }
-            TileMode::Video
-                if dwell_ok && avg <= self.config.exit_video_threshold =>
-            {
+            TileMode::Video if dwell_ok && avg <= self.config.exit_video_threshold => {
                 TileMode::Tiles
             }
             current => current,
@@ -190,7 +186,10 @@ mod tests {
     fn video_mode_hysteresis_holds_through_gray_band() {
         let now = t0();
         let mut policy = TilePolicy::with_config(now, cfg());
-        assert_eq!(policy.evaluate(1.0, now + Duration::from_secs(1)), TileMode::Video);
+        assert_eq!(
+            policy.evaluate(1.0, now + Duration::from_secs(1)),
+            TileMode::Video
+        );
         let later = now + Duration::from_secs(2);
         for _ in 0..4 {
             assert_eq!(policy.evaluate(0.18, later), TileMode::Video);
@@ -203,7 +202,10 @@ mod tests {
     fn exits_video_after_low_average_and_dwell() {
         let now = t0();
         let mut policy = TilePolicy::with_config(now, cfg());
-        assert_eq!(policy.evaluate(1.0, now + Duration::from_secs(1)), TileMode::Video);
+        assert_eq!(
+            policy.evaluate(1.0, now + Duration::from_secs(1)),
+            TileMode::Video
+        );
         for _ in 0..4 {
             policy.evaluate(0.0, now + Duration::from_millis(1200));
         }
@@ -217,7 +219,10 @@ mod tests {
     fn waits_for_min_dwell_before_exiting_video() {
         let now = t0();
         let mut policy = TilePolicy::with_config(now, cfg());
-        assert_eq!(policy.evaluate(1.0, now + Duration::from_secs(1)), TileMode::Video);
+        assert_eq!(
+            policy.evaluate(1.0, now + Duration::from_secs(1)),
+            TileMode::Video
+        );
         for _ in 0..4 {
             assert_eq!(
                 policy.evaluate(0.0, now + Duration::from_millis(1100)),

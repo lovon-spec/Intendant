@@ -76,8 +76,7 @@ impl DisplayTarget {
                     // On Linux, try to find the login session's DISPLAY.
                     // The caller may have overridden DISPLAY for Xvfb, so we
                     // check INTENDANT_USER_DISPLAY first, then fall back to :0.
-                    std::env::var("INTENDANT_USER_DISPLAY")
-                        .unwrap_or_else(|_| ":0".to_string())
+                    std::env::var("INTENDANT_USER_DISPLAY").unwrap_or_else(|_| ":0".to_string())
                 }
             }
         }
@@ -174,7 +173,9 @@ pub enum CuAction {
     },
 }
 
-fn default_scroll_amount() -> i32 { 3 }
+fn default_scroll_amount() -> i32 {
+    3
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -307,7 +308,14 @@ pub async fn execute_actions(
     match effective_backend {
         DisplayBackend::Wayland => {
             if let Some(session) = lookup_display_session(session_registry, &target).await {
-                return execute_via_session(&session, actions, screenshot_dir, action_counter, denorm_ref).await;
+                return execute_via_session(
+                    &session,
+                    actions,
+                    screenshot_dir,
+                    action_counter,
+                    denorm_ref,
+                )
+                .await;
             }
             return vec![CuActionResult {
                 success: false,
@@ -322,8 +330,14 @@ pub async fn execute_actions(
     let mut last_screenshot: Option<ScreenshotData> = None;
 
     for action in actions {
-        let result =
-            execute_single(action, &display, effective_backend, screenshot_dir, action_counter).await;
+        let result = execute_single(
+            action,
+            &display,
+            effective_backend,
+            screenshot_dir,
+            action_counter,
+        )
+        .await;
         if let Some(ref s) = result.screenshot {
             last_screenshot = Some(s.clone());
         }
@@ -335,7 +349,8 @@ pub async fn execute_actions(
         .last()
         .is_some_and(|a| !matches!(a, CuAction::Screenshot));
     if needs_auto_screenshot {
-        let auto = take_screenshot(&display, effective_backend, screenshot_dir, action_counter).await;
+        let auto =
+            take_screenshot(&display, effective_backend, screenshot_dir, action_counter).await;
         match auto {
             Ok(s) => {
                 last_screenshot = Some(s.clone());
@@ -391,7 +406,9 @@ pub fn logical_display_size() -> (u32, u32) {
                 let d = CGMainDisplayID();
                 (CGDisplayPixelsWide(d) as u32, CGDisplayPixelsHigh(d) as u32)
             };
-            if w > 0 && h > 0 { return (w, h); }
+            if w > 0 && h > 0 {
+                return (w, h);
+            }
         }
         // Fallback: assume 1:1 mapping
         (1024, 768)
@@ -467,13 +484,22 @@ async fn execute_single(
                     &format!("m:{},{}", sx, sy),
                     "w:50",
                     &format!("{}:{},{}", button.cliclick_prefix(), sx, sy),
-                ]).await
+                ])
+                .await
             }
             _ => {
-                run_xdotool(display, &[
-                    "mousemove", "--sync", &x.to_string(), &y.to_string(),
-                    "click", button.xdotool_button(),
-                ]).await
+                run_xdotool(
+                    display,
+                    &[
+                        "mousemove",
+                        "--sync",
+                        &x.to_string(),
+                        &y.to_string(),
+                        "click",
+                        button.xdotool_button(),
+                    ],
+                )
+                .await
             }
         },
         CuAction::DoubleClick { x, y, .. } => match backend {
@@ -482,11 +508,22 @@ async fn execute_single(
                 run_cliclick(&[&format!("dc:{},{}", sx, sy)]).await
             }
             _ => {
-                run_xdotool(display, &[
-                    "mousemove", "--sync", &x.to_string(), &y.to_string(),
-                    "click", "--repeat", "2", "--delay", "50",
-                    MouseButton::Left.xdotool_button(),
-                ]).await
+                run_xdotool(
+                    display,
+                    &[
+                        "mousemove",
+                        "--sync",
+                        &x.to_string(),
+                        &y.to_string(),
+                        "click",
+                        "--repeat",
+                        "2",
+                        "--delay",
+                        "50",
+                        MouseButton::Left.xdotool_button(),
+                    ],
+                )
+                .await
             }
         },
         CuAction::Type { text } => match backend {
@@ -503,33 +540,36 @@ async fn execute_single(
                 let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                 run_cliclick(&refs).await
             }
-            _ => {
-                run_xdotool(display, &["type", "--clearmodifiers", text]).await
-            }
+            _ => run_xdotool(display, &["type", "--clearmodifiers", text]).await,
         },
         CuAction::Key { key } => match backend {
-            DisplayBackend::MacOS => {
-                execute_macos_key(key).await
-            }
-            _ => {
-                run_xdotool(display, &["key", "--clearmodifiers", key]).await
-            }
+            DisplayBackend::MacOS => execute_macos_key(key).await,
+            _ => run_xdotool(display, &["key", "--clearmodifiers", key]).await,
         },
-        CuAction::Scroll { x, y, direction, amount } => match backend {
+        CuAction::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+        } => match backend {
             DisplayBackend::MacOS => {
                 let (sx, sy) = scale_coords(*x, *y);
                 execute_macos_scroll(sx, sy, *direction, *amount).await
             }
             _ => {
-                let mut result = run_xdotool(display, &[
-                    "mousemove", "--sync", &x.to_string(), &y.to_string(),
-                ]).await;
+                let mut result = run_xdotool(
+                    display,
+                    &["mousemove", "--sync", &x.to_string(), &y.to_string()],
+                )
+                .await;
                 if result.success {
                     let btn = direction.xdotool_button();
                     let amt = (*amount).max(1);
-                    result = run_xdotool(display, &[
-                        "click", "--repeat", &amt.to_string(), "--delay", "20", btn,
-                    ]).await;
+                    result = run_xdotool(
+                        display,
+                        &["click", "--repeat", &amt.to_string(), "--delay", "20", btn],
+                    )
+                    .await;
                 }
                 result
             }
@@ -540,27 +580,47 @@ async fn execute_single(
                 run_cliclick(&[&format!("m:{},{}", sx, sy)]).await
             }
             _ => {
-                run_xdotool(display, &[
-                    "mousemove", "--sync", &x.to_string(), &y.to_string(),
-                ]).await
+                run_xdotool(
+                    display,
+                    &["mousemove", "--sync", &x.to_string(), &y.to_string()],
+                )
+                .await
             }
         },
-        CuAction::Drag { start_x, start_y, end_x, end_y } => match backend {
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => match backend {
             DisplayBackend::MacOS => {
                 let (sx1, sy1) = scale_coords(*start_x, *start_y);
                 let (sx2, sy2) = scale_coords(*end_x, *end_y);
                 run_cliclick(&[
                     &format!("dd:{},{}", sx1, sy1),
                     &format!("du:{},{}", sx2, sy2),
-                ]).await
+                ])
+                .await
             }
             _ => {
-                run_xdotool(display, &[
-                    "mousemove", "--sync", &start_x.to_string(), &start_y.to_string(),
-                    "mousedown", "1",
-                    "mousemove", "--sync", &end_x.to_string(), &end_y.to_string(),
-                    "mouseup", "1",
-                ]).await
+                run_xdotool(
+                    display,
+                    &[
+                        "mousemove",
+                        "--sync",
+                        &start_x.to_string(),
+                        &start_y.to_string(),
+                        "mousedown",
+                        "1",
+                        "mousemove",
+                        "--sync",
+                        &end_x.to_string(),
+                        &end_y.to_string(),
+                        "mouseup",
+                        "1",
+                    ],
+                )
+                .await
             }
         },
         CuAction::Screenshot => {
@@ -621,10 +681,7 @@ async fn run_xdotool(display: &str, args: &[&str]) -> CuActionResult {
 
 /// Run a cliclick command with the given action arguments.
 async fn run_cliclick(args: &[&str]) -> CuActionResult {
-    let output = Command::new("cliclick")
-        .args(args)
-        .output()
-        .await;
+    let output = Command::new("cliclick").args(args).output().await;
 
     match output {
         Ok(o) if o.status.success() => CuActionResult {
@@ -640,7 +697,10 @@ async fn run_cliclick(args: &[&str]) -> CuActionResult {
         Err(e) => CuActionResult {
             success: false,
             screenshot: None,
-            error: Some(format!("cliclick exec error (is cliclick installed?): {}", e)),
+            error: Some(format!(
+                "cliclick exec error (is cliclick installed?): {}",
+                e
+            )),
         },
     }
 }
@@ -809,20 +869,22 @@ async fn take_screenshot(
     let path = screenshot_dir.join(format!("cu_screenshot_{}.png", counter));
 
     let output = match backend {
-        DisplayBackend::MacOS => {
-            Command::new("screencapture")
-                .args(["-x", &path.to_string_lossy()])
-                .output()
-                .await
-                .map_err(|e| format!("screencapture exec error: {}", e))?
-        }
-        _ => {
-            Command::new("import")
-                .args(["-window", "root", "-display", display, &path.to_string_lossy()])
-                .output()
-                .await
-                .map_err(|e| format!("import exec error: {}", e))?
-        }
+        DisplayBackend::MacOS => Command::new("screencapture")
+            .args(["-x", &path.to_string_lossy()])
+            .output()
+            .await
+            .map_err(|e| format!("screencapture exec error: {}", e))?,
+        _ => Command::new("import")
+            .args([
+                "-window",
+                "root",
+                "-display",
+                display,
+                &path.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("import exec error: {}", e))?,
     };
 
     if !output.status.success() {
@@ -851,11 +913,8 @@ async fn take_screenshot(
         // Resize to logical display size so model coords = logical coords
         match image::load_from_memory(&raw_bytes) {
             Ok(img) => {
-                let resized = img.resize_exact(
-                    logical_w,
-                    logical_h,
-                    image::imageops::FilterType::Triangle,
-                );
+                let resized =
+                    img.resize_exact(logical_w, logical_h, image::imageops::FilterType::Triangle);
                 let mut buf = std::io::Cursor::new(Vec::new());
                 if resized.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
                     buf.into_inner()
@@ -1165,7 +1224,11 @@ async fn execute_via_session(
                 let nx = *x as f64 / width as f64;
                 let ny = *y as f64 / height as f64;
                 let r = session
-                    .inject_input(crate::display::InputEvent::MouseMove { x: nx, y: ny, buttons: 0 })
+                    .inject_input(crate::display::InputEvent::MouseMove {
+                        x: nx,
+                        y: ny,
+                        buttons: 0,
+                    })
                     .await;
                 results.push(CuActionResult {
                     success: r.is_ok(),
@@ -1186,11 +1249,7 @@ async fn execute_via_session(
                 let ey = *end_y as f64 / height as f64;
                 // Drag uses left button (0).
                 let _ = session
-                    .inject_input(crate::display::InputEvent::MouseDown {
-                        x: sx,
-                        y: sy,
-                        b: 0,
-                    })
+                    .inject_input(crate::display::InputEvent::MouseDown { x: sx, y: sy, b: 0 })
                     .await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 // Interpolate intermediate points for smooth drag.
@@ -1199,16 +1258,16 @@ async fn execute_via_session(
                     let mx = sx + (ex - sx) * t;
                     let my = sy + (ey - sy) * t;
                     let _ = session
-                        .inject_input(crate::display::InputEvent::MouseMove { x: mx, y: my, buttons: 0 })
+                        .inject_input(crate::display::InputEvent::MouseMove {
+                            x: mx,
+                            y: my,
+                            buttons: 0,
+                        })
                         .await;
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
                 let _ = session
-                    .inject_input(crate::display::InputEvent::MouseUp {
-                        x: ex,
-                        y: ey,
-                        b: 0,
-                    })
+                    .inject_input(crate::display::InputEvent::MouseUp { x: ex, y: ey, b: 0 })
                     .await;
                 results.push(CuActionResult {
                     success: true,
@@ -1261,8 +1320,7 @@ async fn take_session_screenshot(
             Ok(_) => {
                 let (width, height) = png_dimensions(&png_bytes).unwrap_or((0, 0));
                 use base64::Engine;
-                let base64_png =
-                    base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+                let base64_png = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
                 CuActionResult {
                     success: true,
                     screenshot: Some(ScreenshotData {
@@ -1423,7 +1481,11 @@ mod tests {
     #[test]
     fn no_wayland_session_message_virtual_target_suggests_xvfb() {
         let msg = no_wayland_session_message(&DisplayTarget::Virtual { id: 99 });
-        assert!(msg.contains(":99"), "message should mention display number: {}", msg);
+        assert!(
+            msg.contains(":99"),
+            "message should mention display number: {}",
+            msg
+        );
         assert!(msg.contains("Xvfb"), "message should suggest Xvfb: {}", msg);
     }
 
@@ -1432,11 +1494,19 @@ mod tests {
         // Clear env first so the test is deterministic.
         std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         let msg = no_wayland_session_message(&DisplayTarget::UserSession);
-        assert!(msg.contains("grant_user_display"), "ungranted message: {}", msg);
+        assert!(
+            msg.contains("grant_user_display"),
+            "ungranted message: {}",
+            msg
+        );
 
         std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
         let msg = no_wayland_session_message(&DisplayTarget::UserSession);
-        assert!(msg.contains("portal"), "granted message should mention portal: {}", msg);
+        assert!(
+            msg.contains("portal"),
+            "granted message should mention portal: {}",
+            msg
+        );
         std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
     }
 
@@ -1492,7 +1562,10 @@ mod tests {
         assert_eq!(args, vec!["kd:ctrl", "t:c", "ku:ctrl"]);
 
         let args = translate_key_for_cliclick("super+shift+a");
-        assert_eq!(args, vec!["kd:cmd", "kd:shift", "t:a", "ku:shift", "ku:cmd"]);
+        assert_eq!(
+            args,
+            vec!["kd:cmd", "kd:shift", "t:a", "ku:shift", "ku:cmd"]
+        );
 
         // Special keys still use kp:
         let args = translate_key_for_cliclick("cmd+space");
@@ -1590,10 +1663,7 @@ mod tests {
     #[test]
     fn display_target_display_fmt() {
         assert_eq!(format!("{}", DisplayTarget::Virtual { id: 99 }), ":99");
-        assert_eq!(
-            format!("{}", DisplayTarget::UserSession),
-            "user_session"
-        );
+        assert_eq!(format!("{}", DisplayTarget::UserSession), "user_session");
     }
 
     #[test]

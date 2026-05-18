@@ -89,18 +89,18 @@ pub fn dom_code_to_macos_keycode(code: &str) -> Option<u16> {
 
         // Row 5 -- Bottom
         "ControlLeft" => 0x3B,
-        "AltLeft" => 0x3A,     // Option
-        "MetaLeft" => 0x37,    // Command
+        "AltLeft" => 0x3A,  // Option
+        "MetaLeft" => 0x37, // Command
         "Space" => 0x31,
-        "MetaRight" => 0x36,   // Right Command
-        "AltRight" => 0x3D,    // Right Option
+        "MetaRight" => 0x36, // Right Command
+        "AltRight" => 0x3D,  // Right Option
         "ControlRight" => 0x3E,
 
         // Navigation cluster
-        "Insert" => 0x72,      // Help key on Mac
+        "Insert" => 0x72, // Help key on Mac
         "Home" => 0x73,
         "PageUp" => 0x74,
-        "Delete" => 0x75,      // Forward Delete
+        "Delete" => 0x75, // Forward Delete
         "End" => 0x77,
         "PageDown" => 0x79,
 
@@ -111,7 +111,7 @@ pub fn dom_code_to_macos_keycode(code: &str) -> Option<u16> {
         "ArrowRight" => 0x7C,
 
         // Numpad
-        "NumLock" => 0x47,     // Clear on Mac
+        "NumLock" => 0x47, // Clear on Mac
         "NumpadDivide" => 0x4B,
         "NumpadMultiply" => 0x43,
         "NumpadSubtract" => 0x4E,

@@ -160,9 +160,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(codex_config_changed_event(
-                CodexConfigDelta { sandbox: Some(normalized), ..Default::default() },
-            ));
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                sandbox: Some(normalized),
+                ..Default::default()
+            }));
         }
         ControlMsg::SetCodexApprovalPolicy { policy } => {
             let normalized = crate::project::normalize_approval_policy(policy);
@@ -179,9 +180,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(codex_config_changed_event(
-                CodexConfigDelta { approval_policy: Some(normalized), ..Default::default() },
-            ));
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                approval_policy: Some(normalized),
+                ..Default::default()
+            }));
         }
         ControlMsg::SetCodexModel { model } => {
             // Treat empty/whitespace string as "clear the override" — matches
@@ -320,11 +322,13 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                model: normalized.clone(),
-                model_cleared: normalized.is_none(),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    model: normalized.clone(),
+                    model_cleared: normalized.is_none(),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiApprovalMode { mode } => {
             let normalized = crate::project::normalize_gemini_approval_mode(mode);
@@ -341,10 +345,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                approval_mode: Some(normalized),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    approval_mode: Some(normalized),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiSandbox { enabled } => {
             {
@@ -360,10 +366,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                sandbox: Some(*enabled),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    sandbox: Some(*enabled),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiExtensions { extensions } => {
             let normalized = normalize_name_list(extensions);
@@ -380,10 +388,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                extensions: Some(normalized),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    extensions: Some(normalized),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiAllowedMcpServers { servers } => {
             let normalized = normalize_name_list(servers);
@@ -400,10 +410,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                allowed_mcp_servers: Some(normalized),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    allowed_mcp_servers: Some(normalized),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiIncludeDirectories { directories } => {
             // Reuse writable-roots normalizer — same "drop empty / dedupe,
@@ -422,10 +434,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                include_directories: Some(normalized),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    include_directories: Some(normalized),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiDebug { enabled } => {
             {
@@ -441,10 +455,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                debug: Some(*enabled),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    debug: Some(*enabled),
+                    ..Default::default()
+                }));
         }
         ControlMsg::GeminiThreadAction { op, params } => {
             // Rebroadcast for the daemon-side watcher, same pattern as
@@ -481,7 +497,9 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // (agent runners, etc.) observe the same state the autonomy
             // guard reports. Matches the tui/mcp paths that set it.
             std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-            state.bus.send(AppEvent::UserDisplayGranted { display_id: did });
+            state
+                .bus
+                .send(AppEvent::UserDisplayGranted { display_id: did });
         }
         ControlMsg::RevokeUserDisplay { display_id, note } => {
             let did = display_id.unwrap_or(0);
@@ -914,9 +932,11 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexApprovalPolicy {
-            policy: "never".to_string(),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexApprovalPolicy {
+                policy: "never".to_string(),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(codex_config.read().await.approval_policy, "never");
 
@@ -977,16 +997,23 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexReasoningEffort {
-            effort: Some("high".to_string()),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexReasoningEffort {
+                effort: Some("high".to_string()),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(codex_config.read().await.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            codex_config.read().await.reasoning_effort.as_deref(),
+            Some("high")
+        );
 
         // Unknown value → cleared (normalized to None, don't silently pass garbage to Codex).
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexReasoningEffort {
-            effort: Some("ultra-galaxy".to_string()),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexReasoningEffort {
+                effort: Some("ultra-galaxy".to_string()),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(codex_config.read().await.reasoning_effort, None);
 
@@ -1012,15 +1039,21 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch { enabled: true }));
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexNetworkAccess { enabled: true }));
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch {
+            enabled: true,
+        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexNetworkAccess { enabled: true },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let g = codex_config.read().await;
         assert!(g.web_search);
         assert!(g.network_access);
         drop(g);
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch { enabled: false }));
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch {
+            enabled: false,
+        }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!codex_config.read().await.web_search);
 
@@ -1092,15 +1125,17 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWritableRoots {
-            roots: vec![
-                "/tmp/a".into(),
-                "  ".into(),
-                "/tmp/a".into(),
-                "/tmp/b".into(),
-                "".into(),
-            ],
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexWritableRoots {
+                roots: vec![
+                    "/tmp/a".into(),
+                    "  ".into(),
+                    "/tmp/a".into(),
+                    "/tmp/b".into(),
+                    "".into(),
+                ],
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let got = codex_config.read().await.writable_roots.clone();
         assert_eq!(got, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
@@ -1165,16 +1200,20 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiApprovalMode {
-            mode: "yolo".to_string(),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetGeminiApprovalMode {
+                mode: "yolo".to_string(),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(gemini_config.read().await.approval_mode, "yolo");
 
         // Unknown → default (safe fallback — don't silently leave yolo).
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiApprovalMode {
-            mode: "banana".to_string(),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetGeminiApprovalMode {
+                mode: "banana".to_string(),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(gemini_config.read().await.approval_mode, "default");
 

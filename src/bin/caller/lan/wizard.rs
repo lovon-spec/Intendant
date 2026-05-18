@@ -15,10 +15,7 @@ pub fn prompt(msg: &str, default: Option<&str>) -> LanResult<String> {
     io::stdout().flush().map_err(LanError::from)?;
     let stdin = io::stdin();
     let mut line = String::new();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .map_err(LanError::from)?;
+    stdin.lock().read_line(&mut line).map_err(LanError::from)?;
     let trimmed = line.trim();
     if trimmed.is_empty() {
         match default {

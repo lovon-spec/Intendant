@@ -1,5 +1,7 @@
 mod agent_runner;
+mod app_state_pricing;
 mod approval;
+mod audio_routing;
 mod autonomy;
 mod computer_use;
 mod control;
@@ -25,11 +27,10 @@ mod peer;
 mod platform;
 mod presence;
 mod project;
-mod audio_routing;
-mod quarantine;
-mod recording;
 mod prompts;
 mod provider;
+mod quarantine;
+mod recording;
 mod sandbox;
 mod schema_validator;
 mod session_log;
@@ -46,7 +47,6 @@ mod types;
 mod upload_store;
 mod user_mode;
 mod vision;
-mod app_state_pricing;
 mod web_gateway;
 mod worktree;
 
@@ -150,12 +150,13 @@ fn build_local_advertised_auth(
             )));
         }
     };
-    let application = server_auth.bearer_token.as_ref().map(|_| {
-        peer::ApplicationAuth::Bearer {
+    let application = server_auth
+        .bearer_token
+        .as_ref()
+        .map(|_| peer::ApplicationAuth::Bearer {
             hint: Some("[server.auth] bearer_token".to_string()),
             rotation_url: None,
-        }
-    });
+        });
     Ok(peer::AuthRequirements {
         transport,
         application,
@@ -431,8 +432,7 @@ async fn create_external_agent(
         .ok()
         .map(|log| log.dir().join("model-request-traces"));
 
-    let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend
-    {
+    let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
         AgentBackend::Codex => {
             let cfg = &project.config.agent.codex;
             let sandbox_mode = project::normalize_sandbox_mode(&cfg.sandbox);
@@ -728,7 +728,8 @@ async fn emit_external_context_snapshot_if_changed(
         Err(e) => {
             let message = format!(
                 "Failed to read context snapshot from {}: {}",
-                agent.name(), e
+                agent.name(),
+                e
             );
             if state.last_error.as_deref() != Some(message.as_str()) {
                 slog(config.session_log, |l| l.warn(&message));
@@ -1040,9 +1041,7 @@ async fn drain_external_agent_events(
                 });
             }
             external_agent::AgentEvent::ToolStarted {
-                preview,
-                tool_name,
-                ..
+                preview, tool_name, ..
             } => {
                 turns_in_round += 1;
                 if !config.suppress_agent_started {
@@ -1128,15 +1127,12 @@ async fn drain_external_agent_events(
                 };
                 let needs = { config.autonomy.read().await.needs_approval(cat) };
                 if !needs {
-                    config
-                        .bus
-                        .send(AppEvent::AutoApproved { preview: command.clone() });
+                    config.bus.send(AppEvent::AutoApproved {
+                        preview: command.clone(),
+                    });
                     slog(config.session_log, |l| l.auto_approved(&command));
                     if let Err(e) = agent
-                        .resolve_approval(
-                            &request_id,
-                            external_agent::ApprovalDecision::Accept,
-                        )
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Accept)
                         .await
                     {
                         slog(config.session_log, |l| {
@@ -1153,10 +1149,7 @@ async fn drain_external_agent_events(
                         action: "deny".to_string(),
                     });
                     let _ = agent
-                        .resolve_approval(
-                            &request_id,
-                            external_agent::ApprovalDecision::Decline,
-                        )
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
                         .await;
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
@@ -1235,15 +1228,12 @@ async fn drain_external_agent_events(
                 let preview = format!("file change: {}", path);
 
                 if !needs {
-                    config
-                        .bus
-                        .send(AppEvent::AutoApproved { preview: preview.clone() });
+                    config.bus.send(AppEvent::AutoApproved {
+                        preview: preview.clone(),
+                    });
                     slog(config.session_log, |l| l.auto_approved(&preview));
                     if let Err(e) = agent
-                        .resolve_approval(
-                            &request_id,
-                            external_agent::ApprovalDecision::Accept,
-                        )
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Accept)
                         .await
                     {
                         slog(config.session_log, |l| {
@@ -1260,10 +1250,7 @@ async fn drain_external_agent_events(
                         action: "deny".to_string(),
                     });
                     let _ = agent
-                        .resolve_approval(
-                            &request_id,
-                            external_agent::ApprovalDecision::Decline,
-                        )
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
                         .await;
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
@@ -1686,13 +1673,17 @@ fn print_help() {
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
     println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
     println!("    --transcription       Enable user speech transcription");
-    println!("    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)");
+    println!(
+        "    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)"
+    );
     println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code)");
     println!("    --advertise-url <URL> WebSocket URL to advertise to peers in this daemon's");
     println!("                          Agent Card (repeatable, preference order). Overrides");
     println!("                          [server.advertise] in intendant.toml when given.");
     println!("                          Example: --advertise-url ws://192.168.1.42:8765/ws");
-    println!("                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws");
+    println!(
+        "                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws"
+    );
     println!("    --help, -h            Show this help message");
     println!();
     println!("SESSION LOGS:");
@@ -1976,9 +1967,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     flags.agent_backend = Some(backend);
                     i += 2;
                 } else {
-                    return Err(CallerError::Config(
-                        "Missing value for --agent".to_string(),
-                    ));
+                    return Err(CallerError::Config("Missing value for --agent".to_string()));
                 }
             }
             "--advertise-url" => {
@@ -2334,13 +2323,13 @@ fn substitute_screenshot_from_disk(text: &str, log_dir: &std::path::Path) -> Str
         return text.to_string();
     };
 
-    let base64_data = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &png_bytes,
-    );
+    let base64_data =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_bytes);
 
     // Build MCP-style JSON with both text and image content blocks
-    let text_part = text.replace("[Image: image/png]", "").replace("[Image: image/jpeg]", "");
+    let text_part = text
+        .replace("[Image: image/png]", "")
+        .replace("[Image: image/jpeg]", "");
     let text_part = text_part.trim();
 
     let mut content = Vec::new();
@@ -2384,20 +2373,31 @@ fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> 
 pub(crate) fn format_commands_preview(json_str: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
         if let Some(cmds) = parsed.get("commands").and_then(|v| v.as_array()) {
-            let parts: Vec<String> = cmds.iter().filter_map(|cmd| {
-                let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
-                match func {
-                    "execAsAgent" => cmd.get("command").and_then(|v| v.as_str())
-                        .map(|c| format!("exec: {}", c)),
-                    "inspectPath" => cmd.get("path").and_then(|v| v.as_str())
-                        .map(|p| format!("inspect: {}", p)),
-                    "editFile" | "writeFile" => cmd.get("file_path").and_then(|v| v.as_str())
-                        .map(|p| format!("{}: {}", func, p)),
-                    "spawn_live_audio" => Some(format!("spawn_live_audio ({})",
-                        cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?"))),
-                    _ => Some(func.to_string()),
-                }
-            }).collect();
+            let parts: Vec<String> = cmds
+                .iter()
+                .filter_map(|cmd| {
+                    let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
+                    match func {
+                        "execAsAgent" => cmd
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .map(|c| format!("exec: {}", c)),
+                        "inspectPath" => cmd
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .map(|p| format!("inspect: {}", p)),
+                        "editFile" | "writeFile" => cmd
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .map(|p| format!("{}: {}", func, p)),
+                        "spawn_live_audio" => Some(format!(
+                            "spawn_live_audio ({})",
+                            cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?")
+                        )),
+                        _ => Some(func.to_string()),
+                    }
+                })
+                .collect();
             if !parts.is_empty() {
                 return parts.join(" | ");
             }
@@ -2463,7 +2463,10 @@ async fn maybe_auto_launch_xvfb(
             // Phase 1: no DisplayReady for virtual displays — no DisplaySession means no web slot.
             // The agent uses this display for CU via X11 tools directly.
             slog(session_log, |l| {
-                l.info(&format!("Xvfb :{} launched (no web slot in phase 1)", virtual_id))
+                l.info(&format!(
+                    "Xvfb :{} launched (no web slot in phase 1)",
+                    virtual_id
+                ))
             });
             *xvfb_guard = Some(guard);
         }
@@ -2558,13 +2561,10 @@ async fn start_external_display_recordings(
 ) {
     for &id in displays {
         let (width, height) = query_display_resolution(id);
-        eprintln!(
-            "Recording external display :{} ({}x{})",
-            id, width, height
-        );
+        eprintln!("Recording external display :{} ({}x{})", id, width, height);
         let mut reg = registry.write().await;
         if !reg.is_enabled() {
-            eprintln!("Recording not enabled in config — skipping :{}",id);
+            eprintln!("Recording not enabled in config — skipping :{}", id);
             continue;
         }
         if !recording::is_ffmpeg_available() {
@@ -2640,7 +2640,6 @@ fn normalize_command_batch(json_str: &str) -> String {
 
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2747,7 +2746,10 @@ mod tests {
             Some(peer::ApplicationAuth::Bearer { hint, rotation_url }) => {
                 assert!(hint.is_some(), "hint should document the source");
                 assert!(hint.as_ref().unwrap().contains("[server.auth]"));
-                assert!(rotation_url.is_none(), "rotation_url unset until rotation lands");
+                assert!(
+                    rotation_url.is_none(),
+                    "rotation_url unset until rotation lands"
+                );
             }
             other => panic!("expected Bearer application auth, got {other:?}"),
         }
@@ -2995,7 +2997,8 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn parse_brief_found() {
-        let text = "I did a bunch of work.\n\nBRIEF: Implemented the login feature and added tests.";
+        let text =
+            "I did a bunch of work.\n\nBRIEF: Implemented the login feature and added tests.";
         let (brief, explicit) = parse_brief(text);
         assert_eq!(brief, "Implemented the login feature and added tests.");
         assert!(explicit);
@@ -3538,7 +3541,6 @@ Also: {"source": "bare"}"#;
         assert!(!has_exec_command("not json"));
     }
 
-
     // --- assemble_batch_from_tool_calls tests ---
 
     #[test]
@@ -3863,9 +3865,8 @@ Also: {"source": "bare"}"#;
                 "steer-1".into(),
             ));
 
-        let merged =
-            drain_steer_queue_as_followup(&queue, "original follow-up", &bus, None)
-                .expect("should produce a message");
+        let merged = drain_steer_queue_as_followup(&queue, "original follow-up", &bus, None)
+            .expect("should produce a message");
 
         assert_eq!(merged, "[User] switch to Python\noriginal follow-up");
         // Queue drained.
@@ -3894,9 +3895,8 @@ Also: {"source": "bare"}"#;
             .unwrap()
             .push(event::ContextInjection::text("display grant".into()));
 
-        let merged =
-            drain_steer_queue_as_followup(&queue, "follow-up", &bus, None)
-                .expect("should produce a message");
+        let merged = drain_steer_queue_as_followup(&queue, "follow-up", &bus, None)
+            .expect("should produce a message");
         assert_eq!(merged, "follow-up");
         assert_eq!(queue.lock().unwrap().len(), 1, "non-steer entry preserved");
     }
@@ -3928,8 +3928,7 @@ Also: {"source": "bare"}"#;
             ));
         }
 
-        let merged =
-            drain_steer_queue_as_followup(&queue, "main", &bus, None).expect("merged");
+        let merged = drain_steer_queue_as_followup(&queue, "main", &bus, None).expect("merged");
         assert_eq!(merged, "[User] first\n[User] second\nmain");
 
         let mut delivered_ids: Vec<String> = Vec::new();
@@ -4037,12 +4036,10 @@ async fn run_agent_loop(
                         // Frontends see `mid_turn: true` because they did
                         // not have to send a follow-up themselves.
                         if let Ok(mut q) = watcher_injection.lock() {
-                            q.push(
-                                event::ContextInjection::text_with_steer_id(
-                                    text,
-                                    id.clone(),
-                                ),
-                            );
+                            q.push(event::ContextInjection::text_with_steer_id(
+                                text,
+                                id.clone(),
+                            ));
                         }
                         watcher_bus.send(AppEvent::SteerDelivered {
                             session_id: watcher_session_id.clone(),
@@ -4115,14 +4112,20 @@ async fn run_agent_loop(
         // always used.
         if let Ok(mut q) = context_injection.lock() {
             for inj in q.drain(..) {
-                let prefix = if inj.steer_id.is_some() { "User" } else { "System" };
+                let prefix = if inj.steer_id.is_some() {
+                    "User"
+                } else {
+                    "System"
+                };
                 let text = format!("[{}] {}", prefix, inj.text);
                 if inj.images.is_empty() {
                     conversation.add_user(text.clone());
                 } else {
                     conversation.add_user_with_images(text.clone(), inj.images);
                 }
-                slog(&session_log, |l| l.info(&format!("Context injected: {}", inj.text)));
+                slog(&session_log, |l| {
+                    l.info(&format!("Context injected: {}", inj.text))
+                });
             }
         }
 
@@ -4269,7 +4272,9 @@ async fn run_agent_loop(
                     session_id: local_session_id.clone(),
                     reason: "user requested".into(),
                 });
-                slog(&session_log, |l| l.info("Agent loop interrupted mid-stream"));
+                slog(&session_log, |l| {
+                    l.info("Agent loop interrupted mid-stream")
+                });
                 return Ok((loop_stats, LoopExitReason::Interrupted));
             }
         };
@@ -4370,18 +4375,28 @@ async fn run_agent_loop(
 
         // For CU-only turns, synthesize a content summary from the actions
         let display_content = if response.content.is_empty() && has_cu_calls {
-            let descs: Vec<String> = response.cu_calls.iter().flat_map(|cu| {
-                cu.actions.iter().map(|a| match a {
-                    computer_use::CuAction::Click { x, y, .. } => format!("click({},{})", x, y),
-                    computer_use::CuAction::DoubleClick { x, y, .. } => format!("double_click({},{})", x, y),
-                    computer_use::CuAction::Type { text } => format!("type(\"{}\")", &text[..text.len().min(30)]),
-                    computer_use::CuAction::Key { key } => format!("key({})", key),
-                    computer_use::CuAction::Scroll { x, y, .. } => format!("scroll({},{})", x, y),
-                    computer_use::CuAction::Screenshot => "screenshot".to_string(),
-                    computer_use::CuAction::Wait { .. } => "wait".to_string(),
-                    _ => format!("{:?}", a),
+            let descs: Vec<String> = response
+                .cu_calls
+                .iter()
+                .flat_map(|cu| {
+                    cu.actions.iter().map(|a| match a {
+                        computer_use::CuAction::Click { x, y, .. } => format!("click({},{})", x, y),
+                        computer_use::CuAction::DoubleClick { x, y, .. } => {
+                            format!("double_click({},{})", x, y)
+                        }
+                        computer_use::CuAction::Type { text } => {
+                            format!("type(\"{}\")", &text[..text.len().min(30)])
+                        }
+                        computer_use::CuAction::Key { key } => format!("key({})", key),
+                        computer_use::CuAction::Scroll { x, y, .. } => {
+                            format!("scroll({},{})", x, y)
+                        }
+                        computer_use::CuAction::Screenshot => "screenshot".to_string(),
+                        computer_use::CuAction::Wait { .. } => "wait".to_string(),
+                        _ => format!("{:?}", a),
+                    })
                 })
-            }).collect();
+                .collect();
             descs.join(" → ")
         } else {
             response.content.clone()
@@ -4481,17 +4496,18 @@ async fn run_agent_loop(
             // Process invoke_skill tool calls (if any)
             for (call_id, skill_name, arguments) in &batch.skill_invocations {
                 let discovered = skills::discover_skills(Some(&project.root));
-                match discovered
-                    .iter()
-                    .find(|s| s.config.name == *skill_name)
-                {
+                match discovered.iter().find(|s| s.config.name == *skill_name) {
                     Some(skill) => {
                         let body = skills::load_skill_body(skill, arguments);
                         slog(&session_log, |l| {
                             l.info(&format!(
                                 "Invoked skill '{}' (args: {})",
                                 skill_name,
-                                if arguments.is_empty() { "(none)" } else { arguments }
+                                if arguments.is_empty() {
+                                    "(none)"
+                                } else {
+                                    arguments
+                                }
                             ))
                         });
                         conversation.add_tool_result(
@@ -4584,10 +4600,7 @@ async fn run_agent_loop(
                         if bridge.vortex_socket_path().is_none() {
                             if let Err(e) = audio_routing::set_as_default(&mut bridge).await {
                                 slog(&session_log, |l| {
-                                    l.warn(&format!(
-                                        "Could not set audio bridge as default: {}",
-                                        e
-                                    ))
+                                    l.warn(&format!("Could not set audio bridge as default: {}", e))
                                 });
                             }
                         }
@@ -4599,14 +4612,9 @@ async fn run_agent_loop(
                             ))
                         });
 
-                        let result = live_audio::run_session(
-                            &spec,
-                            &api_key,
-                            &bridge,
-                            log_dir,
-                            Some(bus),
-                        )
-                        .await;
+                        let result =
+                            live_audio::run_session(&spec, &api_key, &bridge, log_dir, Some(bus))
+                                .await;
 
                         drop(bridge);
 
@@ -4660,10 +4668,7 @@ async fn run_agent_loop(
             let json_str = normalize_command_batch(&inject_project_context(json_str, project));
 
             // Headless askHuman check — skip unless JSON mode (which handles it via stdin)
-            if headless
-                && json_approval.is_none()
-                && has_ask_human_command(&json_str)
-            {
+            if headless && json_approval.is_none() && has_ask_human_command(&json_str) {
                 slog(&session_log, |l| {
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
@@ -4720,172 +4725,169 @@ async fn run_agent_loop(
                         l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
                     });
                 } else {
-                slog(&session_log, |l| {
-                    l.approval(&cat.to_string(), &preview, "waiting")
-                });
-
-                if denied_by_policy {
                     slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-policy")
+                        l.approval(&cat.to_string(), &preview, "waiting")
                     });
-                    bus.send(AppEvent::TaskComplete {
-                        reason: format!("Denied by policy ({})", cat),
-                        summary: None,
-                    });
-                    return Ok((loop_stats, LoopExitReason::Denied));
-                }
 
-                if let Some(slot) = json_approval {
-                    // JSON mode: emit approval event and wait for stdin response
-                    bus.send(AppEvent::ApprovalRequired {
-                        session_id: local_session_id.clone(),
-                        id: turn as u64,
-                        command_preview: preview.clone(),
-                        category: cat,
-                    });
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    {
-                        let mut guard = slot.lock().unwrap();
-                        *guard = Some((turn as u64, tx));
+                    if denied_by_policy {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-policy")
+                        });
+                        bus.send(AppEvent::TaskComplete {
+                            reason: format!("Denied by policy ({})", cat),
+                            summary: None,
+                        });
+                        return Ok((loop_stats, LoopExitReason::Denied));
                     }
-                    match rx.await {
-                        Ok(event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approved")
-                            });
-                            bus.send(AppEvent::ApprovalResolved {
-                                session_id: local_session_id.clone(),
-                                id: turn as u64,
-                                action: "approve".to_string(),
-                            });
-                            // Record approved command for dedup
-                            autonomy.write().await.record_approved_command(&preview);
-                            // Session-grant: first DisplayControl approval unlocks the session
-                            if cat == autonomy::ActionCategory::DisplayControl {
+
+                    if let Some(slot) = json_approval {
+                        // JSON mode: emit approval event and wait for stdin response
+                        bus.send(AppEvent::ApprovalRequired {
+                            session_id: local_session_id.clone(),
+                            id: turn as u64,
+                            command_preview: preview.clone(),
+                            category: cat,
+                        });
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((turn as u64, tx));
+                        }
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "approve".to_string(),
+                                });
+                                // Record approved command for dedup
+                                autonomy.write().await.record_approved_command(&preview);
+                                // Session-grant: first DisplayControl approval unlocks the session
+                                if cat == autonomy::ActionCategory::DisplayControl {
+                                    let mut state = autonomy.write().await;
+                                    if !state.user_display_granted {
+                                        state.user_display_granted = true;
+                                        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+                                    }
+                                }
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "approve_all".to_string(),
+                                });
                                 let mut state = autonomy.write().await;
-                                if !state.user_display_granted {
+                                state.level = AutonomyLevel::Full;
+                                // Session-grant: DisplayControl approval also unlocks user display
+                                if cat == autonomy::ActionCategory::DisplayControl
+                                    && !state.user_display_granted
+                                {
                                     state.user_display_granted = true;
                                     std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
                                     bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
                                 }
                             }
-                        }
-                        Ok(event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approve-all")
-                            });
-                            bus.send(AppEvent::ApprovalResolved {
-                                session_id: local_session_id.clone(),
-                                id: turn as u64,
-                                action: "approve_all".to_string(),
-                            });
-                            let mut state = autonomy.write().await;
-                            state.level = AutonomyLevel::Full;
-                            // Session-grant: DisplayControl approval also unlocks user display
-                            if cat == autonomy::ActionCategory::DisplayControl
-                                && !state.user_display_granted
-                            {
-                                state.user_display_granted = true;
-                                std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                            }
-                        }
-                        Ok(event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "skipped")
-                            });
-                            bus.send(AppEvent::ApprovalResolved {
-                                session_id: local_session_id.clone(),
-                                id: turn as u64,
-                                action: "skip".to_string(),
-                            });
-                            should_skip = true;
-                        }
-                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "denied")
-                            });
-                            bus.send(AppEvent::ApprovalResolved {
-                                session_id: local_session_id.clone(),
-                                id: turn as u64,
-                                action: "deny".to_string(),
-                            });
-                            bus.send(AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
-                                summary: None,
-                            });
-                            return Ok((loop_stats, LoopExitReason::Denied));
-                        }
-                    }
-                } else if headless {
-                    slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                    });
-                    bus.send(AppEvent::TaskComplete {
-                        reason: format!(
-                            "Approval required in headless mode ({})",
-                            cat
-                        ),
-                        summary: None,
-                    });
-                    return Ok((loop_stats, LoopExitReason::Denied));
-                } else {
-                    // Interactive mode (TUI/MCP): approval via registry
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    approval_registry.lock().unwrap().insert(turn as u64, tx);
-                    bus.send(AppEvent::ApprovalRequired {
-                        session_id: local_session_id.clone(),
-                        id: turn as u64,
-                        command_preview: preview.clone(),
-                        category: cat,
-                    });
-                    match rx.await {
-                        Ok(event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approved")
-                            });
-                        }
-                        Ok(event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approve-all")
-                            });
-                            let mut state = autonomy.write().await;
-                            state.level = AutonomyLevel::Full;
-                        }
-                        Ok(event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "skipped")
-                            });
-                            should_skip = true;
-                        }
-                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                            // Distinguish a real user deny from an interrupt
-                            // that caused the watcher to drain the registry
-                            // with Deny as a synthetic response. Interrupt
-                            // takes precedence so the phase/exit reason
-                            // reflects what actually happened.
-                            if cancel_token.is_cancelled() {
-                                bus.send(AppEvent::Interrupted {
-                                    session_id: local_session_id.clone(),
-                                    reason: "user requested".into(),
-                                });
+                            Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
-                                    l.info("Agent loop interrupted during approval wait")
+                                    l.approval(&cat.to_string(), &preview, "skipped")
                                 });
-                                return Ok((loop_stats, LoopExitReason::Interrupted));
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "skip".to_string(),
+                                });
+                                should_skip = true;
                             }
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "denied")
-                            });
-                            bus.send(AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
-                                summary: None,
-                            });
-                            return Ok((loop_stats, LoopExitReason::Denied));
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "deny".to_string(),
+                                });
+                                bus.send(AppEvent::TaskComplete {
+                                    reason: "Denied by user".to_string(),
+                                    summary: None,
+                                });
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
+                        }
+                    } else if headless {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                        });
+                        bus.send(AppEvent::TaskComplete {
+                            reason: format!("Approval required in headless mode ({})", cat),
+                            summary: None,
+                        });
+                        return Ok((loop_stats, LoopExitReason::Denied));
+                    } else {
+                        // Interactive mode (TUI/MCP): approval via registry
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        approval_registry.lock().unwrap().insert(turn as u64, tx);
+                        bus.send(AppEvent::ApprovalRequired {
+                            session_id: local_session_id.clone(),
+                            id: turn as u64,
+                            command_preview: preview.clone(),
+                            category: cat,
+                        });
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                let mut state = autonomy.write().await;
+                                state.level = AutonomyLevel::Full;
+                            }
+                            Ok(event::ApprovalResponse::Skip) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "skipped")
+                                });
+                                should_skip = true;
+                            }
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                // Distinguish a real user deny from an interrupt
+                                // that caused the watcher to drain the registry
+                                // with Deny as a synthetic response. Interrupt
+                                // takes precedence so the phase/exit reason
+                                // reflects what actually happened.
+                                if cancel_token.is_cancelled() {
+                                    bus.send(AppEvent::Interrupted {
+                                        session_id: local_session_id.clone(),
+                                        reason: "user requested".into(),
+                                    });
+                                    slog(&session_log, |l| {
+                                        l.info("Agent loop interrupted during approval wait")
+                                    });
+                                    return Ok((loop_stats, LoopExitReason::Interrupted));
+                                }
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                bus.send(AppEvent::TaskComplete {
+                                    reason: "Denied by user".to_string(),
+                                    summary: None,
+                                });
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
                         }
                     }
-                }
-            } // close dedup else block
+                } // close dedup else block
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
                 let preview = format_command_preview(&json_str);
@@ -4905,8 +4907,14 @@ async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, bus)
-                .await;
+            maybe_auto_launch_xvfb(
+                &json_str,
+                &mut xvfb_guard,
+                provider.name(),
+                &session_log,
+                bus,
+            )
+            .await;
             let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
                 turn,
@@ -4939,9 +4947,7 @@ async fn run_agent_loop(
                 let text = format!("{}\n\n{}", result_text, budget);
                 if tool_name == "capture_screen" {
                     if let Some(images) = encode_screenshot(result_text) {
-                        conversation.add_tool_result_with_images(
-                            call_id, tool_name, &text, images,
-                        );
+                        conversation.add_tool_result_with_images(call_id, tool_name, &text, images);
                         continue;
                     }
                 }
@@ -4957,7 +4963,8 @@ async fn run_agent_loop(
                     log_dir,
                     &mut cu_action_counter,
                     &session_log,
-                ).await;
+                )
+                .await;
             }
         } else if has_cu_calls {
             // CU-only turn (no function tool calls)
@@ -4968,7 +4975,8 @@ async fn run_agent_loop(
                 log_dir,
                 &mut cu_action_counter,
                 &session_log,
-            ).await;
+            )
+            .await;
         } else {
             // --- Legacy text extraction path ---
 
@@ -4982,7 +4990,11 @@ async fn run_agent_loop(
                     let brief: String = response.content.chars().take(500).collect();
                     bus.send(AppEvent::TaskComplete {
                         reason: "Task complete".to_string(),
-                        summary: if brief.is_empty() { None } else { Some(brief.clone()) },
+                        summary: if brief.is_empty() {
+                            None
+                        } else {
+                            Some(brief.clone())
+                        },
                     });
                     exit_reason = LoopExitReason::TaskComplete;
                     break;
@@ -5046,7 +5058,11 @@ async fn run_agent_loop(
                         let brief: String = response.content.chars().take(500).collect();
                         bus.send(AppEvent::TaskComplete {
                             reason: "Task complete".to_string(),
-                            summary: if brief.is_empty() { None } else { Some(brief.clone()) },
+                            summary: if brief.is_empty() {
+                                None
+                            } else {
+                                Some(brief.clone())
+                            },
                         });
                         exit_reason = LoopExitReason::TaskComplete;
                         break;
@@ -5068,10 +5084,7 @@ async fn run_agent_loop(
             let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
 
             // In headless mode there is no askHuman input panel — skip unless JSON mode.
-            if headless
-                && json_approval.is_none()
-                && has_ask_human_command(&json_str)
-            {
+            if headless && json_approval.is_none() && has_ask_human_command(&json_str) {
                 slog(&session_log, |l| {
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
@@ -5126,172 +5139,169 @@ Proceed with explicit assumptions and continue without additional questions."
                         l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
                     });
                 } else {
-                slog(&session_log, |l| {
-                    l.approval(&cat.to_string(), &preview, "waiting")
-                });
-
-                if denied_by_policy {
                     slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-policy")
+                        l.approval(&cat.to_string(), &preview, "waiting")
                     });
-                    bus.send(AppEvent::TaskComplete {
-                        reason: format!("Denied by policy ({})", cat),
-                        summary: None,
-                    });
-                    return Ok((loop_stats, LoopExitReason::Denied));
-                }
 
-                if let Some(slot) = json_approval {
-                    // JSON mode: emit approval event and wait for stdin response
-                    bus.send(AppEvent::ApprovalRequired {
-                        session_id: local_session_id.clone(),
-                        id: turn as u64,
-                        command_preview: preview.clone(),
-                        category: cat,
-                    });
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    {
-                        let mut guard = slot.lock().unwrap();
-                        *guard = Some((turn as u64, tx));
+                    if denied_by_policy {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-policy")
+                        });
+                        bus.send(AppEvent::TaskComplete {
+                            reason: format!("Denied by policy ({})", cat),
+                            summary: None,
+                        });
+                        return Ok((loop_stats, LoopExitReason::Denied));
                     }
-                    match rx.await {
-                        Ok(event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approved")
-                            });
-                            bus.send(AppEvent::ApprovalResolved {
-                                session_id: local_session_id.clone(),
-                                id: turn as u64,
-                                action: "approve".to_string(),
-                            });
-                            // Record approved command for dedup
-                            autonomy.write().await.record_approved_command(&preview);
-                            // Session-grant: first DisplayControl approval unlocks the session
-                            if cat == autonomy::ActionCategory::DisplayControl {
+
+                    if let Some(slot) = json_approval {
+                        // JSON mode: emit approval event and wait for stdin response
+                        bus.send(AppEvent::ApprovalRequired {
+                            session_id: local_session_id.clone(),
+                            id: turn as u64,
+                            command_preview: preview.clone(),
+                            category: cat,
+                        });
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((turn as u64, tx));
+                        }
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "approve".to_string(),
+                                });
+                                // Record approved command for dedup
+                                autonomy.write().await.record_approved_command(&preview);
+                                // Session-grant: first DisplayControl approval unlocks the session
+                                if cat == autonomy::ActionCategory::DisplayControl {
+                                    let mut state = autonomy.write().await;
+                                    if !state.user_display_granted {
+                                        state.user_display_granted = true;
+                                        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+                                    }
+                                }
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "approve_all".to_string(),
+                                });
                                 let mut state = autonomy.write().await;
-                                if !state.user_display_granted {
+                                state.level = AutonomyLevel::Full;
+                                // Session-grant: DisplayControl approval also unlocks user display
+                                if cat == autonomy::ActionCategory::DisplayControl
+                                    && !state.user_display_granted
+                                {
                                     state.user_display_granted = true;
                                     std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
                                     bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
                                 }
                             }
-                        }
-                        Ok(event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approve-all")
-                            });
-                            bus.send(AppEvent::ApprovalResolved {
-                                session_id: local_session_id.clone(),
-                                id: turn as u64,
-                                action: "approve_all".to_string(),
-                            });
-                            let mut state = autonomy.write().await;
-                            state.level = AutonomyLevel::Full;
-                            // Session-grant: DisplayControl approval also unlocks user display
-                            if cat == autonomy::ActionCategory::DisplayControl
-                                && !state.user_display_granted
-                            {
-                                state.user_display_granted = true;
-                                std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                            }
-                        }
-                        Ok(event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "skipped")
-                            });
-                            bus.send(AppEvent::ApprovalResolved {
-                                session_id: local_session_id.clone(),
-                                id: turn as u64,
-                                action: "skip".to_string(),
-                            });
-                            should_skip = true;
-                        }
-                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "denied")
-                            });
-                            bus.send(AppEvent::ApprovalResolved {
-                                session_id: local_session_id.clone(),
-                                id: turn as u64,
-                                action: "deny".to_string(),
-                            });
-                            bus.send(AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
-                                summary: None,
-                            });
-                            return Ok((loop_stats, LoopExitReason::Denied));
-                        }
-                    }
-                } else if headless {
-                    slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                    });
-                    bus.send(AppEvent::TaskComplete {
-                        reason: format!(
-                            "Approval required in headless mode ({})",
-                            cat
-                        ),
-                        summary: None,
-                    });
-                    return Ok((loop_stats, LoopExitReason::Denied));
-                } else {
-                    // Interactive mode (TUI/MCP): approval via registry
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    approval_registry.lock().unwrap().insert(turn as u64, tx);
-                    bus.send(AppEvent::ApprovalRequired {
-                        session_id: local_session_id.clone(),
-                        id: turn as u64,
-                        command_preview: preview.clone(),
-                        category: cat,
-                    });
-                    match rx.await {
-                        Ok(event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approved")
-                            });
-                        }
-                        Ok(event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approve-all")
-                            });
-                            let mut state = autonomy.write().await;
-                            state.level = AutonomyLevel::Full;
-                        }
-                        Ok(event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "skipped")
-                            });
-                            should_skip = true;
-                        }
-                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                            // Distinguish a real user deny from an interrupt
-                            // that caused the watcher to drain the registry
-                            // with Deny as a synthetic response. Interrupt
-                            // takes precedence so the phase/exit reason
-                            // reflects what actually happened.
-                            if cancel_token.is_cancelled() {
-                                bus.send(AppEvent::Interrupted {
-                                    session_id: local_session_id.clone(),
-                                    reason: "user requested".into(),
-                                });
+                            Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
-                                    l.info("Agent loop interrupted during approval wait")
+                                    l.approval(&cat.to_string(), &preview, "skipped")
                                 });
-                                return Ok((loop_stats, LoopExitReason::Interrupted));
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "skip".to_string(),
+                                });
+                                should_skip = true;
                             }
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "denied")
-                            });
-                            bus.send(AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
-                                summary: None,
-                            });
-                            return Ok((loop_stats, LoopExitReason::Denied));
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "deny".to_string(),
+                                });
+                                bus.send(AppEvent::TaskComplete {
+                                    reason: "Denied by user".to_string(),
+                                    summary: None,
+                                });
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
+                        }
+                    } else if headless {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                        });
+                        bus.send(AppEvent::TaskComplete {
+                            reason: format!("Approval required in headless mode ({})", cat),
+                            summary: None,
+                        });
+                        return Ok((loop_stats, LoopExitReason::Denied));
+                    } else {
+                        // Interactive mode (TUI/MCP): approval via registry
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        approval_registry.lock().unwrap().insert(turn as u64, tx);
+                        bus.send(AppEvent::ApprovalRequired {
+                            session_id: local_session_id.clone(),
+                            id: turn as u64,
+                            command_preview: preview.clone(),
+                            category: cat,
+                        });
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                let mut state = autonomy.write().await;
+                                state.level = AutonomyLevel::Full;
+                            }
+                            Ok(event::ApprovalResponse::Skip) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "skipped")
+                                });
+                                should_skip = true;
+                            }
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                // Distinguish a real user deny from an interrupt
+                                // that caused the watcher to drain the registry
+                                // with Deny as a synthetic response. Interrupt
+                                // takes precedence so the phase/exit reason
+                                // reflects what actually happened.
+                                if cancel_token.is_cancelled() {
+                                    bus.send(AppEvent::Interrupted {
+                                        session_id: local_session_id.clone(),
+                                        reason: "user requested".into(),
+                                    });
+                                    slog(&session_log, |l| {
+                                        l.info("Agent loop interrupted during approval wait")
+                                    });
+                                    return Ok((loop_stats, LoopExitReason::Interrupted));
+                                }
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                bus.send(AppEvent::TaskComplete {
+                                    reason: "Denied by user".to_string(),
+                                    summary: None,
+                                });
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
                         }
                     }
-                }
-            } // close dedup else block
+                } // close dedup else block
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
                 let preview = format_command_preview(&json_str);
@@ -5309,8 +5319,14 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, bus)
-                .await;
+            maybe_auto_launch_xvfb(
+                &json_str,
+                &mut xvfb_guard,
+                provider.name(),
+                &session_log,
+                bus,
+            )
+            .await;
 
             let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
@@ -5617,7 +5633,7 @@ All relative paths and commands execute from this directory.",
         &sub_agent_registry,
         &event::ContextInjectionQueue::default(),
         &mut None, // sub-agents get their own display if needed
-        true, // headless (sub-agents have no interactive UI)
+        true,      // headless (sub-agents have no interactive UI)
     )
     .await;
 
@@ -5900,8 +5916,7 @@ async fn run_with_presence(
     let project_root = project.root.clone();
 
     // Resolve external agent backend: CLI override > web UI selection > config default > None.
-    let initial_agent_backend =
-        resolve_agent_backend_from_config(agent_backend_override, &project);
+    let initial_agent_backend = resolve_agent_backend_from_config(agent_backend_override, &project);
     // Seed the shared state so the web UI reflects the initial selection.
     {
         let mut guard = shared_external_agent.write().await;
@@ -5917,7 +5932,9 @@ async fn run_with_presence(
     // External agent + thread — created on first task, reused for subsequent messages.
     let mut persistent_agent: Option<Box<dyn external_agent::ExternalAgent>> = None;
     let mut persistent_thread: Option<external_agent::AgentThread> = None;
-    let mut persistent_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>> = None;
+    let mut persistent_event_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    > = None;
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
@@ -6012,7 +6029,10 @@ async fn run_with_presence(
                     persistent_codex_config = None;
                     Ok("agent torn down; next task will start a fresh thread".to_string())
                 } else if let Some(ref mut agent) = persistent_agent {
-                    agent.thread_action(&op, &params).await.map_err(|e| e.to_string())
+                    agent
+                        .thread_action(&op, &params)
+                        .await
+                        .map_err(|e| e.to_string())
                 } else {
                     Err("no active agent — start a task first".to_string())
                 };
@@ -6083,10 +6103,7 @@ async fn run_with_presence(
                 // session reset (shut down, clear persistent state; the
                 // next task will re-initialize from scratch).
                 if let Some(ref mut agent) = persistent_agent {
-                    let backend_name = agent
-                        .name()
-                        .to_ascii_lowercase()
-                        .replace(' ', "-");
+                    let backend_name = agent.name().to_ascii_lowercase().replace(' ', "-");
                     match agent.rollback_turns(turns_to_drop).await {
                         Ok(()) => {
                             bus.send(AppEvent::ConversationRolledBack {
@@ -6178,23 +6195,24 @@ async fn run_with_presence(
         slog(&session_log, |l| {
             l.debug(&format!(
                 "{}task: {}",
-                if envelope.force_direct { "Direct " } else { "Presence dispatched " },
+                if envelope.force_direct {
+                    "Direct "
+                } else {
+                    "Presence dispatched "
+                },
                 envelope.task
             ));
         });
 
         // Resolve frame context_hints → images
-        let frame_images = resolve_frame_hints(
-            &envelope.context_hints, &frame_registry
-        ).await;
+        let frame_images = resolve_frame_hints(&envelope.context_hints, &frame_registry).await;
 
         // Resolve user-attached frames → images. These come from the dashboard's
         // "Attach" buttons (annotation toolbar / Video tab) and are appended to
         // the first user message of the agent conversation, in addition to
         // anything from `context_hints`.
-        let attachment_images = resolve_frame_ids(
-            &envelope.attachment_frame_ids, &frame_registry
-        ).await;
+        let attachment_images =
+            resolve_frame_ids(&envelope.attachment_frame_ids, &frame_registry).await;
         if !attachment_images.is_empty() {
             slog(&session_log, |l| {
                 l.debug(&format!(
@@ -6210,15 +6228,15 @@ async fn run_with_presence(
         slog(&session_log, |l| {
             l.debug(&format!(
                 "CU-first routing: force_direct={}, task={}",
-                envelope.force_direct, &envelope.task[..envelope.task.len().min(60)]
+                envelope.force_direct,
+                &envelope.task[..envelope.task.len().min(60)]
             ))
         });
 
         if !envelope.force_direct {
             // Auto-attach latest display frame(s) if none were explicitly provided
-            let mut reference_images = resolve_frame_ids(
-                &envelope.reference_frame_ids, &frame_registry
-            ).await;
+            let mut reference_images =
+                resolve_frame_ids(&envelope.reference_frame_ids, &frame_registry).await;
             if reference_images.is_empty() {
                 reference_images = auto_attach_display_frames(&frame_registry).await;
             }
@@ -6229,24 +6247,37 @@ async fn run_with_presence(
             cu_context_images.extend(attachment_images.iter().cloned());
 
             match try_cu_first(
-                &project_root, &reference_images, &cu_context_images,
-                &envelope.task, &session_log, &log_dir, &bus, &session_registry,
-            ).await {
+                &project_root,
+                &reference_images,
+                &cu_context_images,
+                &envelope.task,
+                &session_log,
+                &log_dir,
+                &bus,
+                &session_registry,
+            )
+            .await
+            {
                 Some(Ok(CuTaskResult::Completed(stats))) => {
                     cumulative_stats.turns += stats.turns;
                     bus.send(AppEvent::PresenceLog {
                         message: format!("CU task complete ({} turns)", stats.turns),
-                        level: None, turn: None,
+                        level: None,
+                        turn: None,
                     });
                     continue; // done
                 }
                 Some(Ok(CuTaskResult::Escalate { task })) => {
                     slog(&session_log, |l| {
-                        l.info(&format!("CU escalated to agent: {}", &task[..task.len().min(80)]))
+                        l.info(&format!(
+                            "CU escalated to agent: {}",
+                            &task[..task.len().min(80)]
+                        ))
                     });
                     bus.send(AppEvent::PresenceLog {
                         message: format!("Escalating to agent: {}", &task[..task.len().min(80)]),
-                        level: None, turn: None,
+                        level: None,
+                        turn: None,
                     });
                     task_for_agent = Some(task);
                 }
@@ -6280,18 +6311,16 @@ async fn run_with_presence(
         //  - backend changed (any agent)
         //  - backend is Codex and any of the Codex-locked fields differ
         //  - backend is Gemini and any of the Gemini-locked fields differ
-        let codex_config_changed = matches!(
-            agent_backend,
-            Some(external_agent::AgentBackend::Codex)
-        ) && persistent_codex_config
-            .as_ref()
-            .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
-        let gemini_config_changed = matches!(
-            agent_backend,
-            Some(external_agent::AgentBackend::GeminiCli)
-        ) && persistent_gemini_config
-            .as_ref()
-            .is_some_and(|prev| !gemini_runtime_config_equal(prev, &current_gemini_config));
+        let codex_config_changed =
+            matches!(agent_backend, Some(external_agent::AgentBackend::Codex))
+                && persistent_codex_config
+                    .as_ref()
+                    .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
+        let gemini_config_changed =
+            matches!(agent_backend, Some(external_agent::AgentBackend::GeminiCli))
+                && persistent_gemini_config
+                    .as_ref()
+                    .is_some_and(|prev| !gemini_runtime_config_equal(prev, &current_gemini_config));
 
         if persistent_agent.is_some()
             && (agent_backend != persistent_agent_backend
@@ -6359,7 +6388,8 @@ async fn run_with_presence(
                     gm.debug = current_gemini_config.debug;
                 }
                 let (agent, thread, event_rx) =
-                    match create_external_agent(backend, &proj, &session_log, web_port, None).await {
+                    match create_external_agent(backend, &proj, &session_log, web_port, None).await
+                    {
                         Ok(result) => result,
                         Err(e) => {
                             bus.send(AppEvent::PresenceLog {
@@ -6370,10 +6400,12 @@ async fn run_with_presence(
                             continue;
                         }
                     };
-                slog(&session_log, |l| l.debug(&format!(
-                    "Mode: external agent ({}) via presence, thread: {}",
-                    backend, thread.thread_id
-                )));
+                slog(&session_log, |l| {
+                    l.debug(&format!(
+                        "Mode: external agent ({}) via presence, thread: {}",
+                        backend, thread.thread_id
+                    ))
+                });
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
@@ -6403,14 +6435,13 @@ async fn run_with_presence(
             // lines so the agent sees them in the same turn's input.
             let agent = persistent_agent.as_mut().unwrap();
             let thread = persistent_thread.as_ref().unwrap();
-            let merged_text =
-                drain_steer_queue_as_followup(
-                    &context_injection,
-                    &task_text,
-                    &bus,
-                    session_log_id(&session_log).as_deref(),
-                )
-                    .unwrap_or_else(|| task_text.clone());
+            let merged_text = drain_steer_queue_as_followup(
+                &context_injection,
+                &task_text,
+                &bus,
+                session_log_id(&session_log).as_deref(),
+            )
+            .unwrap_or_else(|| task_text.clone());
             let send_result = if envelope.attachment_frame_ids.is_empty() {
                 agent.send_message(thread, &merged_text).await
             } else {
@@ -6437,7 +6468,8 @@ async fn run_with_presence(
             if let Err(e) = send_result {
                 bus.send(AppEvent::PresenceLog {
                     message: format!("External agent send error: {}", e),
-                    level: Some(types::LogLevel::Error), turn: None,
+                    level: Some(types::LogLevel::Error),
+                    turn: None,
                 });
                 continue;
             }
@@ -6457,11 +6489,18 @@ async fn run_with_presence(
                 headless: false,
                 context_injection: &context_injection,
             };
-            match drain_external_agent_events(agent, event_rx, &drain_config, &mut cumulative_stats).await {
-                DrainOutcome::TurnCompleted { message, turns_in_round } => {
+            match drain_external_agent_events(agent, event_rx, &drain_config, &mut cumulative_stats)
+                .await
+            {
+                DrainOutcome::TurnCompleted {
+                    message,
+                    turns_in_round,
+                } => {
                     cumulative_stats.turns += 1;
                     cumulative_stats.rounds += 1;
-                    bus.send(AppEvent::DoneSignal { message: message.clone() });
+                    bus.send(AppEvent::DoneSignal {
+                        message: message.clone(),
+                    });
                     // External-agent rounds: no native conversation to snapshot.
                     // Conversation rollback will use the backend's native
                     // mechanism (Codex thread/rollback) or fall back to a
@@ -6486,7 +6525,8 @@ async fn run_with_presence(
                 DrainOutcome::Terminated { reason, .. } => {
                     bus.send(AppEvent::PresenceLog {
                         message: format!("External agent terminated: {}", reason),
-                        level: Some(types::LogLevel::Error), turn: None,
+                        level: Some(types::LogLevel::Error),
+                        turn: None,
                     });
                     // Agent is gone — clear persistent state so next task re-initializes
                     persistent_agent = None;
@@ -6534,7 +6574,8 @@ async fn run_with_presence(
                 slog(&session_log, |l| {
                     l.info(&format!(
                         "Mode: direct (provider: {}, context: {})",
-                        task_provider.name(), task_provider.context_window()
+                        task_provider.name(),
+                        task_provider.context_window()
                     ));
                 });
 
@@ -6592,16 +6633,12 @@ async fn run_with_presence(
                 if combined_images.is_empty() {
                     conv.add_user(format!("[New Task] {}", task_text));
                 } else {
-                    conv.add_user_with_images(
-                        format!("[New Task] {}", task_text),
-                        combined_images,
-                    );
+                    conv.add_user_with_images(format!("[New Task] {}", task_text), combined_images);
                 }
             }
 
             // Run one round (agent loop until done/budget/error)
-            let (follow_up_tx, mut follow_up_rx) =
-                tokio::sync::mpsc::channel::<FollowUpMessage>(1);
+            let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
             drop(follow_up_tx); // single-round per task dispatch
 
             let result = run_round_loop(
@@ -6618,8 +6655,9 @@ async fn run_with_presence(
                 None, // no JSON approval
                 &approval_registry,
                 &context_injection, // shared with presence
-                false, // not headless
-            ).await;
+                false,              // not headless
+            )
+            .await;
 
             match result {
                 Ok(stats) => {
@@ -6709,7 +6747,9 @@ fn tail_orchestrator_log(
                 }
             }
             "reasoning" => {
-                if message.is_empty() { continue; }
+                if message.is_empty() {
+                    continue;
+                }
                 format!("Reasoning: {}", message)
             }
             "agent_input" => {
@@ -6732,11 +6772,15 @@ fn tail_orchestrator_log(
                 format!("Output: {}", preview)
             }
             "info" | "debug" | "warn" | "error" => {
-                if message.is_empty() { continue; }
+                if message.is_empty() {
+                    continue;
+                }
                 message.to_string()
             }
             _ => {
-                if message.is_empty() { continue; }
+                if message.is_empty() {
+                    continue;
+                }
                 format!("{}: {}", event, message)
             }
         };
@@ -6812,7 +6856,9 @@ async fn run_user_mode(
                 // Extract session log path from "Session log: <path>"
                 if line.starts_with("Session log: ") {
                     let path = PathBuf::from(line.trim_start_matches("Session log: ").trim());
-                    *orch_log_path_writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+                    *orch_log_path_writer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(path);
                 }
                 slog(&session_log_stderr, |l| {
                     l.debug(&format!("orchestrator stderr: {}", line));
@@ -7322,7 +7368,11 @@ async fn resolve_frame_hints(
     for hint in hints {
         if let Some(frame_list) = hint.strip_prefix("frames:") {
             let reg = registry.read().await;
-            for fid in frame_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for fid in frame_list
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 match reg.read_hq(fid) {
                     Ok(data) => {
                         use base64::Engine;
@@ -7422,8 +7472,7 @@ async fn resolve_attachments(
     let mut out: Vec<external_agent::AgentAttachment> = Vec::with_capacity(ids.len());
     for raw in ids {
         if let Some(upload_id) = raw.strip_prefix("upload:") {
-            let Some(d) = upload_store::find_upload(upload_id, session_dir, project_root)
-            else {
+            let Some(d) = upload_store::find_upload(upload_id, session_dir, project_root) else {
                 continue;
             };
             if d.is_image() {
@@ -7535,7 +7584,13 @@ async fn capture_display_screenshot(
     } else {
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
         tokio::process::Command::new("import")
-            .args(["-window", "root", "-display", &display, &screenshot_path.to_string_lossy()])
+            .args([
+                "-window",
+                "root",
+                "-display",
+                &display,
+                &screenshot_path.to_string_lossy(),
+            ])
             .output()
             .await
             .map(|o| o.status.success())
@@ -7568,7 +7623,9 @@ async fn try_cu_first(
     slog(session_log, |l| {
         l.info(&format!(
             "try_cu_first: ref_images={}, frame_images={}, task={}",
-            reference_images.len(), frame_images.len(), &task[..task.len().min(60)]
+            reference_images.len(),
+            frame_images.len(),
+            &task[..task.len().min(60)]
         ))
     });
 
@@ -7636,7 +7693,9 @@ async fn try_cu_first(
     slog(session_log, |l| {
         l.info(&format!(
             "CU-first: {} (provider: {}, model: {})",
-            &task[..task.len().min(80)], cu_provider.name(), cu_provider.model()
+            &task[..task.len().min(80)],
+            cu_provider.name(),
+            cu_provider.model()
         ))
     });
     bus.send(event::AppEvent::PresenceLog {
@@ -7645,17 +7704,20 @@ async fn try_cu_first(
         turn: None,
     });
 
-    Some(run_cu_task(
-        cu_provider.as_ref(),
-        task,
-        reference_images.to_vec(),
-        frame_images.to_vec(),
-        session_log,
-        log_dir,
-        bus,
-        &proj.config.computer_use,
-        None, // auto-resolve display target
-    ).await)
+    Some(
+        run_cu_task(
+            cu_provider.as_ref(),
+            task,
+            reference_images.to_vec(),
+            frame_images.to_vec(),
+            session_log,
+            log_dir,
+            bus,
+            &proj.config.computer_use,
+            None, // auto-resolve display target
+        )
+        .await,
+    )
 }
 
 /// Spawn a listener that reacts to display grant/revoke events.
@@ -7671,12 +7733,21 @@ pub fn spawn_user_display_listener(
         loop {
             match rx.recv().await {
                 Ok(AppEvent::UserDisplayGranted { display_id }) => {
-                    activate_user_display(&bus, &session_registry, frame_registry.clone(), display_id).await;
+                    activate_user_display(
+                        &bus,
+                        &session_registry,
+                        frame_registry.clone(),
+                        display_id,
+                    )
+                    .await;
                 }
                 Ok(AppEvent::UserDisplayRevoked { display_id, .. }) => {
                     deactivate_user_display(&session_registry, display_id).await;
                 }
-                Ok(AppEvent::DisplayCaptureLost { display_id, ref reason }) => {
+                Ok(AppEvent::DisplayCaptureLost {
+                    display_id,
+                    ref reason,
+                }) => {
                     // Capture backend stopped unexpectedly (portal session
                     // ended, backend crashed, etc.).  Remove the session from
                     // the registry so a re-grant creates a fresh one.
@@ -7709,9 +7780,15 @@ pub fn spawn_user_display_listener(
 /// cycle serialized behind `session.stop().await` — "turn on, wait
 /// 20+s, turn on is instant" mapped exactly to "the old stop finally
 /// finished and the listener got to the new grant".
-async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry, display_id: u32) {
+async fn deactivate_user_display(
+    session_registry: &display::SharedSessionRegistry,
+    display_id: u32,
+) {
     if let Some(session) = session_registry.write().await.remove(display_id) {
-        eprintln!("[user_display] Stopping display session for :{}", display_id);
+        eprintln!(
+            "[user_display] Stopping display session for :{}",
+            display_id
+        );
         tokio::spawn(async move {
             session.stop().await;
         });
@@ -7740,7 +7817,10 @@ async fn activate_user_display(
     if std::env::var("WAYLAND_DISPLAY").is_ok() || detect_wayland_socket().is_some() {
         if let Some(socket) = detect_wayland_socket() {
             if std::env::var("WAYLAND_DISPLAY").is_err() {
-                eprintln!("[user_display] WAYLAND_DISPLAY not set, detected socket: {}", socket);
+                eprintln!(
+                    "[user_display] WAYLAND_DISPLAY not set, detected socket: {}",
+                    socket
+                );
                 std::env::set_var("WAYLAND_DISPLAY", &socket);
             }
             if std::env::var("XDG_RUNTIME_DIR").is_err() {
@@ -7749,9 +7829,7 @@ async fn activate_user_display(
                 std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
             }
         }
-        eprintln!(
-            "[user_display] Requesting Wayland screen capture via XDG portal..."
-        );
+        eprintln!("[user_display] Requesting Wayland screen capture via XDG portal...");
         eprintln!(
             "[user_display] A screen-sharing dialog should appear on the display — \
              approve it to enable video capture"
@@ -7780,7 +7858,11 @@ async fn activate_user_display(
                 let session = Arc::new(session);
                 session.spawn_metrics_logger(Some(bus.clone()));
                 session_registry.write().await.insert(display_id, session);
-                bus.send(AppEvent::DisplayReady { display_id, width, height });
+                bus.send(AppEvent::DisplayReady {
+                    display_id,
+                    width,
+                    height,
+                });
                 return;
             }
             Ok(Err(e)) => {
@@ -7799,8 +7881,7 @@ async fn activate_user_display(
     // X11: detect display and create a DisplaySession with X11Backend.
     #[cfg(target_os = "linux")]
     {
-        let has_x11 = std::env::var("DISPLAY").is_ok()
-            || vision::detect_x11_display().is_some();
+        let has_x11 = std::env::var("DISPLAY").is_ok() || vision::detect_x11_display().is_some();
         if has_x11 {
             // Ensure DISPLAY is set for downstream tools (xdotool, import, etc.)
             if std::env::var("DISPLAY").is_err() {
@@ -7840,14 +7921,21 @@ async fn activate_user_display(
             };
             if let Ok(backend) = backend {
                 let session = display::DisplaySession::new(display_id, Arc::new(backend));
-                if let Err(e) = session.start(30, frame_registry.clone(), Some(bus.clone())).await {
+                if let Err(e) = session
+                    .start(30, frame_registry.clone(), Some(bus.clone()))
+                    .await
+                {
                     eprintln!("[user_display] X11 display session failed: {}", e);
                 } else {
                     let (width, height) = session.resolution();
                     let session = Arc::new(session);
                     session.spawn_metrics_logger(Some(bus.clone()));
                     session_registry.write().await.insert(display_id, session);
-                    bus.send(AppEvent::DisplayReady { display_id, width, height });
+                    bus.send(AppEvent::DisplayReady {
+                        display_id,
+                        width,
+                        height,
+                    });
                     return;
                 }
             }
@@ -7863,7 +7951,10 @@ async fn activate_user_display(
             if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
                 display::macos::MacOSBackend::with_display_id(info.platform_id as u32)
             } else {
-                eprintln!("[user_display] display_id {} not found, falling back to primary", target_display_id);
+                eprintln!(
+                    "[user_display] display_id {} not found, falling back to primary",
+                    target_display_id
+                );
                 display::macos::MacOSBackend::new()
             }
         } else {
@@ -7877,7 +7968,11 @@ async fn activate_user_display(
             let session = Arc::new(session);
             session.spawn_metrics_logger(Some(bus.clone()));
             session_registry.write().await.insert(display_id, session);
-            bus.send(AppEvent::DisplayReady { display_id, width, height });
+            bus.send(AppEvent::DisplayReady {
+                display_id,
+                width,
+                height,
+            });
             return;
         }
     }
@@ -7993,7 +8088,8 @@ async fn run_cu_task(
     let display_target = target_override.unwrap_or_else(resolve_cu_display_target);
 
     // CU-first system prompt: handle display tasks or escalate
-    let system_prompt = "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
+    let system_prompt =
+        "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
         ROUTING:\n\
         - If the task involves the display (clicking, typing, scrolling, pressing buttons, \
           opening apps, interacting with GUI elements), handle it with your computer use tools.\n\
@@ -8008,12 +8104,17 @@ async fn run_cu_task(
         RULES:\n\
         - Perform ONLY the requested task, nothing else.\n\
         - Once done, STOP. Do not take additional actions.\n\
-        - Be precise with coordinates. Act efficiently.".to_string();
+        - Be precise with coordinates. Act efficiently."
+            .to_string();
 
     // No display frames at all → escalate immediately without API call
     if reference_images.is_empty() && context_images.is_empty() {
-        slog(session_log, |l| l.info("CU: no display frames available, escalating"));
-        return Ok(CuTaskResult::Escalate { task: task.to_string() });
+        slog(session_log, |l| {
+            l.info("CU: no display frames available, escalating")
+        });
+        return Ok(CuTaskResult::Escalate {
+            task: task.to_string(),
+        });
     }
 
     let ref_image_count = reference_images.len();
@@ -8025,15 +8126,14 @@ async fn run_cu_task(
             "The user was looking at this screen when they made their request:".to_string(),
             reference_images,
         );
-        conv.add_assistant("I can see the reference screen. I'll compare this with the current state.".to_string());
+        conv.add_assistant(
+            "I can see the reference screen. I'll compare this with the current state.".to_string(),
+        );
     }
 
     // Inject context images
     if !context_images.is_empty() {
-        conv.add_user_with_images(
-            "Additional context:".to_string(),
-            context_images,
-        );
+        conv.add_user_with_images("Additional context:".to_string(), context_images);
         conv.add_assistant("Noted.".to_string());
     }
 
@@ -8054,11 +8154,12 @@ async fn run_cu_task(
     for turn in 1..=CU_TASK_MAX_TURNS {
         stats.turns = turn;
 
-        slog(session_log, |l| l.info(&format!("CU turn {} starting", turn)));
+        slog(session_log, |l| {
+            l.info(&format!("CU turn {} starting", turn))
+        });
 
-        let response = provider.chat_stream(
-            conv.messages(),
-            &|event| {
+        let response = provider
+            .chat_stream(conv.messages(), &|event| {
                 if let provider::StreamEvent::Delta(ref delta) = event {
                     bus.send(AppEvent::PresenceLog {
                         message: format!("[CU] {}", delta),
@@ -8066,8 +8167,8 @@ async fn run_cu_task(
                         turn: Some(turn),
                     });
                 }
-            },
-        ).await?;
+            })
+            .await?;
 
         conv.set_usage(response.usage.clone());
 
@@ -8079,7 +8180,11 @@ async fn run_cu_task(
                 .flat_map(|cu| cu.actions.iter().map(|a| format!("{:?}", a)))
                 .collect();
             for tc in &response.tool_calls {
-                actions_desc.push(format!("{}({})", tc.name, &tc.arguments[..tc.arguments.len().min(100)]));
+                actions_desc.push(format!(
+                    "{}({})",
+                    tc.name,
+                    &tc.arguments[..tc.arguments.len().min(100)]
+                ));
             }
             slog(session_log, |l| {
                 l.cu_turn(
@@ -8103,11 +8208,20 @@ async fn run_cu_task(
             });
         }
         // Check for escalation before processing anything else
-        if let Some(esc_call) = response.tool_calls.iter().find(|tc| tc.name == "escalate_to_agent") {
-            let args: serde_json::Value = serde_json::from_str(&esc_call.arguments).unwrap_or_default();
+        if let Some(esc_call) = response
+            .tool_calls
+            .iter()
+            .find(|tc| tc.name == "escalate_to_agent")
+        {
+            let args: serde_json::Value =
+                serde_json::from_str(&esc_call.arguments).unwrap_or_default();
             let escalated_task = args["task"].as_str().unwrap_or(task).to_string();
-            slog(session_log, |l| l.cu_task_error("escalated", Some(&escalated_task)));
-            return Ok(CuTaskResult::Escalate { task: escalated_task });
+            slog(session_log, |l| {
+                l.cu_task_error("escalated", Some(&escalated_task))
+            });
+            return Ok(CuTaskResult::Escalate {
+                task: escalated_task,
+            });
         }
 
         // Handle unrecognized function tool calls: return error results so the
@@ -8209,15 +8323,12 @@ async fn run_cu_task(
                 )
                 .await;
 
-                let last_screenshot =
-                    results.iter().rev().find_map(|r| r.screenshot.as_ref());
+                let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
                 let output = if results.iter().all(|r| r.success) {
                     "Actions executed successfully.".to_string()
                 } else {
-                    let errors: Vec<&str> = results
-                        .iter()
-                        .filter_map(|r| r.error.as_deref())
-                        .collect();
+                    let errors: Vec<&str> =
+                        results.iter().filter_map(|r| r.error.as_deref()).collect();
                     format!("Some actions failed: {}", errors.join("; "))
                 };
 
@@ -8244,7 +8355,9 @@ async fn run_cu_task(
             });
         }
         if turn >= CU_TASK_MAX_TURNS {
-            slog(session_log, |l| l.cu_task_error("CU task hit max turns", None));
+            slog(session_log, |l| {
+                l.cu_task_error("CU task hit max turns", None)
+            });
         }
     }
 
@@ -8271,19 +8384,37 @@ async fn execute_cu_calls(
 
     for cu_call in cu_calls {
         // Build human-readable description of CU actions
-        let action_descs: Vec<String> = cu_call.actions.iter().map(|a| {
-            match a {
-                computer_use::CuAction::Click { x, y, button } => format!("click({},{} {:?})", x, y, button),
-                computer_use::CuAction::DoubleClick { x, y, .. } => format!("double_click({},{})", x, y),
-                computer_use::CuAction::Type { text } => format!("type(\"{}\")", &text[..text.len().min(50)]),
+        let action_descs: Vec<String> = cu_call
+            .actions
+            .iter()
+            .map(|a| match a {
+                computer_use::CuAction::Click { x, y, button } => {
+                    format!("click({},{} {:?})", x, y, button)
+                }
+                computer_use::CuAction::DoubleClick { x, y, .. } => {
+                    format!("double_click({},{})", x, y)
+                }
+                computer_use::CuAction::Type { text } => {
+                    format!("type(\"{}\")", &text[..text.len().min(50)])
+                }
                 computer_use::CuAction::Key { key } => format!("key({})", key),
-                computer_use::CuAction::Scroll { x, y, direction, amount } => format!("scroll({},{} {:?} {})", x, y, direction, amount),
+                computer_use::CuAction::Scroll {
+                    x,
+                    y,
+                    direction,
+                    amount,
+                } => format!("scroll({},{} {:?} {})", x, y, direction, amount),
                 computer_use::CuAction::MoveMouse { x, y } => format!("move({},{})", x, y),
-                computer_use::CuAction::Drag { start_x, start_y, end_x, end_y } => format!("drag({},{}->{},{})", start_x, start_y, end_x, end_y),
+                computer_use::CuAction::Drag {
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                } => format!("drag({},{}->{},{})", start_x, start_y, end_x, end_y),
                 computer_use::CuAction::Screenshot => "screenshot".to_string(),
                 computer_use::CuAction::Wait { ms } => format!("wait({}ms)", ms),
-            }
-        }).collect();
+            })
+            .collect();
         let desc = action_descs.join(" → ");
         slog(session_log, |l| l.info(&format!("CU: {}", desc)));
 
@@ -8296,16 +8427,15 @@ async fn execute_cu_calls(
             counter,
             &None,
             None,
-        ).await;
+        )
+        .await;
 
         // Find the last screenshot from results
         let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
         let output = if results.iter().all(|r| r.success) {
             "Actions executed successfully.".to_string()
         } else {
-            let errors: Vec<&str> = results.iter()
-                .filter_map(|r| r.error.as_deref())
-                .collect();
+            let errors: Vec<&str> = results.iter().filter_map(|r| r.error.as_deref()).collect();
             format!("Some actions failed: {}", errors.join("; "))
         };
 
@@ -8422,7 +8552,8 @@ async fn main() -> Result<(), CallerError> {
             // app-backend.log or stderr captures.
             if let Some(dir) = PANIC_LOG_DIR.get() {
                 let panic_path = dir.join("panic.log");
-                let msg = format!("{}\n\nBacktrace:\n{:?}\n",
+                let msg = format!(
+                    "{}\n\nBacktrace:\n{:?}\n",
                     info,
                     std::backtrace::Backtrace::force_capture(),
                 );
@@ -8556,8 +8687,9 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Create shared frame registry for video frame storage.
-    let frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>> =
-        Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(&log_dir)));
+    let frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>> = Arc::new(
+        tokio::sync::RwLock::new(frames::FrameRegistry::new(&log_dir)),
+    );
 
     // Create recording registry (listener spawned after bus creation in each mode).
     if project.config.recording.enabled && !recording::is_ffmpeg_available() {
@@ -8669,9 +8801,8 @@ async fn main() -> Result<(), CallerError> {
 
     // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
-        let provider = provider.ok_or_else(|| {
-            CallerError::Config("Sub-agent mode requires an API key".to_string())
-        })?;
+        let provider = provider
+            .ok_or_else(|| CallerError::Config("Sub-agent mode requires an API key".to_string()))?;
         run_sub_agent_mode(provider, id, role, session_log, log_dir).await?;
         return Ok(());
     }
@@ -8719,9 +8850,16 @@ async fn main() -> Result<(), CallerError> {
         let bus = EventBus::new();
         let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
+            bus.subscribe(),
+            recording_registry.clone(),
+            bus.clone(),
+            Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
+        let _user_display_listener = spawn_user_display_listener(
+            bus.clone(),
+            session_registry.clone(),
+            Some(frame_registry.clone()),
+        );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = Some(debug::spawn_debug_screen_handler(
             bus.subscribe(),
@@ -8768,30 +8906,35 @@ async fn main() -> Result<(), CallerError> {
             project.config.transcription.enabled,
             project.config.webrtc.to_ice_config(),
         );
-        let shared_session = Arc::new(tokio::sync::RwLock::new(
-            web_gateway::ActiveSessionState {
-                query_ctx: None,
-                frame_registry: Some(frame_registry.clone()),
-                session_log: None,
-                recording_registry: Some(recording_registry.clone()),
-                session_registry: Some(session_registry.clone()),
-                snapshot_dir: Some(log_dir.join("file_snapshots")),
-                project_root_for_changes: Some(project.root.clone()),
-                file_watcher: shared_file_watcher.clone(),
-            },
-        ));
-        let mut mcp_http_state =
-            mcp::McpAppState::new("none".into(), "none".into(), autonomy.clone(), log_dir.clone());
+        let shared_session = Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+            query_ctx: None,
+            frame_registry: Some(frame_registry.clone()),
+            session_log: None,
+            recording_registry: Some(recording_registry.clone()),
+            session_registry: Some(session_registry.clone()),
+            snapshot_dir: Some(log_dir.join("file_snapshots")),
+            project_root_for_changes: Some(project.root.clone()),
+            file_watcher: shared_file_watcher.clone(),
+        }));
+        let mut mcp_http_state = mcp::McpAppState::new(
+            "none".into(),
+            "none".into(),
+            autonomy.clone(),
+            log_dir.clone(),
+        );
         mcp_http_state.frame_registry = Some(frame_registry.clone());
         mcp_http_state.session_registry = Some(session_registry.clone());
         mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
         let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
-            Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+            Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
+            bus.clone(),
         )));
         let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
         let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
         let _web_handle = web_gateway::spawn_web_gateway(
-            web_listener.take().expect("web listener must exist when use_web"),
+            web_listener
+                .take()
+                .expect("web listener must exist when use_web"),
             bus.clone(),
             outbound_tx.clone(),
             web_config,
@@ -8817,30 +8960,34 @@ async fn main() -> Result<(), CallerError> {
             Arc::new(tokio::sync::RwLock::new(agent_backend));
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
-            Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
-                command: cfg.command.clone(),
-                sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
-                approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
-                model: cfg.model.clone(),
-                reasoning_effort: project::normalize_reasoning_effort(
-                    cfg.reasoning_effort.as_deref(),
-                ),
-                web_search: cfg.web_search,
-                network_access: cfg.network_access,
-                writable_roots: cfg.writable_roots.clone(),
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::CodexRuntimeConfig {
+                    command: cfg.command.clone(),
+                    sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                    approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                    model: cfg.model.clone(),
+                    reasoning_effort: project::normalize_reasoning_effort(
+                        cfg.reasoning_effort.as_deref(),
+                    ),
+                    web_search: cfg.web_search,
+                    network_access: cfg.network_access,
+                    writable_roots: cfg.writable_roots.clone(),
+                },
+            ))
         };
         let shared_gemini_config: control_plane::SharedGeminiConfig = {
             let cfg = &project.config.agent.gemini_cli;
-            Arc::new(tokio::sync::RwLock::new(control_plane::GeminiRuntimeConfig {
-                model: cfg.model.clone(),
-                approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
-                sandbox: cfg.sandbox,
-                extensions: cfg.extensions.clone(),
-                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                include_directories: cfg.include_directories.clone(),
-                debug: cfg.debug,
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::GeminiRuntimeConfig {
+                    model: cfg.model.clone(),
+                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                    sandbox: cfg.sandbox,
+                    extensions: cfg.extensions.clone(),
+                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                    include_directories: cfg.include_directories.clone(),
+                    debug: cfg.debug,
+                },
+            ))
         };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
@@ -8854,20 +9001,18 @@ async fn main() -> Result<(), CallerError> {
             },
         );
 
-        session_supervisor::SessionSupervisor::new(
-            session_supervisor::SessionSupervisorConfig {
-                bus,
-                project_root: project.root.clone(),
-                autonomy,
-                shared_external_agent,
-                shared_codex_config,
-                shared_gemini_config,
-                frame_registry,
-                web_port: web_port_for_agent,
-                flags_direct: flags.direct,
-                shared_session: Some(shared_session),
-            },
-        )
+        session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
+            bus,
+            project_root: project.root.clone(),
+            autonomy,
+            shared_external_agent,
+            shared_codex_config,
+            shared_gemini_config,
+            frame_registry,
+            web_port: web_port_for_agent,
+            flags_direct: flags.direct,
+            shared_session: Some(shared_session),
+        })
         .run()
         .await;
         return Ok(());
@@ -8883,9 +9028,16 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
         let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
+            bus.subscribe(),
+            recording_registry.clone(),
+            bus.clone(),
+            Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
+        let _user_display_listener = spawn_user_display_listener(
+            bus.clone(),
+            session_registry.clone(),
+            Some(frame_registry.clone()),
+        );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
@@ -8927,23 +9079,17 @@ async fn main() -> Result<(), CallerError> {
 
         // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
         // shared broadcast channel.
-        let _outbound_broadcaster = event::spawn_outbound_broadcaster(
-            bus.subscribe(),
-            outbound_tx.clone(),
-        );
+        let _outbound_broadcaster =
+            event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
 
         // Wire session log writer: persists bus events that aren't logged inline.
-        let _session_log_writer = event::spawn_session_log_writer(
-            bus.subscribe(),
-            session_log.clone(),
-        );
+        let _session_log_writer =
+            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(
-                project.root.clone(), snapshot_dir, bus.clone(),
-            ) {
+            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
                     let (fw, wh, rh) = watcher.start_shared();
                     (Some(fw), Some(wh), Some(rh))
@@ -8977,8 +9123,8 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.to_ice_config(),
             );
             let snapshot_dir = log_dir.join("file_snapshots");
-            let shared_session = Arc::new(tokio::sync::RwLock::new(
-                web_gateway::ActiveSessionState {
+            let shared_session =
+                Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
                     query_ctx: None,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),
@@ -8987,24 +9133,26 @@ async fn main() -> Result<(), CallerError> {
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
                     file_watcher: shared_file_watcher.clone(),
-                },
-            ));
+                }));
             let mut mcp_http_state = mcp::McpAppState::new(
-                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+                "none".into(),
+                "none".into(),
+                autonomy.clone(),
+                log_dir.clone(),
             );
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
             let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
-                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
+                bus.clone(),
             )));
-            let peer_registry = build_and_hydrate_peer_registry(
-                &log_dir,
-                &project.config.peers,
-            );
+            let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
             let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let handle = web_gateway::spawn_web_gateway(
-                web_listener.take().expect("web listener must exist when use_web"),
+                web_listener
+                    .take()
+                    .expect("web listener must exist when use_web"),
                 bus.clone(),
                 broadcast_tx,
                 config,
@@ -9023,28 +9171,31 @@ async fn main() -> Result<(), CallerError> {
                 )?,
             );
             slog(&session_log, |l| {
-                l.info(&format!(
-                    "Web TUI: http://0.0.0.0:{}",
-                    web_port
-                ))
+                l.info(&format!("Web TUI: http://0.0.0.0:{}", web_port))
             });
-            eprintln!(
-                "Web TUI: http://0.0.0.0:{}",
-                web_port
-            );
+            eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
             Some(handle)
         } else {
             None
         };
 
         let mut mcp_app_state = mcp::McpAppState::new(
-            provider.as_ref().map(|p| p.name().to_string()).unwrap_or_else(|| "none".to_string()),
-            provider.as_ref().map(|p| p.model().to_string()).unwrap_or_else(|| "none".to_string()),
+            provider
+                .as_ref()
+                .map(|p| p.name().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            provider
+                .as_ref()
+                .map(|p| p.model().to_string())
+                .unwrap_or_else(|| "none".to_string()),
             autonomy.clone(),
             log_dir.clone(),
         );
         mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
-        mcp_app_state.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
+        mcp_app_state.session_id = session_log
+            .lock()
+            .map(|l| l.session_id().to_string())
+            .unwrap_or_default();
         mcp_app_state.task_description = task.clone().unwrap_or_default();
         mcp_app_state.frame_registry = Some(frame_registry.clone());
         mcp_app_state.session_registry = Some(session_registry.clone());
@@ -9127,8 +9278,7 @@ async fn main() -> Result<(), CallerError> {
                 };
 
                 // Create follow-up channel for multi-round support
-                let (follow_up_tx, follow_up_rx) =
-                    tokio::sync::mpsc::channel::<FollowUpMessage>(1);
+                let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
                 {
                     let mut s = mcp_state.write().await;
                     s.follow_up_tx = Some(follow_up_tx);
@@ -9291,9 +9441,16 @@ async fn main() -> Result<(), CallerError> {
             event::shared_question_path(log_dir.join("human_question")),
         );
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
+            bus.subscribe(),
+            recording_registry.clone(),
+            bus.clone(),
+            Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
+        let _user_display_listener = spawn_user_display_listener(
+            bus.clone(),
+            session_registry.clone(),
+            Some(frame_registry.clone()),
+        );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
@@ -9311,13 +9468,22 @@ async fn main() -> Result<(), CallerError> {
 
         // Create app state
         let mut app = tui::app::App::new(
-            provider.as_ref().map(|p| p.name().to_string()).unwrap_or_else(|| "none".to_string()),
-            provider.as_ref().map(|p| p.model().to_string()).unwrap_or_else(|| "none".to_string()),
+            provider
+                .as_ref()
+                .map(|p| p.name().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            provider
+                .as_ref()
+                .map(|p| p.model().to_string())
+                .unwrap_or_else(|| "none".to_string()),
             autonomy.clone(),
             log_dir.clone(),
         );
         app.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
-        app.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
+        app.session_id = session_log
+            .lock()
+            .map(|l| l.session_id().to_string())
+            .unwrap_or_default();
         app.task_description = task.clone().unwrap_or_default();
         app.project_root = Some(project.root.clone());
         app.knowledge_path = Some(project.memory_path());
@@ -9361,23 +9527,22 @@ async fn main() -> Result<(), CallerError> {
         // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
         // shared broadcast channel (control socket / web gateway).
         let _outbound_broadcaster = if let Some(ref tx) = app.control_tx {
-            Some(event::spawn_outbound_broadcaster(bus.subscribe(), tx.clone()))
+            Some(event::spawn_outbound_broadcaster(
+                bus.subscribe(),
+                tx.clone(),
+            ))
         } else {
             None
         };
 
         // Wire session log writer: persists bus events that aren't logged inline.
-        let _session_log_writer = event::spawn_session_log_writer(
-            bus.subscribe(),
-            session_log.clone(),
-        );
+        let _session_log_writer =
+            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(
-                project.root.clone(), snapshot_dir, bus.clone(),
-            ) {
+            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
                     let (fw, wh, rh) = watcher.start_shared();
                     (Some(fw), Some(wh), Some(rh))
@@ -9396,16 +9561,14 @@ async fn main() -> Result<(), CallerError> {
         // Determine if presence layer should be active.
         // Note: --direct only forces single-agent mode for the worker; it does
         // NOT disable presence.  Use --no-presence to disable presence.
-        let use_presence = !flags.no_presence
-            && project.config.presence.enabled;
+        let use_presence = !flags.no_presence && project.config.presence.enabled;
 
         // Create follow-up channel for multi-round support.
         // When there is no initial task, the follow-up channel also delivers
         // the very first task from the input panel. Owned by the task
         // dispatcher (spawned below), not the TUI — the TUI emits
         // ControlCommand on the bus, the dispatcher routes.
-        let (follow_up_tx, mut follow_up_rx) =
-            tokio::sync::mpsc::channel::<FollowUpMessage>(4);
+        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(4);
 
         // If no task was provided, start in follow-up mode so the user sees
         // the input panel immediately.
@@ -9425,9 +9588,13 @@ async fn main() -> Result<(), CallerError> {
         // and the shared agent state snapshot. The presence_tx sender is owned by
         // the task dispatcher (spawned below), which routes non-direct user text
         // through the presence LLM.
-        let (presence_user_rx, presence_event_rx_for_task, presence_agent_state, presence_tx_for_dispatch) = if use_presence {
-            let (presence_tx, presence_user_rx) =
-                tokio::sync::mpsc::channel::<String>(4);
+        let (
+            presence_user_rx,
+            presence_event_rx_for_task,
+            presence_agent_state,
+            presence_tx_for_dispatch,
+        ) = if use_presence {
+            let (presence_tx, presence_user_rx) = tokio::sync::mpsc::channel::<String>(4);
 
             // Create presence event channel: TUI forwards filtered events here
             let (presence_event_tx, presence_event_rx) =
@@ -9435,23 +9602,36 @@ async fn main() -> Result<(), CallerError> {
             app.set_presence_event_sender(presence_event_tx);
 
             // Shared agent state: updated by TUI (via forward_to_presence), read by presence tools
-            let agent_state = Arc::new(std::sync::Mutex::new(presence::AgentStateSnapshot::default()));
+            let agent_state = Arc::new(std::sync::Mutex::new(
+                presence::AgentStateSnapshot::default(),
+            ));
             app.set_presence_agent_state(agent_state.clone());
 
-            app.log_sourced(types::LogLevel::Info, "Presence layer active".to_string(), tui::app::LogSource::Presence, None);
+            app.log_sourced(
+                types::LogLevel::Info,
+                "Presence layer active".to_string(),
+                tui::app::LogSource::Presence,
+                None,
+            );
             // If there's an initial task, set the phase to Thinking immediately
             // so the TUI doesn't sit at "Idle" during the presence API call.
             if task.is_some() {
                 app.current_phase = types::Phase::Thinking;
             }
-            (Some(presence_user_rx), Some(presence_event_rx), Some(agent_state), Some(presence_tx))
+            (
+                Some(presence_user_rx),
+                Some(presence_event_rx),
+                Some(agent_state),
+                Some(presence_tx),
+            )
         } else {
             (None, None, None, None)
         };
 
         // Create the shared PresenceSession for event replay and checkpoints
         let presence_session = {
-            let sid = session_log.lock()
+            let sid = session_log
+                .lock()
                 .map(|l| l.session_id().to_string())
                 .unwrap_or_default();
             Arc::new(Mutex::new(presence::PresenceSession::new(sid)))
@@ -9468,8 +9648,7 @@ async fn main() -> Result<(), CallerError> {
         // `follow_up_tx` instead, which is consumed by
         // `run_external_agent_mode` / `run_direct_mode`.
         let (task_tx, task_rx) = if use_presence {
-            let (tx, rx) =
-                tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
+            let (tx, rx) = tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -9498,9 +9677,11 @@ async fn main() -> Result<(), CallerError> {
         // (no live updates), but context_injection is still wired through.
         let mut web_shared_session_for_supervisor: Option<web_gateway::SharedActiveSession> = None;
         let _web_handle = if let Some(broadcast_tx) = web_broadcast_tx {
-            let query_ctx_agent_state = presence_agent_state
-                .clone()
-                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(presence::AgentStateSnapshot::default())));
+            let query_ctx_agent_state = presence_agent_state.clone().unwrap_or_else(|| {
+                Arc::new(std::sync::Mutex::new(
+                    presence::AgentStateSnapshot::default(),
+                ))
+            });
             let query_ctx = Some(web_gateway::WebQueryCtx {
                 agent_state: query_ctx_agent_state,
                 project_root: project.root.clone(),
@@ -9514,7 +9695,10 @@ async fn main() -> Result<(), CallerError> {
                     match transcription::WhisperTranscriber::new(&project.config.transcription) {
                         Ok(t) => Some(std::sync::Arc::new(t)),
                         Err(e) => {
-                            app.log(types::LogLevel::Warn, format!("Transcription init failed: {}", e));
+                            app.log(
+                                types::LogLevel::Warn,
+                                format!("Transcription init failed: {}", e),
+                            );
                             None
                         }
                     }
@@ -9528,8 +9712,8 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.to_ice_config(),
             );
             let snapshot_dir = log_dir.join("file_snapshots");
-            let shared_session = Arc::new(tokio::sync::RwLock::new(
-                web_gateway::ActiveSessionState {
+            let shared_session =
+                Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
                     query_ctx,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),
@@ -9538,29 +9722,31 @@ async fn main() -> Result<(), CallerError> {
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
                     file_watcher: shared_file_watcher.clone(),
-                },
-            ));
+                }));
             web_shared_session_for_supervisor = Some(shared_session.clone());
             // Create MCP server for HTTP transport (display/CU tools for external agents)
             let mut mcp_http_state = mcp::McpAppState::new(
-                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+                "none".into(),
+                "none".into(),
+                autonomy.clone(),
+                log_dir.clone(),
             );
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
             let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
-                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
+                bus.clone(),
             )));
-            let peer_registry = build_and_hydrate_peer_registry(
-                &log_dir,
-                &project.config.peers,
-            );
+            let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
             // Browser-voice SubmitTask actions go via the EventBus → dispatcher
             // path (task_tx=None triggers the fallback at web_gateway.rs),
             // keeping a single routing authority.
             let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let handle = web_gateway::spawn_web_gateway(
-                web_listener.take().expect("web listener must exist when use_web"),
+                web_listener
+                    .take()
+                    .expect("web listener must exist when use_web"),
                 bus.clone(),
                 broadcast_tx,
                 config,
@@ -9618,30 +9804,34 @@ async fn main() -> Result<(), CallerError> {
         // toggle takes effect on the next task without needing a restart.
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
-            Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
-                command: cfg.command.clone(),
-                sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
-                approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
-                model: cfg.model.clone(),
-                reasoning_effort: project::normalize_reasoning_effort(
-                    cfg.reasoning_effort.as_deref(),
-                ),
-                web_search: cfg.web_search,
-                network_access: cfg.network_access,
-                writable_roots: cfg.writable_roots.clone(),
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::CodexRuntimeConfig {
+                    command: cfg.command.clone(),
+                    sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                    approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                    model: cfg.model.clone(),
+                    reasoning_effort: project::normalize_reasoning_effort(
+                        cfg.reasoning_effort.as_deref(),
+                    ),
+                    web_search: cfg.web_search,
+                    network_access: cfg.network_access,
+                    writable_roots: cfg.writable_roots.clone(),
+                },
+            ))
         };
         let shared_gemini_config: control_plane::SharedGeminiConfig = {
             let cfg = &project.config.agent.gemini_cli;
-            Arc::new(tokio::sync::RwLock::new(control_plane::GeminiRuntimeConfig {
-                model: cfg.model.clone(),
-                approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
-                sandbox: cfg.sandbox,
-                extensions: cfg.extensions.clone(),
-                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                include_directories: cfg.include_directories.clone(),
-                debug: cfg.debug,
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::GeminiRuntimeConfig {
+                    model: cfg.model.clone(),
+                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                    sandbox: cfg.sandbox,
+                    extensions: cfg.extensions.clone(),
+                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                    include_directories: cfg.include_directories.clone(),
+                    debug: cfg.debug,
+                },
+            ))
         };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
@@ -9683,8 +9873,7 @@ async fn main() -> Result<(), CallerError> {
             // task_tx/task_rx are Some when use_presence is true (see above).
             let task_tx = task_tx.expect("task_tx created in presence mode");
             let task_rx = task_rx.expect("task_rx created in presence mode");
-            let (response_tx, mut response_rx) =
-                tokio::sync::mpsc::channel::<String>(8);
+            let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<String>(8);
 
             // Shared paused ref-count: incremented by PresenceConnected, decremented by PresenceDisconnected.
             // Server-side presence is paused when count > 0 (any browser has active voice).
@@ -9696,7 +9885,9 @@ async fn main() -> Result<(), CallerError> {
             let _response_forwarder = tokio::spawn(async move {
                 while let Some(response) = response_rx.recv().await {
                     if !response.is_empty() {
-                        if response.starts_with("Presence error:") || response.starts_with("Presence provider timed out") {
+                        if response.starts_with("Presence error:")
+                            || response.starts_with("Presence provider timed out")
+                        {
                             bus_for_responses.send(AppEvent::LoopError(response));
                         } else {
                             // Log presence response as a visible PresenceLog entry
@@ -9757,11 +9948,7 @@ async fn main() -> Result<(), CallerError> {
                     }
                     Err(e) => {
                         slog(&session_log_summary, |l| {
-                            l.write_summary(
-                                "(presence)",
-                                &format!("error: {}", e),
-                                0,
-                            )
+                            l.write_summary("(presence)", &format!("error: {}", e), 0)
                         });
                         bus_clone.send(AppEvent::LoopError(e.to_string()));
                     }
@@ -9868,11 +10055,7 @@ async fn main() -> Result<(), CallerError> {
                     }
                     Err(e) => {
                         slog(&session_log_summary, |l| {
-                            l.write_summary(
-                                "(tui)",
-                                &format!("error: {}", e),
-                                0,
-                            )
+                            l.write_summary("(tui)", &format!("error: {}", e), 0)
                         });
                         bus_clone.send(AppEvent::LoopError(e.to_string()));
                     }
@@ -9908,7 +10091,7 @@ async fn main() -> Result<(), CallerError> {
         // Give the agent task a moment to finish writing the session summary.
         // If it doesn't finish in time (e.g. stuck on an API call), abort it.
         match tokio::time::timeout(std::time::Duration::from_secs(5), &mut loop_handle).await {
-            Ok(_) => {} // task finished naturally
+            Ok(_) => {}                    // task finished naturally
             Err(_) => loop_handle.abort(), // timed out — force stop
         }
 
@@ -9919,7 +10102,10 @@ async fn main() -> Result<(), CallerError> {
             });
             // Daemon mode: keep web gateway alive after TUI quits.
             // Fall through to a headless daemon loop (TUI is not re-created).
-            eprintln!("TUI exited. Web gateway still running on port {}. Waiting for new tasks...", web_port);
+            eprintln!(
+                "TUI exited. Web gateway still running on port {}. Waiting for new tasks...",
+                web_port
+            );
             run_daemon_loop(DaemonConfig {
                 bus: bus.clone(),
                 project_root: project_root.clone(),
@@ -9931,7 +10117,8 @@ async fn main() -> Result<(), CallerError> {
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: None,
-            }).await;
+            })
+            .await;
         }
 
         control::cleanup();
@@ -9942,9 +10129,16 @@ async fn main() -> Result<(), CallerError> {
         // Headless mode (--no-tui or non-TTY)
         let bus = EventBus::new();
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
+            bus.subscribe(),
+            recording_registry.clone(),
+            bus.clone(),
+            Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
+        let _user_display_listener = spawn_user_display_listener(
+            bus.clone(),
+            session_registry.clone(),
+            Some(frame_registry.clone()),
+        );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
@@ -9961,23 +10155,17 @@ async fn main() -> Result<(), CallerError> {
         let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
         // Wire outbound broadcaster: converts AppEvents to OutboundEvents
-        let _outbound_broadcaster = event::spawn_outbound_broadcaster(
-            bus.subscribe(),
-            outbound_tx.clone(),
-        );
+        let _outbound_broadcaster =
+            event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
 
         // Wire session log writer: persists bus events that aren't logged inline.
-        let _session_log_writer = event::spawn_session_log_writer(
-            bus.subscribe(),
-            session_log.clone(),
-        );
+        let _session_log_writer =
+            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(
-                project.root.clone(), snapshot_dir, bus.clone(),
-            ) {
+            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
                     let (fw, wh, rh) = watcher.start_shared();
                     (Some(fw), Some(wh), Some(rh))
@@ -9995,7 +10183,9 @@ async fn main() -> Result<(), CallerError> {
             tokio::spawn(async move {
                 loop {
                     match json_rx.recv().await {
-                        Ok(line) => { println!("{}", line); }
+                        Ok(line) => {
+                            println!("{}", line);
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -10024,8 +10214,8 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.to_ice_config(),
             );
             let snapshot_dir = log_dir.join("file_snapshots");
-            let shared_session = Arc::new(tokio::sync::RwLock::new(
-                web_gateway::ActiveSessionState {
+            let shared_session =
+                Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
                     query_ctx: None,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),
@@ -10034,24 +10224,26 @@ async fn main() -> Result<(), CallerError> {
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
                     file_watcher: shared_file_watcher.clone(),
-                },
-            ));
+                }));
             let mut mcp_http_state = mcp::McpAppState::new(
-                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+                "none".into(),
+                "none".into(),
+                autonomy.clone(),
+                log_dir.clone(),
             );
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
             let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
-                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
+                bus.clone(),
             )));
-            let peer_registry = build_and_hydrate_peer_registry(
-                &log_dir,
-                &project.config.peers,
-            );
+            let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
             let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let _web_handle = web_gateway::spawn_web_gateway(
-                web_listener.take().expect("web listener must exist when use_web"),
+                web_listener
+                    .take()
+                    .expect("web listener must exist when use_web"),
                 bus.clone(),
                 outbound_tx.clone(),
                 config,
@@ -10069,10 +10261,7 @@ async fn main() -> Result<(), CallerError> {
                     &lan::backend::select_backend().cert_dir(),
                 )?,
             );
-            eprintln!(
-                "Web TUI: http://0.0.0.0:{}",
-                web_port
-            );
+            eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
             Some(shared_session)
         } else {
             None
@@ -10087,8 +10276,7 @@ async fn main() -> Result<(), CallerError> {
         // Create follow-up channel. In JSON mode, spawn a stdin reader to enable
         // follow-up via stdin lines and JSON commands (approve, deny, input, etc.).
         // Otherwise, drop the sender immediately so recv() returns None → single-round.
-        let (follow_up_tx, follow_up_rx) =
-            tokio::sync::mpsc::channel::<FollowUpMessage>(1);
+        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
         let json_approval_slot = if flags.json_output {
             Some(new_json_approval_slot())
         } else {
@@ -10138,11 +10326,12 @@ async fn main() -> Result<(), CallerError> {
                                 }
                                 event::ControlMsg::Input { text } => {
                                     // Write human_response file for askHuman IPC
-                                    let resp_path =
-                                        log_dir_for_stdin.join("human_response");
+                                    let resp_path = log_dir_for_stdin.join("human_response");
                                     let _ = std::fs::write(&resp_path, text.as_bytes());
                                 }
-                                event::ControlMsg::FollowUp { text, direct: _, .. } => {
+                                event::ControlMsg::FollowUp {
+                                    text, direct: _, ..
+                                } => {
                                     // This stdin handler only exists in
                                     // the headless `--json` path where
                                     // there's no presence layer, so the
@@ -10199,30 +10388,34 @@ async fn main() -> Result<(), CallerError> {
             Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
-            Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
-                command: cfg.command.clone(),
-                sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
-                approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
-                model: cfg.model.clone(),
-                reasoning_effort: project::normalize_reasoning_effort(
-                    cfg.reasoning_effort.as_deref(),
-                ),
-                web_search: cfg.web_search,
-                network_access: cfg.network_access,
-                writable_roots: cfg.writable_roots.clone(),
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::CodexRuntimeConfig {
+                    command: cfg.command.clone(),
+                    sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                    approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                    model: cfg.model.clone(),
+                    reasoning_effort: project::normalize_reasoning_effort(
+                        cfg.reasoning_effort.as_deref(),
+                    ),
+                    web_search: cfg.web_search,
+                    network_access: cfg.network_access,
+                    writable_roots: cfg.writable_roots.clone(),
+                },
+            ))
         };
         let shared_gemini_config: control_plane::SharedGeminiConfig = {
             let cfg = &project.config.agent.gemini_cli;
-            Arc::new(tokio::sync::RwLock::new(control_plane::GeminiRuntimeConfig {
-                model: cfg.model.clone(),
-                approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
-                sandbox: cfg.sandbox,
-                extensions: cfg.extensions.clone(),
-                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                include_directories: cfg.include_directories.clone(),
-                debug: cfg.debug,
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::GeminiRuntimeConfig {
+                    model: cfg.model.clone(),
+                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                    sandbox: cfg.sandbox,
+                    extensions: cfg.extensions.clone(),
+                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                    include_directories: cfg.include_directories.clone(),
+                    debug: cfg.debug,
+                },
+            ))
         };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
@@ -10322,7 +10515,10 @@ async fn main() -> Result<(), CallerError> {
                     // Keep frame_registry and recording_registry alive
                 }
             }
-            eprintln!("Session ended ({}). Web gateway running on port {}. Waiting for new tasks...", reason, web_port);
+            eprintln!(
+                "Session ended ({}). Web gateway running on port {}. Waiting for new tasks...",
+                reason, web_port
+            );
 
             run_daemon_loop(DaemonConfig {
                 bus: bus.clone(),
@@ -10335,7 +10531,8 @@ async fn main() -> Result<(), CallerError> {
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: headless_shared_session.clone(),
-            }).await;
+            })
+            .await;
         } else {
             result?;
         }

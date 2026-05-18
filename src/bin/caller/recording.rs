@@ -63,7 +63,9 @@ impl Drop for RecordingGuard {
         #[cfg(unix)]
         {
             if let Some(id) = self.child.id() {
-                unsafe { libc::kill(id as i32, libc::SIGINT); }
+                unsafe {
+                    libc::kill(id as i32, libc::SIGINT);
+                }
                 // Wait for ffmpeg to exit and finalize (up to 5 seconds)
                 for _ in 0..50 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -196,8 +198,11 @@ pub async fn start_display_recording(
         "source": source,
     });
     let manifest_path = segments_dir.join("manifest.json");
-    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
-        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
     // Build platform-specific input args.
     // macOS: screencapture (Apple system binary) feeds JPEG frames to ffmpeg
@@ -208,18 +213,25 @@ pub async fn start_display_recording(
     let use_screencapture_feeder = cfg!(target_os = "macos");
     if use_screencapture_feeder {
         input_args.extend([
-            "-f".into(), "image2pipe".into(),
-            "-use_wallclock_as_timestamps".into(), "1".into(),
-            "-i".into(), "pipe:0".into(),
+            "-f".into(),
+            "image2pipe".into(),
+            "-use_wallclock_as_timestamps".into(),
+            "1".into(),
+            "-i".into(),
+            "pipe:0".into(),
         ]);
     } else {
         let display_arg = format!(":{}", display_id);
         let size_arg = format!("{}x{}", width, height);
         input_args.extend([
-            "-f".into(), "x11grab".into(),
-            "-framerate".into(), fps_arg.clone(),
-            "-video_size".into(), size_arg,
-            "-i".into(), display_arg,
+            "-f".into(),
+            "x11grab".into(),
+            "-framerate".into(),
+            fps_arg.clone(),
+            "-video_size".into(),
+            size_arg,
+            "-i".into(),
+            display_arg,
         ]);
     }
 
@@ -228,19 +240,32 @@ pub async fn start_display_recording(
     let mut cmd = tokio::process::Command::new("ffmpeg");
     cmd.args(&input_args)
         .args([
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", &crf_arg,
-            "-pix_fmt", "yuv420p",
-            "-force_key_frames", &keyframe_expr,
-            "-vsync", "cfr",
-            "-f", "segment",
-            "-segment_time", &seg_time_arg,
-            "-segment_format", "mp4",
-            "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof",
-            "-segment_list", segment_list.to_str().unwrap_or("segments.csv"),
-            "-segment_list_type", "csv",
-            "-reset_timestamps", "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            &crf_arg,
+            "-pix_fmt",
+            "yuv420p",
+            "-force_key_frames",
+            &keyframe_expr,
+            "-vsync",
+            "cfr",
+            "-f",
+            "segment",
+            "-segment_time",
+            &seg_time_arg,
+            "-segment_format",
+            "mp4",
+            "-segment_format_options",
+            "movflags=+frag_keyframe+empty_moov+default_base_moof",
+            "-segment_list",
+            segment_list.to_str().unwrap_or("segments.csv"),
+            "-segment_list_type",
+            "csv",
+            "-reset_timestamps",
+            "1",
         ])
         .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
         .stdin(if use_screencapture_feeder {
@@ -266,15 +291,18 @@ pub async fn start_display_recording(
     verify_ffmpeg_started(
         &mut child,
         &segments_dir.join("ffmpeg.log"),
-        if cfg!(target_os = "macos") { "screencapture feeder" } else { "x11grab" },
+        if cfg!(target_os = "macos") {
+            "screencapture feeder"
+        } else {
+            "x11grab"
+        },
     )
     .await?;
 
     if use_screencapture_feeder {
         if let Some(stdin) = child.stdin.take() {
-            let frame_interval = std::time::Duration::from_millis(
-                1000 / config.framerate.max(1) as u64,
-            );
+            let frame_interval =
+                std::time::Duration::from_millis(1000 / config.framerate.max(1) as u64);
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 let mut stdin = stdin;
@@ -343,30 +371,50 @@ pub async fn start_frame_recording(
         "source": "image2pipe",
     });
     let manifest_path = segments_dir.join("manifest.json");
-    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
-        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
     let keyframe_expr = format!("expr:gte(t,n_forced*{})", config.segment_duration_secs);
     let log_path = segments_dir.join("ffmpeg.log");
     let mut child = tokio::process::Command::new("ffmpeg")
         .args([
-            "-f", "image2pipe",
-            "-framerate", &fps_arg,
-            "-use_wallclock_as_timestamps", "1",
-            "-i", "pipe:0",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", &crf_arg,
-            "-pix_fmt", "yuv420p",
-            "-force_key_frames", &keyframe_expr,
-            "-vsync", "cfr",
-            "-f", "segment",
-            "-segment_time", &seg_time_arg,
-            "-segment_format", "mp4",
-            "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof",
-            "-segment_list", segment_list.to_str().unwrap_or("segments.csv"),
-            "-segment_list_type", "csv",
-            "-reset_timestamps", "1",
+            "-f",
+            "image2pipe",
+            "-framerate",
+            &fps_arg,
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            "pipe:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            &crf_arg,
+            "-pix_fmt",
+            "yuv420p",
+            "-force_key_frames",
+            &keyframe_expr,
+            "-vsync",
+            "cfr",
+            "-f",
+            "segment",
+            "-segment_time",
+            &seg_time_arg,
+            "-segment_format",
+            "mp4",
+            "-segment_format_options",
+            "movflags=+frag_keyframe+empty_moov+default_base_moof",
+            "-segment_list",
+            segment_list.to_str().unwrap_or("segments.csv"),
+            "-segment_list_type",
+            "csv",
+            "-reset_timestamps",
+            "1",
         ])
         .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
         .stdin(std::process::Stdio::piped())
@@ -476,10 +524,7 @@ impl RecordingRegistry {
     /// `feed_frame` (typically from a bridge task subscribed to the session's
     /// frame broadcast).  This path is required on Wayland, where the capture
     /// backend is PipeWire/portal and `x11grab` cannot see the user's desktop.
-    pub async fn start_display_frame_fed(
-        &mut self,
-        display_id: u32,
-    ) -> Result<String, String> {
+    pub async fn start_display_frame_fed(&mut self, display_id: u32) -> Result<String, String> {
         let recordings_dir = self.session_dir.join("recordings");
         let stream_name = pick_next_display_stream_name(&recordings_dir, display_id);
         let guard = start_frame_recording(&stream_name, &self.config, &self.session_dir).await?;
@@ -492,8 +537,7 @@ impl RecordingRegistry {
         if self.recordings.contains_key(stream_name) {
             return Err(format!("Already recording stream: {}", stream_name));
         }
-        let guard =
-            start_frame_recording(stream_name, &self.config, &self.session_dir).await?;
+        let guard = start_frame_recording(stream_name, &self.config, &self.session_dir).await?;
         self.recordings.insert(stream_name.to_string(), guard);
         Ok(())
     }
@@ -658,7 +702,8 @@ fn parse_segment_csv(csv_path: &Path, segments_dir: &Path) -> Vec<SegmentInfo> {
                 .flatten()
                 .filter_map(|e| {
                     let name = e.file_name().to_string_lossy().to_string();
-                    if name.starts_with("seg_") && (name.ends_with(".mp4") || name.ends_with(".ts")) {
+                    if name.starts_with("seg_") && (name.ends_with(".mp4") || name.ends_with(".ts"))
+                    {
                         Some(name)
                     } else {
                         None
@@ -713,7 +758,7 @@ fn frame_to_jpeg(frame: &crate::display::Frame) -> Option<Vec<u8>> {
                     let px = row_start + col * 4;
                     rgb.push(frame.data[px + 2]); // R
                     rgb.push(frame.data[px + 1]); // G
-                    rgb.push(frame.data[px]);     // B
+                    rgb.push(frame.data[px]); // B
                 }
             }
         }
@@ -722,7 +767,7 @@ fn frame_to_jpeg(frame: &crate::display::Frame) -> Option<Vec<u8>> {
                 let row_start = row * stride;
                 for col in 0..w {
                     let px = row_start + col * 4;
-                    rgb.push(frame.data[px]);     // R
+                    rgb.push(frame.data[px]); // R
                     rgb.push(frame.data[px + 1]); // G
                     rgb.push(frame.data[px + 2]); // B
                 }
@@ -804,12 +849,7 @@ async fn start_display_auto(
         let fps = reg.config.framerate;
         let stream_name = reg.start_display_frame_fed(display_id).await?;
         drop(reg);
-        let handle = spawn_frame_bridge(
-            registry.clone(),
-            session,
-            stream_name.clone(),
-            fps,
-        );
+        let handle = spawn_frame_bridge(registry.clone(), session, stream_name.clone(), fps);
         let mut reg = registry.write().await;
         if let Some(guard) = reg.recordings.get_mut(&stream_name) {
             guard.bridge_task = Some(handle);
@@ -869,9 +909,9 @@ pub fn spawn_recording_listener(
                         }
                     }
                 }
-                Ok(AppEvent::ControlCommand(
-                    crate::event::ControlMsg::StartRecording { stream_name },
-                )) => {
+                Ok(AppEvent::ControlCommand(crate::event::ControlMsg::StartRecording {
+                    stream_name,
+                })) => {
                     // Already recording this display (including any renamed slot
                     // like `display_0_2`) — drop the duplicate request.
                     {
@@ -892,36 +932,36 @@ pub fn spawn_recording_listener(
                         continue;
                     };
                     let (w, h) = super::query_display_resolution(display_id);
-                    match start_display_auto(
-                        &registry,
-                        session_registry.as_ref(),
-                        display_id,
-                        w,
-                        h,
-                    )
-                    .await
+                    match start_display_auto(&registry, session_registry.as_ref(), display_id, w, h)
+                        .await
                     {
                         Ok(name) => bus.send(AppEvent::RecordingStarted { stream_name: name }),
-                        Err(e) => bus.send(AppEvent::RecordingError { stream_name, message: e }),
+                        Err(e) => bus.send(AppEvent::RecordingError {
+                            stream_name,
+                            message: e,
+                        }),
                     }
                 }
-                Ok(AppEvent::ControlCommand(
-                    crate::event::ControlMsg::StopRecording { stream_name },
-                )) => {
+                Ok(AppEvent::ControlCommand(crate::event::ControlMsg::StopRecording {
+                    stream_name,
+                })) => {
                     let mut reg = registry.write().await;
                     // Find the active recording matching this name or prefix
                     // (e.g. "display_0" matches "display_0", "display_0_2", etc.)
-                    let active = reg.active_streams().into_iter().find(|s| {
-                        *s == stream_name || s.starts_with(&format!("{}_", stream_name))
-                    });
+                    let active = reg
+                        .active_streams()
+                        .into_iter()
+                        .find(|s| *s == stream_name || s.starts_with(&format!("{}_", stream_name)));
                     if let Some(actual) = active {
                         reg.stop(&actual);
-                        bus.send(AppEvent::RecordingStopped { stream_name: actual });
+                        bus.send(AppEvent::RecordingStopped {
+                            stream_name: actual,
+                        });
                     }
                 }
-                Ok(AppEvent::ControlCommand(
-                    crate::event::ControlMsg::DeleteRecording { stream_name },
-                )) => {
+                Ok(AppEvent::ControlCommand(crate::event::ControlMsg::DeleteRecording {
+                    stream_name,
+                })) => {
                     let mut reg = registry.write().await;
                     let was_recording = reg.is_recording(&stream_name);
                     reg.delete(&stream_name);
@@ -1013,7 +1053,11 @@ max_retention_hours = 48
     fn parse_segment_csv_basic() {
         let tmp = tempfile::tempdir().unwrap();
         let csv = tmp.path().join("segments.csv");
-        std::fs::write(&csv, "seg_00000.mp4,0.000000,60.000000\nseg_00001.mp4,60.000000,120.000000\n").unwrap();
+        std::fs::write(
+            &csv,
+            "seg_00000.mp4,0.000000,60.000000\nseg_00001.mp4,60.000000,120.000000\n",
+        )
+        .unwrap();
 
         let segments = parse_segment_csv(&csv, tmp.path());
         assert_eq!(segments.len(), 2);
@@ -1073,7 +1117,8 @@ max_retention_hours = 48
         std::fs::write(
             stream_dir.join("segments.csv"),
             "seg_00000.mp4,0.000000,60.000000\nseg_00001.mp4,60.000000,120.000000\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let reg = RecordingRegistry::new(tmp.path(), RecordingConfig::default());
 

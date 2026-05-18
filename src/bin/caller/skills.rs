@@ -78,12 +78,13 @@ fn parse_skill_md(content: &str, source_path: &Path) -> Result<(SkillConfig, Str
 
     let yaml_str = &rest[..closing_pos];
     let body_start = closing_pos + 4; // skip "\n---"
-    let body = rest[body_start..].trim_start_matches(['\r', '\n']).to_string();
+    let body = rest[body_start..]
+        .trim_start_matches(['\r', '\n'])
+        .to_string();
 
     // Parse YAML frontmatter manually (flat key-value) to avoid serde_yaml dependency.
-    let config = parse_frontmatter(yaml_str).map_err(|e| {
-        format!("{}: {}", source_path.display(), e)
-    })?;
+    let config =
+        parse_frontmatter(yaml_str).map_err(|e| format!("{}: {}", source_path.display(), e))?;
 
     Ok((config, body))
 }
@@ -187,12 +188,16 @@ pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
         // Standard: .agents/skills/
         load_skills_from_dir(
             &root.join(".agents").join("skills"),
-            SkillSource::Project, &mut skills, &mut seen_names,
+            SkillSource::Project,
+            &mut skills,
+            &mut seen_names,
         );
         // Legacy: .intendant/skills/
         load_skills_from_dir(
             &root.join(".intendant").join("skills"),
-            SkillSource::Project, &mut skills, &mut seen_names,
+            SkillSource::Project,
+            &mut skills,
+            &mut seen_names,
         );
     }
 
@@ -201,12 +206,16 @@ pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
         // Standard: ~/.agents/skills/
         load_skills_from_dir(
             &home.join(".agents").join("skills"),
-            SkillSource::Personal, &mut skills, &mut seen_names,
+            SkillSource::Personal,
+            &mut skills,
+            &mut seen_names,
         );
         // Legacy: ~/.intendant/skills/
         load_skills_from_dir(
             &home.join(".intendant").join("skills"),
-            SkillSource::Personal, &mut skills, &mut seen_names,
+            SkillSource::Personal,
+            &mut skills,
+            &mut seen_names,
         );
     }
 
@@ -284,7 +293,10 @@ pub fn format_skill_catalog(skills: &[Skill]) -> String {
     if !auto_skills.is_empty() {
         out.push_str("**Auto-invocable** (use when the task matches):\n");
         for s in &auto_skills {
-            out.push_str(&format!("- **{}**: {}\n", s.config.name, s.config.description));
+            out.push_str(&format!(
+                "- **{}**: {}\n",
+                s.config.name, s.config.description
+            ));
         }
         out.push('\n');
     }
@@ -292,7 +304,10 @@ pub fn format_skill_catalog(skills: &[Skill]) -> String {
     if !manual_skills.is_empty() {
         out.push_str("**Manual only** (only invoke when explicitly requested):\n");
         for s in &manual_skills {
-            out.push_str(&format!("- **{}**: {}\n", s.config.name, s.config.description));
+            out.push_str(&format!(
+                "- **{}**: {}\n",
+                s.config.name, s.config.description
+            ));
         }
         out.push('\n');
     }
@@ -455,11 +470,7 @@ Instructions here.
     #[test]
     fn discover_skills_standard_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp
-            .path()
-            .join(".agents")
-            .join("skills")
-            .join("my-skill");
+        let skill_dir = tmp.path().join(".agents").join("skills").join("my-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
 

@@ -22,8 +22,8 @@
 //! binary `examples/damage-trace.rs`).
 
 pub mod backpressure;
-pub mod grid;
 pub mod encode;
+pub mod grid;
 pub mod policy;
 pub mod recovery;
 pub mod synthetic_dirty;

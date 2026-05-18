@@ -123,9 +123,7 @@ impl FfmpegH264Encoder {
         // reconnect or display re-grant within the same process.
         if is_vaapi_banned() {
             let enc = Self::spawn_x264(width, height, bitrate_kbps)?;
-            eprintln!(
-                "[display/h264_linux] using libx264 (VA-API banned this session)",
-            );
+            eprintln!("[display/h264_linux] using libx264 (VA-API banned this session)",);
             return Ok(enc);
         }
 
@@ -320,26 +318,13 @@ impl FfmpegH264Encoder {
     /// the cached SPS/PPS values + the first-IDR-without-cache warning,
     /// so each call site has one short helper instead of duplicating the
     /// glue.
-    fn flush_pending_packet(
-        &mut self,
-        duration_ms: u64,
-        out: &mut Vec<EncodedPacket>,
-    ) {
+    fn flush_pending_packet(&mut self, duration_ms: u64, out: &mut Vec<EncodedPacket>) {
         if self.pending_frame_nals.is_empty() {
             return;
         }
-        let has_idr = self
-            .pending_frame_nals
-            .iter()
-            .any(|n| n.nal_type == 5);
-        let has_sps_in_au = self
-            .pending_frame_nals
-            .iter()
-            .any(|n| n.nal_type == 7);
-        let has_pps_in_au = self
-            .pending_frame_nals
-            .iter()
-            .any(|n| n.nal_type == 8);
+        let has_idr = self.pending_frame_nals.iter().any(|n| n.nal_type == 5);
+        let has_sps_in_au = self.pending_frame_nals.iter().any(|n| n.nal_type == 7);
+        let has_pps_in_au = self.pending_frame_nals.iter().any(|n| n.nal_type == 8);
         // Warn at most once per encoder if we ever see a bare IDR before
         // libx264 has shipped its first complete IDR. In practice this
         // never fires on a well-behaved libx264 stdin pipe, but if a
@@ -442,10 +427,7 @@ impl FfmpegH264Encoder {
         // sets are not duplicated.
         let mut params_inserted = false;
         for nal in nals {
-            if !params_inserted
-                && nal.nal_type == 5
-                && (prepend_sps || prepend_pps)
-            {
+            if !params_inserted && nal.nal_type == 5 && (prepend_sps || prepend_pps) {
                 if prepend_sps {
                     data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                     data.extend_from_slice(cached_sps.unwrap());
@@ -493,17 +475,11 @@ impl Encoder for FfmpegH264Encoder {
 
         // Write the I420 frame to ffmpeg stdin.
         {
-            let stdin = self
-                .child
-                .stdin
-                .as_mut()
-                .ok_or("ffmpeg stdin closed")?;
+            let stdin = self.child.stdin.as_mut().ok_or("ffmpeg stdin closed")?;
             stdin
                 .write_all(&i420[..self.frame_size])
                 .map_err(|e| format!("write to ffmpeg: {e}"))?;
-            stdin
-                .flush()
-                .map_err(|e| format!("flush ffmpeg: {e}"))?;
+            stdin.flush().map_err(|e| format!("flush ffmpeg: {e}"))?;
         }
 
         // Assign pts to THIS input frame. The NALs that come out may
@@ -608,7 +584,7 @@ fn nal_reader_thread(
 
     loop {
         let n = match stdout.read(&mut tmp) {
-            Ok(0) => break,        // EOF
+            Ok(0) => break, // EOF
             Ok(n) => n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
@@ -648,7 +624,13 @@ fn nal_reader_thread(
 
                     if !nal_data.is_empty() {
                         let nal_type = nal_data[0] & 0x1F;
-                        if nal_tx.send(Nal { data: nal_data, nal_type }).is_err() {
+                        if nal_tx
+                            .send(Nal {
+                                data: nal_data,
+                                nal_type,
+                            })
+                            .is_err()
+                        {
                             return; // receiver dropped
                         }
                     }
@@ -667,7 +649,10 @@ fn nal_reader_thread(
         let nal_data: Vec<u8> = buf[first.sc_len..].to_vec();
         if !nal_data.is_empty() {
             let nal_type = nal_data[0] & 0x1F;
-            let _ = nal_tx.send(Nal { data: nal_data, nal_type });
+            let _ = nal_tx.send(Nal {
+                data: nal_data,
+                nal_type,
+            });
         }
     }
 }
@@ -688,10 +673,16 @@ fn find_start_code(buf: &[u8], from: usize) -> Option<StartCode> {
     while i + 2 < buf.len() {
         if buf[i] == 0 && buf[i + 1] == 0 {
             if i + 3 < buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
-                return Some(StartCode { offset: i, sc_len: 4 });
+                return Some(StartCode {
+                    offset: i,
+                    sc_len: 4,
+                });
             }
             if buf[i + 2] == 1 {
-                return Some(StartCode { offset: i, sc_len: 3 });
+                return Some(StartCode {
+                    offset: i,
+                    sc_len: 3,
+                });
             }
         }
         i += 1;
@@ -771,8 +762,7 @@ mod tests {
     #[test]
     fn find_start_code_with_offset() {
         let buf = [
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A,
-            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE,
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x68, 0xCE,
         ];
         // Skip past the first start code body.
         let sc = find_start_code(&buf, 4).unwrap();
@@ -792,7 +782,7 @@ mod tests {
         let stream = vec![
             0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, // SPS (type 7)
             0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80, // PPS (type 8)
-            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,       // IDR (type 5)
+            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB, // IDR (type 5)
         ];
 
         let (nal_tx, nal_rx) = std::sync::mpsc::sync_channel::<Nal>(64);
@@ -807,9 +797,8 @@ mod tests {
         // Since we can't easily fake a ChildStdout, test the parsing
         // indirectly through find_start_code + the extraction logic.
         let buf = vec![
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A,
-            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80,
-            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x68, 0xCE,
+            0x38, 0x80, 0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,
         ];
 
         // Extract NALs the same way the reader thread does.
@@ -846,12 +835,12 @@ mod tests {
     #[test]
     fn nal_type_classification() {
         // Verify NAL type extraction from first byte.
-        assert_eq!(0x67 & 0x1F, 7);  // SPS
-        assert_eq!(0x68 & 0x1F, 8);  // PPS
-        assert_eq!(0x06 & 0x1F, 6);  // SEI
-        assert_eq!(0x65 & 0x1F, 5);  // IDR slice
-        assert_eq!(0x41 & 0x1F, 1);  // non-IDR slice
-        assert_eq!(0x61 & 0x1F, 1);  // non-IDR slice (different NRI)
+        assert_eq!(0x67 & 0x1F, 7); // SPS
+        assert_eq!(0x68 & 0x1F, 8); // PPS
+        assert_eq!(0x06 & 0x1F, 6); // SEI
+        assert_eq!(0x65 & 0x1F, 5); // IDR slice
+        assert_eq!(0x41 & 0x1F, 1); // non-IDR slice
+        assert_eq!(0x61 & 0x1F, 1); // non-IDR slice (different NRI)
     }
 
     #[test]
@@ -901,11 +890,17 @@ mod tests {
     #[test]
     fn is_first_slice_detection() {
         // first_mb = 0 → first slice of frame
-        let first = Nal { data: vec![0x65, 0x80], nal_type: 5 };
+        let first = Nal {
+            data: vec![0x65, 0x80],
+            nal_type: 5,
+        };
         assert!(FfmpegH264Encoder::is_first_slice(&first));
 
         // first_mb = 1 → continuation slice
-        let cont = Nal { data: vec![0x41, 0x40], nal_type: 1 };
+        let cont = Nal {
+            data: vec![0x41, 0x40],
+            nal_type: 1,
+        };
         assert!(!FfmpegH264Encoder::is_first_slice(&cont));
     }
 
@@ -927,9 +922,18 @@ mod tests {
         let pps = vec![0x68, 0xCE, 0x38, 0x80];
         let idr = vec![0x65, 0xAA, 0xBB];
         let nals = vec![
-            Nal { data: sps.clone(), nal_type: 7 },
-            Nal { data: pps.clone(), nal_type: 8 },
-            Nal { data: idr.clone(), nal_type: 5 },
+            Nal {
+                data: sps.clone(),
+                nal_type: 7,
+            },
+            Nal {
+                data: pps.clone(),
+                nal_type: 8,
+            },
+            Nal {
+                data: idr.clone(),
+                nal_type: 5,
+            },
         ];
 
         // Cache populated case (the realistic path: cache was filled by
@@ -973,7 +977,10 @@ mod tests {
         let cached_sps = vec![0x67, 0x42, 0x00, 0x0A];
         let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
         let idr = vec![0x65, 0xAA, 0xBB];
-        let nals = vec![Nal { data: idr.clone(), nal_type: 5 }];
+        let nals = vec![Nal {
+            data: idr.clone(),
+            nal_type: 5,
+        }];
 
         let pkt = FfmpegH264Encoder::build_packet(
             &nals,
@@ -1003,13 +1010,19 @@ mod tests {
         let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
         let idr = vec![0x65, 0xAA, 0xBB];
         let nals = vec![
-            Nal { data: sps.clone(), nal_type: 7 },
-            Nal { data: idr.clone(), nal_type: 5 },
+            Nal {
+                data: sps.clone(),
+                nal_type: 7,
+            },
+            Nal {
+                data: idr.clone(),
+                nal_type: 5,
+            },
         ];
 
         let pkt = FfmpegH264Encoder::build_packet(
             &nals,
-            Some(&sps),       // cache also has SPS, but it's already in AU
+            Some(&sps), // cache also has SPS, but it's already in AU
             Some(&cached_pps),
             33,
             33,
@@ -1029,7 +1042,11 @@ mod tests {
             "AU with SPS but no PPS must get only PPS prepended"
         );
         // Sanity: SPS appears exactly once in the output bytes.
-        let sps_count = pkt.data.windows(sps.len()).filter(|w| *w == sps.as_slice()).count();
+        let sps_count = pkt
+            .data
+            .windows(sps.len())
+            .filter(|w| *w == sps.as_slice())
+            .count();
         assert_eq!(sps_count, 1, "SPS must not be duplicated");
     }
 
@@ -1044,8 +1061,14 @@ mod tests {
         let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
         let idr = vec![0x65, 0xAA, 0xBB];
         let nals = vec![
-            Nal { data: aud.clone(), nal_type: 9 },
-            Nal { data: idr.clone(), nal_type: 5 },
+            Nal {
+                data: aud.clone(),
+                nal_type: 9,
+            },
+            Nal {
+                data: idr.clone(),
+                nal_type: 5,
+            },
         ];
 
         let pkt = FfmpegH264Encoder::build_packet(
@@ -1063,7 +1086,10 @@ mod tests {
         want.extend_from_slice(&annexb(&cached_sps));
         want.extend_from_slice(&annexb(&cached_pps));
         want.extend_from_slice(&annexb(&idr));
-        assert_eq!(pkt.data, want, "AUD must precede the cached SPS/PPS prepend");
+        assert_eq!(
+            pkt.data, want,
+            "AUD must precede the cached SPS/PPS prepend"
+        );
     }
 
     #[test]
@@ -1074,7 +1100,10 @@ mod tests {
         let cached_sps = vec![0x67, 0x42, 0x00, 0x0A];
         let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
         let nidr = vec![0x41, 0x9A];
-        let nals = vec![Nal { data: nidr.clone(), nal_type: 1 }];
+        let nals = vec![Nal {
+            data: nidr.clone(),
+            nal_type: 1,
+        }];
 
         let pkt = FfmpegH264Encoder::build_packet(
             &nals,

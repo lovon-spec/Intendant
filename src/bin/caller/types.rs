@@ -535,7 +535,9 @@ pub enum OutboundEvent {
     },
     /// A peer was removed from the registry. Carries only the id;
     /// the browser drops the matching row from its local list.
-    PeerRemoved { id: String },
+    PeerRemoved {
+        id: String,
+    },
     /// A peer's connection state, status, or card changed. Carries a
     /// fresh snapshot reflecting the new values; the browser replaces
     /// the matching row.

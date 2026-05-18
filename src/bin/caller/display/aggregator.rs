@@ -119,26 +119,16 @@ enum AggregatorState {
 /// coordinator owning all pool actions, that information is
 /// derived from the state itself (Idle → empty wanted set, others
 /// → full wanted set) and the action enum has been removed.
-fn transition(
-    prev: AggregatorState,
-    peer_count: usize,
-    now: Instant,
-) -> AggregatorState {
+fn transition(prev: AggregatorState, peer_count: usize, now: Instant) -> AggregatorState {
     match prev {
-        AggregatorState::Active if peer_count == 0 => {
-            AggregatorState::IdlePending { since: now }
-        }
+        AggregatorState::Active if peer_count == 0 => AggregatorState::IdlePending { since: now },
         AggregatorState::Active => AggregatorState::Active,
 
-        AggregatorState::IdlePending { .. } if peer_count >= 1 => {
-            AggregatorState::Active
-        }
+        AggregatorState::IdlePending { .. } if peer_count >= 1 => AggregatorState::Active,
         AggregatorState::IdlePending { since } if now >= since + PAUSE_DEBOUNCE => {
             AggregatorState::Idle
         }
-        AggregatorState::IdlePending { since } => {
-            AggregatorState::IdlePending { since }
-        }
+        AggregatorState::IdlePending { since } => AggregatorState::IdlePending { since },
 
         AggregatorState::Idle if peer_count >= 1 => AggregatorState::Active,
         AggregatorState::Idle => AggregatorState::Idle,
@@ -275,9 +265,7 @@ pub fn step_layer_capacity_state(
     let healthy = h.fraction_lost <= config.fraction_lost_recovery;
 
     match prev {
-        LayerCapacityState::Wanted if over_budget => {
-            LayerCapacityState::PendingDrop { since: now }
-        }
+        LayerCapacityState::Wanted if over_budget => LayerCapacityState::PendingDrop { since: now },
         LayerCapacityState::Wanted => LayerCapacityState::Wanted,
 
         LayerCapacityState::PendingDrop { .. } if !over_budget => {
@@ -290,18 +278,12 @@ pub fn step_layer_capacity_state(
             // immediately settles.
             LayerCapacityState::Wanted
         }
-        LayerCapacityState::PendingDrop { since }
-            if now >= since + config.drop_debounce =>
-        {
+        LayerCapacityState::PendingDrop { since } if now >= since + config.drop_debounce => {
             LayerCapacityState::Dropped
         }
-        LayerCapacityState::PendingDrop { since } => {
-            LayerCapacityState::PendingDrop { since }
-        }
+        LayerCapacityState::PendingDrop { since } => LayerCapacityState::PendingDrop { since },
 
-        LayerCapacityState::Dropped if healthy => {
-            LayerCapacityState::PendingRestore { since: now }
-        }
+        LayerCapacityState::Dropped if healthy => LayerCapacityState::PendingRestore { since: now },
         LayerCapacityState::Dropped => LayerCapacityState::Dropped,
 
         LayerCapacityState::PendingRestore { .. } if !healthy => {
@@ -321,9 +303,7 @@ pub fn step_layer_capacity_state(
             // cancels on any regression (`!healthy`).
             LayerCapacityState::Dropped
         }
-        LayerCapacityState::PendingRestore { since }
-            if now >= since + config.restore_debounce =>
-        {
+        LayerCapacityState::PendingRestore { since } if now >= since + config.restore_debounce => {
             LayerCapacityState::Wanted
         }
         LayerCapacityState::PendingRestore { since } => {
@@ -623,19 +603,17 @@ pub fn aggregate_state_wanted_upper_layers(
     upper_layers: &[SimulcastRid],
 ) -> HashSet<SimulcastRid> {
     match state {
-        AggregateLayerCapacity::AllUpperWanted
-        | AggregateLayerCapacity::PendingPauseTop { .. } => {
+        AggregateLayerCapacity::AllUpperWanted | AggregateLayerCapacity::PendingPauseTop { .. } => {
             upper_layers.iter().cloned().collect()
         }
         AggregateLayerCapacity::TopPaused
         | AggregateLayerCapacity::PendingPauseMid { .. }
-        | AggregateLayerCapacity::PendingResumeTop { .. } => upper_layers
-            .iter()
-            .skip(1)
-            .cloned()
-            .collect(),
-        AggregateLayerCapacity::OnlyFloor
-        | AggregateLayerCapacity::PendingResumeMid { .. } => HashSet::new(),
+        | AggregateLayerCapacity::PendingResumeTop { .. } => {
+            upper_layers.iter().skip(1).cloned().collect()
+        }
+        AggregateLayerCapacity::OnlyFloor | AggregateLayerCapacity::PendingResumeMid { .. } => {
+            HashSet::new()
+        }
     }
 }
 
@@ -913,14 +891,12 @@ pub fn spawn_layer_policy_coordinator(
         // uses. Layer-set changes (resize) are tolerated by
         // pruning stale RID entries each tick — `current_rids`
         // is the source of truth.
-        let mut rr_state: HashMap<(PeerId, SimulcastRid), LayerCapacityState> =
-            HashMap::new();
+        let mut rr_state: HashMap<(PeerId, SimulcastRid), LayerCapacityState> = HashMap::new();
         let mut rr_subs: HashMap<
             PeerId,
             tokio::sync::watch::Receiver<HashMap<SimulcastRid, PeerLayerHealth>>,
         > = HashMap::new();
-        let mut prev_measurement_count: HashMap<(PeerId, SimulcastRid), u64> =
-            HashMap::new();
+        let mut prev_measurement_count: HashMap<(PeerId, SimulcastRid), u64> = HashMap::new();
 
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1233,7 +1209,6 @@ mod tests {
         assert_eq!(s, AggregatorState::Idle);
     }
 
-
     // -----------------------------------------------------------------
     // Phase 4d.3b: capacity-policy state-machine tests
     // -----------------------------------------------------------------
@@ -1296,12 +1271,7 @@ mod tests {
     #[test]
     fn capacity_step_wanted_with_healthy_signal_stays_wanted() {
         let h = health(0.01); // well under 5% threshold
-        let s = step_layer_capacity_state(
-            LayerCapacityState::Wanted,
-            Some(&h),
-            &cfg(),
-            t0(),
-        );
+        let s = step_layer_capacity_state(LayerCapacityState::Wanted, Some(&h), &cfg(), t0());
         assert_eq!(s, LayerCapacityState::Wanted);
     }
 
@@ -1309,12 +1279,7 @@ mod tests {
     fn capacity_step_wanted_with_over_budget_enters_pending_drop() {
         let h = health(0.10); // 10%, well over 5% threshold
         let now = t0();
-        let s = step_layer_capacity_state(
-            LayerCapacityState::Wanted,
-            Some(&h),
-            &cfg(),
-            now,
-        );
+        let s = step_layer_capacity_state(LayerCapacityState::Wanted, Some(&h), &cfg(), now);
         assert_eq!(s, LayerCapacityState::PendingDrop { since: now });
     }
 
@@ -1355,12 +1320,7 @@ mod tests {
     #[test]
     fn capacity_step_dropped_with_continued_loss_stays_dropped() {
         let h = health(0.10);
-        let s = step_layer_capacity_state(
-            LayerCapacityState::Dropped,
-            Some(&h),
-            &cfg(),
-            t0(),
-        );
+        let s = step_layer_capacity_state(LayerCapacityState::Dropped, Some(&h), &cfg(), t0());
         assert_eq!(s, LayerCapacityState::Dropped);
     }
 
@@ -1371,12 +1331,7 @@ mod tests {
         // crossing the (lower) recovery threshold — wider hysteresis
         // band prevents oscillation around the threshold.
         let h = health(0.04);
-        let s = step_layer_capacity_state(
-            LayerCapacityState::Dropped,
-            Some(&h),
-            &cfg(),
-            t0(),
-        );
+        let s = step_layer_capacity_state(LayerCapacityState::Dropped, Some(&h), &cfg(), t0());
         assert_eq!(s, LayerCapacityState::Dropped);
     }
 
@@ -1384,12 +1339,7 @@ mod tests {
     fn capacity_step_dropped_with_clear_recovery_enters_pending_restore() {
         let h = health(0.01); // ≤ 2% recovery
         let now = t0();
-        let s = step_layer_capacity_state(
-            LayerCapacityState::Dropped,
-            Some(&h),
-            &cfg(),
-            now,
-        );
+        let s = step_layer_capacity_state(LayerCapacityState::Dropped, Some(&h), &cfg(), now);
         assert_eq!(s, LayerCapacityState::PendingRestore { since: now });
     }
 
@@ -1453,12 +1403,7 @@ mod tests {
         let pending = LayerCapacityState::PendingRestore { since: now };
         let post = now + cfg().restore_debounce;
         let gray_band = health(0.04);
-        let s = step_layer_capacity_state(
-            pending,
-            Some(&gray_band),
-            &cfg(),
-            post,
-        );
+        let s = step_layer_capacity_state(pending, Some(&gray_band), &cfg(), post);
         assert_eq!(
             s,
             LayerCapacityState::Dropped,
@@ -1491,12 +1436,14 @@ mod tests {
         // drop is pending, the encoder is still producing the
         // layer, so peers count it as wanted.
         assert!(layer_state_is_wanted(&LayerCapacityState::Wanted));
-        assert!(layer_state_is_wanted(
-            &LayerCapacityState::PendingDrop { since: Instant::now() }
-        ));
+        assert!(layer_state_is_wanted(&LayerCapacityState::PendingDrop {
+            since: Instant::now()
+        }));
         assert!(!layer_state_is_wanted(&LayerCapacityState::Dropped));
         assert!(!layer_state_is_wanted(
-            &LayerCapacityState::PendingRestore { since: Instant::now() }
+            &LayerCapacityState::PendingRestore {
+                since: Instant::now()
+            }
         ));
     }
 
@@ -1601,12 +1548,7 @@ mod tests {
                 // not let pending states advance.
                 let after_debounce = t0() + cfg().drop_debounce;
                 assert_eq!(
-                    step_aggregate_layer_capacity(
-                        prev,
-                        Some(&empty),
-                        &cfg(),
-                        after_debounce,
-                    ),
+                    step_aggregate_layer_capacity(prev, Some(&empty), &cfg(), after_debounce,),
                     prev,
                     "empty-window Some({empty:?}) must preserve state {prev:?}",
                 );
@@ -1663,10 +1605,7 @@ mod tests {
             &cfg(),
             now,
         );
-        assert_eq!(
-            next,
-            AggregateLayerCapacity::PendingPauseTop { since: now }
-        );
+        assert_eq!(next, AggregateLayerCapacity::PendingPauseTop { since: now });
     }
 
     #[test]
@@ -1729,10 +1668,7 @@ mod tests {
             &cfg(),
             now,
         );
-        assert_eq!(
-            next,
-            AggregateLayerCapacity::PendingPauseMid { since: now }
-        );
+        assert_eq!(next, AggregateLayerCapacity::PendingPauseMid { since: now });
     }
 
     #[test]
@@ -2107,15 +2043,21 @@ mod tests {
         let current = vp8_three_layer_set();
         // TWCC excludes `full` (sustained loss → TopPaused →
         // projection drops top + floor union).
-        let twcc_union: HashSet<SimulcastRid> =
-            [SimulcastRid::half(), SimulcastRid::quarter()]
-                .into_iter()
-                .collect();
+        let twcc_union: HashSet<SimulcastRid> = [SimulcastRid::half(), SimulcastRid::quarter()]
+            .into_iter()
+            .collect();
         // RR has no signal: each peer's per-RID state defaults to
         // Wanted, so peer wants all layers; union is the full set.
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
+        let effective = compose_effective_wanted(
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &HashSet::new(),
+            &full_three_layer_union(),
+        );
 
         assert!(
             !effective.contains(&SimulcastRid::full()),
@@ -2140,7 +2082,14 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(false, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
+        let effective = compose_effective_wanted(
+            false,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &HashSet::new(),
+            &full_three_layer_union(),
+        );
 
         assert_eq!(
             effective,
@@ -2167,7 +2116,14 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
+        let effective = compose_effective_wanted(
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &HashSet::new(),
+            &full_three_layer_union(),
+        );
 
         assert_eq!(
             effective,
@@ -2199,13 +2155,19 @@ mod tests {
         // TWCC was at TopPaused; full is not in the wanted set.
         // After an empty window, the state preserves (per existing
         // empty-window guards), so the union still excludes full.
-        let twcc_union: HashSet<SimulcastRid> =
-            [SimulcastRid::half(), SimulcastRid::quarter()]
-                .into_iter()
-                .collect();
+        let twcc_union: HashSet<SimulcastRid> = [SimulcastRid::half(), SimulcastRid::quarter()]
+            .into_iter()
+            .collect();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
+        let effective = compose_effective_wanted(
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &HashSet::new(),
+            &full_three_layer_union(),
+        );
 
         assert!(
             !effective.contains(&SimulcastRid::full()),
@@ -2237,7 +2199,14 @@ mod tests {
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
+        let effective = compose_effective_wanted(
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &HashSet::new(),
+            &full_three_layer_union(),
+        );
 
         assert!(
             !effective.contains(&SimulcastRid::quarter()),
@@ -2259,12 +2228,18 @@ mod tests {
         // RR genuinely says half is Dropped (hypothetical — RR
         // doesn't fire on the rtc 0.9 stack today, but the
         // composition logic must still respect it).
-        let rr_union: HashSet<SimulcastRid> =
-            [SimulcastRid::full(), SimulcastRid::quarter()]
-                .into_iter()
-                .collect();
+        let rr_union: HashSet<SimulcastRid> = [SimulcastRid::full(), SimulcastRid::quarter()]
+            .into_iter()
+            .collect();
 
-        let effective = compose_effective_wanted(true, &twcc_union, &rr_union, &current, &HashSet::new(), &full_three_layer_union());
+        let effective = compose_effective_wanted(
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &HashSet::new(),
+            &full_three_layer_union(),
+        );
 
         assert!(!effective.contains(&SimulcastRid::half()));
         assert!(effective.contains(&SimulcastRid::full()));
@@ -2285,11 +2260,25 @@ mod tests {
         let full = full_three_layer_union();
 
         assert_eq!(
-            compose_effective_wanted(true, &empty, &full, &current, &HashSet::new(), &full_three_layer_union()),
+            compose_effective_wanted(
+                true,
+                &empty,
+                &full,
+                &current,
+                &HashSet::new(),
+                &full_three_layer_union()
+            ),
             HashSet::new(),
         );
         assert_eq!(
-            compose_effective_wanted(true, &full, &empty, &current, &HashSet::new(), &full_three_layer_union()),
+            compose_effective_wanted(
+                true,
+                &full,
+                &empty,
+                &current,
+                &HashSet::new(),
+                &full_three_layer_union()
+            ),
             HashSet::new(),
         );
     }
@@ -2308,16 +2297,19 @@ mod tests {
     #[test]
     fn compose_pinned_full_overrides_twcc_pause() {
         let current = vp8_three_layer_set();
-        let twcc_union: HashSet<SimulcastRid> =
-            [SimulcastRid::half(), SimulcastRid::quarter()]
-                .into_iter()
-                .collect();
+        let twcc_union: HashSet<SimulcastRid> = [SimulcastRid::half(), SimulcastRid::quarter()]
+            .into_iter()
+            .collect();
         let rr_union = full_three_layer_union();
-        let pinned: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::full()).collect();
+        let pinned: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::full()).collect();
 
         let effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &pinned, &full_three_layer_union(),
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &pinned,
+            &full_three_layer_union(),
         );
         assert!(
             effective.contains(&SimulcastRid::full()),
@@ -2337,16 +2329,19 @@ mod tests {
     fn compose_no_pin_allows_cascade_pause() {
         let current = vp8_three_layer_set();
         // TWCC has cascaded `f`, then `h` — only floor `q` survives.
-        let twcc_union: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::quarter()).collect();
+        let twcc_union: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::quarter()).collect();
         let rr_union = full_three_layer_union();
         let no_pin: HashSet<SimulcastRid> = HashSet::new();
 
         let effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &no_pin, &full_three_layer_union(),
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &no_pin,
+            &full_three_layer_union(),
         );
-        let expected: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::quarter()).collect();
+        let expected: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::quarter()).collect();
         assert_eq!(
             effective, expected,
             "without pin, cascaded TWCC pauses both `f` and `h`",
@@ -2366,17 +2361,20 @@ mod tests {
     #[test]
     fn compose_pin_removed_on_disconnect_restores_pause_authority() {
         let current = vp8_three_layer_set();
-        let twcc_union: HashSet<SimulcastRid> =
-            [SimulcastRid::half(), SimulcastRid::quarter()]
-                .into_iter()
-                .collect();
+        let twcc_union: HashSet<SimulcastRid> = [SimulcastRid::half(), SimulcastRid::quarter()]
+            .into_iter()
+            .collect();
         let rr_union = full_three_layer_union();
 
         // While pinned: f survives TWCC drop.
-        let with_pin: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::full()).collect();
+        let with_pin: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::full()).collect();
         let pinned_effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &with_pin, &full_three_layer_union(),
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &with_pin,
+            &full_three_layer_union(),
         );
         assert!(pinned_effective.contains(&SimulcastRid::full()));
 
@@ -2387,7 +2385,12 @@ mod tests {
         // semantic explicit.
         let no_pin: HashSet<SimulcastRid> = HashSet::new();
         let unpinned_effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &no_pin, &full_three_layer_union(),
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &no_pin,
+            &full_three_layer_union(),
         );
         assert!(
             !unpinned_effective.contains(&SimulcastRid::full()),
@@ -2413,11 +2416,15 @@ mod tests {
         let current = vec![SimulcastRid::half(), SimulcastRid::quarter()];
         let twcc_union = full_three_layer_union();
         let rr_union = full_three_layer_union();
-        let stale_pin: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::full()).collect();
+        let stale_pin: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::full()).collect();
 
         let effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &stale_pin, &full_three_layer_union(),
+            true,
+            &twcc_union,
+            &rr_union,
+            &current,
+            &stale_pin,
+            &full_three_layer_union(),
         );
         assert!(
             !effective.contains(&SimulcastRid::full()),
@@ -2442,11 +2449,15 @@ mod tests {
     fn compose_idle_pause_overrides_even_pinned_layer() {
         let current = vp8_three_layer_set();
         let full_union = full_three_layer_union();
-        let pinned: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::full()).collect();
+        let pinned: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::full()).collect();
 
         let effective = compose_effective_wanted(
-            false, &full_union, &full_union, &current, &pinned, &full_three_layer_union(),
+            false,
+            &full_union,
+            &full_union,
+            &current,
+            &pinned,
+            &full_three_layer_union(),
         );
         assert!(
             effective.is_empty(),
@@ -2467,14 +2478,11 @@ mod tests {
     fn compose_demand_q_only_drops_unconsumed_f_and_h() {
         let current = vp8_three_layer_set();
         let no_loss = full_three_layer_union();
-        let pinned: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::quarter()).collect();
-        let demanded: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::quarter()).collect();
+        let pinned: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::quarter()).collect();
+        let demanded: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::quarter()).collect();
 
-        let effective = compose_effective_wanted(
-            true, &no_loss, &no_loss, &current, &pinned, &demanded,
-        );
+        let effective =
+            compose_effective_wanted(true, &no_loss, &no_loss, &current, &pinned, &demanded);
         assert_eq!(
             effective,
             std::iter::once(SimulcastRid::quarter()).collect::<HashSet<_>>(),
@@ -2495,9 +2503,8 @@ mod tests {
         let no_pin: HashSet<SimulcastRid> = HashSet::new();
         let demanded = full_three_layer_union();
 
-        let effective = compose_effective_wanted(
-            true, &no_loss, &no_loss, &current, &no_pin, &demanded,
-        );
+        let effective =
+            compose_effective_wanted(true, &no_loss, &no_loss, &current, &no_pin, &demanded);
         assert_eq!(effective, full_three_layer_union());
     }
 
@@ -2510,14 +2517,12 @@ mod tests {
     fn compose_demand_mixed_local_and_federated_unions_to_full() {
         let current = vp8_three_layer_set();
         let no_loss = full_three_layer_union();
-        let pinned: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::quarter()).collect();
+        let pinned: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::quarter()).collect();
         let mut demanded = full_three_layer_union();
         demanded.insert(SimulcastRid::quarter());
 
-        let effective = compose_effective_wanted(
-            true, &no_loss, &no_loss, &current, &pinned, &demanded,
-        );
+        let effective =
+            compose_effective_wanted(true, &no_loss, &no_loss, &current, &pinned, &demanded);
         assert_eq!(effective, full_three_layer_union());
     }
 
@@ -2533,9 +2538,8 @@ mod tests {
         let no_pin: HashSet<SimulcastRid> = HashSet::new();
         let no_demand: HashSet<SimulcastRid> = HashSet::new();
 
-        let effective = compose_effective_wanted(
-            true, &no_loss, &no_loss, &current, &no_pin, &no_demand,
-        );
+        let effective =
+            compose_effective_wanted(true, &no_loss, &no_loss, &current, &no_pin, &no_demand);
         assert!(
             effective.is_empty(),
             "empty demand must pause all layers, got {effective:?}",
@@ -2550,17 +2554,13 @@ mod tests {
     #[test]
     fn compose_pin_and_demand_invariants_compose_safely() {
         let current = vp8_three_layer_set();
-        let twcc_union: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::quarter()).collect();
+        let twcc_union: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::quarter()).collect();
         let rr_union = full_three_layer_union();
-        let pinned: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::quarter()).collect();
-        let demanded: HashSet<SimulcastRid> =
-            std::iter::once(SimulcastRid::quarter()).collect();
+        let pinned: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::quarter()).collect();
+        let demanded: HashSet<SimulcastRid> = std::iter::once(SimulcastRid::quarter()).collect();
 
-        let effective = compose_effective_wanted(
-            true, &twcc_union, &rr_union, &current, &pinned, &demanded,
-        );
+        let effective =
+            compose_effective_wanted(true, &twcc_union, &rr_union, &current, &pinned, &demanded);
         assert_eq!(
             effective,
             std::iter::once(SimulcastRid::quarter()).collect::<HashSet<_>>(),
@@ -2600,21 +2600,18 @@ mod tests {
 
         let peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>> =
             Arc::new(RwLock::new(HashMap::new()));
-        let recorded: Arc<StdMutex<Vec<CapacityAction>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let recorded: Arc<StdMutex<Vec<CapacityAction>>> = Arc::new(StdMutex::new(Vec::new()));
         let recorded_for_closure = Arc::clone(&recorded);
-        let on_action: Box<dyn Fn(CapacityAction) + Send + Sync> =
-            Box::new(move |a| {
-                recorded_for_closure.lock().unwrap().push(a);
-            });
+        let on_action: Box<dyn Fn(CapacityAction) + Send + Sync> = Box::new(move |a| {
+            recorded_for_closure.lock().unwrap().push(a);
+        });
         let get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync> =
             Box::new(|| vp8_three_layer_set());
         // Pool reports every layer ACTIVE — the diff after the
         // presence policy fires Idle must produce a PauseLayer
         // for each.
-        let is_layer_paused: Box<
-            dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync,
-        > = Box::new(|_| Some(false));
+        let is_layer_paused: Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync> =
+            Box::new(|_| Some(false));
 
         let shutdown = CancellationToken::new();
         let handle = spawn_layer_policy_coordinator(
@@ -2696,10 +2693,12 @@ mod tests {
 
     #[test]
     fn aggregate_wanted_layers_unions_per_peer_sets() {
-        let peer_a: HashSet<SimulcastRid> =
-            [SimulcastRid::full(), SimulcastRid::quarter()].into_iter().collect();
-        let peer_b: HashSet<SimulcastRid> =
-            [SimulcastRid::half(), SimulcastRid::quarter()].into_iter().collect();
+        let peer_a: HashSet<SimulcastRid> = [SimulcastRid::full(), SimulcastRid::quarter()]
+            .into_iter()
+            .collect();
+        let peer_b: HashSet<SimulcastRid> = [SimulcastRid::half(), SimulcastRid::quarter()]
+            .into_iter()
+            .collect();
         let agg = aggregate_wanted_layers(vec![peer_a, peer_b]);
         // Union: full ∪ half ∪ quarter = all three.
         assert_eq!(agg.len(), 3);
@@ -2717,8 +2716,7 @@ mod tests {
 
     #[test]
     fn aggregate_wanted_layers_one_peer_single_set() {
-        let only_full: HashSet<SimulcastRid> =
-            [SimulcastRid::full()].into_iter().collect();
+        let only_full: HashSet<SimulcastRid> = [SimulcastRid::full()].into_iter().collect();
         let agg = aggregate_wanted_layers(vec![only_full.clone()]);
         assert_eq!(agg, only_full);
     }
@@ -2742,10 +2740,11 @@ mod tests {
             HashSet::<SimulcastRid>::new(),
             [SimulcastRid::full()].into_iter().collect(),
             [SimulcastRid::half()].into_iter().collect(),
-            [SimulcastRid::full(), SimulcastRid::half()].into_iter().collect(),
+            [SimulcastRid::full(), SimulcastRid::half()]
+                .into_iter()
+                .collect(),
         ] {
-            let actions =
-                diff_wanted_aggregate(&set, &set, &vp8_non_floor_rids());
+            let actions = diff_wanted_aggregate(&set, &set, &vp8_non_floor_rids());
             assert!(
                 actions.is_empty(),
                 "no-change diff fired actions for {set:?}: {actions:?}",
@@ -2756,21 +2755,24 @@ mod tests {
     #[test]
     fn diff_wanted_layer_dropped_fires_pause_action() {
         // full was applied, now no longer wanted. Pause action fires.
-        let prev: HashSet<SimulcastRid> =
-            [SimulcastRid::full(), SimulcastRid::half()].into_iter().collect();
-        let current: HashSet<SimulcastRid> =
-            [SimulcastRid::half()].into_iter().collect();
+        let prev: HashSet<SimulcastRid> = [SimulcastRid::full(), SimulcastRid::half()]
+            .into_iter()
+            .collect();
+        let current: HashSet<SimulcastRid> = [SimulcastRid::half()].into_iter().collect();
         let actions = diff_wanted_aggregate(&prev, &current, &vp8_non_floor_rids());
-        assert_eq!(actions, vec![CapacityAction::PauseLayer(SimulcastRid::full())]);
+        assert_eq!(
+            actions,
+            vec![CapacityAction::PauseLayer(SimulcastRid::full())]
+        );
     }
 
     #[test]
     fn diff_wanted_layer_added_fires_resume_action() {
         // full was paused, now wanted again. Resume action fires.
-        let prev: HashSet<SimulcastRid> =
-            [SimulcastRid::half()].into_iter().collect();
-        let current: HashSet<SimulcastRid> =
-            [SimulcastRid::full(), SimulcastRid::half()].into_iter().collect();
+        let prev: HashSet<SimulcastRid> = [SimulcastRid::half()].into_iter().collect();
+        let current: HashSet<SimulcastRid> = [SimulcastRid::full(), SimulcastRid::half()]
+            .into_iter()
+            .collect();
         let actions = diff_wanted_aggregate(&prev, &current, &vp8_non_floor_rids());
         assert_eq!(
             actions,
@@ -2803,17 +2805,11 @@ mod tests {
     /// pure diff function's contract is the same.
     #[test]
     fn diff_wanted_after_pool_regen_pauses_unwanted_layers() {
-        let actual_active: HashSet<SimulcastRid> =
-            [SimulcastRid::full(), SimulcastRid::half()]
-                .into_iter()
-                .collect();
-        let aggregate: HashSet<SimulcastRid> =
-            [SimulcastRid::half()].into_iter().collect();
-        let actions = diff_wanted_aggregate(
-            &actual_active,
-            &aggregate,
-            &vp8_non_floor_rids(),
-        );
+        let actual_active: HashSet<SimulcastRid> = [SimulcastRid::full(), SimulcastRid::half()]
+            .into_iter()
+            .collect();
+        let aggregate: HashSet<SimulcastRid> = [SimulcastRid::half()].into_iter().collect();
+        let actions = diff_wanted_aggregate(&actual_active, &aggregate, &vp8_non_floor_rids());
         assert_eq!(
             actions,
             vec![CapacityAction::PauseLayer(SimulcastRid::full())],
@@ -2827,10 +2823,8 @@ mod tests {
         // full was wanted (now paused); half was paused (now wanted).
         // Iteration order follows `vp8_non_floor_rids()` spec order so
         // tests + downstream consumers see deterministic ordering.
-        let prev: HashSet<SimulcastRid> =
-            [SimulcastRid::full()].into_iter().collect();
-        let current: HashSet<SimulcastRid> =
-            [SimulcastRid::half()].into_iter().collect();
+        let prev: HashSet<SimulcastRid> = [SimulcastRid::full()].into_iter().collect();
+        let current: HashSet<SimulcastRid> = [SimulcastRid::half()].into_iter().collect();
         let actions = diff_wanted_aggregate(&prev, &current, &vp8_non_floor_rids());
         assert_eq!(
             actions,
@@ -2840,7 +2834,6 @@ mod tests {
             ]
         );
     }
-
 
     // -----------------------------------------------------------------
     // Phase 4d.3c review fix: fresh_health + freshness composition tests
@@ -2858,7 +2851,10 @@ mod tests {
     #[test]
     fn fresh_health_count_advanced_returns_some() {
         let h = health_with_measurements(0.05, 3);
-        assert!(fresh_health(Some(&h), 0).is_some(), "first observation: 0 → 3");
+        assert!(
+            fresh_health(Some(&h), 0).is_some(),
+            "first observation: 0 → 3"
+        );
         assert!(fresh_health(Some(&h), 2).is_some(), "advanced: 2 → 3");
     }
 
@@ -2923,12 +2919,7 @@ mod tests {
             );
             // Pass `None` to the policy (the spawn loop does the
             // same after fresh_health filters out the entry).
-            state = step_layer_capacity_state(
-                state,
-                fresh,
-                &cfg,
-                t0 + Duration::from_secs(tick_n),
-            );
+            state = step_layer_capacity_state(state, fresh, &cfg, t0 + Duration::from_secs(tick_n));
             assert!(
                 matches!(state, LayerCapacityState::PendingDrop { .. }),
                 "tick {tick_n}: state must remain PendingDrop \
@@ -2954,20 +2945,14 @@ mod tests {
         // measurement count (1, 2, 3, ...) and the same over-budget
         // fraction_lost. Walk through the drop debounce window.
         for tick_n in 0..=drop_secs {
-            let bad_rr =
-                health_with_measurements(0.10, (tick_n + 1) as u64);
+            let bad_rr = health_with_measurements(0.10, (tick_n + 1) as u64);
             let fresh = fresh_health(Some(&bad_rr), prev_count);
             assert!(
                 fresh.is_some(),
                 "tick {tick_n}: count {} > prev {prev_count}, must be fresh",
                 bad_rr.round_trip_time_measurements,
             );
-            state = step_layer_capacity_state(
-                state,
-                fresh,
-                &cfg,
-                t0 + Duration::from_secs(tick_n),
-            );
+            state = step_layer_capacity_state(state, fresh, &cfg, t0 + Duration::from_secs(tick_n));
             prev_count = bad_rr.round_trip_time_measurements;
         }
 

@@ -1,7 +1,7 @@
 use crate::tui::app::{App, LogEntry, LogSource, LogTab, ViewState};
 use crate::tui::markdown;
-use crate::types::{LogLevel, Phase};
 use crate::tui::theme;
+use crate::types::{LogLevel, Phase};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -199,13 +199,11 @@ pub fn render_log_panel(f: &mut Frame, area: Rect, app: &App, view: &ViewState) 
 
     // Determine which filtered position is focused for highlight
     let focus_raw = view.focus_index(app);
-    let focus_filtered_pos = focus_raw
-        .and_then(|raw| filtered.iter().position(|&i| i == raw));
+    let focus_filtered_pos = focus_raw.and_then(|raw| filtered.iter().position(|&i| i == raw));
 
     // Precompute per-turn visible entry counts for collapsed turns (used for
     // the "+N more" indicator on collapsed turn summaries).
-    let mut turn_counts: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
+    let mut turn_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for entry in &app.log_entries {
         if let Some(t) = entry.turn {
             if !view.expanded_turns.contains(&t)
@@ -369,28 +367,21 @@ fn format_log_entry_with_turn(
     // 6 chars wide (padded) to align content columns.
     let level_span = match (&entry.level, &entry.source) {
         // Browser live presence (voice/video)
-        (_, LogSource::Live) =>
-            Span::styled("Live  ", Style::default().fg(theme::LOG_PRESENCE_FG)),
+        (_, LogSource::Live) => Span::styled("Live  ", Style::default().fg(theme::LOG_PRESENCE_FG)),
         // Server-side text presence model
-        (LogLevel::Info, LogSource::Presence)
-        | (LogLevel::Detail, LogSource::Presence) =>
-            Span::styled("Servr ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
-        (LogLevel::Info, _) =>
-            Span::styled("    ℹ ", Style::default().fg(theme::LOG_DIM_FG)),
-        (LogLevel::Model, _) =>
-            Span::styled("Workr ", Style::default().fg(theme::LOG_MODEL_FG)),
-        (LogLevel::Agent, _) =>
-            Span::styled("Agent ", Style::default().fg(theme::LOG_AGENT_FG)),
-        (LogLevel::Error, _) =>
-            Span::styled("Error ", Style::default().fg(theme::LOG_ERROR_FG)),
-        (LogLevel::Warn, _) =>
-            Span::styled("Warn  ", Style::default().fg(theme::LOG_WARN_FG)),
-        (LogLevel::SubAgent, _) =>
-            Span::styled("Sub   ", Style::default().fg(theme::LOG_SUBAGENT_FG)),
-        (LogLevel::Detail, _) =>
-            Span::styled("    · ", Style::default().fg(theme::LOG_DETAIL_FG)),
-        (LogLevel::Debug, _) =>
-            Span::styled("Debug ", Style::default().fg(theme::LOG_DIM_FG)),
+        (LogLevel::Info, LogSource::Presence) | (LogLevel::Detail, LogSource::Presence) => {
+            Span::styled("Servr ", Style::default().fg(theme::LOG_SUBAGENT_FG))
+        }
+        (LogLevel::Info, _) => Span::styled("    ℹ ", Style::default().fg(theme::LOG_DIM_FG)),
+        (LogLevel::Model, _) => Span::styled("Workr ", Style::default().fg(theme::LOG_MODEL_FG)),
+        (LogLevel::Agent, _) => Span::styled("Agent ", Style::default().fg(theme::LOG_AGENT_FG)),
+        (LogLevel::Error, _) => Span::styled("Error ", Style::default().fg(theme::LOG_ERROR_FG)),
+        (LogLevel::Warn, _) => Span::styled("Warn  ", Style::default().fg(theme::LOG_WARN_FG)),
+        (LogLevel::SubAgent, _) => {
+            Span::styled("Sub   ", Style::default().fg(theme::LOG_SUBAGENT_FG))
+        }
+        (LogLevel::Detail, _) => Span::styled("    · ", Style::default().fg(theme::LOG_DETAIL_FG)),
+        (LogLevel::Debug, _) => Span::styled("Debug ", Style::default().fg(theme::LOG_DIM_FG)),
     };
     prefix.push(level_span);
 
@@ -417,17 +408,12 @@ fn format_log_entry_with_turn(
     let content_lines: Vec<&str> = entry.content.split('\n').collect();
 
     // Use markdown rendering for entry types that contain LLM output
-    let use_markdown = matches!(
-        entry.level,
-        LogLevel::SubAgent | LogLevel::Model
-    ) && content_lines.len() > 1;
+    let use_markdown =
+        matches!(entry.level, LogLevel::SubAgent | LogLevel::Model) && content_lines.len() > 1;
 
     // First line: full prefix + first content line (always plain — it's the summary)
     let mut first_spans = prefix;
-    first_spans.push(Span::styled(
-        content_lines[0].to_string(),
-        content_style,
-    ));
+    first_spans.push(Span::styled(content_lines[0].to_string(), content_style));
 
     // For collapsed turns, append a hint showing how much is hidden
     if turn_collapsed {
@@ -724,10 +710,7 @@ pub fn render_follow_up_reminder(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let line = Line::from(vec![
-        Span::styled(
-            " Press ",
-            Style::default().fg(theme::LOG_DIM_FG),
-        ),
+        Span::styled(" Press ", Style::default().fg(theme::LOG_DIM_FG)),
         Span::styled(
             "f",
             Style::default()
@@ -744,10 +727,7 @@ pub fn render_follow_up_reminder(f: &mut Frame, area: Rect, app: &App) {
                 .fg(theme::HELP_KEY_FG)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            " to quit",
-            Style::default().fg(theme::LOG_DIM_FG),
-        ),
+        Span::styled(" to quit", Style::default().fg(theme::LOG_DIM_FG)),
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme::INPUT_BG)),
@@ -984,8 +964,15 @@ mod tests {
         let lines = format_log_entry_with_turn(&entry, &expanded, false, 5);
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("+5 more"), "expected hidden hint, got: {}", text);
-        assert!(text.contains("Enter to expand"), "expected expand instruction");
+        assert!(
+            text.contains("+5 more"),
+            "expected hidden hint, got: {}",
+            text
+        );
+        assert!(
+            text.contains("Enter to expand"),
+            "expected expand instruction"
+        );
     }
 
     #[test]

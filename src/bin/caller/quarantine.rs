@@ -91,26 +91,11 @@ pub fn list_payloads(live_audio_id: &str) -> Result<Vec<QuarantinePayload>, Call
         let data = std::fs::read_to_string(&path)?;
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
             payloads.push(QuarantinePayload {
-                payload_id: parsed["payload_id"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-                timestamp: parsed["timestamp"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-                live_audio_id: parsed["live_audio_id"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-                content_type: parsed["content_type"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-                summary: parsed["summary"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
+                payload_id: parsed["payload_id"].as_str().unwrap_or("").to_string(),
+                timestamp: parsed["timestamp"].as_str().unwrap_or("").to_string(),
+                live_audio_id: parsed["live_audio_id"].as_str().unwrap_or("").to_string(),
+                content_type: parsed["content_type"].as_str().unwrap_or("").to_string(),
+                summary: parsed["summary"].as_str().unwrap_or("").to_string(),
             });
         }
     }
@@ -126,10 +111,7 @@ pub fn read_payload(live_audio_id: &str, payload_id: &str) -> Result<String, Cal
     let file_path = quarantine_dir(live_audio_id).join(format!("{}.json", payload_id));
     let data = std::fs::read_to_string(&file_path)?;
     let parsed: serde_json::Value = serde_json::from_str(&data)?;
-    Ok(parsed["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string())
+    Ok(parsed["content"].as_str().unwrap_or("").to_string())
 }
 
 /// Remove all quarantine data for a live audio session.
@@ -147,17 +129,16 @@ pub fn make_quarantine_fn(
     live_audio_id: String,
 ) -> impl FnMut(&str, &str, &str) -> QuarantinePayload {
     move |_field: &str, content_type: &str, content: &str| {
-        store_payload(&live_audio_id, content_type, content)
-            .unwrap_or_else(|e| {
-                // If quarantine write fails, return a placeholder reference
-                QuarantinePayload {
-                    payload_id: "error".to_string(),
-                    timestamp: String::new(),
-                    live_audio_id: live_audio_id.clone(),
-                    content_type: content_type.to_string(),
-                    summary: format!("quarantine write failed: {}", e),
-                }
-            })
+        store_payload(&live_audio_id, content_type, content).unwrap_or_else(|e| {
+            // If quarantine write fails, return a placeholder reference
+            QuarantinePayload {
+                payload_id: "error".to_string(),
+                timestamp: String::new(),
+                live_audio_id: live_audio_id.clone(),
+                content_type: content_type.to_string(),
+                summary: format!("quarantine write failed: {}", e),
+            }
+        })
     }
 }
 
@@ -228,8 +209,7 @@ mod tests {
         assert_eq!(payload.live_audio_id, live_id);
 
         // Verify the file exists
-        let file_path =
-            quarantine_dir(&live_id).join(format!("{}.json", payload.payload_id));
+        let file_path = quarantine_dir(&live_id).join(format!("{}.json", payload.payload_id));
         assert!(file_path.exists());
 
         // Verify content is on disk but not in the payload reference

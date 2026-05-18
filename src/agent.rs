@@ -251,8 +251,7 @@ impl Agent {
             }
         }
         // Prefer virtual displays (>0), allow :0 only when granted
-        let user_display_granted =
-            std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
+        let user_display_granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
         self.available_displays
             .iter()
             .copied()
@@ -324,9 +323,7 @@ impl Agent {
                 .unwrap_or_else(|| self.default_display())
         });
         // Gate user session display access
-        if display_id <= 0
-            && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err()
-        {
+        if display_id <= 0 && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err() {
             return Err(AgentError::Process(
                 "Access to the user's session display (display :0) requires explicit grant. \
                  Use a virtual display or request display access first."
@@ -418,9 +415,7 @@ impl Agent {
                     .unwrap_or_else(|| self.default_display())
             });
             // Gate user session display access
-            if display <= 0
-                && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err()
-            {
+            if display <= 0 && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err() {
                 return Err(AgentError::Process(
                     "Access to the user's session display (display :0) requires explicit grant. \
                      Use a virtual display or request display access first."
@@ -465,8 +460,7 @@ impl Agent {
                      terminal app running intendant. A restart may be required after granting."
                         .to_string()
                 } else {
-                    "Screenshot capture failed. Check DISPLAY and XAUTHORITY settings."
-                        .to_string()
+                    "Screenshot capture failed. Check DISPLAY and XAUTHORITY settings.".to_string()
                 }
             } else {
                 stderr.trim().to_string()
@@ -2084,10 +2078,7 @@ mod tests {
             question: Some("proceed?".to_string()),
             ..Default::default()
         };
-        let result = agent
-            .ask_human_with_paths(&cmd, &q, &r, 100)
-            .await
-            .unwrap();
+        let result = agent.ask_human_with_paths(&cmd, &q, &r, 100).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["response"], "yes");
@@ -2423,7 +2414,11 @@ mod tests {
         if cfg!(target_os = "macos") {
             // macOS defaults to virtual display 99; returns 0 only when
             // INTENDANT_USER_DISPLAY_GRANTED is set.
-            assert!(d == 0 || d == 99, "default_display on macOS should be 0 or 99, got {}", d);
+            assert!(
+                d == 0 || d == 99,
+                "default_display on macOS should be 0 or 99, got {}",
+                d
+            );
         } else {
             // Linux: DISPLAY env var or fallback to 1
             assert!(d >= 1, "default_display should be >= 1, got {}", d);

@@ -280,12 +280,10 @@ pub fn write_project_state(dir: &Path, state: &ProjectState) -> Result<(), Calle
 #[allow(dead_code)]
 pub fn read_project_state(dir: &Path) -> Result<ProjectState, CallerError> {
     let path = dir.join("project_state.json");
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        CallerError::SubAgent(format!("Failed to read project state: {}", e))
-    })?;
-    serde_json::from_str(&content).map_err(|e| {
-        CallerError::SubAgent(format!("Failed to parse project state: {}", e))
-    })
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| CallerError::SubAgent(format!("Failed to read project state: {}", e)))?;
+    serde_json::from_str(&content)
+        .map_err(|e| CallerError::SubAgent(format!("Failed to parse project state: {}", e)))
 }
 
 fn shell_escape(s: &str) -> String {
@@ -379,7 +377,7 @@ mod tests {
                 prompt_tokens: 1000,
                 completion_tokens: 500,
                 total_tokens: 1500,
-            ..Default::default()
+                ..Default::default()
             },
         };
         std::fs::write(&path, serde_json::to_string(&result).unwrap()).unwrap();
@@ -496,7 +494,7 @@ mod tests {
                 prompt_tokens: 1000,
                 completion_tokens: 500,
                 total_tokens: 1500,
-            ..Default::default()
+                ..Default::default()
             },
         };
         let msg = format_result_message(&result);
@@ -612,7 +610,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
-            ..Default::default()
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -691,6 +689,9 @@ mod tests {
     #[test]
     fn custom_role_roundtrip() {
         // "presence" is no longer a built-in role; it round-trips as Custom
-        assert_eq!(SubAgentRole::from_str("presence"), SubAgentRole::Custom("presence".into()));
+        assert_eq!(
+            SubAgentRole::from_str("presence"),
+            SubAgentRole::Custom("presence".into())
+        );
     }
 }

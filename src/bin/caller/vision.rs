@@ -72,9 +72,13 @@ pub(crate) fn remove_stale_lock(id: u32) {
 
 // Non-Linux stubs — these are called from debug.rs and XvfbGuard::Drop.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn is_lock_stale(_lock_path: &str) -> bool { false }
+pub(crate) fn is_lock_stale(_lock_path: &str) -> bool {
+    false
+}
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool { false }
+pub(crate) fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool {
+    false
+}
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn kill_and_reclaim(_lock_path: &str, _display_id: u32) {}
 #[cfg(not(target_os = "linux"))]
@@ -95,7 +99,9 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
         _ => (1024, 768),           // safe default
     };
     DisplayConfig {
-        target: DisplayTarget::Virtual { id: find_free_display() },
+        target: DisplayTarget::Virtual {
+            id: find_free_display(),
+        },
         width,
         height,
     }
@@ -217,10 +223,7 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     // Set DISPLAY env var so the runtime subprocess inherits it
     std::env::set_var("DISPLAY", &display_arg);
 
-    Ok(XvfbGuard {
-        child,
-        display_id,
-    })
+    Ok(XvfbGuard { child, display_id })
 }
 
 /// Virtual display launch is not available on non-Linux platforms.

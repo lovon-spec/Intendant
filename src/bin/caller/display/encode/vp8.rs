@@ -70,13 +70,7 @@ impl Vp8Encoder {
 
         let mut ctx: vpx_codec_ctx_t = unsafe { MaybeUninit::zeroed().assume_init() };
         let err = unsafe {
-            vpx_codec_enc_init_ver(
-                &mut ctx,
-                iface,
-                &cfg,
-                0,
-                VPX_ENCODER_ABI_VERSION as i32,
-            )
+            vpx_codec_enc_init_ver(&mut ctx, iface, &cfg, 0, VPX_ENCODER_ABI_VERSION as i32)
         };
         if err != VPX_CODEC_OK {
             return Err(format!("vpx_codec_enc_init_ver: {err:?}"));
@@ -171,10 +165,9 @@ impl Encoder for Vp8Encoder {
                 continue;
             }
             let frame = unsafe { &pkt_ref.data.frame };
-            let data = unsafe {
-                std::slice::from_raw_parts(frame.buf as *const u8, frame.sz as usize)
-            }
-            .to_vec();
+            let data =
+                unsafe { std::slice::from_raw_parts(frame.buf as *const u8, frame.sz as usize) }
+                    .to_vec();
             out.push(EncodedPacket {
                 data,
                 pts_ms: frame.pts as u64,

@@ -102,7 +102,11 @@ impl Conversation {
         self.messages.push(Message {
             role: "user".to_string(),
             content,
-            images: if images.is_empty() { None } else { Some(images) },
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(images)
+            },
             ..Default::default()
         });
     }
@@ -179,12 +183,7 @@ impl Conversation {
     }
 
     /// Add a native computer-use tool result with a screenshot image.
-    pub fn add_cu_result(
-        &mut self,
-        call_id: &str,
-        output: &str,
-        images: Vec<ImageData>,
-    ) {
+    pub fn add_cu_result(&mut self, call_id: &str, output: &str, images: Vec<ImageData>) {
         self.messages.push(Message {
             role: "tool".to_string(),
             content: output.to_string(),
@@ -285,9 +284,10 @@ impl Conversation {
     /// non-CU images.
     pub fn strip_old_images(&mut self) {
         // Find the index of the last non-CU message with images
-        let last_non_cu = self.messages.iter().rposition(|m| {
-            m.images.is_some() && !m.is_cu_result
-        });
+        let last_non_cu = self
+            .messages
+            .iter()
+            .rposition(|m| m.images.is_some() && !m.is_cu_result);
         if let Some(last_idx) = last_non_cu {
             for (i, msg) in self.messages.iter_mut().enumerate() {
                 if i < last_idx && !msg.is_cu_result {
@@ -815,10 +815,7 @@ mod tests {
         // System + user + assistant(tool_calls) + synthetic tool result = 4
         assert_eq!(conv.len(), 4);
         assert_eq!(conv.messages()[3].role, "tool");
-        assert_eq!(
-            conv.messages()[3].tool_call_id.as_deref(),
-            Some("call_1")
-        );
+        assert_eq!(conv.messages()[3].tool_call_id.as_deref(), Some("call_1"));
     }
 
     #[test]
@@ -960,7 +957,7 @@ mod tests {
             prompt_tokens: 50_000,
             completion_tokens: 50_000,
             total_tokens: 100_000,
-        ..Default::default()
+            ..Default::default()
         });
         assert!((conv.usage_fraction() - 0.5).abs() < f64::EPSILON);
     }
@@ -1219,7 +1216,7 @@ mod tests {
             prompt_tokens: 91_000,
             completion_tokens: 0,
             total_tokens: 91_000,
-        ..Default::default()
+            ..Default::default()
         });
         let before = conv.len();
         assert!(conv.auto_compact());
@@ -1255,7 +1252,7 @@ mod tests {
             prompt_tokens: 9_500,
             completion_tokens: 0,
             total_tokens: 9_500,
-        ..Default::default()
+            ..Default::default()
         });
         assert!(conv.auto_compact());
         let msgs = conv.messages();
@@ -1280,7 +1277,7 @@ mod tests {
             prompt_tokens: 950,
             completion_tokens: 0,
             total_tokens: 950,
-        ..Default::default()
+            ..Default::default()
         });
         // Only 5 messages — too few to compact
         assert!(!conv.auto_compact());
@@ -1389,7 +1386,7 @@ mod tests {
             prompt_tokens: 65_000,
             completion_tokens: 0,
             total_tokens: 65_000,
-        ..Default::default()
+            ..Default::default()
         });
         // Standard auto_compact (0.90 threshold) should NOT trigger
         assert!(!conv.auto_compact());
@@ -1410,7 +1407,7 @@ mod tests {
             prompt_tokens: 50_000,
             completion_tokens: 0,
             total_tokens: 50_000,
-        ..Default::default()
+            ..Default::default()
         });
         // 50% is below 0.60 threshold
         assert!(!conv.auto_compact_at(0.60));
@@ -1480,7 +1477,11 @@ mod tests {
         let resolved = conv.resolve_dangling_tool_calls();
         assert_eq!(resolved, 1);
 
-        let tool_msgs: Vec<_> = conv.messages().iter().filter(|m| m.role == "tool").collect();
+        let tool_msgs: Vec<_> = conv
+            .messages()
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
         assert_eq!(tool_msgs.len(), 2);
         assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(tool_msgs[0].content, "ok");

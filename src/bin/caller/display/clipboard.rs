@@ -202,10 +202,7 @@ async fn read_clipboard_image() -> Option<(String, Vec<u8>)> {
     }
 
     // Write clipboard PNG to a temp file via osascript, then read the file.
-    let tmp = std::env::temp_dir().join(format!(
-        "intendant-clipboard-{}.png",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("intendant-clipboard-{}.png", std::process::id()));
     let script = format!(
         concat!(
             "set pngData to the clipboard as «class PNGf»\n",
@@ -252,7 +249,10 @@ async fn write_clipboard_text(text: &str) -> Result<(), String> {
             .await
             .map_err(|e| format!("write to pbcopy: {e}"))?;
     }
-    let status = child.wait().await.map_err(|e| format!("wait pbcopy: {e}"))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("wait pbcopy: {e}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -324,24 +324,20 @@ fn clipboard_tool() -> ClipboardTool {
 #[cfg(target_os = "linux")]
 async fn read_clipboard_text() -> Option<String> {
     let output = match clipboard_tool() {
-        ClipboardTool::WlClipboard => {
-            tokio::process::Command::new("wl-paste")
-                .arg("--no-newline")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .await
-                .ok()?
-        }
-        ClipboardTool::Xclip => {
-            tokio::process::Command::new("xclip")
-                .args(["-o", "-selection", "clipboard"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .await
-                .ok()?
-        }
+        ClipboardTool::WlClipboard => tokio::process::Command::new("wl-paste")
+            .arg("--no-newline")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?,
+        ClipboardTool::Xclip => tokio::process::Command::new("xclip")
+            .args(["-o", "-selection", "clipboard"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?,
     };
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -354,24 +350,20 @@ async fn read_clipboard_text() -> Option<String> {
 async fn read_clipboard_image() -> Option<(String, Vec<u8>)> {
     // Check available MIME types on the clipboard.
     let targets = match clipboard_tool() {
-        ClipboardTool::WlClipboard => {
-            tokio::process::Command::new("wl-paste")
-                .arg("--list-types")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .await
-                .ok()?
-        }
-        ClipboardTool::Xclip => {
-            tokio::process::Command::new("xclip")
-                .args(["-selection", "clipboard", "-t", "TARGETS", "-o"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .await
-                .ok()?
-        }
+        ClipboardTool::WlClipboard => tokio::process::Command::new("wl-paste")
+            .arg("--list-types")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?,
+        ClipboardTool::Xclip => tokio::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?,
     };
     if !targets.status.success() {
         return None;
@@ -383,24 +375,20 @@ async fn read_clipboard_image() -> Option<(String, Vec<u8>)> {
 
     // Read PNG data.
     let output = match clipboard_tool() {
-        ClipboardTool::WlClipboard => {
-            tokio::process::Command::new("wl-paste")
-                .args(["--type", "image/png"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .await
-                .ok()?
-        }
-        ClipboardTool::Xclip => {
-            tokio::process::Command::new("xclip")
-                .args(["-o", "-selection", "clipboard", "-t", "image/png"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .await
-                .ok()?
-        }
+        ClipboardTool::WlClipboard => tokio::process::Command::new("wl-paste")
+            .args(["--type", "image/png"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?,
+        ClipboardTool::Xclip => tokio::process::Command::new("xclip")
+            .args(["-o", "-selection", "clipboard", "-t", "image/png"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?,
     };
     if !output.status.success() || output.stdout.is_empty() {
         return None;

@@ -798,15 +798,30 @@ mod tests {
     /// strings return None so the API surface can return a clean 400.
     #[test]
     fn capability_from_query_string_parses_kinds() {
-        assert_eq!(Capability::from_query_string("display"), Some(Capability::Display));
-        assert_eq!(Capability::from_query_string("voice"), Some(Capability::Voice));
-        assert_eq!(Capability::from_query_string("phone"), Some(Capability::Phone));
+        assert_eq!(
+            Capability::from_query_string("display"),
+            Some(Capability::Display)
+        );
+        assert_eq!(
+            Capability::from_query_string("voice"),
+            Some(Capability::Voice)
+        );
+        assert_eq!(
+            Capability::from_query_string("phone"),
+            Some(Capability::Phone)
+        );
         assert_eq!(
             Capability::from_query_string("computer-use"),
             Some(Capability::ComputerUse)
         );
-        assert_eq!(Capability::from_query_string("knowledge"), Some(Capability::Knowledge));
-        assert_eq!(Capability::from_query_string("recording"), Some(Capability::Recording));
+        assert_eq!(
+            Capability::from_query_string("knowledge"),
+            Some(Capability::Knowledge)
+        );
+        assert_eq!(
+            Capability::from_query_string("recording"),
+            Some(Capability::Recording)
+        );
         assert_eq!(
             Capability::from_query_string("task-delegation"),
             Some(Capability::TaskDelegation)

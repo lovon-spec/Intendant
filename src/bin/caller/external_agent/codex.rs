@@ -42,12 +42,14 @@ impl CodexAgent {
         match op {
             "compact" => self.compact_thread().await,
             "fork" => {
-                let name = params.get("name").and_then(|v| v.as_str()).map(String::from);
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 self.fork_thread(name).await
             }
             "undo" => {
-                let turns =
-                    params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let turns = params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                 self.rollback_turns_inner(turns).await
             }
             "review" => {
@@ -93,7 +95,10 @@ impl CodexAgent {
         let mut obj = serde_json::Map::new();
         obj.insert("threadId".into(), serde_json::Value::String(thread_id));
         if let Some(n) = name.as_deref().filter(|s| !s.trim().is_empty()) {
-            obj.insert("name".into(), serde_json::Value::String(n.trim().to_string()));
+            obj.insert(
+                "name".into(),
+                serde_json::Value::String(n.trim().to_string()),
+            );
         }
         let response = self
             .send_request("thread/fork", Some(serde_json::Value::Object(obj)))
@@ -136,10 +141,7 @@ impl CodexAgent {
         Ok(format!("rolled back {} turn(s)", turns))
     }
 
-    async fn start_review(
-        &mut self,
-        prompt: Option<String>,
-    ) -> Result<String, CallerError> {
+    async fn start_review(&mut self, prompt: Option<String>) -> Result<String, CallerError> {
         let thread_id = self.require_active_thread().await?;
         let mut obj = serde_json::Map::new();
         obj.insert("threadId".into(), serde_json::Value::String(thread_id));
@@ -167,10 +169,7 @@ impl CodexAgent {
         Ok("Codex memory reset".to_string())
     }
 
-    async fn set_thread_name(
-        &mut self,
-        params: &serde_json::Value,
-    ) -> Result<String, CallerError> {
+    async fn set_thread_name(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
         let thread_id = self.require_active_thread().await?;
         let name = params
             .get("name")
@@ -221,7 +220,9 @@ impl CodexAgent {
             || token_budget.is_some()
             || matches!(op, "goal-set")
         {
-            return self.set_goal(objective, status.as_deref(), token_budget).await;
+            return self
+                .set_goal(objective, status.as_deref(), token_budget)
+                .await;
         }
 
         self.get_goal().await
@@ -326,10 +327,11 @@ fn normalize_goal_status(status: &str) -> Result<String, CallerError> {
     Ok(normalized.to_string())
 }
 
-fn parse_goal_token_budget(
-    params: &serde_json::Value,
-) -> Result<Option<Option<u64>>, CallerError> {
-    let Some(value) = params.get("tokenBudget").or_else(|| params.get("token_budget")) else {
+fn parse_goal_token_budget(params: &serde_json::Value) -> Result<Option<Option<u64>>, CallerError> {
+    let Some(value) = params
+        .get("tokenBudget")
+        .or_else(|| params.get("token_budget"))
+    else {
         return Ok(None);
     };
     if value.is_null() {
@@ -410,17 +412,22 @@ fn format_duration_short(seconds: u64) -> String {
 /// libraries before daemon processes" would have short-circuited that.
 pub(super) fn sandbox_hint(sandbox_mode: &str) -> String {
     let body = match sandbox_mode {
-        "read-only" => "\
+        "read-only" => {
+            "\
 You are running under Codex's `read-only` sandbox. You CANNOT modify any \
 file on disk. Use read/search tools only and return findings to the user — \
-do not attempt edits, shell side-effects, or spawning daemons.",
-        "danger-full-access" => "\
+do not attempt edits, shell side-effects, or spawning daemons."
+        }
+        "danger-full-access" => {
+            "\
 You are running under Codex's `danger-full-access` sandbox. No filesystem \
 or network restrictions apply — the user has explicitly opted in. Still \
-prefer the least-invasive approach that gets the task done.",
+prefer the least-invasive approach that gets the task done."
+        }
         // Default: treat anything else as workspace-write (Intendant's
         // project config uses that as the default).
-        _ => "\
+        _ => {
+            "\
 You are running under Codex's `workspace-write` sandbox. Writes are allowed \
 inside the project root and `/tmp`; outbound network is blocked unless \
 `sandbox_workspace_write.network_access = true` in the config; inbound \
@@ -433,7 +440,8 @@ for archives, or hand-rolled XML+zip packaging) over automating a desktop \
 application through UNO / D-Bus / AppleScript — those need a listener the \
 sandbox blocks. If the user explicitly asked for live automation, say the \
 sandbox prevents it and ask whether to switch to `danger-full-access` \
-before retrying.",
+before retrying."
+        }
     };
     format!("\n\n## Environment\n\n{}\n", body)
 }
@@ -958,12 +966,14 @@ async fn read_codex_json_payload(
     relative_path: &str,
 ) -> Result<serde_json::Value, CallerError> {
     let payload_path = bundle_dir.join(relative_path);
-    let contents = tokio::fs::read_to_string(&payload_path).await.map_err(|e| {
-        CallerError::ExternalAgent(format!(
-            "read Codex request payload {}: {e}",
-            payload_path.display()
-        ))
-    })?;
+    let contents = tokio::fs::read_to_string(&payload_path)
+        .await
+        .map_err(|e| {
+            CallerError::ExternalAgent(format!(
+                "read Codex request payload {}: {e}",
+                payload_path.display()
+            ))
+        })?;
     serde_json::from_str::<serde_json::Value>(&contents).map_err(CallerError::Json)
 }
 
@@ -1016,7 +1026,10 @@ async fn resolve_openai_responses_context_payload(
         .unwrap_or(0);
     let mut resolved_payload = latest_payload;
     if let serde_json::Value::Object(map) = &mut resolved_payload {
-        map.insert("input".to_string(), serde_json::Value::Array(resolved_input.clone()));
+        map.insert(
+            "input".to_string(),
+            serde_json::Value::Array(resolved_input.clone()),
+        );
         map.insert(
             "_intendant_context".to_string(),
             serde_json::json!({
@@ -1033,7 +1046,9 @@ async fn resolve_openai_responses_context_payload(
 }
 
 fn codex_previous_response_id(payload: &serde_json::Value) -> Option<&str> {
-    payload.get("previous_response_id").and_then(|value| value.as_str())
+    payload
+        .get("previous_response_id")
+        .and_then(|value| value.as_str())
 }
 
 fn codex_extend_array_field(
@@ -1067,7 +1082,10 @@ fn codex_inference_request_ref(
         return None;
     }
     let request_payload = payload.get("request_payload")?;
-    if request_payload.get("kind")?.get("type").and_then(|v| v.as_str())?
+    if request_payload
+        .get("kind")?
+        .get("type")
+        .and_then(|v| v.as_str())?
         != "inference_request"
     {
         return None;
@@ -1084,7 +1102,11 @@ fn codex_inference_request_ref(
         provider_name: payload
             .get("provider_name")
             .and_then(|v| v.as_str())
-            .or_else(|| request_payload.get("provider_name").and_then(|v| v.as_str()))
+            .or_else(|| {
+                request_payload
+                    .get("provider_name")
+                    .and_then(|v| v.as_str())
+            })
             .map(ToString::to_string),
         order: (
             event
@@ -1106,7 +1128,10 @@ fn codex_inference_response_ref(
         return None;
     }
     let response_payload = payload.get("response_payload")?;
-    if response_payload.get("kind")?.get("type").and_then(|v| v.as_str())?
+    if response_payload
+        .get("kind")?
+        .get("type")
+        .and_then(|v| v.as_str())?
         != "inference_response"
     {
         return None;
@@ -1303,7 +1328,10 @@ async fn reader_task(
         let msg: JsonRpcMessage = match serde_json::from_str(&line) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[codex] failed to parse JSON-RPC message: {}: {:?}", e, line);
+                eprintln!(
+                    "[codex] failed to parse JSON-RPC message: {}: {:?}",
+                    e, line
+                );
                 continue;
             }
         };
@@ -1314,10 +1342,8 @@ async fn reader_task(
                 let mut pending = pending_requests.lock().await;
                 if let Some(tx) = pending.remove(&id) {
                     if let Some(err) = msg.error {
-                        let _ = tx.send(Err(format!(
-                            "JSON-RPC error {}: {}",
-                            err.code, err.message
-                        )));
+                        let _ =
+                            tx.send(Err(format!("JSON-RPC error {}: {}", err.code, err.message)));
                     } else {
                         let _ = tx.send(Ok(msg.result.unwrap_or(serde_json::Value::Null)));
                     }
@@ -1783,8 +1809,12 @@ fn translate_notification(
         }
 
         // Informational Codex v2 notifications — no action needed.
-        "turn/started" | "thread/started" | "thread/tokenUsage/updated"
-        | "account/rateLimits/updated" | "configWarning" | "remoteControl/status/changed" => {}
+        "turn/started"
+        | "thread/started"
+        | "thread/tokenUsage/updated"
+        | "account/rateLimits/updated"
+        | "configWarning"
+        | "remoteControl/status/changed" => {}
 
         "mcpServer/startupStatus/updated" => {
             let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -1807,7 +1837,11 @@ fn translate_notification(
         }
 
         other => {
-            eprintln!("[codex] unknown notification method: {:?} params: {}", other, serde_json::to_string(params).unwrap_or_default());
+            eprintln!(
+                "[codex] unknown notification method: {:?} params: {}",
+                other,
+                serde_json::to_string(params).unwrap_or_default()
+            );
         }
     }
 }
@@ -1957,7 +1991,11 @@ impl ExternalAgent for CodexAgent {
                 port
             );
             if let Err(e) = std::fs::write(&config_path, &config_content) {
-                eprintln!("[codex] Warning: failed to write {}: {}", config_path.display(), e);
+                eprintln!(
+                    "[codex] Warning: failed to write {}: {}",
+                    config_path.display(),
+                    e
+                );
             } else {
                 self.config_working_dir = Some(config.working_dir.clone());
             }
@@ -2019,12 +2057,14 @@ impl ExternalAgent for CodexAgent {
             CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
         })?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            CallerError::ExternalAgent("Failed to capture child stdin".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CallerError::ExternalAgent("Failed to capture child stdout".into())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdout".into()))?;
 
         self.child = Some(child);
         self.writer = Some(BufWriter::new(stdin));
@@ -2108,7 +2148,10 @@ impl ExternalAgent for CodexAgent {
         );
 
         let method = if let Some(ref thread_id) = self.resume_session {
-            params.insert("threadId".into(), serde_json::Value::String(thread_id.clone()));
+            params.insert(
+                "threadId".into(),
+                serde_json::Value::String(thread_id.clone()),
+            );
             "thread/resume"
         } else {
             "thread/start"
@@ -2122,9 +2165,7 @@ impl ExternalAgent for CodexAgent {
             .pointer("/thread/id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                CallerError::ExternalAgent(
-                    "thread/start response missing 'thread.id' field".into(),
-                )
+                CallerError::ExternalAgent("thread/start response missing 'thread.id' field".into())
             })?
             .to_string();
 
@@ -2249,16 +2290,14 @@ impl ExternalAgent for CodexAgent {
             let guard = self.active_turn_id.lock().await;
             guard.clone()
         };
-        let turn_id = turn_id.ok_or_else(|| {
-            CallerError::ExternalAgent("no active turn to interrupt".into())
-        })?;
+        let turn_id = turn_id
+            .ok_or_else(|| CallerError::ExternalAgent("no active turn to interrupt".into()))?;
         let thread_id = {
             let guard = self.active_thread_id.lock().await;
             guard.clone()
         };
-        let thread_id = thread_id.ok_or_else(|| {
-            CallerError::ExternalAgent("no active thread to interrupt".into())
-        })?;
+        let thread_id = thread_id
+            .ok_or_else(|| CallerError::ExternalAgent("no active thread to interrupt".into()))?;
         let params = serde_json::json!({
             "threadId": thread_id,
             "turnId": turn_id,
@@ -2284,16 +2323,14 @@ impl ExternalAgent for CodexAgent {
             let guard = self.active_turn_id.lock().await;
             guard.clone()
         };
-        let turn_id = turn_id.ok_or_else(|| {
-            CallerError::ExternalAgent("no active turn to steer".into())
-        })?;
+        let turn_id =
+            turn_id.ok_or_else(|| CallerError::ExternalAgent("no active turn to steer".into()))?;
         let thread_id = {
             let guard = self.active_thread_id.lock().await;
             guard.clone()
         };
-        let thread_id = thread_id.ok_or_else(|| {
-            CallerError::ExternalAgent("no active thread to steer".into())
-        })?;
+        let thread_id = thread_id
+            .ok_or_else(|| CallerError::ExternalAgent("no active thread to steer".into()))?;
         let params = serde_json::json!({
             "threadId": thread_id,
             "input": [{"type": "text", "text": text}],
@@ -2451,7 +2488,8 @@ mod tests {
 
     #[test]
     fn deserialize_error_response() {
-        let json = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"Invalid request"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"Invalid request"}}"#;
         let msg: JsonRpcMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.id, Some(2));
         assert!(msg.method.is_none());
@@ -2463,7 +2501,8 @@ mod tests {
 
     #[test]
     fn deserialize_notification_message() {
-        let json = r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hello"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hello"}}"#;
         let msg: JsonRpcMessage = serde_json::from_str(json).unwrap();
         assert!(msg.id.is_none());
         assert_eq!(msg.method.as_deref(), Some("item/agentMessage/delta"));
@@ -2542,8 +2581,7 @@ mod tests {
 
         std::fs::write(
             second.join("payloads/1.json"),
-            serde_json::json!({"input": [{"role": "developer"}, {"role": "user"}]})
-                .to_string(),
+            serde_json::json!({"input": [{"role": "developer"}, {"role": "user"}]}).to_string(),
         )
         .unwrap();
         std::fs::write(
@@ -2840,7 +2878,10 @@ mod tests {
             "item": {"type": "agentMessage"}
         });
         translate_notification("item/started", &params, &tx);
-        assert!(rx.try_recv().is_err(), "agentMessage start should emit nothing");
+        assert!(
+            rx.try_recv().is_err(),
+            "agentMessage start should emit nothing"
+        );
     }
 
     #[test]
@@ -2863,7 +2904,10 @@ mod tests {
             "item": {"id": "item-5", "type": "imageView", "status": "completed"}
         });
         translate_notification("item/completed", &completed, &tx);
-        assert!(rx.try_recv().is_err(), "imageView completion should emit nothing");
+        assert!(
+            rx.try_recv().is_err(),
+            "imageView completion should emit nothing"
+        );
     }
 
     #[test]
@@ -2968,9 +3012,20 @@ mod tests {
         let _ = rx.try_recv().unwrap(); // ToolOutputDelta
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolCompleted { status: ToolCompletionStatus::Failed { message }, .. } => {
-                assert!(message.contains("exited 1"), "message should carry exit code: {}", message);
-                assert!(message.contains("ModuleNotFoundError"), "message should carry output tail: {}", message);
+            AgentEvent::ToolCompleted {
+                status: ToolCompletionStatus::Failed { message },
+                ..
+            } => {
+                assert!(
+                    message.contains("exited 1"),
+                    "message should carry exit code: {}",
+                    message
+                );
+                assert!(
+                    message.contains("ModuleNotFoundError"),
+                    "message should carry output tail: {}",
+                    message
+                );
             }
             other => panic!("expected Failed with detailed message, got {:?}", other),
         }
@@ -2992,9 +3047,20 @@ mod tests {
         let _ = rx.try_recv().unwrap();
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolCompleted { status: ToolCompletionStatus::Failed { message }, .. } => {
-                assert!(message.contains("could not connect to pipe"), "got: {}", message);
-                assert!(!message.contains("unknown error"), "should not fall through to unknown: {}", message);
+            AgentEvent::ToolCompleted {
+                status: ToolCompletionStatus::Failed { message },
+                ..
+            } => {
+                assert!(
+                    message.contains("could not connect to pipe"),
+                    "got: {}",
+                    message
+                );
+                assert!(
+                    !message.contains("unknown error"),
+                    "should not fall through to unknown: {}",
+                    message
+                );
             }
             other => panic!("expected Failed with output tail, got {:?}", other),
         }
@@ -3010,7 +3076,10 @@ mod tests {
         translate_notification("item/completed", &params, &tx);
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolCompleted { status: ToolCompletionStatus::Failed { message }, .. } => {
+            AgentEvent::ToolCompleted {
+                status: ToolCompletionStatus::Failed { message },
+                ..
+            } => {
                 assert_eq!(message, "unknown error");
             }
             other => panic!("expected Failed with unknown error, got {:?}", other),
@@ -3026,14 +3095,26 @@ mod tests {
             "workspace-write hint should steer toward library-first path, got: {}",
             ws,
         );
-        assert!(ws.contains("listener"), "should warn about listener binds: {}", ws);
+        assert!(
+            ws.contains("listener"),
+            "should warn about listener binds: {}",
+            ws
+        );
 
         let ro = sandbox_hint("read-only");
         assert!(ro.contains("read-only"), "missing mode: {}", ro);
-        assert!(ro.contains("CANNOT modify"), "read-only hint should be explicit: {}", ro);
+        assert!(
+            ro.contains("CANNOT modify"),
+            "read-only hint should be explicit: {}",
+            ro
+        );
 
         let danger = sandbox_hint("danger-full-access");
-        assert!(danger.contains("danger-full-access"), "missing mode: {}", danger);
+        assert!(
+            danger.contains("danger-full-access"),
+            "missing mode: {}",
+            danger
+        );
     }
 
     #[test]
@@ -3041,7 +3122,11 @@ mod tests {
         // Defensive: if a new sandbox mode is added upstream and we haven't
         // updated here, we don't lie to the model about what's possible.
         let hint = sandbox_hint("some-new-mode");
-        assert!(hint.contains("workspace-write"), "unknown mode must fall back to the safest real policy: {}", hint);
+        assert!(
+            hint.contains("workspace-write"),
+            "unknown mode must fall back to the safest real policy: {}",
+            hint
+        );
     }
 
     #[test]
@@ -3487,7 +3572,8 @@ mod tests {
                 "turnId": "turn-xyz",
             })),
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], 42);
         assert_eq!(v["method"], "turn/interrupt");
@@ -3511,7 +3597,10 @@ mod tests {
             "danger-full-access".into(),
             None,
         );
-        let err = agent.steer_turn("redirect to test coverage").await.unwrap_err();
+        let err = agent
+            .steer_turn("redirect to test coverage")
+            .await
+            .unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {
                 assert!(
@@ -3680,7 +3769,10 @@ mod tests {
         // is dispatched so the call returns Ok without an active
         // thread.
         let mut agent = test_agent();
-        agent.rollback_turns(0).await.expect("0 turns should be a noop");
+        agent
+            .rollback_turns(0)
+            .await
+            .expect("0 turns should be a noop");
     }
 
     #[tokio::test]
@@ -3717,7 +3809,10 @@ mod tests {
         // The implementation constructs the params map conditionally; re-run
         // the same construction here to guarantee the shape doesn't drift.
         let mut obj = serde_json::Map::new();
-        obj.insert("threadId".into(), serde_json::Value::String("thread-abc".into()));
+        obj.insert(
+            "threadId".into(),
+            serde_json::Value::String("thread-abc".into()),
+        );
         obj.insert("name".into(), serde_json::Value::String("feature-x".into()));
         let params = serde_json::Value::Object(obj);
         assert_eq!(params["threadId"], "thread-abc");
@@ -3801,7 +3896,10 @@ mod tests {
             parse_goal_token_budget(&serde_json::json!({"token_budget": null})).unwrap(),
             Some(None)
         );
-        assert_eq!(parse_goal_token_budget(&serde_json::json!({})).unwrap(), None);
+        assert_eq!(
+            parse_goal_token_budget(&serde_json::json!({})).unwrap(),
+            None
+        );
         assert!(parse_goal_token_budget(&serde_json::json!({"tokenBudget": 0})).is_err());
     }
 
@@ -3874,7 +3972,10 @@ mod tests {
     #[test]
     fn thread_fork_wire_format_without_name() {
         let mut obj = serde_json::Map::new();
-        obj.insert("threadId".into(), serde_json::Value::String("thread-abc".into()));
+        obj.insert(
+            "threadId".into(),
+            serde_json::Value::String("thread-abc".into()),
+        );
         let params = serde_json::Value::Object(obj);
         assert_eq!(params["threadId"], "thread-abc");
         assert!(params.get("name").is_none());
@@ -3883,8 +3984,14 @@ mod tests {
     #[test]
     fn review_start_wire_format_with_prompt() {
         let mut obj = serde_json::Map::new();
-        obj.insert("threadId".into(), serde_json::Value::String("thread-abc".into()));
-        obj.insert("prompt".into(), serde_json::Value::String("check for leaks".into()));
+        obj.insert(
+            "threadId".into(),
+            serde_json::Value::String("thread-abc".into()),
+        );
+        obj.insert(
+            "prompt".into(),
+            serde_json::Value::String("check for leaks".into()),
+        );
         let params = serde_json::Value::Object(obj);
         assert_eq!(params["threadId"], "thread-abc");
         assert_eq!(params["prompt"], "check for leaks");

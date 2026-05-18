@@ -135,8 +135,8 @@ const IGNORED_DIRS: &[&str] = &[
 ];
 
 const IGNORED_EXTENSIONS: &[&str] = &[
-    "o", "so", "dylib", "class", "pyc", "wasm", "exe", "bin", "png", "jpg", "jpeg", "gif",
-    "ico", "svg", "webp", "zip", "tar", "gz", "bz2",
+    "o", "so", "dylib", "class", "pyc", "wasm", "exe", "bin", "png", "jpg", "jpeg", "gif", "ico",
+    "svg", "webp", "zip", "tar", "gz", "bz2",
 ];
 
 fn should_ignore(rel_path: &Path) -> bool {
@@ -416,7 +416,11 @@ impl FileWatcher {
             tokio::task::spawn(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(AppEvent::RoundComplete { round, turns_in_round, native_message_count }) => {
+                        Ok(AppEvent::RoundComplete {
+                            round,
+                            turns_in_round,
+                            native_message_count,
+                        }) => {
                             let summary = format!("Round {}", round);
                             let mut w = shared.lock().await;
                             if let Err(e) = w.on_round_complete(
@@ -571,8 +575,7 @@ impl FileWatcher {
         if let Some(head_id) = self.history.current_head_id {
             if let Some(pos) = self.history.rounds.iter().position(|r| r.id == head_id) {
                 if pos + 1 < self.history.rounds.len() {
-                    let drained: Vec<HistoryRound> =
-                        self.history.rounds.drain(pos + 1..).collect();
+                    let drained: Vec<HistoryRound> = self.history.rounds.drain(pos + 1..).collect();
                     self.history.abandoned_branches.push(AbandonedBranch {
                         branched_from_id: head_id,
                         rounds: drained,
@@ -603,8 +606,7 @@ impl FileWatcher {
             .join("manifest.json");
         let manifest_bytes = serde_json::to_vec_pretty(&round)
             .map_err(|e| CallerError::Config(format!("manifest serialize: {}", e)))?;
-        atomic_write(&manifest_path, &manifest_bytes)
-            .map_err(|e| CallerError::Io(e))?;
+        atomic_write(&manifest_path, &manifest_bytes).map_err(|e| CallerError::Io(e))?;
 
         self.history.rounds.push(round);
         self.history.current_head_id = Some(id);
@@ -837,10 +839,7 @@ impl FileWatcher {
     /// Reconcile the on-disk project tree with the given `target` state:
     /// delete any tracked file absent from `target`, restore any file whose
     /// hash differs (or doesn't exist). Returns the count of paths touched.
-    fn restore_to_state(
-        &self,
-        target: &HashMap<String, String>,
-    ) -> Result<u32, CallerError> {
+    fn restore_to_state(&self, target: &HashMap<String, String>) -> Result<u32, CallerError> {
         let objects_dir = self.snapshot_dir.join("objects");
         // Build the current tree's path set.
         let mut current: HashMap<String, [u8; 32]> = HashMap::new();
@@ -1044,9 +1043,7 @@ impl FileWatcher {
         self.history
             .abandoned_branches
             .sort_by_key(|b| b.created_at_unix);
-        while size > SNAPSHOT_DIR_SOFT_CAP_BYTES
-            && !self.history.abandoned_branches.is_empty()
-        {
+        while size > SNAPSHOT_DIR_SOFT_CAP_BYTES && !self.history.abandoned_branches.is_empty() {
             self.history.abandoned_branches.remove(0);
             let freed = self.gc_orphaned_objects();
             size = size.saturating_sub(freed);
@@ -1069,14 +1066,13 @@ async fn run_watcher_loop(
     use notify::Watcher;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut watcher = notify::recommended_watcher(
-        move |res: Result<notify::Event, notify::Error>| {
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
                 let _ = tx.send(event);
             }
-        },
-    )
-    .map_err(|e| CallerError::Config(format!("notify watcher init: {}", e)))?;
+        })
+        .map_err(|e| CallerError::Config(format!("notify watcher init: {}", e)))?;
 
     watcher
         .watch(&project_root, notify::RecursiveMode::Recursive)
@@ -1433,12 +1429,7 @@ mod tests {
             .abandoned_branches
             .sort_by_key(|b| b.created_at_unix);
         let oldest_ts = w.history.abandoned_branches[0].created_at_unix;
-        let newest_ts = w
-            .history
-            .abandoned_branches
-            .last()
-            .unwrap()
-            .created_at_unix;
+        let newest_ts = w.history.abandoned_branches.last().unwrap().created_at_unix;
         assert!(oldest_ts < newest_ts);
 
         // Simulate the soft-cap loop: drop the oldest, verify remaining are

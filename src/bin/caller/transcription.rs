@@ -157,9 +157,7 @@ impl Transcriber for WhisperTranscriber {
         if std::env::var("RUST_LOG").is_ok() {
             eprintln!(
                 "transcription: text={:?} language={:?} duration={:?}",
-                wr.text,
-                wr.language,
-                wr.duration
+                wr.text, wr.language, wr.duration
             );
         }
 

@@ -200,14 +200,9 @@ pub enum AgentEvent {
         entries: Vec<(String, String, String)>,
     },
     /// Token usage update reported by the external agent runtime.
-    Usage {
-        usage: AgentUsageSnapshot,
-    },
+    Usage { usage: AgentUsageSnapshot },
     /// Informational backend event that should be written to the activity log.
-    Log {
-        level: String,
-        message: String,
-    },
+    Log { level: String, message: String },
     /// A tool/command execution has started.
     ToolStarted {
         item_id: String,
@@ -403,7 +398,8 @@ pub trait ExternalAgent: Send + Sync {
         } else {
             format!("{}{}", prelude, message)
         };
-        self.send_message_with_images(thread, &augmented, &images).await
+        self.send_message_with_images(thread, &augmented, &images)
+            .await
     }
 
     /// Respond to an approval request from the agent.
@@ -558,7 +554,11 @@ mod tests {
         assert_eq!(AgentBackend::ClaudeCode.as_short_str(), "claude-code");
         assert_eq!(AgentBackend::GeminiCli.as_short_str(), "gemini");
         // And from_str_loose must round-trip every as_short_str output.
-        for v in [AgentBackend::Codex, AgentBackend::ClaudeCode, AgentBackend::GeminiCli] {
+        for v in [
+            AgentBackend::Codex,
+            AgentBackend::ClaudeCode,
+            AgentBackend::GeminiCli,
+        ] {
             assert_eq!(AgentBackend::from_str_loose(v.as_short_str()), Some(v));
         }
     }

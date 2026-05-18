@@ -124,9 +124,7 @@ impl PeerActor {
         card.transports = self
             .via_urls
             .iter()
-            .map(|url| crate::peer::card::TransportSpec::IntendantWs {
-                url: url.clone(),
-            })
+            .map(|url| crate::peer::card::TransportSpec::IntendantWs { url: url.clone() })
             .collect();
     }
 }
@@ -153,18 +151,15 @@ impl PeerActor {
                     let _ = self.card_tx.send(card_arc);
                     let _ = self.connection_tx.send(ConnectionState::Connected);
                     let _ = self.status_tx.send(PeerStatus::Idle);
-                    self.emit_event(PeerEvent::Connected { card: new_card }).await;
+                    self.emit_event(PeerEvent::Connected { card: new_card })
+                        .await;
 
                     // ---- Main loop: exits on StreamEnded or Disconnect ----
                     match self.main_loop().await {
                         MainLoopExit::Disconnect => {
-                            let _ = self
-                                .connection_tx
-                                .send(ConnectionState::Disconnecting);
+                            let _ = self.connection_tx.send(ConnectionState::Disconnecting);
                             let _ = self.transport.disconnect().await;
-                            let _ = self
-                                .connection_tx
-                                .send(ConnectionState::Disconnected);
+                            let _ = self.connection_tx.send(ConnectionState::Disconnected);
                             self.emit_event(PeerEvent::Disconnected {
                                 reason: "explicit disconnect".to_string(),
                             })
@@ -241,12 +236,8 @@ impl PeerActor {
                 }
             };
             if cancelled {
-                let _ = self
-                    .connection_tx
-                    .send(ConnectionState::Disconnecting);
-                let _ = self
-                    .connection_tx
-                    .send(ConnectionState::Disconnected);
+                let _ = self.connection_tx.send(ConnectionState::Disconnecting);
+                let _ = self.connection_tx.send(ConnectionState::Disconnected);
                 self.emit_event(PeerEvent::Disconnected {
                     reason: "disconnected during reconnect".to_string(),
                 })
@@ -390,6 +381,9 @@ mod tests {
         // First delay should be within ±20% of INITIAL_BACKOFF.
         let min = INITIAL_BACKOFF * 80 / 100;
         let max = INITIAL_BACKOFF * 120 / 100;
-        assert!(d >= min && d <= max, "got {d:?}, expected between {min:?} and {max:?}");
+        assert!(
+            d >= min && d <= max,
+            "got {d:?}, expected between {min:?} and {max:?}"
+        );
     }
 }

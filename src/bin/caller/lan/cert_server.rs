@@ -16,12 +16,7 @@ use super::{certs::CertState, instructions, LanError, LanResult};
 /// Serve `ca.crt`, `client.p12`, and `client.pfx` (Android alias) plus
 /// a small landing page with import instructions. Blocks until the
 /// process is interrupted (Ctrl+C).
-pub async fn serve(
-    state: &CertState,
-    port: u16,
-    lan_ip: &str,
-    https_port: u16,
-) -> LanResult<()> {
+pub async fn serve(state: &CertState, port: u16, lan_ip: &str, https_port: u16) -> LanResult<()> {
     let bind_addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind_addr)
         .await
@@ -60,11 +55,7 @@ async fn accept_loop(listener: TcpListener, cert_dir: std::path::PathBuf, landin
     }
 }
 
-async fn handle_conn(
-    mut stream: TcpStream,
-    cert_dir: &Path,
-    landing: &str,
-) -> std::io::Result<()> {
+async fn handle_conn(mut stream: TcpStream, cert_dir: &Path, landing: &str) -> std::io::Result<()> {
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).await?;
     if n == 0 {
@@ -79,8 +70,13 @@ async fn handle_conn(
 
     match path {
         "/" | "/index.html" => {
-            write_response(&mut stream, "200 OK", "text/html; charset=utf-8", landing.as_bytes())
-                .await
+            write_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                landing.as_bytes(),
+            )
+            .await
         }
         "/client.p12" | "/client.pfx" => {
             let p12 = cert_dir.join("client.p12");
@@ -95,7 +91,9 @@ async fn handle_conn(
                     )
                     .await
                 }
-                Err(_) => write_response(&mut stream, "404 Not Found", "text/plain", b"not found").await,
+                Err(_) => {
+                    write_response(&mut stream, "404 Not Found", "text/plain", b"not found").await
+                }
             }
         }
         "/ca.crt" => {
@@ -111,7 +109,9 @@ async fn handle_conn(
                     )
                     .await
                 }
-                Err(_) => write_response(&mut stream, "404 Not Found", "text/plain", b"not found").await,
+                Err(_) => {
+                    write_response(&mut stream, "404 Not Found", "text/plain", b"not found").await
+                }
             }
         }
         _ => write_response(&mut stream, "404 Not Found", "text/plain", b"not found").await,

@@ -39,18 +39,18 @@ impl FrameRegistry {
     ///
     /// `hq_data` is the raw image bytes (e.g. JPEG).
     /// Returns the path where the HQ image was stored, or an error.
-    pub fn register(
-        &mut self,
-        meta: FrameMeta,
-        hq_data: &[u8],
-    ) -> Result<PathBuf, std::io::Error> {
+    pub fn register(&mut self, meta: FrameMeta, hq_data: &[u8]) -> Result<PathBuf, std::io::Error> {
         let hq_path = self.frames_dir.join(format!("{}.jpg", &meta.frame_id));
         fs::write(&hq_path, hq_data)?;
 
         // Append metadata to frames.jsonl manifest
         if let Ok(json_line) = serde_json::to_string(&meta) {
             let manifest = self.frames_dir.join("frames.jsonl");
-            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&manifest) {
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&manifest)
+            {
                 let _ = writeln!(f, "{}", json_line);
             }
         }
@@ -188,9 +188,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut reg = FrameRegistry::new(tmp.path());
 
-        reg.register(test_meta("cam0-f00001", "cam0"), b"a").unwrap();
-        reg.register(test_meta("cam0-f00002", "cam0"), b"b").unwrap();
-        reg.register(test_meta("d99-f00001", "display:99"), b"c").unwrap();
+        reg.register(test_meta("cam0-f00001", "cam0"), b"a")
+            .unwrap();
+        reg.register(test_meta("cam0-f00002", "cam0"), b"b")
+            .unwrap();
+        reg.register(test_meta("d99-f00001", "display:99"), b"c")
+            .unwrap();
 
         assert_eq!(reg.latest(None), Some("d99-f00001"));
         assert_eq!(reg.latest(Some("cam0")), Some("cam0-f00002"));
@@ -203,9 +206,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut reg = FrameRegistry::new(tmp.path());
 
-        reg.register(test_meta("cam0-f00001", "cam0"), b"a").unwrap();
-        reg.register(test_meta("d99-f00001", "display:99"), b"b").unwrap();
-        reg.register(test_meta("cam0-f00002", "cam0"), b"c").unwrap();
+        reg.register(test_meta("cam0-f00001", "cam0"), b"a")
+            .unwrap();
+        reg.register(test_meta("d99-f00001", "display:99"), b"b")
+            .unwrap();
+        reg.register(test_meta("cam0-f00002", "cam0"), b"c")
+            .unwrap();
 
         let cam_frames = reg.query(Some("cam0"), 10);
         assert_eq!(cam_frames.len(), 2);
@@ -229,8 +235,10 @@ mod tests {
         assert!(vs.current_frame_id.is_none());
         assert_eq!(vs.total_frames, 0);
 
-        reg.register(test_meta("cam0-f00001", "cam0"), b"a").unwrap();
-        reg.register(test_meta("cam0-f00002", "cam0"), b"b").unwrap();
+        reg.register(test_meta("cam0-f00001", "cam0"), b"a")
+            .unwrap();
+        reg.register(test_meta("cam0-f00002", "cam0"), b"b")
+            .unwrap();
 
         let vs = reg.video_state();
         assert_eq!(vs.active_streams, vec!["cam0"]);
@@ -243,8 +251,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut reg = FrameRegistry::new(tmp.path());
 
-        reg.register(test_meta("cam0-f00001", "cam0"), b"a").unwrap();
-        reg.register(test_meta("cam0-f00002", "cam0"), b"b").unwrap();
+        reg.register(test_meta("cam0-f00001", "cam0"), b"a")
+            .unwrap();
+        reg.register(test_meta("cam0-f00002", "cam0"), b"b")
+            .unwrap();
 
         let frames = reg.query(None, 10);
         let text = FrameRegistry::format_frame_list(&frames);

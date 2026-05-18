@@ -112,11 +112,7 @@ struct WebConnection {
 }
 
 impl WebConnection {
-    fn new(
-        cols: u16,
-        rows: u16,
-        direct_tx: mpsc::UnboundedSender<String>,
-    ) -> io::Result<Self> {
+    fn new(cols: u16, rows: u16, direct_tx: mpsc::UnboundedSender<String>) -> io::Result<Self> {
         let writer = SharedWriter::new();
         let backend = CrosstermBackend::new(writer.clone());
         let terminal = Terminal::with_options(
@@ -537,9 +533,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn test_app() -> App {
-        let autonomy = crate::autonomy::shared_autonomy(
-            crate::autonomy::AutonomyState::default(),
-        );
+        let autonomy = crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default());
         App::new(
             "openai".to_string(),
             "gpt-5".to_string(),

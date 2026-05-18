@@ -147,11 +147,7 @@ impl SyntheticDirtySources {
     ///
     /// Returns the union of cursor-move rects and marker-tile rect.
     /// Order is cursor-leave, cursor-new, marker.
-    pub fn collect(
-        &mut self,
-        cursor_pos: Option<(i32, i32)>,
-        marker_changed: bool,
-    ) -> Vec<Rect> {
+    pub fn collect(&mut self, cursor_pos: Option<(i32, i32)>, marker_changed: bool) -> Vec<Rect> {
         let mut out = Vec::new();
         if let Some(pos) = cursor_pos {
             out.extend(self.cursor_moved(pos));
@@ -208,8 +204,8 @@ mod tests {
         let _ = s.cursor_moved((100, 100));
         let rects = s.cursor_moved((200, 150));
         assert_eq!(rects.len(), 2);
-        assert_eq!(rects[0], Rect::new(68, 68, 64, 64));    // leave
-        assert_eq!(rects[1], Rect::new(168, 118, 64, 64));  // new
+        assert_eq!(rects[0], Rect::new(68, 68, 64, 64)); // leave
+        assert_eq!(rects[1], Rect::new(168, 118, 64, 64)); // new
     }
 
     #[test]
@@ -251,16 +247,14 @@ mod tests {
 
     #[test]
     fn marker_disabled_yields_no_rect() {
-        let s = SyntheticDirtySources::new()
-            .with_marker((0, 0), 64);
+        let s = SyntheticDirtySources::new().with_marker((0, 0), 64);
         // marker_enabled defaults to false even after with_marker
         assert!(s.marker_changed().is_empty());
     }
 
     #[test]
     fn marker_enabled_yields_marker_tile_rect() {
-        let mut s = SyntheticDirtySources::new()
-            .with_marker((128, 64), 64);
+        let mut s = SyntheticDirtySources::new().with_marker((128, 64), 64);
         s.set_marker_enabled(true);
         let rects = s.marker_changed();
         assert_eq!(rects.len(), 1);
@@ -269,8 +263,7 @@ mod tests {
 
     #[test]
     fn collect_unions_cursor_and_marker() {
-        let mut s = SyntheticDirtySources::new()
-            .with_marker((0, 0), 64);
+        let mut s = SyntheticDirtySources::new().with_marker((0, 0), 64);
         s.set_marker_enabled(true);
         let rects = s.collect(Some((100, 100)), true);
         // First cursor move = 1 rect; marker = 1 rect; total 2.
@@ -286,8 +279,7 @@ mod tests {
 
     #[test]
     fn collect_into_tiles_partitions_correctly() {
-        let mut s = SyntheticDirtySources::new()
-            .with_marker((0, 0), 64);
+        let mut s = SyntheticDirtySources::new().with_marker((0, 0), 64);
         s.set_marker_enabled(true);
         let g = TileGrid::new(1024, 768, 64).unwrap();
         let (_rects, tiles) = s.collect_into_tiles(&g, Some((100, 100)), true);
