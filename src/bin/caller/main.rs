@@ -1004,6 +1004,25 @@ async fn drain_external_agent_events(
                     source: config.agent_source.clone(),
                 });
             }
+            external_agent::AgentEvent::Usage { usage } => {
+                stats.usage.prompt_tokens = usage.prompt_tokens;
+                stats.usage.completion_tokens = usage.completion_tokens;
+                stats.usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                stats.usage.cached_tokens = usage.cached_tokens;
+                config.bus.send(AppEvent::UsageSnapshot {
+                    main: frontend::ModelUsageSnapshot {
+                        provider: usage.provider,
+                        model: usage.model,
+                        tokens_used: usage.tokens_used,
+                        context_window: usage.context_window,
+                        usage_pct: usage.usage_pct,
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        cached_tokens: usage.cached_tokens,
+                    },
+                    presence: None,
+                });
+            }
             external_agent::AgentEvent::Log { level, message } => {
                 slog(config.session_log, |l| match level.as_str() {
                     "warn" => l.warn(&message),

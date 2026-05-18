@@ -13,7 +13,7 @@ use crate::error::CallerError;
 
 use super::{
     AgentConfig, AgentContextSnapshot, AgentEvent, AgentImageAttachment, AgentThread,
-    ApprovalCategory, ApprovalDecision, ExternalAgent, ToolCompletionStatus,
+    AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ExternalAgent, ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -1136,14 +1136,43 @@ fn first_u64_at(value: &serde_json::Value, paths: &[&str]) -> Option<u64> {
         .find_map(|path| value.pointer(path).and_then(|v| v.as_u64()))
 }
 
+fn codex_usage_bucket<'a>(
+    value: &'a serde_json::Value,
+    names: &[&str],
+) -> Option<&'a serde_json::Value> {
+    for name in names {
+        if let Some(v) = value.get(*name) {
+            return Some(v);
+        }
+        if let Some(info) = value.get("info") {
+            if let Some(v) = info.get(*name) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn codex_usage_total_tokens(value: &serde_json::Value) -> Option<u64> {
     first_u64_at(
         value,
         &[
             "/last/totalTokens",
             "/last/total_tokens",
+            "/last_token_usage/totalTokens",
+            "/last_token_usage/total_tokens",
             "/total/totalTokens",
             "/total/total_tokens",
+            "/total_token_usage/totalTokens",
+            "/total_token_usage/total_tokens",
+            "/info/last/totalTokens",
+            "/info/last/total_tokens",
+            "/info/last_token_usage/totalTokens",
+            "/info/last_token_usage/total_tokens",
+            "/info/total/totalTokens",
+            "/info/total/total_tokens",
+            "/info/total_token_usage/totalTokens",
+            "/info/total_token_usage/total_tokens",
             "/totalTokens",
             "/total_tokens",
         ],
@@ -1158,8 +1187,63 @@ fn codex_usage_context_window(value: &serde_json::Value) -> Option<u64> {
             "/model_context_window",
             "/contextWindow",
             "/context_window",
+            "/info/modelContextWindow",
+            "/info/model_context_window",
+            "/info/contextWindow",
+            "/info/context_window",
         ],
     )
+}
+
+fn codex_usage_input_tokens(value: &serde_json::Value) -> Option<u64> {
+    first_u64_at(value, &["/inputTokens", "/input_tokens"])
+}
+
+fn codex_usage_output_tokens(value: &serde_json::Value) -> Option<u64> {
+    first_u64_at(value, &["/outputTokens", "/output_tokens"])
+}
+
+fn codex_usage_cached_tokens(value: &serde_json::Value) -> Option<u64> {
+    first_u64_at(
+        value,
+        &[
+            "/cachedInputTokens",
+            "/cached_input_tokens",
+            "/cachedTokens",
+            "/cached_tokens",
+        ],
+    )
+}
+
+fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentUsageSnapshot> {
+    let total = codex_usage_bucket(value, &["total", "total_token_usage"]).unwrap_or(value);
+    let last = codex_usage_bucket(value, &["last", "last_token_usage"]);
+
+    let prompt_tokens = codex_usage_input_tokens(total)?;
+    let completion_tokens = codex_usage_output_tokens(total).unwrap_or(0);
+    let cached_tokens = codex_usage_cached_tokens(total).unwrap_or(0);
+    let total_tokens = first_u64_at(total, &["/totalTokens", "/total_tokens"])
+        .unwrap_or_else(|| prompt_tokens + completion_tokens);
+    let tokens_used = last
+        .and_then(|u| first_u64_at(u, &["/totalTokens", "/total_tokens"]))
+        .unwrap_or(total_tokens);
+    let context_window = codex_usage_context_window(value).unwrap_or(0);
+    let usage_pct = if context_window > 0 {
+        tokens_used as f64 / context_window as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    Some(AgentUsageSnapshot {
+        provider: "openai".to_string(),
+        model: model.to_string(),
+        tokens_used,
+        context_window,
+        usage_pct,
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
+    })
 }
 
 fn codex_request_item_count(payload: &serde_json::Value) -> Option<usize> {
@@ -1183,6 +1267,7 @@ async fn reader_task(
     approval_counter: Arc<AtomicU64>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
+    model: Option<String>,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -1299,7 +1384,11 @@ async fn reader_task(
                 .get("tokenUsage")
                 .cloned()
                 .unwrap_or_else(|| params.clone());
+            let snapshot = codex_usage_snapshot(&usage, model.as_deref().unwrap_or("codex"));
             *latest_token_usage.lock().await = Some(usage);
+            if let Some(snapshot) = snapshot {
+                let _ = event_tx.send(AgentEvent::Usage { usage: snapshot });
+            }
         }
 
         // Track active turn id so interrupt_turn() has a target to cancel.
@@ -1887,6 +1976,7 @@ impl ExternalAgent for CodexAgent {
         let approval_counter = Arc::new(AtomicU64::new(1));
         let active_turn_id = Arc::clone(&self.active_turn_id);
         let latest_token_usage = Arc::clone(&self.latest_token_usage);
+        let model = self.model.clone();
 
         let handle = tokio::spawn(reader_task(
             stdout,
@@ -1896,6 +1986,7 @@ impl ExternalAgent for CodexAgent {
             approval_counter,
             active_turn_id,
             latest_token_usage,
+            model,
         ));
         self.reader_handle = Some(handle);
 
@@ -2570,12 +2661,26 @@ mod tests {
     #[test]
     fn codex_token_usage_helpers_accept_app_server_shape() {
         let usage = serde_json::json!({
-            "total": {"inputTokens": 1000, "outputTokens": 200, "totalTokens": 1200},
+            "total": {
+                "inputTokens": 1000,
+                "cachedInputTokens": 300,
+                "outputTokens": 200,
+                "totalTokens": 1200
+            },
             "last": {"inputTokens": 100, "outputTokens": 25, "totalTokens": 125},
             "modelContextWindow": 128000
         });
         assert_eq!(codex_usage_total_tokens(&usage), Some(125));
         assert_eq!(codex_usage_context_window(&usage), Some(128000));
+        let snapshot = codex_usage_snapshot(&usage, "gpt-5.4").unwrap();
+        assert_eq!(snapshot.provider, "openai");
+        assert_eq!(snapshot.model, "gpt-5.4");
+        assert_eq!(snapshot.tokens_used, 125);
+        assert_eq!(snapshot.context_window, 128000);
+        assert_eq!(snapshot.prompt_tokens, 1000);
+        assert_eq!(snapshot.completion_tokens, 200);
+        assert_eq!(snapshot.cached_tokens, 300);
+        assert!((snapshot.usage_pct - (125.0 / 128000.0 * 100.0)).abs() < 1e-12);
     }
 
     #[test]

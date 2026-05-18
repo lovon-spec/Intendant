@@ -199,6 +199,10 @@ pub enum AgentEvent {
     PlanUpdate {
         entries: Vec<(String, String, String)>,
     },
+    /// Token usage update reported by the external agent runtime.
+    Usage {
+        usage: AgentUsageSnapshot,
+    },
     /// Informational backend event that should be written to the activity log.
     Log {
         level: String,
@@ -241,6 +245,18 @@ pub enum AgentEvent {
         reason: String,
         exit_code: Option<i32>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentUsageSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub tokens_used: u64,
+    pub context_window: u64,
+    pub usage_pct: f64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,7 +4,7 @@ use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Read};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1669,11 +1669,27 @@ fn collect_recent_files(root: &Path, suffix: &str, limit: usize) -> Vec<PathBuf>
     files
 }
 
-fn read_text_prefix(path: &Path, max_bytes: u64) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    file.take(max_bytes).read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).to_string())
+fn read_text_head_tail(path: &Path, head_bytes: u64, tail_bytes: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    if len <= head_bytes.saturating_add(tail_bytes) {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).ok()?;
+        return Some(String::from_utf8_lossy(&buf).to_string());
+    }
+
+    let mut head = vec![0; head_bytes as usize];
+    let head_len = file.read(&mut head).ok()?;
+    head.truncate(head_len);
+
+    file.seek(SeekFrom::End(-(tail_bytes as i64))).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+
+    let mut out = String::from_utf8_lossy(&head).to_string();
+    out.push('\n');
+    out.push_str(&String::from_utf8_lossy(&tail));
+    Some(out)
 }
 
 fn file_mtime_string(path: &Path) -> Option<String> {
@@ -1691,6 +1707,66 @@ fn mtime_secs_to_string(secs: u64) -> Option<String> {
 
 fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SessionUsage {
+    total_tokens: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cached_tokens: u64,
+}
+
+impl SessionUsage {
+    fn is_empty(self) -> bool {
+        self.total_tokens == 0
+            && self.prompt_tokens == 0
+            && self.completion_tokens == 0
+            && self.cached_tokens == 0
+    }
+
+    fn add(&mut self, other: SessionUsage) {
+        self.total_tokens += other.total_tokens;
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.cached_tokens += other.cached_tokens;
+    }
+}
+
+fn value_u64_at(value: &serde_json::Value, paths: &[&str]) -> Option<u64> {
+    paths
+        .iter()
+        .find_map(|path| value.pointer(path).and_then(|v| v.as_u64()))
+}
+
+fn apply_session_usage(
+    session: &mut serde_json::Value,
+    usage: SessionUsage,
+    model: Option<&str>,
+) {
+    if usage.is_empty() {
+        return;
+    }
+    let estimated_cost = model
+        .and_then(|m| {
+            crate::app_state_pricing::estimate_session_cost(
+                m,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.cached_tokens,
+            )
+        })
+        .unwrap_or(0.0);
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert("total_tokens".to_string(), serde_json::json!(usage.total_tokens));
+        obj.insert("prompt_tokens".to_string(), serde_json::json!(usage.prompt_tokens));
+        obj.insert(
+            "completion_tokens".to_string(),
+            serde_json::json!(usage.completion_tokens),
+        );
+        obj.insert("cached_tokens".to_string(), serde_json::json!(usage.cached_tokens));
+        obj.insert("estimated_cost".to_string(), serde_json::json!(estimated_cost));
+    }
 }
 
 fn external_session_json(
@@ -1832,6 +1908,77 @@ fn truncate_sessions_preserving_sources(sessions: &mut Vec<serde_json::Value>) {
     *sessions = out;
 }
 
+fn codex_usage_bucket<'a>(
+    value: &'a serde_json::Value,
+    names: &[&str],
+) -> Option<&'a serde_json::Value> {
+    for name in names {
+        if let Some(v) = value.get(*name) {
+            return Some(v);
+        }
+        if let Some(info) = value.get("info") {
+            if let Some(v) = info.get(*name) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn codex_session_usage_from_payload(payload: &serde_json::Value) -> Option<SessionUsage> {
+    let info = payload
+        .get("info")
+        .or_else(|| payload.get("tokenUsage"))
+        .unwrap_or(payload);
+    if info.is_null() {
+        return None;
+    }
+    let total = codex_usage_bucket(info, &["total_token_usage", "total"]).unwrap_or(info);
+    let prompt_tokens = value_u64_at(total, &["/input_tokens", "/inputTokens"])?;
+    let completion_tokens = value_u64_at(total, &["/output_tokens", "/outputTokens"]).unwrap_or(0);
+    let cached_tokens = value_u64_at(
+        total,
+        &[
+            "/cached_input_tokens",
+            "/cachedInputTokens",
+            "/cached_tokens",
+            "/cachedTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let total_tokens = value_u64_at(total, &["/total_tokens", "/totalTokens"])
+        .unwrap_or_else(|| prompt_tokens + completion_tokens);
+    Some(SessionUsage {
+        total_tokens,
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
+    })
+}
+
+fn claude_usage_from_message_usage(usage: &serde_json::Value) -> Option<SessionUsage> {
+    let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64())?;
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let prompt_tokens = input_tokens + cache_creation + cache_read;
+    Some(SessionUsage {
+        total_tokens: prompt_tokens + completion_tokens,
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens: cache_read,
+    })
+}
+
 fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
     let index_path = home.join(".codex").join("session_index.jsonl");
@@ -1871,12 +2018,17 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
     files.truncate(EXTERNAL_SESSION_SCAN_LIMIT);
     for path in files {
-        let Some(contents) = read_text_prefix(&path, EXTERNAL_SESSION_READ_LIMIT) else { continue; };
+        let Some(contents) = read_text_head_tail(
+            &path,
+            EXTERNAL_SESSION_READ_LIMIT,
+            EXTERNAL_SESSION_READ_LIMIT,
+        ) else { continue; };
         let mut id = None;
         let mut created_at = None;
         let mut cwd = None;
         let mut model = None;
         let mut provider = Some("Codex".to_string());
+        let mut usage = SessionUsage::default();
         let mut task_started_turns = 0u64;
         let mut saw_user_message_event = false;
         let mut event_user_turns: Vec<Option<String>> = Vec::new();
@@ -1904,6 +2056,11 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
                         match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                             "task_started" => {
                                 task_started_turns += 1;
+                            }
+                            "token_count" => {
+                                if let Some(parsed) = codex_session_usage_from_payload(payload) {
+                                    usage = parsed;
+                                }
                             }
                             "user_message" => {
                                 saw_user_message_event = true;
@@ -1963,21 +2120,23 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         } else {
             0
         };
-        rows.insert(id.clone(), external_session_json(
+        let mut session = external_session_json(
             "codex",
             "Codex",
             id.clone(),
-            id,
+            id.clone(),
             created_at,
             updated_at,
             task.or(existing_task),
             provider.as_deref().unwrap_or("Codex"),
-            model,
+            model.clone(),
             turns,
             cwd,
             Some(path.to_string_lossy().to_string()),
             file_size(&path),
-        ));
+        );
+        apply_session_usage(&mut session, usage, model.as_deref());
+        rows.insert(id, session);
     }
 
     rows.into_values().collect()
@@ -1999,14 +2158,20 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
         if session_id.is_empty() {
             continue;
         }
-        let Some(contents) = read_text_prefix(&path, EXTERNAL_SESSION_READ_LIMIT) else { continue; };
+        let Some(contents) = read_text_head_tail(
+            &path,
+            EXTERNAL_SESSION_READ_LIMIT,
+            EXTERNAL_SESSION_READ_LIMIT,
+        ) else { continue; };
         let mut created_at = None;
         let mut updated_at = None;
         let mut cwd = None;
         let mut task = None;
         let mut model = None;
+        let mut usage = SessionUsage::default();
+        let mut seen_usage = HashSet::new();
         let mut turns = 0u64;
-        for line in contents.lines() {
+        for (line_idx, line) in contents.lines().enumerate() {
             let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
             created_at = created_at.or_else(|| value_str(&obj, "timestamp"));
             updated_at = value_str(&obj, "timestamp").or(updated_at);
@@ -2021,15 +2186,27 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
                     }
                 }
             }
-            if model.is_none() {
-                model = obj
-                    .get("message")
-                    .and_then(|m| m.get("model"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+            if let Some(msg) = obj.get("message") {
+                if model.is_none() {
+                    model = msg
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+                if let Some(parsed) = msg
+                    .get("usage")
+                    .and_then(claude_usage_from_message_usage)
+                {
+                    let key = value_str(&obj, "requestId")
+                        .or_else(|| value_str(msg, "id"))
+                        .unwrap_or_else(|| format!("line-{line_idx}"));
+                    if seen_usage.insert(key) {
+                        usage.add(parsed);
+                    }
+                }
             }
         }
-        rows.push(external_session_json(
+        let mut session = external_session_json(
             "claude-code",
             "Claude Code",
             session_id.clone(),
@@ -2038,12 +2215,14 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
             file_mtime_string(&path).or(updated_at),
             task,
             "Claude Code",
-            model,
+            model.clone(),
             turns,
             cwd,
             Some(path.to_string_lossy().to_string()),
             file_size(&path),
-        ));
+        );
+        apply_session_usage(&mut session, usage, model.as_deref());
+        rows.push(session);
     }
     rows
 }
@@ -2511,9 +2690,14 @@ fn list_sessions() -> String {
             created_at = mtime_secs_to_string(file_mtime_secs(&dir));
         }
 
-        // Estimate cost using the model's pricing (blended rate without cache info)
+        // Estimate cost using the model's pricing.
         let estimated_cost = model.as_deref()
-            .and_then(|m| crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens))
+            .and_then(|m| crate::app_state_pricing::estimate_session_cost(
+                m,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            ))
             .unwrap_or(0.0);
 
         let created_at = created_at.unwrap_or_default();
@@ -10006,6 +10190,156 @@ mod tests {
             Some("New prompt")
         );
         assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn list_codex_sessions_parses_token_count_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37c5-9d93-76f0-a395-f5b28bd54a74";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "cwd": "/Users/vm/projects/intendant",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:01Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-1"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:02Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fix stats usage"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 200,
+                            "cached_input_tokens": 50,
+                            "output_tokens": 25,
+                            "total_tokens": 225
+                        },
+                        "model_context_window": 258400
+                    }
+                }
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(1000));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(250));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(400));
+        assert_eq!(session["total_tokens"].as_u64(), Some(1250));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!(
+            (cost - 0.00575).abs() < 1e-12,
+            "unexpected cost {cost}"
+        );
+    }
+
+    #[test]
+    fn list_claude_sessions_parses_and_deduplicates_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-Users-vm-projects-intendant");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "019e37cf-34ad-7b08-8a1e-7ad5086eb39f";
+        let assistant = serde_json::json!({
+            "timestamp": "2026-05-17T21:20:02Z",
+            "type": "assistant",
+            "cwd": "/Users/vm/projects/intendant",
+            "requestId": "req-usage-1",
+            "message": {
+                "id": "msg-usage-1",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "output_tokens": 40
+                }
+            }
+        });
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:20:00Z",
+                "type": "user",
+                "cwd": "/Users/vm/projects/intendant",
+                "message": {"content": "Fix stats usage"}
+            }),
+            assistant.clone(),
+            assistant,
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(project_dir.join(format!("{session_id}.jsonl")), contents).unwrap();
+
+        let sessions = list_claude_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .expect("claude session should be listed");
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Fix stats usage")
+        );
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(60));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(40));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(30));
+        assert_eq!(session["total_tokens"].as_u64(), Some(100));
+        assert_eq!(session["turns"].as_u64(), Some(1));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!(
+            (cost - 0.000699).abs() < 1e-12,
+            "unexpected cost {cost}"
+        );
     }
 
     #[test]
