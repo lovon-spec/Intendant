@@ -4581,6 +4581,10 @@ html, body {
                   <option value="gemini">Gemini CLI (Google)</option>
                 </select>
               </div>
+              <div class="settings-row">
+                <label>Codex binary</label>
+                <input id="set-codex-command" type="text" placeholder="codex or /usr/local/bin/codex" autocomplete="off">
+              </div>
             </fieldset>
 
             <fieldset class="settings-group">
@@ -6712,6 +6716,7 @@ window.doPrune = doPrune;
 // all connected dashboards, so two browsers stay in sync.
 
 let controlCodexConfig = {
+  command: 'codex',
   sandbox: null,
   approval_policy: null,
   model: null,
@@ -6740,6 +6745,7 @@ async function refreshControlPane() {
     const d = await resp.json();
     controlCurrentBackend = normalizeAgentId(d.external_agent);
     controlCodexConfig = {
+      command: d.codex_command || 'codex',
       sandbox: d.codex_sandbox || 'workspace-write',
       approval_policy: d.codex_approval_policy || 'on-request',
       model: d.codex_model || '',
@@ -7022,6 +7028,11 @@ function onControlGeminiActionBtnClick(ev) {
 // Apply a CodexConfigChanged event from the server, keeping the pane in
 // sync with toggles from other browsers (and our own server-confirmed write).
 function applyCodexConfigChanged(evt) {
+  if (evt.command) {
+    controlCodexConfig.command = evt.command;
+    const input = document.getElementById('set-codex-command');
+    if (input) input.value = evt.command;
+  }
   if (evt.sandbox) controlCodexConfig.sandbox = evt.sandbox;
   if (evt.approval_policy) controlCodexConfig.approval_policy = evt.approval_policy;
   if (evt.model !== undefined && evt.model !== null) {
@@ -16054,6 +16065,8 @@ async function loadSettings() {
     document.getElementById('set-recording-quality').value = d.recording_quality || 'medium';
     document.getElementById('set-live-audio-enabled').checked = d.live_audio_enabled;
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
+    document.getElementById('set-codex-command').value = d.codex_command || 'codex';
+    controlCodexConfig.command = d.codex_command || 'codex';
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync both the Settings dropdown AND the
     // status bar badge here — on a fresh daemon boot there are no
@@ -16127,6 +16140,7 @@ async function saveSettings() {
     live_audio_timeout_secs: parseInt(g('set-live-audio-timeout').value) || 300,
     // Persisted to intendant.toml so it survives daemon restart.
     external_agent: g('set-external-agent').value || null,
+    codex_command: (g('set-codex-command').value || '').trim() || 'codex',
     codex_sandbox: controlCodexConfig.sandbox || 'workspace-write',
     codex_approval_policy: controlCodexConfig.approval_policy || 'on-request',
     codex_model: controlCodexConfig.model || null,
@@ -16176,6 +16190,10 @@ async function saveSettings() {
   const agentVal = g('set-external-agent').value || null;
   if (app) {
     app.send_server_action({ action: 'set_external_agent', agent: agentVal });
+    app.send_server_action({
+      action: 'set_codex_command',
+      command: (g('set-codex-command').value || '').trim() || null,
+    });
   }
 }
 

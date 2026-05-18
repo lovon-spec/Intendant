@@ -916,6 +916,7 @@ impl AppEventUpcaster {
             )],
 
             AppEvent::CodexConfigChanged {
+                command,
                 sandbox,
                 approval_policy,
                 model,
@@ -927,6 +928,9 @@ impl AppEventUpcaster {
                 writable_roots,
             } => {
                 let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = command {
+                    parts.push(format!("command={v}"));
+                }
                 if let Some(v) = sandbox {
                     parts.push(format!("sandbox={v}"));
                 }
@@ -1823,6 +1827,7 @@ impl WireEventUpcaster {
             )],
 
             OutboundEvent::CodexConfigChanged {
+                command,
                 sandbox,
                 approval_policy,
                 model,
@@ -1834,6 +1839,9 @@ impl WireEventUpcaster {
                 writable_roots,
             } => {
                 let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = command {
+                    parts.push(format!("command={v}"));
+                }
                 if let Some(v) = sandbox {
                     parts.push(format!("sandbox={v}"));
                 }

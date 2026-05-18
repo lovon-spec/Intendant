@@ -330,7 +330,8 @@ fn codex_runtime_config_equal(
     a: &control_plane::CodexRuntimeConfig,
     b: &control_plane::CodexRuntimeConfig,
 ) -> bool {
-    a.sandbox == b.sandbox
+    a.command == b.command
+        && a.sandbox == b.sandbox
         && a.approval_policy == b.approval_policy
         && a.model == b.model
         && a.reasoning_effort == b.reasoning_effort
@@ -6211,6 +6212,7 @@ async fn run_with_presence(
                 // authoritative "what the user just chose" source.
                 if matches!(backend, external_agent::AgentBackend::Codex) {
                     let cx = &mut proj.config.agent.codex;
+                    cx.command = current_codex_config.command.clone();
                     cx.sandbox = current_codex_config.sandbox.clone();
                     cx.approval_policy = current_codex_config.approval_policy.clone();
                     cx.model = current_codex_config.model.clone();
@@ -8689,6 +8691,7 @@ async fn main() -> Result<(), CallerError> {
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
             Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
+                command: cfg.command.clone(),
                 sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
                 approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
                 model: cfg.model.clone(),
@@ -9489,6 +9492,7 @@ async fn main() -> Result<(), CallerError> {
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
             Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
+                command: cfg.command.clone(),
                 sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
                 approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
                 model: cfg.model.clone(),
@@ -10069,6 +10073,7 @@ async fn main() -> Result<(), CallerError> {
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
             Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
+                command: cfg.command.clone(),
                 sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
                 approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
                 model: cfg.model.clone(),

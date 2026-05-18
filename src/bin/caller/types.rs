@@ -237,6 +237,8 @@ pub enum OutboundEvent {
     },
     CodexConfigChanged {
         #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_policy: Option<String>,

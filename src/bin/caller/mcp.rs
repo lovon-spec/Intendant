@@ -1119,6 +1119,20 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetCodexCommand { command } => {
+            let label = command
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("codex");
+            emit_control_result(
+                control_tx,
+                "set_codex_command",
+                true,
+                format!("Codex command set to {} (applies on next task)", label),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetCodexSandbox { mode } => {
             // Shared state + persistence is handled by the control plane;
             // MCP only surfaces acknowledgement to the caller.

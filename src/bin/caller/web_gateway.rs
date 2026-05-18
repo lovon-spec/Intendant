@@ -3383,6 +3383,8 @@ pub struct SettingsPayload {
     pub external_agent: Option<String>,
     // Codex runtime config (persisted to `[agent.codex]`). Mirrored here so
     // the Activity → Control sub-tab can load in one fetch.
+    #[serde(default)]
+    pub codex_command: Option<String>,
     #[serde(default = "default_settings_codex_sandbox")]
     pub codex_sandbox: String,
     #[serde(default = "default_settings_codex_approval_policy")]
@@ -3426,6 +3428,15 @@ fn default_settings_codex_approval_policy() -> String {
     crate::project::normalize_approval_policy("")
 }
 
+fn normalize_settings_codex_command(input: Option<&str>) -> String {
+    let trimmed = input.map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        "codex".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn default_settings_gemini_approval_mode() -> String {
     crate::project::normalize_gemini_approval_mode("")
 }
@@ -3466,6 +3477,7 @@ fn settings_payload_from_config(
         live_audio_enabled: config.live_audio.enabled,
         live_audio_timeout_secs: config.live_audio.default_timeout_secs,
         external_agent: config.agent.default_backend.clone(),
+        codex_command: Some(config.agent.codex.command.clone()),
         codex_sandbox: crate::project::normalize_sandbox_mode(&config.agent.codex.sandbox),
         codex_approval_policy: crate::project::normalize_approval_policy(
             &config.agent.codex.approval_policy,
@@ -3519,6 +3531,10 @@ fn apply_settings_payload(
         .external_agent
         .as_ref()
         .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) });
+    if payload.codex_command.is_some() {
+        config.agent.codex.command =
+            normalize_settings_codex_command(payload.codex_command.as_deref());
+    }
 }
 
 /// Return JSON with boolean flags indicating which API keys are configured.
@@ -10147,13 +10163,53 @@ mod tests {
         assert_eq!(payload.gemini_approval_mode, "default");
 
         let mut config = crate::project::ProjectConfig::default();
+        config.agent.codex.command = "/opt/codex/bin/codex".to_string();
         config.agent.codex.sandbox = "danger-full-access".to_string();
         config.agent.gemini_cli.approval_mode = "yolo".to_string();
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
+        assert_eq!(config.agent.codex.command, "/opt/codex/bin/codex");
         assert_eq!(config.agent.codex.sandbox, "danger-full-access");
         assert_eq!(config.agent.gemini_cli.approval_mode, "yolo");
+    }
+
+    #[test]
+    fn settings_payload_round_trips_codex_command() {
+        let mut config = crate::project::ProjectConfig::default();
+        config.agent.codex.command = "/usr/local/bin/codex".to_string();
+
+        let payload = settings_payload_from_config(&config);
+        assert_eq!(payload.codex_command.as_deref(), Some("/usr/local/bin/codex"));
+
+        let body = serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": "codex",
+            "codex_command": "  /opt/homebrew/bin/codex  "
+        })
+        .to_string();
+
+        let payload: SettingsPayload = serde_json::from_str(&body).unwrap();
+        apply_settings_payload(&mut config, &payload);
+
+        assert_eq!(config.agent.codex.command, "/opt/homebrew/bin/codex");
     }
 
     /// A specific bind address is preserved verbatim in the

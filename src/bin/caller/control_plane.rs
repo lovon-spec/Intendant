@@ -23,6 +23,7 @@ use crate::external_agent;
 /// `thread/start`.
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
+    pub command: String,
     pub sandbox: String,
     pub approval_policy: String,
     pub model: Option<String>,
@@ -123,6 +124,26 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             state.bus.send(AppEvent::ExternalAgentChanged {
                 agent: parsed.map(|b| b.to_string()),
             });
+        }
+        ControlMsg::SetCodexCommand { command } => {
+            let normalized = normalize_codex_command(command.as_deref());
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.command = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.command = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.command to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                command: Some(normalized),
+                ..Default::default()
+            }));
         }
         ControlMsg::SetCodexSandbox { mode } => {
             let normalized = crate::project::normalize_sandbox_mode(mode);
@@ -516,6 +537,7 @@ fn normalize_writable_roots(raw: &[String]) -> Vec<String> {
 /// to "unchanged" so callers can populate only the field they touched.
 #[derive(Debug, Default)]
 struct CodexConfigDelta {
+    command: Option<String>,
     sandbox: Option<String>,
     approval_policy: Option<String>,
     model: Option<String>,
@@ -529,6 +551,7 @@ struct CodexConfigDelta {
 
 fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
     AppEvent::CodexConfigChanged {
+        command: delta.command,
         sandbox: delta.sandbox,
         approval_policy: delta.approval_policy,
         model: delta.model,
@@ -538,6 +561,15 @@ fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
         web_search: delta.web_search,
         network_access: delta.network_access,
         writable_roots: delta.writable_roots,
+    }
+}
+
+fn normalize_codex_command(input: Option<&str>) -> String {
+    let trimmed = input.map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        "codex".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -617,6 +649,7 @@ mod tests {
 
     fn test_codex_config() -> SharedCodexConfig {
         Arc::new(RwLock::new(CodexRuntimeConfig {
+            command: "codex".to_string(),
             sandbox: "workspace-write".to_string(),
             approval_policy: "on-request".to_string(),
             model: None,
@@ -787,6 +820,40 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(external_agent.read().await.is_none());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_command_updates_shared_state() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
+            command: Some("  /opt/bin/codex  ".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.command, "/opt/bin/codex");
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
+            command: Some(" ".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.command, "codex");
 
         handle.abort();
     }

@@ -113,6 +113,15 @@ provider = "gemini"           # provider for CU model (optional)
 model = "gemini-3-flash"      # model for CU tasks (optional)
 backend = "auto"              # "x11", "wayland", "macos", or "auto" (default)
 
+[agent]
+default_backend = "codex"     # "codex", "claude-code", "gemini", or omitted
+
+[agent.codex]
+command = "codex"             # binary path or command name (default: "codex")
+model = "gpt-5"               # optional model override
+approval_policy = "on-request"
+sandbox = "workspace-write"
+
 [live_audio]
 enabled = false               # enable live audio sessions (default: false)
 default_timeout_secs = 300    # session timeout (default: 300)

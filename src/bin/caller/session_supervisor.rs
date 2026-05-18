@@ -938,6 +938,7 @@ impl SessionSupervisor {
             Some(external_agent::AgentBackend::Codex) => {
                 let current = self.config.shared_codex_config.read().await.clone();
                 let cfg = &mut project.config.agent.codex;
+                cfg.command = current.command;
                 cfg.sandbox = current.sandbox;
                 cfg.approval_policy = current.approval_policy;
                 cfg.model = current.model;

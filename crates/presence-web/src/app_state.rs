@@ -233,6 +233,8 @@ pub enum UiCommand {
     /// Control sub-tab can zero the corresponding input.
     CodexConfigChanged {
         #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_policy: Option<String>,
@@ -1176,6 +1178,7 @@ impl AppState {
             }
 
             "codex_config_changed" => {
+                let command = msg.get("command").and_then(|v| v.as_str()).map(String::from);
                 let sandbox = msg.get("sandbox").and_then(|v| v.as_str()).map(String::from);
                 let approval_policy = msg
                     .get("approval_policy")
@@ -1200,6 +1203,7 @@ impl AppState {
                     |arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
                 );
                 cmds.push(UiCommand::CodexConfigChanged {
+                    command,
                     sandbox,
                     approval_policy,
                     model,
@@ -2397,6 +2401,7 @@ mod tests {
         let mut s = AppState::new();
         let msg = json!({
             "event": "codex_config_changed",
+            "command": "/opt/bin/codex",
             "sandbox": "danger-full-access",
             "approval_policy": "never",
             "model": "gpt-5",
@@ -2409,6 +2414,7 @@ mod tests {
         let matched = cmds.iter().any(|c| matches!(
             c,
             UiCommand::CodexConfigChanged {
+                command: Some(cmd),
                 sandbox: Some(sand),
                 approval_policy: Some(p),
                 model: Some(m),
@@ -2418,7 +2424,8 @@ mod tests {
                 web_search: Some(true),
                 network_access: Some(true),
                 writable_roots: Some(roots),
-            } if sand == "danger-full-access"
+            } if cmd == "/opt/bin/codex"
+                && sand == "danger-full-access"
                 && p == "never"
                 && m == "gpt-5"
                 && re == "high"
@@ -2439,6 +2446,7 @@ mod tests {
         let matched = cmds.iter().any(|c| matches!(
             c,
             UiCommand::CodexConfigChanged {
+                command: None,
                 sandbox: None,
                 approval_policy: None,
                 model: None,

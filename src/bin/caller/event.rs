@@ -502,6 +502,7 @@ pub enum AppEvent {
     /// None, bool true). `Option<Option<_>>` would be cleaner in Rust
     /// but doesn't round-trip through our JSON as obviously.
     CodexConfigChanged {
+        command: Option<String>,
         sandbox: Option<String>,
         approval_policy: Option<String>,
         model: Option<String>,
@@ -703,6 +704,13 @@ pub enum ControlMsg {
     SetExternalAgent {
         #[serde(default)]
         agent: Option<String>,
+    },
+    /// Set the Codex executable path or command name. `None`, missing, or
+    /// an empty string falls back to `codex` on PATH. Applies to the NEXT
+    /// task because changing this requires respawning the Codex process.
+    SetCodexCommand {
+        #[serde(default)]
+        command: Option<String>,
     },
     /// Set the Codex sandbox mode. Applies to the NEXT task because Codex
     /// locks the sandbox at `thread/start`. Valid values match
@@ -1397,6 +1405,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // consumes it directly); browsers don't need it.
         AppEvent::CodexThreadActionRequested { .. } => None,
         AppEvent::CodexConfigChanged {
+            command,
             sandbox,
             approval_policy,
             model,
@@ -1407,6 +1416,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             network_access,
             writable_roots,
         } => Some(OutboundEvent::CodexConfigChanged {
+            command: command.clone(),
             sandbox: sandbox.clone(),
             approval_policy: approval_policy.clone(),
             model: model.clone(),

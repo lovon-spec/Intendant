@@ -1168,6 +1168,16 @@ impl App {
                     format!("External agent set to {} (takes effect on next task)", label),
                 );
             }
+            ControlMsg::SetCodexCommand { ref command } => {
+                let label = command
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("codex");
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex command → {} (applies on next task)", label),
+                );
+            }
             ControlMsg::SetCodexSandbox { ref mode } => {
                 self.log(
                     LogLevel::Info,
