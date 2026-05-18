@@ -1291,6 +1291,88 @@ fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
     )
 }
 
+fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.contains('/') {
+        let dir = PathBuf::from(session_id);
+        return dir.is_dir().then_some(dir);
+    }
+
+    let logs_dir = home.join(".intendant").join("logs");
+    let direct = logs_dir.join(session_id);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(session_id) {
+            return Some(path);
+        }
+        let meta_path = path.join("session_meta.json");
+        let Ok(meta_str) = std::fs::read_to_string(meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else {
+            continue;
+        };
+        let Some(meta_id) = meta.get("session_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if meta_id == session_id || meta_id.starts_with(session_id) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn resume_session_activity_replay(
+    source: &str,
+    session_id: &str,
+    resume_id: Option<&str>,
+    task: Option<&str>,
+    limit: usize,
+) -> Option<String> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    resume_session_activity_replay_from_home(&home, source, session_id, resume_id, task, limit)
+}
+
+fn resume_session_activity_replay_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    resume_id: Option<&str>,
+    task: Option<&str>,
+    limit: usize,
+) -> Option<String> {
+    if task.map(str::trim).is_some_and(|task| !task.is_empty()) {
+        return None;
+    }
+
+    let source_norm = source.trim().to_lowercase();
+    if source_norm == "intendant" {
+        let log_dir = intendant_session_dir_from_home(home, session_id)?;
+        return session_log_replay_from_dir(&log_dir);
+    }
+
+    let replay_id = resume_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(session_id);
+    external_session_activity_replay_from_home_with_attach(
+        home,
+        &source_norm,
+        replay_id,
+        limit,
+        false,
+    )
+}
+
 /// Compute a short content hash for cache-busting embedded static assets.
 /// When the WASM or JS changes (i.e. a new build), the hash changes,
 /// the URL changes, and browsers fetch the new version.
@@ -2690,6 +2772,16 @@ fn external_session_activity_replay_from_home(
     session_id: &str,
     limit: usize,
 ) -> Option<String> {
+    external_session_activity_replay_from_home_with_attach(home, source, session_id, limit, true)
+}
+
+fn external_session_activity_replay_from_home_with_attach(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    limit: usize,
+    include_attached: bool,
+) -> Option<String> {
     let mut transcript = external_session_entries_from_home(home, source, session_id)?;
     if limit > 0 && transcript.len() > limit {
         transcript = transcript.split_off(transcript.len() - limit);
@@ -2697,11 +2789,13 @@ fn external_session_activity_replay_from_home(
 
     let mut entries = Vec::with_capacity(transcript.len() + 2);
     entries.push(serde_json::json!({ "event": "replay_start" }));
-    entries.push(serde_json::json!({
-        "event": "session_attached",
-        "session_id": session_id,
-        "source": source,
-    }));
+    if include_attached {
+        entries.push(serde_json::json!({
+            "event": "session_attached",
+            "session_id": session_id,
+            "source": source,
+        }));
+    }
 
     for entry in transcript {
         let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -6978,6 +7072,38 @@ pub fn spawn_web_gateway(
                                                             );
                                                         }
                                                     }
+                                                }
+                                                Ok(ctrl @ ControlMsg::ResumeSession { .. }) => {
+                                                    if let ControlMsg::ResumeSession {
+                                                        source,
+                                                        session_id,
+                                                        resume_id,
+                                                        task,
+                                                        ..
+                                                    } = &ctrl
+                                                    {
+                                                        if let Some(replay) =
+                                                            resume_session_activity_replay(
+                                                                source,
+                                                                session_id,
+                                                                resume_id.as_deref(),
+                                                                task.as_deref(),
+                                                                EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+                                                            )
+                                                        {
+                                                            let _ = direct_tx_inbound.send(replay);
+                                                        }
+                                                    }
+                                                    bus_inbound.send(AppEvent::PresenceLog {
+                                                        message: format!(
+                                                            "[ws] ControlMsg: {:?}",
+                                                            ctrl
+                                                        ),
+                                                        level: Some(LogLevel::Debug),
+                                                        turn: None,
+                                                    });
+                                                    bus_inbound
+                                                        .send(AppEvent::ControlCommand(ctrl));
                                                 }
                                                 Ok(ctrl) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
@@ -11582,6 +11708,100 @@ mod tests {
             .collect();
 
         assert_eq!(contents, vec!["message 2", "message 3"]);
+    }
+
+    #[test]
+    fn resume_session_open_replays_external_transcript_without_attach_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-e756-7461-9946-34b639448717";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Open this from Sessions" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            session_id,
+            None,
+            None,
+            80,
+        )
+        .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        assert_eq!(entries[0]["event"], "replay_start");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["event"] != "session_attached"),
+            "Sessions-tab open replay should let the live attach event render the attach line"
+        );
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry" && entry["content"] == "Open this from Sessions"
+        }));
+    }
+
+    #[test]
+    fn resume_session_open_does_not_replay_when_task_is_submitted() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            "session-1",
+            None,
+            Some("continue the task"),
+            80,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn resume_session_open_replays_intendant_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join(".intendant").join("logs").join("session-1");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.model_response("internal history", 0, 0, 0, 0, None);
+        drop(log);
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "intendant",
+            "session-1",
+            None,
+            None,
+            80,
+        )
+        .expect("intendant session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+
+        assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["event"] == "model_response" && entry["summary"] == "internal history"
+        }));
     }
 
     #[test]
