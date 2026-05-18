@@ -16805,10 +16805,20 @@ window.submitActivityOrSteer = function() {
     // that something went wrong.
     steerCounter = (steerCounter + 1) >>> 0;
     const id = 'steer-' + Date.now() + '-' + steerCounter;
+    const attachments = pendingAttachments.map(a => a.frameId);
     const msg = { action: 'steer', text, id };
     if (currentSessionFullId) msg.session_id = currentSessionFullId;
+    if (attachments.length > 0) msg.attachments = attachments;
     app.send_server_action(msg);
-    onSteerStatusUpdate(id, text, 'pending', null);
+    onSteerStatusUpdate(
+      id,
+      attachments.length > 0 ? `${text} (${attachments.length} attachment${attachments.length === 1 ? '' : 's'})` : text,
+      'pending',
+      null
+    );
+    if (attachments.length > 0) {
+      clearPendingAttachments();
+    }
     input.value = '';
   } else {
     // Normal task / follow-up path.

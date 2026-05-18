@@ -90,6 +90,11 @@ pub struct TaskEnvelope {
     /// `context_hints` (which are `frames:`-prefixed strings used by presence).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachment_frame_ids: Vec<String>,
+    /// Optional dashboard steer correlation id. Present when a mid-turn steer
+    /// had attachments and was forced through the next-turn task path so the
+    /// frontend can retire its queued steer row after delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_id: Option<String>,
 }
 
 /// Filtered events pushed to the presence layer from the agent loop.
@@ -493,6 +498,7 @@ mod tests {
             reference_frame_ids: vec!["display:99-f00012".to_string()],
             display_target: Some("user_session".to_string()),
             attachment_frame_ids: vec!["ann-recording-3".to_string()],
+            steer_id: Some("steer-1".to_string()),
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let back: TaskEnvelope = serde_json::from_str(&json).unwrap();
@@ -503,6 +509,7 @@ mod tests {
         assert_eq!(back.display_target.as_deref(), Some("user_session"));
         assert_eq!(back.attachment_frame_ids.len(), 1);
         assert_eq!(back.attachment_frame_ids[0], "ann-recording-3");
+        assert_eq!(back.steer_id.as_deref(), Some("steer-1"));
     }
 
     #[test]

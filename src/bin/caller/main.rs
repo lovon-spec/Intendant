@@ -1584,6 +1584,7 @@ impl UserAttachments {
 struct FollowUpMessage {
     text: String,
     attachments: UserAttachments,
+    steer_id: Option<String>,
 }
 
 impl FollowUpMessage {
@@ -1591,11 +1592,24 @@ impl FollowUpMessage {
         Self {
             text,
             attachments: UserAttachments::default(),
+            steer_id: None,
         }
     }
 
     fn with_attachments(text: String, attachments: UserAttachments) -> Self {
-        Self { text, attachments }
+        Self {
+            text,
+            attachments,
+            steer_id: None,
+        }
+    }
+
+    fn steer(text: String, attachments: UserAttachments, steer_id: String) -> Self {
+        Self {
+            text,
+            attachments,
+            steer_id: Some(steer_id),
+        }
     }
 }
 
@@ -5419,6 +5433,7 @@ async fn run_round_loop(
     let mut round = 1usize;
     let mut cumulative_stats = LoopStats::default();
     let mut xvfb_guard: Option<vision::XvfbGuard> = None;
+    let local_session_id = session_log_id(&session_log);
 
     loop {
         let (stats, exit_reason) = run_agent_loop(
@@ -5487,6 +5502,13 @@ async fn run_round_loop(
                             conversation.add_user(followup_text);
                         } else {
                             conversation.add_user_with_images(followup_text, followup_images);
+                        }
+                        if let Some(id) = message.steer_id {
+                            bus.send(AppEvent::SteerDelivered {
+                                session_id: local_session_id.clone(),
+                                id,
+                                mid_turn: false,
+                            });
                         }
                     }
                     None => {
@@ -5856,6 +5878,7 @@ async fn run_with_presence(
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachment_frame_ids: vec![],
+                steer_id: None,
             };
             let _ = fallback_task_tx.send(envelope).await;
         }
@@ -5883,6 +5906,7 @@ async fn run_with_presence(
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachment_frame_ids: vec![],
+                steer_id: None,
             };
             let _ = fallback_task_tx.send(envelope).await;
         }
@@ -5900,6 +5924,7 @@ async fn run_with_presence(
                     reference_frame_ids: vec![],
                     display_target: None,
                     attachment_frame_ids: vec![],
+                    steer_id: None,
                 };
                 if forwarder_tx.send(envelope).await.is_err() {
                     break;
@@ -6473,6 +6498,13 @@ async fn run_with_presence(
                 });
                 continue;
             }
+            if let Some(id) = envelope.steer_id.as_deref() {
+                bus.send(AppEvent::SteerDelivered {
+                    session_id: session_log_id(&session_log),
+                    id: id.to_string(),
+                    mid_turn: false,
+                });
+            }
 
             // Drain events until this turn completes
             let event_rx = persistent_event_rx.as_mut().unwrap();
@@ -6635,6 +6667,14 @@ async fn run_with_presence(
                 } else {
                     conv.add_user_with_images(format!("[New Task] {}", task_text), combined_images);
                 }
+            }
+
+            if let Some(id) = envelope.steer_id.as_deref() {
+                bus.send(AppEvent::SteerDelivered {
+                    session_id: session_log_id(&session_log),
+                    id: id.to_string(),
+                    mid_turn: false,
+                });
             }
 
             // Run one round (agent loop until done/budget/error)
@@ -7145,7 +7185,7 @@ async fn run_external_agent_mode(
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
-        Some((task, attachments))
+        Some((task, attachments, None))
     };
 
     let drain_config = DrainConfig {
@@ -7163,10 +7203,10 @@ async fn run_external_agent_mode(
     };
 
     loop {
-        let (turn_text, attachments) = match next_turn.take() {
+        let (turn_text, attachments, steer_id) = match next_turn.take() {
             Some(turn) => turn,
             None => match follow_up_rx.recv().await {
-                Some(followup) => (followup.text, followup.attachments),
+                Some(followup) => (followup.text, followup.attachments, followup.steer_id),
                 None => {
                     slog(&session_log, |l| {
                         l.info("Follow-up channel closed, exiting")
@@ -7226,6 +7266,13 @@ async fn run_external_agent_mode(
                 e
             )));
             break;
+        }
+        if let Some(id) = steer_id {
+            bus.send(AppEvent::SteerDelivered {
+                session_id: live_session_id.clone(),
+                id,
+                mid_turn: false,
+            });
         }
 
         match drain_external_agent_events(&mut agent, &mut event_rx, &drain_config, &mut stats)

@@ -1055,6 +1055,13 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         text: String,
+        /// Optional attachment ids queued from the dashboard. These mirror
+        /// `StartTask.attachments`: live frame ids or `upload:<id>` handles.
+        /// Native mid-turn steer protocols are text-only today, so managed
+        /// sessions queue steers with attachments as the next follow-up turn
+        /// rather than silently dropping the attachments.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
         /// Optional correlation id supplied by the frontend. Frontends use
         /// it to track the lifecycle of one steer request across the
         /// `SteerRequested` → `SteerQueued`/`SteerDelivered` events. An
@@ -2309,11 +2316,13 @@ mod tests {
             ControlMsg::Steer {
                 session_id: None,
                 text: "use Python".to_string(),
+                attachments: vec![],
                 id: Some("s-1".to_string()),
             },
             ControlMsg::Steer {
                 session_id: None,
                 text: "never mind".to_string(),
+                attachments: vec![],
                 id: None,
             },
         ];
@@ -2334,10 +2343,12 @@ mod tests {
             ControlMsg::Steer {
                 session_id,
                 text,
+                attachments,
                 id,
             } => {
                 assert!(session_id.is_none());
                 assert_eq!(text, "switch to Python");
+                assert!(attachments.is_empty());
                 assert_eq!(id.as_deref(), Some("s-42"));
             }
             _ => panic!("expected Steer"),
@@ -2352,10 +2363,33 @@ mod tests {
             ControlMsg::Steer {
                 session_id,
                 text,
+                attachments,
                 id,
             } => {
                 assert!(session_id.is_none());
                 assert_eq!(text, "never mind");
+                assert!(attachments.is_empty());
+                assert_eq!(id, None);
+            }
+            _ => panic!("expected Steer"),
+        }
+    }
+
+    #[test]
+    fn control_msg_steer_with_attachments_deserialize() {
+        let json =
+            r#"{"action":"steer","text":"look here","attachments":["frame:latest","upload:u1"]}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::Steer {
+                session_id,
+                text,
+                attachments,
+                id,
+            } => {
+                assert!(session_id.is_none());
+                assert_eq!(text, "look here");
+                assert_eq!(attachments, vec!["frame:latest", "upload:u1"]);
                 assert_eq!(id, None);
             }
             _ => panic!("expected Steer"),

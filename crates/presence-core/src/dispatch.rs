@@ -106,6 +106,7 @@ fn handle_submit_task(args: &Value) -> PresenceAction {
         reference_frame_ids,
         display_target,
         attachment_frame_ids: Vec::new(),
+        steer_id: None,
     })
 }
 
@@ -381,6 +382,7 @@ mod tests {
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachment_frame_ids: vec![],
+                steer_id: None,
             })),
             "Task submitted: fix bug"
         );

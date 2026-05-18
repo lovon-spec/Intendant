@@ -121,6 +121,7 @@ impl Dispatcher {
                         reference_frame_ids,
                         display_target,
                         attachment_frame_ids: attachments,
+                        steer_id: None,
                     };
                     if tx.try_send(envelope).is_ok() {
                         return;
@@ -160,6 +161,7 @@ impl Dispatcher {
                         reference_frame_ids: vec![],
                         display_target: None,
                         attachment_frame_ids: vec![],
+                        steer_id: None,
                     };
                     if tx.try_send(envelope).is_ok() {
                         return;
@@ -189,7 +191,36 @@ impl Dispatcher {
                 session_id,
                 text,
                 id,
+                attachments,
             } => {
+                if !attachments.is_empty() {
+                    if let Some(ref tx) = self.task_tx {
+                        let steer_id = id.unwrap_or_default();
+                        let envelope = presence_core::TaskEnvelope {
+                            task: text.clone(),
+                            force_direct: true,
+                            context_hints: vec![],
+                            reference_frame_ids: vec![],
+                            display_target: None,
+                            attachment_frame_ids: attachments,
+                            steer_id: if steer_id.is_empty() {
+                                None
+                            } else {
+                                Some(steer_id.clone())
+                            },
+                        };
+                        if tx.try_send(envelope).is_ok() {
+                            bus.send(AppEvent::SteerQueued {
+                                session_id,
+                                id: steer_id,
+                                reason: "attachments are queued for the next turn".to_string(),
+                            });
+                            return;
+                        }
+                    }
+                    self.warn_drop(bus, "Steer", &text);
+                    return;
+                }
                 // Re-emit as AppEvent::SteerRequested so agent loops can
                 // subscribe and either inject the text into the active turn
                 // (native mid-turn steering) or queue it onto
@@ -556,6 +587,7 @@ mod tests {
         bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
             session_id: Some("sess-b".into()),
             text: "use SQLite instead".into(),
+            attachments: vec![],
             id: Some("s1".into()),
         }));
 
@@ -600,6 +632,7 @@ mod tests {
         bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
             session_id: None,
             text: "never mind".into(),
+            attachments: vec![],
             id: None,
         }));
 
@@ -618,5 +651,54 @@ mod tests {
             }
         }
         assert_eq!(seen_id.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn steer_with_attachments_routes_task_envelope() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+        let (task_tx, mut task_rx) = mpsc::channel::<presence_core::TaskEnvelope>(4);
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: Some(task_tx),
+            follow_up_tx: None,
+            primary_session_id: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: Some("sess-c".into()),
+            text: "look at this screenshot".into(),
+            attachments: vec!["frame:latest".into()],
+            id: Some("s2".into()),
+        }));
+
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.task, "look at this screenshot");
+        assert!(envelope.force_direct);
+        assert_eq!(envelope.attachment_frame_ids, vec!["frame:latest"]);
+        assert_eq!(envelope.steer_id.as_deref(), Some("s2"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_queued = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SteerQueued { id, .. })) => {
+                    assert_eq!(id, "s2");
+                    saw_queued = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(saw_queued, "expected SteerQueued for attached steer");
     }
 }

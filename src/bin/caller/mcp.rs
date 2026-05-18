@@ -2083,6 +2083,7 @@ async fn handle_control_command_mcp(
             session_id,
             text,
             id,
+            attachments: _,
         } => {
             // Mid-turn steering from an MCP client. Re-broadcast as an
             // `AppEvent::SteerRequested` so the running agent loop (if any)

@@ -1344,6 +1344,7 @@ mod tests {
             reference_frame_ids: vec!["cam0-f00005".to_string()],
             display_target: Some("user_session".to_string()),
             attachment_frame_ids: vec![],
+            steer_id: None,
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: TaskEnvelope = serde_json::from_str(&json).unwrap();

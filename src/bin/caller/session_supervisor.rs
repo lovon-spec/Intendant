@@ -163,8 +163,9 @@ impl SessionSupervisor {
                 session_id,
                 text,
                 id,
+                attachments,
             } => {
-                self.route_steer(session_id, text, id).await;
+                self.route_steer(session_id, text, id, attachments).await;
             }
             event::ControlMsg::Approve { session_id, id } => {
                 self.resolve_approval(session_id, id, event::ApprovalResponse::Approve, "approve")
@@ -765,22 +766,81 @@ impl SessionSupervisor {
         });
     }
 
-    async fn route_steer(&self, session_id: Option<String>, text: String, id: Option<String>) {
+    async fn route_steer(
+        &self,
+        session_id: Option<String>,
+        text: String,
+        id: Option<String>,
+        attachments: Vec<String>,
+    ) {
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Steer dropped: no active managed session");
             return;
         };
-        if !self.session_is_managed(&target_id).await {
+        let entry = {
+            let state = self.state.lock().await;
+            state.sessions.get(&target_id).map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.source.clone(),
+                    s.project_root.clone(),
+                    s.session_dir.clone(),
+                    s.follow_up_tx.clone(),
+                )
+            })
+        };
+        let Some((managed_id, source, project_root, session_dir, tx)) = entry else {
             self.warn(&format!(
                 "Steer dropped: session {} is not managed by this daemon",
                 short_session(&target_id)
             ));
             return;
+        };
+
+        let steer_id = id.unwrap_or_default();
+        if attachments.is_empty() {
+            self.config.bus.send(AppEvent::SteerRequested {
+                session_id: Some(managed_id),
+                text,
+                id: steer_id,
+            });
+            return;
         }
-        self.config.bus.send(AppEvent::SteerRequested {
-            session_id: Some(target_id),
+
+        let resolved_attachments = resolve_attachments(
+            &attachments,
+            &self.config.frame_registry,
+            &session_dir,
+            &project_root,
+        )
+        .await;
+        if resolved_attachments.len() < attachments.len() {
+            self.warn(&format!(
+                "Only resolved {} of {} steer attachment(s) for {} session {}",
+                resolved_attachments.len(),
+                attachments.len(),
+                source,
+                short_session(&managed_id)
+            ));
+        }
+        let msg = FollowUpMessage::steer(
             text,
-            id: id.unwrap_or_default(),
+            UserAttachments::from_items(resolved_attachments),
+            steer_id.clone(),
+        );
+        if tx.send(msg).await.is_err() {
+            self.warn(&format!(
+                "Steer dropped: {} session {} in {} is not accepting input",
+                source,
+                short_session(&managed_id),
+                project_root.display()
+            ));
+            return;
+        }
+        self.config.bus.send(AppEvent::SteerQueued {
+            session_id: Some(managed_id),
+            id: steer_id,
+            reason: "attachments are queued for the next turn".to_string(),
         });
     }
 
