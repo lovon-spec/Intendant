@@ -2770,11 +2770,11 @@ fn handle_changes_request(
         return ("200 OK", serde_json::json!([]).to_string());
     }
 
-    // Extract the path after /api/session/current/changes
-    let file_path = request_line
-        .split("/api/session/current/changes")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
+    // Extract the request target from `GET <target> HTTP/1.1`, then trim the
+    // endpoint prefix. The list endpoint has no path suffix.
+    let target = request_line.split_whitespace().nth(1).unwrap_or("");
+    let file_path = target
+        .strip_prefix("/api/session/current/changes")
         .unwrap_or("")
         .split('?')
         .next()
@@ -10840,6 +10840,32 @@ mod tests {
         assert_eq!(json["path"], "src/main.rs");
         assert!(json["diff"].as_str().unwrap().contains("-old"));
         assert!(json["diff"].as_str().unwrap().contains("+new"));
+    }
+
+    #[test]
+    fn changes_request_without_path_lists_files() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/src/main.rs");
+        let current_path = project.path().join("src/main.rs");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "old\n").unwrap();
+        std::fs::write(&current_path, "new\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert!(
+            json.as_array().is_some(),
+            "list endpoint should return an array"
+        );
+        assert_eq!(json[0]["path"], "src/main.rs");
     }
 
     #[test]

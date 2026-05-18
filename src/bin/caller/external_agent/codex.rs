@@ -1441,6 +1441,67 @@ fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn non_empty_string_at(value: &serde_json::Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        value
+            .pointer(path)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn codex_file_change_preview(params: &serde_json::Value) -> Option<String> {
+    if let Some(path) = non_empty_string_at(
+        params,
+        &[
+            "/item/path",
+            "/item/filePath",
+            "/item/file_path",
+            "/item/name",
+            "/path",
+            "/filePath",
+            "/file_path",
+        ],
+    ) {
+        return Some(path);
+    }
+
+    let item = params.get("item").unwrap_or(params);
+    for key in ["paths", "files"] {
+        if let Some(values) = item.get(key).and_then(|v| v.as_array()) {
+            let mut paths = Vec::new();
+            for value in values {
+                if let Some(path) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        non_empty_string_at(value, &["/path", "/filePath", "/file_path", "/name"])
+                    })
+                {
+                    paths.push(path);
+                }
+            }
+            if !paths.is_empty() {
+                return Some(paths.join(", "));
+            }
+        }
+    }
+
+    if let Some(changes) = item.get("changes").and_then(|v| v.as_object()) {
+        let mut paths: Vec<String> = changes.keys().cloned().collect();
+        paths.sort();
+        if !paths.is_empty() {
+            return Some(paths.join(", "));
+        }
+    }
+
+    None
+}
+
 /// Translate a Codex notification into one or more `AgentEvent`s.
 fn translate_notification(
     method: &str,
@@ -1483,16 +1544,17 @@ fn translate_notification(
                     });
                 }
                 "fileChange" => {
-                    let path = params
-                        .pointer("/item/path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let _ = event_tx.send(AgentEvent::ToolStarted {
-                        item_id,
-                        tool_name: "file_change".to_string(),
-                        preview: path,
-                    });
+                    // Codex can emit a fileChange item before the concrete
+                    // path metadata is attached. Avoid showing a blank
+                    // "file_change:" activity row; the filesystem watcher
+                    // will still report the actual changed files.
+                    if let Some(preview) = codex_file_change_preview(params) {
+                        let _ = event_tx.send(AgentEvent::ToolStarted {
+                            item_id,
+                            tool_name: "file_change".to_string(),
+                            preview,
+                        });
+                    }
                 }
                 "agentMessage" | "userMessage" | "reasoning" | "imageView" => {
                     // agentMessage: deltas will follow via item/agentMessage/delta.
@@ -2724,6 +2786,47 @@ mod tests {
                 assert_eq!(item_id, "item-2");
                 assert_eq!(tool_name, "file_change");
                 assert_eq!(preview, "/tmp/test.txt");
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_started_file_change_without_path_is_ignored() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-2",
+            "item": {"type": "fileChange"}
+        });
+        translate_notification("item/started", &params, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "blank fileChange should emit nothing"
+        );
+    }
+
+    #[test]
+    fn translate_item_started_file_change_uses_changes_map() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-2",
+            "item": {
+                "type": "fileChange",
+                "changes": {
+                    "src/main.rs": {},
+                    "src/lib.rs": {}
+                }
+            }
+        });
+        translate_notification("item/started", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolStarted {
+                tool_name, preview, ..
+            } => {
+                assert_eq!(tool_name, "file_change");
+                assert!(preview.contains("src/lib.rs"));
+                assert!(preview.contains("src/main.rs"));
             }
             other => panic!("expected ToolStarted, got {:?}", other),
         }
