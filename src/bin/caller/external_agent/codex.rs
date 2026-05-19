@@ -109,9 +109,9 @@ impl CodexAgent {
             .and_then(|v| v.as_str())
             .or_else(|| response.pointer("/threadId").and_then(|v| v.as_str()))
             .unwrap_or("(unknown)");
-        // Point subsequent RPCs at the fork — matches raw codex UX where
-        // `/fork` moves you into the new thread automatically.
-        *self.active_thread_id.lock().await = Some(new_id.to_string());
+        // Do not retarget this running agent here. The dashboard control
+        // plane attaches the forked thread as its own managed session so the
+        // parent thread remains controllable from its original window.
         Ok(format!("forked into thread {}", new_id))
     }
 

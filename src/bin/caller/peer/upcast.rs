@@ -287,6 +287,7 @@ impl AppEventUpcaster {
                 action,
                 success,
                 message,
+                ..
             } => vec![log_event(
                 if *success {
                     LogLevel::Info
@@ -1288,6 +1289,7 @@ impl WireEventUpcaster {
                 action,
                 success,
                 message,
+                ..
             } => vec![log_event(
                 if *success {
                     LogLevel::Info

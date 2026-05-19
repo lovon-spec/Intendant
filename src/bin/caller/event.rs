@@ -500,6 +500,7 @@ pub enum AppEvent {
     /// its params — one-way, no ack on this variant. The watcher emits a
     /// `CodexThreadActionResult` after the agent call returns.
     CodexThreadActionRequested {
+        session_id: Option<String>,
         action: String,
         params: serde_json::Value,
     },
@@ -509,6 +510,7 @@ pub enum AppEvent {
     /// informational status line; `success=false` → message is the error
     /// surfaced to the caller. Dashboard consumes to flash a toast.
     CodexThreadActionResult {
+        session_id: Option<String>,
         action: String,
         success: bool,
         message: String,
@@ -797,6 +799,8 @@ pub enum ControlMsg {
     /// The variant's field is named `op` (not `action`) because ControlMsg's
     /// serde tag is already `action`, and nested fields can't share the tag.
     CodexThreadAction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         op: String,
         #[serde(default)]
         params: serde_json::Value,
@@ -1486,10 +1490,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             autonomy: autonomy.clone(),
         }),
         AppEvent::CodexThreadActionResult {
+            session_id,
             action,
             success,
             message,
         } => Some(OutboundEvent::CodexThreadActionResult {
+            session_id: session_id.clone(),
             action: action.clone(),
             success: *success,
             message: message.clone(),

@@ -273,11 +273,16 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
-        ControlMsg::CodexThreadAction { op, params } => {
+        ControlMsg::CodexThreadAction {
+            session_id,
+            op,
+            params,
+        } => {
             // Republish as an AppEvent so the daemon-side watcher (which
             // owns the persistent Codex agent) can pick it up and run the
             // RPC. We don't own the agent here, so we only translate.
             state.bus.send(AppEvent::CodexThreadActionRequested {
+                session_id: session_id.clone(),
                 action: op.clone(),
                 params: params.clone(),
             });
@@ -1083,6 +1088,7 @@ mod tests {
         );
 
         bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+            session_id: Some("sess-action".to_string()),
             op: "compact".to_string(),
             params: serde_json::json!({"extra": "data"}),
         }));
@@ -1091,7 +1097,12 @@ mod tests {
         let mut found = false;
         for _ in 0..20 {
             match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
-                Ok(Ok(AppEvent::CodexThreadActionRequested { action, params })) => {
+                Ok(Ok(AppEvent::CodexThreadActionRequested {
+                    session_id,
+                    action,
+                    params,
+                })) => {
+                    assert_eq!(session_id.as_deref(), Some("sess-action"));
                     assert_eq!(action, "compact");
                     assert_eq!(params["extra"], "data");
                     found = true;

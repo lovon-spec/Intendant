@@ -7464,7 +7464,10 @@ function applyCodexConfigChanged(evt) {
 const controlPendingActions = new Map(); // op -> { timeoutHandle, btnEl }
 
 function dispatchCodexThreadAction(op, params) {
-  dispatchControlMsg({ action: 'codex_thread_action', op, params: params || {} });
+  const sid = resolvePromptTargetSessionId();
+  const payload = { action: 'codex_thread_action', op, params: params || {} };
+  if (sid) payload.session_id = sid;
+  dispatchControlMsg(payload);
 }
 
 function showControlToast(kind, text) {
@@ -17886,6 +17889,10 @@ function onSessionStarted(sessionId, task) {
   // server state if the session already has rounds recorded (reconnect
   // during an in-flight task).
   if (typeof refreshHistory === 'function') refreshHistory();
+  if (sessionsLoaded) {
+    loadSessions();
+    setTimeout(loadSessions, 1000);
+  }
 }
 
 function onSessionAttached(sessionId, source) {
@@ -17901,6 +17908,10 @@ function onSessionAttached(sessionId, source) {
   switchTab('activity');
   refreshChangesList({ selectFirst: activeActivitySubtab === 'changes', quiet: true });
   if (typeof refreshHistory === 'function') refreshHistory();
+  if (sessionsLoaded) {
+    loadSessions();
+    setTimeout(loadSessions, 1000);
+  }
 }
 
 function onSessionEnded(sessionId, reason) {

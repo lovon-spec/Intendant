@@ -547,6 +547,7 @@ struct DrainConfig<'a> {
     session_id: Option<String>,
     autonomy: SharedAutonomy,
     session_log: &'a SharedSessionLog,
+    project_root: &'a Path,
     log_dir: &'a Path,
     approval_registry: &'a event::ApprovalRegistry,
     json_approval: Option<&'a JsonApprovalSlot>,
@@ -736,6 +737,59 @@ async fn emit_external_context_snapshot_if_changed(
                 slog(config.session_log, |l| l.warn(&message));
                 state.last_error = Some(message);
             }
+        }
+    }
+}
+
+fn forked_thread_id_from_message(message: &str) -> Option<String> {
+    message
+        .strip_prefix("forked into thread ")
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && *id != "(unknown)")
+        .map(str::to_string)
+}
+
+async fn handle_external_thread_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    op: String,
+    params: serde_json::Value,
+    config: &DrainConfig<'_>,
+) {
+    let result = agent
+        .thread_action(&op, &params)
+        .await
+        .map_err(|e| e.to_string());
+    let (success, message) = match result {
+        Ok(msg) => (true, msg),
+        Err(e) => (false, e),
+    };
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Codex thread action /{}: {} — {}",
+            op,
+            if success { "ok" } else { "FAILED" },
+            message
+        ))
+    });
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: config.session_id.clone(),
+        action: op.clone(),
+        success,
+        message: message.clone(),
+    });
+
+    if success && op == "fork" {
+        if let Some(child_id) = forked_thread_id_from_message(&message) {
+            config
+                .bus
+                .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                    source: "codex".to_string(),
+                    session_id: child_id.clone(),
+                    resume_id: Some(child_id),
+                    project_root: Some(config.project_root.to_string_lossy().to_string()),
+                    task: None,
+                    direct: Some(true),
+                }));
         }
     }
 }
@@ -932,6 +986,14 @@ async fn drain_external_agent_events(
                                 });
                             }
                         }
+                        continue;
+                    }
+                    Ok(AppEvent::CodexThreadActionRequested {
+                        session_id,
+                        action,
+                        params,
+                    }) if event_targets_session(&session_id, &local_session_id) => {
+                        handle_external_thread_action(agent, action, params, config).await;
                         continue;
                     }
                     Ok(_) => continue,
@@ -6025,6 +6087,7 @@ async fn run_with_presence(
     // the dashboard / MCP between tasks. We subscribe to the bus here (not
     // just inside the drain) so actions still fire when the loop is idle,
     // waiting for the next task.
+    let local_session_id = session_log_id(&session_log);
     let mut outer_bus_rx = bus.subscribe();
 
     // Outer loop: either a task envelope arrives (run the agent), a thread
@@ -6033,6 +6096,7 @@ async fn run_with_presence(
     enum OuterSignal {
         Task(presence::TaskEnvelope),
         ThreadAction {
+            session_id: Option<String>,
             op: String,
             params: serde_json::Value,
         },
@@ -6064,8 +6128,16 @@ async fn run_with_presence(
                 None => OuterSignal::Done,
             },
             msg = outer_bus_rx.recv() => match msg {
-                Ok(AppEvent::CodexThreadActionRequested { action, params }) => {
-                    OuterSignal::ThreadAction { op: action, params }
+                Ok(AppEvent::CodexThreadActionRequested {
+                    session_id,
+                    action,
+                    params,
+                }) if event_targets_session(&session_id, &local_session_id) => {
+                    OuterSignal::ThreadAction {
+                        session_id,
+                        op: action,
+                        params,
+                    }
                 }
                 Ok(AppEvent::GeminiThreadActionRequested { action, params }) => {
                     OuterSignal::GeminiThreadAction { op: action, params }
@@ -6088,7 +6160,11 @@ async fn run_with_presence(
         let envelope = match signal {
             OuterSignal::Task(e) => e,
             OuterSignal::Done => break,
-            OuterSignal::ThreadAction { op, params } => {
+            OuterSignal::ThreadAction {
+                session_id,
+                op,
+                params,
+            } => {
                 // `/new` is a daemon-side operation (not a Codex RPC): clear
                 // the persistent agent so the next task creates a fresh
                 // thread. Handled here — not inside dispatch_thread_action
@@ -6111,6 +6187,7 @@ async fn run_with_presence(
                     Ok(msg) => (true, msg),
                     Err(e) => (false, e),
                 };
+                let result_session_id = session_id.or_else(|| local_session_id.clone());
                 slog(&session_log, |l| {
                     l.info(&format!(
                         "Codex thread action /{}: {} — {}",
@@ -6120,10 +6197,23 @@ async fn run_with_presence(
                     ))
                 });
                 bus.send(AppEvent::CodexThreadActionResult {
-                    action: op,
+                    session_id: result_session_id.clone(),
+                    action: op.clone(),
                     success,
-                    message,
+                    message: message.clone(),
                 });
+                if success && op == "fork" {
+                    if let Some(child_id) = forked_thread_id_from_message(&message) {
+                        bus.send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                            source: "codex".to_string(),
+                            session_id: child_id.clone(),
+                            resume_id: Some(child_id),
+                            project_root: Some(project_root.to_string_lossy().to_string()),
+                            task: None,
+                            direct: Some(true),
+                        }));
+                    }
+                }
                 continue;
             }
             OuterSignal::GeminiThreadAction { op, params: _ } => {
@@ -6559,6 +6649,7 @@ async fn run_with_presence(
                 session_id: session_log_id(&session_log),
                 autonomy: autonomy.clone(),
                 session_log: &session_log,
+                project_root: &project.root,
                 log_dir: &log_dir,
                 approval_registry: &approval_registry,
                 json_approval: None,
@@ -7241,6 +7332,7 @@ async fn run_external_agent_mode(
         session_id: live_session_id.clone(),
         autonomy: autonomy.clone(),
         session_log: &session_log,
+        project_root: &project.root,
         log_dir: &_log_dir,
         approval_registry: &approval_registry,
         json_approval: json_approval.as_ref(),
@@ -7249,17 +7341,49 @@ async fn run_external_agent_mode(
         headless,
         context_injection: &context_injection,
     };
+    let mut idle_bus_rx = bus.subscribe();
 
-    loop {
+    'outer: loop {
         let (turn_text, attachments, steer_id) = match next_turn.take() {
             Some(turn) => turn,
-            None => match follow_up_rx.recv().await {
-                Some(followup) => (followup.text, followup.attachments, followup.steer_id),
-                None => {
-                    slog(&session_log, |l| {
-                        l.info("Follow-up channel closed, exiting")
-                    });
-                    break;
+            None => loop {
+                tokio::select! {
+                    maybe_followup = follow_up_rx.recv() => {
+                        match maybe_followup {
+                            Some(followup) => {
+                                break (followup.text, followup.attachments, followup.steer_id);
+                            }
+                            None => {
+                                slog(&session_log, |l| {
+                                    l.info("Follow-up channel closed, exiting")
+                                });
+                                break 'outer;
+                            }
+                        }
+                    }
+                    bus_event = idle_bus_rx.recv() => {
+                        match bus_event {
+                            Ok(AppEvent::CodexThreadActionRequested {
+                                session_id,
+                                action,
+                                params,
+                            }) if event_targets_session(&session_id, &live_session_id) => {
+                                handle_external_thread_action(
+                                    &mut agent,
+                                    action,
+                                    params,
+                                    &drain_config,
+                                )
+                                .await;
+                            }
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                slog(&session_log, |l| l.info("Event bus closed, exiting"));
+                                break 'outer;
+                            }
+                        }
+                    }
                 }
             },
         };
