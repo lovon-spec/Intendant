@@ -4211,7 +4211,7 @@ html, body {
     <span class="field-label">ctx</span>
     <div class="budget-bar">
       <div class="bar-track"><div class="bar-fill" id="sb-budget-fill"></div></div>
-      <span class="budget-pct" id="sb-budget-pct">0%</span>
+      <span class="budget-pct" id="sb-budget-pct">--</span>
     </div>
     <span class="sep">|</span>
     <span class="field-label">autonomy</span>
@@ -5493,6 +5493,8 @@ let currentPhase = 'idle';
 let currentSessionFullId = '';
 let foregroundSessionFullId = '';
 const sessionWindows = new Map();
+const sessionUsageById = new Map();
+let latestGlobalUsage = null;
 const SESSION_WINDOW_LOG_LIMIT = 600;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
@@ -6563,6 +6565,7 @@ function processCommands(cmds) {
       case 'hide_human_input': hidePanel('human-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
       case 'update_usage':
+        cacheSessionUsage(c);
         // Cache the payload under the self host so the Stats host
         // picker can re-render it on demand. Only drive the live
         // rendering path when the picker is on self (or unset) — when
@@ -6571,6 +6574,7 @@ function processCommands(cmds) {
         hostStatsCache.set(selfPeerId, c);
         if (isStatsShowingSelf()) renderUsageTab(c);
         updateTickerFromUsage(c);
+        renderForegroundSessionUsage();
         break;
       case 'add_display': addDisplaySlot(c.display_id, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
@@ -7881,11 +7885,16 @@ function focusSessionWindow(sessionId) {
   foregroundSessionFullId = sid;
   currentSessionFullId = sid;
   document.getElementById('sb-session').textContent = shortSessionId(sid);
-  if (app && typeof app.select_session === 'function') app.select_session(sid);
+  if (app && typeof app.select_session === 'function') {
+    const cmds = app.select_session(sid);
+    if (cmds) processCommands(cmds);
+  }
   for (const [id, other] of sessionWindows) {
     other.el.classList.toggle('foreground', id === sid);
   }
   updateTaskTargetChip();
+  renderForegroundSessionUsage();
+  renderContextPane();
   if (win.phase) setPhase(win.phase);
 }
 
@@ -8458,19 +8467,60 @@ function renderLogEntry(c) {
   appendLogEntryElement(entry);
 }
 
+function setContextUsagePct(pct) {
+  const fill = document.getElementById('sb-budget-fill');
+  const label = document.getElementById('sb-budget-pct');
+  if (!fill || !label) return;
+  if (pct === undefined || pct === null || Number.isNaN(Number(pct))) {
+    fill.style.width = '0%';
+    fill.style.background = '#6c7086';
+    label.textContent = '--';
+    label.style.color = '#6c7086';
+    return;
+  }
+  const value = Number(pct);
+  fill.style.width = Math.min(value, 100) + '%';
+  const color = value < 50 ? '#a6e3a1' : value < 85 ? '#f9e2af' : '#f38ba8';
+  fill.style.background = color;
+  label.textContent = value.toFixed(1) + '%';
+  label.style.color = color;
+}
+
+function parseUsageJson(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function cacheSessionUsage(c) {
+  if (!c || typeof c !== 'object') return;
+  const sid = String(c.session_id || '').trim();
+  if (sid) {
+    sessionUsageById.set(sid, c);
+  } else {
+    latestGlobalUsage = c;
+  }
+}
+
+function usageForForegroundSession() {
+  const sid = resolvePromptTargetSessionId();
+  if (sid && sessionUsageById.has(sid)) return sessionUsageById.get(sid);
+  if (sid && sessionUsageById.size > 0) return null;
+  return latestGlobalUsage;
+}
+
+function renderForegroundSessionUsage() {
+  const usageCommand = usageForForegroundSession();
+  const main = usageCommand ? parseUsageJson(usageCommand.main_json) : null;
+  setContextUsagePct(main && typeof main.usage_pct === 'number' ? main.usage_pct : null);
+}
+
 function updateStatusBar(d) {
   if (d.provider) document.getElementById('sb-provider').textContent = d.provider;
   if (d.model) document.getElementById('sb-model').textContent = d.model;
   if (d.turn !== undefined && d.turn !== null) document.getElementById('sb-turn').textContent = 'T' + d.turn;
   if (d.budget_pct !== undefined && d.budget_pct !== null) {
-    const fill = document.getElementById('sb-budget-fill');
-    const label = document.getElementById('sb-budget-pct');
-    const pct = d.budget_pct;
-    fill.style.width = Math.min(pct, 100) + '%';
-    const color = pct < 50 ? '#a6e3a1' : pct < 85 ? '#f9e2af' : '#f38ba8';
-    fill.style.background = color;
-    label.textContent = pct.toFixed(1) + '%';
-    label.style.color = color;
+    setContextUsagePct(d.budget_pct);
   }
   if (d.autonomy) {
     const el = document.getElementById('sb-autonomy');
@@ -12874,6 +12924,7 @@ function switchTab(tabId) {
 // lose their place when the page auto-refreshes.
 let activeActivitySubtab = 'log';
 let latestContextSnapshot = null;
+const contextSnapshotsBySession = new Map();
 
 function contextValueText(value) {
   if (value === null || value === undefined) return '--';
@@ -12918,8 +12969,20 @@ function highlightJson(jsonText) {
 }
 
 function handleContextSnapshot(snapshot) {
-  latestContextSnapshot = snapshot;
+  const sid = snapshot && String(snapshot.session_id || '').trim();
+  if (sid) {
+    contextSnapshotsBySession.set(sid, snapshot);
+  } else {
+    latestContextSnapshot = snapshot;
+  }
   renderContextPane();
+}
+
+function contextSnapshotForForegroundSession() {
+  const sid = resolvePromptTargetSessionId();
+  if (sid && contextSnapshotsBySession.has(sid)) return contextSnapshotsBySession.get(sid);
+  if (sid && contextSnapshotsBySession.size > 0) return null;
+  return latestContextSnapshot;
 }
 
 function renderContextPane() {
@@ -12929,7 +12992,8 @@ function renderContextPane() {
     const el = document.getElementById(id);
     if (el) el.textContent = contextValueText(value);
   };
-  if (!latestContextSnapshot) {
+  const snapshot = contextSnapshotForForegroundSession();
+  if (!snapshot) {
     set('context-source', '--');
     set('context-turn', '--');
     set('context-items', '--');
@@ -12938,7 +13002,7 @@ function renderContextPane() {
     rawEl.innerHTML = '<span class="json-null">No context snapshot yet</span>';
     return;
   }
-  const d = latestContextSnapshot;
+  const d = snapshot;
   set('context-source', d.label || d.source || 'model');
   set('context-turn', d.turn);
   set('context-items', d.item_count);

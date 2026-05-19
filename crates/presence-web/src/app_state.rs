@@ -70,6 +70,8 @@ pub enum UiCommand {
     HideHumanInput,
     HideAllPanels,
     UpdateUsage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         main_json: Option<String>,
         presence_json: Option<String>,
         live_json: Option<String>,
@@ -742,6 +744,7 @@ pub struct AppState {
 
     // Usage
     main_usage: Option<UsageSnapshot>,
+    session_main_usage: std::collections::HashMap<String, UsageSnapshot>,
     presence_usage: Option<UsageSnapshot>,
     live_usage: Option<LiveUsageSnapshot>,
     token_history: Vec<TokenHistoryEntry>,
@@ -783,6 +786,7 @@ impl AppState {
             replay_ts: None,
             event_session_id: None,
             main_usage: None,
+            session_main_usage: std::collections::HashMap::new(),
             presence_usage: None,
             live_usage: None,
             token_history: Vec::new(),
@@ -808,8 +812,24 @@ impl AppState {
     }
 
     /// Select which agent session should drive session-scoped UI updates.
-    pub fn select_session(&mut self, session_id: &str) {
+    pub fn select_session(&mut self, session_id: &str) -> Vec<UiCommand> {
         self.session_id = session_id.to_string();
+        let mut cmds = Vec::new();
+        if let Some(usage) = self.session_main_usage.get(session_id).cloned() {
+            self.budget_pct = usage.usage_pct;
+            self.main_usage = Some(usage.clone());
+            cmds.push(UiCommand::UpdateStatusBar {
+                provider: None,
+                model: None,
+                turn: None,
+                budget_pct: Some(usage.usage_pct),
+                autonomy: None,
+                session_id: None,
+                external_agent: None,
+            });
+        }
+        cmds.push(self.build_usage_command_for_session(Some(session_id)));
+        cmds
     }
 
     /// Change verbosity and return commands to re-filter visible logs.
@@ -1669,16 +1689,9 @@ impl AppState {
             "usage" | "usage_update" => {
                 if let Some(main) = msg.get("main") {
                     if let Ok(u) = serde_json::from_value::<UsageSnapshot>(main.clone()) {
-                        self.budget_pct = u.usage_pct;
-                        cmds.push(UiCommand::UpdateStatusBar {
-                            provider: None,
-                            model: None,
-                            turn: None,
-                            budget_pct: Some(u.usage_pct),
-                            autonomy: None,
-                            session_id: None,
-                            external_agent: None,
-                        });
+                        if let Some(sid) = self.event_session_id.clone() {
+                            self.session_main_usage.insert(sid, u.clone());
+                        }
                         cmds.extend(self.add_log(
                             "detail",
                             &format!(
@@ -1690,7 +1703,19 @@ impl AppState {
                             None,
                             "system",
                         ));
-                        self.main_usage = Some(u);
+                        if current_session_event {
+                            self.budget_pct = u.usage_pct;
+                            cmds.push(UiCommand::UpdateStatusBar {
+                                provider: None,
+                                model: None,
+                                turn: None,
+                                budget_pct: Some(u.usage_pct),
+                                autonomy: None,
+                                session_id: self.event_session_id.clone(),
+                                external_agent: None,
+                            });
+                            self.main_usage = Some(u);
+                        }
                     }
                 }
                 if let Some(presence) = msg.get("presence") {
@@ -1698,7 +1723,7 @@ impl AppState {
                         self.presence_usage = Some(u);
                     }
                 }
-                cmds.push(self.build_usage_command());
+                cmds.push(self.build_usage_command_for_session(self.event_session_id.as_deref()));
             }
 
             "display_ready" => {
@@ -2268,10 +2293,15 @@ impl AppState {
 
     /// Build an UpdateUsage command from current state.
     fn build_usage_command(&self) -> UiCommand {
-        let main_json = self
-            .main_usage
-            .as_ref()
-            .and_then(|u| serde_json::to_string(u).ok());
+        let selected_session = (!self.session_id.is_empty()).then_some(self.session_id.as_str());
+        self.build_usage_command_for_session(selected_session)
+    }
+
+    fn build_usage_command_for_session(&self, session_id: Option<&str>) -> UiCommand {
+        let selected_main = session_id
+            .and_then(|sid| self.session_main_usage.get(sid))
+            .or(self.main_usage.as_ref());
+        let main_json = selected_main.and_then(|u| serde_json::to_string(u).ok());
         let presence_json = self
             .presence_usage
             .as_ref()
@@ -2284,7 +2314,7 @@ impl AppState {
         // Cost calculation
         let cost_json = {
             let mut summary = CostSummary::default();
-            if let Some(ref u) = self.main_usage {
+            if let Some(u) = selected_main {
                 if let Some(pricing) = find_pricing(&u.model) {
                     let cost = calculate_cost(
                         u.prompt_tokens,
@@ -2348,6 +2378,7 @@ impl AppState {
         };
 
         UiCommand::UpdateUsage {
+            session_id: session_id.map(str::to_string),
             main_json,
             presence_json,
             live_json,
@@ -2915,6 +2946,85 @@ mod tests {
             UiCommand::AddLogEntry { session_id, content, .. }
                 if session_id.as_deref() == Some("sess-b")
                     && content == "Turn 8 started"
+        )));
+    }
+
+    #[test]
+    fn session_scoped_usage_updates_selected_session_status_only() {
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        let msg = json!({
+            "event": "usage_update",
+            "session_id": "sess-a",
+            "main": {
+                "provider": "openai",
+                "model": "gpt-5",
+                "tokens_used": 1250,
+                "context_window": 10000,
+                "usage_pct": 12.5,
+                "prompt_tokens": 1000,
+                "completion_tokens": 250,
+                "cached_tokens": 100
+            }
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.budget_pct, 12.5);
+        assert_eq!(s.main_usage.as_ref().unwrap().tokens_used, 1250);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateStatusBar { budget_pct: Some(pct), session_id, .. }
+                if (*pct - 12.5).abs() < f64::EPSILON
+                    && session_id.as_deref() == Some("sess-a")
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateUsage { session_id, main_json: Some(_), .. }
+                if session_id.as_deref() == Some("sess-a")
+        )));
+    }
+
+    #[test]
+    fn session_scoped_background_usage_is_cached_without_overwriting_status() {
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        s.main_usage = Some(UsageSnapshot {
+            tokens_used: 500,
+            usage_pct: 5.0,
+            ..Default::default()
+        });
+        s.budget_pct = 5.0;
+        let msg = json!({
+            "event": "usage_update",
+            "session_id": "sess-b",
+            "main": {
+                "provider": "openai",
+                "model": "gpt-5",
+                "tokens_used": 4000,
+                "context_window": 10000,
+                "usage_pct": 40.0,
+                "prompt_tokens": 3000,
+                "completion_tokens": 1000,
+                "cached_tokens": 0
+            }
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.session_id, "sess-a");
+        assert_eq!(s.budget_pct, 5.0);
+        assert_eq!(s.main_usage.as_ref().unwrap().tokens_used, 500);
+        assert_eq!(s.session_main_usage["sess-b"].tokens_used, 4000);
+        assert!(!cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::UpdateStatusBar { budget_pct: Some(pct), .. }
+                    if (*pct - 40.0).abs() < f64::EPSILON
+            )
+        }));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateUsage { session_id, main_json: Some(_), .. }
+                if session_id.as_deref() == Some("sess-b")
         )));
     }
 

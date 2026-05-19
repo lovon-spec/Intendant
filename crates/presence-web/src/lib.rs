@@ -993,8 +993,9 @@ mod wasm_impl {
 
         /// Select the session whose scoped events should update global UI state.
         #[wasm_bindgen]
-        pub fn select_session(&self, session_id: &str) {
-            self.dashboard.borrow_mut().select_session(session_id);
+        pub fn select_session(&self, session_id: &str) -> JsValue {
+            let cmds = self.dashboard.borrow_mut().select_session(session_id);
+            to_js(&cmds)
         }
 
         /// Approve/skip/deny/approve_all a pending action.

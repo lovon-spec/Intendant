@@ -1109,6 +1109,7 @@ impl App {
             }
             ControlMsg::Usage => {
                 self.broadcast_control(OutboundEvent::Usage {
+                    session_id: Some(self.session_id.clone()).filter(|s| !s.is_empty()),
                     main: self.main_usage_snapshot(),
                     presence: self.presence_usage_snapshot(),
                 });
@@ -1737,6 +1738,7 @@ impl App {
                 self.session_cached_tokens += usage.cached_tokens;
                 // Emit usage snapshot so external consumers (web UI) get updated
                 derived.push(AppEvent::UsageSnapshot {
+                    session_id: Some(self.session_id.clone()).filter(|s| !s.is_empty()),
                     main: self.main_usage_snapshot(),
                     presence: self.presence_usage_snapshot(),
                 });
@@ -2140,6 +2142,7 @@ impl App {
                     self.presence_model_name = Some(model);
                 }
                 derived.push(AppEvent::UsageSnapshot {
+                    session_id: Some(self.session_id.clone()).filter(|s| !s.is_empty()),
                     main: self.main_usage_snapshot(),
                     presence: self.presence_usage_snapshot(),
                 });

@@ -300,16 +300,22 @@ pub enum OutboundEvent {
         message: String,
     },
     Usage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         main: crate::frontend::ModelUsageSnapshot,
         #[serde(skip_serializing_if = "Option::is_none")]
         presence: Option<crate::frontend::ModelUsageSnapshot>,
     },
     UsageUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         main: crate::frontend::ModelUsageSnapshot,
         #[serde(skip_serializing_if = "Option::is_none")]
         presence: Option<crate::frontend::ModelUsageSnapshot>,
     },
     ContextSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         source: String,
         label: String,
         #[serde(skip_serializing_if = "Option::is_none")]

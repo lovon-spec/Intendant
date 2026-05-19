@@ -2384,6 +2384,7 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
             Some(AppEvent::ContextSnapshot {
+                session_id: None,
                 source,
                 label,
                 turn,
@@ -3465,6 +3466,7 @@ mod tests {
 
         match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
             crate::event::AppEvent::ContextSnapshot {
+                session_id: _,
                 source,
                 label,
                 turn,

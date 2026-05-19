@@ -457,11 +457,13 @@ pub enum AppEvent {
 
     /// Computed usage snapshot (emitted by TUI after accumulating tokens).
     UsageSnapshot {
+        session_id: Option<String>,
         main: crate::frontend::ModelUsageSnapshot,
         presence: Option<crate::frontend::ModelUsageSnapshot>,
     },
     /// Parsed, otherwise raw model-context snapshot for dashboard inspection.
     ContextSnapshot {
+        session_id: Option<String>,
         source: String,
         label: String,
         turn: Option<usize>,
@@ -1433,11 +1435,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             total_tokens: *total_tokens,
             thinking_tokens: *thinking_tokens,
         }),
-        AppEvent::UsageSnapshot { main, presence } => Some(OutboundEvent::UsageUpdate {
+        AppEvent::UsageSnapshot {
+            session_id,
+            main,
+            presence,
+        } => Some(OutboundEvent::UsageUpdate {
+            session_id: session_id.clone(),
             main: main.clone(),
             presence: presence.clone(),
         }),
         AppEvent::ContextSnapshot {
+            session_id,
             source,
             label,
             turn,
@@ -1447,6 +1455,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             item_count,
             raw,
         } => Some(OutboundEvent::ContextSnapshot {
+            session_id: session_id.clone(),
             source: source.clone(),
             label: label.clone(),
             turn: *turn,
@@ -1898,6 +1907,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.live_usage_update(provider, model, *total_tokens);
         }
         AppEvent::ContextSnapshot {
+            session_id: _,
             source,
             label,
             turn,
@@ -2970,6 +2980,7 @@ mod tests {
     #[test]
     fn outbound_context_snapshot() {
         let event = AppEvent::ContextSnapshot {
+            session_id: Some("sess-ctx".to_string()),
             source: "codex".to_string(),
             label: "Codex thread".to_string(),
             turn: Some(3),
@@ -2982,6 +2993,7 @@ mod tests {
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"context_snapshot\""));
+        assert!(json.contains("\"session_id\":\"sess-ctx\""));
         assert!(json.contains("\"source\":\"codex\""));
         assert!(json.contains("\"raw\""));
     }

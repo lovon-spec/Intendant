@@ -28,7 +28,7 @@ export const presenceweb_release_display_input_authority: (a: number, b: number)
 export const presenceweb_request_display_input_authority: (a: number, b: number) => void;
 export const presenceweb_revoke_user_display: (a: number) => void;
 export const presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
-export const presenceweb_select_session: (a: number, b: number, c: number) => void;
+export const presenceweb_select_session: (a: number, b: number, c: number) => any;
 export const presenceweb_send_approval: (a: number, b: number, c: number) => any;
 export const presenceweb_send_audio: (a: number, b: number, c: number) => void;
 export const presenceweb_send_follow_up: (a: number, b: number, c: number, d: number) => any;

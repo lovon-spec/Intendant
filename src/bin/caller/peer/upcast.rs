@@ -898,7 +898,7 @@ impl AppEventUpcaster {
                 },
             }],
 
-            AppEvent::UsageSnapshot { main, presence: _ } => vec![PeerEvent::Usage {
+            AppEvent::UsageSnapshot { main, .. } => vec![PeerEvent::Usage {
                 snapshot: UsageSnapshot {
                     tokens_in: main.prompt_tokens,
                     tokens_out: main.completion_tokens,
@@ -1831,22 +1831,23 @@ impl WireEventUpcaster {
                 },
             }],
 
-            OutboundEvent::Usage { main, presence: _ }
-            | OutboundEvent::UsageUpdate { main, presence: _ } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: main.prompt_tokens,
-                    tokens_out: main.completion_tokens,
-                    tokens_cached: main.cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![ModelUsage {
-                        provider: main.provider.clone(),
-                        model: main.model.clone(),
+            OutboundEvent::Usage { main, .. } | OutboundEvent::UsageUpdate { main, .. } => {
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
                         tokens_in: main.prompt_tokens,
                         tokens_out: main.completion_tokens,
+                        tokens_cached: main.cached_tokens,
                         cost_usd: None,
-                    }],
-                },
-            }],
+                        by_model: vec![ModelUsage {
+                            provider: main.provider.clone(),
+                            model: main.model.clone(),
+                            tokens_in: main.prompt_tokens,
+                            tokens_out: main.completion_tokens,
+                            cost_usd: None,
+                        }],
+                    },
+                }]
+            }
 
             // ---- Status ----
             OutboundEvent::Status { phase, .. } => {

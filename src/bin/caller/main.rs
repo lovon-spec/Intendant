@@ -712,6 +712,7 @@ async fn emit_external_context_snapshot_if_changed(
             state.last_key = Some(key);
             state.last_error = None;
             config.bus.send(AppEvent::ContextSnapshot {
+                session_id: config.session_id.clone(),
                 source: snapshot.source,
                 label: snapshot.label,
                 turn,
@@ -1017,6 +1018,7 @@ async fn drain_external_agent_events(
                 stats.usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
                 stats.usage.cached_tokens = usage.cached_tokens;
                 config.bus.send(AppEvent::UsageSnapshot {
+                    session_id: config.session_id.clone(),
                     main: frontend::ModelUsageSnapshot {
                         provider: usage.provider,
                         model: usage.model,
@@ -4190,6 +4192,7 @@ async fn run_agent_loop(
         match provider.request_snapshot(conversation.messages(), true) {
             Ok((context_format, raw_context)) => {
                 bus.send(AppEvent::ContextSnapshot {
+                    session_id: local_session_id.clone(),
                     source: "native".to_string(),
                     label: "Internal agent request payload".to_string(),
                     turn: Some(turn),

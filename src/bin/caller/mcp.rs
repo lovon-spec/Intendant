@@ -996,6 +996,7 @@ async fn handle_control_command_mcp(
             if let Some(tx) = control_tx {
                 let s = state.read().await;
                 let event = OutboundEvent::Usage {
+                    session_id: None,
                     main: s.usage_snapshot().main,
                     presence: s.usage_snapshot().presence,
                 };
