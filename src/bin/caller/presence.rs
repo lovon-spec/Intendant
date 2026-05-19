@@ -1396,6 +1396,7 @@ mod tests {
             stdout: "hello".to_string(),
             stderr: String::new(),
             source: None,
+            output_id: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
 
@@ -1494,6 +1495,7 @@ mod tests {
                 stdout: "hello world".to_string(),
                 stderr: String::new(),
                 source: None,
+                output_id: None,
             },
             &state,
         );

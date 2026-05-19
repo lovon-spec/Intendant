@@ -176,6 +176,7 @@ mod tests {
             stdout: "hello".to_string(),
             stderr: "".to_string(),
             source: None,
+            output_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));

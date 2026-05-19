@@ -10,7 +10,20 @@ use crate::types::LogLevel;
 use crossterm::event::KeyEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_AGENT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_agent_output_id() -> String {
+    let seq = NEXT_AGENT_OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    format!("ao-{millis:x}-{seq:x}")
+}
 
 /// Source of a context injection item.
 ///
@@ -140,6 +153,7 @@ pub enum AppEvent {
         stdout: String,
         stderr: String,
         source: Option<String>,
+        output_id: Option<String>,
     },
     SubAgentResult {
         formatted: String,
@@ -1211,11 +1225,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             stdout,
             stderr,
             source,
+            output_id,
         } => Some(OutboundEvent::AgentOutput {
             session_id: session_id.clone(),
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             source: source.clone(),
+            output_id: output_id.clone(),
         }),
         AppEvent::DoneSignal { message } => Some(OutboundEvent::DoneSignal {
             message: message.clone(),
@@ -1924,16 +1940,6 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.live_audio_completed(id, status, *quarantine_count);
         }
 
-        // External agent paths emit these AppEvents without inline slog()
-        // calls, so the EventBus writer is the only path to disk.
-        AppEvent::AgentOutput {
-            stdout,
-            stderr,
-            source,
-            ..
-        } => {
-            log.agent_output(stdout, stderr, source.as_deref());
-        }
         AppEvent::ModelResponse {
             content,
             usage,
@@ -2005,7 +2011,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
 
         // ---- Events already logged inline by the agent loop or web_gateway ----
-        // turn_start, model_response, agent_input, approval decisions,
+        // turn_start, model_response, agent_input/output, approval decisions,
         // json_extracted, reasoning, budget warnings, loop errors, context
         // management, voice_log, voice_diagnostic, presence_connected/disconnected,
         // presence_checkpoint, user_transcript — all have slog() calls at their
@@ -2929,11 +2935,36 @@ mod tests {
             stdout: "hello".to_string(),
             stderr: "".to_string(),
             source: None,
+            output_id: None,
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));
         assert!(json.contains("\"hello\""));
+    }
+
+    #[test]
+    fn session_log_writer_skips_agent_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        write_event_to_session_log(
+            &shared,
+            &AppEvent::AgentOutput {
+                session_id: None,
+                stdout: "already logged inline".to_string(),
+                stderr: String::new(),
+                source: Some("Codex".to_string()),
+                output_id: Some("out-1".to_string()),
+            },
+        );
+        drop(shared);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        assert!(!contents.contains("\"event\":\"agent_output\""));
+        assert!(!contents.contains("already logged inline"));
     }
 
     #[test]

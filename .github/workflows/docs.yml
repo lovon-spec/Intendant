@@ -3,6 +3,15 @@ name: Deploy docs
 on:
   push:
     branches: [main]
+    # The published mdBook is only docs/src + book.toml. Without this filter
+    # every push to main redeployed a byte-identical Pages artifact (~9 of
+    # every 10 pushes touch no book sources). Mirrors audit.yml's scoping.
+    paths:
+      - "docs/src/**"
+      - "docs/book.toml"
+      - ".github/workflows/docs.yml"
+  # Manual escape hatch: redeploy without faking a docs commit.
+  workflow_dispatch:
 
 permissions:
   contents: read

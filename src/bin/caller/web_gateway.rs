@@ -1291,6 +1291,201 @@ fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
     )
 }
 
+fn agent_output_chunks_with_fallback(
+    primary_log_dir: &Path,
+    ids: &[String],
+    fallback_logs_dir: Option<&Path>,
+) -> Vec<crate::session_log::AgentOutputChunk> {
+    let mut found: HashMap<String, crate::session_log::AgentOutputChunk> = HashMap::new();
+
+    for chunk in crate::session_log::agent_output_chunks_by_id(primary_log_dir, ids) {
+        found.entry(chunk.output_id.clone()).or_insert(chunk);
+    }
+
+    if found.len() < ids.len() {
+        if let Some(logs_dir) = fallback_logs_dir {
+            let mut dirs = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(logs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir()
+                        && path.join("session.jsonl").is_file()
+                        && !same_path(&path, primary_log_dir)
+                    {
+                        dirs.push(path);
+                    }
+                }
+            }
+            dirs.sort_by(|a, b| session_log_mtime(b).cmp(&session_log_mtime(a)));
+
+            for dir in dirs {
+                let missing: Vec<String> = ids
+                    .iter()
+                    .filter(|id| !found.contains_key(id.as_str()))
+                    .cloned()
+                    .collect();
+                if missing.is_empty() {
+                    break;
+                }
+                for chunk in crate::session_log::agent_output_chunks_by_id(&dir, &missing) {
+                    found.entry(chunk.output_id.clone()).or_insert(chunk);
+                }
+            }
+        }
+    }
+
+    ids.iter().filter_map(|id| found.remove(id)).collect()
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn session_log_mtime(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path.join("session.jsonl"))
+        .or_else(|_| std::fs::metadata(path))
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+fn current_agent_output_response(request_line: &str, log_dir: &Path) -> String {
+    let ids_param = query_param(request_line, "ids").unwrap_or_default();
+    let ids: Vec<String> = ids_param
+        .split(',')
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+        })
+        .map(str::to_string)
+        .collect();
+    if ids.is_empty() {
+        return upload_error_response("400 Bad Request", "missing output ids");
+    }
+
+    let fallback_logs_dir = std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".intendant").join("logs"));
+    let chunks = agent_output_chunks_with_fallback(log_dir, &ids, fallback_logs_dir.as_deref());
+    let found: HashSet<&str> = chunks
+        .iter()
+        .map(|chunk| chunk.output_id.as_str())
+        .collect();
+    let missing: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !found.contains(id))
+        .collect();
+    let body = serde_json::json!({
+        "outputs": chunks,
+        "missing": missing,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    )
+}
+
+fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.contains('/') {
+        let dir = PathBuf::from(session_id);
+        return dir.is_dir().then_some(dir);
+    }
+
+    let logs_dir = home.join(".intendant").join("logs");
+    let direct = logs_dir.join(session_id);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(session_id) {
+            return Some(path);
+        }
+        let meta_path = path.join("session_meta.json");
+        let Ok(meta_str) = std::fs::read_to_string(meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else {
+            continue;
+        };
+        let Some(meta_id) = meta.get("session_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if meta_id == session_id || meta_id.starts_with(session_id) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn resume_session_activity_replay(
+    source: &str,
+    session_id: &str,
+    resume_id: Option<&str>,
+    task: Option<&str>,
+    limit: usize,
+) -> Option<String> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    resume_session_activity_replay_from_home(&home, source, session_id, resume_id, task, limit)
+}
+
+fn resume_session_activity_replay_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    resume_id: Option<&str>,
+    task: Option<&str>,
+    limit: usize,
+) -> Option<String> {
+    if task.map(str::trim).is_some_and(|task| !task.is_empty()) {
+        return None;
+    }
+
+    let source_norm = source.trim().to_lowercase();
+    if source_norm == "intendant" {
+        let log_dir = intendant_session_dir_from_home(home, session_id)?;
+        return session_log_replay_from_dir(&log_dir);
+    }
+
+    let replay_id = resume_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(session_id);
+    external_session_activity_replay_from_home_with_attach(
+        home,
+        &source_norm,
+        replay_id,
+        limit,
+        false,
+    )
+}
+
 /// Compute a short content hash for cache-busting embedded static assets.
 /// When the WASM or JS changes (i.e. a new build), the hash changes,
 /// the URL changes, and browsers fetch the new version.
@@ -2690,6 +2885,16 @@ fn external_session_activity_replay_from_home(
     session_id: &str,
     limit: usize,
 ) -> Option<String> {
+    external_session_activity_replay_from_home_with_attach(home, source, session_id, limit, true)
+}
+
+fn external_session_activity_replay_from_home_with_attach(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    limit: usize,
+    include_attached: bool,
+) -> Option<String> {
     let mut transcript = external_session_entries_from_home(home, source, session_id)?;
     if limit > 0 && transcript.len() > limit {
         transcript = transcript.split_off(transcript.len() - limit);
@@ -2697,11 +2902,13 @@ fn external_session_activity_replay_from_home(
 
     let mut entries = Vec::with_capacity(transcript.len() + 2);
     entries.push(serde_json::json!({ "event": "replay_start" }));
-    entries.push(serde_json::json!({
-        "event": "session_attached",
-        "session_id": session_id,
-        "source": source,
-    }));
+    if include_attached {
+        entries.push(serde_json::json!({
+            "event": "session_attached",
+            "session_id": session_id,
+            "source": source,
+        }));
+    }
 
     for entry in transcript {
         let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -6979,6 +7186,38 @@ pub fn spawn_web_gateway(
                                                         }
                                                     }
                                                 }
+                                                Ok(ctrl @ ControlMsg::ResumeSession { .. }) => {
+                                                    if let ControlMsg::ResumeSession {
+                                                        source,
+                                                        session_id,
+                                                        resume_id,
+                                                        task,
+                                                        ..
+                                                    } = &ctrl
+                                                    {
+                                                        if let Some(replay) =
+                                                            resume_session_activity_replay(
+                                                                source,
+                                                                session_id,
+                                                                resume_id.as_deref(),
+                                                                task.as_deref(),
+                                                                EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+                                                            )
+                                                        {
+                                                            let _ = direct_tx_inbound.send(replay);
+                                                        }
+                                                    }
+                                                    bus_inbound.send(AppEvent::PresenceLog {
+                                                        message: format!(
+                                                            "[ws] ControlMsg: {:?}",
+                                                            ctrl
+                                                        ),
+                                                        level: Some(LogLevel::Debug),
+                                                        turn: None,
+                                                    });
+                                                    bus_inbound
+                                                        .send(AppEvent::ControlCommand(ctrl));
+                                                }
                                                 Ok(ctrl) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!(
@@ -7922,6 +8161,23 @@ pub fn spawn_web_gateway(
                             body.len(),
                             body
                         );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/session/current/agent-output")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let log_dir = if let Some(ref slog) = session_log {
+                            match slog.lock() {
+                                Ok(l) => Some(l.dir().to_path_buf()),
+                                Err(_) => None,
+                            }
+                        } else {
+                            query_ctx.as_ref().map(|ctx| ctx.log_dir.clone())
+                        };
+                        let response = match log_dir {
+                            Some(dir) => current_agent_output_response(&request_line, &dir),
+                            None => upload_error_response("404 Not Found", "no active session log"),
+                        };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
                         && request_line.contains(" /api/session/current/uploads")
@@ -11585,6 +11841,100 @@ mod tests {
     }
 
     #[test]
+    fn resume_session_open_replays_external_transcript_without_attach_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-e756-7461-9946-34b639448717";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Open this from Sessions" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            session_id,
+            None,
+            None,
+            80,
+        )
+        .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        assert_eq!(entries[0]["event"], "replay_start");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["event"] != "session_attached"),
+            "Sessions-tab open replay should let the live attach event render the attach line"
+        );
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry" && entry["content"] == "Open this from Sessions"
+        }));
+    }
+
+    #[test]
+    fn resume_session_open_does_not_replay_when_task_is_submitted() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            "session-1",
+            None,
+            Some("continue the task"),
+            80,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn resume_session_open_replays_intendant_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join(".intendant").join("logs").join("session-1");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.model_response("internal history", 0, 0, 0, 0, None);
+        drop(log);
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "intendant",
+            "session-1",
+            None,
+            None,
+            80,
+        )
+        .expect("intendant session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+
+        assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["event"] == "model_response" && entry["summary"] == "internal history"
+        }));
+    }
+
+    #[test]
     fn external_attached_session_cache_ignores_internal_sessions() {
         assert_eq!(
             external_attached_session_from_wire(
@@ -12234,6 +12584,34 @@ mod tests {
         assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
             entry["event"] == "model_response" && entry["summary"] == "still here after refresh"
         }));
+    }
+
+    #[test]
+    fn agent_output_chunks_falls_back_to_other_logs_by_output_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_dir = dir.path().join("logs");
+        let primary_dir = logs_dir.join("primary");
+        let fallback_dir = logs_dir.join("fallback");
+
+        let mut primary = crate::session_log::SessionLog::open(primary_dir.clone()).unwrap();
+        primary.agent_output_with_id("primary output", "", Some("Codex"), Some("primary-out"));
+        drop(primary);
+
+        let mut fallback = crate::session_log::SessionLog::open(fallback_dir.clone()).unwrap();
+        fallback.agent_output_with_id("fallback output", "", Some("Codex"), Some("fallback-out"));
+        drop(fallback);
+
+        let chunks = agent_output_chunks_with_fallback(
+            &primary_dir,
+            &["fallback-out".to_string(), "primary-out".to_string()],
+            Some(&logs_dir),
+        );
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].output_id, "fallback-out");
+        assert_eq!(chunks[0].stdout, "fallback output");
+        assert_eq!(chunks[1].output_id, "primary-out");
+        assert_eq!(chunks[1].stdout, "primary output");
     }
 
     #[test]

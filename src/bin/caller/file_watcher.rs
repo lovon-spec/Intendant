@@ -110,8 +110,12 @@ pub struct PruneResult {
 /// abandoned branches (oldest first).
 const SNAPSHOT_DIR_SOFT_CAP_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Per-file size cap for tracked snapshots. Mirrors the watcher's baseline cap.
-const SNAPSHOT_MAX_FILE_BYTES: u64 = 100_000;
+/// Per-file size cap for tracked snapshots.
+///
+/// Keep this aligned for initial baselines and live change events. If the
+/// initial scan skips a file that the live watcher later accepts, an atomic
+/// rewrite can look like a brand-new file and report the whole file as added.
+const SNAPSHOT_MAX_FILE_BYTES: u64 = 1_000_000;
 
 // ---------------------------------------------------------------------------
 // Ignore filter
@@ -463,12 +467,17 @@ impl FileWatcher {
             return;
         }
 
+        let known_file = self.baselines.contains_key(&rel) || self.hashes.contains_key(&rel);
         let change_kind = match kind {
             notify::EventKind::Create(_) => {
                 if !abs_path.is_file() {
                     return;
                 }
-                FileChangeKind::Created
+                if known_file {
+                    FileChangeKind::Modified
+                } else {
+                    FileChangeKind::Created
+                }
             }
             notify::EventKind::Modify(_) => {
                 if !abs_path.is_file() {
@@ -487,8 +496,8 @@ impl FileWatcher {
                     Err(_) => return, // file gone or permission denied
                 };
 
-                // Skip binary files or files >1MB.
-                if content.len() > 1_000_000 || is_binary(&content) {
+                // Skip binary files or oversized files.
+                if content.len() as u64 > SNAPSHOT_MAX_FILE_BYTES || is_binary(&content) {
                     return;
                 }
 
@@ -1190,6 +1199,51 @@ mod tests {
 
         let baseline = snap.path().join("baseline").join("src").join("main.rs");
         assert_eq!(std::fs::read_to_string(baseline).unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn large_existing_file_is_baselined_for_create_like_rewrites() {
+        let root = TempDir::new().unwrap();
+        let snap = TempDir::new().unwrap();
+        let src_dir = root.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let file_path = src_dir.join("large.rs");
+        let baseline = (0..20_000)
+            .map(|n| format!("let value_{n} = {n};\n"))
+            .collect::<String>();
+        assert!(baseline.len() as u64 > 100_000);
+        assert!(baseline.len() as u64 <= SNAPSHOT_MAX_FILE_BYTES);
+        std::fs::write(&file_path, &baseline).unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut watcher =
+            FileWatcher::new(root.path().to_path_buf(), snap.path().to_path_buf(), bus)
+                .expect("watcher");
+
+        let baseline_path = snap.path().join("baseline").join("src").join("large.rs");
+        assert_eq!(std::fs::read_to_string(baseline_path).unwrap(), baseline);
+
+        std::fs::write(&file_path, format!("{baseline}let extra = 1;\n")).unwrap();
+        watcher.process_change(
+            &file_path,
+            &notify::EventKind::Create(notify::event::CreateKind::File),
+        );
+
+        match rx.try_recv().expect("file_changed event") {
+            AppEvent::FileChanged {
+                path,
+                kind,
+                lines_added,
+                lines_removed,
+            } => {
+                assert_eq!(path, "src/large.rs");
+                assert_eq!(kind, FileChangeKind::Modified);
+                assert_eq!(lines_added, 1);
+                assert_eq!(lines_removed, 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
