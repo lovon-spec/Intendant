@@ -1446,6 +1446,60 @@ fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<Path
     None
 }
 
+#[derive(Debug, Clone, Default)]
+struct ExternalSessionContext {
+    project_root: Option<String>,
+    cwd: Option<String>,
+}
+
+fn external_session_context_by_id(
+    sessions: &[serde_json::Value],
+) -> HashMap<String, ExternalSessionContext> {
+    let mut out = HashMap::new();
+    for session in sessions {
+        let context = ExternalSessionContext {
+            project_root: value_str(session, "project_root"),
+            cwd: value_str(session, "cwd"),
+        };
+        if context.project_root.is_none() && context.cwd.is_none() {
+            continue;
+        }
+        for key in [
+            value_str(session, "session_id"),
+            value_str(session, "resume_id"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.entry(key).or_insert_with(|| context.clone());
+        }
+    }
+    out
+}
+
+fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
+    if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
+        return clean_external_thread_id(thread_id);
+    }
+    if message.starts_with("Mode: external agent") {
+        if let Some((_, thread_id)) = message.rsplit_once("thread: ") {
+            return clean_external_thread_id(thread_id);
+        }
+    }
+    None
+}
+
+fn clean_external_thread_id(thread_id: &str) -> Option<String> {
+    let thread_id = thread_id
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | ';'));
+    if thread_id.is_empty() || thread_id.chars().any(char::is_whitespace) {
+        None
+    } else {
+        Some(thread_id.to_string())
+    }
+}
+
 fn resume_session_activity_replay(
     source: &str,
     session_id: &str,
@@ -3261,15 +3315,16 @@ fn list_sessions() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let home_path = PathBuf::from(&home);
     let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+    let mut external_sessions = Vec::new();
+    external_sessions.extend(list_codex_sessions(&home_path));
+    external_sessions.extend(list_claude_sessions(&home_path));
+    external_sessions.extend(list_gemini_sessions(&home_path));
     if !logs_dir.is_dir() {
-        let mut sessions = Vec::new();
-        sessions.extend(list_codex_sessions(&home_path));
-        sessions.extend(list_claude_sessions(&home_path));
-        sessions.extend(list_gemini_sessions(&home_path));
-        sort_sessions_newest_first(&mut sessions);
-        truncate_sessions_preserving_sources(&mut sessions);
-        return serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string());
+        sort_sessions_newest_first(&mut external_sessions);
+        truncate_sessions_preserving_sources(&mut external_sessions);
+        return serde_json::to_string(&external_sessions).unwrap_or_else(|_| "[]".to_string());
     }
+    let external_context_by_id = external_session_context_by_id(&external_sessions);
 
     let mut sessions: Vec<serde_json::Value> = Vec::new();
 
@@ -3293,6 +3348,7 @@ fn list_sessions() -> String {
         let mut task: Option<String> = None;
         let mut created_at: Option<String> = None;
         let mut project_root: Option<String> = None;
+        let mut cwd: Option<String> = None;
         let mut provider: Option<String> = None;
         let mut model: Option<String> = None;
         let mut status = "in_progress".to_string();
@@ -3302,6 +3358,7 @@ fn list_sessions() -> String {
         let mut completion_tokens: u64 = 0;
         let mut cached_tokens: u64 = 0;
         let mut role: Option<String> = None;
+        let mut external_resume_id: Option<String> = None;
         let mut updated_at_secs = file_mtime_secs(&dir);
 
         if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
@@ -3361,6 +3418,8 @@ fn list_sessions() -> String {
                             model = Some(message.trim_start_matches("Model: ").to_string());
                         } else if message.starts_with("Task: ") && task.is_none() {
                             task = Some(message.trim_start_matches("Task: ").to_string());
+                        } else if external_resume_id.is_none() {
+                            external_resume_id = external_agent_thread_id_from_message(message);
                         }
                     }
                     "turn_start" => {
@@ -3393,6 +3452,17 @@ fn list_sessions() -> String {
                         status = "interrupted".to_string();
                     }
                     _ => {}
+                }
+            }
+        }
+
+        if let Some(external_id) = external_resume_id.as_deref() {
+            if let Some(context) = external_context_by_id.get(external_id) {
+                if project_root.is_none() {
+                    project_root = context.project_root.clone();
+                }
+                if cwd.is_none() {
+                    cwd = context.cwd.clone().or_else(|| context.project_root.clone());
                 }
             }
         }
@@ -3556,7 +3626,7 @@ fn list_sessions() -> String {
             "turns_bytes": turns_bytes,
             "logs_bytes": logs_bytes,
             "total_bytes": total_bytes,
-            "cwd": project_root.clone(),
+            "cwd": cwd.or_else(|| project_root.clone()),
             "project_root": project_root,
             "path": dir.to_string_lossy().to_string(),
             "can_delete": true,
@@ -11439,6 +11509,46 @@ mod tests {
 
         assert_eq!(session["created_at"], "2026-05-17T10:00:00Z");
         assert_eq!(session["updated_at"], "2026-05-17T10:00:00Z");
+    }
+
+    #[test]
+    fn external_agent_thread_id_is_extracted_from_log_messages() {
+        assert_eq!(
+            external_agent_thread_id_from_message(
+                "External agent thread: 019e41de-e785-7581-85dd-8e74bb464c6c"
+            )
+            .as_deref(),
+            Some("019e41de-e785-7581-85dd-8e74bb464c6c")
+        );
+        assert_eq!(
+            external_agent_thread_id_from_message(
+                "Mode: external agent (Codex) via presence, thread: codex-session-1"
+            )
+            .as_deref(),
+            Some("codex-session-1")
+        );
+    }
+
+    #[test]
+    fn external_session_context_indexes_session_and_resume_ids() {
+        let sessions = vec![serde_json::json!({
+            "session_id": "display-id",
+            "resume_id": "resume-id",
+            "project_root": "/repo",
+            "cwd": "/repo/.worktrees/feature"
+        })];
+
+        let context = external_session_context_by_id(&sessions);
+        assert_eq!(
+            context
+                .get("display-id")
+                .and_then(|ctx| ctx.project_root.as_deref()),
+            Some("/repo")
+        );
+        assert_eq!(
+            context.get("resume-id").and_then(|ctx| ctx.cwd.as_deref()),
+            Some("/repo/.worktrees/feature")
+        );
     }
 
     #[test]
