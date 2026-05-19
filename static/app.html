@@ -2082,12 +2082,40 @@ html, body {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 16px;
+  flex-wrap: wrap;
 }
 .sessions-title {
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
+  flex-shrink: 0;
 }
+.sessions-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 240px;
+  max-width: 360px;
+  min-width: 180px;
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--overlay0);
+}
+.sessions-search input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.sessions-search input:focus { outline: none; border-color: var(--blue); }
+.sessions-search input::placeholder { color: var(--overlay0); }
 .sessions-new-task {
   display: flex;
   align-items: flex-start;
@@ -4325,6 +4353,11 @@ html, body {
   .log-entry .log-level { width: 44px; font-size: 10px; }
   .usage-card { min-width: unset; }
   .usage-cards { flex-direction: column; }
+  .sessions-header { align-items: stretch; }
+  .sessions-search { flex: 1 1 100%; max-width: none; margin-left: 0; }
+  .sessions-new-task { width: 100%; margin-left: 0; }
+  .sessions-new-task-input { flex: 1; width: auto; }
+  .sessions-filter, .sessions-sort { margin-left: 0; }
   .sessions-aggregate { flex-direction: column; }
   .sessions-aggregate .agg-card { min-width: unset; }
   .session-card .sc-meta { gap: 8px; }
@@ -4977,6 +5010,10 @@ html, body {
       <div class="sessions-container">
         <div class="sessions-header">
           <span class="sessions-title">Recent Sessions</span>
+          <label class="sessions-search" for="sessions-search">
+            Search
+            <input type="search" id="sessions-search" placeholder="ID, task, model, path..." autocomplete="off" spellcheck="false">
+          </label>
           <div class="sessions-new-task">
             <textarea id="new-session-input" class="sessions-new-task-input" rows="1" placeholder="New task..."></textarea>
             <button class="sessions-start-btn" onclick="startNewSession()">Start</button>
@@ -19075,13 +19112,20 @@ function loadSessions() {
 }
 
 function _refilterSessions() {
-  if (_cachedSessions.length > 0) {
+  if (sessionsLoaded) {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-list'));
   }
 }
 document.getElementById('filter-abandoned')?.addEventListener('change', _refilterSessions);
 document.getElementById('filter-idle')?.addEventListener('change', _refilterSessions);
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
+document.getElementById('sessions-search')?.addEventListener('input', _refilterSessions);
+document.getElementById('sessions-search')?.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Escape' || !ev.currentTarget.value) return;
+  ev.currentTarget.value = '';
+  _refilterSessions();
+  ev.stopPropagation();
+});
 
 function sessionDateSortValue(session, field) {
   const raw = session[field] || (field === 'updated_at' ? session.created_at : '');
@@ -19091,6 +19135,53 @@ function sessionDateSortValue(session, field) {
     : raw;
   const parsed = Date.parse(normalized);
   return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function sessionSearchQuery() {
+  return (document.getElementById('sessions-search')?.value || '').trim().toLowerCase();
+}
+
+function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
+  const totalBytes = session.total_bytes || 0;
+  const fields = [
+    session.session_id,
+    shortId,
+    session.resume_id,
+    session.task,
+    displayStatus,
+    session.status,
+    source,
+    source !== 'intendant' ? 'external' : '',
+    session.source_label,
+    prettyAgentName(source),
+    session.role,
+    isCurrent ? 'current' : '',
+    session.provider,
+    session.model,
+    session.created_at,
+    session.updated_at,
+    session.changed_at,
+    session.project_root,
+    session.cwd,
+    session.path,
+    session.turns != null ? `${session.turns} turns` : '',
+    session.recordings ? `${session.recordings} recordings` : '',
+    session.annotations ? `${session.annotations} annotations` : '',
+    session.clips ? `${session.clips} clips` : '',
+    totalBytes > 0 ? `${_fmtBytes(totalBytes)} size` : '',
+    session.total_tokens != null ? `${session.total_tokens} tokens` : '',
+    session.estimated_cost != null ? `$${Number(session.estimated_cost).toFixed(4)}` : '',
+  ];
+  return fields
+    .filter(v => v !== null && v !== undefined && v !== '')
+    .join(' ')
+    .toLowerCase();
+}
+
+function sessionMatchesSearch(session, query, displayStatus, source, shortId, isCurrent) {
+  if (!query) return true;
+  const haystack = sessionSearchText(session, displayStatus, source, shortId, isCurrent);
+  return query.split(/\s+/).every(term => haystack.includes(term));
 }
 
 function renderSessionsAggregate(sessions, el) {
@@ -19175,6 +19266,8 @@ function renderSessionsList(sessions, el) {
 
   const showAbandoned = document.getElementById('filter-abandoned')?.checked ?? true;
   const showIdle = document.getElementById('filter-idle')?.checked ?? true;
+  const query = sessionSearchQuery();
+  let visibleCount = 0;
 
   for (const s of sorted) {
     const source = s.source || 'intendant';
@@ -19191,6 +19284,9 @@ function renderSessionsList(sessions, el) {
     // Apply filters
     if (!showAbandoned && displayStatus === 'abandoned') continue;
     if (!showIdle && displayStatus === 'idle') continue;
+    if (!sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent)) continue;
+
+    visibleCount += 1;
 
     const card = document.createElement('div');
     card.className = 'session-card';
@@ -19438,6 +19534,15 @@ function renderSessionsList(sessions, el) {
     card.appendChild(meta);
     card.addEventListener('click', () => openSessionDetail(s));
     el.appendChild(card);
+  }
+
+  if (visibleCount === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = query
+      ? 'No sessions match your search'
+      : 'No sessions match the active filters';
+    el.appendChild(empty);
   }
 }
 
