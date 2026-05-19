@@ -6718,6 +6718,9 @@ function processCommands(cmds) {
   for (const c of cmds) {
     switch (c.cmd) {
       case 'add_log_entry': renderLogEntry(c); break;
+      case 'mark_activity_context_rewind':
+        markActivityContextRewind(c.session_id, c.user_turn_index, c.turns_removed);
+        break;
       case 'clear_logs': clearLogs({ clearSessionWindows: !processingLogReplay }); break;
       case 'add_turn_separator': renderTurnSeparator(c.turn); break;
       case 'update_status_bar': updateStatusBar(c); break;
@@ -9019,6 +9022,60 @@ function appendLogStateBadges(cnt, c) {
     wrap.appendChild(el);
   }
   cnt.appendChild(wrap);
+}
+
+function ensureLogStateBadge(cnt, cls, text, title) {
+  if (!cnt) return;
+  let wrap = cnt.querySelector(':scope > .log-state-badges');
+  if (!wrap) {
+    wrap = document.createElement('span');
+    wrap.className = 'log-state-badges';
+    cnt.appendChild(wrap);
+  }
+  if (wrap.querySelector('.log-state-badge.' + cls)) return;
+  const el = document.createElement('span');
+  el.className = 'log-state-badge ' + cls;
+  el.textContent = text;
+  if (title) el.title = title;
+  wrap.appendChild(el);
+}
+
+function markLogEntrySuperseded(entry) {
+  if (!entry || entry.classList.contains('rollback-marker')) return;
+  entry.classList.add('superseded');
+  entry.dataset.superseded = 'true';
+  entry.querySelectorAll('.log-edit-message').forEach(btn => btn.remove());
+  ensureLogStateBadge(entry.querySelector('.log-content'), 'overwritten', 'overwritten');
+}
+
+function markActivityContextRewind(sessionId, userTurnIndex, turnsRemoved) {
+  const sid = String(sessionId || '').trim();
+  const startTurn = Number(userTurnIndex || 0);
+  const turnCount = Number(turnsRemoved || 0);
+  if (!sid || !Number.isInteger(startTurn) || startTurn <= 0) return;
+  const endTurn = Number.isInteger(turnCount) && turnCount > 0
+    ? startTurn + turnCount - 1
+    : Number.MAX_SAFE_INTEGER;
+  const streams = [document.getElementById('log-stream')];
+  for (const win of sessionWindows.values()) {
+    if (win?.log) streams.push(win.log);
+  }
+  for (const stream of streams.filter(Boolean)) {
+    let inRewoundRegion = false;
+    const entries = Array.from(stream.querySelectorAll('.log-entry'));
+    for (const entry of entries) {
+      if (entry.dataset.sessionId !== sid) continue;
+      const turn = Number(entry.dataset.userTurnIndex || 0);
+      if (Number.isInteger(turn) && turn > 0) {
+        if (!inRewoundRegion && turn >= startTurn && turn <= endTurn) {
+          inRewoundRegion = true;
+        } else if (inRewoundRegion && turn > endTurn) {
+          break;
+        }
+      }
+      if (inRewoundRegion) markLogEntrySuperseded(entry);
+    }
+  }
 }
 
 function isEditableUserMessage(c) {

@@ -2239,6 +2239,7 @@ pub fn spawn_event_listener(
                     | AppEvent::ContextSnapshot { .. }
                     | AppEvent::StatusUpdate { .. }
                     | AppEvent::LogEntry { .. }
+                    | AppEvent::UserMessageRewind { .. }
                     | AppEvent::UserMessageLog { .. }
                     | AppEvent::ExternalAgentChanged { .. }
                     | AppEvent::AutonomyChanged { .. }

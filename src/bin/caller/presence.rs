@@ -1011,6 +1011,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::LiveUsageUpdate { .. }
         | AppEvent::StatusUpdate { .. }
         | AppEvent::LogEntry { .. }
+        | AppEvent::UserMessageRewind { .. }
         | AppEvent::UserMessageLog { .. }
         | AppEvent::ExternalAgentChanged { .. }
         | AppEvent::AutonomyChanged { .. }

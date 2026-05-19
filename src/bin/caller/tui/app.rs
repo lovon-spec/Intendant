@@ -2359,6 +2359,7 @@ impl App {
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::StatusUpdate { .. }
             | AppEvent::LogEntry { .. }
+            | AppEvent::UserMessageRewind { .. }
             | AppEvent::UserMessageLog { .. }
             | AppEvent::LiveUsageUpdate { .. }
             | AppEvent::DisplayMetrics { .. }

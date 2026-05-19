@@ -43,6 +43,12 @@ pub enum UiCommand {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
     },
+    MarkActivityContextRewind {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        user_turn_index: u32,
+        turns_removed: u32,
+    },
     ClearLogs,
     AddTurnSeparator {
         turn: u64,
@@ -1988,6 +1994,54 @@ impl AppState {
                 ));
             }
 
+            "user_message_rewind" => {
+                let session_id = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let user_turn_index = msg["user_turn_index"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+                let turns_removed = msg["turns_removed"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+                if user_turn_index > 0 && turns_removed > 0 {
+                    self.mark_log_buffer_rewound(
+                        session_id.as_deref(),
+                        user_turn_index,
+                        turns_removed,
+                    );
+                    cmds.push(UiCommand::MarkActivityContextRewind {
+                        session_id: session_id.clone(),
+                        user_turn_index,
+                        turns_removed,
+                    });
+                }
+                let content = if turns_removed == 1 {
+                    "Rewound 1 user turn; overwritten entries are no longer active context."
+                        .to_string()
+                } else {
+                    format!(
+                        "Rewound {turns_removed} user turns; overwritten entries are no longer active context."
+                    )
+                };
+                cmds.extend(self.add_log_with_metadata(
+                    "warn",
+                    &content,
+                    None,
+                    "system",
+                    Vec::new(),
+                    Some("rollback_marker"),
+                    None,
+                    None,
+                    false,
+                    None,
+                ));
+            }
+
             "file_changed" => {
                 let path = msg["path"].as_str().unwrap_or("").to_string();
                 let kind = msg["kind"].as_str().unwrap_or("modified").to_string();
@@ -2200,6 +2254,38 @@ impl AppState {
         self.replay_ts = None;
         self.event_session_id = None;
         cmds
+    }
+
+    fn mark_log_buffer_rewound(
+        &mut self,
+        session_id: Option<&str>,
+        user_turn_index: u32,
+        turns_removed: u32,
+    ) {
+        let end_turn = user_turn_index
+            .saturating_add(turns_removed)
+            .saturating_sub(1);
+        let mut in_rewound_region = false;
+        for entry in &mut self.log_buffer {
+            if let Some(sid) = session_id {
+                if entry.session_id.as_deref() != Some(sid) {
+                    continue;
+                }
+            }
+            if entry.kind.as_deref() == Some("rollback_marker") {
+                continue;
+            }
+            if let Some(turn) = entry.user_turn_index {
+                if !in_rewound_region && turn >= user_turn_index && turn <= end_turn {
+                    in_rewound_region = true;
+                } else if in_rewound_region && turn > end_turn {
+                    break;
+                }
+            }
+            if in_rewound_region {
+                entry.superseded = true;
+            }
+        }
     }
 
     fn current_event_matches_selected_session(&self) -> bool {
@@ -3858,6 +3944,75 @@ mod tests {
         assert_eq!(*entry.2, Some(3));
         assert!(*entry.3);
         assert_eq!(*entry.4, Some(3));
+    }
+
+    #[test]
+    fn live_user_message_rewind_marks_buffer_and_emits_marker() {
+        let mut s = AppState::new();
+        for msg in [
+            json!({
+                "event": "log_entry",
+                "level": "info",
+                "source": "user",
+                "content": "Old prompt",
+                "session_id": "session-1",
+                "user_turn_index": 1
+            }),
+            json!({
+                "event": "log_entry",
+                "level": "model",
+                "source": "codex",
+                "content": "Old answer",
+                "session_id": "session-1"
+            }),
+        ] {
+            s.handle_message(&msg);
+        }
+
+        let cmds = s.handle_message(&json!({
+            "event": "user_message_rewind",
+            "session_id": "session-1",
+            "user_turn_index": 1,
+            "turns_removed": 1
+        }));
+
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::MarkActivityContextRewind {
+                session_id,
+                user_turn_index: 1,
+                turns_removed: 1,
+            } if session_id.as_deref() == Some("session-1")
+        )));
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::AddLogEntry {
+                kind,
+                content,
+                session_id,
+                ..
+            } if kind.as_deref() == Some("rollback_marker")
+                && content.contains("Rewound 1 user turn")
+                && session_id.as_deref() == Some("session-1")
+        )));
+
+        let refiltered = s.set_verbosity("normal");
+        assert!(refiltered.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::AddLogEntry {
+                content,
+                superseded: true,
+                ..
+            } if content == "Old prompt"
+        )));
+        assert!(refiltered.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::AddLogEntry {
+                content,
+                superseded: true,
+                ..
+            } if content == "Old answer"
+        )));
     }
 
     #[test]
