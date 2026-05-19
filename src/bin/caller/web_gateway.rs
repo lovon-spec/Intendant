@@ -1841,9 +1841,49 @@ fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
     message_content_text(content).map(|text| (role, text))
 }
 
+fn codex_event_message_text(payload: &serde_json::Value) -> Option<(String, String)> {
+    match payload.get("type").and_then(|v| v.as_str())? {
+        "user_message" => value_str(payload, "message").map(|text| ("user".to_string(), text)),
+        "agent_message" => {
+            value_str(payload, "message").map(|text| ("assistant".to_string(), text))
+        }
+        _ => None,
+    }
+}
+
 fn is_codex_injected_user_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("# AGENTS.md instructions for ") || trimmed.starts_with("<turn_aborted>")
+}
+
+fn push_external_transcript_entry(
+    entries: &mut Vec<serde_json::Value>,
+    seen_messages: &mut HashSet<(String, String)>,
+    provider_source: &str,
+    ts: &str,
+    role: &str,
+    text: String,
+) -> bool {
+    let role = role.trim().to_lowercase();
+    if role != "user" && role != "assistant" && role != "model" {
+        return false;
+    }
+    if text.trim().is_empty() {
+        return false;
+    }
+    if role == "user" && is_codex_injected_user_text(&text) {
+        return false;
+    }
+    if !seen_messages.insert((role.clone(), text.clone())) {
+        return false;
+    }
+    entries.push(serde_json::json!({
+        "ts": ts,
+        "level": if role == "assistant" || role == "model" { "model" } else { "info" },
+        "source": external_transcript_source(provider_source, &role),
+        "content": text,
+    }));
+    true
 }
 
 fn collect_files(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
@@ -2863,6 +2903,7 @@ fn external_session_entries_from_home(
                 return None;
             };
             let mut user_turn_index = 0u32;
+            let mut seen_messages = HashSet::new();
             for line in contents.lines() {
                 let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
@@ -2878,7 +2919,25 @@ fn external_session_entries_from_home(
                                 .unwrap_or(0);
                             for _ in 0..turns {
                                 while let Some(entry) = entries.pop() {
-                                    if entry.get("source").and_then(|v| v.as_str()) == Some("User")
+                                    if let (Some(source), Some(content)) = (
+                                        entry.get("source").and_then(|v| v.as_str()),
+                                        entry.get("content").and_then(|v| v.as_str()),
+                                    ) {
+                                        let role = if source == "user" {
+                                            Some("user")
+                                        } else if entry.get("level").and_then(|v| v.as_str())
+                                            == Some("model")
+                                        {
+                                            Some("assistant")
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(role) = role {
+                                            seen_messages
+                                                .remove(&(role.to_string(), content.to_string()));
+                                        }
+                                    }
+                                    if entry.get("source").and_then(|v| v.as_str()) == Some("user")
                                     {
                                         user_turn_index = user_turn_index.saturating_sub(1);
                                         break;
@@ -2891,21 +2950,37 @@ fn external_session_entries_from_home(
                 }
                 let ts = value_str(&obj, "timestamp").unwrap_or_default();
                 if let Some(payload) = obj.get("payload") {
-                    if let Some((role, text)) = codex_payload_text(payload) {
-                        if role == "user" && is_codex_injected_user_text(&text) {
-                            continue;
-                        }
-                        let mut entry = serde_json::json!({
-                            "ts": ts,
-                            "level": if role == "assistant" { "model" } else { "info" },
-                            "source": external_transcript_source("codex", &role),
-                            "content": text,
-                        });
-                        if role == "user" {
+                    if let Some((role, text)) = codex_event_message_text(payload) {
+                        if push_external_transcript_entry(
+                            &mut entries,
+                            &mut seen_messages,
+                            "codex",
+                            &ts,
+                            &role,
+                            text,
+                        ) && role == "user"
+                        {
                             user_turn_index = user_turn_index.saturating_add(1);
-                            entry["user_turn_index"] = serde_json::json!(user_turn_index);
+                            if let Some(entry) = entries.last_mut() {
+                                entry["user_turn_index"] = serde_json::json!(user_turn_index);
+                            }
                         }
-                        entries.push(entry);
+                    }
+                    if let Some((role, text)) = codex_payload_text(payload) {
+                        if push_external_transcript_entry(
+                            &mut entries,
+                            &mut seen_messages,
+                            "codex",
+                            &ts,
+                            &role,
+                            text,
+                        ) && role == "user"
+                        {
+                            user_turn_index = user_turn_index.saturating_add(1);
+                            if let Some(entry) = entries.last_mut() {
+                                entry["user_turn_index"] = serde_json::json!(user_turn_index);
+                            }
+                        }
                     }
                 }
             }
@@ -3047,11 +3122,11 @@ fn external_session_activity_replay_from_home_with_attach(
         }
         entries.push(serde_json::json!({
             "event": "log_entry",
+            "session_id": session_id,
             "ts": entry.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
             "level": entry.get("level").and_then(|v| v.as_str()).unwrap_or("info"),
             "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(source),
             "content": content,
-            "session_id": session_id,
             "user_turn_index": entry.get("user_turn_index").and_then(|v| v.as_u64()),
         }));
     }
@@ -12019,6 +12094,101 @@ mod tests {
     }
 
     #[test]
+    fn codex_transcript_filters_and_deduplicates_human_assistant_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-transcript-filter";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:53Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{ "type": "input_text", "text": "internal developer context" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:54Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "# AGENTS.md instructions for /Users/vm/projects/intendant\n<INSTRUCTIONS>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Visible prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "Visible prompt" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "Visible answer" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Visible answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:05Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"echo hidden\"}"
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let detail = external_session_detail_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should resolve");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let entries = detail["entries"].as_array().unwrap();
+        let contents: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(contents, vec!["Visible prompt", "Visible answer"]);
+        assert_eq!(entries[0]["source"], "user");
+        assert_eq!(entries[1]["source"], "codex");
+    }
+
+    #[test]
     fn external_activity_replay_uses_compact_session_transcript() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join(".codex").join("sessions");
@@ -12073,6 +12243,7 @@ mod tests {
 
         assert!(entries.iter().any(|entry| {
             entry["event"] == "log_entry"
+                && entry["session_id"] == session_id
                 && entry["level"] == "info"
                 && entry["source"] == "user"
                 && entry["content"] == "What happens on refresh?"
@@ -12080,6 +12251,7 @@ mod tests {
         }));
         assert!(entries.iter().any(|entry| {
             entry["event"] == "log_entry"
+                && entry["session_id"] == session_id
                 && entry["level"] == "model"
                 && entry["source"] == "codex"
                 && entry["content"] == "The task keeps running."
@@ -12140,6 +12312,12 @@ mod tests {
         assert_eq!(contents.len(), 90);
         assert_eq!(contents.first(), Some(&"turn message 1"));
         assert_eq!(contents.last(), Some(&"turn message 90"));
+        assert!(replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "log_entry")
+            .all(|entry| entry["session_id"] == session_id));
     }
 
     #[test]
@@ -12241,7 +12419,9 @@ mod tests {
             "Sessions-tab open replay should let the live attach event render the attach line"
         );
         assert!(entries.iter().any(|entry| {
-            entry["event"] == "log_entry" && entry["content"] == "Open this from Sessions"
+            entry["event"] == "log_entry"
+                && entry["session_id"] == session_id
+                && entry["content"] == "Open this from Sessions"
         }));
     }
 
