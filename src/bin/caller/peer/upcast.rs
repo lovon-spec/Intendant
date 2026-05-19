@@ -1077,6 +1077,22 @@ impl AppEventUpcaster {
                 };
                 vec![log_event(log_level, source, content.clone())]
             }
+            AppEvent::UserMessageRewind {
+                user_turn_index,
+                turns_removed,
+                ..
+            } => vec![log_event(
+                LogLevel::Warn,
+                "system",
+                if *turns_removed == 1 {
+                    format!("Rewound user turn {user_turn_index}")
+                } else {
+                    format!(
+                        "Rewound user turn {user_turn_index} and {} later turns",
+                        turns_removed.saturating_sub(1)
+                    )
+                },
+            )],
             AppEvent::UserMessageLog { content, .. } => {
                 vec![log_event(LogLevel::Info, "User", content.clone())]
             }
@@ -2003,9 +2019,26 @@ impl WireEventUpcaster {
                 turn: _,
                 session_id: _,
                 user_turn_index: _,
+                replacement_for_user_turn_index: _,
             } => {
                 vec![log_event(wire_log_level(level), source, content.clone())]
             }
+            OutboundEvent::UserMessageRewind {
+                user_turn_index,
+                turns_removed,
+                ..
+            } => vec![log_event(
+                LogLevel::Warn,
+                "system",
+                if *turns_removed == 1 {
+                    format!("Rewound user turn {user_turn_index}")
+                } else {
+                    format!(
+                        "Rewound user turn {user_turn_index} and {} later turns",
+                        turns_removed.saturating_sub(1)
+                    )
+                },
+            )],
 
             // ---- CommandResult: control-plane meta-event ----
             //

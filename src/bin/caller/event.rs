@@ -581,6 +581,12 @@ pub enum AppEvent {
         content: String,
         turn: Option<usize>,
     },
+    /// Active user-message edit rewound already-rendered session context.
+    UserMessageRewind {
+        session_id: Option<String>,
+        user_turn_index: u32,
+        turns_removed: u32,
+    },
 
     /// Editable user-message log entry for managed external sessions.
     ///
@@ -591,6 +597,7 @@ pub enum AppEvent {
         session_id: Option<String>,
         content: String,
         user_turn_index: Option<u32>,
+        replacement_for_user_turn_index: Option<u32>,
     },
 
     /// Display transport pipeline metrics snapshot.
@@ -1593,11 +1600,22 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             turn: *turn,
             session_id: None,
             user_turn_index: None,
+            replacement_for_user_turn_index: None,
+        }),
+        AppEvent::UserMessageRewind {
+            session_id,
+            user_turn_index,
+            turns_removed,
+        } => Some(OutboundEvent::UserMessageRewind {
+            session_id: session_id.clone(),
+            user_turn_index: *user_turn_index,
+            turns_removed: *turns_removed,
         }),
         AppEvent::UserMessageLog {
             session_id,
             content,
             user_turn_index,
+            replacement_for_user_turn_index,
         } => Some(OutboundEvent::LogEntry {
             level: "info".to_string(),
             source: "User".to_string(),
@@ -1605,6 +1623,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             turn: None,
             session_id: session_id.clone(),
             user_turn_index: *user_turn_index,
+            replacement_for_user_turn_index: *replacement_for_user_turn_index,
         }),
         AppEvent::RecordingStarted { stream_name } => Some(OutboundEvent::RecordingStarted {
             stream_name: stream_name.clone(),
@@ -2997,6 +3016,36 @@ mod tests {
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));
         assert!(json.contains("\"hello\""));
+    }
+
+    #[test]
+    fn outbound_user_message_rewind() {
+        let event = AppEvent::UserMessageRewind {
+            session_id: Some("sess-1".to_string()),
+            user_turn_index: 4,
+            turns_removed: 2,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"user_message_rewind\""));
+        assert!(json.contains("\"session_id\":\"sess-1\""));
+        assert!(json.contains("\"user_turn_index\":4"));
+        assert!(json.contains("\"turns_removed\":2"));
+    }
+
+    #[test]
+    fn outbound_user_message_log_preserves_replacement_turn() {
+        let event = AppEvent::UserMessageLog {
+            session_id: Some("sess-1".to_string()),
+            content: "New prompt".to_string(),
+            user_turn_index: Some(4),
+            replacement_for_user_turn_index: Some(4),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"log_entry\""));
+        assert!(json.contains("\"user_turn_index\":4"));
+        assert!(json.contains("\"replacement_for_user_turn_index\":4"));
     }
 
     #[test]

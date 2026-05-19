@@ -294,6 +294,7 @@ fn emit_user_message_log(
     session_log: &SharedSessionLog,
     session_id: Option<&str>,
     user_turn_index: Option<u32>,
+    replacement_for_user_turn_index: Option<u32>,
     text: &str,
 ) {
     let text = text.trim();
@@ -305,6 +306,7 @@ fn emit_user_message_log(
         session_id: session_id.map(str::to_string),
         content: text.to_string(),
         user_turn_index,
+        replacement_for_user_turn_index,
     });
 }
 
@@ -7603,6 +7605,7 @@ async fn run_external_agent_mode(
             },
         };
 
+        let mut replacement_for_user_turn_index = None;
         if let Some(user_turn_index) = edit_user_turn_index {
             if user_turn_index == 0 || user_turn_index as usize > round {
                 let message = format!(
@@ -7623,6 +7626,7 @@ async fn run_external_agent_mode(
             match agent.rollback_turns(turns_to_drop).await {
                 Ok(()) => {
                     round = user_turn_index.saturating_sub(1) as usize;
+                    replacement_for_user_turn_index = Some(user_turn_index);
                     let message = format!(
                         "Edited user turn {}; rolled back {} turn{}",
                         user_turn_index,
@@ -7630,11 +7634,10 @@ async fn run_external_agent_mode(
                         if turns_to_drop == 1 { "" } else { "s" }
                     );
                     slog(&session_log, |l| l.info(&message));
-                    bus.send(AppEvent::LogEntry {
-                        level: "info".to_string(),
-                        source: "system".to_string(),
-                        content: message,
-                        turn: None,
+                    bus.send(AppEvent::UserMessageRewind {
+                        session_id: live_session_id.clone(),
+                        user_turn_index,
+                        turns_removed: turns_to_drop,
                     });
                 }
                 Err(e) => {
@@ -7657,6 +7660,7 @@ async fn run_external_agent_mode(
             &session_log,
             live_session_id.as_deref(),
             Some(round as u32),
+            replacement_for_user_turn_index,
             &turn_text,
         );
         let merged = drain_steer_queue_as_followup(

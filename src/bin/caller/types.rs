@@ -446,6 +446,15 @@ pub enum OutboundEvent {
         session_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         user_turn_index: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replacement_for_user_turn_index: Option<u32>,
+    },
+    /// Live user-message edit rewound an active external-agent session.
+    UserMessageRewind {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        user_turn_index: u32,
+        turns_removed: u32,
     },
     /// Display transport pipeline metrics snapshot.
     DisplayMetrics {
