@@ -663,7 +663,7 @@ pub enum AppEvent {
         target_native_message_count: Option<u32>,
         /// Number of turns that occurred between the current head and
         /// the target round. Passed through to external-agent backends
-        /// that accept a `turnsToRollback` parameter (Codex).
+        /// that accept a `numTurns` parameter (Codex).
         turns_to_drop: u32,
     },
 

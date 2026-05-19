@@ -127,12 +127,11 @@ impl CodexAgent {
             ));
         }
         let thread_id = self.require_active_thread().await?;
-        // Codex's `ThreadRollbackParams` accepts `turnsToRollback` in camel
-        // case (matching the rest of the wire vocabulary). If Codex ends up
-        // accepting `turns` too in a later version, this still works.
+        // Codex's `ThreadRollbackParams` accepts `numTurns`; the event it
+        // emits after rollback currently uses `num_turns`.
         let params = serde_json::json!({
             "threadId": thread_id,
-            "turnsToRollback": turns,
+            "numTurns": turns,
         });
         let _ = self
             .send_request("thread/rollback", Some(params))
@@ -2435,7 +2434,7 @@ impl ExternalAgent for CodexAgent {
     }
 
     /// Native implementation of conversation rollback. Reuses the
-    /// `thread/rollback` RPC under `turnsToRollback` — same as `/undo`,
+    /// `thread/rollback` RPC under `numTurns` — same as `/undo`,
     /// just without the status string and with a guard allowing 0 to be
     /// a no-op (the HTTP handler may issue rollback with 0 turns when
     /// the target round is already the head).
@@ -3971,10 +3970,10 @@ mod tests {
         // Assert the params shape without actually running the RPC.
         let params = serde_json::json!({
             "threadId": "thread-abc",
-            "turnsToRollback": 2,
+            "numTurns": 2,
         });
         assert_eq!(params["threadId"], "thread-abc");
-        assert_eq!(params["turnsToRollback"], 2);
+        assert_eq!(params["numTurns"], 2);
     }
 
     #[test]

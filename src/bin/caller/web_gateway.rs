@@ -4064,7 +4064,7 @@ async fn handle_history_rollback(
         match (target_idx, head_idx) {
             (Some(t), Some(h)) => {
                 // Compute turns to drop from the head turn-count sum
-                // between (t, h]. This matches Codex's `turnsToRollback`
+                // between (t, h]. This matches Codex's `numTurns`
                 // semantics: the number of turns we want to undo.
                 let turns_to_drop: u32 = if t < h {
                     hist.rounds[t + 1..=h]
