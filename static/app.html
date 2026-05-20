@@ -2118,12 +2118,33 @@ html, body {
 .sessions-search input::placeholder { color: var(--overlay0); }
 .sessions-new-task {
   display: flex;
-  align-items: flex-start;
-  gap: 4px;
+  align-items: flex-end;
+  gap: 6px;
+  flex: 1 1 520px;
+  justify-content: flex-end;
   margin-left: auto;
+  min-width: min(100%, 520px);
+}
+.sessions-new-session-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  color: var(--overlay0);
+  font-size: 10px;
+  line-height: 1.1;
+  text-transform: uppercase;
+}
+.sessions-new-session-task {
+  flex: 1 1 220px;
+  max-width: 300px;
+}
+.sessions-new-session-project {
+  flex: 1 1 240px;
+  max-width: 340px;
 }
 .sessions-new-task-input {
-  width: 200px;
+  width: 100%;
   min-height: 28px;
   max-height: 96px;
   padding: 4px 8px;
@@ -2139,6 +2160,21 @@ html, body {
   overflow-y: auto;
 }
 .sessions-new-task-input:focus { outline: none; border-color: var(--blue); }
+.sessions-project-input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.sessions-project-input:focus { outline: none; border-color: var(--blue); }
+.sessions-project-input::placeholder { color: var(--overlay0); }
 .sessions-start-btn {
   padding: 4px 12px;
   border: 1px solid var(--green);
@@ -4355,8 +4391,9 @@ html, body {
   .usage-cards { flex-direction: column; }
   .sessions-header { align-items: stretch; }
   .sessions-search { flex: 1 1 100%; max-width: none; margin-left: 0; }
-  .sessions-new-task { width: 100%; margin-left: 0; }
-  .sessions-new-task-input { flex: 1; width: auto; }
+  .sessions-new-task { width: 100%; min-width: 0; margin-left: 0; flex-wrap: wrap; justify-content: stretch; }
+  .sessions-new-session-field { flex: 1 1 100%; max-width: none; }
+  .sessions-start-btn { width: 100%; }
   .sessions-filter, .sessions-sort { margin-left: 0; }
   .sessions-aggregate { flex-direction: column; }
   .sessions-aggregate .agg-card { min-width: unset; }
@@ -5015,8 +5052,15 @@ html, body {
             <input type="search" id="sessions-search" placeholder="ID, task, model, path..." autocomplete="off" spellcheck="false">
           </label>
           <div class="sessions-new-task">
-            <textarea id="new-session-input" class="sessions-new-task-input" rows="1" placeholder="New task..."></textarea>
-            <button class="sessions-start-btn" onclick="startNewSession()">Start</button>
+            <label class="sessions-new-session-field sessions-new-session-task" for="new-session-input">
+              New session
+              <textarea id="new-session-input" class="sessions-new-task-input" rows="1" placeholder="Initial message..."></textarea>
+            </label>
+            <label class="sessions-new-session-field sessions-new-session-project" for="new-session-project-root">
+              Project
+              <input id="new-session-project-root" class="sessions-project-input" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/project">
+            </label>
+            <button class="sessions-start-btn" onclick="startNewSession()">Start session</button>
           </div>
           <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
           <div class="sessions-filter" id="sessions-filter">
@@ -5690,6 +5734,7 @@ let processingLogReplay = false;
 const sessionMetadataById = new Map();
 const sessionUsageById = new Map();
 let latestGlobalUsage = null;
+let dashboardProjectRoot = '';
 const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 2500;
@@ -6640,6 +6685,7 @@ async function main() {
   // to open the Settings tab. Idempotent — visiting Settings after
   // this won't refetch.
   loadSettings();
+  loadNewSessionProjectRoot();
 
   // Restore pure-client toggles from localStorage. These are UI
   // preferences that don't belong in intendant.toml but also shouldn't
@@ -19093,6 +19139,24 @@ function onSteerStatusUpdate(id, text, status, reason) {
   }
 }
 
+function setNewSessionProjectRoot(root) {
+  dashboardProjectRoot = String(root || '').trim();
+  const input = document.getElementById('new-session-project-root');
+  if (!input || !dashboardProjectRoot) return;
+  if (!input.value.trim()) input.value = dashboardProjectRoot;
+  input.title = dashboardProjectRoot;
+}
+
+async function loadNewSessionProjectRoot() {
+  try {
+    const resp = await fetch('/api/project-root');
+    const d = await resp.json();
+    if (resp.ok) setNewSessionProjectRoot(d.project_root || '');
+  } catch (e) {
+    console.warn('Failed to load project root:', e);
+  }
+}
+
 function startNewSession() {
   const input = document.getElementById('new-session-input');
   if (!input) return;
@@ -19103,7 +19167,9 @@ function startNewSession() {
     const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const attachments = pendingAttachments.map(a => a.frameId);
     const attachmentReceipt = pendingAttachments.slice();
+    const projectRoot = document.getElementById('new-session-project-root')?.value.trim() || '';
     const msg = { action: 'create_session', task: task };
+    if (projectRoot) msg.project_root = projectRoot;
     if (direct) msg.direct = true;
     if (attachments.length > 0) msg.attachments = attachments;
     app.send_server_action(msg);

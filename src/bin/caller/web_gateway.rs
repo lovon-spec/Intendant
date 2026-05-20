@@ -7966,6 +7966,26 @@ pub fn spawn_web_gateway(
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
+                    } else if request_line.contains("/api/project-root") {
+                        use tokio::io::AsyncWriteExt;
+                        let body = serde_json::json!({
+                            "project_root": project_root
+                                .as_ref()
+                                .map(|root| root.to_string_lossy().to_string())
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
                         && request_line.contains("/api/settings")
                     {

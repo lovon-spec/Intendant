@@ -100,6 +100,7 @@ impl SessionSupervisor {
         match msg {
             event::ControlMsg::CreateSession {
                 task,
+                project_root,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -117,6 +118,7 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    project_root,
                     orchestrate,
                     direct,
                     reference_frame_ids,
@@ -163,6 +165,7 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    None,
                     orchestrate,
                     direct,
                     reference_frame_ids,
@@ -254,6 +257,7 @@ impl SessionSupervisor {
     async fn start_new_session(
         &self,
         task: String,
+        project_root: Option<String>,
         orchestrate: Option<bool>,
         direct: Option<bool>,
         reference_frame_ids: Vec<String>,
@@ -273,7 +277,15 @@ impl SessionSupervisor {
             .lock()
             .map(|log| log.session_id().to_string())
             .unwrap_or_else(|_| path_file_name(&log_dir));
-        let project = match Project::from_root(self.config.project_root.clone()) {
+        let project_root = match resolve_project_root_override(project_root, &self.config.project_root)
+        {
+            Ok(root) => root,
+            Err(e) => {
+                self.loop_error(format!("Project load failed: {}", e));
+                return;
+            }
+        };
+        let project = match Project::from_root(project_root) {
             Ok(project) => project,
             Err(e) => {
                 self.loop_error(format!("Project load failed: {}", e));
@@ -1227,6 +1239,40 @@ fn path_file_name(path: &std::path::Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn resolve_project_root_override(
+    project_root: Option<String>,
+    default_root: &Path,
+) -> Result<PathBuf, String> {
+    let Some(raw) = project_root else {
+        return Ok(default_root.to_path_buf());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(default_root.to_path_buf());
+    }
+    let path = if trimmed == "~" {
+        dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| "could not resolve home directory".to_string())?
+            .join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "project directory must be absolute or start with ~/ (got {})",
+            trimmed
+        ));
+    }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("{} is not accessible: {}", path.display(), e))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a directory", canonical.display()));
+    }
+    Ok(canonical)
 }
 
 fn write_session_meta(

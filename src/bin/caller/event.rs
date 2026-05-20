@@ -923,6 +923,11 @@ pub enum ControlMsg {
     /// continue whichever session a legacy frontend considers active.
     CreateSession {
         task: String,
+        /// Directory to use as the new session's project root. When omitted,
+        /// the session supervisor uses the project root of this Intendant
+        /// instance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
         #[serde(default)]
         orchestrate: Option<bool>,
         /// Bypass presence/orchestration, matching StartTask.direct.
@@ -2408,6 +2413,7 @@ mod tests {
             ControlMsg::GetControllerLoopStatus,
             ControlMsg::CreateSession {
                 task: "start fresh".to_string(),
+                project_root: None,
                 orchestrate: Some(false),
                 direct: Some(true),
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
@@ -2606,11 +2612,12 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","project_root":"/repo","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
                 task,
+                project_root,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -2618,6 +2625,7 @@ mod tests {
                 attachments,
             } => {
                 assert_eq!(task, "fix bug");
+                assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert!(orchestrate.is_none());
                 assert_eq!(direct, Some(true));
                 assert!(reference_frame_ids.is_empty());
