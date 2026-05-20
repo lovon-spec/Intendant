@@ -1022,21 +1022,26 @@ html, body {
 .task-target-chip:focus { outline: 1px solid var(--blue); outline-offset: 1px; }
 .task-new-session-btn {
   flex-shrink: 0;
-  padding: 3px 8px;
-  border: 1px solid var(--surface1);
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid rgba(137, 180, 250, 0.8);
   border-radius: 4px;
-  background: var(--surface0);
-  color: var(--subtext0);
+  background: var(--blue);
+  color: var(--crust);
   font-family: inherit;
-  font-size: 11px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
   cursor: pointer;
+  box-shadow: 0 0 0 1px rgba(137, 180, 250, 0.14), 0 0 14px rgba(137, 180, 250, 0.18);
+  white-space: nowrap;
 }
 .task-new-session-btn:hover {
-  border-color: var(--green);
-  color: var(--green);
+  background: var(--lavender);
+  border-color: var(--lavender);
+  box-shadow: 0 0 0 1px rgba(180, 190, 254, 0.22), 0 0 18px rgba(180, 190, 254, 0.24);
 }
-.task-new-session-btn:focus { outline: 1px solid var(--blue); outline-offset: 1px; }
+.task-new-session-btn:focus { outline: 2px solid rgba(137, 180, 250, 0.72); outline-offset: 2px; }
 .edit-message-chip {
   display: flex;
   align-items: center;
@@ -5172,7 +5177,7 @@ html, body {
       <span class="phase-text" id="phase-text">Idle</span>
     </div>
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
-    <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session">New</button>
+    <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session" aria-label="Create a new session">+ New</button>
     <button id="task-target-chip" class="task-target-chip" onclick="focusForegroundSessionWindow()" title="Prompt target" style="display:none"></button>
     <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
       <span id="edit-message-label">Editing</span>
