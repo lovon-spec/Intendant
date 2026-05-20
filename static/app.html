@@ -1291,7 +1291,8 @@ html, body {
   gap: 8px;
 }
 .session-window-id {
-  flex-shrink: 0;
+  flex-shrink: 1;
+  max-width: 220px;
   color: var(--session-badge-fg, var(--text));
   background: var(--session-badge-bg, var(--surface0));
   border: 1px solid var(--session-badge-border, transparent);
@@ -1299,6 +1300,9 @@ html, body {
   padding: 1px 5px;
   font-size: 11px;
   font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .session-window-task {
   color: var(--overlay1);
@@ -1386,6 +1390,11 @@ html, body {
   cursor: pointer;
 }
 .session-window-menu button:hover {
+  background: var(--surface0);
+}
+.session-window-menu-separator {
+  height: 1px;
+  margin: 4px 2px;
   background: var(--surface0);
 }
 .session-window-log {
@@ -8209,6 +8218,14 @@ function releaseActionPending(op) {
 
 function handleCodexThreadActionResult(evt) {
   releaseActionPending(evt.action);
+  if (evt.success && evt.action === 'rename') {
+    const sid = String(evt.session_id || '').trim();
+    const name = String(evt.message || '').replace(/^Codex thread renamed to\s+/i, '').trim();
+    if (sid && name && name !== evt.message) {
+      updateSessionWindow(sid, { name });
+    }
+    refreshSessionWindowMetadata(600);
+  }
   showControlToast(
     evt.success ? 'success' : 'error',
     evt.success
@@ -8690,6 +8707,8 @@ function compactPathLabel(value, preserveAbsolute = false) {
 
 function normalizeSessionWindowMeta(meta = {}) {
   const out = {};
+  const name = compactSessionText(meta.name || meta.display_name || meta.displayName || meta.thread_name || meta.threadName || meta.title);
+  if (name) out.name = name;
   const task = compactSessionText(meta.initial_message || meta.initialMessage || meta.task);
   if (task) out.task = task;
   const project = compactSessionText(meta.project_root || meta.projectRoot || meta.project_dir || meta.projectDir || meta.project);
@@ -8712,6 +8731,7 @@ function normalizeSessionWindowMeta(meta = {}) {
 function sessionWindowMetaFromSession(session) {
   if (!session || typeof session !== 'object') return {};
   return normalizeSessionWindowMeta({
+    name: session.name || session.display_name || session.thread_name,
     task: session.task,
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
@@ -8765,6 +8785,36 @@ function syncSessionWindowMetadataRefresh() {
   }
 }
 
+function copyTextToClipboard(text) {
+  const value = String(text || '');
+  if (!value) return Promise.reject(new Error('Nothing to copy'));
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    return navigator.clipboard.writeText(value);
+  }
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = value;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      if (document.execCommand('copy')) resolve();
+      else reject(new Error('Copy command failed'));
+    } catch (err) {
+      reject(err);
+    } finally {
+      ta.remove();
+    }
+  });
+}
+
+const SESSION_WINDOW_GENERIC_ACTIONS = [
+  { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
+];
+
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', promptName: true },
   { op: 'rename', label: 'Rename...', title: 'Rename this Codex thread', promptRename: true },
@@ -8796,7 +8846,7 @@ function setSessionWindowMenuOpen(sessionId, open) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win || !win.actionMenu || !win.actionMenuButton) return false;
-  const nextOpen = !!open && sessionWindowIsCodex(sid, win);
+  const nextOpen = !!open;
   closeSessionWindowMenus(nextOpen ? sid : '');
   win.actionMenu.classList.toggle('hidden', !nextOpen);
   win.actionMenuButton.setAttribute('aria-expanded', nextOpen ? 'true' : 'false');
@@ -8815,13 +8865,28 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win || !win.actionMenuButton) return;
   const isCodex = sessionWindowIsCodex(sid, win);
-  win.actionMenuButton.classList.toggle('hidden', !isCodex);
-  win.actionMenuButton.disabled = !isCodex;
-  win.actionMenuButton.title = isCodex
-    ? 'Codex actions'
-    : 'Codex actions unavailable for this session';
+  win.actionMenuButton.classList.remove('hidden');
+  win.actionMenuButton.disabled = false;
+  win.actionMenuButton.title = 'Session actions';
   win.actionMenuButton.setAttribute('aria-label', win.actionMenuButton.title);
-  if (!isCodex) setSessionWindowMenuOpen(sid, false);
+  win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
+    item.classList.toggle('hidden', !isCodex);
+  });
+  win.actionMenu?.querySelectorAll('[data-session-window-codex-separator]').forEach(item => {
+    item.classList.toggle('hidden', !isCodex);
+  });
+}
+
+function runSessionWindowAction(sessionId, op) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  if (op === 'copy-session-id') {
+    copyTextToClipboard(sid)
+      .then(() => showControlToast('success', `Copied session ID ${shortSessionId(sid)}`))
+      .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+    return;
+  }
+  runSessionWindowCodexAction(sid, op);
 }
 
 function runSessionWindowCodexAction(sessionId, op) {
@@ -8889,9 +8954,9 @@ function ensureSessionWindow(sessionId, meta = {}) {
   status.className = 'session-window-status';
   status.textContent = normalizeSessionPhase(meta.phase || 'idle');
   const actions = document.createElement('button');
-  actions.className = 'session-window-action session-window-actions hidden';
+  actions.className = 'session-window-action session-window-actions';
   actions.type = 'button';
-  actions.title = 'Codex actions';
+  actions.title = 'Session actions';
   actions.setAttribute('aria-label', actions.title);
   actions.setAttribute('aria-haspopup', 'menu');
   actions.setAttribute('aria-expanded', 'false');
@@ -8899,12 +8964,27 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const actionMenu = document.createElement('div');
   actionMenu.className = 'session-window-menu hidden';
   actionMenu.setAttribute('role', 'menu');
+  SESSION_WINDOW_GENERIC_ACTIONS.forEach(action => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.textContent = action.label;
+    item.title = action.title;
+    item.dataset.sessionWindowAction = action.op;
+    item.setAttribute('role', 'menuitem');
+    actionMenu.appendChild(item);
+  });
+  const codexSeparator = document.createElement('div');
+  codexSeparator.className = 'session-window-menu-separator';
+  codexSeparator.dataset.sessionWindowCodexSeparator = '1';
+  codexSeparator.setAttribute('role', 'separator');
+  actionMenu.appendChild(codexSeparator);
   SESSION_WINDOW_CODEX_ACTIONS.forEach(action => {
     const item = document.createElement('button');
     item.type = 'button';
     item.textContent = action.label;
     item.title = action.title;
     item.dataset.sessionWindowAction = action.op;
+    item.dataset.sessionWindowCodexAction = '1';
     item.setAttribute('role', 'menuitem');
     actionMenu.appendChild(item);
   });
@@ -8949,7 +9029,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     e.preventDefault();
     e.stopPropagation();
     setSessionWindowMenuOpen(sid, false);
-    runSessionWindowCodexAction(sid, item.dataset.sessionWindowAction);
+    runSessionWindowAction(sid, item.dataset.sessionWindowAction);
   });
   maximize.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -9014,6 +9094,9 @@ function updateSessionWindow(sessionId, meta = {}) {
     sessionMetadataById.set(sid, { ...previous, ...normalized });
   }
   meta = { ...(sessionMetadataById.get(sid) || {}), ...normalized };
+  const displayName = compactSessionText(meta.name);
+  win.id.textContent = displayName || shortSessionId(sid);
+  win.id.title = displayName ? `${displayName} · ${sid}` : sid;
   if (meta.projectRoot) {
     win.project.textContent = meta.projectLabel || compactPathLabel(meta.projectRoot, true);
     win.project.title = meta.projectRoot;
@@ -9032,6 +9115,7 @@ function updateSessionWindow(sessionId, meta = {}) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
   }
+  win.task.classList.toggle('hidden', !!displayName);
   if (meta.source) {
     win.source = meta.source;
   }
@@ -20070,6 +20154,7 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     session.session_id,
     shortId,
     session.resume_id,
+    session.name,
     session.task,
     displayStatus,
     session.status,

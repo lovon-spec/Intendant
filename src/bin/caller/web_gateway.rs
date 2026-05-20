@@ -1944,6 +1944,14 @@ fn is_codex_injected_user_text(text: &str) -> bool {
     trimmed.starts_with("# AGENTS.md instructions for ") || trimmed.starts_with("<turn_aborted>")
 }
 
+fn codex_thread_display_name(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| !is_codex_injected_user_text(s))
+        .map(|s| compact_text(&s, 180))
+}
+
 fn push_external_transcript_entry(
     entries: &mut Vec<serde_json::Value>,
     seen_messages: &mut HashSet<(String, String)>,
@@ -2274,6 +2282,7 @@ fn external_session_json(
     resume_id: String,
     created_at: Option<String>,
     updated_at: Option<String>,
+    name: Option<String>,
     task: Option<String>,
     provider: &str,
     model: Option<String>,
@@ -2293,6 +2302,7 @@ fn external_session_json(
         "resume_id": resume_id,
         "created_at": created_at,
         "updated_at": updated_at,
+        "name": name,
         "task": task,
         "provider": provider,
         "model": model,
@@ -2575,6 +2585,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
                 continue;
             };
             let updated_at = value_str(&obj, "updated_at");
+            let name = codex_thread_display_name(value_str(&obj, "thread_name"));
             rows.insert(
                 id.clone(),
                 external_session_json(
@@ -2584,7 +2595,8 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
                     id,
                     None,
                     updated_at,
-                    value_str(&obj, "thread_name"),
+                    name,
+                    None,
                     "Codex",
                     None,
                     0,
@@ -2729,6 +2741,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         let existing_task = existing
             .and_then(|v| value_str(v, "task"))
             .filter(|s| !is_codex_injected_user_text(s));
+        let existing_name = existing.and_then(|v| value_str(v, "name"));
         let existing_updated_at = existing.and_then(|v| value_str(v, "updated_at"));
         let file_updated_at = file_mtime_string(&path);
         let created_at = created_at.or_else(|| file_updated_at.clone());
@@ -2758,6 +2771,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
             id.clone(),
             created_at,
             updated_at,
+            existing_name,
             task.or(existing_task),
             provider.as_deref().unwrap_or("Codex"),
             model.clone(),
@@ -2876,6 +2890,7 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
                 .or_else(|| updated_at.clone())
                 .or_else(|| file_mtime_string(&path)),
             file_mtime_string(&path).or(updated_at),
+            None,
             task,
             "Claude Code",
             model.clone(),
@@ -2982,6 +2997,7 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
             session_id,
             value_str(&obj, "startTime").or_else(|| file_mtime_string(&path)),
             file_mtime_string(&path),
+            None,
             task,
             "Gemini CLI",
             model.clone(),
@@ -3405,6 +3421,7 @@ fn list_sessions_from_home(home_path: &Path) -> String {
 
         // Try to read session_meta.json first (fast path)
         let meta_path = dir.join("session_meta.json");
+        let mut name: Option<String> = None;
         let mut task: Option<String> = None;
         let mut created_at: Option<String> = None;
         let mut project_root: Option<String> = None;
@@ -3435,6 +3452,10 @@ fn list_sessions_from_home(home_path: &Path) -> String {
                     .get("project_root")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                name = meta
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| compact_text(s, 180));
                 if let Some(s) = meta.get("status").and_then(|v| v.as_str()) {
                     status = s.to_string();
                 }
@@ -3671,6 +3692,7 @@ fn list_sessions_from_home(home_path: &Path) -> String {
             "resume_id": session_id,
             "created_at": created_at,
             "updated_at": updated_at,
+            "name": name,
             "task": task,
             "provider": provider,
             "model": model,
@@ -12129,6 +12151,7 @@ mod tests {
             "session-1".to_string(),
             Some("2026-05-17T10:00:00Z".to_string()),
             None,
+            Some("name".to_string()),
             Some("task".to_string()),
             "Codex",
             None,
@@ -12141,6 +12164,7 @@ mod tests {
 
         assert_eq!(session["created_at"], "2026-05-17T10:00:00Z");
         assert_eq!(session["updated_at"], "2026-05-17T10:00:00Z");
+        assert_eq!(session["name"], "name");
     }
 
     #[test]
@@ -12370,7 +12394,74 @@ mod tests {
             session.get("task").and_then(|v| v.as_str()),
             Some("Fix the Sessions tab")
         );
+        assert_eq!(session.get("name").and_then(|v| v.as_str()), None);
         assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn list_codex_sessions_exposes_thread_name_separately_from_task() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-thread-name";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": id,
+                "updated_at": "2026-05-17T20:44:33Z",
+                "thread_name": "Rehydration fix"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/Users/vm/projects/intendant"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fix activity replay"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.get("name").and_then(|v| v.as_str()),
+            Some("Rehydration fix")
+        );
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Fix activity replay")
+        );
     }
 
     #[test]

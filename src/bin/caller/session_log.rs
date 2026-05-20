@@ -50,6 +50,8 @@ pub struct SessionMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -222,6 +224,7 @@ impl SessionLog {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             project_root: project_root.map(|p| p.to_string_lossy().to_string()),
+            name: None,
             task: task.map(|t| t.to_string()),
             status: Some("running".to_string()),
             last_turn: None,
@@ -3121,6 +3124,7 @@ mod tests {
             session_id: "test-session-123".to_string(),
             created_at: "2026-01-01T00:00:00".to_string(),
             project_root: None,
+            name: None,
             task: None,
             status: None,
             last_turn: None,
@@ -3348,6 +3352,7 @@ mod tests {
             session_id: "session-1".to_string(),
             created_at: "2026-01-01T00:00:00".to_string(),
             project_root: Some("/tmp/project".to_string()),
+            name: None,
             task: Some("task 1".to_string()),
             status: Some("completed".to_string()),
             last_turn: Some(5),
@@ -3366,6 +3371,7 @@ mod tests {
             session_id: "session-2".to_string(),
             created_at: "2026-01-02T00:00:00".to_string(),
             project_root: Some("/tmp/project".to_string()),
+            name: None,
             task: Some("task 2".to_string()),
             status: Some("completed".to_string()),
             last_turn: Some(3),
