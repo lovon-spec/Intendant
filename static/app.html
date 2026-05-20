@@ -2164,11 +2164,15 @@ html, body {
 }
 .sessions-header {
   display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.sessions-title-line {
+  display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 16px;
-  flex-wrap: wrap;
+  gap: 12px;
 }
 .sessions-title {
   font-size: 14px;
@@ -2176,14 +2180,18 @@ html, body {
   color: var(--text);
   flex-shrink: 0;
 }
+.sessions-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto auto auto minmax(210px, auto);
+  align-items: end;
+  gap: 8px;
+}
 .sessions-search {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   gap: 6px;
-  flex: 1 1 240px;
-  max-width: 360px;
-  min-width: 180px;
-  margin-left: 8px;
+  min-width: 0;
   font-size: 11px;
   color: var(--overlay0);
 }
@@ -2202,6 +2210,32 @@ html, body {
 }
 .sessions-search input:focus { outline: none; border-color: var(--blue); }
 .sessions-search input::placeholder { color: var(--overlay0); }
+.sessions-control {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 116px;
+  font-size: 11px;
+  color: var(--overlay0);
+}
+.sessions-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--surface0) 70%, transparent);
+  color: var(--subtext0);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sessions-toggle input[type="checkbox"] {
+  accent-color: var(--blue);
+  margin: 0;
+}
 .sessions-subtab-panes {
   background: transparent;
 }
@@ -2361,13 +2395,15 @@ html, body {
   cursor: pointer;
 }
 .sessions-refresh {
-  padding: 4px 12px;
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 3px 10px;
   background: var(--surface0);
   border: 1px solid var(--surface1);
   border-radius: 4px;
   color: var(--subtext0);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 11px;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
 }
@@ -2376,35 +2412,37 @@ html, body {
   color: var(--text);
 }
 .sessions-aggregate {
-  display: flex;
-  gap: 16px;
-  flex-wrap: wrap;
-  margin-bottom: 20px;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  margin: 8px 0 12px;
 }
 .sessions-aggregate .agg-card {
-  flex: 1;
-  min-width: 140px;
-  background: var(--surface0);
+  min-width: 0;
+  background: color-mix(in srgb, var(--surface0) 76%, transparent);
   border: 1px solid var(--surface1);
-  border-radius: 8px;
-  padding: 12px 16px;
+  border-radius: 6px;
+  padding: 8px 10px;
 }
 .sessions-aggregate .agg-label {
-  font-size: 11px;
+  font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--overlay1);
-  margin-bottom: 4px;
+  margin-bottom: 2px;
 }
 .sessions-aggregate .agg-value {
-  font-size: 18px;
+  font-size: 14px;
+  line-height: 1.15;
   font-weight: 600;
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .sessions-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 .session-detail { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .session-detail-header {
@@ -2544,9 +2582,10 @@ html, body {
 .session-card {
   background: var(--surface0);
   border: 1px solid var(--surface1);
-  border-radius: 8px;
-  padding: 12px 16px;
+  border-radius: 6px;
+  padding: 9px 124px 9px 12px;
   cursor: default;
+  position: relative;
   transition: border-color 0.15s;
 }
 .session-card:hover {
@@ -2558,14 +2597,14 @@ html, body {
 }
 .session-card .sc-top {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 8px;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
+  min-width: 0;
 }
 .session-card .sc-title-block {
   display: flex;
   flex-direction: column;
-  gap: 2px;
   min-width: 0;
   flex: 1 1 auto;
 }
@@ -2587,7 +2626,7 @@ html, body {
   white-space: nowrap;
 }
 .session-card .sc-id {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--overlay1);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   user-select: text;
@@ -2597,7 +2636,7 @@ html, body {
 }
 .session-card .sc-status {
   flex: 0 0 auto;
-  font-size: 10px;
+  font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 1px 6px;
@@ -2630,7 +2669,7 @@ html, body {
 }
 .session-card .sc-source {
   flex: 0 0 auto;
-  font-size: 10px;
+  font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 1px 6px;
@@ -2639,9 +2678,13 @@ html, body {
   color: var(--teal);
   font-weight: 600;
 }
+.session-card .sc-source.local {
+  background: color-mix(in srgb, var(--surface2) 16%, transparent);
+  color: var(--overlay1);
+}
 .session-card .sc-role {
   flex: 0 0 auto;
-  font-size: 10px;
+  font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 1px 6px;
@@ -2651,7 +2694,7 @@ html, body {
 }
 .session-card .sc-current-badge {
   flex: 0 0 auto;
-  font-size: 10px;
+  font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 1px 6px;
@@ -2659,13 +2702,12 @@ html, body {
   background: color-mix(in srgb, var(--blue) 20%, transparent);
   color: var(--blue);
   font-weight: 600;
-  margin-left: auto;
 }
 .session-card .sc-task {
-  font-size: 13px;
-  color: var(--text);
-  margin-bottom: 8px;
-  line-height: 1.4;
+  font-size: 12px;
+  color: var(--subtext0);
+  margin: -1px 0 4px 0;
+  line-height: 1.3;
   overflow: hidden;
   text-overflow: ellipsis;
   display: -webkit-box;
@@ -2676,8 +2718,8 @@ html, body {
   display: flex;
   gap: 8px;
   align-items: baseline;
-  margin: 4px 0 8px;
-  padding: 5px 7px;
+  margin: 3px 0 5px;
+  padding: 4px 7px;
   border-left: 2px solid var(--blue);
   border-radius: 4px;
   background: color-mix(in srgb, var(--blue) 8%, transparent);
@@ -2700,10 +2742,11 @@ html, body {
 }
 .session-card .sc-meta {
   display: flex;
-  gap: 16px;
+  gap: 11px;
   flex-wrap: wrap;
   font-size: 11px;
   color: var(--overlay1);
+  line-height: 1.35;
 }
 .session-card .sc-meta span {
   display: flex;
@@ -2715,21 +2758,23 @@ html, body {
 .session-card .sc-meta .provider-val { color: var(--blue); }
 .session-card .sc-meta .model-val { color: var(--green); }
 .session-card .sc-meta.sc-media {
-  padding-top: 4px;
-  border-top: 1px solid var(--surface1);
-  margin-top: 4px;
+  padding-top: 1px;
+  border-top: none;
+  margin-top: 1px;
 }
 .session-card .sc-actions {
   display: flex;
   gap: 6px;
-  padding-top: 6px;
-  margin-top: 4px;
-  border-top: 1px solid var(--surface1);
-  position: relative;
+  padding-top: 0;
+  margin-top: 0;
+  border-top: none;
+  position: absolute;
+  right: 12px;
+  top: 34px;
 }
 .sc-delete-btn {
   font-size: 11px;
-  padding: 2px 8px;
+  padding: 2px 7px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
   background: var(--surface0);
@@ -2743,7 +2788,7 @@ html, body {
 }
 .sc-resume-btn {
   font-size: 11px;
-  padding: 2px 8px;
+  padding: 2px 7px;
   border: 1px solid var(--green);
   border-radius: 4px;
   background: color-mix(in srgb, var(--green) 12%, transparent);
@@ -2803,32 +2848,8 @@ html, body {
 .sessions-filter input[type="checkbox"] {
   accent-color: var(--blue);
 }
-.sessions-filter select {
-  padding: 2px 6px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
-  color: var(--text);
-  font-size: 11px;
-  font-family: inherit;
-}
-.sessions-search-status {
-  min-height: 16px;
-  margin: -8px 0 12px;
-  color: var(--overlay1);
-  font-size: 11px;
-}
-.sessions-search-status.error {
-  color: var(--red);
-}
-.sessions-sort {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  color: var(--overlay0);
-  margin-left: 8px;
-}
+.sessions-control select,
+.sessions-filter select,
 .sessions-sort select {
   padding: 2px 6px;
   border: 1px solid var(--surface1);
@@ -2837,6 +2858,29 @@ html, body {
   color: var(--text);
   font-size: 11px;
   font-family: inherit;
+  height: 28px;
+  min-width: 0;
+}
+.sessions-search-status {
+  min-height: 16px;
+  margin: -4px 0 8px;
+  color: var(--overlay1);
+  font-size: 11px;
+}
+.sessions-search-status:empty {
+  display: none;
+}
+.sessions-search-status.error {
+  color: var(--red);
+}
+.sessions-sort {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--overlay0);
+  margin-left: 0;
 }
 .timeline-time-mark {
   position: absolute;
@@ -4787,16 +4831,26 @@ html, body {
   .log-entry .log-level { width: 44px; font-size: 10px; }
   .usage-card { min-width: unset; }
   .usage-cards { flex-direction: column; }
-  .sessions-header { align-items: stretch; }
-  .sessions-search { flex: 1 1 100%; max-width: none; margin-left: 0; }
+  .sessions-header,
+  .sessions-title-line { align-items: stretch; }
+  .sessions-title-line { flex-direction: column; }
+  .sessions-toolbar { grid-template-columns: 1fr; }
+  .sessions-search { max-width: none; margin-left: 0; }
   .sessions-new-task { width: 100%; min-width: 0; }
   .sessions-new-session-field { flex: 1 1 100%; max-width: none; }
   .sessions-project-row { flex-wrap: wrap; }
   .sessions-project-browse, .sessions-project-create-label { flex: 0 0 auto; }
   .sessions-start-btn { width: 100%; }
   .sessions-filter, .sessions-sort { margin-left: 0; }
-  .sessions-aggregate { flex-direction: column; }
+  .sessions-aggregate { grid-template-columns: 1fr 1fr; }
   .sessions-aggregate .agg-card { min-width: unset; }
+  .session-card { padding: 10px; }
+  .session-card .sc-top { align-items: flex-start; flex-wrap: wrap; }
+  .session-card .sc-title-block { flex-basis: 100%; }
+  .session-card .sc-actions {
+    position: static;
+    margin-top: 6px;
+  }
   .session-card .sc-meta { gap: 8px; }
   .budget-bar .bar-track { width: 40px; }
   .mic-btn { width: 40px; height: 40px; font-size: 16px; }
@@ -5453,29 +5507,37 @@ html, body {
         <div class="subtab-panes sessions-subtab-panes">
           <div class="subtab-pane active" id="sessions-pane-recent">
             <div class="sessions-header">
-              <span class="sessions-title">Recent Sessions</span>
-              <label class="sessions-search" for="sessions-search">
-                Search
-                <input type="search" id="sessions-search" placeholder="ID, task, model, path; logs if detailed..." autocomplete="off" spellcheck="false">
-              </label>
-              <button class="sessions-refresh" onclick="loadSessions()" style="margin-left:8px">Refresh</button>
-              <div class="sessions-filter" id="sessions-filter">
-                <label>Source
+              <div class="sessions-title-line">
+                <span class="sessions-title">Recent Sessions</span>
+                <button class="sessions-refresh" onclick="loadSessions()" title="Reload session list">Refresh</button>
+              </div>
+              <div class="sessions-toolbar">
+                <label class="sessions-search" for="sessions-search">
+                  <span>Search</span>
+                  <input type="search" id="sessions-search" placeholder="ID, task, model, path; logs if detailed..." autocomplete="off" spellcheck="false">
+                </label>
+                <label class="sessions-control">Source
                   <select id="filter-session-source">
-                    <option value="all" selected>all</option>
+                    <option value="all" selected>All sources</option>
                     <option value="intendant">Intendant</option>
-                    <option value="external">external</option>
+                    <option value="external">External agents</option>
                     <option value="codex">Codex</option>
                     <option value="claude-code">Claude</option>
                     <option value="gemini">Gemini</option>
                   </select>
                 </label>
-                <label><input type="checkbox" id="sessions-detailed-search"> detailed logs</label>
-                <label><input type="checkbox" id="filter-abandoned" checked> abandoned</label>
-                <label><input type="checkbox" id="filter-idle" checked> idle</label>
-              </div>
-              <div class="sessions-sort">
-                <label>Sort
+                <label class="sessions-control">Status
+                  <select id="filter-session-status">
+                    <option value="all" selected>All statuses</option>
+                    <option value="active">Active</option>
+                    <option value="idle">Idle</option>
+                    <option value="completed">Completed</option>
+                    <option value="abandoned">Abandoned</option>
+                    <option value="interrupted">Interrupted</option>
+                  </select>
+                </label>
+                <label class="sessions-toggle"><input type="checkbox" id="sessions-detailed-search"> Detailed logs</label>
+                <label class="sessions-sort">Sort
                   <select id="sort-sessions">
                     <option value="updated-desc" selected>Date changed (newest)</option>
                     <option value="updated-asc">Date changed (oldest)</option>
@@ -6246,9 +6308,8 @@ let selfVersion = '';
 const DIRECT_MODE_KEY = 'intendant_direct_mode';
 const VERBOSITY_KEY = 'intendant_verbosity';
 const HOST_FILTER_KEY = 'intendant_host_filter';
-const SESSIONS_FILTER_ABANDONED_KEY = 'intendant_sessions_filter_abandoned';
-const SESSIONS_FILTER_IDLE_KEY = 'intendant_sessions_filter_idle';
 const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
+const SESSIONS_FILTER_STATUS_KEY = 'intendant_sessions_filter_status';
 const SESSIONS_DETAILED_SEARCH_KEY = 'intendant_sessions_detailed_search';
 
 // Current Activity host filter selection. Empty string = show all
@@ -14976,30 +15037,22 @@ function restoreClientToggles() {
     // rather than duplicate to keep a single source of truth.
   }
 
-  // Sessions filter checkboxes default to checked in HTML; restore
-  // explicit stored preferences if the user toggled them previously.
-  const fa = document.getElementById('filter-abandoned');
-  if (fa) {
-    const stored = localStorage.getItem(SESSIONS_FILTER_ABANDONED_KEY);
-    if (stored !== null) fa.checked = stored === 'true';
-    fa.addEventListener('change', () => {
-      localStorage.setItem(SESSIONS_FILTER_ABANDONED_KEY, String(fa.checked));
-    });
-  }
-  const fi = document.getElementById('filter-idle');
-  if (fi) {
-    const stored = localStorage.getItem(SESSIONS_FILTER_IDLE_KEY);
-    if (stored !== null) fi.checked = stored === 'true';
-    fi.addEventListener('change', () => {
-      localStorage.setItem(SESSIONS_FILTER_IDLE_KEY, String(fi.checked));
-    });
-  }
+  // Sessions filters are UI preferences; restore them locally so reloads keep
+  // the same list shape without writing anything to intendant.toml.
   const fs = document.getElementById('filter-session-source');
   if (fs) {
     const stored = localStorage.getItem(SESSIONS_FILTER_SOURCE_KEY);
     if (stored && Array.from(fs.options).some(opt => opt.value === stored)) fs.value = stored;
     fs.addEventListener('change', () => {
       localStorage.setItem(SESSIONS_FILTER_SOURCE_KEY, fs.value);
+    });
+  }
+  const status = document.getElementById('filter-session-status');
+  if (status) {
+    const stored = localStorage.getItem(SESSIONS_FILTER_STATUS_KEY);
+    if (stored && Array.from(status.options).some(opt => opt.value === stored)) status.value = stored;
+    status.addEventListener('change', () => {
+      localStorage.setItem(SESSIONS_FILTER_STATUS_KEY, status.value);
     });
   }
   const ds = document.getElementById('sessions-detailed-search');
@@ -20502,9 +20555,8 @@ function _refreshSessionsFilters() {
   scheduleSessionLogSearch();
   _refilterSessions();
 }
-document.getElementById('filter-abandoned')?.addEventListener('change', _refilterSessions);
-document.getElementById('filter-idle')?.addEventListener('change', _refilterSessions);
 document.getElementById('filter-session-source')?.addEventListener('change', _refreshSessionsFilters);
+document.getElementById('filter-session-status')?.addEventListener('change', _refilterSessions);
 document.getElementById('sessions-detailed-search')?.addEventListener('change', _refreshSessionsFilters);
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
 document.getElementById('sessions-search')?.addEventListener('input', _refreshSessionsFilters);
@@ -20543,6 +20595,10 @@ function sessionSourceFilterValue() {
   return document.getElementById('filter-session-source')?.value || 'all';
 }
 
+function sessionStatusFilterValue() {
+  return document.getElementById('filter-session-status')?.value || 'all';
+}
+
 function sessionDetailedSearchEnabled() {
   return !!document.getElementById('sessions-detailed-search')?.checked;
 }
@@ -20551,6 +20607,12 @@ function sessionMatchesSourceFilter(source, filter) {
   if (!filter || filter === 'all') return true;
   if (filter === 'external') return source !== 'intendant';
   return source === filter;
+}
+
+function sessionMatchesStatusFilter(status, filter) {
+  if (!filter || filter === 'all') return true;
+  if (filter === 'active') return status === 'running' || status === 'in_progress';
+  return status === filter;
 }
 
 function sessionLogSearchKey(source, sessionId) {
@@ -20793,10 +20855,9 @@ function renderSessionsList(sessions, el) {
 
   const currentSessionId = (document.getElementById('sb-session').textContent || '').trim();
 
-  const showAbandoned = document.getElementById('filter-abandoned')?.checked ?? true;
-  const showIdle = document.getElementById('filter-idle')?.checked ?? true;
   const query = sessionSearchQuery();
   const sourceFilter = sessionSourceFilterValue();
+  const statusFilter = sessionStatusFilterValue();
   const detailedSearch = sessionDetailedSearchEnabled();
   let visibleCount = 0;
 
@@ -20814,8 +20875,7 @@ function renderSessionsList(sessions, el) {
 
     // Apply filters
     if (!sessionMatchesSourceFilter(source, sourceFilter)) continue;
-    if (!showAbandoned && displayStatus === 'abandoned') continue;
-    if (!showIdle && displayStatus === 'idle') continue;
+    if (!sessionMatchesStatusFilter(displayStatus, statusFilter)) continue;
     const summaryMatch = sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent);
     const logHit = sessionLogSearchHit(s, source, query, sourceFilter);
     if (query && detailedSearch) {
@@ -20834,7 +20894,8 @@ function renderSessionsList(sessions, el) {
     const sessionName = compactSessionText(s.name);
     const taskText = compactSessionText(s.task);
     const sessionId = s.session_id || '';
-    const primaryText = sessionName || taskText || '(no task)';
+    const primaryText = sessionName || taskText || 'Untitled session';
+    const titleKindText = sessionName ? 'name' : taskText ? 'initial' : 'untitled';
 
     // Top row: name/task + full ID + status badges
     const top = document.createElement('div');
@@ -20846,8 +20907,12 @@ function renderSessionsList(sessions, el) {
     titleRow.className = 'sc-title-row';
     const titleKind = document.createElement('span');
     titleKind.className = 'sc-title-kind';
-    titleKind.textContent = sessionName ? 'name' : 'initial';
-    titleKind.title = sessionName ? 'User-assigned session name' : 'Initial message fallback';
+    titleKind.textContent = titleKindText;
+    titleKind.title = sessionName
+      ? 'User-assigned session name'
+      : taskText
+        ? 'Initial message fallback'
+        : 'No initial message found';
     titleRow.appendChild(titleKind);
     const nameEl = document.createElement('div');
     nameEl.className = 'sc-name';
@@ -20855,12 +20920,6 @@ function renderSessionsList(sessions, el) {
     nameEl.title = primaryText;
     titleRow.appendChild(nameEl);
     titleBlock.appendChild(titleRow);
-
-    const idEl = document.createElement('span');
-    idEl.className = 'sc-id';
-    idEl.textContent = sessionId || shortId;
-    idEl.title = sessionId || shortId;
-    titleBlock.appendChild(idEl);
     top.appendChild(titleBlock);
 
     const statusEl = document.createElement('span');
@@ -20868,12 +20927,10 @@ function renderSessionsList(sessions, el) {
     statusEl.textContent = displayStatus.replace('_', ' ');
     top.appendChild(statusEl);
 
-    if (isExternal) {
-      const sourceEl = document.createElement('span');
-      sourceEl.className = 'sc-source';
-      sourceEl.textContent = s.source_label || prettyAgentName(source) || source;
-      top.appendChild(sourceEl);
-    }
+    const sourceEl = document.createElement('span');
+    sourceEl.className = 'sc-source' + (isExternal ? '' : ' local');
+    sourceEl.textContent = s.source_label || (isExternal ? prettyAgentName(source) : 'Intendant') || source;
+    top.appendChild(sourceEl);
 
     if (s.role) {
       const roleEl = document.createElement('span');
@@ -20920,6 +20977,20 @@ function renderSessionsList(sessions, el) {
     // Meta row
     const meta = document.createElement('div');
     meta.className = 'sc-meta';
+
+    if (sessionId || shortId) {
+      const id = document.createElement('span');
+      const idLabel = document.createElement('span');
+      idLabel.className = 'label';
+      idLabel.textContent = 'id';
+      const idVal = document.createElement('span');
+      idVal.className = 'value sc-id';
+      idVal.textContent = sessionId || shortId;
+      idVal.title = sessionId || shortId;
+      id.appendChild(idLabel);
+      id.appendChild(idVal);
+      meta.appendChild(id);
+    }
 
     if (s.created_at) {
       const ts = document.createElement('span');
