@@ -2343,7 +2343,9 @@ html, body {
 .session-detail { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .session-detail-header {
   display: flex; align-items: center; gap: 12px;
+  position: sticky; top: 0; z-index: 20;
   padding: 8px 0; border-bottom: 1px solid var(--surface0); margin-bottom: 8px;
+  background: var(--base);
   flex-shrink: 0;
 }
 .session-back-btn {
@@ -2352,7 +2354,54 @@ html, body {
   font-family: inherit; font-size: 12px; cursor: pointer;
 }
 .session-back-btn:hover { background: var(--surface1); }
-.session-detail-title { color: var(--text); font-size: 13px; }
+.session-detail-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.session-detail-title .sd-title-line,
+.session-detail-title .sd-title-subline {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.session-detail-title .sd-title-subline {
+  color: var(--overlay1);
+  font-size: 12px;
+}
+.session-detail-title .sd-title-kind,
+.session-card .sc-title-kind {
+  flex: 0 0 auto;
+  font-size: 9px;
+  line-height: 1.45;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--overlay0);
+  border: 1px solid var(--surface1);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.session-detail-title .sd-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-detail-title .sd-title-id {
+  flex: 0 1 auto;
+  min-width: 12ch;
+  color: var(--overlay1);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  user-select: text;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .session-detail-body { flex: 1; overflow-y: auto; display: flex; flex-direction: column; min-height: 0; }
 .sd-section { border-bottom: 1px solid var(--surface0); }
 .sd-section:last-child { border-bottom: none; flex: 1; display: flex; flex-direction: column; min-height: 200px; }
@@ -2454,7 +2503,15 @@ html, body {
   min-width: 0;
   flex: 1 1 auto;
 }
+.session-card .sc-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
 .session-card .sc-name {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 13px;
   color: var(--text);
   font-weight: 600;
@@ -20375,11 +20432,19 @@ function renderSessionsList(sessions, el) {
 
     const titleBlock = document.createElement('div');
     titleBlock.className = 'sc-title-block';
+    const titleRow = document.createElement('div');
+    titleRow.className = 'sc-title-row';
+    const titleKind = document.createElement('span');
+    titleKind.className = 'sc-title-kind';
+    titleKind.textContent = sessionName ? 'name' : 'initial';
+    titleKind.title = sessionName ? 'User-assigned session name' : 'Initial message fallback';
+    titleRow.appendChild(titleKind);
     const nameEl = document.createElement('div');
     nameEl.className = 'sc-name';
     nameEl.textContent = primaryText;
     nameEl.title = primaryText;
-    titleBlock.appendChild(nameEl);
+    titleRow.appendChild(nameEl);
+    titleBlock.appendChild(titleRow);
 
     const idEl = document.createElement('span');
     idEl.className = 'sc-id';
@@ -20701,10 +20766,39 @@ function openSessionDetail(sessionOrId, taskArg) {
   headerEl.style.display = 'none';
   detailEl.style.display = 'flex';
   const sourceLabel = session.source_label || (source === 'intendant' ? 'Intendant' : prettyAgentName(source) || source);
-  titleEl.textContent = sessionName
-    ? `${sessionName} · ${sourceLabel} ${sessionId}`
-    : `${task} · ${sourceLabel} ${sessionId}`;
-  titleEl.title = sessionName ? `${task} · ${sessionId}` : sessionId;
+  titleEl.innerHTML = '';
+  const titleLine = document.createElement('div');
+  titleLine.className = 'sd-title-line';
+  const titleKind = document.createElement('span');
+  titleKind.className = 'sd-title-kind';
+  titleKind.textContent = sessionName ? 'name' : 'initial';
+  titleKind.title = sessionName ? 'User-assigned session name' : 'Initial message fallback';
+  const titleText = document.createElement('span');
+  titleText.className = 'sd-title-text';
+  titleText.textContent = sessionName || task;
+  titleText.title = sessionName || task;
+  const titleId = document.createElement('span');
+  titleId.className = 'sd-title-id';
+  titleId.textContent = `${sourceLabel} ${sessionId}`;
+  titleId.title = sessionId;
+  titleLine.appendChild(titleKind);
+  titleLine.appendChild(titleText);
+  titleLine.appendChild(titleId);
+  titleEl.appendChild(titleLine);
+  if (sessionName && task) {
+    const subline = document.createElement('div');
+    subline.className = 'sd-title-subline';
+    const subKind = document.createElement('span');
+    subKind.className = 'sd-title-kind';
+    subKind.textContent = 'initial';
+    const subText = document.createElement('span');
+    subText.className = 'sd-title-text';
+    subText.textContent = task;
+    subText.title = task;
+    subline.appendChild(subKind);
+    subline.appendChild(subText);
+    titleEl.appendChild(subline);
+  }
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
 
   // Reset sections
