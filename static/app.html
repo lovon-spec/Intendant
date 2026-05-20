@@ -21547,12 +21547,16 @@ function worktreeDateSortValue(wt, field) {
   return d ? d.getTime() : 0;
 }
 
-function fmtWorktreeAge(days) {
-  if (days === null || days === undefined || !Number.isFinite(Number(days))) return '--';
-  const n = Number(days);
-  if (n <= 0) return 'today';
-  if (n === 1) return '1 day';
-  return `${n.toLocaleString()} days`;
+function fmtWorktreeMinute(value) {
+  const d = worktreeDate(value);
+  if (!d) return '--';
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(d);
 }
 
 function worktreeSearchText(wt) {
@@ -21598,6 +21602,80 @@ function worktreeRemoveCommand(wt) {
   return `git -C ${shellQuote(wt.repo_root)} worktree remove ${shellQuote(wt.path)}`;
 }
 
+function recomputeWorktreeSummary(scan) {
+  const rows = Array.isArray(scan?.worktrees) ? scan.worktrees : [];
+  const summary = {
+    worktrees: rows.length,
+    repos: new Set(rows.map(wt => wt.repo_root).filter(Boolean)).size,
+    total_bytes: 0,
+    dirty: 0,
+    unmerged: 0,
+    active: 0,
+    stale: 0,
+    cleanup_candidates: 0,
+    truncated_sizes: 0,
+  };
+  for (const wt of rows) {
+    summary.total_bytes += Number(wt.size_bytes || 0);
+    if (wt.dirty) summary.dirty += 1;
+    if (wt.merge_status === 'unmerged') summary.unmerged += 1;
+    if ((wt.active_sessions || 0) > 0) summary.active += 1;
+    if ((wt.labels || []).includes('stale')) summary.stale += 1;
+    if (wt.safe_to_remove) summary.cleanup_candidates += 1;
+    if (wt.size_truncated) summary.truncated_sizes += 1;
+  }
+  scan.summary = summary;
+}
+
+function removeWorktree(wt, button) {
+  const branch = wt.branch || wt.head_short || '(unknown ref)';
+  const ok = window.confirm(
+    `Remove worktree ${branch}?\n\n` +
+    `Path: ${wt.path}\n` +
+    `Repo: ${wt.repo_root}\n\n` +
+    `${wt.safety || 'This worktree was marked as safe to remove.'}\n\n` +
+    'Before removing, Intendant will re-check that this is not the main worktree, has no active sessions, is not locked, is clean, is merged or prunable, and still points at the same HEAD.'
+  );
+  if (!ok) return;
+
+  if (button) button.disabled = true;
+  setWorktreesStatus(`Removing ${wt.path}...`);
+  authedFetch('/api/worktrees/remove', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      repo_root: wt.repo_root,
+      path: wt.path,
+      expected_head: wt.head || null,
+    }),
+  })
+    .then(async r => {
+      const text = await r.text();
+      let result = {};
+      try { result = text ? JSON.parse(text) : {}; } catch (_) {}
+      if (!r.ok || result.ok === false) {
+        throw new Error(result.error || `worktree removal returned ${r.status}`);
+      }
+      return result;
+    })
+    .then(result => {
+      const freed = Number(result.size_bytes || wt.size_bytes || 0);
+      if (_cachedWorktreeScan && Array.isArray(_cachedWorktreeScan.worktrees)) {
+        _cachedWorktreeScan.worktrees = _cachedWorktreeScan.worktrees
+          .filter(entry => entry.path !== wt.path);
+        recomputeWorktreeSummary(_cachedWorktreeScan);
+        renderWorktrees(_cachedWorktreeScan);
+      }
+      setWorktreesStatus(`Removed ${wt.path}. Freed about ${_fmtBytes(freed)}. Click Scan to refresh from disk.`);
+    })
+    .catch(err => {
+      setWorktreesStatus(err.message || 'Worktree removal failed', 'error');
+    })
+    .finally(() => {
+      if (button) button.disabled = false;
+    });
+}
+
 function renderWorktreesList(scan, el) {
   if (!el) return;
   el.innerHTML = '';
@@ -21633,7 +21711,7 @@ function renderWorktreesList(scan, el) {
       case 'changed-asc':
         return worktreeDateSortValue(a, 'last_changed_at') - worktreeDateSortValue(b, 'last_changed_at');
       case 'head-age-desc':
-        return (b.head_age_days || 0) - (a.head_age_days || 0);
+        return worktreeDateSortValue(a, 'head_author_time') - worktreeDateSortValue(b, 'head_author_time');
       case 'risk-desc':
         return worktreeRiskRank(b) - worktreeRiskRank(a) || (b.size_bytes || 0) - (a.size_bytes || 0);
       case 'path-asc':
@@ -21703,7 +21781,7 @@ function renderWorktreesList(scan, el) {
 
     const meta = document.createElement('div');
     meta.className = 'sc-meta';
-    const addMeta = (label, value, color) => {
+    const addMeta = (label, value, color, title) => {
       if (value === null || value === undefined || value === '') return;
       const span = document.createElement('span');
       const l = document.createElement('span');
@@ -21712,6 +21790,7 @@ function renderWorktreesList(scan, el) {
       const v = document.createElement('span');
       v.className = 'value';
       v.textContent = value;
+      if (title) v.title = title;
       if (color) v.style.color = color;
       span.appendChild(l);
       span.appendChild(v);
@@ -21719,8 +21798,8 @@ function renderWorktreesList(scan, el) {
     };
     addMeta('repo', wt.repo_name);
     addMeta('size', _fmtBytes(wt.size_bytes || 0) + (wt.size_truncated ? ' +' : ''), wt.safe_to_remove ? 'var(--green)' : null);
-    addMeta('changed', fmtWorktreeAge(wt.last_changed_age_days));
-    addMeta('commit age', fmtWorktreeAge(wt.head_age_days));
+    addMeta('changed', fmtWorktreeMinute(wt.last_changed_at), null, wt.last_changed_at || '');
+    addMeta('commit', fmtWorktreeMinute(wt.head_author_time), null, wt.head_author_time || '');
     addMeta('merge', wt.merge_status, wt.merge_status === 'merged' ? 'var(--green)' : (wt.merge_status === 'unmerged' ? 'var(--red)' : null));
     if (wt.ahead || wt.behind) addMeta('upstream', `+${wt.ahead || 0} / -${wt.behind || 0}`);
     if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'var(--red)');
@@ -21746,10 +21825,16 @@ function renderWorktreesList(scan, el) {
 
     if (wt.safe_to_remove) {
       const command = worktreeRemoveCommand(wt);
-      const cmd = document.createElement('span');
-      cmd.className = 'wt-command';
-      cmd.textContent = command;
-      cmd.title = command;
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'sc-delete-btn';
+      removeBtn.textContent = 'Remove worktree...';
+      removeBtn.title = 'Re-check safety and remove this worktree';
+      removeBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        removeWorktree(wt, removeBtn);
+      });
+      actions.appendChild(removeBtn);
+
       const copyCmd = document.createElement('button');
       copyCmd.className = 'sc-resume-btn';
       copyCmd.textContent = 'Copy remove command';
@@ -21761,6 +21846,10 @@ function renderWorktreesList(scan, el) {
         );
       });
       actions.appendChild(copyCmd);
+      const cmd = document.createElement('span');
+      cmd.className = 'wt-command';
+      cmd.textContent = command;
+      cmd.title = command;
       actions.appendChild(cmd);
     }
     card.appendChild(actions);

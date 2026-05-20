@@ -3600,6 +3600,38 @@ fn scan_worktree_inventory_response(home: &Path, project_root: Option<&Path>) ->
     serde_json::to_string(&scan).unwrap_or_else(|_| "{}".to_string())
 }
 
+fn remove_worktree_inventory_response(home: &Path, body_text: &str) -> (&'static str, String) {
+    let request =
+        match serde_json::from_str::<crate::worktree_inventory::WorktreeRemoveRequest>(body_text) {
+            Ok(request) => request,
+            Err(e) => {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": format!("invalid worktree removal request: {e}")
+                    })
+                    .to_string(),
+                );
+            }
+        };
+    let hints = worktree_session_hints_from_home(home);
+    match crate::worktree_inventory::remove_worktree_if_safe(request, &hints) {
+        Ok(response) => (
+            "200 OK",
+            serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
+        ),
+        Err(e) => (
+            "409 Conflict",
+            serde_json::json!({
+                "ok": false,
+                "error": e
+            })
+            .to_string(),
+        ),
+    }
+}
+
 fn worktree_session_hints_from_home(
     home: &Path,
 ) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
@@ -10391,6 +10423,36 @@ pub fn spawn_web_gateway(
                              {body}",
                             body.len(),
                         );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/worktrees/remove")
+                    {
+                        let body_text = read_request_body(&mut stream, &header_text).await;
+                        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                        let cache = worktree_inventory_cache.clone();
+                        let (status, body) = match tokio::task::spawn_blocking(move || {
+                            let result = remove_worktree_inventory_response(&home, &body_text);
+                            if result.0 == "200 OK" {
+                                if let Ok(mut guard) = cache.lock() {
+                                    *guard = None;
+                                }
+                            }
+                            result
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => (
+                                "500 Internal Server Error",
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("worktree removal task failed: {e}")
+                                })
+                                .to_string(),
+                            ),
+                        };
+                        let response = json_response(status, body);
+                        use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
                         && request_line.contains(" /api/worktrees/scan")

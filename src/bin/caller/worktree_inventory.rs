@@ -106,6 +106,24 @@ pub struct RelatedSession {
     pub updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeRemoveRequest {
+    pub repo_root: PathBuf,
+    pub path: PathBuf,
+    pub expected_head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeRemoveResponse {
+    pub ok: bool,
+    pub path: PathBuf,
+    pub repo_root: PathBuf,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub size_bytes: u64,
+    pub safety: String,
+}
+
 #[derive(Debug, Default)]
 struct RawWorktree {
     path: PathBuf,
@@ -231,6 +249,95 @@ pub fn scan_worktrees(
         worktrees,
         errors,
     }
+}
+
+pub fn remove_worktree_if_safe(
+    request: WorktreeRemoveRequest,
+    session_hints: &[WorktreeSessionHint],
+) -> Result<WorktreeRemoveResponse, String> {
+    if !request.repo_root.is_absolute() {
+        return Err("repo_root must be an absolute path".to_string());
+    }
+    if !request.path.is_absolute() {
+        return Err("worktree path must be an absolute path".to_string());
+    }
+
+    let repo_root = git_repo_root(&request.repo_root).ok_or_else(|| {
+        format!(
+            "{} is not the root of a Git repository",
+            request.repo_root.display()
+        )
+    })?;
+    if !same_path(&repo_root, &request.repo_root) {
+        return Err(format!(
+            "repo_root resolves to {}; scan again before removing",
+            repo_root.display()
+        ));
+    }
+
+    let raw = list_git_worktrees(&repo_root)?
+        .into_iter()
+        .find(|raw| same_path(&raw.path, &request.path))
+        .ok_or_else(|| {
+            format!(
+                "{} is not registered as a worktree for {}",
+                request.path.display(),
+                repo_root.display()
+            )
+        })?;
+
+    let mut default_branches = HashMap::new();
+    default_branches.insert(path_key(&repo_root), default_branch_for_repo(&repo_root));
+    let entry = enrich_worktree(raw, &default_branches, session_hints)?;
+
+    if let Some(expected) = request
+        .expected_head
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if entry.head.as_deref() != Some(expected) {
+            return Err(
+                "worktree HEAD changed since the last scan; scan again before removing".to_string(),
+            );
+        }
+    }
+
+    if !entry.safe_to_remove {
+        return Err(format!("safety check refused removal: {}", entry.safety));
+    }
+
+    let output = Command::new("git")
+        .arg("-c")
+        .arg("color.ui=false")
+        .args(["worktree", "remove"])
+        .arg(&entry.path)
+        .current_dir(&entry.repo_root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "git worktree remove failed".to_string()
+        };
+        return Err(detail);
+    }
+
+    Ok(WorktreeRemoveResponse {
+        ok: true,
+        path: entry.path,
+        repo_root: entry.repo_root,
+        branch: entry.branch,
+        head: entry.head,
+        size_bytes: entry.size_bytes,
+        safety: entry.safety,
+    })
 }
 
 fn default_scan_roots(
@@ -968,6 +1075,13 @@ mod tests {
         tmp.path().join("repo")
     }
 
+    fn canonical_child_path(path: &Path) -> PathBuf {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
     #[test]
     fn scan_marks_clean_merged_worktree_as_candidate() {
         let tmp = init_repo();
@@ -1040,5 +1154,106 @@ mod tests {
         assert_eq!(found.active_sessions, 1);
         assert!(!found.safe_to_remove);
         assert!(found.labels.iter().any(|l| l == "active"));
+    }
+
+    #[test]
+    fn remove_safe_worktree_deletes_clean_merged_worktree() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("remove-worktree");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "remove-me", &wt_str, "main"],
+        );
+
+        let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
+        let found = scan
+            .worktrees
+            .iter()
+            .find(|entry| entry.branch.as_deref() == Some("remove-me"))
+            .expect("remove-me worktree found");
+        assert!(found.safe_to_remove);
+
+        let response = remove_worktree_if_safe(
+            WorktreeRemoveRequest {
+                repo_root: repo.clone(),
+                path: wt.clone(),
+                expected_head: found.head.clone(),
+            },
+            &[],
+        )
+        .expect("safe worktree removed");
+
+        assert!(response.ok);
+        assert_eq!(
+            canonical_child_path(&response.path),
+            canonical_child_path(&wt)
+        );
+        assert!(!wt.exists());
+        let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
+        assert!(!scan
+            .worktrees
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some("remove-me")));
+    }
+
+    #[test]
+    fn remove_dirty_worktree_is_refused() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("dirty-remove-worktree");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "dirty-remove", &wt_str, "main"],
+        );
+        std::fs::write(wt.join("scratch.txt"), "local\n").unwrap();
+
+        let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
+        let found = scan
+            .worktrees
+            .iter()
+            .find(|entry| entry.branch.as_deref() == Some("dirty-remove"))
+            .expect("dirty-remove worktree found");
+        assert!(!found.safe_to_remove);
+
+        let err = remove_worktree_if_safe(
+            WorktreeRemoveRequest {
+                repo_root: repo,
+                path: wt.clone(),
+                expected_head: found.head.clone(),
+            },
+            &[],
+        )
+        .expect_err("dirty worktree refused");
+
+        assert!(err.contains("safety check refused"));
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn remove_worktree_refuses_changed_head() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("changed-head-worktree");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "changed-head", &wt_str, "main"],
+        );
+
+        let err = remove_worktree_if_safe(
+            WorktreeRemoveRequest {
+                repo_root: repo,
+                path: wt.clone(),
+                expected_head: Some("0000000000000000000000000000000000000000".to_string()),
+            },
+            &[],
+        )
+        .expect_err("changed head refused");
+
+        assert!(err.contains("HEAD changed"));
+        assert!(wt.exists());
     }
 }
