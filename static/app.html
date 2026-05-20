@@ -1268,6 +1268,7 @@ html, body {
   box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.35);
 }
 .session-window-header {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1359,6 +1360,34 @@ html, body {
   cursor: pointer;
 }
 .session-window-action:hover { background: var(--surface0); color: var(--text); }
+.session-window-menu {
+  position: absolute;
+  top: 32px;
+  right: 34px;
+  z-index: 30;
+  min-width: 138px;
+  padding: 4px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--mantle);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+}
+.session-window-menu button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  border: 0;
+  border-radius: 4px;
+  padding: 6px 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.session-window-menu button:hover {
+  background: var(--surface0);
+}
 .session-window-log {
   flex: 1;
   min-height: 0;
@@ -7790,8 +7819,8 @@ function applyCodexConfigChanged(evt) {
 // matching CodexThreadActionResult arrives (or a short timeout elapses).
 const controlPendingActions = new Map(); // op -> { timeoutHandle, btnEl }
 
-function dispatchCodexThreadAction(op, params) {
-  const sid = resolvePromptTargetSessionId();
+function dispatchCodexThreadAction(op, params, sessionId = '') {
+  const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
   const payload = { action: 'codex_thread_action', op, params: params || {} };
   if (sid) payload.session_id = sid;
   dispatchControlMsg(payload);
@@ -8012,60 +8041,71 @@ function handleCodexThreadActionResult(evt) {
   );
 }
 
+function promptCodexThreadActionParams(opts = {}) {
+  let params = {};
+  if (opts.promptName) {
+    const name = window.prompt('Fork name (leave empty for auto):', '');
+    if (name === null) return null;
+    if (name.trim()) params.name = name.trim();
+  } else if (opts.promptReview) {
+    const prompt = window.prompt(
+      'Review prompt (leave empty to review current changes with Codex defaults):',
+      ''
+    );
+    if (prompt === null) return null;
+    if (prompt.trim()) params.prompt = prompt.trim();
+  } else if (opts.promptRename) {
+    const name = window.prompt('Thread name:', '');
+    if (name === null) return null;
+    if (!name.trim()) {
+      showControlToast('error', '/rename failed: thread name is required');
+      return null;
+    }
+    params.name = name.trim();
+  } else if (opts.promptGoal) {
+    const objective = window.prompt('Goal objective:', '');
+    if (objective === null) return null;
+    if (!objective.trim()) {
+      showControlToast('error', '/goal failed: objective is required');
+      return null;
+    }
+    if ([...objective.trim()].length > 4000) {
+      showControlToast('error', '/goal failed: objective must be 4000 characters or fewer');
+      return null;
+    }
+    params.objective = objective.trim();
+    const budget = window.prompt('Token budget (optional):', '');
+    if (budget === null) return null;
+    if (budget.trim()) {
+      const parsed = parseInt(budget.trim(), 10);
+      if (isNaN(parsed) || parsed <= 0) {
+        showControlToast('error', '/goal failed: token budget must be a positive integer');
+        return null;
+      }
+      params.tokenBudget = parsed;
+    }
+  } else if (opts.turns) {
+    const n = parseInt(opts.turns, 10);
+    if (!isNaN(n) && n > 0) params.turns = n;
+  }
+  if (opts.confirm && !window.confirm(opts.confirm)) return null;
+  return params;
+}
+
 function onControlActionBtnClick(ev) {
   const btn = ev.currentTarget;
   if (btn.classList.contains('pending') || btn.disabled) return;
   const op = btn.dataset.codexAction;
   if (!op) return;
-  let params = {};
-  // Prompt for actions that need extra input. Plain prompts keep this control
-  // pane dependency-free; a dedicated modal can come later if needed.
-  if (btn.dataset.promptName) {
-    const name = window.prompt('Fork name (leave empty for auto):', '');
-    if (name === null) return; // user cancelled
-    if (name.trim()) params.name = name.trim();
-  } else if (btn.dataset.promptReview) {
-    const prompt = window.prompt(
-      'Review prompt (leave empty to review current changes with Codex defaults):',
-      ''
-    );
-    if (prompt === null) return;
-    if (prompt.trim()) params.prompt = prompt.trim();
-  } else if (btn.dataset.promptRename) {
-    const name = window.prompt('Thread name:', '');
-    if (name === null) return;
-    if (!name.trim()) {
-      showControlToast('error', '/rename failed: thread name is required');
-      return;
-    }
-    params.name = name.trim();
-  } else if (btn.dataset.promptGoal) {
-    const objective = window.prompt('Goal objective:', '');
-    if (objective === null) return;
-    if (!objective.trim()) {
-      showControlToast('error', '/goal failed: objective is required');
-      return;
-    }
-    if ([...objective.trim()].length > 4000) {
-      showControlToast('error', '/goal failed: objective must be 4000 characters or fewer');
-      return;
-    }
-    params.objective = objective.trim();
-    const budget = window.prompt('Token budget (optional):', '');
-    if (budget === null) return;
-    if (budget.trim()) {
-      const parsed = parseInt(budget.trim(), 10);
-      if (isNaN(parsed) || parsed <= 0) {
-        showControlToast('error', '/goal failed: token budget must be a positive integer');
-        return;
-      }
-      params.tokenBudget = parsed;
-    }
-  } else if (btn.dataset.turns) {
-    const n = parseInt(btn.dataset.turns, 10);
-    if (!isNaN(n) && n > 0) params.turns = n;
-  }
-  if (btn.dataset.confirm && !window.confirm(btn.dataset.confirm)) return;
+  const params = promptCodexThreadActionParams({
+    promptName: btn.dataset.promptName,
+    promptReview: btn.dataset.promptReview,
+    promptRename: btn.dataset.promptRename,
+    promptGoal: btn.dataset.promptGoal,
+    turns: btn.dataset.turns,
+    confirm: btn.dataset.confirm,
+  });
+  if (params === null) return;
   // Init is a task dispatch, not an RPC: send as a regular task instead so
   // the agent loop picks it up and AGENTS.md flows through the normal
   // approval path. The backend dispatcher also accepts /init and will
@@ -8549,6 +8589,79 @@ function syncSessionWindowMetadataRefresh() {
   }
 }
 
+const SESSION_WINDOW_CODEX_ACTIONS = [
+  { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', promptName: true },
+  { op: 'rename', label: 'Rename...', title: 'Rename this Codex thread', promptRename: true },
+  { op: 'goal', label: 'Configure goal...', title: 'Create or update this thread goal', promptGoal: true },
+  { op: 'goal-get', label: 'Goal status', title: 'Fetch this thread goal' },
+  { op: 'compact', label: 'Compact', title: 'Compact this thread history' },
+];
+
+function sessionWindowIsCodex(sessionId, win = null) {
+  const sid = String(sessionId || '').trim();
+  const current = win || (sid ? sessionWindows.get(sid) : null);
+  const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  return normalizeAgentId(current?.source || meta.source || '') === 'codex';
+}
+
+function closeSessionWindowMenus(exceptSessionId = '') {
+  const except = String(exceptSessionId || '').trim();
+  let closed = false;
+  for (const [sid, win] of sessionWindows) {
+    if (sid === except || !win.actionMenu) continue;
+    if (!win.actionMenu.classList.contains('hidden')) closed = true;
+    win.actionMenu.classList.add('hidden');
+    win.actionMenuButton?.setAttribute('aria-expanded', 'false');
+  }
+  return closed;
+}
+
+function setSessionWindowMenuOpen(sessionId, open) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win || !win.actionMenu || !win.actionMenuButton) return false;
+  const nextOpen = !!open && sessionWindowIsCodex(sid, win);
+  closeSessionWindowMenus(nextOpen ? sid : '');
+  win.actionMenu.classList.toggle('hidden', !nextOpen);
+  win.actionMenuButton.setAttribute('aria-expanded', nextOpen ? 'true' : 'false');
+  return nextOpen;
+}
+
+function toggleSessionWindowMenu(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win || !win.actionMenu) return;
+  setSessionWindowMenuOpen(sid, win.actionMenu.classList.contains('hidden'));
+}
+
+function updateSessionWindowActionMenuVisibility(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win || !win.actionMenuButton) return;
+  const isCodex = sessionWindowIsCodex(sid, win);
+  win.actionMenuButton.classList.toggle('hidden', !isCodex);
+  win.actionMenuButton.disabled = !isCodex;
+  win.actionMenuButton.title = isCodex
+    ? 'Codex actions'
+    : 'Codex actions unavailable for this session';
+  win.actionMenuButton.setAttribute('aria-label', win.actionMenuButton.title);
+  if (!isCodex) setSessionWindowMenuOpen(sid, false);
+}
+
+function runSessionWindowCodexAction(sessionId, op) {
+  const sid = String(sessionId || '').trim();
+  const spec = SESSION_WINDOW_CODEX_ACTIONS.find(action => action.op === op);
+  if (!sid || !spec) return;
+  if (!sessionWindowIsCodex(sid)) {
+    showControlToast('error', 'Codex actions are only available for Codex sessions');
+    return;
+  }
+  const params = promptCodexThreadActionParams(spec);
+  if (params === null) return;
+  markActionPending(op);
+  dispatchCodexThreadAction(op, params, sid);
+}
+
 function ensureSessionWindow(sessionId, meta = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
@@ -8599,6 +8712,26 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const status = document.createElement('span');
   status.className = 'session-window-status';
   status.textContent = normalizeSessionPhase(meta.phase || 'idle');
+  const actions = document.createElement('button');
+  actions.className = 'session-window-action session-window-actions hidden';
+  actions.type = 'button';
+  actions.title = 'Codex actions';
+  actions.setAttribute('aria-label', actions.title);
+  actions.setAttribute('aria-haspopup', 'menu');
+  actions.setAttribute('aria-expanded', 'false');
+  actions.textContent = '\u22EF';
+  const actionMenu = document.createElement('div');
+  actionMenu.className = 'session-window-menu hidden';
+  actionMenu.setAttribute('role', 'menu');
+  SESSION_WINDOW_CODEX_ACTIONS.forEach(action => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.textContent = action.label;
+    item.title = action.title;
+    item.dataset.sessionWindowAction = action.op;
+    item.setAttribute('role', 'menuitem');
+    actionMenu.appendChild(item);
+  });
   const maximize = document.createElement('button');
   maximize.className = 'session-window-action session-window-maximize';
   maximize.type = 'button';
@@ -8613,8 +8746,10 @@ function ensureSessionWindow(sessionId, meta = {}) {
   close.textContent = '\u00d7';
   header.appendChild(title);
   header.appendChild(status);
+  header.appendChild(actions);
   header.appendChild(maximize);
   header.appendChild(close);
+  header.appendChild(actionMenu);
 
   const log = document.createElement('div');
   log.className = 'session-window-log';
@@ -8624,12 +8759,30 @@ function ensureSessionWindow(sessionId, meta = {}) {
   el.appendChild(log);
   el.addEventListener('mousedown', () => focusSessionWindow(sid));
   el.addEventListener('focus', () => focusSessionWindow(sid));
+  actions.addEventListener('mousedown', (e) => e.stopPropagation());
+  actions.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    focusSessionWindow(sid);
+    toggleSessionWindowMenu(sid);
+  });
+  actionMenu.addEventListener('mousedown', (e) => e.stopPropagation());
+  actionMenu.addEventListener('click', (e) => {
+    const item = e.target.closest?.('[data-session-window-action]');
+    if (!item) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setSessionWindowMenuOpen(sid, false);
+    runSessionWindowCodexAction(sid, item.dataset.sessionWindowAction);
+  });
   maximize.addEventListener('click', (e) => {
     e.stopPropagation();
+    closeSessionWindowMenus();
     toggleSessionWindowMaximized(sid);
   });
   close.addEventListener('click', (e) => {
     e.stopPropagation();
+    setSessionWindowMenuOpen(sid, false);
     el.remove();
     sessionWindows.delete(sid);
     if (maximizedSessionWindowId === sid) maximizedSessionWindowId = '';
@@ -8659,6 +8812,9 @@ function ensureSessionWindow(sessionId, meta = {}) {
     cwd,
     task,
     status,
+    source: meta.source || '',
+    actionMenuButton: actions,
+    actionMenu,
     maximize,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
     pendingActiveUntil: 0,
@@ -8700,6 +8856,9 @@ function updateSessionWindow(sessionId, meta = {}) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
   }
+  if (meta.source) {
+    win.source = meta.source;
+  }
   if (meta.ended !== undefined) {
     win.ended = !!meta.ended;
     if (win.ended) win.pendingActiveUntil = 0;
@@ -8714,6 +8873,7 @@ function updateSessionWindow(sessionId, meta = {}) {
     const cls = sessionPhaseClass(win.phase);
     if (cls) win.status.classList.add(cls);
   }
+  updateSessionWindowActionMenuVisibility(sid);
 }
 
 function updateSessionWindowMaximizeState() {
@@ -8790,6 +8950,10 @@ window.focusForegroundSessionWindow = function() {
     win.el.focus();
   }
 };
+
+document.addEventListener('click', () => {
+  closeSessionWindowMenus();
+});
 
 function appendLogEntryToSessionWindow(entry) {
   const sid = entry?.dataset?.sessionId || '';
@@ -9613,6 +9777,9 @@ function updateStatusBar(d) {
       el.style.display = '';
       sep.style.display = '';
       lbl.style.display = '';
+      if (currentSessionFullId) {
+        updateSessionWindow(currentSessionFullId, { source: prettyAgentName(shortId) });
+      }
     } else {
       el.style.display = 'none';
       sep.style.display = 'none';
@@ -20307,6 +20474,10 @@ function renderSessionDetailEntries(entries, el) {
 // ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+  if (e.key === 'Escape' && closeSessionWindowMenus()) {
+    e.preventDefault();
+    return;
+  }
   if (e.key === 'Escape' && maximizedSessionWindowId && !shouldDeferSessionWindowEscape()) {
     setSessionWindowMaximized(maximizedSessionWindowId, false);
     e.preventDefault();
