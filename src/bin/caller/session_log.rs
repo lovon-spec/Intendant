@@ -2781,6 +2781,14 @@ pub fn session_log_entry_to_app_event(
             output_tokens: 0,
             cached_tokens: 0,
             thinking_tokens: 0,
+            input_text_tokens: 0,
+            input_audio_tokens: 0,
+            input_image_tokens: 0,
+            cached_text_tokens: 0,
+            cached_audio_tokens: 0,
+            cached_image_tokens: 0,
+            output_text_tokens: 0,
+            output_audio_tokens: 0,
         }),
 
         // ── User transcript ──

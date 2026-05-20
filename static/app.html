@@ -9657,8 +9657,16 @@ function updateTickerFromUsage(c) {
   const thinking = d.thinking_tokens || 0;
   const cacheHit = input > 0 ? Math.round(cached / input * 100) : 0;
 
-  // Cost estimate (gpt-realtime-1.5: $5/1M in, $20/1M out, cached $2.50/1M)
-  const cost = (input * 5 + output * 20 + cached * 2.5) / 1000000;
+  let liveCost = null;
+  if (c.cost_json) {
+    try {
+      const costSummary = typeof c.cost_json === 'string' ? JSON.parse(c.cost_json) : c.cost_json;
+      const liveLine = Array.isArray(costSummary?.lines)
+        ? costSummary.lines.find(line => line.label === 'Live Model')
+        : null;
+      if (liveLine && Number.isFinite(Number(liveLine.cost))) liveCost = Number(liveLine.cost);
+    } catch {}
+  }
 
   // Collapsed view
   const tkTokens = document.getElementById('tk-tokens');
@@ -9666,14 +9674,14 @@ function updateTickerFromUsage(c) {
   const tkCost = document.getElementById('tk-cost');
   tkTokens.textContent = fmtK(total) + ' tok';
   tkCached.textContent = fmtK(cached) + ' cached (' + cacheHit + '%)';
-  tkCost.textContent = '$' + cost.toFixed(3);
+  tkCost.textContent = liveCost == null ? '$--' : formatUsd(liveCost, 4);
   flashEl(tkTokens);
 
   // Expanded view
   document.getElementById('tk-detail-1').textContent =
     'Live: ' + total.toLocaleString() + ' tokens (in: ' + input.toLocaleString() + ' | out: ' + output.toLocaleString() + ' | think: ' + thinking.toLocaleString() + ')';
   document.getElementById('tk-detail-2').textContent =
-    'Cache: ' + cached.toLocaleString() + ' / ' + input.toLocaleString() + ' input = ' + cacheHit + '% hit | Frames: ' + tickerFramesSent + ' sent, ' + tickerFramesDropped + ' dropped | Cost: $' + cost.toFixed(3);
+    'Cache: ' + cached.toLocaleString() + ' / ' + input.toLocaleString() + ' input = ' + cacheHit + '% hit | Frames: ' + tickerFramesSent + ' sent, ' + tickerFramesDropped + ' dropped | Cost: ' + (liveCost == null ? '$--' : formatUsd(liveCost, 4));
 }
 
 function updateTickerFrames() {
@@ -18396,8 +18404,15 @@ function sessionCost(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function formatUsd(value, digits) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '$--';
+  const places = digits != null ? digits : (Math.abs(n) > 0 && Math.abs(n) < 1 ? 4 : 2);
+  return '$' + n.toFixed(places);
+}
+
 function sessionDate(session) {
-  const raw = session && (session.created_at || session.updated_at);
+  const raw = session && (session.updated_at || session.created_at);
   if (!raw) return null;
   const normalized = typeof raw === 'string' && raw.includes(' ') && !raw.includes('T')
     ? raw.replace(' ', 'T')
@@ -18561,7 +18576,7 @@ function renderSessionStatsFallback(sessions) {
       { label: 'Cached', value: cached.toLocaleString(), color: 'var(--green)' },
       { label: 'Output tokens', value: output.toLocaleString() },
       { label: 'Total tokens', value: total.toLocaleString() },
-      { label: 'Estimated cost', value: `$${sessionCost(latest.estimated_cost).toFixed(4)}`, color: 'var(--green)' },
+      { label: 'Estimated cost', value: formatUsd(sessionCost(latest.estimated_cost), 4), color: 'var(--green)' },
     ]));
   }
 
@@ -18571,9 +18586,9 @@ function renderSessionStatsFallback(sessions) {
     if (grid) {
       grid.style.gridTemplateColumns = 'auto 1fr';
       grid.innerHTML = `
-        <span class="label">Today</span><span class="value">$${totals.todayCost.toFixed(4)}</span>
-        <span class="label">This Week</span><span class="value">$${totals.weekCost.toFixed(4)}</span>
-        <span class="label" style="font-weight:600;color:var(--text)">All Time</span><span class="value">$${totals.allCost.toFixed(4)}</span>
+        <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost, 4)}</span>
+        <span class="label">This Week</span><span class="value">${formatUsd(totals.weekCost, 4)}</span>
+        <span class="label" style="font-weight:600;color:var(--text)">All Time</span><span class="value">${formatUsd(totals.allCost, 4)}</span>
       `;
     }
   }
@@ -18706,7 +18721,7 @@ function renderAllSessionsUsage(sessions) {
       <span class="value">${input.toLocaleString()}</span>
       <span class="value" style="color:var(--green)">${cached.toLocaleString()}</span>
       <span class="value">${output.toLocaleString()}</span>
-      <span class="value" style="color:var(--green)">$${cost.toFixed(2)}</span>
+      <span class="value" style="color:var(--green)">${formatUsd(cost)}</span>
     `;
   }
 }
@@ -18746,7 +18761,7 @@ function renderAgentUsage(sessions) {
       <span class="value">${b.input.toLocaleString()}</span>
       <span class="value" style="color:var(--green)">${b.cached.toLocaleString()}</span>
       <span class="value">${b.output.toLocaleString()}</span>
-      <span class="value" style="color:var(--green)">$${b.cost.toFixed(2)}${unpriced}</span>
+      <span class="value" style="color:var(--green)">${formatUsd(b.cost)}${unpriced}</span>
     `;
   }
 }
@@ -19628,7 +19643,7 @@ function renderSessionsList(sessions, el) {
       const costVal = document.createElement('span');
       costVal.className = 'value';
       costVal.style.color = 'var(--green)';
-      costVal.textContent = '$' + s.estimated_cost.toFixed(4);
+      costVal.textContent = formatUsd(s.estimated_cost, 4);
       cost.appendChild(costLabel);
       cost.appendChild(costVal);
       meta.appendChild(cost);

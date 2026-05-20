@@ -423,6 +423,14 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         },
     ),
     (
+        "gpt-5.3-codex",
+        ModelPricing {
+            input: 1.75e-6,
+            cached: 0.175e-6,
+            output: 14.0e-6,
+        },
+    ),
+    (
         "gpt-5",
         ModelPricing {
             input: 1.25e-6,
@@ -545,6 +553,14 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         },
     ),
     (
+        "gemini-3.1-flash",
+        ModelPricing {
+            input: 0.5e-6,
+            cached: 0.05e-6,
+            output: 3.0e-6,
+        },
+    ),
+    (
         "gemini-2.5-pro",
         ModelPricing {
             input: 1.25e-6,
@@ -614,6 +630,179 @@ pub fn calculate_cost(
     }
 }
 
+/// Per-token pricing in USD for realtime/live multimodal models.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveModelPricing {
+    pub text_input: f64,
+    pub text_cached: f64,
+    pub text_output: f64,
+    pub audio_input: f64,
+    pub audio_cached: f64,
+    pub audio_output: f64,
+    pub image_input: f64,
+    pub image_cached: f64,
+}
+
+const LIVE_PRICING_TABLE: &[(&str, LiveModelPricing)] = &[
+    (
+        "gpt-realtime-1.5",
+        LiveModelPricing {
+            text_input: 4.0e-6,
+            text_cached: 0.4e-6,
+            text_output: 16.0e-6,
+            audio_input: 32.0e-6,
+            audio_cached: 0.4e-6,
+            audio_output: 64.0e-6,
+            image_input: 5.0e-6,
+            image_cached: 0.5e-6,
+        },
+    ),
+    (
+        "gpt-realtime",
+        LiveModelPricing {
+            text_input: 4.0e-6,
+            text_cached: 0.4e-6,
+            text_output: 16.0e-6,
+            audio_input: 32.0e-6,
+            audio_cached: 0.4e-6,
+            audio_output: 64.0e-6,
+            image_input: 5.0e-6,
+            image_cached: 0.5e-6,
+        },
+    ),
+    (
+        "gpt-realtime-mini",
+        LiveModelPricing {
+            text_input: 0.6e-6,
+            text_cached: 0.06e-6,
+            text_output: 2.4e-6,
+            audio_input: 10.0e-6,
+            audio_cached: 0.3e-6,
+            audio_output: 20.0e-6,
+            image_input: 0.6e-6,
+            image_cached: 0.06e-6,
+        },
+    ),
+    (
+        "gpt-4o-realtime-preview",
+        LiveModelPricing {
+            text_input: 5.0e-6,
+            text_cached: 2.5e-6,
+            text_output: 20.0e-6,
+            audio_input: 40.0e-6,
+            audio_cached: 2.5e-6,
+            audio_output: 80.0e-6,
+            image_input: 5.0e-6,
+            image_cached: 2.5e-6,
+        },
+    ),
+    (
+        "gemini-3.1-flash-live-preview",
+        LiveModelPricing {
+            text_input: 0.75e-6,
+            text_cached: 0.75e-6,
+            text_output: 4.5e-6,
+            audio_input: 3.0e-6,
+            audio_cached: 3.0e-6,
+            audio_output: 12.0e-6,
+            image_input: 1.0e-6,
+            image_cached: 1.0e-6,
+        },
+    ),
+    (
+        "gemini-2.5-flash-native-audio-preview-12-2025",
+        LiveModelPricing {
+            text_input: 0.5e-6,
+            text_cached: 0.5e-6,
+            text_output: 3.0e-6,
+            audio_input: 3.0e-6,
+            audio_cached: 3.0e-6,
+            audio_output: 12.0e-6,
+            image_input: 1.0e-6,
+            image_cached: 1.0e-6,
+        },
+    ),
+];
+
+fn find_live_pricing(model: &str) -> Option<LiveModelPricing> {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    for &(key, pricing) in LIVE_PRICING_TABLE {
+        if model == key {
+            return Some(pricing);
+        }
+    }
+    LIVE_PRICING_TABLE
+        .iter()
+        .filter(|(key, _)| model_key_matches(model, key))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, pricing)| *pricing)
+}
+
+fn billed_input_cost(tokens: u64, cached: u64, input_rate: f64, cached_rate: f64) -> f64 {
+    let cached = cached.min(tokens);
+    tokens.saturating_sub(cached) as f64 * input_rate + cached as f64 * cached_rate
+}
+
+pub fn calculate_live_cost(usage: &LiveUsageSnapshot) -> Option<CostBreakdown> {
+    if let Some(pricing) = find_live_pricing(&usage.model) {
+        let has_details = usage.input_text_tokens
+            + usage.input_audio_tokens
+            + usage.input_image_tokens
+            + usage.cached_text_tokens
+            + usage.cached_audio_tokens
+            + usage.cached_image_tokens
+            + usage.output_text_tokens
+            + usage.output_audio_tokens
+            > 0;
+        if has_details {
+            let input_cost = billed_input_cost(
+                usage.input_text_tokens,
+                usage.cached_text_tokens,
+                pricing.text_input,
+                pricing.text_cached,
+            ) + billed_input_cost(
+                usage.input_audio_tokens,
+                usage.cached_audio_tokens,
+                pricing.audio_input,
+                pricing.audio_cached,
+            ) + billed_input_cost(
+                usage.input_image_tokens,
+                usage.cached_image_tokens,
+                pricing.image_input,
+                pricing.image_cached,
+            );
+            let output_cost = (usage.output_text_tokens + usage.thinking_tokens) as f64
+                * pricing.text_output
+                + usage.output_audio_tokens as f64 * pricing.audio_output;
+            return Some(CostBreakdown {
+                input_cost,
+                output_cost,
+                total: input_cost + output_cost,
+            });
+        }
+
+        let cached = usage.cached_tokens.min(usage.input_tokens);
+        let input_cost = usage.input_tokens.saturating_sub(cached) as f64 * pricing.audio_input
+            + cached as f64 * pricing.audio_cached;
+        let output_cost =
+            (usage.output_tokens + usage.thinking_tokens) as f64 * pricing.audio_output;
+        return Some(CostBreakdown {
+            input_cost,
+            output_cost,
+            total: input_cost + output_cost,
+        });
+    }
+
+    find_pricing(&usage.model).map(|pricing| {
+        calculate_cost(
+            usage.input_tokens,
+            usage.output_tokens + usage.thinking_tokens,
+            usage.cached_tokens,
+            &pricing,
+        )
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostBreakdown {
     pub input_cost: f64,
@@ -667,6 +856,22 @@ pub struct LiveUsageSnapshot {
     pub cached_tokens: u64,
     pub total_tokens: u64,
     pub thinking_tokens: u64,
+    #[serde(default)]
+    pub input_text_tokens: u64,
+    #[serde(default)]
+    pub input_audio_tokens: u64,
+    #[serde(default)]
+    pub input_image_tokens: u64,
+    #[serde(default)]
+    pub cached_text_tokens: u64,
+    #[serde(default)]
+    pub cached_audio_tokens: u64,
+    #[serde(default)]
+    pub cached_image_tokens: u64,
+    #[serde(default)]
+    pub output_text_tokens: u64,
+    #[serde(default)]
+    pub output_audio_tokens: u64,
 }
 
 // ── Token history entry ────────────────────────────────────────────
@@ -1946,6 +2151,14 @@ impl AppState {
                     cached_tokens: msg["cached_tokens"].as_u64().unwrap_or(0),
                     total_tokens: msg["total_tokens"].as_u64().unwrap_or(0),
                     thinking_tokens: msg["thinking_tokens"].as_u64().unwrap_or(0),
+                    input_text_tokens: msg["input_text_tokens"].as_u64().unwrap_or(0),
+                    input_audio_tokens: msg["input_audio_tokens"].as_u64().unwrap_or(0),
+                    input_image_tokens: msg["input_image_tokens"].as_u64().unwrap_or(0),
+                    cached_text_tokens: msg["cached_text_tokens"].as_u64().unwrap_or(0),
+                    cached_audio_tokens: msg["cached_audio_tokens"].as_u64().unwrap_or(0),
+                    cached_image_tokens: msg["cached_image_tokens"].as_u64().unwrap_or(0),
+                    output_text_tokens: msg["output_text_tokens"].as_u64().unwrap_or(0),
+                    output_audio_tokens: msg["output_audio_tokens"].as_u64().unwrap_or(0),
                 });
                 cmds.push(self.build_usage_command());
             }
@@ -2407,25 +2620,8 @@ impl AppState {
     }
 
     /// Update live model usage and return commands to re-render the Usage tab.
-    pub fn update_live_usage(
-        &mut self,
-        provider: &str,
-        model: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cached_tokens: u64,
-        total_tokens: u64,
-        thinking_tokens: u64,
-    ) -> Vec<UiCommand> {
-        self.live_usage = Some(LiveUsageSnapshot {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            total_tokens,
-            thinking_tokens,
-        });
+    pub fn update_live_usage(&mut self, usage: LiveUsageSnapshot) -> Vec<UiCommand> {
+        self.live_usage = Some(usage);
         vec![self.build_usage_command()]
     }
 
@@ -2489,9 +2685,7 @@ impl AppState {
                 }
             }
             if let Some(ref u) = self.live_usage {
-                if let Some(pricing) = find_pricing(&u.model) {
-                    let cost =
-                        calculate_cost(u.input_tokens, u.output_tokens, u.cached_tokens, &pricing);
+                if let Some(cost) = calculate_live_cost(u) {
                     summary.total += cost.total;
                     summary.lines.push(CostLine {
                         label: "Live Model".into(),
@@ -4119,7 +4313,16 @@ mod tests {
     #[test]
     fn update_live_usage_returns_commands() {
         let mut s = AppState::new();
-        let cmds = s.update_live_usage("gemini", "gemini-2.5-flash", 100, 50, 10, 150, 0);
+        let cmds = s.update_live_usage(LiveUsageSnapshot {
+            provider: "gemini".into(),
+            model: "gemini-2.5-flash".into(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 10,
+            total_tokens: 150,
+            thinking_tokens: 0,
+            ..Default::default()
+        });
         assert!(s.live_usage.is_some());
         assert!(cmds
             .iter()
@@ -4141,8 +4344,20 @@ mod tests {
         });
         s.handle_message(&main_msg);
 
-        // Set live usage with a known-priced model
-        s.update_live_usage("gemini", "gemini-2.0-flash", 1000, 500, 0, 1500, 0);
+        // Set live usage with a known-priced realtime model and audio tokens.
+        s.update_live_usage(LiveUsageSnapshot {
+            provider: "openai".into(),
+            model: "gpt-realtime-1.5".into(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_tokens: 100,
+            total_tokens: 1500,
+            thinking_tokens: 0,
+            input_audio_tokens: 1000,
+            cached_audio_tokens: 100,
+            output_audio_tokens: 500,
+            ..Default::default()
+        });
 
         let cmd = s.build_usage_command();
         if let UiCommand::UpdateUsage {
@@ -4156,7 +4371,12 @@ mod tests {
             let cost: CostSummary = serde_json::from_str(&cost_json.unwrap()).unwrap();
             // Should have both main and live cost lines
             assert_eq!(cost.lines.len(), 2);
-            assert!(cost.lines.iter().any(|l| l.label == "Live Model"));
+            let live = cost
+                .lines
+                .iter()
+                .find(|l| l.label == "Live Model")
+                .expect("live cost line");
+            assert!((live.cost - 0.06084).abs() < 1e-12);
         } else {
             panic!("Expected UpdateUsage");
         }

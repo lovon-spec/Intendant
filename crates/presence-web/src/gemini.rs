@@ -17,6 +17,25 @@ fn to_js_object(val: &serde_json::Value) -> JsValue {
         .unwrap_or(JsValue::NULL)
 }
 
+fn modality_tokens(usage: &serde_json::Value, field: &str, modality: &str) -> u64 {
+    usage
+        .get(field)
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("modality")
+                        .and_then(|v| v.as_str())
+                        .map(|m| m.eq_ignore_ascii_case(modality))
+                        .unwrap_or(false)
+                })
+                .filter_map(|item| item.get("tokenCount").and_then(|v| v.as_u64()))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 const DEFAULT_MODEL: &str = "gemini-2.5-flash-native-audio-preview-12-2025";
 /// Constrained endpoint — used with ephemeral tokens (baked model+config).
 const API_BASE_CONSTRAINED: &str =
@@ -275,6 +294,20 @@ impl GeminiProvider {
                 cached_tokens: usage["cachedContentTokenCount"].as_u64().unwrap_or(0),
                 total_tokens: usage["totalTokenCount"].as_u64().unwrap_or(0),
                 thinking_tokens: usage["thoughtsTokenCount"].as_u64().unwrap_or(0),
+                input_text_tokens: modality_tokens(usage, "promptTokensDetails", "TEXT"),
+                input_audio_tokens: modality_tokens(usage, "promptTokensDetails", "AUDIO"),
+                input_image_tokens: modality_tokens(usage, "promptTokensDetails", "IMAGE")
+                    + modality_tokens(usage, "promptTokensDetails", "VIDEO"),
+                cached_text_tokens: modality_tokens(usage, "cacheTokensDetails", "TEXT")
+                    + modality_tokens(usage, "cachedContentTokensDetails", "TEXT"),
+                cached_audio_tokens: modality_tokens(usage, "cacheTokensDetails", "AUDIO")
+                    + modality_tokens(usage, "cachedContentTokensDetails", "AUDIO"),
+                cached_image_tokens: modality_tokens(usage, "cacheTokensDetails", "IMAGE")
+                    + modality_tokens(usage, "cacheTokensDetails", "VIDEO")
+                    + modality_tokens(usage, "cachedContentTokensDetails", "IMAGE")
+                    + modality_tokens(usage, "cachedContentTokensDetails", "VIDEO"),
+                output_text_tokens: modality_tokens(usage, "responseTokensDetails", "TEXT"),
+                output_audio_tokens: modality_tokens(usage, "responseTokensDetails", "AUDIO"),
             };
             callbacks.invoke_live_usage(&to_js_object(
                 &serde_json::to_value(&live_usage).unwrap_or_default(),

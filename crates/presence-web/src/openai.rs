@@ -8,6 +8,10 @@ use crate::callbacks::Callbacks;
 
 const DEFAULT_MODEL: &str = "gpt-4o-realtime-preview";
 
+fn detail_u64(details: Option<&serde_json::Value>, key: &str) -> Option<u64> {
+    details.and_then(|d| d.get(key)).and_then(|v| v.as_u64())
+}
+
 pub struct OpenAIProvider {
     ws: Option<WebSocket>,
     pub connected: bool,
@@ -187,16 +191,59 @@ impl OpenAIProvider {
                 // Extract usage from response.done event
                 if let Some(resp) = msg.get("response") {
                     if let Some(usage) = resp.get("usage") {
-                        let cached = usage
+                        let input_details = usage
                             .get("input_token_details")
-                            .and_then(|d| d["cached_tokens"].as_u64())
+                            .or_else(|| usage.get("input_tokens_details"));
+                        let output_details = usage
+                            .get("output_token_details")
+                            .or_else(|| usage.get("output_tokens_details"));
+                        let cached = input_details
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(|v| v.as_u64())
                             .unwrap_or(0);
+                        let input_text_tokens =
+                            detail_u64(input_details, "text_tokens").unwrap_or(0);
+                        let input_audio_tokens =
+                            detail_u64(input_details, "audio_tokens").unwrap_or(0);
+                        let input_image_tokens =
+                            detail_u64(input_details, "image_tokens").unwrap_or(0);
+                        let cached_details = input_details.and_then(|d| {
+                            d.get("cached_tokens_details")
+                                .or_else(|| d.get("cached_token_details"))
+                        });
+                        let mut cached_text_tokens =
+                            detail_u64(cached_details, "text_tokens").unwrap_or(0);
+                        let mut cached_audio_tokens =
+                            detail_u64(cached_details, "audio_tokens").unwrap_or(0);
+                        let mut cached_image_tokens =
+                            detail_u64(cached_details, "image_tokens").unwrap_or(0);
+                        if cached > 0
+                            && cached_text_tokens + cached_audio_tokens + cached_image_tokens == 0
+                        {
+                            if input_audio_tokens > 0 {
+                                cached_audio_tokens = cached.min(input_audio_tokens);
+                            } else if input_image_tokens > 0 {
+                                cached_image_tokens = cached.min(input_image_tokens);
+                            } else {
+                                cached_text_tokens = cached.min(input_text_tokens.max(cached));
+                            }
+                        }
                         let live_usage = crate::LiveUsage {
                             input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                             output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
                             cached_tokens: cached,
                             total_tokens: usage["total_tokens"].as_u64().unwrap_or(0),
                             thinking_tokens: 0, // OpenAI Realtime doesn't report thinking tokens
+                            input_text_tokens,
+                            input_audio_tokens,
+                            input_image_tokens,
+                            cached_text_tokens,
+                            cached_audio_tokens,
+                            cached_image_tokens,
+                            output_text_tokens: detail_u64(output_details, "text_tokens")
+                                .unwrap_or(0),
+                            output_audio_tokens: detail_u64(output_details, "audio_tokens")
+                                .unwrap_or(0),
                         };
                         let val = serde_json::to_value(&live_usage).unwrap_or_default();
                         callbacks.invoke_live_usage(

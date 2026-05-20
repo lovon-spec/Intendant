@@ -350,16 +350,24 @@ impl ServerConnection {
 
     /// Send live model (Gemini Live / OpenAI Realtime) usage to the server.
     /// Provider/model are taken from the active voice config set during connect.
-    pub fn send_live_usage(&self, input: u64, output: u64, cached: u64, total: u64, thinking: u64) {
+    pub fn send_live_usage(&self, usage: &crate::LiveUsage) {
         let msg = serde_json::json!({
             "t": "live_usage_update",
             "provider": *self.active_provider.borrow(),
             "model": *self.active_model.borrow(),
-            "input_tokens": input,
-            "output_tokens": output,
-            "cached_tokens": cached,
-            "total_tokens": total,
-            "thinking_tokens": thinking,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cached_tokens": usage.cached_tokens,
+            "total_tokens": usage.total_tokens,
+            "thinking_tokens": usage.thinking_tokens,
+            "input_text_tokens": usage.input_text_tokens,
+            "input_audio_tokens": usage.input_audio_tokens,
+            "input_image_tokens": usage.input_image_tokens,
+            "cached_text_tokens": usage.cached_text_tokens,
+            "cached_audio_tokens": usage.cached_audio_tokens,
+            "cached_image_tokens": usage.cached_image_tokens,
+            "output_text_tokens": usage.output_text_tokens,
+            "output_audio_tokens": usage.output_audio_tokens,
         });
         self.send_json(&msg);
     }

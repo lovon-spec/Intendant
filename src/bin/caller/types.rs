@@ -434,6 +434,22 @@ pub enum OutboundEvent {
         cached_tokens: u64,
         total_tokens: u64,
         thinking_tokens: u64,
+        #[serde(default)]
+        input_text_tokens: u64,
+        #[serde(default)]
+        input_audio_tokens: u64,
+        #[serde(default)]
+        input_image_tokens: u64,
+        #[serde(default)]
+        cached_text_tokens: u64,
+        #[serde(default)]
+        cached_audio_tokens: u64,
+        #[serde(default)]
+        cached_image_tokens: u64,
+        #[serde(default)]
+        output_text_tokens: u64,
+        #[serde(default)]
+        output_audio_tokens: u64,
     },
     /// App-originated log entry broadcast to external consumers.
     LogEntry {

@@ -23,7 +23,7 @@ mod server;
 /// Provider-agnostic live model usage snapshot.
 /// Both Gemini Live and OpenAI Realtime map their provider-specific
 /// usage metadata into this common structure.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LiveUsage {
     /// Input/prompt tokens (includes cached).
     pub input_tokens: u64,
@@ -35,6 +35,30 @@ pub struct LiveUsage {
     pub total_tokens: u64,
     /// Thinking/reasoning tokens (model-dependent, 0 if not applicable).
     pub thinking_tokens: u64,
+    /// Input text tokens, when provider reports modality breakdown.
+    #[serde(default)]
+    pub input_text_tokens: u64,
+    /// Input audio tokens, when provider reports modality breakdown.
+    #[serde(default)]
+    pub input_audio_tokens: u64,
+    /// Input image/video tokens, when provider reports modality breakdown.
+    #[serde(default)]
+    pub input_image_tokens: u64,
+    /// Cached text tokens, subset of input_text_tokens.
+    #[serde(default)]
+    pub cached_text_tokens: u64,
+    /// Cached audio tokens, subset of input_audio_tokens.
+    #[serde(default)]
+    pub cached_audio_tokens: u64,
+    /// Cached image/video tokens, subset of input_image_tokens.
+    #[serde(default)]
+    pub cached_image_tokens: u64,
+    /// Output text tokens, when provider reports modality breakdown.
+    #[serde(default)]
+    pub output_text_tokens: u64,
+    /// Output audio tokens, when provider reports modality breakdown.
+    #[serde(default)]
+    pub output_audio_tokens: u64,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -711,17 +735,8 @@ mod wasm_impl {
         }
 
         /// Send live model usage to the server for tracking/broadcast.
-        pub fn send_live_usage(
-            &self,
-            input: u64,
-            output: u64,
-            cached: u64,
-            total: u64,
-            thinking: u64,
-        ) {
-            self.server
-                .borrow()
-                .send_live_usage(input, output, cached, total, thinking);
+        fn send_live_usage(&self, usage: &crate::LiveUsage) {
+            self.server.borrow().send_live_usage(usage);
         }
 
         /// Get the active voice provider name (e.g. "gemini", "openai", or "").
@@ -933,35 +948,35 @@ mod wasm_impl {
         /// Updates dashboard state, sends to server, returns `UiCommand[]`.
         #[wasm_bindgen]
         pub fn handle_live_usage(&self, usage: JsValue) -> JsValue {
-            let Ok(val) = serde_wasm_bindgen::from_value::<serde_json::Value>(usage) else {
+            let Ok(live_usage) = serde_wasm_bindgen::from_value::<crate::LiveUsage>(usage) else {
                 return JsValue::NULL;
             };
             let provider = self.active_voice_provider();
             let model = self.active_voice_model();
-            let input_tokens = val["input_tokens"].as_u64().unwrap_or(0);
-            let output_tokens = val["output_tokens"].as_u64().unwrap_or(0);
-            let cached_tokens = val["cached_tokens"].as_u64().unwrap_or(0);
-            let total_tokens = val["total_tokens"].as_u64().unwrap_or(0);
-            let thinking_tokens = val["thinking_tokens"].as_u64().unwrap_or(0);
 
             // Update WASM state for immediate rendering
-            let cmds = self.dashboard.borrow_mut().update_live_usage(
-                &provider,
-                &model,
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                total_tokens,
-                thinking_tokens,
-            );
+            let cmds =
+                self.dashboard
+                    .borrow_mut()
+                    .update_live_usage(app_state::LiveUsageSnapshot {
+                        provider,
+                        model,
+                        input_tokens: live_usage.input_tokens,
+                        output_tokens: live_usage.output_tokens,
+                        cached_tokens: live_usage.cached_tokens,
+                        total_tokens: live_usage.total_tokens,
+                        thinking_tokens: live_usage.thinking_tokens,
+                        input_text_tokens: live_usage.input_text_tokens,
+                        input_audio_tokens: live_usage.input_audio_tokens,
+                        input_image_tokens: live_usage.input_image_tokens,
+                        cached_text_tokens: live_usage.cached_text_tokens,
+                        cached_audio_tokens: live_usage.cached_audio_tokens,
+                        cached_image_tokens: live_usage.cached_image_tokens,
+                        output_text_tokens: live_usage.output_text_tokens,
+                        output_audio_tokens: live_usage.output_audio_tokens,
+                    });
             // Notify server for caching/broadcast to other connections
-            self.send_live_usage(
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                total_tokens,
-                thinking_tokens,
-            );
+            self.send_live_usage(&live_usage);
 
             to_js(&cmds)
         }

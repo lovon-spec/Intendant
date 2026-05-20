@@ -2046,6 +2046,12 @@ fn metadata_mtime_secs(metadata: &std::fs::Metadata) -> u64 {
 fn collect_recent_files(root: &Path, suffix: &str, limit: usize) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_files(root, suffix, &mut files);
+    let mut seen = HashSet::new();
+    files.retain(|path| {
+        std::fs::canonicalize(path)
+            .map(|canonical| seen.insert(canonical))
+            .unwrap_or(true)
+    });
     files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
     files.truncate(limit);
     files
@@ -2122,6 +2128,7 @@ struct SessionUsage {
     total_tokens: u64,
     prompt_tokens: u64,
     completion_tokens: u64,
+    cache_creation_tokens: u64,
     cached_tokens: u64,
 }
 
@@ -2130,6 +2137,7 @@ impl SessionUsage {
         self.total_tokens == 0
             && self.prompt_tokens == 0
             && self.completion_tokens == 0
+            && self.cache_creation_tokens == 0
             && self.cached_tokens == 0
     }
 
@@ -2137,6 +2145,7 @@ impl SessionUsage {
         self.total_tokens += other.total_tokens;
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
         self.cached_tokens += other.cached_tokens;
     }
 }
@@ -2157,6 +2166,7 @@ fn apply_session_usage(session: &mut serde_json::Value, usage: SessionUsage, mod
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.cached_tokens,
+            usage.cache_creation_tokens,
         )
     });
     if let Some(obj) = session.as_object_mut() {
@@ -2175,6 +2185,10 @@ fn apply_session_usage(session: &mut serde_json::Value, usage: SessionUsage, mod
         obj.insert(
             "cached_tokens".to_string(),
             serde_json::json!(usage.cached_tokens),
+        );
+        obj.insert(
+            "cache_creation_tokens".to_string(),
+            serde_json::json!(usage.cache_creation_tokens),
         );
         obj.insert(
             "estimated_cost".to_string(),
@@ -2203,6 +2217,10 @@ fn session_usage_from_json(session: &serde_json::Value) -> SessionUsage {
             .unwrap_or(0),
         cached_tokens: session
             .get("cached_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_creation_tokens: session
+            .get("cache_creation_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
     }
@@ -2250,6 +2268,7 @@ fn external_session_json(
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "cached_tokens": 0,
+        "cache_creation_tokens": 0,
         "estimated_cost": 0.0,
         "pricing_known": false,
         "role": null,
@@ -2402,6 +2421,7 @@ fn codex_session_usage_from_payload(payload: &serde_json::Value) -> Option<Sessi
         total_tokens,
         prompt_tokens,
         completion_tokens,
+        cache_creation_tokens: 0,
         cached_tokens,
     })
 }
@@ -2425,6 +2445,7 @@ fn claude_usage_from_message_usage(usage: &serde_json::Value) -> Option<SessionU
         total_tokens: prompt_tokens + completion_tokens,
         prompt_tokens,
         completion_tokens,
+        cache_creation_tokens: cache_creation,
         cached_tokens: cache_read,
     })
 }
@@ -2484,6 +2505,7 @@ fn gemini_usage_from_tokens(tokens: &serde_json::Value) -> Option<SessionUsage> 
         total_tokens,
         prompt_tokens,
         completion_tokens,
+        cache_creation_tokens: 0,
         cached_tokens,
     })
 }
@@ -2512,7 +2534,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     let index_path = home.join(".codex").join("session_index.jsonl");
     if let Ok(contents) = std::fs::read_to_string(&index_path) {
         for line in contents.lines() {
-            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
             let Some(id) = value_str(&obj, "id") else {
@@ -2575,7 +2597,7 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
         let mut event_user_turns: Vec<Option<String>> = Vec::new();
         let mut fallback_user_turns: Vec<Option<String>> = Vec::new();
         for line in contents.lines() {
-            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
             match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
@@ -2753,13 +2775,10 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
         if session_id.is_empty() {
             continue;
         }
-        let Some(contents) = read_text_head_tail(
-            &path,
-            EXTERNAL_SESSION_READ_LIMIT,
-            EXTERNAL_SESSION_READ_LIMIT,
-        ) else {
+        let Ok(file) = std::fs::File::open(&path) else {
             continue;
         };
+        let reader = std::io::BufReader::new(file);
         let mut created_at = None;
         let mut updated_at = None;
         let mut session_cwd = None;
@@ -2769,8 +2788,11 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
         let mut usage = SessionUsage::default();
         let mut seen_usage = HashSet::new();
         let mut turns = 0u64;
-        for (line_idx, line) in contents.lines().enumerate() {
-            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+        for (line_idx, line_result) in reader.lines().enumerate() {
+            let Ok(line) = line_result else {
+                continue;
+            };
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
             created_at = created_at.or_else(|| value_str(&obj, "timestamp"));
@@ -3592,6 +3614,7 @@ fn list_sessions() -> String {
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
+                0,
             )
         });
 
@@ -3615,6 +3638,7 @@ fn list_sessions() -> String {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "cached_tokens": cached_tokens,
+            "cache_creation_tokens": 0,
             "estimated_cost": estimated_cost.unwrap_or(0.0),
             "pricing_known": estimated_cost.is_some(),
             "role": role,
@@ -6229,6 +6253,30 @@ pub fn spawn_web_gateway(
                                                     .as_u64()
                                                     .unwrap_or(0),
                                                 thinking_tokens: json["thinking_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                input_text_tokens: json["input_text_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                input_audio_tokens: json["input_audio_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                input_image_tokens: json["input_image_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                cached_text_tokens: json["cached_text_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                cached_audio_tokens: json["cached_audio_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                cached_image_tokens: json["cached_image_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                output_text_tokens: json["output_text_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                output_audio_tokens: json["output_audio_tokens"]
                                                     .as_u64()
                                                     .unwrap_or(0),
                                             });
@@ -12118,10 +12166,113 @@ mod tests {
         assert_eq!(session["prompt_tokens"].as_u64(), Some(60));
         assert_eq!(session["completion_tokens"].as_u64(), Some(40));
         assert_eq!(session["cached_tokens"].as_u64(), Some(30));
+        assert_eq!(session["cache_creation_tokens"].as_u64(), Some(20));
         assert_eq!(session["total_tokens"].as_u64(), Some(100));
         assert_eq!(session["turns"].as_u64(), Some(1));
         let cost = session["estimated_cost"].as_f64().unwrap();
-        assert!((cost - 0.000699).abs() < 1e-12, "unexpected cost {cost}");
+        assert!((cost - 0.000714).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn list_claude_sessions_counts_usage_in_large_file_middle() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-Users-vm-projects-intendant");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "019e37cf-large-middle-usage";
+        let user = serde_json::json!({
+            "timestamp": "2026-05-17T21:20:00Z",
+            "type": "user",
+            "cwd": "/Users/vm/projects/intendant",
+            "message": {"content": "Fix stats usage"}
+        });
+        let assistant = serde_json::json!({
+            "timestamp": "2026-05-17T21:20:02Z",
+            "type": "assistant",
+            "cwd": "/Users/vm/projects/intendant",
+            "requestId": "req-middle",
+            "message": {
+                "id": "msg-middle",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 1000,
+                    "cache_creation_input_tokens": 2000,
+                    "cache_read_input_tokens": 3000,
+                    "output_tokens": 4000
+                }
+            }
+        });
+        let filler = "x".repeat(EXTERNAL_SESSION_READ_LIMIT as usize + 64);
+        let contents = format!("{}\n{}\n{}\n{}\n", user, filler, assistant, filler);
+        std::fs::write(project_dir.join(format!("{session_id}.jsonl")), contents).unwrap();
+
+        let sessions = list_claude_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .expect("claude session should be listed");
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(6000));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(4000));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(3000));
+        assert_eq!(session["cache_creation_tokens"].as_u64(), Some(2000));
+        assert_eq!(session["total_tokens"].as_u64(), Some(10000));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!((cost - 0.0714).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_claude_sessions_deduplicates_symlinked_project_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let projects_dir = home.path().join(".claude").join("projects");
+        let project_dir = projects_dir.join("-Users-vm-projects-intendant");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "019e37cf-symlink-dedupe";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:20:00Z",
+                "type": "user",
+                "cwd": "/Users/vm/projects/intendant",
+                "message": {"content": "Fix stats usage"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:20:02Z",
+                "type": "assistant",
+                "cwd": "/Users/vm/projects/intendant",
+                "requestId": "req-usage",
+                "message": {
+                    "id": "msg-usage",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 10, "output_tokens": 20}
+                }
+            }),
+        ];
+        std::fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            &project_dir,
+            projects_dir.join("-Volumes-Untitled-projects-intendant"),
+        )
+        .unwrap();
+
+        let sessions = list_claude_sessions(home.path());
+        let matching = sessions
+            .iter()
+            .filter(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .count();
+        assert_eq!(matching, 1);
     }
 
     #[test]

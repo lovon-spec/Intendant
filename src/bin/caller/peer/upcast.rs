@@ -46,6 +46,7 @@
 //!   stream, not an event, and the federation layer doesn't need
 //!   per-peer display metrics visible in the aggregate feed.
 
+use crate::app_state_pricing::{estimate_live_usage_cost, estimate_session_cost, LiveUsageTokens};
 use crate::event::AppEvent;
 use crate::peer::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, Capability,
@@ -860,20 +861,35 @@ impl AppEventUpcaster {
                 total_tokens: _,
                 context_window: _,
                 usage_pct: _,
-                provider: _,
-                model: _,
+                provider,
+                model,
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
-            } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: *prompt_tokens,
-                    tokens_out: *completion_tokens,
-                    tokens_cached: *cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![],
-                },
-            }],
+            } => {
+                let cost_usd = estimate_session_cost(
+                    model,
+                    *prompt_tokens,
+                    *completion_tokens,
+                    *cached_tokens,
+                    0,
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
+                        tokens_in: *prompt_tokens,
+                        tokens_out: *completion_tokens,
+                        tokens_cached: *cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            tokens_in: *prompt_tokens,
+                            tokens_out: *completion_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
             AppEvent::LiveUsageUpdate {
                 provider,
@@ -882,38 +898,74 @@ impl AppEventUpcaster {
                 output_tokens,
                 cached_tokens,
                 total_tokens: _,
-                thinking_tokens: _,
-            } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: *input_tokens,
-                    tokens_out: *output_tokens,
-                    tokens_cached: *cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![ModelUsage {
-                        provider: provider.clone(),
-                        model: model.clone(),
+                thinking_tokens,
+                input_text_tokens,
+                input_audio_tokens,
+                input_image_tokens,
+                cached_text_tokens,
+                cached_audio_tokens,
+                cached_image_tokens,
+                output_text_tokens,
+                output_audio_tokens,
+            } => {
+                let cost_usd = estimate_live_usage_cost(
+                    model,
+                    LiveUsageTokens {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        cached_tokens: *cached_tokens,
+                        thinking_tokens: *thinking_tokens,
+                        input_text_tokens: *input_text_tokens,
+                        input_audio_tokens: *input_audio_tokens,
+                        input_image_tokens: *input_image_tokens,
+                        cached_text_tokens: *cached_text_tokens,
+                        cached_audio_tokens: *cached_audio_tokens,
+                        cached_image_tokens: *cached_image_tokens,
+                        output_text_tokens: *output_text_tokens,
+                        output_audio_tokens: *output_audio_tokens,
+                    },
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
                         tokens_in: *input_tokens,
                         tokens_out: *output_tokens,
-                        cost_usd: None,
-                    }],
-                },
-            }],
+                        tokens_cached: *cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            tokens_in: *input_tokens,
+                            tokens_out: *output_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
-            AppEvent::UsageSnapshot { main, .. } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: main.prompt_tokens,
-                    tokens_out: main.completion_tokens,
-                    tokens_cached: main.cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![ModelUsage {
-                        provider: main.provider.clone(),
-                        model: main.model.clone(),
+            AppEvent::UsageSnapshot { main, .. } => {
+                let cost_usd = estimate_session_cost(
+                    &main.model,
+                    main.prompt_tokens,
+                    main.completion_tokens,
+                    main.cached_tokens,
+                    0,
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
                         tokens_in: main.prompt_tokens,
                         tokens_out: main.completion_tokens,
-                        cost_usd: None,
-                    }],
-                },
-            }],
+                        tokens_cached: main.cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: main.provider.clone(),
+                            model: main.model.clone(),
+                            tokens_in: main.prompt_tokens,
+                            tokens_out: main.completion_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
             // ---- Status ----
             AppEvent::StatusUpdate { phase, .. } => {
@@ -1813,20 +1865,35 @@ impl WireEventUpcaster {
                 total_tokens: _,
                 context_window: _,
                 usage_pct: _,
-                provider: _,
-                model: _,
+                provider,
+                model,
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
-            } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: *prompt_tokens,
-                    tokens_out: *completion_tokens,
-                    tokens_cached: *cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![],
-                },
-            }],
+            } => {
+                let cost_usd = estimate_session_cost(
+                    model,
+                    *prompt_tokens,
+                    *completion_tokens,
+                    *cached_tokens,
+                    0,
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
+                        tokens_in: *prompt_tokens,
+                        tokens_out: *completion_tokens,
+                        tokens_cached: *cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            tokens_in: *prompt_tokens,
+                            tokens_out: *completion_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
             OutboundEvent::LiveUsageUpdate {
                 provider,
@@ -1835,36 +1902,70 @@ impl WireEventUpcaster {
                 output_tokens,
                 cached_tokens,
                 total_tokens: _,
-                thinking_tokens: _,
-            } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: *input_tokens,
-                    tokens_out: *output_tokens,
-                    tokens_cached: *cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![ModelUsage {
-                        provider: provider.clone(),
-                        model: model.clone(),
+                thinking_tokens,
+                input_text_tokens,
+                input_audio_tokens,
+                input_image_tokens,
+                cached_text_tokens,
+                cached_audio_tokens,
+                cached_image_tokens,
+                output_text_tokens,
+                output_audio_tokens,
+            } => {
+                let cost_usd = estimate_live_usage_cost(
+                    model,
+                    LiveUsageTokens {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        cached_tokens: *cached_tokens,
+                        thinking_tokens: *thinking_tokens,
+                        input_text_tokens: *input_text_tokens,
+                        input_audio_tokens: *input_audio_tokens,
+                        input_image_tokens: *input_image_tokens,
+                        cached_text_tokens: *cached_text_tokens,
+                        cached_audio_tokens: *cached_audio_tokens,
+                        cached_image_tokens: *cached_image_tokens,
+                        output_text_tokens: *output_text_tokens,
+                        output_audio_tokens: *output_audio_tokens,
+                    },
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
                         tokens_in: *input_tokens,
                         tokens_out: *output_tokens,
-                        cost_usd: None,
-                    }],
-                },
-            }],
+                        tokens_cached: *cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            tokens_in: *input_tokens,
+                            tokens_out: *output_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
             OutboundEvent::Usage { main, .. } | OutboundEvent::UsageUpdate { main, .. } => {
+                let cost_usd = estimate_session_cost(
+                    &main.model,
+                    main.prompt_tokens,
+                    main.completion_tokens,
+                    main.cached_tokens,
+                    0,
+                );
                 vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
                         tokens_in: main.prompt_tokens,
                         tokens_out: main.completion_tokens,
                         tokens_cached: main.cached_tokens,
-                        cost_usd: None,
+                        cost_usd,
                         by_model: vec![ModelUsage {
                             provider: main.provider.clone(),
                             model: main.model.clone(),
                             tokens_in: main.prompt_tokens,
                             tokens_out: main.completion_tokens,
-                            cost_usd: None,
+                            cost_usd,
                         }],
                     },
                 }]
