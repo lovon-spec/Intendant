@@ -3589,6 +3589,62 @@ fn list_sessions() -> String {
     list_sessions_from_home(&home_path)
 }
 
+fn empty_worktree_inventory_response() -> String {
+    serde_json::to_string(&crate::worktree_inventory::empty_scan())
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn scan_worktree_inventory_response(home: &Path, project_root: Option<&Path>) -> String {
+    let hints = worktree_session_hints_from_home(home);
+    let scan = crate::worktree_inventory::scan_worktrees(home, project_root, &hints);
+    serde_json::to_string(&scan).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn worktree_session_hints_from_home(
+    home: &Path,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_default();
+    sessions
+        .into_iter()
+        .filter_map(|session| {
+            let session_id = session.get("session_id")?.as_str()?.to_string();
+            let source = session
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("intendant")
+                .to_string();
+            let status = session
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let project_root = session
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            let cwd = session
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            let updated_at = session
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            Some(crate::worktree_inventory::WorktreeSessionHint {
+                session_id,
+                source,
+                status,
+                project_root,
+                cwd,
+                updated_at,
+            })
+        })
+        .collect()
+}
+
 fn list_sessions_from_home(home_path: &Path) -> String {
     let logs_dir = home_path.join(".intendant").join("logs");
     let mut external_sessions = Vec::new();
@@ -5808,6 +5864,11 @@ pub fn spawn_web_gateway(
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // Cache the most recent worktree inventory scan. Scanning can walk
+    // large worktree directories for disk-size accounting, so the
+    // dashboard explicitly triggers refreshes instead of doing it on
+    // every GET.
+    let worktree_inventory_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
@@ -6045,6 +6106,7 @@ pub fn spawn_web_gateway(
             let mcp_server = mcp_server.clone();
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
+            let worktree_inventory_cache = worktree_inventory_cache.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
@@ -10330,6 +10392,42 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/worktrees/scan")
+                    {
+                        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                        let project_root = project_root.clone();
+                        let cache = worktree_inventory_cache.clone();
+                        let body = match tokio::task::spawn_blocking(move || {
+                            let body =
+                                scan_worktree_inventory_response(&home, project_root.as_deref());
+                            if let Ok(mut guard) = cache.lock() {
+                                *guard = Some(body.clone());
+                            }
+                            body
+                        })
+                        .await
+                        {
+                            Ok(body) => body,
+                            Err(e) => serde_json::json!({
+                                "error": format!("worktree scan task failed: {e}")
+                            })
+                            .to_string(),
+                        };
+                        let response = json_response("200 OK", body);
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/worktrees")
+                    {
+                        let body = worktree_inventory_cache
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone())
+                            .unwrap_or_else(empty_worktree_inventory_response);
+                        let response = json_response("200 OK", body);
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/sessions/search") {
                         let body = session_log_search_from_request(&request_line);
                         let response = format!(
@@ -11866,7 +11964,8 @@ async fn coordinator_route(registry: &crate::peer::PeerRegistry, body_text: &str
 }
 
 /// True for HTTP requests that hit the federation REST surface:
-/// `/api/peers*`, `/api/coordinator/*`, and `/api/sessions`. These
+/// `/api/peers*`, `/api/coordinator/*`, `/api/sessions`, and
+/// `/api/worktrees`. These
 /// are the endpoints the bearer-token enforcement layer protects
 /// when `[server.auth] bearer_token` is set. Discovery
 /// (`/.well-known/agent-card.json`), browser bootstrap (`/config`,
@@ -11876,6 +11975,7 @@ fn is_federation_path(request_line: &str) -> bool {
     request_line.contains(" /api/peers")
         || request_line.contains(" /api/coordinator/")
         || request_line.contains(" /api/sessions")
+        || request_line.contains(" /api/worktrees")
 }
 
 /// Extract a token from the `?token=...` query parameter of an HTTP

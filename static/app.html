@@ -2444,6 +2444,126 @@ html, body {
   flex-direction: column;
   gap: 6px;
 }
+.worktrees-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.worktrees-header .sessions-toolbar {
+  grid-template-columns: minmax(260px, 1fr) auto auto auto auto auto auto minmax(190px, auto);
+}
+.worktrees-header .sessions-search {
+  max-width: none;
+}
+.session-card.worktree-card {
+  cursor: default;
+  padding: 9px 12px;
+}
+.session-card.worktree-card .sc-actions {
+  position: static;
+  right: auto;
+  top: auto;
+  padding-top: 6px;
+  margin-top: 8px;
+  border-top: 1px solid var(--surface1);
+}
+.worktree-card.safe {
+  border-color: color-mix(in srgb, var(--green) 50%, var(--surface1));
+}
+.worktree-card.warning {
+  border-color: color-mix(in srgb, var(--yellow) 55%, var(--surface1));
+}
+.worktree-card.danger {
+  border-color: color-mix(in srgb, var(--red) 55%, var(--surface1));
+}
+.worktree-card .wt-path {
+  font-size: 12px;
+  color: var(--overlay1);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  user-select: text;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.worktree-card .wt-branch {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.worktree-card .wt-safety {
+  margin: 6px 0 8px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--surface2);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--surface1) 30%, transparent);
+  color: var(--subtext0);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.worktree-card.safe .wt-safety {
+  border-left-color: var(--green);
+}
+.worktree-card.warning .wt-safety {
+  border-left-color: var(--yellow);
+}
+.worktree-card.danger .wt-safety {
+  border-left-color: var(--red);
+}
+.worktree-card .wt-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0;
+}
+.worktree-card .wt-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--surface2) 25%, transparent);
+  color: var(--overlay1);
+  font-weight: 600;
+}
+.worktree-card .wt-label.cleanup-candidate,
+.worktree-card .wt-label.merged {
+  background: color-mix(in srgb, var(--green) 15%, transparent);
+  color: var(--green);
+}
+.worktree-card .wt-label.dirty,
+.worktree-card .wt-label.unmerged,
+.worktree-card .wt-label.conflicts {
+  background: color-mix(in srgb, var(--red) 15%, transparent);
+  color: var(--red);
+}
+.worktree-card .wt-label.active,
+.worktree-card .wt-label.locked,
+.worktree-card .wt-label.main {
+  background: color-mix(in srgb, var(--yellow) 15%, transparent);
+  color: var(--yellow);
+}
+.worktree-card .wt-label.stale,
+.worktree-card .wt-label.untracked,
+.worktree-card .wt-label.unknown-merge {
+  background: color-mix(in srgb, var(--peach) 15%, transparent);
+  color: var(--peach);
+}
+.worktree-card .wt-command {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--overlay1);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+}
 .session-detail { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .session-detail-header {
   display: flex; align-items: center; gap: 12px;
@@ -5522,6 +5642,7 @@ html, body {
       <div class="sessions-container">
         <div class="subtabs" id="sessions-subtabs">
           <button class="subtab-btn active" data-sessions-tab="recent">Recent</button>
+          <button class="subtab-btn" data-sessions-tab="worktrees">Worktrees</button>
           <button class="subtab-btn" data-sessions-tab="new">New Session</button>
         </div>
         <div class="subtab-panes sessions-subtab-panes">
@@ -5610,6 +5731,40 @@ html, body {
                   <div class="sd-section-content session-detail-logs" id="session-detail-logs"></div>
                 </div>
               </div>
+            </div>
+          </div>
+          <div class="subtab-pane" id="sessions-pane-worktrees">
+            <div class="sessions-header worktrees-header">
+              <div class="sessions-title-line">
+                <span class="sessions-title">Worktrees</span>
+                <button class="sessions-refresh" id="worktrees-scan-btn" title="Scan known worktree roots">Scan</button>
+              </div>
+              <div class="sessions-toolbar">
+                <label class="sessions-search" for="worktrees-search">
+                  <span>Search</span>
+                  <input type="search" id="worktrees-search" placeholder="Path, branch, repo, label..." autocomplete="off" spellcheck="false">
+                </label>
+                <button class="sessions-refresh" id="worktrees-refresh-btn" title="Reload the last cached scan">Cached</button>
+                <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-active" checked> Active</label>
+                <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-dirty" checked> Dirty</label>
+                <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-unmerged" checked> Unmerged</label>
+                <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-main"> Main</label>
+                <label class="sessions-sort">Sort
+                  <select id="sort-worktrees">
+                    <option value="size-desc" selected>Size (largest)</option>
+                    <option value="changed-desc">Changed (newest)</option>
+                    <option value="changed-asc">Changed (oldest)</option>
+                    <option value="head-age-desc">Commit age (oldest)</option>
+                    <option value="risk-desc">Risk first</option>
+                    <option value="path-asc">Path</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="sessions-search-status" id="worktrees-status"></div>
+            <div class="sessions-aggregate" id="worktrees-aggregate"></div>
+            <div class="worktrees-list" id="worktrees-list">
+              <div class="empty-state">No worktree scan yet</div>
             </div>
           </div>
           <div class="subtab-pane sessions-new-pane" id="sessions-pane-new">
@@ -6177,7 +6332,8 @@ import init, { PresenceWeb } from '/wasm-web/presence_web.js';
 // ── Federation auth ──
 //
 // When the daemon's `[server.auth] bearer_token` is set, federation
-// REST endpoints (/api/peers*, /api/coordinator/*, /api/sessions) and
+// REST endpoints (/api/peers*, /api/coordinator/*, /api/sessions,
+// /api/worktrees) and
 // /ws all require the matching token. The dashboard stores the
 // operator-supplied token in localStorage (set via Settings → Network
 // → Federation auth) and:
@@ -14739,7 +14895,7 @@ const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'se
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
-const VALID_SESSIONS_SUBTABS = ['recent', 'new'];
+const VALID_SESSIONS_SUBTABS = ['recent', 'worktrees', 'new'];
 
 function parseRoute() {
   const raw = window.location.hash.slice(1); // strip leading '#'
@@ -15013,6 +15169,8 @@ function switchSessionsSubtab(name) {
   if (next === 'new') {
     updateNewSessionProjectPrefills();
     requestAnimationFrame(focusNewSessionInput);
+  } else if (next === 'worktrees') {
+    loadWorktrees({ forceScan: !worktreesLoaded });
   } else if (!sessionsLoaded) {
     loadSessions();
   }
@@ -20586,6 +20744,8 @@ function onDebugScreenTornDown() {
 // ── Sessions Tab ──
 let sessionsLoaded = false;
 let _cachedSessions = [];
+let worktreesLoaded = false;
+let _cachedWorktreeScan = null;
 let _sessionLogSearchTimer = null;
 let _sessionLogSearchToken = 0;
 let _sessionLogSearch = {
@@ -20639,6 +20799,14 @@ document.getElementById('session-detail-rename')?.addEventListener('click', (ev)
   ev.preventDefault();
   if (currentSessionDetail) requestSessionRename(currentSessionDetail);
 });
+document.getElementById('worktrees-search')?.addEventListener('input', _refilterWorktrees);
+document.getElementById('sort-worktrees')?.addEventListener('change', _refilterWorktrees);
+document.getElementById('filter-worktrees-active')?.addEventListener('change', _refilterWorktrees);
+document.getElementById('filter-worktrees-dirty')?.addEventListener('change', _refilterWorktrees);
+document.getElementById('filter-worktrees-unmerged')?.addEventListener('change', _refilterWorktrees);
+document.getElementById('filter-worktrees-main')?.addEventListener('change', _refilterWorktrees);
+document.getElementById('worktrees-refresh-btn')?.addEventListener('click', () => loadWorktrees({ forceScan: false }));
+document.getElementById('worktrees-scan-btn')?.addEventListener('click', () => loadWorktrees({ forceScan: true }));
 document.getElementById('new-session-project-root')?.addEventListener('input', (ev) => {
   ev.currentTarget.title = ev.currentTarget.value.trim();
   scheduleNewSessionProjectStatusRefresh();
@@ -21285,6 +21453,318 @@ function renderSessionsList(sessions, el) {
       ? 'No sessions match your search'
       : 'No sessions match the active filters';
     el.appendChild(empty);
+  }
+}
+
+function _refilterWorktrees() {
+  if (worktreesLoaded && _cachedWorktreeScan) {
+    renderWorktrees(_cachedWorktreeScan);
+  }
+}
+
+function setWorktreesStatus(message, kind = '') {
+  const el = document.getElementById('worktrees-status');
+  if (!el) return;
+  el.classList.toggle('error', kind === 'error');
+  el.textContent = message || '';
+}
+
+function loadWorktrees(options = {}) {
+  const forceScan = !!options.forceScan;
+  const listEl = document.getElementById('worktrees-list');
+  if (!listEl) return;
+  if (forceScan) {
+    listEl.innerHTML = '<div class="empty-state">Scanning worktrees...</div>';
+    setWorktreesStatus('Scanning known project, session, and common worktree roots...');
+  } else {
+    setWorktreesStatus('Loading cached worktree scan...');
+  }
+  const url = forceScan ? '/api/worktrees/scan' : '/api/worktrees';
+  authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+    .then(scan => {
+      worktreesLoaded = true;
+      _cachedWorktreeScan = scan;
+      renderWorktrees(scan);
+    })
+    .catch(err => {
+      setWorktreesStatus(err.message || 'Failed to load worktrees', 'error');
+      listEl.innerHTML = '<div class="empty-state">Failed to load worktrees</div>';
+    });
+}
+
+function renderWorktrees(scan) {
+  renderWorktreesAggregate(scan, document.getElementById('worktrees-aggregate'));
+  renderWorktreesList(scan, document.getElementById('worktrees-list'));
+  const scannedAt = scan && scan.scanned_at;
+  if (!scannedAt) {
+    setWorktreesStatus('No worktree scan yet. Click Scan to inventory known roots.');
+    return;
+  }
+  const scanned = worktreeDate(scannedAt);
+  const when = scanned ? scanned.toLocaleString() : scannedAt;
+  const errors = Array.isArray(scan.errors) && scan.errors.length > 0
+    ? ` ${scan.errors.length} scan warning${scan.errors.length === 1 ? '' : 's'}.`
+    : '';
+  setWorktreesStatus(`Last scanned ${when}.${errors}`);
+}
+
+function renderWorktreesAggregate(scan, el) {
+  if (!el) return;
+  el.innerHTML = '';
+  const summary = scan?.summary || {};
+  const cards = [
+    { label: 'Worktrees', value: Number(summary.worktrees || 0).toLocaleString() },
+    { label: 'Disk', value: _fmtBytes(summary.total_bytes || 0) },
+    { label: 'Dirty', value: Number(summary.dirty || 0).toLocaleString() },
+    { label: 'Unmerged', value: Number(summary.unmerged || 0).toLocaleString() },
+    { label: 'Active', value: Number(summary.active || 0).toLocaleString() },
+    { label: 'Candidates', value: Number(summary.cleanup_candidates || 0).toLocaleString() },
+  ];
+  for (const c of cards) {
+    const card = document.createElement('div');
+    card.className = 'agg-card';
+    const labelEl = document.createElement('div');
+    labelEl.className = 'agg-label';
+    labelEl.textContent = c.label;
+    const valueEl = document.createElement('div');
+    valueEl.className = 'agg-value';
+    valueEl.textContent = c.value;
+    card.appendChild(labelEl);
+    card.appendChild(valueEl);
+    el.appendChild(card);
+  }
+}
+
+function worktreeDate(value) {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : new Date(parsed);
+}
+
+function worktreeDateSortValue(wt, field) {
+  const d = worktreeDate(wt?.[field]);
+  return d ? d.getTime() : 0;
+}
+
+function fmtWorktreeAge(days) {
+  if (days === null || days === undefined || !Number.isFinite(Number(days))) return '--';
+  const n = Number(days);
+  if (n <= 0) return 'today';
+  if (n === 1) return '1 day';
+  return `${n.toLocaleString()} days`;
+}
+
+function worktreeSearchText(wt) {
+  return [
+    wt.path,
+    wt.repo_root,
+    wt.repo_name,
+    wt.branch,
+    wt.branch_ref,
+    wt.default_branch,
+    wt.upstream,
+    wt.merge_status,
+    wt.recommended_action,
+    wt.safety,
+    ...(wt.labels || []),
+    ...(wt.related_sessions || []).map(s => `${s.session_id} ${s.source} ${s.status}`),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function worktreeMatchesSearch(wt, query) {
+  if (!query) return true;
+  const haystack = worktreeSearchText(wt);
+  return query.split(/\s+/).every(term => haystack.includes(term));
+}
+
+function worktreeRiskRank(wt) {
+  if (wt.conflicted > 0) return 90;
+  if (wt.active_sessions > 0) return 80;
+  if (wt.dirty) return 70;
+  if (wt.merge_status === 'unmerged') return 60;
+  if (wt.locked) return 50;
+  if (wt.size_truncated) return 40;
+  if (wt.safe_to_remove) return 25;
+  if (wt.merge_status === 'unknown') return 20;
+  return 10;
+}
+
+function shellQuote(value) {
+  return "'" + String(value || '').replace(/'/g, "'\\''") + "'";
+}
+
+function worktreeRemoveCommand(wt) {
+  return `git -C ${shellQuote(wt.repo_root)} worktree remove ${shellQuote(wt.path)}`;
+}
+
+function renderWorktreesList(scan, el) {
+  if (!el) return;
+  el.innerHTML = '';
+  const all = Array.isArray(scan?.worktrees) ? scan.worktrees : [];
+  if (!scan?.scanned_at) {
+    el.innerHTML = '<div class="empty-state">No worktree scan yet</div>';
+    return;
+  }
+  if (all.length === 0) {
+    el.innerHTML = '<div class="empty-state">No worktrees found in scanned roots</div>';
+    return;
+  }
+
+  const query = (document.getElementById('worktrees-search')?.value || '').trim().toLowerCase();
+  const showActive = document.getElementById('filter-worktrees-active')?.checked ?? true;
+  const showDirty = document.getElementById('filter-worktrees-dirty')?.checked ?? true;
+  const showUnmerged = document.getElementById('filter-worktrees-unmerged')?.checked ?? true;
+  const showMain = document.getElementById('filter-worktrees-main')?.checked ?? false;
+
+  let rows = all.filter(wt => {
+    if (!showActive && (wt.active_sessions || 0) > 0) return false;
+    if (!showDirty && wt.dirty) return false;
+    if (!showUnmerged && wt.merge_status === 'unmerged') return false;
+    if (!showMain && wt.is_main) return false;
+    return worktreeMatchesSearch(wt, query);
+  });
+
+  const sortVal = document.getElementById('sort-worktrees')?.value || 'size-desc';
+  rows.sort((a, b) => {
+    switch (sortVal) {
+      case 'changed-desc':
+        return worktreeDateSortValue(b, 'last_changed_at') - worktreeDateSortValue(a, 'last_changed_at');
+      case 'changed-asc':
+        return worktreeDateSortValue(a, 'last_changed_at') - worktreeDateSortValue(b, 'last_changed_at');
+      case 'head-age-desc':
+        return (b.head_age_days || 0) - (a.head_age_days || 0);
+      case 'risk-desc':
+        return worktreeRiskRank(b) - worktreeRiskRank(a) || (b.size_bytes || 0) - (a.size_bytes || 0);
+      case 'path-asc':
+        return String(a.path || '').localeCompare(String(b.path || ''));
+      case 'size-desc':
+      default:
+        return (b.size_bytes || 0) - (a.size_bytes || 0);
+    }
+  });
+
+  if (rows.length === 0) {
+    el.innerHTML = '<div class="empty-state">No worktrees match the active filters</div>';
+    return;
+  }
+
+  for (const wt of rows) {
+    const card = document.createElement('div');
+    card.className = 'session-card worktree-card';
+    if (wt.safe_to_remove) card.classList.add('safe');
+    else if (wt.dirty || wt.merge_status === 'unmerged' || (wt.active_sessions || 0) > 0 || wt.conflicted > 0) card.classList.add('danger');
+    else card.classList.add('warning');
+
+    const top = document.createElement('div');
+    top.className = 'sc-top';
+
+    const titleBlock = document.createElement('div');
+    titleBlock.className = 'sc-title-block';
+    const titleRow = document.createElement('div');
+    titleRow.className = 'sc-title-row';
+    const titleKind = document.createElement('span');
+    titleKind.className = 'sc-title-kind';
+    titleKind.textContent = wt.is_main ? 'main' : (wt.detached ? 'detached' : 'branch');
+    titleRow.appendChild(titleKind);
+    const branchEl = document.createElement('div');
+    branchEl.className = 'wt-branch';
+    branchEl.textContent = wt.branch || wt.head_short || '(unknown ref)';
+    branchEl.title = wt.branch_ref || wt.head || branchEl.textContent;
+    titleRow.appendChild(branchEl);
+    titleBlock.appendChild(titleRow);
+    const pathEl = document.createElement('div');
+    pathEl.className = 'wt-path';
+    pathEl.textContent = wt.path || '';
+    pathEl.title = wt.path || '';
+    titleBlock.appendChild(pathEl);
+    top.appendChild(titleBlock);
+
+    const statusEl = document.createElement('span');
+    statusEl.className = 'sc-status ' + (wt.safe_to_remove ? 'completed' : (wt.dirty || wt.merge_status === 'unmerged' ? 'interrupted' : 'idle'));
+    statusEl.textContent = wt.safe_to_remove ? 'candidate' : wt.recommended_action || 'review';
+    top.appendChild(statusEl);
+    card.appendChild(top);
+
+    const labels = document.createElement('div');
+    labels.className = 'wt-labels';
+    for (const label of wt.labels || []) {
+      const pill = document.createElement('span');
+      pill.className = 'wt-label ' + String(label).replace(/[^a-z0-9_-]/gi, '-');
+      pill.textContent = label;
+      labels.appendChild(pill);
+    }
+    card.appendChild(labels);
+
+    const safety = document.createElement('div');
+    safety.className = 'wt-safety';
+    safety.textContent = wt.safety || 'Review manually.';
+    card.appendChild(safety);
+
+    const meta = document.createElement('div');
+    meta.className = 'sc-meta';
+    const addMeta = (label, value, color) => {
+      if (value === null || value === undefined || value === '') return;
+      const span = document.createElement('span');
+      const l = document.createElement('span');
+      l.className = 'label';
+      l.textContent = label;
+      const v = document.createElement('span');
+      v.className = 'value';
+      v.textContent = value;
+      if (color) v.style.color = color;
+      span.appendChild(l);
+      span.appendChild(v);
+      meta.appendChild(span);
+    };
+    addMeta('repo', wt.repo_name);
+    addMeta('size', _fmtBytes(wt.size_bytes || 0) + (wt.size_truncated ? ' +' : ''), wt.safe_to_remove ? 'var(--green)' : null);
+    addMeta('changed', fmtWorktreeAge(wt.last_changed_age_days));
+    addMeta('commit age', fmtWorktreeAge(wt.head_age_days));
+    addMeta('merge', wt.merge_status, wt.merge_status === 'merged' ? 'var(--green)' : (wt.merge_status === 'unmerged' ? 'var(--red)' : null));
+    if (wt.ahead || wt.behind) addMeta('upstream', `+${wt.ahead || 0} / -${wt.behind || 0}`);
+    if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'var(--red)');
+    if ((wt.active_sessions || 0) > 0 || (wt.related_session_count || 0) > 0) {
+      addMeta('sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`, (wt.active_sessions || 0) > 0 ? 'var(--yellow)' : null);
+    }
+    addMeta('files', `${Number(wt.file_count || 0).toLocaleString()} files`);
+    card.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'sc-actions';
+    const copyPath = document.createElement('button');
+    copyPath.className = 'sc-delete-btn';
+    copyPath.textContent = 'Copy path';
+    copyPath.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      copyTextToClipboard(wt.path || '').then(
+        () => setWorktreesStatus('Copied worktree path.'),
+        err => setWorktreesStatus(err.message || 'Copy failed', 'error')
+      );
+    });
+    actions.appendChild(copyPath);
+
+    if (wt.safe_to_remove) {
+      const command = worktreeRemoveCommand(wt);
+      const cmd = document.createElement('span');
+      cmd.className = 'wt-command';
+      cmd.textContent = command;
+      cmd.title = command;
+      const copyCmd = document.createElement('button');
+      copyCmd.className = 'sc-resume-btn';
+      copyCmd.textContent = 'Copy remove command';
+      copyCmd.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        copyTextToClipboard(command).then(
+          () => setWorktreesStatus('Copied git worktree remove command.'),
+          err => setWorktreesStatus(err.message || 'Copy failed', 'error')
+        );
+      });
+      actions.appendChild(copyCmd);
+      actions.appendChild(cmd);
+    }
+    card.appendChild(actions);
+    el.appendChild(card);
   }
 }
 

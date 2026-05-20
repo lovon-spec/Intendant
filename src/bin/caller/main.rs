@@ -50,6 +50,7 @@ mod user_mode;
 mod vision;
 mod web_gateway;
 mod worktree;
+mod worktree_inventory;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
 use conversation::Conversation;
