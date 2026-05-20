@@ -904,6 +904,26 @@ fn forked_thread_id_from_message(message: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn fork_session_name_from_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn emit_codex_fork_session_name(bus: &EventBus, child_id: &str, params: &serde_json::Value) {
+    let Some(name) = fork_session_name_from_params(params) else {
+        return;
+    };
+    bus.send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
+        source: Some("codex".to_string()),
+        session_id: child_id.to_string(),
+        name,
+    }));
+}
+
 async fn handle_external_thread_action(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     op: String,
@@ -935,6 +955,7 @@ async fn handle_external_thread_action(
 
     if success && op == "fork" {
         if let Some(child_id) = forked_thread_id_from_message(&message) {
+            emit_codex_fork_session_name(config.bus, &child_id, &params);
             config
                 .bus
                 .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
@@ -2920,6 +2941,19 @@ mod tests {
         let cert_dir = std::path::PathBuf::from("/nonexistent");
         let auth = build_local_advertised_auth(&server_auth, &cert_dir).unwrap();
         assert_eq!(auth, peer::AuthRequirements::none());
+    }
+
+    #[test]
+    fn fork_session_name_from_params_trims_blank_names() {
+        assert_eq!(
+            fork_session_name_from_params(&serde_json::json!({ "name": "  Forked work  " })),
+            Some("Forked work".to_string())
+        );
+        assert_eq!(
+            fork_session_name_from_params(&serde_json::json!({ "name": "   " })),
+            None
+        );
+        assert_eq!(fork_session_name_from_params(&serde_json::json!({})), None);
     }
 
     /// `advertised_transport = "mutual-tls"` advertises plain mTLS.
@@ -6384,6 +6418,7 @@ async fn run_with_presence(
                 });
                 if success && op == "fork" {
                     if let Some(child_id) = forked_thread_id_from_message(&message) {
+                        emit_codex_fork_session_name(&bus, &child_id, &params);
                         bus.send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
                             source: "codex".to_string(),
                             session_id: child_id.clone(),

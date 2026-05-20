@@ -1122,6 +1122,14 @@ html, body {
   opacity: 0.6;
   cursor: progress;
 }
+.sessions-attach-btn.drag-hover {
+  border-color: var(--blue);
+  background: rgba(137, 180, 250, 0.18);
+}
+.sessions-attach-btn.uploading {
+  opacity: 0.6;
+  cursor: progress;
+}
 .global-pending-attachments {
   display: flex;
   align-items: center;
@@ -2257,6 +2265,35 @@ html, body {
   overflow-y: auto;
 }
 .sessions-new-task-input:focus { outline: none; border-color: var(--blue); }
+.sessions-attach-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.sessions-attach-btn {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.sessions-attach-btn:hover {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+.sessions-attach-row .pending-attachments-bar {
+  flex: 1 1 280px;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+}
 .sessions-project-input {
   width: 100%;
   min-width: 0;
@@ -4811,8 +4848,8 @@ html, body {
       <span class="phase-text" id="phase-text">Idle</span>
     </div>
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
-    <button id="task-target-chip" class="task-target-chip" onclick="focusForegroundSessionWindow()" title="Prompt target">New session</button>
     <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session">New</button>
+    <button id="task-target-chip" class="task-target-chip" onclick="focusForegroundSessionWindow()" title="Prompt target" style="display:none"></button>
     <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
       <span id="edit-message-label">Editing</span>
       <button type="button" id="edit-message-cancel" title="Cancel edit">x</button>
@@ -4875,7 +4912,7 @@ html, body {
             <span class="pending-attachments-label">Attachments</span>
             <span class="pending-attachments-count" id="pending-attachments-count">0</span>
             <div id="pending-attachments-list" style="display:flex;gap:4px;flex-wrap:wrap"></div>
-            <button class="pending-attachments-clear" id="pending-attachments-clear" title="Remove all attachments">Clear</button>
+            <button class="pending-attachments-clear" id="pending-attachments-clear" data-pending-attachments-clear title="Remove all attachments">Clear</button>
           </div>
 
           <!-- Display Strip (shown when displays are active) -->
@@ -5444,6 +5481,15 @@ html, body {
                   Initial message
                   <textarea id="new-session-input" class="sessions-new-task-input" rows="4" placeholder="Initial message..."></textarea>
                 </label>
+                <div class="sessions-attach-row">
+                  <button type="button" id="new-session-attach-btn" class="sessions-attach-btn" title="Attach file(s) to this new session">Attach</button>
+                  <div class="pending-attachments-bar hidden" id="new-session-attachments-bar">
+                    <span class="pending-attachments-label">Attachments</span>
+                    <span class="pending-attachments-count" id="new-session-attachments-count">0</span>
+                    <div id="new-session-attachments-list" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+                    <button type="button" class="pending-attachments-clear" id="new-session-attachments-clear" data-pending-attachments-clear title="Remove all attachments">Clear</button>
+                  </div>
+                </div>
                 <div class="sessions-new-session-field sessions-new-session-project">
                   <label class="sessions-project-label" for="new-session-project-root">Project</label>
                   <div class="sessions-project-row">
@@ -8813,9 +8859,18 @@ function updateTaskTargetChip() {
   const chip = document.getElementById('task-target-chip');
   if (!chip) return;
   const sid = resolvePromptTargetSessionId();
-  chip.classList.toggle('has-target', !!sid);
-  chip.textContent = sid ? `Target ${shortSessionId(sid)}` : 'New session';
-  chip.title = sid ? `Prompt target: ${sid}` : 'Prompt target: new session';
+  if (!sid) {
+    chip.style.display = 'none';
+    chip.classList.remove('has-target');
+    chip.textContent = '';
+    chip.title = '';
+    applySessionBadgeStyle(chip, '');
+    return;
+  }
+  chip.style.display = '';
+  chip.classList.add('has-target');
+  chip.textContent = `Target ${shortSessionId(sid)}`;
+  chip.title = `Prompt target: ${sid}`;
   applySessionBadgeStyle(chip, sid);
 }
 
@@ -13048,14 +13103,21 @@ function renderAttachmentReceipt(text, attachments, verb, sessionId) {
   rememberAttachmentReceipt(text);
 }
 
+function uploadAttachButtons() {
+  return [
+    document.getElementById('upload-attach-btn'),
+    document.getElementById('new-session-attach-btn'),
+  ].filter(Boolean);
+}
+
 async function triggerUploadFlow(files) {
   if (!files || files.length === 0) return;
   const dest = document.getElementById('upload-destination')?.value === 'task'
     ? 'task'
     : 'workspace';
-  const btn = document.getElementById('upload-attach-btn');
+  const buttons = uploadAttachButtons();
   activeUploadFlows += 1;
-  if (btn) btn.classList.add('uploading');
+  buttons.forEach(btn => btn.classList.add('uploading'));
   // Fire uploads sequentially to avoid hammering the gateway — it's a
   // hand-rolled server, not multiplexed. Can parallelise later if it
   // becomes a bottleneck.
@@ -13065,7 +13127,9 @@ async function triggerUploadFlow(files) {
     }
   } finally {
     activeUploadFlows = Math.max(0, activeUploadFlows - 1);
-    if (btn && activeUploadFlows === 0) btn.classList.remove('uploading');
+    if (activeUploadFlows === 0) {
+      buttons.forEach(btn => btn.classList.remove('uploading'));
+    }
   }
 }
 
@@ -13095,11 +13159,18 @@ function onUploadDeleted(id) {
 }
 
 function wireUploadControls() {
-  const btn = document.getElementById('upload-attach-btn');
   const input = document.getElementById('upload-file-input');
   const taskInput = document.getElementById('activity-task-input');
-  if (!btn || !input) return;
-  btn.addEventListener('click', () => input.click());
+  const newSessionInput = document.getElementById('new-session-input');
+  const buttons = uploadAttachButtons();
+  if (!buttons.length || !input) return;
+  buttons.forEach(btn => {
+    if (btn._uploadWired) return;
+    btn._uploadWired = true;
+    btn.addEventListener('click', () => input.click());
+  });
+  if (input._uploadWired) return;
+  input._uploadWired = true;
   input.addEventListener('change', (ev) => {
     const files = Array.from(ev.target.files || []);
     triggerUploadFlow(files);
@@ -13109,15 +13180,17 @@ function wireUploadControls() {
   // Drag-and-drop on the task input AND the Attach button for a larger hit
   // target. The whole page would be nicer but has more false positives
   // (dragging text, other apps' files onto the tab).
-  const dropTargets = [btn];
+  const setDragHover = (on) => buttons.forEach(btn => btn.classList.toggle('drag-hover', on));
+  const dropTargets = buttons.slice();
   if (taskInput) dropTargets.push(taskInput);
+  if (newSessionInput) dropTargets.push(newSessionInput);
   for (const el of dropTargets) {
-    el.addEventListener('dragenter', (e) => { e.preventDefault(); btn.classList.add('drag-hover'); });
+    el.addEventListener('dragenter', (e) => { e.preventDefault(); setDragHover(true); });
     el.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
-    el.addEventListener('dragleave', () => { btn.classList.remove('drag-hover'); });
+    el.addEventListener('dragleave', () => { setDragHover(false); });
     el.addEventListener('drop', (e) => {
       e.preventDefault();
-      btn.classList.remove('drag-hover');
+      setDragHover(false);
       const files = Array.from(e.dataTransfer?.files || []);
       triggerUploadFlow(files);
     });
@@ -13171,24 +13244,14 @@ function renderAttachmentList(list) {
   }
 }
 
-function renderPendingAttachments() {
-  const bar = document.getElementById('pending-attachments-bar');
-  const list = document.getElementById('pending-attachments-list');
-  const count = document.getElementById('pending-attachments-count');
-  const globalList = document.getElementById('global-pending-attachments');
-  if (globalList) {
-    globalList.classList.toggle('hidden', pendingAttachments.length === 0);
-    globalList.title = pendingAttachments.length === 0
-      ? ''
-      : `${pendingAttachments.length} pending attachment${pendingAttachments.length === 1 ? '' : 's'}`;
-    renderAttachmentList(globalList);
-  }
+function renderPendingAttachmentBar(bar, list, count) {
   if (!bar || !list || !count) return;
   if (pendingAttachments.length === 0) {
     bar.classList.add('hidden');
     list.innerHTML = '';
     count.textContent = '0';
     count.classList.remove('warn');
+    count.title = '';
     return;
   }
   bar.classList.remove('hidden');
@@ -13200,6 +13263,25 @@ function renderPendingAttachments() {
     count.title = `${pendingAttachments.length} pending attachment${pendingAttachments.length === 1 ? '' : 's'}`;
   }
   renderAttachmentList(list);
+}
+
+function renderPendingAttachments() {
+  const bar = document.getElementById('pending-attachments-bar');
+  const list = document.getElementById('pending-attachments-list');
+  const count = document.getElementById('pending-attachments-count');
+  const newSessionBar = document.getElementById('new-session-attachments-bar');
+  const newSessionList = document.getElementById('new-session-attachments-list');
+  const newSessionCount = document.getElementById('new-session-attachments-count');
+  const globalList = document.getElementById('global-pending-attachments');
+  if (globalList) {
+    globalList.classList.toggle('hidden', pendingAttachments.length === 0);
+    globalList.title = pendingAttachments.length === 0
+      ? ''
+      : `${pendingAttachments.length} pending attachment${pendingAttachments.length === 1 ? '' : 's'}`;
+    renderAttachmentList(globalList);
+  }
+  renderPendingAttachmentBar(bar, list, count);
+  renderPendingAttachmentBar(newSessionBar, newSessionList, newSessionCount);
 }
 
 window.addPendingAttachment = addPendingAttachment;
@@ -13234,22 +13316,19 @@ function updateAnnotationSendState() {
 }
 window.updateAnnotationSendState = updateAnnotationSendState;
 
-// Wire the bar's Clear button (after DOM is ready)
-document.addEventListener('DOMContentLoaded', () => {
-  const clearBtn = document.getElementById('pending-attachments-clear');
-  if (clearBtn) {
-    clearBtn.addEventListener('click', () => clearPendingAttachments());
-  }
-});
-
-// Hot-wire in case DOMContentLoaded already fired
-{
-  const clearBtn = document.getElementById('pending-attachments-clear');
-  if (clearBtn && !clearBtn._wired) {
+function wirePendingAttachmentClearButtons() {
+  document.querySelectorAll('[data-pending-attachments-clear]').forEach(clearBtn => {
+    if (clearBtn._wired) return;
     clearBtn._wired = true;
     clearBtn.addEventListener('click', () => clearPendingAttachments());
-  }
+  });
 }
+
+// Wire the bars' Clear buttons (after DOM is ready)
+document.addEventListener('DOMContentLoaded', wirePendingAttachmentClearButtons);
+
+// Hot-wire in case DOMContentLoaded already fired
+wirePendingAttachmentClearButtons();
 
 // Submit an annotation with one of three actions:
 //   'save'   — register in frame registry, don't inject, don't attach
