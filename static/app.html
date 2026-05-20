@@ -1230,6 +1230,28 @@ html, body {
   background: var(--base);
   flex-shrink: 0;
 }
+.session-window-grid.maximized {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow: hidden;
+}
+.session-window-grid.maximized .session-window {
+  display: none;
+}
+.session-window-grid.maximized .session-window.maximized {
+  display: flex;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  max-height: none;
+  cursor: default;
+}
+.session-window-grid.maximized ~ .log-stream,
+.session-window-grid.maximized ~ .scroll-bottom-btn {
+  display: none !important;
+}
 .session-window {
   min-height: 180px;
   max-height: 320px;
@@ -1322,7 +1344,7 @@ html, body {
 .session-window-status.active { color: var(--teal); }
 .session-window-status.waiting { color: var(--yellow); }
 .session-window-status.done { color: var(--green); }
-.session-window-close {
+.session-window-action {
   flex-shrink: 0;
   width: 22px;
   height: 22px;
@@ -1336,7 +1358,7 @@ html, body {
   font-size: 14px;
   cursor: pointer;
 }
-.session-window-close:hover { background: var(--surface0); color: var(--text); }
+.session-window-action:hover { background: var(--surface0); color: var(--text); }
 .session-window-log {
   flex: 1;
   min-height: 0;
@@ -5731,6 +5753,7 @@ const commandOutputGroupByEntry = new WeakMap();
 let currentPhase = 'idle';
 let currentSessionFullId = '';
 let foregroundSessionFullId = '';
+let maximizedSessionWindowId = '';
 const sessionWindows = new Map();
 let processingLogReplay = false;
 const sessionMetadataById = new Map();
@@ -8576,13 +8599,21 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const status = document.createElement('span');
   status.className = 'session-window-status';
   status.textContent = normalizeSessionPhase(meta.phase || 'idle');
+  const maximize = document.createElement('button');
+  maximize.className = 'session-window-action session-window-maximize';
+  maximize.type = 'button';
+  maximize.title = 'Maximize window';
+  maximize.setAttribute('aria-label', maximize.title);
+  maximize.setAttribute('aria-pressed', 'false');
+  maximize.textContent = '\u26F6';
   const close = document.createElement('button');
-  close.className = 'session-window-close';
+  close.className = 'session-window-action session-window-close';
   close.type = 'button';
   close.title = 'Close window';
   close.textContent = '\u00d7';
   header.appendChild(title);
   header.appendChild(status);
+  header.appendChild(maximize);
   header.appendChild(close);
 
   const log = document.createElement('div');
@@ -8593,10 +8624,15 @@ function ensureSessionWindow(sessionId, meta = {}) {
   el.appendChild(log);
   el.addEventListener('mousedown', () => focusSessionWindow(sid));
   el.addEventListener('focus', () => focusSessionWindow(sid));
+  maximize.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleSessionWindowMaximized(sid);
+  });
   close.addEventListener('click', (e) => {
     e.stopPropagation();
     el.remove();
     sessionWindows.delete(sid);
+    if (maximizedSessionWindowId === sid) maximizedSessionWindowId = '';
     if (foregroundSessionFullId === sid) {
       const next = sessionWindows.keys().next().value || '';
       if (next) focusSessionWindow(next);
@@ -8610,6 +8646,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
       }
     }
     if (grid.childElementCount === 0) grid.classList.add('hidden');
+    updateSessionWindowMaximizeState();
     syncSessionWindowMetadataRefresh();
   });
 
@@ -8622,6 +8659,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     cwd,
     task,
     status,
+    maximize,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
     pendingActiveUntil: 0,
     ended: false,
@@ -8629,6 +8667,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   sessionWindows.set(sid, win);
   syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
+  updateSessionWindowMaximizeState();
   return win;
 }
 
@@ -8675,6 +8714,50 @@ function updateSessionWindow(sessionId, meta = {}) {
     const cls = sessionPhaseClass(win.phase);
     if (cls) win.status.classList.add(cls);
   }
+}
+
+function updateSessionWindowMaximizeState() {
+  const grid = document.getElementById('session-window-grid');
+  if (!grid) return;
+  const sid = maximizedSessionWindowId && sessionWindows.has(maximizedSessionWindowId)
+    ? maximizedSessionWindowId
+    : '';
+  if (!sid) maximizedSessionWindowId = '';
+  grid.classList.toggle('maximized', !!sid);
+  for (const [id, win] of sessionWindows) {
+    const maximized = id === sid;
+    win.el.classList.toggle('maximized', maximized);
+    if (win.maximize) {
+      win.maximize.textContent = maximized ? '\u2750' : '\u26F6';
+      win.maximize.title = maximized ? 'Restore window' : 'Maximize window';
+      win.maximize.setAttribute('aria-label', win.maximize.title);
+      win.maximize.setAttribute('aria-pressed', maximized ? 'true' : 'false');
+    }
+  }
+}
+
+function setSessionWindowMaximized(sessionId, maximized) {
+  const sid = String(sessionId || '').trim();
+  if (maximized) {
+    if (!sid || !sessionWindows.has(sid)) return;
+    maximizedSessionWindowId = sid;
+    focusSessionWindow(sid);
+  } else if (!sid || maximizedSessionWindowId === sid) {
+    maximizedSessionWindowId = '';
+  }
+  updateSessionWindowMaximizeState();
+}
+
+function toggleSessionWindowMaximized(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  setSessionWindowMaximized(sid, maximizedSessionWindowId !== sid);
+}
+
+function shouldDeferSessionWindowEscape() {
+  if (annotationMode || clipMode || clipAnnotatingRange || displayPickerVisible) return true;
+  const rollbackModal = document.getElementById('rollback-modal');
+  return !!rollbackModal && rollbackModal.style.display !== 'none';
 }
 
 function focusSessionWindow(sessionId) {
@@ -20224,6 +20307,11 @@ function renderSessionDetailEntries(entries, el) {
 // ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+  if (e.key === 'Escape' && maximizedSessionWindowId && !shouldDeferSessionWindowEscape()) {
+    setSessionWindowMaximized(maximizedSessionWindowId, false);
+    e.preventDefault();
+    return;
+  }
   if (activeTab === 'activity' && app && pendingApprovalId !== null) {
     if (e.key === 'y') { sendApproval('approve'); e.preventDefault(); }
     else if (e.key === 's') { sendApproval('skip'); e.preventDefault(); }
