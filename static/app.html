@@ -999,33 +999,54 @@ html, body {
 }
 .global-task-bar .phase-banner { min-width: 160px; }
 .task-target-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   flex-shrink: 0;
-  max-width: 160px;
-  padding: 3px 8px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
-  color: var(--subtext1);
+  max-width: 180px;
+  padding: 0;
+  border: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  color: var(--overlay1);
   font-family: inherit;
   font-size: 11px;
   font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
 }
-.task-target-chip .session-identity-prefix {
+.task-target-label {
   flex-shrink: 0;
 }
 .task-target-chip.has-target {
   display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--session-badge-fg, var(--blue));
-  border-color: var(--session-badge-border, rgba(137, 180, 250, 0.45));
-  background: var(--session-badge-bg, rgba(137, 180, 250, 0.08));
 }
-.task-target-chip:focus { outline: 1px solid var(--blue); outline-offset: 1px; }
+.task-target-session-badge {
+  display: inline-block;
+  max-width: 110px;
+  padding: 3px 8px;
+  border: 1px solid var(--session-badge-border, rgba(137, 180, 250, 0.45));
+  border-radius: 4px;
+  background: var(--session-badge-bg, rgba(137, 180, 250, 0.08));
+  color: var(--session-badge-fg, var(--blue));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-target-chip:hover .task-target-session-badge {
+  border-color: var(--session-badge-fg, var(--blue));
+}
+.task-target-chip:focus {
+  outline: 1px solid var(--blue);
+  outline-offset: 2px;
+}
+.task-target-chip:focus .task-target-session-badge {
+  border-color: var(--session-badge-fg, var(--blue));
+}
+.task-target-chip:focus:not(:focus-visible) {
+  outline: none;
+}
 .task-new-session-btn {
   flex-shrink: 0;
   min-height: 28px;
@@ -5393,7 +5414,7 @@ html, body {
     </div>
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session" aria-label="Create a new session">+ New</button>
-    <button id="task-target-chip" class="task-target-chip" onclick="focusForegroundSessionWindow()" title="Prompt target" style="display:none"></button>
+    <button id="task-target-chip" class="task-target-chip" type="button" onclick="focusForegroundSessionWindow()" title="Prompt target" style="display:none"></button>
     <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
       <span id="edit-message-label">Editing</span>
       <button type="button" id="edit-message-cancel" title="Cancel edit">x</button>
@@ -9630,19 +9651,28 @@ function updateTaskTargetChip() {
   const chip = document.getElementById('task-target-chip');
   if (!chip) return;
   const sid = resolvePromptTargetSessionId();
+  clearSessionBadgeStyle(chip);
   if (!sid) {
     chip.style.display = 'none';
     chip.classList.remove('has-target');
     chip.replaceChildren();
     chip.title = '';
     chip.removeAttribute('aria-label');
-    applySessionBadgeStyle(chip, '');
     return;
   }
   chip.style.display = '';
   chip.classList.add('has-target');
-  renderSessionIdentity(chip, sid, { prefix: 'Target', showName: false, titlePrefix: 'Prompt target' });
-  applySessionBadgeStyle(chip, sid);
+  const label = document.createElement('span');
+  label.className = 'task-target-label';
+  label.textContent = 'Target:';
+  const badge = document.createElement('span');
+  badge.className = 'task-target-session-badge';
+  renderSessionIdentity(badge, sid, { showName: false });
+  applySessionBadgeStyle(badge, sid);
+  chip.replaceChildren(label, badge);
+  const title = `Prompt target: ${sid}`;
+  chip.title = title;
+  chip.setAttribute('aria-label', title);
 }
 
 function resolvePromptTargetSessionId() {
