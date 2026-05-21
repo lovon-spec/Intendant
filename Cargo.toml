@@ -166,6 +166,12 @@ windows = { version = "0.59", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
+    # OpenInputDesktop / OpenDesktopW / SetThreadDesktop: the capture thread must
+    # bind to the *interactive* desktop (Winsta0\Default) before any GDI DC work,
+    # otherwise GetDC(None)+BitBlt reads the worker thread's default (blank/black)
+    # desktop even though a real desktop is being displayed. See
+    # `bind_thread_to_input_desktop` in display/windows.rs.
+    "Win32_System_StationsAndDesktops",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     # Media Foundation H.264 encoder (display/encode/h264_windows.rs): the

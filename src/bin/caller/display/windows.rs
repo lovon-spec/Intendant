@@ -103,6 +103,10 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC,
     HGDIOBJ, SRCCOPY,
 };
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, OpenDesktopW, OpenInputDesktop, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
+    DESKTOP_READOBJECTS, HDESK,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE,
@@ -830,6 +834,13 @@ fn run_dxgi_capture(
     // responsive.
     let acquire_timeout_ms = (frame_interval.as_millis() as u32).clamp(5, 100);
 
+    // Bind to the interactive desktop before duplicating it. Desktop
+    // Duplication is keyed off the calling thread's desktop too, so a
+    // worker thread on the wrong desktop can fail to duplicate (or duplicate
+    // the wrong surface). Harmless on hosts where the thread already has the
+    // right desktop; the guard lives for the whole loop.
+    let _desktop_guard = bind_thread_to_input_desktop("DXGI");
+
     let mut dup = match init_duplication(target_output) {
         Ok((dup, w, h)) => {
             let _ = init_tx.send(Ok((w, h)));
@@ -1055,6 +1066,138 @@ fn clone_frame(f: &Frame) -> Frame {
         height: f.height,
         stride: f.stride,
         timestamp: f.timestamp,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive-desktop binding (shared by both capture threads)
+// ---------------------------------------------------------------------------
+
+/// RAII guard owning the `HDESK` handle a capture thread is bound to.
+///
+/// The handle must outlive every GDI/DXGI operation on the thread, so we hold
+/// the guard for the whole capture loop and only drop it when the thread
+/// returns. `CloseDesktop` refuses to close a desktop that is still the calling
+/// thread's desktop (the bind is still in effect at drop time) and returns an
+/// error; that is harmless here because the OS reclaims the handle when the
+/// thread exits moments later. We attempt the close anyway (and ignore the
+/// result) so that if the bind had failed -- leaving an opened-but-unassigned
+/// handle -- it is still released.
+struct DesktopGuard {
+    handle: HDESK,
+}
+
+impl Drop for DesktopGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            // Best-effort: the thread is ending, so a failure here is inert.
+            let _ = unsafe { CloseDesktop(self.handle) };
+        }
+    }
+}
+
+/// Bind the **calling** thread to the interactive input desktop
+/// (`Winsta0\Default`) so GDI `GetDC(None)` + `BitBlt` (and DXGI duplication)
+/// read the desktop the user actually sees rather than the worker thread's
+/// inherited default desktop.
+///
+/// ## Why this is the black-frame fix
+///
+/// GDI/DXGI capture reads the desktop **bound to the calling thread**. A thread
+/// spawned by a service or a thread that simply never associated itself with
+/// the displayed desktop renders against a blank/black desktop surface, so
+/// `BitBlt` copies all-black even though a *different* interactive process
+/// (e.g. PowerShell `CopyFromScreen`) captures the real pixels at the same
+/// instant. Calling `SetThreadDesktop(OpenInputDesktop(...))` at the top of the
+/// capture thread points it at the live desktop, after which `BitBlt` reads the
+/// real composed pixels.
+///
+/// ## Robustness
+///
+/// Returns the guard on success, or `None` on failure (logged, not fatal):
+/// `SetThreadDesktop` fails with `ERROR_BUSY` if the thread already owns
+/// windows/hooks, and `OpenInputDesktop` can fail under tight station ACLs.
+/// In the common always-on-steward case the capture thread is freshly spawned
+/// and window-less, so the bind succeeds; when it doesn't we fall through and
+/// capture against whatever desktop the thread already had (the prior
+/// behavior), so this is strictly an improvement and never a regression.
+///
+/// Tries `OpenInputDesktop` first (no name needed — always the *displayed*
+/// desktop, which is what we want even across fast-user-switching), then falls
+/// back to `OpenDesktopW("Default")` on `Winsta0`.
+fn bind_thread_to_input_desktop(thread_label: &str) -> Option<DesktopGuard> {
+    // `OpenInputDesktop` opens the desktop currently receiving input — the one
+    // on screen. DESKTOP_READOBJECTS is the access needed to read its surface.
+    let handle = match unsafe {
+        OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS)
+    } {
+        Ok(h) if !h.is_invalid() => h,
+        Ok(_) => {
+            eprintln!(
+                "[display/windows] {thread_label}: OpenInputDesktop returned a null \
+                 desktop; trying OpenDesktopW(\"Default\")"
+            );
+            match open_default_desktop() {
+                Some(h) => h,
+                None => return None,
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[display/windows] {thread_label}: OpenInputDesktop failed ({e}); \
+                 trying OpenDesktopW(\"Default\")"
+            );
+            match open_default_desktop() {
+                Some(h) => h,
+                None => return None,
+            }
+        }
+    };
+
+    match unsafe { SetThreadDesktop(handle) } {
+        Ok(()) => {
+            eprintln!(
+                "[display/windows] {thread_label}: bound capture thread to the \
+                 interactive input desktop"
+            );
+            Some(DesktopGuard { handle })
+        }
+        Err(e) => {
+            // Couldn't switch (e.g. thread already owns windows/hooks). Close
+            // the handle we opened and continue on the inherited desktop.
+            eprintln!(
+                "[display/windows] {thread_label}: SetThreadDesktop failed ({e}); \
+                 capturing on the thread's existing desktop"
+            );
+            let _ = unsafe { CloseDesktop(handle) };
+            None
+        }
+    }
+}
+
+/// Fallback: open `Winsta0\Default` by name with read access. Returns the
+/// handle on success; logs and returns `None` on failure.
+fn open_default_desktop() -> Option<HDESK> {
+    // UTF-16, NUL-terminated "Default".
+    let name: Vec<u16> = "Default\0".encode_utf16().collect();
+    let pcwstr = windows::core::PCWSTR::from_raw(name.as_ptr());
+    match unsafe {
+        OpenDesktopW(
+            pcwstr,
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_READOBJECTS.0,
+        )
+    } {
+        Ok(h) if !h.is_invalid() => Some(h),
+        Ok(_) => {
+            eprintln!("[display/windows] OpenDesktopW(\"Default\") returned a null desktop");
+            None
+        }
+        Err(e) => {
+            eprintln!("[display/windows] OpenDesktopW(\"Default\") failed: {e}");
+            None
+        }
     }
 }
 
@@ -1320,6 +1463,31 @@ impl Drop for GdiCapture {
     }
 }
 
+/// Average byte value of a pixel buffer, computed over a bounded sample (not
+/// the whole buffer) so it stays cheap on the capture thread.
+///
+/// Used only by the black-frame diagnostic: an all-black BGRA frame averages
+/// ~0 (the alpha byte from `CreateDIBSection` is also 0), while any real
+/// desktop content averages well above 0. We step through the buffer so the
+/// sample spans the whole image (top to bottom) rather than just the first
+/// rows, and cap the work at ~4096 samples regardless of resolution.
+fn sampled_avg_byte(data: &[u8]) -> u32 {
+    if data.is_empty() {
+        return 0;
+    }
+    const MAX_SAMPLES: usize = 4096;
+    let step = (data.len() / MAX_SAMPLES).max(1);
+    let mut sum: u64 = 0;
+    let mut n: u64 = 0;
+    let mut i = 0;
+    while i < data.len() {
+        sum += data[i] as u64;
+        n += 1;
+        i += step;
+    }
+    (sum / n.max(1)) as u32
+}
+
 /// Run the GDI `BitBlt` capture loop on a dedicated OS thread.
 ///
 /// Sends the initial resolution (or an init error) through `init_tx`, then
@@ -1341,6 +1509,14 @@ fn run_gdi_capture(
 ) {
     let frame_interval =
         std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
+
+    // Bind this thread to the interactive desktop BEFORE any GDI DC work
+    // (`GetDC(None)` happens inside `GdiCapture::new`). Without this the worker
+    // thread captures its inherited (blank/black) desktop even though the real
+    // desktop is on screen -- the root cause of the all-black GDI stream. The
+    // guard is held for the whole loop so the handle stays valid; a bind
+    // failure is logged and we proceed on the existing desktop.
+    let _desktop_guard = bind_thread_to_input_desktop("GDI");
 
     let (mut rect_x, mut rect_y, init_w, init_h) = match resolve_capture_rect(target_output) {
         Ok(r) => r,
@@ -1418,6 +1594,20 @@ fn run_gdi_capture(
                         frame.height,
                         frame.stride,
                         frame.data.len(),
+                    );
+                }
+
+                // Black-frame diagnostic: log the average byte value of the
+                // captured buffer for the first few frames (then once every
+                // ~600 as a cheap liveness check). avg_byte ~= 0 means the
+                // capture is black (wrong-desktop / capture bug); avg_byte > 0
+                // means real pixels reached the buffer, so any remaining black
+                // is downstream (encode/transport). Sampled, not summed, to
+                // stay off the hot path.
+                if frame_count <= 3 || frame_count % 600 == 0 {
+                    let avg = sampled_avg_byte(&frame.data);
+                    eprintln!(
+                        "[display/windows] GDI frame #{frame_count} avg_byte={avg}"
                     );
                 }
 
@@ -1535,6 +1725,31 @@ mod tests {
         let b = WindowsBackend::with_method(Some(1), CaptureMethod::Dxgi);
         assert_eq!(b.method, CaptureMethod::Dxgi);
         assert_eq!(b.target_output_index, Some(1));
+    }
+
+    #[test]
+    fn sampled_avg_byte_black_is_zero_real_is_nonzero() {
+        // The black-frame diagnostic contract: an all-zero (black BGRA) buffer
+        // averages 0, any real content averages > 0, and an empty buffer is 0.
+        assert_eq!(sampled_avg_byte(&[]), 0);
+        let black = vec![0u8; 1920 * 1080 * 4];
+        assert_eq!(sampled_avg_byte(&black), 0, "all-black must report avg 0");
+        let mid = vec![128u8; 1920 * 1080 * 4];
+        assert_eq!(sampled_avg_byte(&mid), 128, "uniform 128 must report 128");
+        // Real desktop content (a non-trivial fraction of non-black pixels)
+        // reads clearly above 0, which is the signal the diagnostic relies on.
+        // Here every other byte is 64 -> sampled average ~32.
+        let mut content = vec![0u8; 1920 * 1080 * 4];
+        for (i, b) in content.iter_mut().enumerate() {
+            if i % 2 == 0 {
+                *b = 64;
+            }
+        }
+        assert!(
+            sampled_avg_byte(&content) > 0,
+            "real content must read above 0 (got {})",
+            sampled_avg_byte(&content)
+        );
     }
 
     #[test]
