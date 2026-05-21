@@ -22757,6 +22757,11 @@ function worktreeRemoveCommand(wt) {
   return `git -C ${shellQuote(wt.repo_root)} worktree remove ${shellQuote(wt.path)}`;
 }
 
+function formatWorktreeDivergence(target, ahead, behind) {
+  const label = target ? `${target} ` : '';
+  return `${label}+${Number(ahead || 0).toLocaleString()} / -${Number(behind || 0).toLocaleString()}`;
+}
+
 function recomputeWorktreeSummary(scan) {
   const rows = Array.isArray(scan?.worktrees) ? scan.worktrees : [];
   const summary = {
@@ -22956,7 +22961,12 @@ function renderWorktreesList(scan, el) {
     addMeta('changed', fmtWorktreeMinute(wt.last_changed_at), null, wt.last_changed_at || '');
     addMeta('commit', fmtWorktreeMinute(wt.head_author_time), null, wt.head_author_time || '');
     addMeta('merge', wt.merge_status, wt.merge_status === 'merged' ? 'var(--green)' : (wt.merge_status === 'unmerged' ? 'var(--red)' : null));
-    if (wt.ahead || wt.behind) addMeta('upstream', `+${wt.ahead || 0} / -${wt.behind || 0}`);
+    if (wt.default_branch && (wt.default_ahead || wt.default_behind)) {
+      addMeta('base', formatWorktreeDivergence(wt.default_branch, wt.default_ahead, wt.default_behind), (wt.default_behind || 0) > 0 ? 'var(--yellow)' : null, wt.default_branch);
+    }
+    if (wt.upstream && (!wt.default_branch || wt.upstream !== wt.default_branch) && (wt.ahead || wt.behind)) {
+      addMeta('tracking', formatWorktreeDivergence(wt.upstream, wt.ahead, wt.behind), null, wt.upstream);
+    }
     if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'var(--red)');
     if ((wt.active_sessions || 0) > 0 || (wt.related_session_count || 0) > 0) {
       addMeta('sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`, (wt.active_sessions || 0) > 0 ? 'var(--yellow)' : null);

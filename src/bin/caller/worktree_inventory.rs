@@ -71,6 +71,8 @@ pub struct WorktreeEntry {
     pub last_changed_at: Option<String>,
     pub last_changed_age_days: Option<i64>,
     pub default_branch: Option<String>,
+    pub default_ahead: i64,
+    pub default_behind: i64,
     pub upstream: Option<String>,
     pub ahead: i64,
     pub behind: i64,
@@ -508,6 +510,12 @@ fn enrich_worktree(
     }
 
     let is_main = raw.path == repo_root || same_path(&raw.path, &repo_root);
+    let (default_ahead, default_behind) = match (raw.head.as_ref(), default_branch.as_ref()) {
+        (Some(head), Some(default_branch)) if git_ref_exists(&repo_root, default_branch) => {
+            git_ahead_behind(&repo_root, head, default_branch).unwrap_or((0, 0))
+        }
+        _ => (0, 0),
+    };
     let mut merged_targets = Vec::new();
     if let Some(head) = raw.head.as_ref() {
         for target in &target_refs {
@@ -645,6 +653,8 @@ fn enrich_worktree(
         last_changed_at,
         last_changed_age_days,
         default_branch,
+        default_ahead,
+        default_behind,
         upstream: status.upstream,
         ahead: status.ahead,
         behind: status.behind,
@@ -853,6 +863,15 @@ fn git_ref_exists(repo: &Path, target: &str) -> bool {
 
 fn git_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
     git_status(repo, &["merge-base", "--is-ancestor", ancestor, descendant])
+}
+
+fn git_ahead_behind(repo: &Path, left: &str, right: &str) -> Option<(i64, i64)> {
+    let range = format!("{left}...{right}");
+    let output = git_string(repo, &["rev-list", "--left-right", "--count", &range]).ok()?;
+    let mut parts = output.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
 }
 
 fn git_i64(path: &Path, args: &[&str]) -> Result<i64, String> {
@@ -1126,6 +1145,33 @@ mod tests {
         assert_eq!(found.untracked, 1);
         assert!(!found.safe_to_remove);
         assert!(found.safety.contains("local changes") || found.safety.contains("untracked"));
+    }
+
+    #[test]
+    fn scan_reports_default_branch_divergence() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("behind-default-worktree");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "behind-default", &wt_str, "main"],
+        );
+        std::fs::write(repo.join("README.md"), "hello\nnew main work\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "advance main"]);
+
+        let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
+        let found = scan
+            .worktrees
+            .iter()
+            .find(|entry| entry.branch.as_deref() == Some("behind-default"))
+            .expect("behind-default worktree found");
+
+        assert_eq!(found.default_branch.as_deref(), Some("main"));
+        assert_eq!(found.default_ahead, 0);
+        assert_eq!(found.default_behind, 1);
+        assert_eq!(found.merge_status, "merged");
     }
 
     #[test]
