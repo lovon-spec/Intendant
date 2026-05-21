@@ -238,10 +238,12 @@ impl SessionSupervisor {
             }
             event::ControlMsg::RenameSession {
                 session_id,
+                backend_session_id,
                 source,
                 name,
             } => {
-                self.rename_session(session_id, source, name).await;
+                self.rename_session(session_id, backend_session_id, source, name)
+                    .await;
             }
             _ => {}
         }
@@ -1079,7 +1081,13 @@ impl SessionSupervisor {
         }
     }
 
-    async fn rename_session(&self, session_id: String, source: Option<String>, name: String) {
+    async fn rename_session(
+        &self,
+        session_id: String,
+        backend_session_id: Option<String>,
+        source: Option<String>,
+        name: String,
+    ) {
         let managed = {
             let state = self.state.lock().await;
             state
@@ -1106,10 +1114,18 @@ impl SessionSupervisor {
             .or(source)
             .unwrap_or_else(|| "intendant".to_string());
         let normalized_source = crate::session_names::normalize_source(&source);
+        let persistence_session_id = if normalized_source == "intendant" {
+            session_id.as_str()
+        } else {
+            backend_session_id.as_deref().unwrap_or(&session_id)
+        };
         let result = match dirs::home_dir() {
-            Some(home) => {
-                crate::session_names::rename_session(&home, &normalized_source, &session_id, &name)
-            }
+            Some(home) => crate::session_names::rename_session(
+                &home,
+                &normalized_source,
+                persistence_session_id,
+                &name,
+            ),
             None => Err("could not resolve home directory".to_string()),
         };
 

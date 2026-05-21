@@ -225,6 +225,14 @@ pub enum AppEvent {
         session_id: String,
         task: Option<String>,
     },
+    /// Links an Intendant wrapper/log session to a backend-native
+    /// session/thread id. Frontends use this to route backend-specific actions
+    /// without confusing the wrapper UUID with the provider's own id.
+    SessionIdentity {
+        session_id: String,
+        source: String,
+        backend_session_id: String,
+    },
     SessionAttached {
         session_id: String,
         source: String,
@@ -847,6 +855,8 @@ pub enum ControlMsg {
     RenameSession {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
         name: String,
     },
@@ -1353,6 +1363,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::SessionStarted { session_id, task } => Some(OutboundEvent::SessionStarted {
             session_id: session_id.clone(),
             task: task.clone(),
+        }),
+        AppEvent::SessionIdentity {
+            session_id,
+            source,
+            backend_session_id,
+        } => Some(OutboundEvent::SessionIdentity {
+            session_id: session_id.clone(),
+            source: source.clone(),
+            backend_session_id: backend_session_id.clone(),
         }),
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
@@ -2695,16 +2714,18 @@ mod tests {
 
     #[test]
     fn control_msg_rename_session_deserialize() {
-        let json = r#"{"action":"rename_session","session_id":"abc123","source":"intendant","name":"UI polish"}"#;
+        let json = r#"{"action":"rename_session","session_id":"abc123","backend_session_id":"codex-thread-1","source":"codex","name":"UI polish"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::RenameSession {
                 session_id,
+                backend_session_id,
                 source,
                 name,
             } => {
                 assert_eq!(session_id, "abc123");
-                assert_eq!(source.as_deref(), Some("intendant"));
+                assert_eq!(backend_session_id.as_deref(), Some("codex-thread-1"));
+                assert_eq!(source.as_deref(), Some("codex"));
                 assert_eq!(name, "UI polish");
             }
             _ => panic!("expected RenameSession"),

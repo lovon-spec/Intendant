@@ -2058,6 +2058,12 @@ impl AppState {
                 cmds.push(UiCommand::SessionStarted { session_id, task });
             }
 
+            "session_identity" => {
+                // Browser JS keeps the richer wrapper ↔ backend-native id map.
+                // The Rust dashboard reducer intentionally treats this as
+                // metadata so it does not create activity noise.
+            }
+
             "session_attached" => {
                 let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
                 let source = msg["source"].as_str().unwrap_or("").to_string();
