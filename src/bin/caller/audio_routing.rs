@@ -710,12 +710,356 @@ async fn switchaudio_set(device_name: &str, device_type: &str) -> Result<(), Cal
     Ok(())
 }
 
+// ─── Windows backend (ffmpeg dshow capture + ffplay playback) ────────────────
+//
+// Windows has no built-in audio CLI analogous to PulseAudio/SwitchAudioSource,
+// so the bridge shells out to the ffmpeg toolchain (the same external-CLI seam
+// Linux and macOS use). Two runtime prerequisites, analogous to PulseAudio
+// modules on Linux or BlackHole on macOS:
+//
+//   1. ffmpeg + ffplay on PATH (the standard ffmpeg distribution ships both;
+//      ffmpeg encodes/captures, ffplay plays — ffmpeg itself has no Windows
+//      audio *output* muxer).
+//   2. A virtual audio cable — VB-CABLE (VB-Audio) is the de-facto free option.
+//      It exposes a paired playback endpoint "CABLE Input (VB-Audio Virtual
+//      Cable)" and a recording endpoint "CABLE Output (VB-Audio Virtual
+//      Cable)": whatever is played to CABLE Input is captured from CABLE
+//      Output. That loopback is the bridge.
+//
+// Routing model (mirrors macOS BlackHole):
+//   - model output → app mic: ffplay plays the model's PCM to the DEFAULT
+//     output device. The user points the default playback device at "CABLE
+//     Input"; the target app then reads "CABLE Output" as its microphone.
+//   - app audio → model: ffmpeg captures "CABLE Output" via DirectShow and
+//     emits raw PCM. The app must play into "CABLE Input" (e.g. as its default
+//     output) for the bridge to hear it.
+//
+// ffplay on Windows plays to the system default output device only — its
+// SDL/dsound backend exposes no device-selection flag — so, exactly like the
+// macOS path, per-app routing is unsupported and default-device save/restore
+// is a no-op (Windows ships no CLI to change the default device). The
+// dispatcher in main.rs/mcp.rs only logs a warning if `set_as_default` fails
+// and then proceeds, so this degrades cleanly.
+
+/// DirectShow recording endpoint of VB-CABLE — what the app's audio is captured
+/// from. ffmpeg `-f dshow -i audio="..."` reads the cable loopback here.
+#[cfg(windows)]
+const VB_CABLE_OUTPUT: &str = "CABLE Output (VB-Audio Virtual Cable)";
+
+/// Playback endpoint of VB-CABLE — where app/model audio is sent so the paired
+/// recording endpoint can capture it. Used for documentation and device
+/// detection; ffplay targets the default device, which the user points here.
+#[cfg(windows)]
+const VB_CABLE_INPUT: &str = "CABLE Input (VB-Audio Virtual Cable)";
+
+#[cfg(windows)]
+struct PlatformBridge {
+    /// DirectShow device the model's audio is played toward (virtual mic):
+    /// the cable's playback endpoint. Apps read its paired recording endpoint
+    /// as mic input.
+    mic_device_name: String,
+    /// DirectShow device app audio is captured from (virtual speaker): the
+    /// cable's recording endpoint, fed to the model.
+    capture_device_name: String,
+}
+
+#[cfg(windows)]
+impl PlatformBridge {
+    /// Stub bridge for network mode — no local devices needed.
+    fn stub() -> Self {
+        Self {
+            mic_device_name: String::new(),
+            capture_device_name: String::new(),
+        }
+    }
+
+    async fn is_available() -> bool {
+        // Both halves of the toolchain plus a detectable virtual cable.
+        has_ffmpeg_tool("ffmpeg").await
+            && has_ffmpeg_tool("ffplay").await
+            && find_virtual_cable().await.is_some()
+    }
+
+    async fn create(_session_id: &str) -> Result<Self, CallerError> {
+        if !has_ffmpeg_tool("ffmpeg").await || !has_ffmpeg_tool("ffplay").await {
+            return Err(CallerError::Agent(
+                "ffmpeg and ffplay are required for audio routing on Windows. \
+                 Install the full ffmpeg distribution (which ships both) and \
+                 ensure they are on PATH — e.g. `winget install Gyan.FFmpeg` \
+                 or `choco install ffmpeg-full`."
+                    .into(),
+            ));
+        }
+        let (capture, mic) = find_virtual_cable().await.ok_or_else(|| {
+            CallerError::Agent(format!(
+                "No virtual audio cable found. A virtual cable is required to \
+                 bridge audio between the app and the live model. Install \
+                 VB-CABLE (https://vb-audio.com/Cable/) which provides the \
+                 paired '{}' / '{}' endpoints, then set '{}' as the default \
+                 playback device so app and model audio route through the cable.",
+                VB_CABLE_INPUT, VB_CABLE_OUTPUT, VB_CABLE_INPUT
+            ))
+        })?;
+        Ok(Self {
+            mic_device_name: mic,
+            capture_device_name: capture,
+        })
+    }
+
+    fn model_output_device(&self) -> &str {
+        &self.mic_device_name
+    }
+
+    fn app_capture_device(&self) -> &str {
+        &self.capture_device_name
+    }
+
+    fn capture_command(&self, sample_rate: u32) -> (&'static str, Vec<String>) {
+        // ffmpeg captures the cable's recording endpoint via DirectShow and
+        // writes raw mono s16le PCM to stdout (`-` / `pipe:1`), which
+        // start_local_audio_bridge reads and forwards to the model.
+        (
+            "ffmpeg",
+            vec![
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "error".into(),
+                "-f".into(),
+                "dshow".into(),
+                // Keep input buffered so brief stalls don't drop samples.
+                "-rtbufsize".into(),
+                "64M".into(),
+                "-i".into(),
+                format!("audio={}", self.capture_device_name),
+                "-f".into(),
+                "s16le".into(),
+                "-acodec".into(),
+                "pcm_s16le".into(),
+                "-ac".into(),
+                "1".into(),
+                "-ar".into(),
+                sample_rate.to_string(),
+                "-".into(),
+            ],
+        )
+    }
+
+    fn playback_command(&self, sample_rate: u32) -> (&'static str, Vec<String>) {
+        // ffmpeg has no Windows audio-output muxer, so playback uses ffplay,
+        // which reads raw mono s16le PCM from stdin (`-i -`) and renders it to
+        // the system default output device. The user points the default
+        // playback device at the cable's playback endpoint so the model's
+        // voice lands on the virtual mic the app records from.
+        (
+            "ffplay",
+            vec![
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "error".into(),
+                "-nodisp".into(),
+                "-autoexit".into(),
+                // Low-latency flags so the model's speech plays promptly.
+                "-fflags".into(),
+                "nobuffer".into(),
+                "-flags".into(),
+                "low_delay".into(),
+                "-f".into(),
+                "s16le".into(),
+                "-ar".into(),
+                sample_rate.to_string(),
+                "-ac".into(),
+                "1".into(),
+                "-i".into(),
+                "-".into(),
+            ],
+        )
+    }
+
+    async fn get_defaults(&self) -> Result<(String, String), CallerError> {
+        // Windows ships no CLI to read or change the default audio endpoint;
+        // routing is the user's responsibility (point the default playback
+        // device at the virtual cable). Report unsupported so set_as_default's
+        // caller — which only logs a warning — proceeds without a save/restore.
+        Err(CallerError::Agent(
+            "default audio device query is not supported on Windows; route the \
+             app's audio through the virtual cable manually (set the cable as \
+             the default playback device)"
+                .into(),
+        ))
+    }
+
+    async fn set_as_default(&self) -> Result<(), CallerError> {
+        Err(CallerError::Agent(
+            "setting the default audio device is not supported on Windows. \
+             Set the virtual cable's playback endpoint as the default playback \
+             device in Sound settings so app and model audio route through it."
+                .into(),
+        ))
+    }
+
+    fn set_default_source(&self, _name: &str) {}
+    fn set_default_sink(&self, _name: &str) {}
+
+    async fn route_app(&self, _app_name: &str) -> Result<(), CallerError> {
+        Err(CallerError::Agent(
+            "Per-app audio routing is not supported on Windows. Route the app's \
+             audio through the virtual cable (set it as the default playback \
+             device)."
+                .into(),
+        ))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PlatformBridge {
+    fn drop(&mut self) {
+        // The virtual cable is a system-level driver; nothing to tear down.
+        // Default-device restoration is a no-op on Windows (see set_as_default).
+    }
+}
+
+// ─── Windows helpers ─────────────────────────────────────────────────────────
+
+/// Check whether an ffmpeg-family tool is on PATH. `ffmpeg`/`ffplay` exit
+/// non-zero with no real args, so success is "spawned and produced banner
+/// output" — we treat a clean spawn (status returned at all) as present.
+#[cfg(windows)]
+async fn has_ffmpeg_tool(tool: &str) -> bool {
+    // `-version` exits 0 and prints the build string; a missing binary fails
+    // to spawn (ErrorKind::NotFound) and maps to false.
+    tokio::process::Command::new(tool)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Enumerate DirectShow audio devices via ffmpeg and locate a virtual cable.
+/// Returns (capture_device, playback_device) = (recording endpoint, playback
+/// endpoint) of the cable. VB-CABLE is matched first by its exact endpoint
+/// names, then any device whose name contains "CABLE" or "Virtual" is accepted
+/// as a fallback (covers Virtual Audio Cable and clones).
+#[cfg(windows)]
+async fn find_virtual_cable() -> Option<(String, String)> {
+    let names = list_dshow_audio_devices().await;
+
+    // Preferred: the exact VB-CABLE endpoint pair.
+    let has_vb_out = names.iter().any(|n| n == VB_CABLE_OUTPUT);
+    let has_vb_in = names.iter().any(|n| n == VB_CABLE_INPUT);
+    if has_vb_out && has_vb_in {
+        return Some((VB_CABLE_OUTPUT.to_string(), VB_CABLE_INPUT.to_string()));
+    }
+
+    // Fallback: a single recording endpoint that looks like a virtual cable.
+    // DirectShow exposes only recording endpoints as `dshow` inputs, so the
+    // capture device must be in this list; we reuse VB_CABLE_INPUT as the
+    // documented playback target the user is expected to route to.
+    let cable = names.iter().find(|n| {
+        let l = n.to_lowercase();
+        l.contains("cable") || l.contains("virtual")
+    })?;
+    Some((cable.clone(), VB_CABLE_INPUT.to_string()))
+}
+
+/// Run `ffmpeg -list_devices true -f dshow -i dummy` and parse the audio
+/// device names. ffmpeg writes the listing to stderr; each device line looks
+/// like:  `[dshow @ 000..] "Device Name" (audio)`  — older builds omit the
+/// trailing `(audio)`/`(video)` tag and instead group devices under
+/// "DirectShow video devices" / "DirectShow audio devices" headers. We handle
+/// both: prefer the explicit `(audio)` tag, else fall back to the section
+/// header. Names are returned without surrounding quotes.
+#[cfg(windows)]
+async fn list_dshow_audio_devices() -> Vec<String> {
+    let output = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    // This invocation always "fails" (dummy isn't a real device); the device
+    // listing is on stderr regardless of exit status.
+    let text = String::from_utf8_lossy(&output.stderr);
+    parse_dshow_audio_devices(&text)
+}
+
+/// Pure parser for `ffmpeg -list_devices` stderr → audio device names.
+/// Split out so it can be unit-tested without ffmpeg present.
+#[cfg(windows)]
+fn parse_dshow_audio_devices(stderr: &str) -> Vec<String> {
+    let mut devices = Vec::new();
+    // Tracks which section we're in for the header-style (older) format.
+    let mut in_audio_section = false;
+
+    for line in stderr.lines() {
+        let lower = line.to_lowercase();
+
+        // Section headers (older ffmpeg): "DirectShow audio devices".
+        if lower.contains("directshow audio devices") {
+            in_audio_section = true;
+            continue;
+        }
+        if lower.contains("directshow video devices") {
+            in_audio_section = false;
+            continue;
+        }
+
+        // Device lines carry a quoted name: [dshow @ ..] "Name" (audio)
+        let Some(name) = extract_quoted(line) else {
+            continue;
+        };
+        // Skip the "Alternative name" lines ffmpeg emits (a device path), which
+        // are also quoted — they immediately follow the friendly name.
+        if lower.contains("alternative name") {
+            continue;
+        }
+
+        let is_audio = if lower.contains("(audio)") {
+            true
+        } else if lower.contains("(video)") {
+            false
+        } else {
+            // No explicit tag → rely on the section header.
+            in_audio_section
+        };
+
+        if is_audio {
+            devices.push(name);
+        }
+    }
+    devices
+}
+
+/// Extract the first double-quoted substring from a line, without the quotes.
+#[cfg(windows)]
+fn extract_quoted(line: &str) -> Option<String> {
+    let start = line.find('"')? + 1;
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 // ─── Fallback for other platforms ───────────────────────────────────────────
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 struct PlatformBridge;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl PlatformBridge {
     fn stub() -> Self {
         Self
@@ -753,7 +1097,7 @@ impl PlatformBridge {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl Drop for PlatformBridge {
     fn drop(&mut self) {}
 }
@@ -894,5 +1238,110 @@ Source Output #7
         };
         assert_eq!(bridge.model_output_device(), "BlackHole 2ch");
         assert_eq!(bridge.app_capture_device(), "BlackHole 16ch");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_command_uses_ffmpeg_dshow() {
+        let bridge = PlatformBridge {
+            mic_device_name: VB_CABLE_INPUT.into(),
+            capture_device_name: VB_CABLE_OUTPUT.into(),
+        };
+        let (cmd, args) = bridge.capture_command(24000);
+        assert_eq!(cmd, "ffmpeg");
+        assert!(args.iter().any(|a| a == "dshow"));
+        assert!(args.iter().any(|a| a == "s16le"));
+        // The DirectShow input names the cable's recording endpoint.
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("audio={}", VB_CABLE_OUTPUT)));
+        assert!(args.iter().any(|a| a == "24000"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn playback_command_uses_ffplay_stdin() {
+        let bridge = PlatformBridge {
+            mic_device_name: VB_CABLE_INPUT.into(),
+            capture_device_name: VB_CABLE_OUTPUT.into(),
+        };
+        let (cmd, args) = bridge.playback_command(48000);
+        assert_eq!(cmd, "ffplay");
+        assert!(args.iter().any(|a| a == "s16le"));
+        assert!(args.iter().any(|a| a == "48000"));
+        // ffplay reads raw PCM from stdin.
+        assert!(args.iter().any(|a| a == "-i"));
+        assert!(args.iter().any(|a| a == "-"));
+        assert!(args.iter().any(|a| a == "-nodisp"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn model_output_is_cable_input() {
+        let bridge = PlatformBridge {
+            mic_device_name: VB_CABLE_INPUT.into(),
+            capture_device_name: VB_CABLE_OUTPUT.into(),
+        };
+        assert_eq!(bridge.model_output_device(), VB_CABLE_INPUT);
+        assert_eq!(bridge.app_capture_device(), VB_CABLE_OUTPUT);
+    }
+
+    // Newer ffmpeg: explicit "(audio)"/"(video)" tags on each device line.
+    #[cfg(windows)]
+    #[test]
+    fn parse_dshow_devices_tagged_format() {
+        let stderr = r#"
+[dshow @ 0000] "Integrated Camera" (video)
+[dshow @ 0000]   Alternative name "@device_pnp_\\?\usb#vid"
+[dshow @ 0000] "Microphone (Realtek Audio)" (audio)
+[dshow @ 0000]   Alternative name "@device_cm_{...}\wave_{...}"
+[dshow @ 0000] "CABLE Output (VB-Audio Virtual Cable)" (audio)
+[dshow @ 0000]   Alternative name "@device_cm_{...}\wave_{...}"
+"#;
+        let devices = parse_dshow_audio_devices(stderr);
+        assert_eq!(
+            devices,
+            vec![
+                "Microphone (Realtek Audio)".to_string(),
+                "CABLE Output (VB-Audio Virtual Cable)".to_string(),
+            ]
+        );
+    }
+
+    // Older ffmpeg: section headers, no per-line tag.
+    #[cfg(windows)]
+    #[test]
+    fn parse_dshow_devices_header_format() {
+        let stderr = r#"
+[dshow @ 0000] DirectShow video devices
+[dshow @ 0000]  "Integrated Camera"
+[dshow @ 0000] DirectShow audio devices
+[dshow @ 0000]  "Microphone (Realtek Audio)"
+[dshow @ 0000]  "CABLE Output (VB-Audio Virtual Cable)"
+"#;
+        let devices = parse_dshow_audio_devices(stderr);
+        assert_eq!(
+            devices,
+            vec![
+                "Microphone (Realtek Audio)".to_string(),
+                "CABLE Output (VB-Audio Virtual Cable)".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_dshow_devices_empty() {
+        assert!(parse_dshow_audio_devices("").is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extract_quoted_basic() {
+        assert_eq!(
+            extract_quoted(r#"[dshow @ 0] "CABLE Output" (audio)"#),
+            Some("CABLE Output".to_string())
+        );
+        assert_eq!(extract_quoted("no quotes here"), None);
     }
 }
