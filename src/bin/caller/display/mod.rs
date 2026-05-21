@@ -48,6 +48,10 @@ pub mod visual_marker;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 pub mod webrtc;
+#[cfg(windows)]
+pub mod windows;
+#[cfg(windows)]
+pub mod windows_keymap;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
@@ -159,13 +163,12 @@ async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
     Vec::new()
 }
 
-/// No display capture backend exists on Windows yet (Tier-1 will add a
-/// DXGI Desktop Duplication backend). Report no displays so callers
-/// (`list_displays`, the dashboard) gracefully show an empty set rather
-/// than failing.
+/// Enumerate Windows displays via DXGI output enumeration (the same DXGI
+/// objects the Desktop Duplication capture backend uses). Returns an empty
+/// `Vec` on failure; [`enumerate_displays`] then supplies a fallback entry.
 #[cfg(target_os = "windows")]
 async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
-    Vec::new()
+    windows::enumerate_displays().await
 }
 
 // ---------------------------------------------------------------------------

@@ -8749,6 +8749,42 @@ async fn activate_user_display(
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // If a specific display was requested, resolve its platform_id (DXGI
+        // output ordinal) from the enumerated list; otherwise capture the
+        // primary output. Mirrors the macOS arm.
+        let backend = if target_display_id != 0 {
+            let displays = display::enumerate_displays().await;
+            if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
+                display::windows::WindowsBackend::with_output_index(info.platform_id as u32)
+            } else {
+                eprintln!(
+                    "[user_display] display_id {} not found, falling back to primary",
+                    target_display_id
+                );
+                display::windows::WindowsBackend::new()
+            }
+        } else {
+            display::windows::WindowsBackend::new()
+        };
+        let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
+            eprintln!("[user_display] Windows display session failed: {}", e);
+        } else {
+            let (width, height) = session.resolution();
+            let session = Arc::new(session);
+            session.spawn_metrics_logger(Some(bus.clone()));
+            session_registry.write().await.insert(display_id, session);
+            bus.send(AppEvent::DisplayReady {
+                display_id,
+                width,
+                height,
+            });
+            return;
+        }
+    }
+
     #[allow(unreachable_code)]
     {
         eprintln!("[user_display] No supported display backend detected");
