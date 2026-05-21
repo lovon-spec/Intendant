@@ -1288,7 +1288,10 @@ html, body {
   top: 6px;
   right: 12px;
   z-index: 2;
-  padding: 1px 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 4px 1px 6px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
   background: var(--mantle);
@@ -1296,7 +1299,30 @@ html, body {
   font-size: 10px;
   font-weight: 600;
   line-height: 16px;
-  pointer-events: none;
+  pointer-events: auto;
+}
+.concurrent-log-action {
+  width: 18px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--overlay1);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 16px;
+}
+.concurrent-log-action:hover,
+.concurrent-log-action:focus {
+  background: var(--surface0);
+  color: var(--text);
+  outline: none;
+}
+.concurrent-log-action:focus-visible {
+  outline: 1px solid var(--blue);
+  outline-offset: 1px;
 }
 .session-window-grid {
   display: grid;
@@ -1336,9 +1362,34 @@ html, body {
 .session-window-grid.maximized ~ .scroll-bottom-btn {
   display: none !important;
 }
+.subtab-pane.concurrent-log-minimized .session-window-grid {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+}
+.subtab-pane.concurrent-log-minimized .concurrent-log-region {
+  flex: 0 0 30px;
+  min-height: 30px;
+  border-top: 1px solid var(--surface0);
+}
+.subtab-pane.concurrent-log-minimized .log-stream {
+  display: none;
+}
+.subtab-pane.concurrent-log-minimized .concurrent-log-label {
+  top: 6px;
+}
+.subtab-pane.concurrent-log-maximized .session-window-grid,
+.subtab-pane.concurrent-log-maximized .session-window-grid-resize-handle {
+  display: none !important;
+}
+.subtab-pane.concurrent-log-maximized .concurrent-log-region {
+  flex: 1 1 auto;
+  min-height: 0;
+}
 .session-window-grid-resize-handle {
   position: relative;
-  height: 8px;
+  height: 10px;
   flex-shrink: 0;
   cursor: row-resize;
   background: var(--mantle);
@@ -1348,7 +1399,7 @@ html, body {
   content: "";
   position: absolute;
   left: 50%;
-  top: 3px;
+  top: 4px;
   width: 48px;
   height: 2px;
   border-radius: 999px;
@@ -5500,9 +5551,13 @@ html, body {
           <div class="steer-strip empty" id="steer-strip"></div>
 
           <div class="session-window-grid hidden" id="session-window-grid"></div>
-          <div class="session-window-grid-resize-handle hidden" id="session-window-grid-resize-handle" title="Drag to resize session windows"></div>
+          <div class="session-window-grid-resize-handle hidden" id="session-window-grid-resize-handle" title="Drag to resize session windows and concurrent view"></div>
           <div class="concurrent-log-region" id="concurrent-log-region">
-            <div class="concurrent-log-label hidden" id="concurrent-log-label" title="Concurrent agent view">Concurrent view</div>
+            <div class="concurrent-log-label hidden" id="concurrent-log-label" title="Concurrent agent view">
+              <span>Concurrent view</span>
+              <button type="button" class="concurrent-log-action" id="concurrent-log-minimize" title="Minimize concurrent view" aria-label="Minimize concurrent view">-</button>
+              <button type="button" class="concurrent-log-action" id="concurrent-log-maximize" title="Maximize concurrent view" aria-label="Maximize concurrent view">&#x26F6;</button>
+            </div>
             <div class="log-stream" id="log-stream"></div>
           </div>
           <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
@@ -6857,14 +6912,18 @@ let dashboardProjectRoot = '';
 const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
-const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v2';
-const SESSION_WINDOW_GRID_MIN_HEIGHT = 72;
+const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3';
+const SESSION_WINDOW_GRID_MIN_HEIGHT = 180;
 const SESSION_WINDOW_GRID_DEFAULT_RATIO = 0.5;
 const SESSION_WINDOW_GRID_MAX_RATIO = 0.8;
+const CONCURRENT_LOG_MODE_NORMAL = 'normal';
+const CONCURRENT_LOG_MODE_MINIMIZED = 'minimized';
+const CONCURRENT_LOG_MODE_MAXIMIZED = 'maximized';
 let sessionMetadataRefreshTimer = null;
 let sessionMetadataRefreshInFlight = null;
 let sessionWindowGridHeightPx = readStoredSessionWindowGridHeight();
 let sessionWindowGridResizeDrag = null;
+let concurrentLogMode = CONCURRENT_LOG_MODE_NORMAL;
 let currentSessionDetail = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
@@ -9971,9 +10030,52 @@ function syncSessionWindowGridControls() {
   const logLabel = document.getElementById('concurrent-log-label');
   if (!grid || !handle) return;
   const showGrid = !grid.classList.contains('hidden');
-  const showResize = showGrid && !grid.classList.contains('maximized');
-  if (logLabel) logLabel.classList.toggle('hidden', !showResize);
+  if (!showGrid && concurrentLogMode !== CONCURRENT_LOG_MODE_NORMAL) {
+    concurrentLogMode = CONCURRENT_LOG_MODE_NORMAL;
+  }
+  syncConcurrentLogModeUi();
+  const showResize =
+    showGrid
+    && !grid.classList.contains('maximized')
+    && concurrentLogMode === CONCURRENT_LOG_MODE_NORMAL;
+  if (logLabel) logLabel.classList.toggle('hidden', !showGrid);
   handle.classList.toggle('hidden', !showResize);
+}
+
+function syncConcurrentLogModeUi() {
+  const pane = document.getElementById('activity-log-pane');
+  const grid = document.getElementById('session-window-grid');
+  const label = document.getElementById('concurrent-log-label');
+  const minimize = document.getElementById('concurrent-log-minimize');
+  const maximize = document.getElementById('concurrent-log-maximize');
+  const showGrid = !!grid && !grid.classList.contains('hidden');
+  if (!pane) return;
+  const mode = showGrid ? concurrentLogMode : CONCURRENT_LOG_MODE_NORMAL;
+  pane.classList.toggle('concurrent-log-minimized', mode === CONCURRENT_LOG_MODE_MINIMIZED);
+  pane.classList.toggle('concurrent-log-maximized', mode === CONCURRENT_LOG_MODE_MAXIMIZED);
+  if (label) label.classList.toggle('hidden', !showGrid);
+  if (minimize) {
+    const minimized = mode === CONCURRENT_LOG_MODE_MINIMIZED;
+    minimize.textContent = minimized ? '+' : '-';
+    minimize.title = minimized ? 'Restore concurrent view' : 'Minimize concurrent view';
+    minimize.setAttribute('aria-label', minimize.title);
+    minimize.setAttribute('aria-pressed', minimized ? 'true' : 'false');
+  }
+  if (maximize) {
+    const maximized = mode === CONCURRENT_LOG_MODE_MAXIMIZED;
+    maximize.innerHTML = maximized ? '&#x2750;' : '&#x26F6;';
+    maximize.title = maximized ? 'Restore concurrent view' : 'Maximize concurrent view';
+    maximize.setAttribute('aria-label', maximize.title);
+    maximize.setAttribute('aria-pressed', maximized ? 'true' : 'false');
+  }
+}
+
+function setConcurrentLogMode(mode) {
+  const next = [CONCURRENT_LOG_MODE_MINIMIZED, CONCURRENT_LOG_MODE_MAXIMIZED].includes(mode)
+    ? mode
+    : CONCURRENT_LOG_MODE_NORMAL;
+  concurrentLogMode = next;
+  syncSessionWindowGridControls();
 }
 
 function applySessionWindowGridHeight() {
@@ -10617,6 +10719,24 @@ document.getElementById('session-window-grid-resize-handle')?.addEventListener('
 document.getElementById('session-window-grid-resize-handle')?.addEventListener('pointerup', endSessionWindowGridResize);
 document.getElementById('session-window-grid-resize-handle')?.addEventListener('pointercancel', endSessionWindowGridResize);
 document.getElementById('session-window-grid-resize-handle')?.addEventListener('dblclick', resetSessionWindowGridHeight);
+document.getElementById('concurrent-log-minimize')?.addEventListener('click', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  setConcurrentLogMode(
+    concurrentLogMode === CONCURRENT_LOG_MODE_MINIMIZED
+      ? CONCURRENT_LOG_MODE_NORMAL
+      : CONCURRENT_LOG_MODE_MINIMIZED
+  );
+});
+document.getElementById('concurrent-log-maximize')?.addEventListener('click', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  setConcurrentLogMode(
+    concurrentLogMode === CONCURRENT_LOG_MODE_MAXIMIZED
+      ? CONCURRENT_LOG_MODE_NORMAL
+      : CONCURRENT_LOG_MODE_MAXIMIZED
+  );
+});
 window.addEventListener('resize', () => applySessionWindowGridHeight());
 
 function appendLogEntryToSessionWindow(entry) {
