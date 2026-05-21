@@ -7797,6 +7797,22 @@ async fn run_external_agent_mode(
                     }
                     bus_event = idle_bus_rx.recv() => {
                         match bus_event {
+                            Ok(AppEvent::SteerRequested {
+                                session_id,
+                                text,
+                                id,
+                            }) if event_targets_session_or_alias(
+                                &session_id,
+                                &live_session_id,
+                                &drain_config.alias_session_id,
+                            ) => {
+                                break (
+                                    text,
+                                    UserAttachments::default(),
+                                    Some(id),
+                                    None,
+                                );
+                            }
                             Ok(AppEvent::CodexThreadActionRequested {
                                 session_id,
                                 action,

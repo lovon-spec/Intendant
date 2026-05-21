@@ -10663,7 +10663,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   }
   if (meta.phase) {
     win.phase = normalizeSessionPhase(meta.phase);
-    if (win.phase === 'done' || win.phase === 'interrupted') {
+    if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
       win.pendingActiveUntil = 0;
     }
     win.status.textContent = win.phase;

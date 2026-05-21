@@ -1601,6 +1601,43 @@ fn codex_web_search_preview(params: &serde_json::Value) -> String {
     "web search".to_string()
 }
 
+fn normalize_plan_status(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn codex_plan_entries(params: &serde_json::Value) -> Vec<(String, String, String)> {
+    let Some(plan) = params.get("plan").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    plan.iter()
+        .filter_map(|entry| {
+            let content = entry
+                .get("step")
+                .or_else(|| entry.get("content"))
+                .or_else(|| entry.get("text"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let priority = entry
+                .get("priority")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let status = entry
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(normalize_plan_status)
+                .unwrap_or_default();
+            Some((content.to_string(), priority, status))
+        })
+        .collect()
+}
+
 /// Translate a Codex notification into one or more `AgentEvent`s.
 fn translate_notification(
     method: &str,
@@ -1840,6 +1877,13 @@ fn translate_notification(
                 files_changed,
                 unified_diff,
             });
+        }
+
+        "turn/plan/updated" => {
+            let entries = codex_plan_entries(params);
+            if !entries.is_empty() {
+                let _ = event_tx.send(AgentEvent::PlanUpdate { entries });
+            }
         }
 
         "thread/goal/updated" => {
@@ -2884,6 +2928,35 @@ mod tests {
                 assert_eq!(preview, "ls -la");
             }
             other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_turn_plan_updated() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "plan": [
+                {"status": "completed", "step": "Inspect current picker APIs/UI"},
+                {"status": "inProgress", "step": "Add binary path browse mode"},
+                {"status": "pending", "step": "Run focused checks/tests"}
+            ],
+            "threadId": "thread-1",
+            "turnId": "turn-1"
+        });
+
+        translate_notification("turn/plan/updated", &params, &tx);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::PlanUpdate { entries } => {
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].0, "Inspect current picker APIs/UI");
+                assert_eq!(entries[0].2, "completed");
+                assert_eq!(entries[1].0, "Add binary path browse mode");
+                assert_eq!(entries[1].2, "inprogress");
+                assert_eq!(entries[2].0, "Run focused checks/tests");
+                assert_eq!(entries[2].2, "pending");
+            }
+            other => panic!("expected PlanUpdate, got {:?}", other),
         }
     }
 
