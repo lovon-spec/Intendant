@@ -6811,8 +6811,10 @@ let dashboardProjectRoot = '';
 const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
-const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height';
+const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v2';
 const SESSION_WINDOW_GRID_MIN_HEIGHT = 72;
+const SESSION_WINDOW_GRID_DEFAULT_RATIO = 0.5;
+const SESSION_WINDOW_GRID_MAX_RATIO = 0.8;
 let sessionMetadataRefreshTimer = null;
 let sessionMetadataRefreshInFlight = null;
 let sessionWindowGridHeightPx = readStoredSessionWindowGridHeight();
@@ -9871,12 +9873,26 @@ function storeSessionWindowGridHeight(heightPx) {
   } catch {}
 }
 
-function maxSessionWindowGridHeight() {
+function sessionWindowGridAvailableHeight() {
   const pane = document.getElementById('activity-log-pane');
+  const grid = document.getElementById('session-window-grid');
   const paneHeight = pane?.clientHeight || window.innerHeight || 600;
+  if (!pane || !grid) return paneHeight;
+  const paneRect = pane.getBoundingClientRect();
+  const gridRect = grid.getBoundingClientRect();
+  const gridTop = gridRect.height > 0 ? gridRect.top : paneRect.top;
+  const topOffset = Math.max(0, gridTop - paneRect.top);
+  return Math.max(SESSION_WINDOW_GRID_MIN_HEIGHT * 2, paneRect.height - topOffset);
+}
+
+function maxSessionWindowGridHeight() {
+  const availableHeight = sessionWindowGridAvailableHeight();
   return Math.max(
     SESSION_WINDOW_GRID_MIN_HEIGHT,
-    Math.min(Math.round(window.innerHeight * 0.72), paneHeight - 120)
+    Math.min(
+      Math.round(availableHeight * SESSION_WINDOW_GRID_MAX_RATIO),
+      availableHeight - SESSION_WINDOW_GRID_MIN_HEIGHT
+    )
   );
 }
 
@@ -9887,6 +9903,11 @@ function clampSessionWindowGridHeight(heightPx) {
     SESSION_WINDOW_GRID_MIN_HEIGHT,
     Math.min(n, maxSessionWindowGridHeight())
   ));
+}
+
+function defaultSessionWindowGridHeight() {
+  const availableHeight = sessionWindowGridAvailableHeight();
+  return clampSessionWindowGridHeight(Math.round(availableHeight * SESSION_WINDOW_GRID_DEFAULT_RATIO));
 }
 
 function syncSessionWindowGridControls() {
@@ -9900,8 +9921,11 @@ function syncSessionWindowGridControls() {
 function applySessionWindowGridHeight() {
   const grid = document.getElementById('session-window-grid');
   if (!grid) return;
-  const height = clampSessionWindowGridHeight(sessionWindowGridHeightPx);
-  sessionWindowGridHeightPx = height;
+  const hasCustomHeight = sessionWindowGridHeightPx !== null;
+  const height = hasCustomHeight
+    ? clampSessionWindowGridHeight(sessionWindowGridHeightPx)
+    : defaultSessionWindowGridHeight();
+  if (hasCustomHeight) sessionWindowGridHeightPx = height;
   if (height) {
     grid.style.setProperty('--session-window-grid-height', `${height}px`);
     grid.classList.add('resized');
