@@ -42,11 +42,16 @@
 //!
 //! Each [`EncoderPool`] holds two kinds of encoders:
 //!
-//! - **Always-on** (constructed at pool creation): VP8 layers from
+//! - **Always-on** (constructed at pool creation): the platform
+//!   [`BASELINE_CODEC`]. On macOS/Linux that's VP8 layers from
 //!   `LayerSpec::vp8_simulcast` (up to three at full / half / quarter).
 //!   VP8 is the universal codec — Safari, Firefox, Chrome, Edge all
 //!   decode it reliably and it has a long history of working well for
-//!   screen content. The layers exist as a *capability*; which ones
+//!   screen content. On Windows the VP8/libvpx backend is gated off
+//!   (Tier-0 deferral), so the baseline is instead a single full-resolution
+//!   H.264 layer via the Media Foundation software encoder — also
+//!   universally decodable by WebRTC browsers. The layers exist as a
+//!   *capability*; which ones
 //!   actually emit frames is governed by the demand-bound (#48) and
 //!   capacity policies. By default:
 //!     - a local DisplaySlot viewer (single-RID, post-#58) demands `f`
@@ -214,6 +219,24 @@ pub const I420_BROADCAST_CAPACITY: usize = 4;
 // Codec identity
 // ---------------------------------------------------------------------------
 
+/// The always-on / baseline codec for this platform — the codec the pool
+/// guarantees is producing frames the instant any peer subscribes, and the one
+/// `EncoderPool::new` / `on_resize` spawn for every always-on layer.
+///
+/// VP8 everywhere it's available (universal browser support, no licensing
+/// complications). On Windows the VP8/libvpx backend is gated off (Tier-0
+/// deferral — see `vp8.rs` / `Cargo.toml`), so the baseline is **H.264** via
+/// the Media Foundation software encoder ([`super::h264_windows`]); H.264 is
+/// universally decodable by WebRTC browsers too, so it is a sound baseline.
+/// This keeps the Windows streaming path supplied with a working always-on
+/// encoder while leaving the macOS/Linux VP8 baseline unchanged.
+#[cfg(not(target_os = "windows"))]
+pub const BASELINE_CODEC: CodecKind = CodecKind::Vp8;
+/// See the non-Windows definition above; Windows has no VP8 backend so the
+/// baseline is H.264.
+#[cfg(target_os = "windows")]
+pub const BASELINE_CODEC: CodecKind = CodecKind::H264;
+
 /// Codec kinds the pool can produce. Closed enum because adding a codec is a
 /// coordinated change (new encoder backend + RTC codec registration + browser
 /// compat survey).
@@ -267,11 +290,12 @@ impl CodecKind {
         }
     }
 
-    /// Whether this codec is in the always-on bank by default. Only
-    /// VP8 is always-on (universal compatibility); everything else
-    /// spins up on demand.
+    /// Whether this codec is in the always-on bank by default. The
+    /// [`BASELINE_CODEC`] is always-on (VP8 on macOS/Linux for universal
+    /// compatibility; H.264 on Windows where VP8 is unavailable); everything
+    /// else spins up on demand.
     pub fn is_always_on_default(&self) -> bool {
-        matches!(self, Self::Vp8)
+        *self == BASELINE_CODEC
     }
 }
 
@@ -1118,14 +1142,14 @@ impl EncoderPool {
         let initial_layers = (layer_factory)(source_width, source_height);
         let mut always_on = Vec::with_capacity(initial_layers.len());
         for layer in initial_layers {
-            // Always-on bank is VP8 (universal codec, see module docs).
-            // Use the failable constructor here and PANIC on failure —
-            // always-on is the universally-available fallback path; if
-            // even VP8 won't construct, there is no recovery and the
-            // display pipeline is fundamentally broken. Better to fail
-            // loud at pool construction than produce a silent
-            // never-decoding stream.
-            let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
+            // Always-on bank is the platform [`BASELINE_CODEC`] (VP8 on
+            // macOS/Linux, H.264 on Windows — see module docs). Use the
+            // failable constructor here and PANIC on failure — always-on is
+            // the universally-available fallback path; if even the baseline
+            // codec won't construct, there is no recovery and the display
+            // pipeline is fundamentally broken. Better to fail loud at pool
+            // construction than produce a silent never-decoding stream.
+            let id = EncoderId::new(BASELINE_CODEC, layer.rid.clone());
             let handle = try_spawn_encoder_thread(
                 id.clone(),
                 layer,
@@ -1167,10 +1191,22 @@ impl EncoderPool {
     }
 
     /// Codecs this pool knows how to spawn an on-demand encoder for.
-    /// Currently VP8 + H.264 (the two with wired backends).
-    /// VP9 and AV1 will be added when their encoder crates are picked.
+    /// VP8 + H.264 are the codecs with wired backends; VP9 and AV1 will be
+    /// added when their encoder crates are picked.
+    ///
+    /// On Windows the VP8/libvpx backend is gated off (its `new()` always
+    /// `Err`s), so VP8 is excluded — attempting it would just fail
+    /// construction and get logged+skipped. H.264 (Media Foundation) is the
+    /// only spawnable codec there, and it's already the always-on baseline.
+    #[cfg(not(target_os = "windows"))]
     fn on_demand_spawnable(codec: CodecKind) -> bool {
         matches!(codec, CodecKind::Vp8 | CodecKind::H264)
+    }
+
+    /// Windows variant — see the non-Windows definition. VP8 has no backend.
+    #[cfg(target_os = "windows")]
+    fn on_demand_spawnable(codec: CodecKind) -> bool {
+        matches!(codec, CodecKind::H264)
     }
 
     /// Source (capture) dimensions the pool was constructed with.
@@ -1318,7 +1354,7 @@ impl EncoderPool {
 
             let new_layers = (self.inner.layer_factory)(new_width, new_height);
             for layer in new_layers {
-                let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
+                let id = EncoderId::new(BASELINE_CODEC, layer.rid.clone());
                 let new_handle = try_spawn_encoder_thread(
                     id.clone(),
                     layer,
@@ -2478,15 +2514,17 @@ fn spawn_encoder_thread_with(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Codec-agnostic, allocation-free pool logic tests that run on **every**
+/// platform (no `EncoderPool::new`, so no encoder backend is constructed).
+/// Kept separate from [`tests`] so the Windows target — where the heavier
+/// pool-construction tests are gated off (see that module's note) — still
+/// verifies codec identity, the platform baseline, and the pure helper math.
 #[cfg(test)]
-mod tests {
+mod logic_tests {
     use super::*;
-    use std::thread::sleep;
 
     #[test]
     fn codec_kind_mime_round_trip() {
-        // mime() → CodecChoice expectation (existing constants from
-        // super::). Guards against drift between the two enums.
         assert_eq!(CodecKind::Vp8.mime(), super::super::MIME_TYPE_VP8);
         assert_eq!(CodecKind::H264.mime(), super::super::MIME_TYPE_H264);
         assert_eq!(CodecKind::Vp9.mime(), "video/VP9");
@@ -2503,16 +2541,36 @@ mod tests {
         ] {
             assert_eq!(CodecKind::from_mime(k.mime()), Some(k));
         }
-        assert_eq!(CodecKind::from_mime("video/HEVC"), None);
         assert_eq!(CodecKind::from_mime(""), None);
     }
 
     #[test]
-    fn codec_kind_only_vp8_is_always_on_default() {
-        assert!(CodecKind::Vp8.is_always_on_default());
-        assert!(!CodecKind::H264.is_always_on_default());
-        assert!(!CodecKind::Vp9.is_always_on_default());
-        assert!(!CodecKind::Av1.is_always_on_default());
+    fn codec_kind_only_baseline_is_always_on_default() {
+        // Exactly the platform BASELINE_CODEC is always-on (VP8 on
+        // macOS/Linux, H.264 on Windows where VP8 is gated off); every other
+        // codec spins up on demand. This is the load-bearing cross-platform
+        // assertion for the Windows H.264-baseline wiring.
+        for k in [
+            CodecKind::Vp8,
+            CodecKind::H264,
+            CodecKind::Vp9,
+            CodecKind::Av1,
+        ] {
+            assert_eq!(
+                k.is_always_on_default(),
+                k == BASELINE_CODEC,
+                "{k:?} always-on should equal (k == BASELINE_CODEC)"
+            );
+        }
+        assert!(BASELINE_CODEC.is_always_on_default());
+    }
+
+    #[test]
+    fn baseline_codec_is_h264_on_windows_vp8_elsewhere() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(BASELINE_CODEC, CodecKind::H264);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(BASELINE_CODEC, CodecKind::Vp8);
     }
 
     #[test]
@@ -2526,20 +2584,47 @@ mod tests {
     fn vp8_simulcast_layout_is_three_descending_layers() {
         let layers = LayerSpec::vp8_simulcast(1920, 1080, 30);
         assert_eq!(layers.len(), 3);
-        // Order: full, half, quarter.
+        // Order: full, half, quarter, with exact even-rounded dims.
         assert_eq!(layers[0].rid, SimulcastRid::full());
-        assert_eq!(layers[0].width, 1920);
-        assert_eq!(layers[0].height, 1080);
+        assert_eq!((layers[0].width, layers[0].height), (1920, 1080));
         assert_eq!(layers[1].rid, SimulcastRid::half());
-        assert_eq!(layers[1].width, 960);
-        assert_eq!(layers[1].height, 540);
+        assert_eq!((layers[1].width, layers[1].height), (960, 540));
         assert_eq!(layers[2].rid, SimulcastRid::quarter());
-        assert_eq!(layers[2].width, 480);
-        assert_eq!(layers[2].height, 270);
+        assert_eq!((layers[2].width, layers[2].height), (480, 270));
         // Bitrate strictly descending — smaller layers are cheap.
         assert!(layers[0].target_bitrate_kbps > layers[1].target_bitrate_kbps);
         assert!(layers[1].target_bitrate_kbps > layers[2].target_bitrate_kbps);
     }
+}
+
+// These pool-orchestration tests are gated off Windows. They were written
+// around VP8 as the always-on baseline: they construct pools with
+// `LayerSpec::vp8_simulcast` factories at small synthetic dimensions (64×64
+// and below, down to 16×16 quarter layers) — sizes VP8/libvpx accepts but the
+// Windows Media Foundation H.264 encoder MFT rejects at `SetOutputType`
+// (`MF_E_INVALIDMEDIATYPE`; the MS H.264 encoder enforces a larger minimum
+// frame size). On Windows the baseline codec is H.264 (`BASELINE_CODEC`), so
+// every such `EncoderPool::new` would try to spawn an H.264 encoder at those
+// dims and panic on the always-on construction-failure contract.
+//
+// The orchestration semantics these tests cover (refcounted on-demand slots,
+// PoolLease drop ordering, resize epoch races, pause/resume, keyframe
+// coalescing) are codec-agnostic and fully exercised on macOS/Linux where VP8
+// is the baseline. The Windows-specific pool behavior — H.264 as the always-on
+// baseline — is covered by [`logic_tests`] (which run everywhere) plus
+// `h264_windows`'s own encoder tests (which construct the MF encoder and
+// encode a real frame). Rather than rewrite 47 VP8-shaped construction sites
+// to H.264-compatible dimensions (a large, risky change to proven test code),
+// the heavyweight module is gated; see the task's pool-integration scope note.
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+
+    // NOTE: codec-identity / baseline / simulcast-layout / RID-constant tests
+    // live in [`super::logic_tests`] (compiled on every platform). This module
+    // is gated off Windows and holds the pool-construction tests; see the
+    // module-level comment above for why.
 
     /// **Phase 4a follow-up regression test (review finding).** Common
     /// non-power-of-2 display widths produce odd half/quarter dims

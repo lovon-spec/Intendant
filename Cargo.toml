@@ -136,6 +136,14 @@ windows = { version = "0.59", features = [
     "Win32_System_Com",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # Media Foundation H.264 encoder (display/encode/h264_windows.rs): the
+    # H.264 Encoder MFT (IMFTransform / MFTEnumEx), media types, samples,
+    # ICodecAPI for force-keyframe, and all the MF_MT_* / MFVideoFormat_* /
+    # eAVEncH264VProfile_* GUIDs. `ICodecAPI::SetValue` takes a `VARIANT`
+    # (Win32_System_Variant, itself gated on Com + Ole), so those come too.
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
 ] }
 # Cross-platform network-interface enumeration. On Windows it wraps
 # GetAdaptersAddresses; this backs `lan::routable_local_addrs`, which feeds

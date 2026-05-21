@@ -1060,11 +1060,20 @@ impl DisplaySession {
         // failure is the leak class to avoid (X11's capture thread, in
         // particular, ignores send-on-dropped-rx and only exits on
         // explicit `stop_capture`).
-        if encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty() {
+        // On Windows the always-on baseline is a single H.264 layer (VP8 is
+        // gated off — see `encode::pool::BASELINE_CODEC`), so the guard checks
+        // that the single full-resolution layer clears MIN_LAYER_DIM rather
+        // than the VP8 simulcast set.
+        #[cfg(not(target_os = "windows"))]
+        let baseline_empty = encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty();
+        #[cfg(target_os = "windows")]
+        let baseline_empty =
+            width < encode::pool::MIN_LAYER_DIM || height < encode::pool::MIN_LAYER_DIM;
+        if baseline_empty {
             self.backend.stop_capture().await;
             return Err(CallerError::Display(format!(
-                "source too small for VP8 simulcast: {raw_width}x{raw_height} \
-                 (normalized to {width}x{height}, each candidate layer falls \
+                "source too small for the always-on encoder baseline: \
+                 {raw_width}x{raw_height} (normalized to {width}x{height}, \
                  below MIN_LAYER_DIM={})",
                 encode::pool::MIN_LAYER_DIM,
             )));
@@ -1139,31 +1148,45 @@ impl DisplaySession {
         //
         // `get_or_init` swallows concurrent initializations cheaply;
         // in practice `start()` is called at most once per session.
+        // Always-on layer factory. The factory receives the (possibly
+        // resized) source dims and re-derives the layout from them — so a
+        // runtime resize regenerates the layer set at the new dims rather
+        // than rescaling (and accumulating rounding drift on) the previous
+        // epoch's handles. This is the contract from 4a-fix-#3: every
+        // construction site (initial spawn AND on_resize) goes through the
+        // factory's `normalize_layer_dims` filter.
+        //
+        // macOS/Linux: VP8 simulcast (up to full / half / quarter). The
+        // multi-RID end-to-end machinery (answer SDP carrying
+        // `a=simulcast:send f;h;q` + per-rid lines, multi-forwarder intake,
+        // TWCC-driven per-layer pick) lights up only when a peer offers the
+        // matching `a=simulcast:recv f;h;q` hint; the default DisplaySlot and
+        // federated paths leave it dormant.
+        //
+        // Windows: a single full-resolution H.264 layer (`BASELINE_CODEC` is
+        // H.264 there because VP8/libvpx is gated off). H.264 isn't
+        // simulcast in this pool — matching the existing `LayerSpec::single`
+        // rationale — so the always-on bank is one layer the Media
+        // Foundation encoder serves.
+        #[cfg(not(target_os = "windows"))]
+        let layer_factory =
+            move |w: u32, h: u32| encode::pool::LayerSpec::vp8_simulcast(w, h, fps);
+        #[cfg(target_os = "windows")]
+        let layer_factory = move |w: u32, h: u32| {
+            vec![encode::pool::LayerSpec::single(
+                encode::pool::CodecKind::H264,
+                w,
+                h,
+                fps,
+            )]
+        };
+
         let pool_arc = Arc::clone(self.pool.get_or_init(|| {
             Arc::new(encode::pool::EncoderPool::new(
                 width,
                 height,
                 fps,
-                // VP8 layer factory (up to full / half / quarter). The
-                // factory receives the (possibly resized) source dims
-                // and re-derives the layout from them — so a runtime
-                // resize regenerates the layer set at the new dims
-                // rather than rescaling (and accumulating rounding
-                // drift on) the previous epoch's handles. This is the
-                // contract from 4a-fix-#3: every construction site
-                // (initial spawn AND on_resize) goes through
-                // `vp8_simulcast`'s `normalize_layer_dims` filter, so
-                // resize-down dropping the quarter layer and resize-up
-                // restoring it both work cleanly.
-                //
-                // The multi-RID end-to-end machinery (answer SDP
-                // carrying `a=simulcast:send f;h;q` + per-rid lines,
-                // multi-forwarder intake feeding each rid's frames to
-                // a per-rid SSRC packetizer, TWCC-driven per-layer
-                // pick) lights up only when a peer offers the matching
-                // `a=simulcast:recv f;h;q` hint. The default DisplaySlot
-                // and federated paths leave it dormant.
-                move |w, h| encode::pool::LayerSpec::vp8_simulcast(w, h, fps),
+                layer_factory,
                 // Pool encoders feed the same metrics counters as the
                 // capture bridge so DisplayMetricsSnapshot continues to
                 // reflect total throughput. Pool is the sole producer
