@@ -1869,14 +1869,22 @@ fn session_log_search_from_request(request_line: &str) -> String {
     let home_path = PathBuf::from(&home);
     let query = query_param(request_line, "q").unwrap_or_default();
     let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
-    session_log_search_from_home(&home_path, &query, &source_filter)
+    let mode = query_param(request_line, "mode").unwrap_or_default();
+    session_log_search_from_home(&home_path, &query, &source_filter, &mode)
 }
 
-fn session_log_search_from_home(home: &Path, query: &str, source_filter: &str) -> String {
+fn session_log_search_from_home(
+    home: &Path,
+    query: &str,
+    source_filter: &str,
+    mode: &str,
+) -> String {
+    let mode = SessionLogSearchMode::from_query(mode);
     let terms = session_log_search_terms(query);
-    if terms.is_empty() {
+    if !mode.has_search_input(query, &terms) {
         return serde_json::json!({
             "query": query,
+            "mode": mode.as_str(),
             "source_filter": normalize_session_source_filter(source_filter),
             "searched": 0,
             "truncated": false,
@@ -1923,7 +1931,7 @@ fn session_log_search_from_home(home: &Path, query: &str, source_filter: &str) -
             continue;
         };
         let Some((matches, snippets, file_truncated)) =
-            search_session_log_file(&search_path, &terms)
+            search_session_log_file(&search_path, query, &terms, mode)
         else {
             continue;
         };
@@ -1944,6 +1952,7 @@ fn session_log_search_from_home(home: &Path, query: &str, source_filter: &str) -
 
     serde_json::json!({
         "query": query,
+        "mode": mode.as_str(),
         "source_filter": source_filter,
         "searched": searched,
         "truncated": truncated,
@@ -2027,10 +2036,12 @@ fn read_text_prefix(path: &Path, max_bytes: u64) -> Option<(String, bool)> {
 
 fn search_session_log_file(
     path: &Path,
+    query: &str,
     terms: &[String],
+    mode: SessionLogSearchMode,
 ) -> Option<(usize, Vec<serde_json::Value>, bool)> {
     let (contents, truncated) = read_text_prefix(path, SESSION_LOG_SEARCH_READ_LIMIT)?;
-    let (matches, snippets) = search_session_log_text(&contents, terms);
+    let (matches, snippets) = search_session_log_text(&contents, query, terms, mode);
     Some((matches, snippets, truncated))
 }
 
@@ -2062,15 +2073,71 @@ fn session_log_search_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
-fn search_session_log_text(text: &str, terms: &[String]) -> (usize, Vec<serde_json::Value>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLogSearchMode {
+    AllKeywords,
+    ExactPhrase,
+    AnyKeywordSession,
+    UserMessageAllKeywords,
+}
+
+impl SessionLogSearchMode {
+    fn from_query(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "exact" | "exact_phrase" | "phrase" => Self::ExactPhrase,
+            "any" | "any_keyword" | "any_keyword_session" => Self::AnyKeywordSession,
+            "user" | "user_message" | "user_message_all_keywords" => Self::UserMessageAllKeywords,
+            _ => Self::AllKeywords,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllKeywords => "all_keywords",
+            Self::ExactPhrase => "exact_phrase",
+            Self::AnyKeywordSession => "any_keyword_session",
+            Self::UserMessageAllKeywords => "user_message_all_keywords",
+        }
+    }
+
+    fn has_search_input(self, query: &str, terms: &[String]) -> bool {
+        match self {
+            Self::ExactPhrase => !query.trim().is_empty(),
+            _ => !terms.is_empty(),
+        }
+    }
+}
+
+fn search_session_log_text(
+    text: &str,
+    query: &str,
+    terms: &[String],
+    mode: SessionLogSearchMode,
+) -> (usize, Vec<serde_json::Value>) {
+    let candidates: Vec<SessionLogSearchCandidate> = text
+        .lines()
+        .filter_map(session_log_search_candidate_from_line)
+        .collect();
+    if mode == SessionLogSearchMode::AnyKeywordSession
+        && !candidates
+            .iter()
+            .any(|candidate| text_matches_any_session_term(&candidate.text, terms))
+    {
+        return (0, Vec::new());
+    }
+
     let mut matches = 0usize;
     let mut snippets = Vec::new();
+    let snippet_needles = if mode == SessionLogSearchMode::ExactPhrase {
+        vec![query.trim().to_ascii_lowercase()]
+    } else {
+        terms.to_vec()
+    };
 
-    for line in text.lines() {
-        let Some(candidate) = session_log_search_candidate_from_line(line) else {
-            continue;
-        };
-        if candidate.text.trim().is_empty() || !text_matches_session_terms(&candidate.text, terms) {
+    for candidate in candidates {
+        if candidate.text.trim().is_empty()
+            || !session_log_candidate_matches(&candidate, query, terms, mode)
+        {
             continue;
         }
         matches += 1;
@@ -2082,7 +2149,7 @@ fn search_session_log_text(text: &str, terms: &[String]) -> (usize, Vec<serde_js
                 "event": candidate.event,
                 "content": session_log_match_snippet(
                     &candidate.text,
-                    terms,
+                    &snippet_needles,
                     SESSION_LOG_SEARCH_SNIPPET_CHARS
                 ),
             }));
@@ -2092,12 +2159,31 @@ fn search_session_log_text(text: &str, terms: &[String]) -> (usize, Vec<serde_js
     (matches, snippets)
 }
 
+fn session_log_candidate_matches(
+    candidate: &SessionLogSearchCandidate,
+    query: &str,
+    terms: &[String],
+    mode: SessionLogSearchMode,
+) -> bool {
+    match mode {
+        SessionLogSearchMode::AllKeywords => text_matches_session_terms(&candidate.text, terms),
+        SessionLogSearchMode::ExactPhrase => text_contains_session_phrase(&candidate.text, query),
+        SessionLogSearchMode::AnyKeywordSession => {
+            text_matches_any_session_term(&candidate.text, terms)
+        }
+        SessionLogSearchMode::UserMessageAllKeywords => {
+            candidate.is_user && text_matches_session_terms(&candidate.text, terms)
+        }
+    }
+}
+
 struct SessionLogSearchCandidate {
     ts: String,
     source: String,
     level: String,
     event: String,
     text: String,
+    is_user: bool,
 }
 
 fn session_log_search_candidate_from_line(line: &str) -> Option<SessionLogSearchCandidate> {
@@ -2113,6 +2199,7 @@ fn session_log_search_candidate_from_line(line: &str) -> Option<SessionLogSearch
             level: String::new(),
             event: String::new(),
             text: trimmed.to_string(),
+            is_user: false,
         });
     };
 
@@ -2148,7 +2235,25 @@ fn session_log_search_candidate_from_line(line: &str) -> Option<SessionLogSearch
             .unwrap_or("")
             .to_string(),
         text,
+        is_user: session_log_json_is_user_message(&value),
     })
+}
+
+fn session_log_json_is_user_message(value: &serde_json::Value) -> bool {
+    [
+        value.get("source"),
+        value.get("role"),
+        value.get("type"),
+        value.pointer("/payload/source"),
+        value.pointer("/payload/role"),
+        value.pointer("/payload/type"),
+        value.pointer("/message/role"),
+        value.pointer("/message/type"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|v| v.as_str())
+    .any(|value| matches!(value.to_ascii_lowercase().as_str(), "user" | "user_message"))
 }
 
 fn collect_session_log_search_strings(value: &serde_json::Value, out: &mut Vec<String>) {
@@ -2176,6 +2281,16 @@ fn collect_session_log_search_strings(value: &serde_json::Value, out: &mut Vec<S
 fn text_matches_session_terms(text: &str, terms: &[String]) -> bool {
     let haystack = text.to_ascii_lowercase();
     terms.iter().all(|term| haystack.contains(term))
+}
+
+fn text_matches_any_session_term(text: &str, terms: &[String]) -> bool {
+    let haystack = text.to_ascii_lowercase();
+    terms.iter().any(|term| haystack.contains(term))
+}
+
+fn text_contains_session_phrase(text: &str, phrase: &str) -> bool {
+    let phrase = phrase.trim().to_ascii_lowercase();
+    !phrase.is_empty() && text.to_ascii_lowercase().contains(&phrase)
 }
 
 fn session_log_match_snippet(text: &str, terms: &[String], max_chars: usize) -> String {
@@ -12893,6 +13008,7 @@ mod tests {
             home.path(),
             "alpha-search-token",
             "all",
+            "",
         ))
         .unwrap();
         let results = response.get("results").and_then(|v| v.as_array()).unwrap();
@@ -12960,6 +13076,7 @@ mod tests {
             home.path(),
             "beta-search-token",
             "external",
+            "",
         ))
         .unwrap();
         let results = response.get("results").and_then(|v| v.as_array()).unwrap();
@@ -12973,6 +13090,202 @@ mod tests {
             home.path(),
             "beta-search-token",
             "intendant",
+            "",
+        ))
+        .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn session_log_search_supports_exact_phrase_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "exact-phrase-search-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00",
+                "task": "exact phrase task",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            serde_json::json!({
+                "ts": "2026-05-17T20:45:00",
+                "event": "info",
+                "message": "Needle words appear as alpha phrase token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "alpha phrase",
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        assert_eq!(
+            response
+                .get("results")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "alpha token",
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn session_log_search_supports_any_keyword_session_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "any-keyword-search-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00",
+                "task": "any keyword task",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            serde_json::json!({
+                "ts": "2026-05-17T20:45:00",
+                "event": "info",
+                "message": "This line contains only one-side-token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "one-side-token absent-token",
+            "all",
+            "all_keywords",
+        ))
+        .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "one-side-token absent-token",
+            "all",
+            "any_keyword_session",
+        ))
+        .unwrap();
+        assert_eq!(
+            response
+                .get("results")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_log_search_supports_user_message_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let id = "019e37ae-user-message-search";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/repo"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:40Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "user-only alpha-token beta-token"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:50Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "assistant-only gamma-token delta-token"
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "alpha-token beta-token",
+            "codex",
+            "user_message_all_keywords",
+        ))
+        .unwrap();
+        assert_eq!(
+            response
+                .get("results")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "gamma-token delta-token",
+            "codex",
+            "user_message_all_keywords",
         ))
         .unwrap();
         assert!(response
