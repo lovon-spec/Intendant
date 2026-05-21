@@ -158,6 +158,8 @@ impl SessionSupervisor {
             event::ControlMsg::CreateSession {
                 task,
                 project_root,
+                agent,
+                agent_command,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -165,9 +167,13 @@ impl SessionSupervisor {
                 attachments,
             } => {
                 if parse_codex_slash_command(&task).is_some() {
-                    if !reference_frame_ids.is_empty() || display_target.is_some() {
+                    if !reference_frame_ids.is_empty()
+                        || display_target.is_some()
+                        || agent.is_some()
+                        || agent_command.is_some()
+                    {
                         self.warn(
-                            "Slash command dropped reference frame/display metadata; routing to active Codex session",
+                            "Slash command dropped new-session metadata; routing to active Codex session",
                         );
                     }
                     self.route_follow_up(None, task, direct, attachments).await;
@@ -176,6 +182,8 @@ impl SessionSupervisor {
                 self.start_new_session(
                     task,
                     project_root,
+                    agent,
+                    agent_command,
                     orchestrate,
                     direct,
                     reference_frame_ids,
@@ -222,6 +230,8 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    None,
+                    None,
                     None,
                     orchestrate,
                     direct,
@@ -325,6 +335,8 @@ impl SessionSupervisor {
         &self,
         task: String,
         project_root: Option<String>,
+        agent: Option<String>,
+        agent_command: Option<String>,
         orchestrate: Option<bool>,
         direct: Option<bool>,
         reference_frame_ids: Vec<String>,
@@ -388,8 +400,21 @@ impl SessionSupervisor {
             || orchestrate
                 .map(|o| !o)
                 .unwrap_or_else(|| self.config.flags_direct || is_simple_task(&task));
-        let backend = resolve_agent_backend(&self.config.shared_external_agent, &project).await;
-        let project = match self
+        let agent_selection = match SessionAgentSelection::from_wire(agent.as_deref()) {
+            Ok(selection) => selection,
+            Err(e) => {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        };
+        let backend = match agent_selection {
+            SessionAgentSelection::Configured => {
+                resolve_agent_backend(&self.config.shared_external_agent, &project).await
+            }
+            SessionAgentSelection::Internal => None,
+            SessionAgentSelection::External(backend) => Some(backend),
+        };
+        let mut project = match self
             .project_with_runtime_config(project.root.clone(), backend.as_ref())
             .await
         {
@@ -399,6 +424,16 @@ impl SessionSupervisor {
                 return;
             }
         };
+        let agent_command = normalize_session_agent_command(agent_command.as_deref());
+        if let Some(command) = agent_command {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: agent_command requires an external agent".to_string(),
+                );
+                return;
+            };
+            apply_session_agent_command(&mut project, backend, command);
+        }
         let session_dir = session_log
             .lock()
             .map(|log| log.dir().to_path_buf())
@@ -1501,6 +1536,65 @@ fn resolve_project_root_override(
     Ok(canonical)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionAgentSelection {
+    Configured,
+    Internal,
+    External(external_agent::AgentBackend),
+}
+
+impl SessionAgentSelection {
+    fn from_wire(agent: Option<&str>) -> Result<Self, String> {
+        let Some(agent) = agent else {
+            return Ok(Self::Configured);
+        };
+        let trimmed = agent.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("configured") {
+            return Ok(Self::Configured);
+        }
+        let lowered = trimmed.to_ascii_lowercase();
+        if matches!(
+            lowered.as_str(),
+            "internal" | "intendant" | "native" | "none"
+        ) {
+            return Ok(Self::Internal);
+        }
+        external_agent::AgentBackend::from_str_loose(trimmed)
+            .map(Self::External)
+            .ok_or_else(|| {
+                format!(
+                    "unknown agent '{}' (expected internal, codex, claude-code, or gemini)",
+                    trimmed
+                )
+            })
+    }
+}
+
+fn normalize_session_agent_command(command: Option<&str>) -> Option<String> {
+    command
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn apply_session_agent_command(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    command: String,
+) {
+    match backend {
+        external_agent::AgentBackend::Codex => {
+            project.config.agent.codex.command = command;
+        }
+        external_agent::AgentBackend::ClaudeCode => {
+            project.config.agent.claude_code.command = command;
+        }
+        external_agent::AgentBackend::GeminiCli => {
+            project.config.agent.gemini_cli.command = command;
+        }
+    }
+}
+
 fn write_session_meta(
     session_log: &Arc<std::sync::Mutex<session_log::SessionLog>>,
     project_root: &Path,
@@ -1768,5 +1862,39 @@ mod tests {
     #[test]
     fn ignores_non_codex_slash_commands() {
         assert!(parse_codex_slash_command("/help").is_none());
+    }
+
+    #[test]
+    fn parses_session_agent_selection() {
+        assert_eq!(
+            SessionAgentSelection::from_wire(None).unwrap(),
+            SessionAgentSelection::Configured
+        );
+        assert_eq!(
+            SessionAgentSelection::from_wire(Some("internal")).unwrap(),
+            SessionAgentSelection::Internal
+        );
+        assert_eq!(
+            SessionAgentSelection::from_wire(Some("gemini")).unwrap(),
+            SessionAgentSelection::External(external_agent::AgentBackend::GeminiCli)
+        );
+        assert!(SessionAgentSelection::from_wire(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn applies_session_agent_command_to_selected_backend() {
+        let mut project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        apply_session_agent_command(
+            &mut project,
+            &external_agent::AgentBackend::ClaudeCode,
+            "/opt/claude/bin/claude".to_string(),
+        );
+        assert_eq!(
+            project.config.agent.claude_code.command,
+            "/opt/claude/bin/claude"
+        );
     }
 }

@@ -5788,6 +5788,13 @@ pub struct SettingsPayload {
     pub codex_network_access: bool,
     #[serde(default)]
     pub codex_writable_roots: Vec<String>,
+    // Other external-agent executable commands. The Settings pane does not
+    // edit these today, but the New Session pane uses them as per-launch
+    // command/path defaults.
+    #[serde(default)]
+    pub claude_command: Option<String>,
+    #[serde(default)]
+    pub gemini_command: Option<String>,
     // Gemini runtime config (persisted to `[agent.gemini_cli]`). Mirrors
     // the Codex fields above for the Activity → Control sub-tab.
     #[serde(default)]
@@ -5818,9 +5825,13 @@ fn default_settings_codex_approval_policy() -> String {
 }
 
 fn normalize_settings_codex_command(input: Option<&str>) -> String {
+    normalize_settings_agent_command(input, "codex")
+}
+
+fn normalize_settings_agent_command(input: Option<&str>, fallback: &str) -> String {
     let trimmed = input.map(str::trim).unwrap_or("");
     if trimmed.is_empty() {
-        "codex".to_string()
+        fallback.to_string()
     } else {
         trimmed.to_string()
     }
@@ -5876,6 +5887,8 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         codex_web_search: config.agent.codex.web_search,
         codex_network_access: config.agent.codex.network_access,
         codex_writable_roots: config.agent.codex.writable_roots.clone(),
+        claude_command: Some(config.agent.claude_code.command.clone()),
+        gemini_command: Some(config.agent.gemini_cli.command.clone()),
         gemini_model: config.agent.gemini_cli.model.clone(),
         gemini_approval_mode: crate::project::normalize_gemini_approval_mode(
             &config.agent.gemini_cli.approval_mode,
@@ -5919,6 +5932,14 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     if payload.codex_command.is_some() {
         config.agent.codex.command =
             normalize_settings_codex_command(payload.codex_command.as_deref());
+    }
+    if payload.claude_command.is_some() {
+        config.agent.claude_code.command =
+            normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
+    }
+    if payload.gemini_command.is_some() {
+        config.agent.gemini_cli.command =
+            normalize_settings_agent_command(payload.gemini_command.as_deref(), "gemini");
     }
 }
 
@@ -15128,11 +15149,21 @@ mod tests {
     fn settings_payload_round_trips_codex_command() {
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/usr/local/bin/codex".to_string();
+        config.agent.claude_code.command = "/usr/local/bin/claude".to_string();
+        config.agent.gemini_cli.command = "/usr/local/bin/gemini".to_string();
 
         let payload = settings_payload_from_config(&config);
         assert_eq!(
             payload.codex_command.as_deref(),
             Some("/usr/local/bin/codex")
+        );
+        assert_eq!(
+            payload.claude_command.as_deref(),
+            Some("/usr/local/bin/claude")
+        );
+        assert_eq!(
+            payload.gemini_command.as_deref(),
+            Some("/usr/local/bin/gemini")
         );
 
         let body = serde_json::json!({
@@ -15155,7 +15186,9 @@ mod tests {
             "live_audio_enabled": false,
             "live_audio_timeout_secs": 300,
             "external_agent": "codex",
-            "codex_command": "  /opt/homebrew/bin/codex  "
+            "codex_command": "  /opt/homebrew/bin/codex  ",
+            "claude_command": "  /opt/claude/bin/claude  ",
+            "gemini_command": "  /opt/gemini/bin/gemini  "
         })
         .to_string();
 
@@ -15163,6 +15196,8 @@ mod tests {
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.codex.command, "/opt/homebrew/bin/codex");
+        assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");
+        assert_eq!(config.agent.gemini_cli.command, "/opt/gemini/bin/gemini");
     }
 
     /// A specific bind address is preserved verbatim in the

@@ -965,6 +965,15 @@ pub enum ControlMsg {
         /// instance.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_root: Option<String>,
+        /// Optional one-shot agent override for this session. Omitted means
+        /// use the configured default. Accepted values are "internal",
+        /// "codex", "claude-code", or "gemini".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// Optional one-shot executable path or command name for the selected
+        /// external agent. Empty/missing falls back to the configured command.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_command: Option<String>,
         #[serde(default)]
         orchestrate: Option<bool>,
         /// Bypass presence/orchestration, matching StartTask.direct.
@@ -2490,6 +2499,8 @@ mod tests {
             ControlMsg::CreateSession {
                 task: "start fresh".to_string(),
                 project_root: None,
+                agent: Some("codex".to_string()),
+                agent_command: Some("/opt/codex/bin/codex".to_string()),
                 orchestrate: Some(false),
                 direct: Some(true),
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
@@ -2688,12 +2699,14 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","project_root":"/repo","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
                 task,
                 project_root,
+                agent,
+                agent_command,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -2702,6 +2715,8 @@ mod tests {
             } => {
                 assert_eq!(task, "fix bug");
                 assert_eq!(project_root.as_deref(), Some("/repo"));
+                assert_eq!(agent.as_deref(), Some("codex"));
+                assert_eq!(agent_command.as_deref(), Some("/opt/codex/bin/codex"));
                 assert!(orchestrate.is_none());
                 assert_eq!(direct, Some(true));
                 assert!(reference_frame_ids.is_empty());

@@ -2565,6 +2565,17 @@ html, body {
 .sessions-new-session-project {
   width: 100%;
 }
+.sessions-new-agent-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.45fr) minmax(220px, 1fr);
+  gap: 10px;
+  align-items: end;
+}
+.sessions-agent-command-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
 .sessions-project-label {
   color: var(--overlay0);
 }
@@ -2634,6 +2645,34 @@ html, body {
 }
 .sessions-project-input:focus { outline: none; border-color: var(--blue); }
 .sessions-project-input::placeholder { color: var(--overlay0); }
+.sessions-agent-select,
+.sessions-agent-command-input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.sessions-agent-select:focus,
+.sessions-agent-command-input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.sessions-agent-command-input:disabled {
+  color: var(--overlay0);
+  cursor: not-allowed;
+  opacity: 0.75;
+}
+.sessions-agent-command-row .sessions-project-browse:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .sessions-project-browse,
 .sessions-project-create-label {
   height: 28px;
@@ -3838,6 +3877,13 @@ html, body {
 .fs-picker-entry.file {
   cursor: default;
   opacity: 0.55;
+}
+.fs-picker-dialog.file-mode .fs-picker-entry.file {
+  cursor: pointer;
+  opacity: 1;
+}
+.fs-picker-dialog.file-mode .fs-picker-entry.file.selected {
+  border-color: var(--green);
 }
 .fs-picker-dialog .modal-confirm {
   background: var(--green);
@@ -5307,6 +5353,7 @@ html, body {
   .sessions-search { max-width: none; margin-left: 0; }
   .sessions-new-task { width: 100%; min-width: 0; }
   .sessions-new-session-field { flex: 1 1 100%; max-width: none; }
+  .sessions-new-agent-row { grid-template-columns: 1fr; }
   .sessions-project-row { flex-wrap: wrap; }
   .sessions-project-browse, .sessions-project-create-label { flex: 0 0 auto; }
   .sessions-start-btn { width: 100%; }
@@ -6211,6 +6258,25 @@ html, body {
                   <div id="new-session-project-status" class="sessions-project-status"></div>
                   <datalist id="new-session-project-options"></datalist>
                 </div>
+                <div class="sessions-new-agent-row">
+                  <label class="sessions-new-session-field" for="new-session-agent">
+                    Agent
+                    <select id="new-session-agent" class="sessions-agent-select">
+                      <option value="">Current setting</option>
+                      <option value="internal">Internal agent</option>
+                      <option value="codex">Codex</option>
+                      <option value="claude-code">Claude Code</option>
+                      <option value="gemini">Gemini CLI</option>
+                    </select>
+                  </label>
+                  <div class="sessions-new-session-field">
+                    <label for="new-session-agent-command">Binary path</label>
+                    <div class="sessions-agent-command-row">
+                      <input id="new-session-agent-command" class="sessions-agent-command-input" type="text" autocomplete="off" spellcheck="false" placeholder="Select an external agent" disabled>
+                      <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
+                    </div>
+                  </div>
+                </div>
                 <button class="sessions-start-btn" onclick="startNewSession()">Start session</button>
               </div>
             </div>
@@ -6616,19 +6682,19 @@ html, body {
 <div id="fs-picker-modal" class="modal-backdrop" style="display:none">
   <div class="modal-dialog fs-picker-dialog">
     <div class="fs-picker-header">
-      <h3>Choose project directory</h3>
-      <button type="button" class="fs-picker-close" onclick="closeProjectDirectoryPicker()" title="Close">X</button>
+      <h3 id="fs-picker-title">Choose project directory</h3>
+      <button type="button" class="fs-picker-close" onclick="closeFsPicker()" title="Close">X</button>
     </div>
     <div class="fs-picker-path-row">
       <input id="fs-picker-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/project">
-      <button type="button" onclick="loadProjectDirectoryPickerPath()">Go</button>
+      <button type="button" onclick="loadFsPickerPath()">Go</button>
     </div>
     <div id="fs-picker-status" class="fs-picker-status"></div>
     <div id="fs-picker-list" class="fs-picker-list"></div>
     <div class="modal-actions">
-      <button class="modal-cancel" type="button" onclick="closeProjectDirectoryPicker()">Cancel</button>
-      <button class="modal-cancel" type="button" onclick="createPickerDirectory()">Create directory</button>
-      <button class="modal-confirm" id="fs-picker-use-btn" type="button" onclick="useProjectDirectoryPickerSelection()">Use directory</button>
+      <button class="modal-cancel" type="button" onclick="closeFsPicker()">Cancel</button>
+      <button class="modal-cancel" id="fs-picker-create-btn" type="button" onclick="createPickerDirectory()">Create directory</button>
+      <button class="modal-confirm" id="fs-picker-use-btn" type="button" onclick="useFsPickerSelection()">Use directory</button>
     </div>
   </div>
 </div>
@@ -8008,6 +8074,7 @@ function processCommands(cmds) {
       case 'session_started': onSessionStarted(c.session_id, c.task); break;
       case 'session_attached': onSessionAttached(c.session_id, c.source); break;
       case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
+      case 'external_agent_changed': updateStatusBar({ external_agent: c.agent }); break;
       case 'debug_screen_ready': onDebugScreenReady(c.display_id); break;
       case 'debug_screen_torn_down': onDebugScreenTornDown(); break;
       case 'show_badge': showBadge(c.tab, c.text); break;
@@ -8618,6 +8685,12 @@ let controlGeminiConfig = {
 let controlCurrentBackend = null;
 let controlBackendActive = false;
 const controlAppliesBaseText = 'changes apply on next task';
+let newSessionConfiguredAgent = '';
+let newSessionAgentCommands = {
+  codex: 'codex',
+  'claude-code': 'claude',
+  gemini: 'gemini',
+};
 
 async function refreshControlPane() {
   try {
@@ -8911,8 +8984,10 @@ function onControlGeminiActionBtnClick(ev) {
 function applyCodexConfigChanged(evt) {
   if (evt.command) {
     controlCodexConfig.command = evt.command;
+    newSessionAgentCommands.codex = evt.command;
     const input = document.getElementById('set-codex-command');
     if (input) input.value = evt.command;
+    renderNewSessionAgentControls();
   }
   if (evt.sandbox) controlCodexConfig.sandbox = evt.sandbox;
   if (evt.approval_policy) controlCodexConfig.approval_policy = evt.approval_policy;
@@ -11473,6 +11548,8 @@ function updateStatusBar(d) {
       controlCurrentBackend = shortId;
       renderControlPane();
     }
+    newSessionConfiguredAgent = shortId;
+    renderNewSessionAgentControls();
   }
 }
 
@@ -20250,6 +20327,7 @@ async function loadSettings() {
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
     controlCodexConfig.command = d.codex_command || 'codex';
+    setNewSessionAgentDefaults(d);
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync both the Settings dropdown AND the
     // status bar badge here — on a fresh daemon boot there are no
@@ -20266,6 +20344,8 @@ async function loadSettings() {
     {
       const shortId = normalizeAgentId(d.external_agent);
       document.getElementById('set-external-agent').value = shortId;
+      newSessionConfiguredAgent = shortId;
+      renderNewSessionAgentControls();
 
       const el = document.getElementById('sb-external-agent');
       const sep = document.getElementById('sb-agent-sep');
@@ -21261,6 +21341,9 @@ function setNewSessionProjectRoot(root) {
 
 let newSessionProjectStatusTimer = null;
 let fsPickerCurrentPath = '';
+let fsPickerSelectedPath = '';
+let fsPickerMode = 'directory';
+let fsPickerTarget = 'project';
 
 function newSessionProjectInputValue() {
   return document.getElementById('new-session-project-root')?.value.trim() || '';
@@ -21424,12 +21507,54 @@ function setFsPickerStatus(kind, text) {
   el.textContent = text || '';
 }
 
-function renderProjectDirectoryPicker(data) {
+function fsPathLooksAbsolute(path) {
+  const value = String(path || '').trim();
+  return value === '~' || value.startsWith('~/') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate }) {
+  fsPickerMode = mode || 'directory';
+  fsPickerTarget = target || 'project';
+  fsPickerCurrentPath = '';
+  fsPickerSelectedPath = '';
+  const dialog = document.querySelector('#fs-picker-modal .fs-picker-dialog');
+  const titleEl = document.getElementById('fs-picker-title');
+  const pathInput = document.getElementById('fs-picker-path');
+  const createBtn = document.getElementById('fs-picker-create-btn');
+  const useBtn = document.getElementById('fs-picker-use-btn');
+  if (dialog) dialog.classList.toggle('file-mode', fsPickerMode === 'file');
+  if (titleEl) titleEl.textContent = title || 'Choose path';
+  if (pathInput) pathInput.placeholder = placeholder || '/path';
+  if (createBtn) createBtn.style.display = showCreate ? '' : 'none';
+  if (useBtn) {
+    useBtn.textContent = useLabel || 'Use path';
+    useBtn.disabled = true;
+  }
+}
+
+function setFsPickerUseButtonState() {
+  const useBtn = document.getElementById('fs-picker-use-btn');
+  if (!useBtn) return;
+  useBtn.disabled = fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath;
+}
+
+function selectFsPickerFile(path) {
+  fsPickerSelectedPath = String(path || '').trim();
+  const input = document.getElementById('fs-picker-path');
+  if (input && fsPickerSelectedPath) input.value = fsPickerSelectedPath;
+  setFsPickerUseButtonState();
+  document.querySelectorAll('#fs-picker-list .fs-picker-entry.file').forEach(btn => {
+    btn.classList.toggle('selected', (btn.dataset.path || '') === fsPickerSelectedPath);
+  });
+  if (fsPickerSelectedPath) setFsPickerStatus('', 'File selected');
+}
+
+function renderFsPicker(data) {
   const list = document.getElementById('fs-picker-list');
   const useBtn = document.getElementById('fs-picker-use-btn');
   if (!list) return;
   fsPickerCurrentPath = data.path || '';
-  if (useBtn) useBtn.disabled = !fsPickerCurrentPath;
+  setFsPickerUseButtonState();
 
   const rows = [];
   if (data.parent) {
@@ -21444,8 +21569,11 @@ function renderProjectDirectoryPicker(data) {
   for (const entry of data.entries || []) {
     const cls = entry.is_dir ? 'dir' : 'file';
     const title = escapeHtml(entry.path || entry.name || '');
+    const selectableFile = fsPickerMode === 'file' && entry.is_file;
+    const selected = selectableFile && (entry.path || '') === fsPickerSelectedPath ? ' selected' : '';
+    const disabled = entry.is_dir || selectableFile ? '' : 'disabled';
     rows.push(
-      `<button type="button" class="fs-picker-entry ${cls}" data-path="${title}" ${entry.is_dir ? '' : 'disabled'}>` +
+      `<button type="button" class="fs-picker-entry ${cls}${selected}" data-path="${title}" ${disabled}>` +
       `<span class="fs-picker-entry-meta">${entry.is_dir ? 'dir' : 'file'}</span>` +
       `<span class="fs-picker-entry-name" title="${title}">${escapeHtml(entry.name || '')}</span>` +
       `<span class="fs-picker-entry-meta">${entry.hidden ? 'hidden' : ''}</span>` +
@@ -21454,25 +21582,67 @@ function renderProjectDirectoryPicker(data) {
   }
   list.innerHTML = rows.length ? rows.join('') : '<div class="empty-state">No entries</div>';
   list.querySelectorAll('.fs-picker-entry.dir').forEach(btn => {
-    btn.addEventListener('click', () => loadProjectDirectoryPicker(btn.dataset.path || ''));
+    btn.addEventListener('click', () => loadFsPicker(btn.dataset.path || ''));
   });
+  if (fsPickerMode === 'file') {
+    list.querySelectorAll('.fs-picker-entry.file').forEach(btn => {
+      btn.addEventListener('click', () => selectFsPickerFile(btn.dataset.path || ''));
+      btn.addEventListener('dblclick', () => {
+        selectFsPickerFile(btn.dataset.path || '');
+        useFsPickerSelection();
+      });
+    });
+  }
+  if (useBtn) {
+    useBtn.disabled = fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath;
+  }
 }
 
-async function loadProjectDirectoryPicker(path) {
+async function resolveFsPickerListTarget(target) {
+  if (fsPickerMode !== 'file' || !fsPathLooksAbsolute(target)) {
+    return { listPath: target, selectedPath: '' };
+  }
+  const resp = await authedFetch('/api/fs/stat?path=' + encodeURIComponent(target));
+  const status = await resp.json().catch(() => ({}));
+  if (!resp.ok) return { listPath: target, selectedPath: '' };
+  if (status.exists && status.is_file && status.parent) {
+    return { listPath: status.parent, selectedPath: status.path || target };
+  }
+  if (status.exists && status.is_dir) {
+    return { listPath: status.path || target, selectedPath: '' };
+  }
+  if (!status.exists && status.parent_is_dir && status.parent) {
+    return { listPath: status.parent, selectedPath: '' };
+  }
+  return {
+    listPath: status.nearest_existing_parent || target,
+    selectedPath: '',
+  };
+}
+
+async function loadFsPicker(path) {
   const input = document.getElementById('fs-picker-path');
-  const target = String(path || input?.value || '').trim() || dashboardProjectRoot || '~';
+  let target = String(path || input?.value || '').trim();
+  if (!target) target = fsPickerMode === 'directory' ? (dashboardProjectRoot || '~') : '~';
   if (input) input.value = target;
   fsPickerCurrentPath = '';
-  const useBtn = document.getElementById('fs-picker-use-btn');
-  if (useBtn) useBtn.disabled = true;
+  fsPickerSelectedPath = '';
+  setFsPickerUseButtonState();
   setFsPickerStatus('', 'Loading...');
   try {
-    const resp = await authedFetch('/api/fs/list?path=' + encodeURIComponent(target));
+    const resolved = await resolveFsPickerListTarget(target);
+    fsPickerSelectedPath = resolved.selectedPath || '';
+    const resp = await authedFetch('/api/fs/list?path=' + encodeURIComponent(resolved.listPath));
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
-    if (input) input.value = data.path || target;
-    setFsPickerStatus('', data.truncated ? 'Showing first 500 entries' : '');
-    renderProjectDirectoryPicker(data);
+    if (input) input.value = fsPickerSelectedPath || data.path || resolved.listPath;
+    const statusText = fsPickerSelectedPath
+      ? 'File selected'
+      : data.truncated
+        ? 'Showing first 500 entries'
+        : '';
+    setFsPickerStatus('', statusText);
+    renderFsPicker(data);
   } catch (e) {
     setFsPickerStatus('error', e.message || 'Directory load failed');
     const list = document.getElementById('fs-picker-list');
@@ -21480,33 +21650,87 @@ async function loadProjectDirectoryPicker(path) {
   }
 }
 
-function loadProjectDirectoryPickerPath() {
-  loadProjectDirectoryPicker(document.getElementById('fs-picker-path')?.value || '');
+function loadFsPickerPath() {
+  loadFsPicker(document.getElementById('fs-picker-path')?.value || '');
 }
 
 function openProjectDirectoryPicker() {
+  configureFsPicker({
+    mode: 'directory',
+    target: 'project',
+    title: 'Choose project directory',
+    placeholder: '/path/to/project',
+    useLabel: 'Use directory',
+    showCreate: true,
+  });
   const modal = document.getElementById('fs-picker-modal');
   if (modal) modal.style.display = 'flex';
-  loadProjectDirectoryPicker(newSessionProjectInputValue() || dashboardProjectRoot || '~');
+  loadFsPicker(newSessionProjectInputValue() || dashboardProjectRoot || '~');
 }
 
-function closeProjectDirectoryPicker() {
+function openAgentBinaryPicker() {
+  const agentId = normalizeAgentId(document.getElementById('new-session-agent')?.value || '');
+  if (!agentId) return;
+  configureFsPicker({
+    mode: 'file',
+    target: 'agentBinary',
+    title: `Choose ${prettyAgentName(agentId)} binary`,
+    placeholder: '/path/to/binary',
+    useLabel: 'Use binary',
+    showCreate: false,
+  });
+  const modal = document.getElementById('fs-picker-modal');
+  if (modal) modal.style.display = 'flex';
+  const current = document.getElementById('new-session-agent-command')?.value.trim()
+    || commandDefaultForNewSessionAgent(agentId)
+    || '';
+  loadFsPicker(fsPathLooksAbsolute(current) ? current : '~');
+}
+
+function closeFsPicker() {
   const modal = document.getElementById('fs-picker-modal');
   if (modal) modal.style.display = 'none';
 }
 
-function useProjectDirectoryPickerSelection() {
+function closeProjectDirectoryPicker() {
+  closeFsPicker();
+}
+
+function useFsPickerSelection() {
+  if (fsPickerTarget === 'agentBinary') {
+    if (!fsPickerSelectedPath) return;
+    const input = document.getElementById('new-session-agent-command');
+    if (input) {
+      input.value = fsPickerSelectedPath;
+      input.title = fsPickerSelectedPath;
+    }
+    closeFsPicker();
+    return;
+  }
   if (!fsPickerCurrentPath) return;
   const input = document.getElementById('new-session-project-root');
   if (input) {
     input.value = fsPickerCurrentPath;
     input.title = fsPickerCurrentPath;
   }
-  closeProjectDirectoryPicker();
+  closeFsPicker();
   refreshNewSessionProjectStatus();
 }
 
+function useProjectDirectoryPickerSelection() {
+  useFsPickerSelection();
+}
+
+function loadProjectDirectoryPicker(path) {
+  loadFsPicker(path);
+}
+
+function loadProjectDirectoryPickerPath() {
+  loadFsPickerPath();
+}
+
 async function createPickerDirectory() {
+  if (fsPickerMode !== 'directory') return;
   const path = document.getElementById('fs-picker-path')?.value.trim() || '';
   if (!path) return;
   setFsPickerStatus('', 'Creating directory...');
@@ -21528,7 +21752,53 @@ window.openProjectDirectoryPicker = openProjectDirectoryPicker;
 window.closeProjectDirectoryPicker = closeProjectDirectoryPicker;
 window.loadProjectDirectoryPickerPath = loadProjectDirectoryPickerPath;
 window.useProjectDirectoryPickerSelection = useProjectDirectoryPickerSelection;
+window.closeFsPicker = closeFsPicker;
+window.loadFsPickerPath = loadFsPickerPath;
+window.useFsPickerSelection = useFsPickerSelection;
+window.openAgentBinaryPicker = openAgentBinaryPicker;
 window.createPickerDirectory = createPickerDirectory;
+
+function setNewSessionAgentDefaults(settings) {
+  newSessionAgentCommands = {
+    codex: settings.codex_command || 'codex',
+    'claude-code': settings.claude_command || 'claude',
+    gemini: settings.gemini_command || 'gemini',
+  };
+  renderNewSessionAgentControls();
+}
+
+function commandDefaultForNewSessionAgent(agentId) {
+  return newSessionAgentCommands[agentId] || ({
+    codex: 'codex',
+    'claude-code': 'claude',
+    gemini: 'gemini',
+  }[agentId] || '');
+}
+
+function renderNewSessionAgentControls(options = {}) {
+  const select = document.getElementById('new-session-agent');
+  const commandInput = document.getElementById('new-session-agent-command');
+  const browseBtn = document.getElementById('new-session-agent-command-browse');
+  if (!select || !commandInput) return;
+
+  const currentOption = select.querySelector('option[value=""]');
+  if (currentOption) {
+    currentOption.textContent = newSessionConfiguredAgent
+      ? `Current setting (${prettyAgentName(newSessionConfiguredAgent)})`
+      : 'Current setting (internal agent)';
+  }
+
+  const selectedAgent = normalizeAgentId(select.value);
+  const hasExternalAgent = !!selectedAgent;
+  commandInput.disabled = !hasExternalAgent;
+  if (browseBtn) browseBtn.disabled = !hasExternalAgent;
+  commandInput.placeholder = hasExternalAgent
+    ? commandDefaultForNewSessionAgent(selectedAgent)
+    : 'Select an external agent';
+  if (!hasExternalAgent || options.replaceCommand) {
+    commandInput.value = '';
+  }
+}
 
 async function loadNewSessionProjectRoot() {
   try {
@@ -21554,6 +21824,15 @@ async function startNewSession() {
     if (requestedProjectRoot && !projectRoot) return;
     const msg = { action: 'create_session', task: task };
     if (projectRoot) msg.project_root = projectRoot;
+    const agentValue = document.getElementById('new-session-agent')?.value || '';
+    const selectedAgent = normalizeAgentId(agentValue);
+    if (agentValue === 'internal') {
+      msg.agent = 'internal';
+    } else if (selectedAgent) {
+      msg.agent = selectedAgent;
+      const agentCommand = document.getElementById('new-session-agent-command')?.value.trim() || '';
+      if (agentCommand) msg.agent_command = agentCommand;
+    }
     if (direct) msg.direct = true;
     if (attachments.length > 0) msg.attachments = attachments;
     clearTaskTextarea(input);
@@ -21858,6 +22137,9 @@ document.getElementById('new-session-project-root')?.addEventListener('input', (
   scheduleNewSessionProjectStatusRefresh();
 });
 document.getElementById('new-session-create-project-dir')?.addEventListener('change', refreshNewSessionProjectStatus);
+document.getElementById('new-session-agent')?.addEventListener('change', () => {
+  renderNewSessionAgentControls({ replaceCommand: true });
+});
 document.getElementById('fs-picker-path')?.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Enter') return;
   ev.preventDefault();
