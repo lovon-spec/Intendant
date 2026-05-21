@@ -9641,6 +9641,7 @@ async fn main() -> Result<(), CallerError> {
             project.config.webrtc.to_ice_config(),
         );
         let shared_session = Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+            daemon_session_id: session_log_id(&session_log),
             query_ctx: None,
             frame_registry: Some(frame_registry.clone()),
             session_log: None,
@@ -9859,6 +9860,7 @@ async fn main() -> Result<(), CallerError> {
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =
                 Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+                    daemon_session_id: session_log_id(&session_log),
                     query_ctx: None,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),
@@ -10449,6 +10451,7 @@ async fn main() -> Result<(), CallerError> {
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =
                 Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+                    daemon_session_id: session_log_id(&session_log),
                     query_ctx,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),
@@ -10953,6 +10956,7 @@ async fn main() -> Result<(), CallerError> {
             let snapshot_dir = log_dir.join("file_snapshots");
             let shared_session =
                 Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+                    daemon_session_id: session_log_id(&session_log),
                     query_ctx: None,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),

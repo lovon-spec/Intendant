@@ -1086,6 +1086,10 @@ const EXTERNAL_ACTIVITY_REPLAY_LIMIT: usize = 0;
 /// Wrapped in `Arc<tokio::sync::RwLock<...>>` so the web gateway can observe
 /// session changes without restarting.
 pub struct ActiveSessionState {
+    /// Stable identity for the long-lived Intendant process. This is distinct
+    /// from `session_log`, which may point at a currently active worker session
+    /// and may be cleared while the dashboard waits for new tasks.
+    pub daemon_session_id: Option<String>,
     pub query_ctx: Option<WebQueryCtx>,
     pub frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
     pub session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
@@ -1103,6 +1107,7 @@ pub struct ActiveSessionState {
 impl ActiveSessionState {
     pub fn empty() -> SharedActiveSession {
         Arc::new(tokio::sync::RwLock::new(Self {
+            daemon_session_id: None,
             query_ctx: None,
             frame_registry: None,
             session_log: None,
@@ -1341,6 +1346,14 @@ fn replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
                 .map(|name| name.to_string_lossy().to_string())
                 .filter(|session_id| !session_id.trim().is_empty())
         })
+}
+
+fn session_log_id(session_log: &Arc<Mutex<crate::session_log::SessionLog>>) -> Option<String> {
+    session_log
+        .lock()
+        .ok()
+        .map(|log| log.session_id().to_string())
+        .filter(|id| !id.trim().is_empty())
 }
 
 fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
@@ -6611,6 +6624,7 @@ pub fn spawn_web_gateway(
             tokio::spawn(async move {
                 // Snapshot session state at connection time
                 let session_snap = shared_session.read().await;
+                let daemon_session_id = session_snap.daemon_session_id.clone();
                 let query_ctx = session_snap.query_ctx.clone();
                 let frame_registry = session_snap.frame_registry.clone();
                 let session_log = session_snap.session_log.clone();
@@ -6785,27 +6799,34 @@ pub fn spawn_web_gateway(
 
                     // Send bootstrap state snapshot on connect (with connection_id).
                     // Include config (provider/model) since AgentStateSnapshot
-                    // doesn't carry those.
-                    if let Some(ref ctx) = query_ctx {
-                        let state = ctx
-                            .agent_state
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
+                    // doesn't carry those. The top-level `session_id` is the
+                    // stable daemon/process session, not the active worker log.
+                    let state = query_ctx
+                        .as_ref()
+                        .map(|ctx| {
+                            ctx.agent_state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        })
+                        .unwrap_or_default();
+                    let bootstrap_session_id = daemon_session_id
+                        .clone()
+                        .or_else(|| {
+                            query_ctx
+                                .as_ref()
+                                .and_then(|ctx| replay_session_id_from_dir(&ctx.log_dir))
+                        })
+                        .or_else(|| session_log.as_ref().and_then(session_log_id));
+                    if query_ctx.is_some() || bootstrap_session_id.is_some() {
                         let config: serde_json::Value =
                             serde_json::from_str(&config_json).unwrap_or_default();
-                        // Extract session_id from log_dir path name
-                        let session_id = ctx
-                            .log_dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("");
                         let bootstrap = serde_json::json!({
                             "t": "state_snapshot",
                             "state": state,
                             "connection_id": connection_id,
                             "config": config,
-                            "session_id": session_id,
+                            "session_id": bootstrap_session_id.unwrap_or_default(),
                         });
                         let _ = direct_tx.send(bootstrap.to_string());
                     }
@@ -17727,6 +17748,124 @@ mod tests {
             assert_eq!(json["t"], "state_snapshot");
             assert_eq!(json["state"]["phase"], "thinking");
             assert_eq!(json["state"]["turn"], 3);
+        } else {
+            panic!("expected text message for state_snapshot");
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_state_snapshot_uses_daemon_session_without_active_session() {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let config = WebGatewayConfig::default();
+        let handle = {
+            let ss = ActiveSessionState::empty();
+            ss.write().await.daemon_session_id = Some("daemon-session".to_string());
+            spawn_web_gateway(
+                listener,
+                bus,
+                broadcast_tx,
+                config,
+                ss,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::peer::AuthRequirements::none(),
+            )
+        };
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (_ws, mut ws_rx) = tokio_tungstenite::connect_async(&url)
+            .await
+            .unwrap()
+            .0
+            .split();
+
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
+
+        if let Message::Text(text) = msg {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["t"], "state_snapshot");
+            assert_eq!(json["session_id"], "daemon-session");
+        } else {
+            panic!("expected text message for state_snapshot");
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_state_snapshot_prefers_daemon_over_active_session_log() {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let active_log = Arc::new(Mutex::new(
+            crate::session_log::SessionLog::open(dir.path().join("active-worker")).unwrap(),
+        ));
+
+        let config = WebGatewayConfig::default();
+        let handle = {
+            let ss = ActiveSessionState::empty();
+            {
+                let mut state = ss.write().await;
+                state.daemon_session_id = Some("daemon-session".to_string());
+                state.session_log = Some(active_log);
+            }
+            spawn_web_gateway(
+                listener,
+                bus,
+                broadcast_tx,
+                config,
+                ss,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::peer::AuthRequirements::none(),
+            )
+        };
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (_ws, mut ws_rx) = tokio_tungstenite::connect_async(&url)
+            .await
+            .unwrap()
+            .0
+            .split();
+
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
+
+        if let Message::Text(text) = msg {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["t"], "state_snapshot");
+            assert_eq!(json["session_id"], "daemon-session");
         } else {
             panic!("expected text message for state_snapshot");
         }
