@@ -1657,8 +1657,9 @@ html, body {
 }
 .log-markdown ul,
 .log-markdown ol {
-  margin: 2px 0 7px 20px;
-  padding: 0;
+  margin: 2px 0 7px;
+  padding-left: 2.45em;
+  list-style-position: outside;
 }
 .log-markdown li { margin: 1px 0; }
 .log-markdown blockquote {
@@ -1802,6 +1803,7 @@ html, body {
 .log-entry.collapsible:hover .collapse-toggle { color: var(--sapphire); }
 .log-entry.collapsible.expanded .log-content {
   max-height: none;
+  overflow: visible;
 }
 .log-entry.collapsible.expanded .collapse-toggle .arrow { display: none; }
 .log-entry.collapsible:not(.expanded) .collapse-toggle .arrow-up { display: none; }
@@ -22944,6 +22946,7 @@ function renderSessionDetailEntries(entries, el) {
       entry.addEventListener('click', () => {
         const expanded = cnt.style.maxHeight === 'none';
         cnt.style.maxHeight = expanded ? '1.5em' : 'none';
+        cnt.style.overflow = expanded ? 'hidden' : 'visible';
         toggle.querySelector('.arrow').style.display = expanded ? '' : 'none';
         toggle.querySelector('.arrow-up').style.display = expanded ? 'none' : '';
       });
