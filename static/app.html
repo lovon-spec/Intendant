@@ -2187,7 +2187,7 @@ html, body {
 }
 .sessions-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) auto auto auto minmax(210px, auto);
+  grid-template-columns: minmax(260px, 1fr) auto auto minmax(210px, auto);
   align-items: end;
   gap: 8px;
 }
@@ -2301,6 +2301,95 @@ html, body {
 .sessions-toggle input[type="checkbox"] {
   accent-color: var(--blue);
   margin: 0;
+}
+.sessions-deep-search {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface0) 62%, transparent);
+}
+.sessions-deep-search-row {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1fr) auto auto auto;
+  align-items: end;
+  gap: 8px;
+}
+.sessions-deep-search-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+.sessions-deep-search-title span:last-child {
+  color: var(--overlay1);
+  font-size: 10px;
+  font-weight: 400;
+  text-transform: none;
+}
+.sessions-deep-search-query {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  color: var(--overlay0);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.sessions-deep-search-query input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.sessions-deep-search-query input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.sessions-deep-search-btn {
+  height: 28px;
+  padding: 3px 10px;
+  border: 1px solid var(--blue);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--blue) 12%, transparent);
+  color: var(--blue);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sessions-deep-search-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--blue) 20%, transparent);
+}
+.sessions-deep-search-btn.secondary {
+  border-color: var(--surface1);
+  background: var(--surface0);
+  color: var(--subtext0);
+}
+.sessions-deep-search-btn.secondary:hover:not(:disabled) {
+  border-color: var(--overlay0);
+  color: var(--text);
+  background: var(--surface1);
+}
+.sessions-deep-search-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.sessions-deep-search-btn.hidden {
+  display: none;
 }
 .sessions-subtab-panes {
   background: transparent;
@@ -5066,6 +5155,8 @@ html, body {
   .sessions-title-line { align-items: stretch; }
   .sessions-title-line { flex-direction: column; }
   .sessions-toolbar { grid-template-columns: 1fr; }
+  .sessions-deep-search-row { grid-template-columns: 1fr; }
+  .sessions-deep-search-title { min-width: 0; }
   .sessions-search { max-width: none; margin-left: 0; }
   .sessions-new-task { width: 100%; min-width: 0; }
   .sessions-new-session-field { flex: 1 1 100%; max-width: none; }
@@ -5746,7 +5837,7 @@ html, body {
               <div class="sessions-toolbar">
                 <label class="sessions-search" for="sessions-search">
                   <span>Search</span>
-                  <input type="search" id="sessions-search" placeholder="ID, name, task, model, path; logs with Deep search..." autocomplete="off" spellcheck="false">
+                  <input type="search" id="sessions-search" placeholder="ID, name, task, model, path..." autocomplete="off" spellcheck="false">
                 </label>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="source">
                   <span>Source</span>
@@ -5770,7 +5861,6 @@ html, body {
                     <label><input type="checkbox" value="interrupted"> Interrupted</label>
                   </div>
                 </div>
-                <label class="sessions-toggle" title="Search session log content on the server, not just summary fields. Slower and capped for dashboard responsiveness."><input type="checkbox" id="sessions-detailed-search"> Deep search</label>
                 <label class="sessions-sort">Sort
                   <select id="sort-sessions">
                     <option value="updated-desc" selected>Date changed (newest)</option>
@@ -5786,8 +5876,23 @@ html, body {
                   </select>
                 </label>
               </div>
+              <div class="sessions-deep-search" id="sessions-deep-search-panel">
+                <div class="sessions-deep-search-row">
+                  <div class="sessions-deep-search-title">
+                    <span>Deep Search</span>
+                    <span>Explicit log scan; regular search stays instant.</span>
+                  </div>
+                  <label class="sessions-deep-search-query" for="sessions-deep-search-query">
+                    <span>Log query</span>
+                    <input type="search" id="sessions-deep-search-query" placeholder="Search session log content..." autocomplete="off" spellcheck="false">
+                  </label>
+                  <button type="button" class="sessions-deep-search-btn" id="sessions-deep-search-run">Run deep search</button>
+                  <button type="button" class="sessions-deep-search-btn secondary hidden" id="sessions-deep-search-cancel">Cancel</button>
+                  <button type="button" class="sessions-deep-search-btn secondary" id="sessions-deep-search-clear">Clear</button>
+                </div>
+                <div class="sessions-search-status" id="sessions-deep-search-status"></div>
+              </div>
             </div>
-            <div class="sessions-search-status" id="sessions-search-status"></div>
             <div class="sessions-aggregate" id="sessions-aggregate"></div>
             <div class="sessions-list" id="sessions-list">
               <div class="empty-state">Loading sessions...</div>
@@ -6581,7 +6686,6 @@ const VERBOSITY_KEY = 'intendant_verbosity';
 const HOST_FILTER_KEY = 'intendant_host_filter';
 const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
 const SESSIONS_FILTER_STATUS_KEY = 'intendant_sessions_filter_status';
-const SESSIONS_DETAILED_SEARCH_KEY = 'intendant_sessions_detailed_search';
 const SESSION_SOURCE_FILTER_OPTIONS = [
   { value: 'intendant', label: 'Intendant', plural: 'sources' },
   { value: 'external', label: 'External agents', plural: 'sources' },
@@ -15441,14 +15545,6 @@ function restoreClientToggles() {
   // the same list shape without writing anything to intendant.toml.
   restoreSessionMultiFilter('source');
   restoreSessionMultiFilter('status');
-  const ds = document.getElementById('sessions-detailed-search');
-  if (ds) {
-    const stored = localStorage.getItem(SESSIONS_DETAILED_SEARCH_KEY);
-    if (stored !== null) ds.checked = stored === 'true';
-    ds.addEventListener('change', () => {
-      localStorage.setItem(SESSIONS_DETAILED_SEARCH_KEY, String(ds.checked));
-    });
-  }
 
   // Host filter (Activity tab). The dropdown's option list is built
   // later by refreshHostFilterOptions() — that function reads from
@@ -20899,17 +20995,19 @@ let sessionsLoaded = false;
 let _cachedSessions = [];
 let worktreesLoaded = false;
 let _cachedWorktreeScan = null;
-let _sessionLogSearchTimer = null;
-let _sessionLogSearchToken = 0;
-let _sessionLogSearch = {
+let _sessionDeepSearchToken = 0;
+let _sessionDeepSearchAbort = null;
+let _sessionDeepSearch = {
   query: '',
   sourceFilter: 'all',
+  active: false,
   loading: false,
   loaded: false,
   error: null,
   searched: 0,
   truncated: false,
   limit: 0,
+  truncatedFiles: 0,
   results: new Map(),
 };
 
@@ -20925,7 +21023,6 @@ function loadSessions() {
       _cachedSessions = sessions;
       updateNewSessionProjectPrefills(sessions);
       cacheSessionWindowMetadata(sessions);
-      scheduleSessionLogSearch(true);
       renderSessionsAggregate(sessions, aggEl);
       renderSessionsList(sessions, listEl);
     })
@@ -20940,7 +21037,6 @@ function _refilterSessions() {
   }
 }
 function _refreshSessionsFilters() {
-  scheduleSessionLogSearch();
   _refilterSessions();
 }
 function sessionMultiFilterConfig(kind) {
@@ -21072,9 +21168,20 @@ document.addEventListener('click', () => closeSessionMultiFilterMenus());
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') closeSessionMultiFilterMenus();
 });
-document.getElementById('sessions-detailed-search')?.addEventListener('change', _refreshSessionsFilters);
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
 document.getElementById('sessions-search')?.addEventListener('input', _refreshSessionsFilters);
+document.getElementById('sessions-deep-search-run')?.addEventListener('click', () => runSessionDeepSearch());
+document.getElementById('sessions-deep-search-cancel')?.addEventListener('click', () => cancelSessionDeepSearch('Deep search cancelled.'));
+document.getElementById('sessions-deep-search-clear')?.addEventListener('click', clearSessionDeepSearch);
+document.getElementById('sessions-deep-search-query')?.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    runSessionDeepSearch();
+  } else if (ev.key === 'Escape') {
+    ev.preventDefault();
+    clearSessionDeepSearch();
+  }
+});
 document.getElementById('session-detail-rename')?.addEventListener('click', (ev) => {
   ev.preventDefault();
   if (currentSessionDetail) requestSessionRename(currentSessionDetail);
@@ -21126,10 +21233,6 @@ function sessionStatusFilterValue() {
   return sessionMultiFilterValues('status');
 }
 
-function sessionDetailedSearchEnabled() {
-  return !!document.getElementById('sessions-detailed-search')?.checked;
-}
-
 function sessionMatchesSourceFilter(source, filter) {
   const filters = Array.isArray(filter) ? filter : (filter && filter !== 'all' ? [filter] : []);
   if (filters.length === 0) return true;
@@ -21148,116 +21251,184 @@ function sessionLogSearchKey(source, sessionId) {
   return `${source || 'intendant'}:${sessionId || ''}`;
 }
 
-function scheduleSessionLogSearch(force = false) {
-  const query = sessionSearchQuery();
-  const sourceFilter = sessionSourceFilterValue();
-  const sourceFilterKey = sessionMultiFilterKey(sourceFilter);
-  const sourceSearchScope = sessionSourceSearchScope(sourceFilter);
-  const detailed = sessionDetailedSearchEnabled();
-  if (_sessionLogSearchTimer) {
-    clearTimeout(_sessionLogSearchTimer);
-    _sessionLogSearchTimer = null;
-  }
-  if (!detailed || !query) {
-    _sessionLogSearchToken += 1;
-    _sessionLogSearch = {
+function sessionDeepSearchQuery() {
+  return (document.getElementById('sessions-deep-search-query')?.value || '').trim();
+}
+
+function setSessionDeepSearchLoading(loading) {
+  const runBtn = document.getElementById('sessions-deep-search-run');
+  const cancelBtn = document.getElementById('sessions-deep-search-cancel');
+  if (runBtn) runBtn.disabled = !!loading;
+  if (cancelBtn) cancelBtn.classList.toggle('hidden', !loading);
+}
+
+function runSessionDeepSearch() {
+  const query = sessionDeepSearchQuery();
+  if (query.length < 2) {
+    _sessionDeepSearch = {
       query,
-      sourceFilter: sourceFilterKey,
+      sourceFilter: sessionMultiFilterKey(sessionSourceFilterValue()),
+      active: false,
       loading: false,
       loaded: false,
-      error: null,
+      error: 'Enter at least 2 characters for deep search.',
       searched: 0,
       truncated: false,
       limit: 0,
+      truncatedFiles: 0,
       results: new Map(),
     };
+    updateSessionsSearchStatus();
     return;
   }
-  if (!force && _sessionLogSearch.query === query && _sessionLogSearch.sourceFilter === sourceFilterKey && (_sessionLogSearch.loading || _sessionLogSearch.loaded)) {
-    return;
+  const sourceFilter = sessionSourceFilterValue();
+  const sourceFilterKey = sessionMultiFilterKey(sourceFilter);
+  const sourceSearchScope = sessionSourceSearchScope(sourceFilter);
+  if (_sessionDeepSearchAbort) {
+    _sessionDeepSearchAbort.abort();
   }
-  _sessionLogSearch = {
+  const controller = new AbortController();
+  _sessionDeepSearchAbort = controller;
+  _sessionDeepSearch = {
     query,
     sourceFilter: sourceFilterKey,
+    active: false,
     loading: true,
     loaded: false,
     error: null,
     searched: 0,
     truncated: false,
     limit: 0,
+    truncatedFiles: 0,
     results: new Map(),
   };
-  const token = ++_sessionLogSearchToken;
-  _sessionLogSearchTimer = setTimeout(() => {
-    const url = `/api/sessions/search?q=${encodeURIComponent(query)}&source=${encodeURIComponent(sourceSearchScope)}`;
-    authedFetch(url)
-      .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions/search returned ${r.status}`)))
-      .then(data => {
-        if (token !== _sessionLogSearchToken) return;
-        const results = new Map();
-        for (const hit of data.results || []) {
-          const key = hit.key || sessionLogSearchKey(hit.source, hit.session_id);
-          results.set(key, hit);
-        }
-        _sessionLogSearch = {
-          query,
-          sourceFilter: sourceFilterKey,
-          loading: false,
-          loaded: true,
-          error: null,
-          searched: data.searched || 0,
-          truncated: !!data.truncated,
-          limit: data.limit || 0,
-          results,
-        };
-        _refilterSessions();
-      })
-      .catch(err => {
-        if (token !== _sessionLogSearchToken) return;
-        _sessionLogSearch = {
-          query,
-          sourceFilter: sourceFilterKey,
-          loading: false,
-          loaded: true,
-          error: err.message || String(err),
-          searched: 0,
-          truncated: false,
-          limit: 0,
-          results: new Map(),
-        };
-        _refilterSessions();
-      });
-  }, 250);
+  const token = ++_sessionDeepSearchToken;
+  setSessionDeepSearchLoading(true);
+  updateSessionsSearchStatus();
+  _refilterSessions();
+
+  const url = `/api/sessions/search?q=${encodeURIComponent(query)}&source=${encodeURIComponent(sourceSearchScope)}`;
+  authedFetch(url, { signal: controller.signal })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions/search returned ${r.status}`)))
+    .then(data => {
+      if (token !== _sessionDeepSearchToken) return;
+      if (data.error) throw new Error(data.error);
+      const results = new Map();
+      for (const hit of data.results || []) {
+        const key = hit.key || sessionLogSearchKey(hit.source, hit.session_id);
+        results.set(key, hit);
+      }
+      _sessionDeepSearch = {
+        query,
+        sourceFilter: sourceFilterKey,
+        active: true,
+        loading: false,
+        loaded: true,
+        error: null,
+        searched: data.searched || 0,
+        truncated: !!data.truncated,
+        limit: data.limit || 0,
+        truncatedFiles: data.truncated_files || data.skipped_large || 0,
+        results,
+      };
+      _sessionDeepSearchAbort = null;
+      setSessionDeepSearchLoading(false);
+      _refilterSessions();
+    })
+    .catch(err => {
+      if (token !== _sessionDeepSearchToken) return;
+      const aborted = err?.name === 'AbortError';
+      _sessionDeepSearch = {
+        query,
+        sourceFilter: sourceFilterKey,
+        active: false,
+        loading: false,
+        loaded: !aborted,
+        error: aborted ? 'Deep search cancelled.' : (err.message || String(err)),
+        searched: 0,
+        truncated: false,
+        limit: 0,
+        truncatedFiles: 0,
+        results: new Map(),
+      };
+      _sessionDeepSearchAbort = null;
+      setSessionDeepSearchLoading(false);
+      _refilterSessions();
+    });
 }
 
-function sessionLogSearchHit(session, source, query, sourceFilter) {
-  if (!sessionDetailedSearchEnabled() || !query) return null;
-  if (_sessionLogSearch.query !== query || _sessionLogSearch.sourceFilter !== sessionMultiFilterKey(sourceFilter)) return null;
-  return _sessionLogSearch.results.get(sessionLogSearchKey(source, session.session_id)) || null;
+function cancelSessionDeepSearch(message = '') {
+  if (_sessionDeepSearchAbort) {
+    _sessionDeepSearchAbort.abort();
+    _sessionDeepSearchAbort = null;
+  }
+  _sessionDeepSearchToken += 1;
+  _sessionDeepSearch = {
+    ..._sessionDeepSearch,
+    active: false,
+    loading: false,
+    loaded: false,
+    error: message || null,
+    truncatedFiles: 0,
+    results: new Map(),
+  };
+  setSessionDeepSearchLoading(false);
+  _refilterSessions();
+}
+
+function clearSessionDeepSearch() {
+  cancelSessionDeepSearch('');
+  const input = document.getElementById('sessions-deep-search-query');
+  if (input) input.value = '';
+  _sessionDeepSearch = {
+    query: '',
+    sourceFilter: 'all',
+    active: false,
+    loading: false,
+    loaded: false,
+    error: null,
+    searched: 0,
+    truncated: false,
+    limit: 0,
+    truncatedFiles: 0,
+    results: new Map(),
+  };
+  _refilterSessions();
+}
+
+function sessionDeepSearchHit(session, source, sourceFilter) {
+  if (!_sessionDeepSearch.active || !_sessionDeepSearch.query) return null;
+  if (_sessionDeepSearch.sourceFilter !== sessionMultiFilterKey(sourceFilter)) return null;
+  return _sessionDeepSearch.results.get(sessionLogSearchKey(source, session.session_id)) || null;
 }
 
 function updateSessionsSearchStatus() {
-  const el = document.getElementById('sessions-search-status');
+  const el = document.getElementById('sessions-deep-search-status');
   if (!el) return;
   el.classList.remove('error');
   el.textContent = '';
-  const query = sessionSearchQuery();
-  if (!sessionDetailedSearchEnabled() || !query) return;
-  if (_sessionLogSearch.loading) {
-    el.textContent = 'Deep search is scanning session logs...';
+  if (_sessionDeepSearch.loading) {
+    el.textContent = `Deep search running for "${_sessionDeepSearch.query}". The regular session list remains usable.`;
     return;
   }
-  if (_sessionLogSearch.error) {
+  if (_sessionDeepSearch.error) {
     el.classList.add('error');
-    el.textContent = `Deep search failed: ${_sessionLogSearch.error}`;
+    el.textContent = _sessionDeepSearch.error;
     return;
   }
-  if (_sessionLogSearch.loaded) {
-    const resultCount = _sessionLogSearch.results.size;
-    const suffix = _sessionLogSearch.truncated
-      ? ` Search capped at ${_sessionLogSearch.limit.toLocaleString()} sessions.`
+  if (_sessionDeepSearch.loaded && _sessionDeepSearch.sourceFilter !== sessionMultiFilterKey(sessionSourceFilterValue())) {
+    el.textContent = 'Deep search results are for a previous source filter. Run deep search again to apply the current filters.';
+    return;
+  }
+  if (_sessionDeepSearch.loaded) {
+    const resultCount = _sessionDeepSearch.results.size;
+    const suffix = _sessionDeepSearch.truncated
+      ? ` Search capped at ${_sessionDeepSearch.limit.toLocaleString()} sessions.`
       : '';
-    el.textContent = `Deep search scanned ${_sessionLogSearch.searched.toLocaleString()} sessions; ${resultCount.toLocaleString()} had log matches.${suffix}`;
+    const truncatedFiles = _sessionDeepSearch.truncatedFiles
+      ? ` ${_sessionDeepSearch.truncatedFiles.toLocaleString()} large session log${_sessionDeepSearch.truncatedFiles === 1 ? ' was' : 's were'} scanned with a byte cap.`
+      : '';
+    el.textContent = `Deep search scanned ${_sessionDeepSearch.searched.toLocaleString()} sessions; ${resultCount.toLocaleString()} had log matches.${suffix}${truncatedFiles}`;
   }
 }
 
@@ -21389,7 +21560,8 @@ function renderSessionsList(sessions, el) {
   const query = sessionSearchQuery();
   const sourceFilter = sessionSourceFilterValue();
   const statusFilter = sessionStatusFilterValue();
-  const detailedSearch = sessionDetailedSearchEnabled();
+  const deepSearchActive =
+    _sessionDeepSearch.active && _sessionDeepSearch.sourceFilter === sessionMultiFilterKey(sourceFilter);
   let visibleCount = 0;
 
   for (const s of sorted) {
@@ -21408,12 +21580,9 @@ function renderSessionsList(sessions, el) {
     if (!sessionMatchesSourceFilter(source, sourceFilter)) continue;
     if (!sessionMatchesStatusFilter(displayStatus, statusFilter)) continue;
     const summaryMatch = sessionMatchesSearch(s, query, displayStatus, source, shortId, isCurrent);
-    const logHit = sessionLogSearchHit(s, source, query, sourceFilter);
-    if (query && detailedSearch) {
-      if (!summaryMatch && !logHit) continue;
-    } else if (!summaryMatch) {
-      continue;
-    }
+    if (!summaryMatch) continue;
+    const logHit = sessionDeepSearchHit(s, source, sourceFilter);
+    if (deepSearchActive && !logHit) continue;
 
     visibleCount += 1;
 
@@ -21734,7 +21903,9 @@ function renderSessionsList(sessions, el) {
   if (visibleCount === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-    empty.textContent = query
+    empty.textContent = deepSearchActive
+      ? 'No sessions match the deep search results'
+      : query
       ? 'No sessions match your search'
       : 'No sessions match the active filters';
     el.appendChild(empty);
