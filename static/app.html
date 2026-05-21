@@ -1266,9 +1266,14 @@ html, body {
   background: var(--base);
   flex-shrink: 0;
 }
+.session-window-grid.resized {
+  height: var(--session-window-grid-height);
+  max-height: none;
+}
 .session-window-grid.maximized {
   display: flex;
   flex: 1 1 auto;
+  height: auto;
   min-height: 0;
   max-height: none;
   overflow: hidden;
@@ -1288,6 +1293,36 @@ html, body {
 .session-window-grid.maximized ~ .scroll-bottom-btn {
   display: none !important;
 }
+.session-window-grid-resize-handle {
+  position: relative;
+  height: 8px;
+  flex-shrink: 0;
+  cursor: row-resize;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+}
+.session-window-grid-resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 3px;
+  width: 48px;
+  height: 2px;
+  border-radius: 999px;
+  transform: translateX(-50%);
+  background: var(--surface2);
+  opacity: 0.65;
+}
+.session-window-grid-resize-handle:hover::before,
+.session-window-grid-resize-handle.dragging::before {
+  background: var(--blue);
+  opacity: 1;
+}
+.session-window-grid.maximized + .session-window-grid-resize-handle,
+.session-window-grid.hidden + .session-window-grid-resize-handle,
+.session-window-grid-resize-handle.hidden {
+  display: none;
+}
 .session-window {
   min-height: 180px;
   max-height: 320px;
@@ -1302,6 +1337,26 @@ html, body {
 .session-window.foreground {
   border-color: var(--blue);
   box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.35);
+}
+.session-window.minimized {
+  min-height: 36px;
+  max-height: 36px;
+}
+.session-window.minimized .session-window-log,
+.session-window.minimized .session-window-cwd,
+.session-window.minimized .session-window-task {
+  display: none;
+}
+.session-window.minimized .session-window-header {
+  height: 36px;
+  border-bottom: 0;
+}
+.session-window.minimized .session-window-title {
+  flex-direction: row;
+  align-items: center;
+}
+.session-window.minimized .session-window-meta {
+  flex: 1;
 }
 .session-window-header {
   position: relative;
@@ -5402,6 +5457,7 @@ html, body {
           <div class="steer-strip empty" id="steer-strip"></div>
 
           <div class="session-window-grid hidden" id="session-window-grid"></div>
+          <div class="session-window-grid-resize-handle hidden" id="session-window-grid-resize-handle" title="Drag to resize session windows"></div>
           <div class="log-stream" id="log-stream"></div>
           <button class="scroll-bottom-btn" id="scroll-bottom" title="Scroll to bottom">&#x2193;</button>
 
@@ -6755,8 +6811,12 @@ let dashboardProjectRoot = '';
 const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
+const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height';
+const SESSION_WINDOW_GRID_MIN_HEIGHT = 72;
 let sessionMetadataRefreshTimer = null;
 let sessionMetadataRefreshInFlight = null;
+let sessionWindowGridHeightPx = readStoredSessionWindowGridHeight();
+let sessionWindowGridResizeDrag = null;
 let currentSessionDetail = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
@@ -9794,6 +9854,106 @@ function syncSessionWindowMetadataRefresh() {
 
 document.addEventListener('visibilitychange', syncSessionWindowMetadataRefresh);
 
+function readStoredSessionWindowGridHeight() {
+  try {
+    const raw = localStorage.getItem(SESSION_WINDOW_GRID_HEIGHT_KEY);
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeSessionWindowGridHeight(heightPx) {
+  try {
+    if (heightPx) localStorage.setItem(SESSION_WINDOW_GRID_HEIGHT_KEY, String(Math.round(heightPx)));
+    else localStorage.removeItem(SESSION_WINDOW_GRID_HEIGHT_KEY);
+  } catch {}
+}
+
+function maxSessionWindowGridHeight() {
+  const pane = document.getElementById('activity-log-pane');
+  const paneHeight = pane?.clientHeight || window.innerHeight || 600;
+  return Math.max(
+    SESSION_WINDOW_GRID_MIN_HEIGHT,
+    Math.min(Math.round(window.innerHeight * 0.72), paneHeight - 120)
+  );
+}
+
+function clampSessionWindowGridHeight(heightPx) {
+  const n = Number(heightPx);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(Math.max(
+    SESSION_WINDOW_GRID_MIN_HEIGHT,
+    Math.min(n, maxSessionWindowGridHeight())
+  ));
+}
+
+function syncSessionWindowGridControls() {
+  const grid = document.getElementById('session-window-grid');
+  const handle = document.getElementById('session-window-grid-resize-handle');
+  if (!grid || !handle) return;
+  const show = !grid.classList.contains('hidden') && !grid.classList.contains('maximized');
+  handle.classList.toggle('hidden', !show);
+}
+
+function applySessionWindowGridHeight() {
+  const grid = document.getElementById('session-window-grid');
+  if (!grid) return;
+  const height = clampSessionWindowGridHeight(sessionWindowGridHeightPx);
+  sessionWindowGridHeightPx = height;
+  if (height) {
+    grid.style.setProperty('--session-window-grid-height', `${height}px`);
+    grid.classList.add('resized');
+  } else {
+    grid.style.removeProperty('--session-window-grid-height');
+    grid.classList.remove('resized');
+  }
+  syncSessionWindowGridControls();
+}
+
+function setSessionWindowGridHeight(heightPx, persist = true) {
+  sessionWindowGridHeightPx = clampSessionWindowGridHeight(heightPx);
+  if (persist) storeSessionWindowGridHeight(sessionWindowGridHeightPx);
+  applySessionWindowGridHeight();
+}
+
+function resetSessionWindowGridHeight() {
+  sessionWindowGridHeightPx = null;
+  storeSessionWindowGridHeight(null);
+  applySessionWindowGridHeight();
+}
+
+function startSessionWindowGridResize(ev) {
+  const grid = document.getElementById('session-window-grid');
+  const handle = document.getElementById('session-window-grid-resize-handle');
+  if (!grid || !handle || grid.classList.contains('hidden') || grid.classList.contains('maximized')) return;
+  ev.preventDefault();
+  sessionWindowGridResizeDrag = {
+    pointerId: ev.pointerId,
+    startY: ev.clientY,
+    startHeight: grid.getBoundingClientRect().height,
+  };
+  handle.classList.add('dragging');
+  handle.setPointerCapture?.(ev.pointerId);
+}
+
+function updateSessionWindowGridResize(ev) {
+  if (!sessionWindowGridResizeDrag || ev.pointerId !== sessionWindowGridResizeDrag.pointerId) return;
+  ev.preventDefault();
+  const nextHeight = sessionWindowGridResizeDrag.startHeight + (ev.clientY - sessionWindowGridResizeDrag.startY);
+  setSessionWindowGridHeight(nextHeight, false);
+}
+
+function endSessionWindowGridResize(ev) {
+  if (!sessionWindowGridResizeDrag || ev.pointerId !== sessionWindowGridResizeDrag.pointerId) return;
+  const handle = document.getElementById('session-window-grid-resize-handle');
+  handle?.classList.remove('dragging');
+  handle?.releasePointerCapture?.(ev.pointerId);
+  storeSessionWindowGridHeight(sessionWindowGridHeightPx);
+  sessionWindowGridResizeDrag = null;
+}
+
 function copyTextToClipboard(text) {
   const value = String(text || '');
   if (!value) return Promise.reject(new Error('Nothing to copy'));
@@ -10022,6 +10182,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const grid = document.getElementById('session-window-grid');
   if (!grid) return null;
   grid.classList.remove('hidden');
+  applySessionWindowGridHeight();
 
   const el = document.createElement('div');
   el.className = 'session-window';
@@ -10058,6 +10219,13 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const status = document.createElement('span');
   status.className = 'session-window-status';
   status.textContent = normalizeSessionPhase(meta.phase || 'idle');
+  const minimize = document.createElement('button');
+  minimize.className = 'session-window-action session-window-minimize';
+  minimize.type = 'button';
+  minimize.title = 'Minimize window';
+  minimize.setAttribute('aria-label', minimize.title);
+  minimize.setAttribute('aria-pressed', 'false');
+  minimize.textContent = '\u2212';
   const actions = document.createElement('button');
   actions.className = 'session-window-action session-window-actions';
   actions.type = 'button';
@@ -10107,6 +10275,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   close.textContent = '\u00d7';
   header.appendChild(title);
   header.appendChild(status);
+  header.appendChild(minimize);
   header.appendChild(actions);
   header.appendChild(maximize);
   header.appendChild(close);
@@ -10136,6 +10305,11 @@ function ensureSessionWindow(sessionId, meta = {}) {
     setSessionWindowMenuOpen(sid, false);
     runSessionWindowAction(sid, item.dataset.sessionWindowAction);
   });
+  minimize.addEventListener('click', (e) => {
+    e.stopPropagation();
+    closeSessionWindowMenus();
+    toggleSessionWindowMinimized(sid);
+  });
   maximize.addEventListener('click', (e) => {
     e.stopPropagation();
     closeSessionWindowMenus();
@@ -10160,6 +10334,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     }
     if (grid.childElementCount === 0) grid.classList.add('hidden');
     updateSessionWindowMaximizeState();
+    syncSessionWindowGridControls();
     syncSessionWindowMetadataRefresh();
   });
 
@@ -10175,10 +10350,12 @@ function ensureSessionWindow(sessionId, meta = {}) {
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
+    minimize,
     maximize,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
     pendingActiveUntil: 0,
     ended: false,
+    minimized: false,
   };
   sessionWindows.set(sid, win);
   syncSessionWindowMetadataRefresh();
@@ -10238,6 +10415,39 @@ function updateSessionWindow(sessionId, meta = {}) {
   updateSessionWindowActionMenuVisibility(sid);
 }
 
+function updateSessionWindowMinimizeState(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  const minimized = !!win.minimized;
+  win.el.classList.toggle('minimized', minimized);
+  if (win.minimize) {
+    win.minimize.textContent = minimized ? '\u25A1' : '\u2212';
+    win.minimize.title = minimized ? 'Restore window' : 'Minimize window';
+    win.minimize.setAttribute('aria-label', win.minimize.title);
+    win.minimize.setAttribute('aria-pressed', minimized ? 'true' : 'false');
+  }
+}
+
+function setSessionWindowMinimized(sessionId, minimized) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  win.minimized = !!minimized;
+  if (win.minimized && maximizedSessionWindowId === sid) {
+    maximizedSessionWindowId = '';
+    updateSessionWindowMaximizeState();
+  }
+  updateSessionWindowMinimizeState(sid);
+}
+
+function toggleSessionWindowMinimized(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  setSessionWindowMinimized(sid, !win.minimized);
+}
+
 function updateSessionWindowMaximizeState() {
   const grid = document.getElementById('session-window-grid');
   if (!grid) return;
@@ -10256,12 +10466,14 @@ function updateSessionWindowMaximizeState() {
       win.maximize.setAttribute('aria-pressed', maximized ? 'true' : 'false');
     }
   }
+  syncSessionWindowGridControls();
 }
 
 function setSessionWindowMaximized(sessionId, maximized) {
   const sid = String(sessionId || '').trim();
   if (maximized) {
     if (!sid || !sessionWindows.has(sid)) return;
+    setSessionWindowMinimized(sid, false);
     maximizedSessionWindowId = sid;
     focusSessionWindow(sid);
   } else if (!sid || maximizedSessionWindowId === sid) {
@@ -10317,6 +10529,13 @@ window.focusForegroundSessionWindow = function() {
 document.addEventListener('click', () => {
   closeSessionWindowMenus();
 });
+
+document.getElementById('session-window-grid-resize-handle')?.addEventListener('pointerdown', startSessionWindowGridResize);
+document.getElementById('session-window-grid-resize-handle')?.addEventListener('pointermove', updateSessionWindowGridResize);
+document.getElementById('session-window-grid-resize-handle')?.addEventListener('pointerup', endSessionWindowGridResize);
+document.getElementById('session-window-grid-resize-handle')?.addEventListener('pointercancel', endSessionWindowGridResize);
+document.getElementById('session-window-grid-resize-handle')?.addEventListener('dblclick', resetSessionWindowGridHeight);
+window.addEventListener('resize', () => applySessionWindowGridHeight());
 
 function appendLogEntryToSessionWindow(entry) {
   const sid = entry?.dataset?.sessionId || '';
@@ -15714,6 +15933,7 @@ function switchActivitySubtab(name) {
   document.getElementById('activity-context-pane').classList.toggle('active', name === 'context');
   document.getElementById('activity-changes-pane').classList.toggle('active', name === 'changes');
   document.getElementById('activity-control-pane').classList.toggle('active', name === 'control');
+  syncSessionWindowGridControls();
   if (name === 'context') {
     renderContextPane();
   }
