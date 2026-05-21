@@ -6708,8 +6708,9 @@ let latestGlobalUsage = null;
 let dashboardProjectRoot = '';
 const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
-const SESSION_METADATA_REFRESH_MS = 2500;
+const SESSION_METADATA_REFRESH_MS = 15000;
 let sessionMetadataRefreshTimer = null;
+let sessionMetadataRefreshInFlight = null;
 let currentSessionDetail = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
@@ -9527,6 +9528,33 @@ function normalizeSessionWindowMeta(meta = {}) {
   return out;
 }
 
+function sessionWindowMetadataSignature(meta = {}) {
+  return [
+    meta.name || '',
+    meta.task || '',
+    meta.projectRoot || '',
+    meta.projectLabel || '',
+    meta.cwd || '',
+    meta.cwdLabel || '',
+    meta.source || '',
+    meta.sourceLabel || '',
+    meta.phase || '',
+    meta.ended === undefined ? '' : (meta.ended ? '1' : '0'),
+  ].join('\u001f');
+}
+
+function mergeSessionWindowMetadata(sessionId, meta = {}) {
+  const sid = String(sessionId || '').trim();
+  const normalized = normalizeSessionWindowMeta(meta);
+  const previous = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  const merged = Object.keys(normalized).length > 0
+    ? { ...previous, ...normalized }
+    : previous;
+  const changed = sessionWindowMetadataSignature(previous) !== sessionWindowMetadataSignature(merged);
+  if (sid && changed) sessionMetadataById.set(sid, merged);
+  return { meta: merged, changed };
+}
+
 function sessionWindowMetaFromSession(session) {
   if (!session || typeof session !== 'object') return {};
   return normalizeSessionWindowMeta({
@@ -9548,29 +9576,39 @@ function cacheSessionWindowMetadata(sessions) {
       .map(id => String(id || '').trim())
       .filter(Boolean);
     for (const id of ids) {
-      sessionMetadataById.set(id, meta);
-      if (sessionWindows.has(id)) updateSessionWindow(id, meta);
+      const { meta: merged, changed } = mergeSessionWindowMetadata(id, meta);
+      if (changed && sessionWindows.has(id)) updateSessionWindow(id, merged);
     }
   }
 }
 
-function refreshSessionWindowMetadata(delay = 0) {
+function shouldPollSessionWindowMetadata() {
+  return sessionWindows.size > 0 && activeTab === 'activity' && !document.hidden;
+}
+
+function refreshSessionWindowMetadata(delay = 0, options = {}) {
   const run = () => {
-    authedFetch('/api/sessions')
+    if (!options.force && !shouldPollSessionWindowMetadata()) return null;
+    if (sessionMetadataRefreshInFlight) return sessionMetadataRefreshInFlight;
+    sessionMetadataRefreshInFlight = authedFetch('/api/sessions')
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions returned ${r.status}`)))
       .then(sessions => cacheSessionWindowMetadata(sessions))
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        sessionMetadataRefreshInFlight = null;
+      });
+    return sessionMetadataRefreshInFlight;
   };
   if (delay > 0) setTimeout(run, delay);
   else run();
 }
 
 function syncSessionWindowMetadataRefresh() {
-  if (sessionWindows.size > 0) {
+  if (shouldPollSessionWindowMetadata()) {
     if (!sessionMetadataRefreshTimer) {
       refreshSessionWindowMetadata();
       sessionMetadataRefreshTimer = setInterval(() => {
-        if (sessionWindows.size === 0) {
+        if (!shouldPollSessionWindowMetadata()) {
           syncSessionWindowMetadataRefresh();
           return;
         }
@@ -9584,6 +9622,8 @@ function syncSessionWindowMetadataRefresh() {
     sessionMetadataRefreshTimer = null;
   }
 }
+
+document.addEventListener('visibilitychange', syncSessionWindowMetadataRefresh);
 
 function copyTextToClipboard(text) {
   const value = String(text || '');
@@ -9959,12 +9999,11 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (!sid) return;
   const win = sessionWindows.get(sid);
   if (!win) return;
-  const normalized = normalizeSessionWindowMeta(meta);
-  if (Object.keys(normalized).length > 0) {
-    const previous = sessionMetadataById.get(sid) || {};
-    sessionMetadataById.set(sid, { ...previous, ...normalized });
-  }
-  meta = { ...(sessionMetadataById.get(sid) || {}), ...normalized };
+  const merged = mergeSessionWindowMetadata(sid, meta);
+  meta = merged.meta;
+  const signature = sessionWindowMetadataSignature(meta);
+  if (win.metadataSignature === signature) return;
+  win.metadataSignature = signature;
   const displayName = compactSessionText(meta.name);
   win.id.textContent = displayName || shortSessionId(sid);
   win.id.title = displayName ? `${displayName} · ${sid}` : sid;
@@ -15350,6 +15389,7 @@ function switchTab(tabId) {
   if (tabId === 'activity' || tabId === 'displays') {
     relocateDisplays(tabId);
   }
+  syncSessionWindowMetadataRefresh();
   if (tabId === 'sessions' && !sessionsLoaded) {
     loadSessions();
   }
