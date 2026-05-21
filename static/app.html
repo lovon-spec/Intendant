@@ -9291,6 +9291,7 @@ function handleCodexThreadActionResult(evt) {
     const sid = String(evt.session_id || '').trim();
     const name = String(evt.message || '').replace(/^Codex thread renamed to\s+/i, '').trim();
     if (sid && name && name !== evt.message) {
+      applySessionRenameToUi(sid, 'codex', name);
       updateSessionWindow(sid, { name });
       successText = `Renamed session to ${name}`;
     }
@@ -10239,33 +10240,56 @@ function copyTextToClipboard(text) {
   });
 }
 
+function sessionAliasIds(session) {
+  if (!session) return [];
+  return [session.session_id, session.resume_id, session.backend_session_id, session.intendant_session_id]
+    .map(id => String(id || '').trim())
+    .filter(Boolean);
+}
+
+function normalizeSessionSource(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return '';
+  if (v === 'session' || v === 'intendant') return 'intendant';
+  return normalizeAgentId(v) || v;
+}
+
 function sessionIdentityMatches(session, sessionId, source = '') {
   if (!session || !sessionId) return false;
   const sid = String(sessionId || '').trim();
-  const ids = [session.session_id, session.resume_id, session.backend_session_id, session.intendant_session_id]
-    .map(id => String(id || '').trim())
-    .filter(Boolean);
-  if (!ids.includes(sid)) {
+  if (!sessionAliasIds(session).includes(sid)) {
     return false;
   }
-  const normalizedSource = String(source || '').trim();
-  return !normalizedSource || String(session.source || 'intendant').trim() === normalizedSource;
+  const normalizedSource = normalizeSessionSource(source);
+  if (!normalizedSource) return true;
+  return [
+    session.source || 'intendant',
+    session.backend_source,
+    session.backendSource,
+  ]
+    .map(normalizeSessionSource)
+    .some(candidate => candidate === normalizedSource);
 }
 
 function applySessionRenameToUi(sessionId, source, name) {
   const sid = String(sessionId || '').trim();
   const displayName = compactSessionText(name);
   if (!sid || !displayName) return;
-  const normalizedSource = String(source || '').trim();
+  const normalizedSource = normalizeSessionSource(source);
   const aliasIds = new Set([sid]);
   for (const session of _cachedSessions) {
     if (sessionIdentityMatches(session, sid, normalizedSource)) {
       session.name = displayName;
-      [session.session_id, session.resume_id, session.backend_session_id, session.intendant_session_id].forEach(id => {
+      sessionAliasIds(session).forEach(id => {
         const alias = String(id || '').trim();
         if (alias) aliasIds.add(alias);
       });
     }
+  }
+  if (currentSessionDetail && sessionIdentityMatches(currentSessionDetail, sid, normalizedSource)) {
+    sessionAliasIds(currentSessionDetail).forEach(id => {
+      if (id) aliasIds.add(id);
+    });
   }
   aliasIds.forEach(id => {
     const previous = sessionMetadataById.get(id) || {};
