@@ -39,6 +39,30 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 /// HTTP/WebSocket handling.
 type DemuxStream = std::pin::Pin<Box<dyn AsyncReadWrite>>;
 
+/// Finalize a one-shot HTTP response on a demuxed stream before it drops.
+///
+/// Every dashboard HTTP reply is a single buffered response sent with
+/// `Connection: close`, after which the connection task returns and the
+/// boxed [`DemuxStream`] is dropped. For a plain `TcpStream` that's fine —
+/// the kernel keeps queued bytes and flushes them on close. But the TLS
+/// path's stream is a `tokio_rustls::server::TlsStream`, which buffers
+/// *ciphertext* inside the rustls session: `write_all` only guarantees the
+/// plaintext was accepted into that buffer, not that the encrypted records
+/// reached the socket. Dropping the `TlsStream` without flushing discards
+/// the unwritten tail records, truncating large bodies (e.g. the ~871 KB
+/// `app.html` arrived ~19.5 KB short over HTTPS).
+///
+/// Calling `flush` drives rustls to emit all buffered ciphertext to the
+/// TCP socket; `shutdown` then writes the TLS `close_notify` and the TCP
+/// FIN, closing the session cleanly. On the plain path both delegate
+/// straight through to the `TcpStream` (flush is a no-op, shutdown sends
+/// the FIN we'd send on drop anyway), so behavior there is unchanged.
+async fn finalize_http_stream(stream: &mut DemuxStream) {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
+}
+
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
 /// connections.  Used for WebRTC signaling so that each browser tab gets a
 /// stable identity within a display session.
@@ -9260,6 +9284,7 @@ pub fn spawn_web_gateway(
                             Connection: close\r\n\
                             \r\n";
                         let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
                         return;
                     }
 
@@ -9292,6 +9317,7 @@ pub fn spawn_web_gateway(
                                 body.len(),
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
                             return;
                         }
                     }
@@ -11272,6 +11298,16 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     }
+
+                    // Flush + cleanly shut down the stream before this task
+                    // returns and drops it. Mandatory for the TLS path so the
+                    // final ciphertext records reach the socket (rustls buffers
+                    // them; dropping mid-buffer truncates large bodies); a
+                    // harmless pass-through on plain TCP. Covers every
+                    // fall-through dispatch arm above in one place; the early
+                    // `return`s (OPTIONS / failed federation auth) finalize
+                    // inline before returning.
+                    finalize_http_stream(&mut stream).await;
                 }
             });
         }
