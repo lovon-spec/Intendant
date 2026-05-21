@@ -1,35 +1,59 @@
-//! Windows display backend using DXGI Desktop Duplication for frame capture
-//! and the `SendInput` API for input injection.
+//! Windows display backend with two capture paths -- GDI `BitBlt` (default) and
+//! DXGI Desktop Duplication (opt-in) -- plus `SendInput` for input injection.
 //!
 //! ## Capture
 //!
-//! DXGI Desktop Duplication (`IDXGIOutputDuplication`) is the modern,
-//! GPU-accelerated path for whole-desktop capture on Windows 8+. The duplication
-//! interface, the D3D11 device, and the device context are all single-threaded
-//! COM objects that are **not** `Send` across `await` points, so -- exactly like
-//! the X11 backend's XShm connection -- the capture loop runs on a dedicated
-//! `std::thread`. It communicates with the tokio runtime via a bounded `mpsc`
-//! channel (capacity 4, `try_send`, drop on full -- the same backpressure
-//! policy as the macOS and X11 backends) and an `AtomicBool` for shutdown.
+//! Two implementations sit behind the same `DisplayBackend` seam, selected by
+//! [`CaptureMethod`]:
 //!
-//! Per-frame the loop:
-//! 1. `AcquireNextFrame` with a timeout derived from the target fps. A
-//!    `DXGI_ERROR_WAIT_TIMEOUT` simply means the desktop did not change -- we
-//!    re-emit the previous frame so the encoder keeps a live cadence (matching
-//!    the always-on heartbeat the rest of the pipeline expects).
-//! 2. `CopyResource` the acquired GPU texture into a CPU-readable staging
-//!    texture (`D3D11_USAGE_STAGING` + `CPU_ACCESS_READ`).
-//! 3. `Map` the staging texture and copy the BGRA rows into a `Vec<u8>`
-//!    (per-frame heap copy, same as macOS).
-//! 4. `ReleaseFrame` and send the `Frame`.
+//! ### GDI `BitBlt` (default -- [`CaptureMethod::Gdi`])
 //!
-//! `DXGI_ERROR_ACCESS_LOST` (resolution change, full-screen app taking
-//! exclusive ownership, secure-desktop / UAC transition, GPU mode switch) tears
-//! down the duplication and re-acquires it on the next iteration.
+//! `BitBlt` from the screen DC reads the **DWM-composed** desktop, the same
+//! pixels a user sees. Crucially it works on *every* display adapter, including
+//! the virtual/indirect ones Intendant's "always-on steward" actually runs on:
+//! RDP indirect display, GCP/cloud virtual display, headless. On those adapters
+//! DXGI Desktop Duplication captures **all-black** frames -- it requires real
+//! frame presentation/scanout that virtual/headless/RDP displays don't provide,
+//! so it "succeeds" yet duplicates black. (Proven live on a GCP Windows VM: DDA
+//! streamed black on both RDP and the console session with a virtual display
+//! device, while a GDI `BitBlt` capture at the same instant showed the real
+//! desktop.) GDI is therefore the robust, default capture path.
 //!
-//! Desktop Duplication produces `DXGI_FORMAT_B8G8R8A8_UNORM`, i.e. BGRA8, so we
-//! tag frames `FrameFormat::Bgra` and feed the existing `bgra_to_i420`
-//! converter unchanged.
+//! The capture loop runs on a dedicated `std::thread` because GDI device
+//! contexts and bitmaps are raw `HDC`/`HBITMAP` handles that are **not** `Send`.
+//! Per frame the loop `BitBlt`s the screen DC into a cached top-down 32-bit
+//! `CreateDIBSection` DIB (`SRCCOPY | CAPTUREBLT`, the latter so layered/overlay
+//! windows are included), then copies the DIB bits into a `Vec<u8>`. The DC,
+//! memory DC, and DIB are cached across frames and recreated only on a
+//! resolution change. The DIB is created BGRA8 top-down (`biHeight` negative,
+//! `biBitCount = 32`, `biCompression = BI_RGB`), so the emitted rows are the
+//! identical `DXGI_FORMAT_B8G8R8A8_UNORM` byte layout the DDA path produced --
+//! `FrameFormat::Bgra`, `stride = width * 4` -- and feed the existing
+//! `bgra_to_i420` / Media Foundation H.264 encoder unchanged.
+//!
+//! ### DXGI Desktop Duplication (opt-in -- [`CaptureMethod::Dxgi`])
+//!
+//! `IDXGIOutputDuplication` is the GPU-accelerated path: zero-copy from the GPU
+//! into a CPU-readable staging texture, lowest overhead on physical hardware. It
+//! is retained as an opt-in fast path (constructor or
+//! `INTENDANT_WINDOWS_CAPTURE=dxgi`) for hosts with a real GPU/scanout where it
+//! works, but it is **not** the default because it silently captures black on
+//! the cloud/RDP/headless adapters this project commonly targets.
+//!
+//! Like GDI, the duplication interface, the D3D11 device, and the device context
+//! are single-threaded COM objects **not** `Send` across `await` points, so the
+//! loop runs on a dedicated `std::thread`. Per frame: `AcquireNextFrame`
+//! (`DXGI_ERROR_WAIT_TIMEOUT` -> re-emit the last frame to keep cadence),
+//! `CopyResource` into a staging texture, `Map` and copy the BGRA rows,
+//! `ReleaseFrame`. `DXGI_ERROR_ACCESS_LOST` (resolution change, exclusive
+//! full-screen, secure-desktop / UAC transition, GPU mode switch) tears down the
+//! duplication and re-acquires it.
+//!
+//! Both paths talk to the tokio runtime via a bounded `mpsc` channel (capacity
+//! 4, `try_send`, drop on full -- the same backpressure policy as the macOS and
+//! X11 backends) and an `AtomicBool` for shutdown, and both report their initial
+//! resolution back through a oneshot so `start_capture` fails loudly rather than
+//! returning a silent black session.
 //!
 //! ## Input
 //!
@@ -42,11 +66,11 @@
 //!
 //! ## Status
 //!
-//! Compiles and links for `x86_64-pc-windows-msvc`. Live capture requires an
-//! interactive desktop session (Desktop Duplication is unavailable on the
-//! headless / service / disconnected-RDP "Session 0" desktop), so end-to-end
-//! frame delivery and input injection are pending validation on an interactive
-//! Windows host -- see the crate-level Windows-port notes.
+//! Compiles and links for `x86_64-pc-windows-msvc`. The GDI default path
+//! captures the real desktop on the cloud/RDP/headless hosts this project
+//! targets (validated live). Input injection via `SendInput` still requires an
+//! interactive desktop session (it is blocked on the headless service "Session
+//! 0" desktop) -- see the crate-level Windows-port notes.
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
 use crate::error::CallerError;
@@ -74,6 +98,11 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
 };
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC,
+    HGDIOBJ, SRCCOPY,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE,
@@ -82,8 +111,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, WHEEL_DELTA,
+    GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
 };
 
 /// Active capture state: holds the thread handle for cleanup.
@@ -91,45 +120,82 @@ struct CaptureState {
     thread: std::thread::JoinHandle<()>,
 }
 
+/// Which whole-desktop capture implementation a [`WindowsBackend`] drives.
+///
+/// Both produce byte-identical `FrameFormat::Bgra` frames with `stride =
+/// width * 4`; only the OS path that fills them differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMethod {
+    /// GDI `BitBlt` of the screen DC. **Default.** Reads the DWM-composed
+    /// desktop and works on virtual/indirect/headless/RDP/cloud display
+    /// adapters where DXGI Desktop Duplication captures black.
+    Gdi,
+    /// DXGI Desktop Duplication. GPU-accelerated fast path for hosts with a
+    /// real GPU + scanout; opt-in because it captures black on the cloud/RDP/
+    /// headless adapters this project commonly targets.
+    Dxgi,
+}
+
+impl CaptureMethod {
+    /// Resolve the default capture method, honoring an
+    /// `INTENDANT_WINDOWS_CAPTURE` override (`gdi` | `dxgi`, case-insensitive)
+    /// so the fast path can be opted into at runtime without a code change.
+    /// Anything unrecognized (or unset) falls back to the GDI default.
+    fn from_env_or_default() -> Self {
+        match std::env::var("INTENDANT_WINDOWS_CAPTURE") {
+            Ok(v) if v.eq_ignore_ascii_case("dxgi") => CaptureMethod::Dxgi,
+            Ok(v) if v.eq_ignore_ascii_case("gdi") => CaptureMethod::Gdi,
+            _ => CaptureMethod::Gdi,
+        }
+    }
+}
+
 /// Windows screen capture and input injection backend.
 ///
-/// Uses DXGI Desktop Duplication for GPU-accelerated full-desktop capture and
-/// the `SendInput` API for keyboard/mouse/scroll injection. Resolution is
-/// resolved when `start_capture()` runs (from the duplicated output's mode
-/// description); `with_output_index` targets a specific monitor by its DXGI
-/// output ordinal.
+/// Captures the full desktop via GDI `BitBlt` (default) or DXGI Desktop
+/// Duplication (opt-in -- see [`CaptureMethod`]) and injects keyboard/mouse/
+/// scroll via `SendInput`. Resolution is resolved when `start_capture()` runs
+/// (from `GetSystemMetrics` for the primary GDI path, or the monitor/output
+/// rect when a specific monitor is targeted); `with_output_index` targets a
+/// specific monitor by its DXGI output ordinal.
 pub struct WindowsBackend {
     capture: Mutex<Option<CaptureState>>,
     width: Arc<AtomicU32>,
     height: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
-    /// Target DXGI output index on adapter 0. `None` captures the first
-    /// available output (backwards-compatible single-monitor behavior).
+    /// Target DXGI output index on adapter 0. `None` captures the primary /
+    /// first available output (backwards-compatible single-monitor behavior).
     target_output_index: Option<u32>,
+    /// Capture implementation to drive.
+    method: CaptureMethod,
 }
 
 impl WindowsBackend {
-    /// Create a new Windows backend capturing the first available output.
-    /// Resolution is populated once `start_capture()` runs.
+    /// Create a new Windows backend capturing the primary output with the
+    /// default (GDI) capture path, honoring the `INTENDANT_WINDOWS_CAPTURE`
+    /// override. Resolution is populated once `start_capture()` runs.
     pub fn new() -> Self {
-        Self {
-            capture: Mutex::new(None),
-            width: Arc::new(AtomicU32::new(0)),
-            height: Arc::new(AtomicU32::new(0)),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            target_output_index: None,
-        }
+        Self::with_method(None, CaptureMethod::from_env_or_default())
     }
 
     /// Create a backend targeting a specific DXGI output (monitor) by its
-    /// ordinal on adapter 0. Mirrors `MacOSBackend::with_display_id`.
+    /// ordinal on adapter 0, with the default (GDI) capture path. Mirrors
+    /// `MacOSBackend::with_display_id`.
     pub fn with_output_index(output_index: u32) -> Self {
+        Self::with_method(Some(output_index), CaptureMethod::from_env_or_default())
+    }
+
+    /// Create a backend with an explicit output target and capture method.
+    /// Lets callers force the DXGI fast path (e.g. on a known-good GPU host)
+    /// without relying on the environment override.
+    pub fn with_method(target_output_index: Option<u32>, method: CaptureMethod) -> Self {
         Self {
             capture: Mutex::new(None),
             width: Arc::new(AtomicU32::new(0)),
             height: Arc::new(AtomicU32::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            target_output_index: Some(output_index),
+            target_output_index,
+            method,
         }
     }
 }
@@ -291,26 +357,40 @@ impl DisplayBackend for WindowsBackend {
         let shared_w = Arc::clone(&self.width);
         let shared_h = Arc::clone(&self.height);
         let target_output = self.target_output_index;
+        let method = self.method;
 
-        // Probe the duplication on the capture thread and report the initial
-        // resolution back through a oneshot, so `start_capture` fails loudly
-        // (rather than returning a silent black session) if Desktop
-        // Duplication is unavailable -- e.g. running on the headless Session 0
-        // desktop, no GPU, or DDA disabled. This mirrors the X11 backend
-        // surfacing connect failures, but here the device init happens on the
-        // thread because the COM objects are not `Send`.
+        // Probe the capture on its own thread and report the initial resolution
+        // back through a oneshot, so `start_capture` fails loudly (rather than
+        // returning a silent black session) if init fails -- e.g. Desktop
+        // Duplication unavailable on the headless Session 0 desktop, no GPU, or
+        // a GDI DC that can't be acquired. This mirrors the X11 backend
+        // surfacing connect failures, but here init happens on the thread
+        // because the COM/GDI objects are not `Send`.
         let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<(u32, u32), String>>();
 
-        let thread = std::thread::spawn(move || {
-            run_dxgi_capture(
-                tx,
-                shutdown_flag,
-                fps,
-                target_output,
-                shared_w,
-                shared_h,
-                init_tx,
-            );
+        let thread = std::thread::spawn(move || match method {
+            CaptureMethod::Gdi => {
+                run_gdi_capture(
+                    tx,
+                    shutdown_flag,
+                    fps,
+                    target_output,
+                    shared_w,
+                    shared_h,
+                    init_tx,
+                );
+            }
+            CaptureMethod::Dxgi => {
+                run_dxgi_capture(
+                    tx,
+                    shutdown_flag,
+                    fps,
+                    target_output,
+                    shared_w,
+                    shared_h,
+                    init_tx,
+                );
+            }
         });
 
         match init_rx.await {
@@ -328,7 +408,7 @@ impl DisplayBackend for WindowsBackend {
                 })
                 .await;
                 Err(CallerError::Display(format!(
-                    "DXGI Desktop Duplication init failed: {e}"
+                    "Windows {method:?} capture init failed: {e}"
                 )))
             }
             Err(_) => {
@@ -338,9 +418,9 @@ impl DisplayBackend for WindowsBackend {
                     let _ = thread.join();
                 })
                 .await;
-                Err(CallerError::Display(
-                    "DXGI capture thread exited before initialization".into(),
-                ))
+                Err(CallerError::Display(format!(
+                    "Windows {method:?} capture thread exited before initialization"
+                )))
             }
         }
     }
@@ -979,6 +1059,400 @@ fn clone_frame(f: &Frame) -> Frame {
 }
 
 // ---------------------------------------------------------------------------
+// GDI BitBlt capture (default path)
+// ---------------------------------------------------------------------------
+
+/// Resolve the source rect to `BitBlt` from the screen DC, in physical pixels:
+/// `(left, top, width, height)`. Dimensions are forced even (`& !1`) so the
+/// VP8/I420 path -- which requires even dimensions, like the other backends --
+/// is satisfied identically to the DXGI path.
+///
+/// - `None` (primary): origin `(0, 0)` with `GetSystemMetrics(SM_CXSCREEN /
+///   SM_CYSCREEN)`. These report the *primary* monitor's size, which is what
+///   the always-on single-desktop steward scenario wants.
+/// - `Some(ordinal)`: the DXGI output's `DesktopCoordinates` rect (reusing the
+///   enumeration path), so a targeted secondary monitor is captured at its true
+///   virtual-desktop offset. Falls back to the primary metrics if the ordinal
+///   can't be resolved.
+fn resolve_capture_rect(target_output: Option<u32>) -> Result<(i32, i32, u32, u32), String> {
+    if let Some(idx) = target_output {
+        match output_rect_for_ordinal(idx) {
+            Ok(rect) => return Ok(rect),
+            Err(e) => {
+                eprintln!(
+                    "[display/windows] GDI: output ordinal {idx} unresolved ({e}); \
+                     falling back to primary screen metrics",
+                );
+            }
+        }
+    }
+
+    let (w, h) = unsafe {
+        (
+            GetSystemMetrics(SM_CXSCREEN).max(0) as u32,
+            GetSystemMetrics(SM_CYSCREEN).max(0) as u32,
+        )
+    };
+    if w == 0 || h == 0 {
+        return Err(format!(
+            "GetSystemMetrics returned an empty primary screen ({w}x{h})"
+        ));
+    }
+    Ok((0, 0, w & !1, h & !1))
+}
+
+/// Resolve a DXGI output ordinal (adapter 0 enumeration order, the same ordinal
+/// `enumerate_displays` reports as `platform_id`) to its desktop rect in
+/// virtual-screen pixel coordinates: `(left, top, width, height)`.
+fn output_rect_for_ordinal(target: u32) -> Result<(i32, i32, u32, u32), String> {
+    let factory = create_dxgi_factory().map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
+
+    let mut ordinal = 0u32;
+    let mut adapter_index = 0u32;
+    loop {
+        let adapter: IDXGIAdapter = match unsafe { factory.EnumAdapters(adapter_index) } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        adapter_index += 1;
+
+        let mut output_index = 0u32;
+        loop {
+            let output: IDXGIOutput = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            output_index += 1;
+
+            if ordinal == target {
+                let desc = unsafe { get_output_desc(&output) }
+                    .ok_or_else(|| format!("GetDesc on output ordinal {target} failed"))?;
+                let rect = &desc.DesktopCoordinates;
+                let (w, h) = output_dimensions(rect, desc.Rotation);
+                return Ok((rect.left, rect.top, w & !1, h & !1));
+            }
+            ordinal += 1;
+        }
+    }
+    Err(format!("DXGI output ordinal {target} not found"))
+}
+
+/// Cached GDI capture resources for one resolution. Recreated on resize.
+///
+/// Holds the screen DC (source), a compatible memory DC, and a top-down 32-bit
+/// `CreateDIBSection` DIB selected into the memory DC. `bits` points at the
+/// DIB's pixel storage, which GDI owns for the lifetime of the `HBITMAP`. All
+/// handles live on the capture thread only -- `HDC`/`HBITMAP` are raw pointers
+/// and not `Send` -- and are released in [`GdiCapture::free`] / `Drop`.
+struct GdiCapture {
+    /// Source DC for the whole screen (`GetDC(None)`).
+    screen_dc: HDC,
+    /// Memory DC the DIB is selected into.
+    mem_dc: HDC,
+    /// The DIB section we `BitBlt` into and read back from.
+    dib: HBITMAP,
+    /// Object previously selected in `mem_dc`, restored before deletion so the
+    /// DIB can be freed (`SelectObject` returns the prior selection).
+    old_obj: HGDIOBJ,
+    /// Raw pointer to the DIB's top-down BGRA pixel bits (GDI-owned).
+    bits: *mut u8,
+    /// Source rect on the virtual desktop.
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl GdiCapture {
+    /// Acquire the screen DC and build a top-down 32-bit DIB sized to the rect.
+    ///
+    /// The DIB header uses `biBitCount = 32`, `biCompression = BI_RGB`, and a
+    /// **negative** `biHeight` so the rows are stored top-down -- giving us the
+    /// exact `DXGI_FORMAT_B8G8R8A8_UNORM` byte layout (BGRA, first row first)
+    /// that the DXGI path emitted, so everything downstream is unchanged.
+    fn new(x: i32, y: i32, width: u32, height: u32) -> Result<Self, String> {
+        // Whole-screen DC. `GetDC(None)` returns the DC for the entire screen
+        // (the virtual desktop's primary surface); `BitBlt`'s source x/y then
+        // index into it, so a secondary monitor's offset rect reads correctly.
+        let screen_dc = unsafe { GetDC(None) };
+        if screen_dc.is_invalid() {
+            return Err("GetDC(None) returned a null screen DC".into());
+        }
+
+        let mem_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
+        if mem_dc.is_invalid() {
+            unsafe {
+                ReleaseDC(None, screen_dc);
+            }
+            return Err("CreateCompatibleDC returned a null memory DC".into());
+        }
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                // Negative height => top-down DIB (row 0 is the top scanline).
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: Default::default(),
+        };
+
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = unsafe {
+            CreateDIBSection(
+                Some(mem_dc),
+                &bmi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+        }
+        .map_err(|e| format!("CreateDIBSection ({width}x{height}): {e}"))?;
+
+        if dib.is_invalid() || bits.is_null() {
+            unsafe {
+                let _ = DeleteDC(mem_dc);
+                ReleaseDC(None, screen_dc);
+            }
+            return Err("CreateDIBSection returned a null DIB / bits pointer".into());
+        }
+
+        // Select the DIB into the memory DC so BitBlt writes into its bits.
+        let old_obj = unsafe { SelectObject(mem_dc, HGDIOBJ::from(dib)) };
+
+        Ok(Self {
+            screen_dc,
+            mem_dc,
+            dib,
+            old_obj,
+            bits: bits as *mut u8,
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    /// `BitBlt` the screen rect into the DIB, then copy the bits into a tightly
+    /// packed `Vec<u8>` (`stride = width * 4`, BGRA, top-down). Returns a
+    /// `Frame` byte-identical in layout to the DXGI path's output.
+    ///
+    /// `SRCCOPY | CAPTUREBLT` is used so layered / overlay windows (and, on most
+    /// drivers, the visible cursor's host content) are included, matching what a
+    /// user sees -- the same flags PowerShell's `CopyFromScreen` uses under the
+    /// hood and which captured the real desktop on the cloud VM.
+    fn grab(&self) -> Result<Frame, String> {
+        unsafe {
+            BitBlt(
+                self.mem_dc,
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                Some(self.screen_dc),
+                self.x,
+                self.y,
+                SRCCOPY | CAPTUREBLT,
+            )
+        }
+        .map_err(|e| format!("BitBlt: {e}"))?;
+
+        let row_bytes = (self.width as usize) * 4;
+        let total = row_bytes * self.height as usize;
+        let mut data = vec![0u8; total];
+        // The DIB is top-down and tightly packed at 32bpp, so its stride is
+        // exactly `width * 4` -- a single contiguous copy suffices (no per-row
+        // RowPitch stride to step over, unlike the DXGI staging map).
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.bits as *const u8, data.as_mut_ptr(), total);
+        }
+
+        Ok(Frame {
+            data,
+            format: FrameFormat::Bgra,
+            width: self.width,
+            height: self.height,
+            stride: row_bytes as u32,
+            timestamp: std::time::Instant::now(),
+        })
+    }
+
+    /// Release every GDI handle in the correct order: restore the memory DC's
+    /// original selection, delete the DIB, delete the memory DC, release the
+    /// screen DC. Idempotent enough for the single `Drop` call.
+    fn free(&mut self) {
+        unsafe {
+            // Restore the previously selected object so the DIB is no longer in
+            // use, then it can be deleted.
+            if !self.mem_dc.is_invalid() {
+                SelectObject(self.mem_dc, self.old_obj);
+            }
+            if !self.dib.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ::from(self.dib));
+            }
+            if !self.mem_dc.is_invalid() {
+                let _ = DeleteDC(self.mem_dc);
+            }
+            if !self.screen_dc.is_invalid() {
+                ReleaseDC(None, self.screen_dc);
+            }
+        }
+        // Null the handles so a stray second free is a no-op.
+        self.dib = HBITMAP::default();
+        self.mem_dc = HDC::default();
+        self.screen_dc = HDC::default();
+        self.bits = std::ptr::null_mut();
+    }
+}
+
+impl Drop for GdiCapture {
+    fn drop(&mut self) {
+        self.free();
+    }
+}
+
+/// Run the GDI `BitBlt` capture loop on a dedicated OS thread.
+///
+/// Sends the initial resolution (or an init error) through `init_tx`, then
+/// loops at the target framerate, `BitBlt`-ing the screen into a cached DIB and
+/// emitting a `Frame`. Unlike DXGI there is no "no change" signal -- every
+/// iteration grabs the current desktop -- so the frame-interval sleep is the
+/// only pacing. A `BitBlt` failure re-emits the previous frame to keep the
+/// encoder's heartbeat alive, and a resolution change (detected via
+/// `GetSystemMetrics`) rebuilds the cached DCs/DIB.
+#[allow(clippy::too_many_arguments)]
+fn run_gdi_capture(
+    tx: mpsc::Sender<Frame>,
+    shutdown: Arc<AtomicBool>,
+    fps: u32,
+    target_output: Option<u32>,
+    shared_width: Arc<AtomicU32>,
+    shared_height: Arc<AtomicU32>,
+    init_tx: tokio::sync::oneshot::Sender<Result<(u32, u32), String>>,
+) {
+    let frame_interval =
+        std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
+
+    let (mut rect_x, mut rect_y, init_w, init_h) = match resolve_capture_rect(target_output) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = init_tx.send(Err(e));
+            return;
+        }
+    };
+
+    let mut capture = match GdiCapture::new(rect_x, rect_y, init_w, init_h) {
+        Ok(c) => {
+            let _ = init_tx.send(Ok((init_w, init_h)));
+            c
+        }
+        Err(e) => {
+            let _ = init_tx.send(Err(e));
+            return;
+        }
+    };
+
+    let mut last_frame: Option<Frame> = None;
+    let mut frame_count: u64 = 0;
+    let mut consecutive_errors: u32 = 0;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 60;
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let start = std::time::Instant::now();
+
+        // Detect a primary-resolution change and rebuild the cached resources.
+        // For a targeted output we re-resolve its rect too, so a monitor
+        // re-arrange / mode switch is picked up.
+        if let Ok((nx, ny, nw, nh)) = resolve_capture_rect(target_output) {
+            if nw != capture.width || nh != capture.height || nx != rect_x || ny != rect_y {
+                match GdiCapture::new(nx, ny, nw, nh) {
+                    Ok(c) => {
+                        eprintln!(
+                            "[display/windows] GDI resize: {}x{} -> {nw}x{nh}",
+                            capture.width, capture.height,
+                        );
+                        capture = c;
+                        rect_x = nx;
+                        rect_y = ny;
+                        shared_width.store(nw, Ordering::SeqCst);
+                        shared_height.store(nh, Ordering::SeqCst);
+                        last_frame = None;
+                    }
+                    Err(e) => {
+                        eprintln!("[display/windows] GDI resize rebuild failed: {e}");
+                    }
+                }
+            }
+        }
+
+        match capture.grab() {
+            Ok(frame) => {
+                consecutive_errors = 0;
+
+                let w = frame.width;
+                let h = frame.height;
+                let prev_w = shared_width.load(Ordering::SeqCst);
+                let prev_h = shared_height.load(Ordering::SeqCst);
+                if w != prev_w || h != prev_h {
+                    shared_width.store(w, Ordering::SeqCst);
+                    shared_height.store(h, Ordering::SeqCst);
+                }
+
+                frame_count += 1;
+                if frame_count == 1 || frame_count % 300 == 0 {
+                    eprintln!(
+                        "[display/windows] GDI frame #{frame_count} {}x{} stride={} size={}B",
+                        frame.width,
+                        frame.height,
+                        frame.stride,
+                        frame.data.len(),
+                    );
+                }
+
+                last_frame = Some(clone_frame(&frame));
+                let _ = tx.try_send(frame);
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                eprintln!("[display/windows] GDI capture error ({consecutive_errors}): {e}");
+                // Keep the encoder's heartbeat alive with the last good frame.
+                if let Some(prev) = &last_frame {
+                    let mut hb = clone_frame(prev);
+                    hb.timestamp = std::time::Instant::now();
+                    let _ = tx.try_send(hb);
+                }
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    eprintln!(
+                        "[display/windows] GDI giving up after {consecutive_errors} errors",
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed < frame_interval {
+            std::thread::sleep(frame_interval - elapsed);
+        }
+    }
+
+    // `capture` drops here, freeing all GDI handles.
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1028,5 +1502,63 @@ mod tests {
         assert_eq!(mouse_up_flag(0), MOUSEEVENTF_LEFTUP);
         assert_eq!(mouse_up_flag(1), MOUSEEVENTF_MIDDLEUP);
         assert_eq!(mouse_up_flag(2), MOUSEEVENTF_RIGHTUP);
+    }
+
+    #[test]
+    fn default_capture_method_is_gdi() {
+        // GDI is the robust default; DXGI captures black on cloud/RDP/headless.
+        // The constructors must default to GDI (absent an env override).
+        std::env::remove_var("INTENDANT_WINDOWS_CAPTURE");
+        assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Gdi);
+        assert_eq!(WindowsBackend::new().method, CaptureMethod::Gdi);
+        assert_eq!(
+            WindowsBackend::with_output_index(0).method,
+            CaptureMethod::Gdi
+        );
+    }
+
+    #[test]
+    fn capture_method_env_override_opts_into_dxgi() {
+        // The override is the documented runtime opt-in for the fast path.
+        std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "dxgi");
+        assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Dxgi);
+        std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "GDI");
+        assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Gdi);
+        // Anything unrecognized falls back to the GDI default.
+        std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "nonsense");
+        assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Gdi);
+        std::env::remove_var("INTENDANT_WINDOWS_CAPTURE");
+    }
+
+    #[test]
+    fn explicit_method_overrides_default() {
+        let b = WindowsBackend::with_method(Some(1), CaptureMethod::Dxgi);
+        assert_eq!(b.method, CaptureMethod::Dxgi);
+        assert_eq!(b.target_output_index, Some(1));
+    }
+
+    #[test]
+    fn gdi_dib_header_is_topdown_bgra32_matching_dxgi() {
+        // The frame layout contract the whole downstream pipeline depends on:
+        // BGRA, 32bpp, top-down (negative biHeight), uncompressed (BI_RGB),
+        // tightly packed (stride = width*4) -- byte-identical to the DXGI
+        // staging-map output so the MF H.264 encoder is unchanged.
+        let (w, h) = (1600u32, 900u32);
+        let hdr = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        assert_eq!(hdr.biBitCount, 32, "must be 32bpp BGRA");
+        assert_eq!(hdr.biCompression, BI_RGB.0, "must be uncompressed BI_RGB");
+        assert!(hdr.biHeight < 0, "negative height => top-down rows");
+        assert_eq!(hdr.biWidth.unsigned_abs(), w);
+        assert_eq!(hdr.biHeight.unsigned_abs(), h);
+        // Emitted stride matches what the DXGI path produced: width * 4.
+        assert_eq!((w as usize) * 4, 6400);
     }
 }
