@@ -804,6 +804,41 @@ fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
     idx
 }
 
+fn external_tool_preview_text(tool_name: &str, preview: &str) -> Option<String> {
+    let tool_name = tool_name.trim();
+    let preview = preview.trim();
+    match (tool_name.is_empty(), preview.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(preview.to_string()),
+        (false, true) => Some(tool_name.to_string()),
+        (false, false) => Some(format!("{tool_name}: {preview}")),
+    }
+}
+
+fn external_agent_log_source(agent_source: Option<&str>) -> String {
+    agent_source
+        .filter(|source| !source.trim().is_empty())
+        .unwrap_or("worker")
+        .to_string()
+}
+
+fn external_tool_failure_content(
+    item_id: &str,
+    message: &str,
+    tool_preview: Option<&str>,
+) -> String {
+    let mut content = if item_id.trim().is_empty() {
+        format!("Tool failed: {message}")
+    } else {
+        format!("Tool failed ({item_id}): {message}")
+    };
+    if let Some(preview) = tool_preview.map(str::trim).filter(|s| !s.is_empty()) {
+        content.push_str("\nTool: ");
+        content.push_str(preview);
+    }
+    content
+}
+
 /// Result of draining one batch of external agent events.
 enum DrainOutcome {
     /// The agent's turn completed. The caller decides how to continue
@@ -1015,6 +1050,8 @@ async fn drain_external_agent_events(
     let mut last_diff_hash: Option<u64> = None;
     let mut context_snapshot_state = ExternalContextSnapshotState::default();
     let mut tool_output_limiter = ExternalToolOutputLimiter::default();
+    let mut tool_previews: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut context_snapshot_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
         EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
@@ -1288,9 +1325,16 @@ async fn drain_external_agent_events(
                 });
             }
             external_agent::AgentEvent::ToolStarted {
-                preview, tool_name, ..
+                item_id,
+                preview,
+                tool_name,
             } => {
                 turns_in_round += 1;
+                if let Some(preview_text) = external_tool_preview_text(&tool_name, &preview) {
+                    if !item_id.is_empty() {
+                        tool_previews.insert(item_id, preview_text);
+                    }
+                }
                 if !config.suppress_agent_started {
                     stats.turns += 1;
                     let preview_text = format!("{}: {}", tool_name, preview);
@@ -1341,6 +1385,7 @@ async fn drain_external_agent_events(
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
                 tool_output_limiter.complete(&item_id);
+                let tool_preview = tool_previews.remove(&item_id);
                 // Success: nothing to emit.  The tool command was already
                 // shown via AgentStarted at start, and any output streamed
                 // via ToolOutputDelta → AgentOutput.  A completion marker
@@ -1350,13 +1395,16 @@ async fn drain_external_agent_events(
                 // Cancelled: silent.
                 match &status {
                     external_agent::ToolCompletionStatus::Failed { message } => {
-                        slog(config.session_log, |l| {
-                            l.warn(&format!("Tool {} failed: {}", item_id, message))
-                        });
+                        let content = external_tool_failure_content(
+                            &item_id,
+                            message,
+                            tool_preview.as_deref(),
+                        );
+                        slog(config.session_log, |l| l.warn(&content));
                         config.bus.send(AppEvent::LogEntry {
                             level: "warn".to_string(),
-                            source: "worker".to_string(),
-                            content: format!("Tool failed: {}", message),
+                            source: external_agent_log_source(config.agent_source.as_deref()),
+                            content,
                             turn: None,
                         });
                     }
@@ -4142,6 +4190,47 @@ Also: {"source": "bare"}"#;
 
         let out = limiter.filter("item-1", "fresh".to_string()).unwrap();
         assert_eq!(out, "fresh");
+    }
+
+    #[test]
+    fn external_tool_failure_content_includes_item_and_preview() {
+        let content = external_tool_failure_content(
+            "call-1",
+            "command exited 1",
+            Some("command: rg missing static/app.html"),
+        );
+
+        assert_eq!(
+            content,
+            "Tool failed (call-1): command exited 1\nTool: command: rg missing static/app.html"
+        );
+    }
+
+    #[test]
+    fn external_tool_failure_content_omits_empty_preview() {
+        let content = external_tool_failure_content("call-1", "unknown error", Some("  "));
+
+        assert_eq!(content, "Tool failed (call-1): unknown error");
+    }
+
+    #[test]
+    fn external_agent_log_source_prefers_backend_source() {
+        assert_eq!(external_agent_log_source(Some("Codex")), "Codex");
+        assert_eq!(external_agent_log_source(Some("  ")), "worker");
+        assert_eq!(external_agent_log_source(None), "worker");
+    }
+
+    #[test]
+    fn external_tool_preview_text_combines_tool_name_and_preview() {
+        assert_eq!(
+            external_tool_preview_text("command", "rg needle file").as_deref(),
+            Some("command: rg needle file")
+        );
+        assert_eq!(
+            external_tool_preview_text("", "rg needle file").as_deref(),
+            Some("rg needle file")
+        );
+        assert_eq!(external_tool_preview_text("", ""), None);
     }
 
     // ── Steer fallback plumbing ──
