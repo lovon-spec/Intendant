@@ -6694,6 +6694,7 @@ let activeCommandOutputGroup = null;
 const commandOutputGroups = new Map();
 const commandOutputGroupByEntry = new WeakMap();
 let currentPhase = 'idle';
+let daemonSessionFullId = '';
 let currentSessionFullId = '';
 let foregroundSessionFullId = '';
 let maximizedSessionWindowId = '';
@@ -7261,6 +7262,12 @@ async function main() {
         // navigation source of truth, so re-apply it after replay settles.
         applyCurrentRoute();
         return;
+      }
+      if (d.t === 'state_snapshot' && d.session_id) {
+        setDaemonSessionId(d.session_id);
+      }
+      if (d.event === 'session_identity') {
+        applySessionIdentity(d);
       }
       if (d.event === 'approval_required' && d.id !== undefined && d.session_id) {
         approvalSessionIds.set(String(d.id), d.session_id);
@@ -9395,6 +9402,38 @@ function shortSessionId(sessionId) {
   return String(sessionId || '').slice(0, 8);
 }
 
+function setDaemonSessionId(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  daemonSessionFullId = sid;
+  const el = document.getElementById('sb-session');
+  if (el) {
+    el.textContent = shortSessionId(sid);
+    el.title = sid;
+  }
+}
+
+function applySessionIdentity(meta = {}) {
+  const sid = String(meta.session_id || meta.intendant_session_id || '').trim();
+  const backendSessionId = String(meta.backend_session_id || meta.backendSessionId || '').trim();
+  const backendSource = String(meta.backend_source || meta.backendSource || meta.source || '').trim();
+  if (!sid || (!backendSessionId && !backendSource)) return;
+  const next = {
+    ...(backendSessionId ? { backendSessionId } : {}),
+    ...(backendSource ? { backendSource, source: backendSource } : {}),
+    ...(meta.backend_source_label || meta.backendSourceLabel ? { sourceLabel: meta.backend_source_label || meta.backendSourceLabel } : {}),
+  };
+  sessionMetadataById.set(sid, { ...(sessionMetadataById.get(sid) || {}), ...next });
+  if (backendSessionId) {
+    sessionMetadataById.set(backendSessionId, {
+      ...(sessionMetadataById.get(backendSessionId) || {}),
+      intendantSessionId: sid,
+      ...(backendSource ? { backendSource, source: backendSource } : {}),
+    });
+  }
+  if (sessionWindows.has(sid)) updateSessionWindow(sid, next);
+}
+
 function normalizeSessionPhase(phase) {
   const p = String(phase || 'idle').toLowerCase();
   if (p === 'running_agent') return 'running';
@@ -9519,6 +9558,12 @@ function normalizeSessionWindowMeta(meta = {}) {
   if (source) out.source = source;
   const sourceLabel = compactSessionText(meta.source_label || meta.sourceLabel);
   if (sourceLabel) out.sourceLabel = sourceLabel;
+  const backendSource = compactSessionText(meta.backend_source || meta.backendSource);
+  if (backendSource) out.backendSource = backendSource;
+  const backendSessionId = compactSessionText(meta.backend_session_id || meta.backendSessionId || meta.thread_id || meta.threadId);
+  if (backendSessionId) out.backendSessionId = backendSessionId;
+  const intendantSessionId = compactSessionText(meta.intendant_session_id || meta.intendantSessionId);
+  if (intendantSessionId) out.intendantSessionId = intendantSessionId;
   if (meta.phase) out.phase = meta.phase;
   if (meta.ended !== undefined) out.ended = !!meta.ended;
   return out;
@@ -9532,7 +9577,10 @@ function sessionWindowMetaFromSession(session) {
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
     source: session.source,
-    source_label: session.source_label || prettyAgentName(session.source || '') || session.source,
+    source_label: session.backend_source_label || session.source_label || prettyAgentName(session.backend_source || session.source || '') || session.backend_source || session.source,
+    backend_source: session.backend_source,
+    backend_session_id: session.backend_session_id,
+    intendant_session_id: session.intendant_session_id,
   });
 }
 
@@ -9547,6 +9595,14 @@ function cacheSessionWindowMetadata(sessions) {
     for (const id of ids) {
       sessionMetadataById.set(id, meta);
       if (sessionWindows.has(id)) updateSessionWindow(id, meta);
+    }
+    if (session.backend_session_id && session.session_id) {
+      applySessionIdentity({
+        session_id: session.session_id,
+        backend_session_id: session.backend_session_id,
+        source: session.backend_source,
+        backend_source_label: session.backend_source_label,
+      });
     }
   }
 }
@@ -9653,6 +9709,19 @@ function requestSessionRename(sessionOrId, sourceArg = '') {
   }
   const source = String(sourceArg || session.source || 'intendant').trim();
   const cached = sessionMetadataById.get(sid) || {};
+  const backendSessionId = String(
+    session.backend_session_id ||
+    session.backendSessionId ||
+    cached.backendSessionId ||
+    ''
+  ).trim();
+  const backendSource = String(
+    session.backend_source ||
+    session.backendSource ||
+    cached.backendSource ||
+    ''
+  ).trim();
+  const effectiveSource = backendSource || source;
   const currentName = compactSessionText(session.name || cached.name);
   const name = window.prompt('Session name:', currentName);
   if (name === null) return false;
@@ -9663,7 +9732,8 @@ function requestSessionRename(sessionOrId, sourceArg = '') {
   dispatchControlMsg({
     action: 'rename_session',
     session_id: sid,
-    source,
+    source: effectiveSource,
+    ...(backendSessionId ? { backend_session_id: backendSessionId } : {}),
     name: name.trim(),
   });
   return true;
@@ -9685,7 +9755,7 @@ function sessionWindowIsCodex(sessionId, win = null) {
   const sid = String(sessionId || '').trim();
   const current = win || (sid ? sessionWindows.get(sid) : null);
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
-  return normalizeAgentId(current?.source || meta.source || meta.sourceLabel || '') === 'codex';
+  return normalizeAgentId(meta.backendSource || current?.source || meta.source || meta.sourceLabel || '') === 'codex';
 }
 
 function closeSessionWindowMenus(exceptSessionId = '') {
@@ -9749,7 +9819,8 @@ function runSessionWindowAction(sessionId, op) {
     const meta = sessionMetadataById.get(sid) || {};
     requestSessionRename({
       session_id: sid,
-      source: meta.source || win?.source || '',
+      source: meta.backendSource || meta.source || win?.source || '',
+      backendSessionId: meta.backendSessionId || '',
       name: meta.name || '',
     });
     return;
@@ -9917,7 +9988,6 @@ function ensureSessionWindow(sessionId, meta = {}) {
         foregroundSessionFullId = '';
         if (currentSessionFullId === sid) {
           currentSessionFullId = '';
-          document.getElementById('sb-session').textContent = '';
         }
         updateTaskTargetChip();
       }
@@ -10057,7 +10127,6 @@ function focusSessionWindow(sessionId) {
   if (!win) return;
   foregroundSessionFullId = sid;
   currentSessionFullId = sid;
-  document.getElementById('sb-session').textContent = shortSessionId(sid);
   if (app && typeof app.select_session === 'function') {
     const cmds = app.select_session(sid);
     if (cmds) processCommands(cmds);
@@ -10881,12 +10950,10 @@ function updateStatusBar(d) {
     el.style.color = colors[autonomy] || '#f9e2af';
   }
   if (d.session_id) {
-    currentSessionFullId = d.session_id;
-    document.getElementById('sb-session').textContent = d.session_id.substring(0, 8);
-    ensureSessionWindow(d.session_id, { ended: false });
-    if (!foregroundSessionFullId || foregroundSessionFullId === d.session_id) {
-      focusSessionWindow(d.session_id);
-    } else {
+    const sid = String(d.session_id || '').trim();
+    if (!daemonSessionFullId) setDaemonSessionId(sid);
+    if (sid && sid !== daemonSessionFullId) {
+      ensureSessionWindow(sid, { ended: false });
       updateTaskTargetChip();
     }
   }
@@ -20349,7 +20416,6 @@ function renderDiskUsage(sessions) {
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
   currentSessionFullId = sessionId || '';
-  document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
   if (sessionId) {
     ensureSessionWindow(sessionId, { task: task || 'session', phase: 'thinking', ended: false });
     focusSessionWindow(sessionId);
@@ -20375,7 +20441,6 @@ function onSessionStarted(sessionId, task) {
 
 function onSessionAttached(sessionId, source) {
   currentSessionFullId = sessionId || '';
-  document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
   if (sessionId) {
     ensureSessionWindow(sessionId, { source: source || 'session', phase: 'idle', ended: false });
     focusSessionWindow(sessionId);
@@ -20399,7 +20464,6 @@ function onSessionEnded(sessionId, reason) {
   if (sessionId) updateSessionWindow(sessionId, { phase: 'done', ended: true });
   if (!sessionId || sessionId === currentSessionFullId) {
     currentSessionFullId = '';
-    document.getElementById('sb-session').textContent = '';
   }
   if (!sessionId || sessionId === foregroundSessionFullId) {
     foregroundSessionFullId = '';
@@ -21704,7 +21768,7 @@ function renderSessionsList(sessions, el, options = {}) {
     return asc ? va - vb : vb - va;
   });
 
-  const currentSessionId = (document.getElementById('sb-session').textContent || '').trim();
+  const currentSessionId = daemonSessionFullId || '';
 
   const query = options.query || '';
   const sourceFilter = options.sourceFilter || [];

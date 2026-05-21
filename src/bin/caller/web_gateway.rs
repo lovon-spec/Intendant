@@ -1489,6 +1489,9 @@ fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<Path
 struct ExternalSessionContext {
     project_root: Option<String>,
     cwd: Option<String>,
+    source: Option<String>,
+    source_label: Option<String>,
+    name: Option<String>,
 }
 
 fn external_session_context_by_id(
@@ -1499,8 +1502,16 @@ fn external_session_context_by_id(
         let context = ExternalSessionContext {
             project_root: value_str(session, "project_root"),
             cwd: value_str(session, "cwd"),
+            source: value_str(session, "source"),
+            source_label: value_str(session, "source_label"),
+            name: value_str(session, "name"),
         };
-        if context.project_root.is_none() && context.cwd.is_none() {
+        if context.project_root.is_none()
+            && context.cwd.is_none()
+            && context.source.is_none()
+            && context.source_label.is_none()
+            && context.name.is_none()
+        {
             continue;
         }
         for key in [
@@ -1526,6 +1537,23 @@ fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn external_agent_source_from_message(message: &str) -> Option<String> {
+    let mode = message.strip_prefix("Mode: external agent (")?;
+    let (source, _) = mode.split_once(')')?;
+    let source = crate::session_names::normalize_source(source);
+    (!source.is_empty()).then_some(source)
+}
+
+fn pretty_external_source_label(source: &str) -> String {
+    match crate::session_names::normalize_source(source).as_str() {
+        "codex" => "Codex".to_string(),
+        "claude-code" => "Claude Code".to_string(),
+        "gemini" => "Gemini CLI".to_string(),
+        "intendant" => "Intendant".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn clean_external_thread_id(thread_id: &str) -> Option<String> {
@@ -3994,6 +4022,7 @@ fn list_sessions_from_home(home_path: &Path) -> String {
         let mut cached_tokens: u64 = 0;
         let mut role: Option<String> = None;
         let mut external_resume_id: Option<String> = None;
+        let mut external_source: Option<String> = None;
         let mut updated_at_secs = file_mtime_secs(&dir);
 
         if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
@@ -4064,6 +4093,9 @@ fn list_sessions_from_home(home_path: &Path) -> String {
                         if external_resume_id.is_none() {
                             external_resume_id = external_agent_thread_id_from_message(message);
                         }
+                        if external_source.is_none() {
+                            external_source = external_agent_source_from_message(message);
+                        }
                     }
                     "turn_start" => {
                         if let Some(t) = obj.get("turn").and_then(|v| v.as_u64()) {
@@ -4107,8 +4139,22 @@ fn list_sessions_from_home(home_path: &Path) -> String {
                 if cwd.is_none() {
                     cwd = context.cwd.clone().or_else(|| context.project_root.clone());
                 }
+                if name.is_none() {
+                    name = context.name.clone();
+                }
+                if external_source.is_none() {
+                    external_source = context.source.clone();
+                }
             }
         }
+
+        let backend_source_label = external_source.as_deref().and_then(|source| {
+            external_resume_id
+                .as_deref()
+                .and_then(|external_id| external_context_by_id.get(external_id))
+                .and_then(|context| context.source_label.clone())
+                .or_else(|| Some(pretty_external_source_label(source)))
+        });
 
         // Check for summary.json (written on clean exit)
         if status != "completed" && dir.join("summary.json").exists() {
@@ -4248,6 +4294,9 @@ fn list_sessions_from_home(home_path: &Path) -> String {
             "source_label": "Intendant",
             "session_id": session_id,
             "resume_id": session_id,
+            "backend_source": external_source,
+            "backend_source_label": backend_source_label,
+            "backend_session_id": external_resume_id,
             "created_at": created_at,
             "updated_at": updated_at,
             "name": name,
@@ -12850,6 +12899,13 @@ mod tests {
             .as_deref(),
             Some("codex-session-1")
         );
+        assert_eq!(
+            external_agent_source_from_message(
+                "Mode: external agent (Claude Code) via presence, thread: claude-session-1"
+            )
+            .as_deref(),
+            Some("claude-code")
+        );
     }
 
     #[test]
@@ -12858,7 +12914,10 @@ mod tests {
             "session_id": "display-id",
             "resume_id": "resume-id",
             "project_root": "/repo",
-            "cwd": "/repo/.worktrees/feature"
+            "cwd": "/repo/.worktrees/feature",
+            "source": "codex",
+            "source_label": "Codex",
+            "name": "Dashboard task"
         })];
 
         let context = external_session_context_by_id(&sessions);
@@ -12871,6 +12930,22 @@ mod tests {
         assert_eq!(
             context.get("resume-id").and_then(|ctx| ctx.cwd.as_deref()),
             Some("/repo/.worktrees/feature")
+        );
+        assert_eq!(
+            context
+                .get("resume-id")
+                .and_then(|ctx| ctx.source.as_deref()),
+            Some("codex")
+        );
+        assert_eq!(
+            context
+                .get("resume-id")
+                .and_then(|ctx| ctx.source_label.as_deref()),
+            Some("Codex")
+        );
+        assert_eq!(
+            context.get("resume-id").and_then(|ctx| ctx.name.as_deref()),
+            Some("Dashboard task")
         );
     }
 
@@ -12903,11 +12978,18 @@ mod tests {
         .unwrap();
 
         let codex_id = "019e37ae-dashboard-started";
-        let intendant_lines = [serde_json::json!({
-            "ts": "2026-05-17T20:44:01",
-            "event": "debug",
-            "message": format!("External agent thread: {codex_id}")
-        })];
+        let intendant_lines = [
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:01",
+                "event": "debug",
+                "message": "Mode: external agent (Codex)"
+            }),
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:02",
+                "event": "debug",
+                "message": format!("External agent thread: {codex_id}")
+            }),
+        ];
         std::fs::write(
             log_dir.join("session.jsonl"),
             intendant_lines
@@ -12973,6 +13055,18 @@ mod tests {
         assert_eq!(
             wrapped.get("cwd").and_then(|v| v.as_str()),
             Some(expected_cwd.as_str())
+        );
+        assert_eq!(
+            wrapped.get("backend_source").and_then(|v| v.as_str()),
+            Some("codex")
+        );
+        assert_eq!(
+            wrapped.get("backend_source_label").and_then(|v| v.as_str()),
+            Some("Codex")
+        );
+        assert_eq!(
+            wrapped.get("backend_session_id").and_then(|v| v.as_str()),
+            Some(codex_id)
         );
     }
 

@@ -956,6 +956,7 @@ fn emit_codex_fork_session_name(bus: &EventBus, child_id: &str, params: &serde_j
     bus.send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
         source: Some("codex".to_string()),
         session_id: child_id.to_string(),
+        backend_session_id: Some(child_id.to_string()),
         name,
     }));
 }
@@ -7631,8 +7632,16 @@ async fn run_external_agent_mode(
 
     // Construct, initialize, and start a thread for the external agent
     let resumed_external_session = resume_session.clone();
+    let live_session_id = control_session_id.or_else(|| session_log_id(&session_log));
     let (mut agent, thread, mut event_rx) =
         create_external_agent(&backend, &project, &session_log, web_port, resume_session).await?;
+    if let Some(session_id) = live_session_id.clone() {
+        bus.send(AppEvent::SessionIdentity {
+            session_id,
+            source: backend.as_short_str().to_string(),
+            backend_session_id: thread.thread_id.clone(),
+        });
+    }
 
     // Event loop
     let mut round = match (
@@ -7646,7 +7655,6 @@ async fn run_external_agent_mode(
         _ => 0,
     };
     let mut stats = LoopStats::default();
-    let live_session_id = control_session_id.or_else(|| session_log_id(&session_log));
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {

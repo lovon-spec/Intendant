@@ -2469,6 +2469,11 @@ impl App {
                     None,
                 );
             }
+            AppEvent::SessionIdentity { .. } => {
+                // Frontend-neutral metadata: the web dashboard uses this to
+                // map Intendant wrapper sessions to backend-native thread ids.
+                // The terminal TUI has no separate rendering for it.
+            }
             AppEvent::SessionAttached {
                 ref session_id,
                 ref source,
