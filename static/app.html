@@ -12111,9 +12111,14 @@ async function loadCommandOutputIntoBody(group, body) {
     body.textContent = 'Output is not available for lazy loading.';
     return;
   }
-  const resp = await authedFetch('/api/session/current/agent-output?ids=' + encodeURIComponent(group.outputIds.join(',')));
-  const json = await resp.json();
-  if (!resp.ok) throw new Error(json.error || resp.statusText);
+  const resp = await authedFetch('/api/session/current/agent-output', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids: group.outputIds }),
+  });
+  const text = await resp.text();
+  const json = text ? JSON.parse(text) : {};
+  if (!resp.ok) throw new Error(json.error || resp.statusText || `HTTP ${resp.status}`);
   body.innerHTML = '';
   for (const out of (json.outputs || [])) {
     const text = [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : '');

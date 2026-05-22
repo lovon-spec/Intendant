@@ -1524,20 +1524,15 @@ fn session_log_mtime(path: &Path) -> std::time::SystemTime {
         .unwrap_or(std::time::UNIX_EPOCH)
 }
 
-fn current_agent_output_response(request_line: &str, log_dir: &Path) -> String {
-    let ids_param = query_param(request_line, "ids").unwrap_or_default();
-    let ids: Vec<String> = ids_param
-        .split(',')
-        .map(str::trim)
-        .filter(|id| {
-            !id.is_empty()
-                && id.len() <= 128
-                && id
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
-        })
-        .map(str::to_string)
-        .collect();
+fn is_valid_agent_output_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+}
+
+fn current_agent_output_response_for_ids(ids: Vec<String>, log_dir: &Path) -> String {
     if ids.is_empty() {
         return upload_error_response("400 Bad Request", "missing output ids");
     }
@@ -1572,6 +1567,32 @@ fn current_agent_output_response(request_line: &str, log_dir: &Path) -> String {
         body.len(),
         body
     )
+}
+
+fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let Some(ids) = parsed.get("ids").and_then(|ids| ids.as_array()) else {
+        return Err("missing output ids".to_string());
+    };
+    let ids: Vec<String> = ids
+        .iter()
+        .filter_map(|id| id.as_str())
+        .map(str::trim)
+        .filter(|id| is_valid_agent_output_id(id))
+        .map(ToString::to_string)
+        .collect();
+    if ids.is_empty() {
+        return Err("missing output ids".to_string());
+    }
+    Ok(ids)
+}
+
+fn current_agent_output_post_response(body: &str, log_dir: &Path) -> String {
+    match agent_output_ids_from_json_body(body) {
+        Ok(ids) => current_agent_output_response_for_ids(ids, log_dir),
+        Err(e) => upload_error_response("400 Bad Request", &e),
+    }
 }
 
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
@@ -9821,7 +9842,7 @@ pub fn spawn_web_gateway(
                         let response = "HTTP/1.1 204 No Content\r\n\
                             Access-Control-Allow-Origin: *\r\n\
                             Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
-                            Access-Control-Allow-Headers: Content-Type\r\n\
+                            Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
                             Access-Control-Max-Age: 86400\r\n\
                             Connection: close\r\n\
                             \r\n";
@@ -10567,7 +10588,7 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET")
+                    } else if request_line.starts_with("POST")
                         && request_line.contains(" /api/session/current/agent-output")
                     {
                         use tokio::io::AsyncWriteExt;
@@ -10579,8 +10600,9 @@ pub fn spawn_web_gateway(
                         } else {
                             query_ctx.as_ref().map(|ctx| ctx.log_dir.clone())
                         };
+                        let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = match log_dir {
-                            Some(dir) => current_agent_output_response(&request_line, &dir),
+                            Some(dir) => current_agent_output_post_response(&body_text, &dir),
                             None => upload_error_response("404 Not Found", "no active session log"),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
@@ -16718,6 +16740,45 @@ mod tests {
         assert_eq!(chunks[0].stdout, "fallback output");
         assert_eq!(chunks[1].output_id, "primary-out");
         assert_eq!(chunks[1].stdout, "primary output");
+    }
+
+    #[test]
+    fn agent_output_post_response_reads_json_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.agent_output_with_id("first output", "", Some("Codex"), Some("out-1"));
+        drop(log);
+
+        let response =
+            current_agent_output_post_response(r#"{"ids":["out-1","missing-out"]}"#, &log_dir);
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["outputs"][0]["output_id"], "out-1");
+        assert_eq!(json["outputs"][0]["stdout"], "first output");
+        assert_eq!(json["missing"][0], "missing-out");
+    }
+
+    #[test]
+    fn agent_output_post_response_rejects_empty_json_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = current_agent_output_post_response(r#"{"ids":[""]}"#, dir.path());
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("missing output ids"));
+    }
+
+    #[test]
+    fn agent_output_json_body_accepts_large_id_lists() {
+        let ids: Vec<String> = (0..700).map(|n| format!("ao-19e4f985a17-{n:x}")).collect();
+        let body = serde_json::json!({ "ids": ids }).to_string();
+
+        let parsed = agent_output_ids_from_json_body(&body).unwrap();
+
+        assert_eq!(parsed.len(), 700);
+        assert_eq!(parsed[0], "ao-19e4f985a17-0");
+        assert_eq!(parsed[699], "ao-19e4f985a17-2bb");
     }
 
     #[test]
