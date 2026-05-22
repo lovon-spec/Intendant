@@ -313,10 +313,10 @@ pub enum UiCommand {
     HistoryChanged,
     /// Status update for an in-flight mid-turn steer. Emitted when the
     /// browser sends a steer (pending), when the backend reports it
-    /// queued, or when the backend reports it delivered. The JS layer
+    /// accepted, queued, or when the backend reports it delivered. The JS layer
     /// maintains an "in-flight steers" strip above the activity log and
     /// updates the row keyed by `id`. `status` is one of
-    /// `"pending"` | `"queued"` | `"delivered"`.
+    /// `"pending"` | `"accepted"` | `"queued"` | `"delivered"`.
     SteerStatusUpdate {
         id: String,
         text: String,
@@ -343,6 +343,9 @@ pub struct FileChangeEntry {
 pub enum SteerStatus {
     /// Sent by the browser, awaiting backend acknowledgement.
     Pending,
+    /// Backend/runtime accepted the steer. The model may not see it until the
+    /// backend reaches a checkpoint.
+    Accepted,
     /// Backend acknowledged but can't deliver mid-turn — message
     /// is queued and will be delivered at the next turn boundary.
     Queued,
@@ -988,7 +991,7 @@ pub struct AppState {
 
     /// In-flight mid-turn steer messages keyed by client-generated id.
     /// Populated when the browser sees `steer_requested`, updated on
-    /// `steer_queued`, and removed on `steer_delivered`. The UI renders
+    /// `steer_accepted` / `steer_queued`, and removed on `steer_delivered`. The UI renders
     /// the remaining entries as a strip above the activity log so the
     /// user can see which interjections are still pending.
     pub queued_steers: std::collections::HashMap<String, QueuedSteer>,
@@ -1612,8 +1615,9 @@ impl AppState {
             // server. The backend dispatcher echoes three events back:
             //
             //   steer_requested  → we saw the request (matches what we sent)
+            //   steer_accepted   → backend/runtime accepted it; waiting for checkpoint
             //   steer_queued     → backend can't deliver mid-turn, queued for turn boundary
-            //   steer_delivered  → agent actually received it (mid_turn or as follow-up)
+            //   steer_delivered  → agent actually received it (mid_turn or at turn boundary)
             //
             // For each event we update `queued_steers[id]` and emit a
             // `SteerStatusUpdate` UiCommand so the JS layer can refresh
@@ -1671,12 +1675,42 @@ impl AppState {
                 });
             }
 
+            "steer_accepted" => {
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                if let Some(q) = self.queued_steers.get_mut(&id) {
+                    q.status = SteerStatus::Accepted;
+                    q.reason = Some(reason.clone());
+                }
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("\u{21AA} Steer accepted: {}", reason),
+                    None,
+                    "user",
+                ));
+                let text = self
+                    .queued_steers
+                    .get(&id)
+                    .map(|q| q.text.clone())
+                    .unwrap_or_default();
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "accepted".into(),
+                    reason: Some(reason),
+                });
+            }
+
             "steer_delivered" => {
                 let id = msg["id"].as_str().unwrap_or("").to_string();
                 let mid_turn = msg["mid_turn"].as_bool().unwrap_or(false);
                 let entry = self.queued_steers.remove(&id);
                 let text = entry.as_ref().map(|q| q.text.clone()).unwrap_or_default();
-                let where_ = if mid_turn { "mid-turn" } else { "as follow-up" };
+                let where_ = if mid_turn {
+                    "mid-turn"
+                } else {
+                    "at turn boundary"
+                };
                 cmds.extend(self.add_log(
                     "info",
                     &format!(
@@ -4777,6 +4811,52 @@ mod tests {
     }
 
     #[test]
+    fn handle_event_steer_accepted_updates_status() {
+        let mut s = AppState::new();
+        s.queued_steers.insert(
+            "codex".into(),
+            QueuedSteer {
+                text: "wait for windows VM".into(),
+                status: SteerStatus::Pending,
+                reason: None,
+            },
+        );
+        let msg = json!({
+            "event": "steer_accepted",
+            "id": "codex",
+            "reason": "Codex accepted the steer; waiting for the next runtime checkpoint"
+        });
+        let cmds = s.handle_message(&msg);
+        let entry = s.queued_steers.get("codex").expect("still tracked");
+        assert_eq!(entry.status, SteerStatus::Accepted);
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some("Codex accepted the steer; waiting for the next runtime checkpoint")
+        );
+        let saw_update = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, reason, text }
+                    if id == "codex"
+                        && status == "accepted"
+                        && reason.as_deref()
+                            == Some("Codex accepted the steer; waiting for the next runtime checkpoint")
+                        && text == "wait for windows VM"
+            )
+        });
+        assert!(
+            saw_update,
+            "expected accepted SteerStatusUpdate, got {:?}",
+            cmds
+        );
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "info" && content.contains("Steer accepted")
+        )));
+    }
+
+    #[test]
     fn handle_event_steer_delivered_removes_entry() {
         let mut s = AppState::new();
         s.queued_steers.insert(
@@ -4823,7 +4903,7 @@ mod tests {
     #[test]
     fn steer_delivered_followup_log_variant() {
         // When mid_turn=false (queued delivery at turn boundary), the log
-        // line calls it out as "as follow-up" rather than mid-turn so the
+        // line calls it out as "at turn boundary" rather than mid-turn so the
         // user understands the interjection wasn't real-time.
         let mut s = AppState::new();
         s.queued_steers.insert(
@@ -4843,7 +4923,7 @@ mod tests {
         assert!(cmds.iter().any(|c| matches!(
             c,
             UiCommand::AddLogEntry { content, .. }
-                if content.contains("as follow-up")
+                if content.contains("at turn boundary")
         )));
     }
 

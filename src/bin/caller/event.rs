@@ -46,8 +46,7 @@ pub struct ContextInjection {
     pub text: String,
     pub images: Vec<crate::conversation::ImageData>,
     pub source: InjectionSource,
-    /// When this injection was queued by a fallback steer (the backend didn't
-    /// support mid-turn steering), this carries the steer id so a
+    /// When this injection was queued by a steer, this carries the steer id so a
     /// `SteerDelivered` event can be emitted with the right correlation id
     /// when the item is eventually drained into the agent's conversation.
     ///
@@ -200,6 +199,16 @@ pub enum AppEvent {
         text: String,
         id: String,
     },
+    /// Native steering was accepted by the active backend/runtime. This only
+    /// means the backend accepted responsibility for applying it at a runtime
+    /// checkpoint; it does not prove the model has seen it yet.
+    SteerAccepted {
+        session_id: Option<String>,
+        id: String,
+        /// Short human-readable detail for UI display, e.g. "Codex accepted
+        /// the steer; waiting for the next runtime checkpoint".
+        reason: String,
+    },
     /// Mid-turn steering could not be delivered natively by the current
     /// backend and was queued as a follow-up injection instead. Emitted
     /// after the fallback push to `context_injection`; paired with a later
@@ -212,9 +221,9 @@ pub enum AppEvent {
         /// queued as follow-up").
         reason: String,
     },
-    /// Mid-turn steering reached the agent. `mid_turn = true` means the
-    /// backend injected it into the currently running turn (no queue
-    /// fallback); `mid_turn = false` means a queued item was drained at
+    /// Steering was observed in the agent conversation. `mid_turn = true`
+    /// means a native backend reported the steered user message in the active
+    /// conversation; `mid_turn = false` means a queued item was drained at
     /// turn boundary and delivered as part of the next user message.
     SteerDelivered {
         session_id: Option<String>,
@@ -1181,10 +1190,10 @@ pub enum ControlMsg {
     },
     /// Mid-turn steering: nudge the currently running agent turn with new
     /// user text without interrupting it. Backends that support native
-    /// mid-turn steering (Codex `turn/steer`) inject the text into the
-    /// in-progress turn; backends that don't queue the text onto the
-    /// shared `context_injection` queue so it's delivered at the start of
-    /// the next turn.
+    /// mid-turn steering (Codex `turn/steer`) accept the text for the active
+    /// turn and may apply it at their next runtime checkpoint; backends that
+    /// don't queue the text onto the shared `context_injection` queue so it's
+    /// delivered at the start of the next turn.
     Steer {
         /// Optional target session. Daemon supervisors use this to deliver
         /// the steer to one managed session.
@@ -1200,7 +1209,8 @@ pub enum ControlMsg {
         attachments: Vec<String>,
         /// Optional correlation id supplied by the frontend. Frontends use
         /// it to track the lifecycle of one steer request across the
-        /// `SteerRequested` → `SteerQueued`/`SteerDelivered` events. An
+        /// `SteerRequested` → `SteerAccepted`/`SteerQueued` →
+        /// `SteerDelivered` events. An
         /// empty string or missing id is treated as "no correlation" —
         /// the backend still honors the request, but frontends that didn't
         /// tag it can't match the delivery event back to a pending UI row.
@@ -1356,6 +1366,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             id,
             reason,
         } => Some(OutboundEvent::SteerQueued {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            reason: reason.clone(),
+        }),
+        AppEvent::SteerAccepted {
+            session_id,
+            id,
+            reason,
+        } => Some(OutboundEvent::SteerAccepted {
             session_id: session_id.clone(),
             id: id.clone(),
             reason: reason.clone(),

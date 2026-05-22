@@ -2804,6 +2804,20 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
+                    AppEvent::SteerAccepted {
+                        ref id, ref reason, ..
+                    } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Steer accepted{}: {}", id_part, reason),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
                     AppEvent::SteerDelivered {
                         ref id, mid_turn, ..
                     } => {
@@ -2812,7 +2826,11 @@ pub fn spawn_event_listener(
                         } else {
                             format!(" [{}]", id)
                         };
-                        let mode = if mid_turn { "mid-turn" } else { "follow-up" };
+                        let mode = if mid_turn {
+                            "mid-turn"
+                        } else {
+                            "turn boundary"
+                        };
                         s.push_log(
                             LogLevel::Info,
                             format!("Steer delivered{} ({})", id_part, mode),

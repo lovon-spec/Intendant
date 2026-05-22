@@ -1694,7 +1694,7 @@ fn translate_notification(
                 }
                 "agentMessage" | "userMessage" | "reasoning" | "imageView" => {
                     // agentMessage: deltas will follow via item/agentMessage/delta.
-                    // userMessage: echo of the user's input; nothing to emit.
+                    // userMessage: final text normally arrives on item/completed.
                     // reasoning: model reasoning trace; nothing to emit.
                     // imageView: Codex UI bookkeeping, not a tool.
                 }
@@ -1799,9 +1799,19 @@ fn translate_notification(
                 return;
             }
 
-            // userMessage items are echoes of the user's own input. The
-            // remaining types are Codex UI/bookkeeping records, not tools.
-            if matches!(item_type, "userMessage" | "contextCompaction" | "imageView") {
+            if item_type == "userMessage" {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        let _ = event_tx.send(AgentEvent::UserMessage {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+                return;
+            }
+
+            // The remaining types are Codex UI/bookkeeping records, not tools.
+            if matches!(item_type, "contextCompaction" | "imageView") {
                 return;
             }
 
@@ -3505,13 +3515,19 @@ mod tests {
     }
 
     #[test]
-    fn translate_item_completed_user_message_silent() {
-        // userMessage items are echoes of the user's input — emit nothing.
+    fn translate_item_completed_user_message_observed() {
+        // userMessage items are echoes of the user's input. Surface them
+        // internally so the caller can confirm accepted steers reached Codex's
+        // conversation.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
             "item": {"id": "u_001", "type": "userMessage", "text": "hello"}
         });
         translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::UserMessage { text } => assert_eq!(text, "hello"),
+            other => panic!("expected UserMessage, got {:?}", other),
+        }
         assert!(rx.try_recv().is_err());
     }
 

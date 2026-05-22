@@ -984,6 +984,11 @@ struct DrainConfig<'a> {
     context_injection: &'a event::ContextInjectionQueue,
 }
 
+struct PendingRuntimeSteer {
+    id: String,
+    text: String,
+}
+
 const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT: usize = 64 * 1024;
 
@@ -1308,6 +1313,7 @@ async fn drain_external_agent_events(
     config: &DrainConfig<'_>,
     stats: &mut LoopStats,
     diff_tracker: &mut ExternalDiffDeltaTracker,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
 ) -> DrainOutcome {
     use std::sync::atomic::Ordering;
 
@@ -1451,25 +1457,32 @@ async fn drain_external_agent_events(
                         &alias_session_id,
                     ) => {
                         // Try native mid-turn steering first. On success the
-                        // backend injects the text into the active turn and
-                        // we're done. On failure (unsupported or no active
-                        // turn), fall back to queuing onto context_injection
-                        // — the drain-between-turns path in
+                        // backend/runtime has accepted the steer for the
+                        // active turn, but it may only surface to the model at
+                        // the backend's next checkpoint. We keep tracking it
+                        // until the adapter observes the echoed user message.
+                        // On failure (unsupported or no active turn), fall
+                        // back to queuing onto context_injection — the drain-between-turns path in
                         // `run_external_agent_mode` / `run_with_presence`
                         // will flush it as a follow-up prefix on the next
                         // user message and emit SteerDelivered at that point.
                         match agent.steer_turn(&text).await {
                             Ok(()) => {
-                                slog(config.session_log, |l| {
-                                    l.info(&format!(
-                                        "Steer delivered mid-turn to {}",
-                                        agent.name()
-                                    ))
+                                pending_runtime_steers.push_back(PendingRuntimeSteer {
+                                    id: id.clone(),
+                                    text: text.clone(),
                                 });
-                                config.bus.send(AppEvent::SteerDelivered {
+                                let reason = format!(
+                                    "{} accepted the steer; waiting for the next runtime checkpoint",
+                                    agent.name()
+                                );
+                                slog(config.session_log, |l| {
+                                    l.info(&format!("Steer accepted by {}", agent.name()))
+                                });
+                                config.bus.send(AppEvent::SteerAccepted {
                                     session_id: local_session_id.clone(),
                                     id,
-                                    mid_turn: true,
+                                    reason,
                                 });
                             }
                             Err(e) => {
@@ -1549,6 +1562,24 @@ async fn drain_external_agent_events(
                     reasoning: None,
                     source: config.agent_source.clone(),
                 });
+            }
+            external_agent::AgentEvent::UserMessage { text } => {
+                if let Some(pos) = pending_runtime_steers
+                    .iter()
+                    .position(|pending| pending.text == text || pending.text.trim() == text.trim())
+                {
+                    let Some(pending) = pending_runtime_steers.remove(pos) else {
+                        continue;
+                    };
+                    slog(config.session_log, |l| {
+                        l.info(&format!("Steer observed in {} conversation", agent.name()))
+                    });
+                    config.bus.send(AppEvent::SteerDelivered {
+                        session_id: local_session_id.clone(),
+                        id: pending.id,
+                        mid_turn: true,
+                    });
+                }
             }
             external_agent::AgentEvent::Reasoning { text } => {
                 // Surface reasoning via ModelResponse with empty content +
@@ -4867,12 +4898,11 @@ async fn run_agent_loop(
     // The same watcher also handles AppEvent::SteerRequested: it pushes
     // the steer text onto the shared `context_injection` queue (tagged as
     // a user injection so it survives inter-task drains) and emits
-    // `SteerDelivered { mid_turn: true }`. The native agent loop drains
-    // `context_injection` at the top of every turn, so queued steers land
-    // on the next iteration's user message — from the user's perspective
-    // that's mid-turn (no follow-up required from them). We keep the
-    // watcher alive across multiple steers — unlike the interrupt branch
-    // which exits after cancelling.
+    // `SteerAccepted`. The native agent loop drains `context_injection` at
+    // the top of every turn and emits `SteerDelivered` at that point, so
+    // queued steers are distinguishable from actual model-context delivery.
+    // We keep the watcher alive across multiple steers — unlike the interrupt
+    // branch which exits after cancelling.
     let local_session_id = session_log_id(&session_log);
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cancel_watcher_handle = {
@@ -4908,20 +4938,18 @@ async fn run_agent_loop(
                     }) if event_targets_session(&session_id, &watcher_session_id) => {
                         // Queue the steer for the next turn's drain. The
                         // native loop has no separate "mid-turn inject"
-                        // hook — model calls are atomic — so this is as
-                        // close to mid-turn as the native path gets.
-                        // Frontends see `mid_turn: true` because they did
-                        // not have to send a follow-up themselves.
+                        // hook — model calls are atomic — so acceptance and
+                        // delivery are separate UI states.
                         if let Ok(mut q) = watcher_injection.lock() {
                             q.push(event::ContextInjection::text_with_steer_id(
                                 text,
                                 id.clone(),
                             ));
                         }
-                        watcher_bus.send(AppEvent::SteerDelivered {
+                        watcher_bus.send(AppEvent::SteerAccepted {
                             session_id: watcher_session_id.clone(),
                             id,
-                            mid_turn: true,
+                            reason: "Queued for the next model checkpoint".to_string(),
                         });
                     }
                     Ok(_) => continue,
@@ -5003,6 +5031,13 @@ async fn run_agent_loop(
                 slog(&session_log, |l| {
                     l.info(&format!("Context injected: {}", inj.text))
                 });
+                if let Some(id) = inj.steer_id {
+                    bus.send(AppEvent::SteerDelivered {
+                        session_id: local_session_id.clone(),
+                        id,
+                        mid_turn: false,
+                    });
+                }
             }
         }
 
@@ -6850,6 +6885,8 @@ async fn run_with_presence(
         tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
     > = None;
     let mut persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+    let mut persistent_pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
+        std::collections::VecDeque::new();
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
@@ -7303,6 +7340,7 @@ async fn run_with_presence(
             persistent_codex_config = None;
             persistent_gemini_config = None;
             persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+            persistent_pending_runtime_steers.clear();
         }
 
         if let Some(ref backend) = agent_backend {
@@ -7371,6 +7409,7 @@ async fn run_with_presence(
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
                 persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                persistent_pending_runtime_steers.clear();
                 persistent_agent_backend = agent_backend.clone();
                 // Remember the Codex config this agent was spawned with so
                 // we can detect drift at the next task and rebuild.
@@ -7469,6 +7508,7 @@ async fn run_with_presence(
                 &drain_config,
                 &mut cumulative_stats,
                 &mut persistent_diff_tracker,
+                &mut persistent_pending_runtime_steers,
             )
             .await
             {
@@ -8191,6 +8231,8 @@ async fn run_external_agent_mode(
     };
     let mut stats = LoopStats::default();
     let mut diff_tracker = ExternalDiffDeltaTracker::default();
+    let mut pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
+        std::collections::VecDeque::new();
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
@@ -8425,6 +8467,7 @@ async fn run_external_agent_mode(
             &drain_config,
             &mut stats,
             &mut diff_tracker,
+            &mut pending_runtime_steers,
         )
         .await
         {

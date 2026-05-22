@@ -573,6 +573,14 @@ pub enum OutboundEvent {
         text: String,
         id: String,
     },
+    /// Native steering was accepted by the backend/runtime, but may still be
+    /// waiting for the backend's next checkpoint before the model sees it.
+    SteerAccepted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: String,
+        reason: String,
+    },
     /// The active backend doesn't support mid-turn steering and the steer
     /// text was queued for the next turn instead. Paired with a later
     /// `SteerDelivered { mid_turn: false }` once the queue drains.
@@ -582,8 +590,8 @@ pub enum OutboundEvent {
         id: String,
         reason: String,
     },
-    /// Steer reached the agent — either mid-turn (native `turn/steer`) or
-    /// as a follow-up injection at turn boundary.
+    /// Steer was observed in the agent conversation — either through a native
+    /// backend echo or as a follow-up injection at turn boundary.
     SteerDelivered {
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,

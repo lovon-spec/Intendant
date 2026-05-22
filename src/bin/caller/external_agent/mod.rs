@@ -206,6 +206,10 @@ pub enum AgentEvent {
     MessageDelta { text: String },
     /// Complete agent message.
     Message { text: String },
+    /// Echo of a user message observed by the external runtime. This is used
+    /// internally to confirm that an accepted steer reached the conversation;
+    /// it is not rendered as agent output.
+    UserMessage { text: String },
     /// The agent's chain-of-thought / reasoning trace.
     ///
     /// Codex emits this via `item/completed` with `type: "reasoning"`. The

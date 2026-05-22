@@ -1196,13 +1196,29 @@ impl AppEventUpcaster {
                     format!("steer queued{id_part}: {reason}"),
                 )]
             }
+            AppEvent::SteerAccepted { id, reason, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer accepted{id_part}: {reason}"),
+                )]
+            }
             AppEvent::SteerDelivered { id, mid_turn, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
                     format!(" [{id}]")
                 };
-                let mode = if *mid_turn { "mid-turn" } else { "follow-up" };
+                let mode = if *mid_turn {
+                    "mid-turn"
+                } else {
+                    "turn boundary"
+                };
                 vec![log_event(
                     LogLevel::Info,
                     "agent",
@@ -2204,13 +2220,29 @@ impl WireEventUpcaster {
                     format!("steer queued{id_part}: {reason}"),
                 )]
             }
+            OutboundEvent::SteerAccepted { id, reason, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer accepted{id_part}: {reason}"),
+                )]
+            }
             OutboundEvent::SteerDelivered { id, mid_turn, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
                     format!(" [{id}]")
                 };
-                let mode = if *mid_turn { "mid-turn" } else { "follow-up" };
+                let mode = if *mid_turn {
+                    "mid-turn"
+                } else {
+                    "turn boundary"
+                };
                 vec![log_event(
                     LogLevel::Info,
                     "agent",
@@ -3293,6 +3325,15 @@ mod tests {
             session_id: None,
             id: "steer-7".into(),
             reason: "Claude Code doesn't support mid-turn steering".into(),
+        });
+    }
+
+    #[test]
+    fn parity_steer_accepted() {
+        assert_parity(AppEvent::SteerAccepted {
+            session_id: None,
+            id: "steer-8".into(),
+            reason: "Codex accepted the steer".into(),
         });
     }
 

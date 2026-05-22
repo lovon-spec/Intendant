@@ -1213,9 +1213,9 @@ html, body {
 
 /* ── Steer in-flight strip ──
    Sits above the activity log; each entry is a QueuedSteer. Pending
-   (just submitted) shows an hourglass; Queued (will deliver at turn
-   boundary) uses yellow; Delivered briefly shows a green checkmark
-   before fading out. */
+   (just submitted) shows an hourglass; Accepted means the backend/runtime
+   has queued it for a checkpoint; Queued means Intendant will deliver it at
+   a turn boundary; Delivered briefly shows a green checkmark before fading out. */
 .steer-strip {
   display: flex;
   flex-direction: column;
@@ -1238,6 +1238,7 @@ html, body {
   transition: opacity 180ms ease, color 180ms ease;
 }
 .steer-row.pending { opacity: 0.65; }
+.steer-row.accepted { color: var(--blue); border-left-color: var(--blue); }
 .steer-row.queued { color: var(--yellow); border-left-color: var(--yellow); }
 .steer-row.delivered { color: var(--green); border-left-color: var(--green); }
 .steer-row.fading { opacity: 0; }
@@ -8387,8 +8388,9 @@ function processCommands(cmds) {
       // trailing observer events).
       case 'peer_state_changed': updateDaemonSnapshot(c.peer); break;
       case 'peer_removed': removeDaemonById(c.id); break;
-      // Mid-turn steer lifecycle: pending (just sent), queued (backend
-      // couldn't deliver mid-turn), delivered (agent got it).
+      // Mid-turn steer lifecycle: pending (just sent), accepted
+      // (backend/runtime accepted it), queued (Intendant fallback),
+      // delivered (agent got it).
       case 'steer_status_update':
         onSteerStatusUpdate(c.id, c.text, c.status, c.reason);
         break;
@@ -22158,7 +22160,7 @@ window.submitActivityTask = function() {
 // waiting-approval / waiting-human / interrupting), the click injects a
 // mid-turn steer via a session-scoped server action, which round-trips
 // through the backend as ControlMsg::Steer and comes back as steer_requested /
-// steer_queued / steer_delivered events.
+// steer_accepted / steer_queued / steer_delivered events.
 //
 // The submit button's label tracks the phase (Send vs ↗ Steer) so the
 // user sees which behavior will fire before clicking.
@@ -22245,8 +22247,8 @@ function updateSubmitButtonLabel(phase) {
 // Renders one row per QueuedSteer. The backend flow is:
 //   1. User types + clicks Steer → session-scoped server action → server ControlMsg::Steer
 //   2. Server emits steer_requested (echo) → WASM → SteerStatusUpdate(pending)
-//   3. Server emits steer_queued OR steer_delivered (possibly both)
-//   4. Delivered row fades and is removed; queued row stays until delivered.
+//   3. Server emits steer_accepted / steer_queued, then steer_delivered when observed
+//   4. Delivered row fades and is removed; accepted/queued rows stay until delivered.
 //
 // We stash the DOM node in a Map keyed by the steer id so a later
 // SteerStatusUpdate for the same id updates the row in place. Row
@@ -22271,9 +22273,8 @@ function onSteerStatusUpdate(id, text, status, reason) {
   }
   const el = entry.el;
   el.className = 'steer-row ' + status;
-  // Icons chosen to match the WASM-side log lines (hourglass / alarm /
-  // checkmark) so the strip and the log tell the same story.
-  const iconByStatus = { pending: '\u23F3', queued: '\u23F0', delivered: '\u2713' };
+  // Icons chosen to match the WASM-side log lines so the strip and the log tell the same story.
+  const iconByStatus = { pending: '\u23F3', accepted: '\u21AA', queued: '\u23F0', delivered: '\u2713' };
   el.querySelector('.steer-icon').textContent = iconByStatus[status] || '';
   el.querySelector('.steer-text').textContent = text || '';
   el.querySelector('.steer-reason').textContent = reason ? ('— ' + reason) : '';

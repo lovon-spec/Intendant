@@ -2652,6 +2652,19 @@ impl App {
                     format!("Steer queued{}: {}", id_part, reason),
                 );
             }
+            AppEvent::SteerAccepted {
+                ref id, ref reason, ..
+            } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", id)
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!("Steer accepted{}: {}", id_part, reason),
+                );
+            }
             AppEvent::SteerDelivered {
                 ref id, mid_turn, ..
             } => {
@@ -2660,7 +2673,11 @@ impl App {
                 } else {
                     format!(" [{}]", id)
                 };
-                let mode = if mid_turn { "mid-turn" } else { "follow-up" };
+                let mode = if mid_turn {
+                    "mid-turn"
+                } else {
+                    "turn boundary"
+                };
                 self.log(
                     LogLevel::Info,
                     format!("Steer delivered{} ({})", id_part, mode),

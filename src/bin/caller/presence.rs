@@ -1056,6 +1056,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         // narrate these (the worker's next model response will reflect
         // the effect of the steer, which we already surface).
         | AppEvent::SteerRequested { .. }
+        | AppEvent::SteerAccepted { .. }
         | AppEvent::SteerQueued { .. }
         | AppEvent::SteerDelivered { .. } => None,
     }

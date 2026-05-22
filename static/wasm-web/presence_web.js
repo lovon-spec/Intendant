@@ -426,8 +426,9 @@ export class PresenceWeb {
     /**
      * Inject a user message into the currently running turn. Sends
      * ControlMsg::Steer via the WebSocket with a client-generated id so
-     * the backend can echo it back on SteerRequested/SteerQueued/
-     * SteerDelivered events and the UI can correlate delivery state.
+     * the backend can echo it back on SteerRequested/SteerAccepted/
+     * SteerQueued/SteerDelivered events and the UI can correlate
+     * delivery state.
      *
      * Returns the generated id as a JsValue string so the caller can
      * attach it to the pending-steer row in the activity log.
