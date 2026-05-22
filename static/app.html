@@ -1515,6 +1515,9 @@ html, body {
 .session-window.header-collapsed:not(.minimized) {
   min-height: 130px;
 }
+.session-window:not(.header-collapsed):not(.minimized) {
+  max-height: none;
+}
 .session-window.header-collapsed .session-window-task {
   display: none;
 }
@@ -1537,6 +1540,10 @@ html, body {
   border-bottom: 1px solid var(--surface0);
   background: var(--crust);
   flex-shrink: 0;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-header {
+  align-items: flex-start;
+  cursor: pointer;
 }
 .session-window-title {
   min-width: 0;
@@ -1636,6 +1643,24 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-window:not(.header-collapsed):not(.minimized) .session-window-id,
+.session-window:not(.header-collapsed):not(.minimized) .session-identity-name,
+.session-window:not(.header-collapsed):not(.minimized) .session-window-task,
+.session-window:not(.header-collapsed):not(.minimized) .session-window-project,
+.session-window:not(.header-collapsed):not(.minimized) .session-window-cwd {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-project,
+.session-window:not(.header-collapsed):not(.minimized) .session-window-cwd {
+  max-width: none;
+  line-height: 1.35;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-project {
+  flex: 1 1 100%;
+}
 .session-window-project { color: var(--sapphire); }
 .session-window-cwd { color: var(--green); }
 .session-window-task::before,
@@ -1718,6 +1743,9 @@ html, body {
   min-height: 0;
   overflow-y: auto;
   padding: 3px 0;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-log {
+  max-height: 220px;
 }
 .session-window-log .log-entry {
   padding: 2px 8px;
@@ -11672,13 +11700,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const status = document.createElement('span');
   status.className = 'session-window-status';
   status.textContent = normalizeSessionPhase(meta.phase || 'idle');
-  const headerToggle = document.createElement('button');
-  headerToggle.className = 'session-window-action session-window-header-toggle';
-  headerToggle.type = 'button';
-  headerToggle.title = 'Collapse header';
-  headerToggle.setAttribute('aria-label', headerToggle.title);
-  headerToggle.setAttribute('aria-pressed', 'false');
-  headerToggle.textContent = '\u25B4';
+  header.title = 'Click header to collapse or expand';
   const minimize = document.createElement('button');
   minimize.className = 'session-window-action session-window-minimize';
   minimize.type = 'button';
@@ -11735,7 +11757,6 @@ function ensureSessionWindow(sessionId, meta = {}) {
   close.textContent = '\u00d7';
   header.appendChild(title);
   header.appendChild(status);
-  header.appendChild(headerToggle);
   header.appendChild(minimize);
   header.appendChild(actions);
   header.appendChild(maximize);
@@ -11750,6 +11771,14 @@ function ensureSessionWindow(sessionId, meta = {}) {
   el.appendChild(log);
   el.addEventListener('mousedown', () => focusSessionWindow(sid));
   el.addEventListener('focus', () => focusSessionWindow(sid));
+  header.addEventListener('click', (e) => {
+    if (e.target.closest?.('button, a, input, textarea, select, [role="menu"]')) return;
+    if (sessionWindows.get(sid)?.minimized) return;
+    e.preventDefault();
+    e.stopPropagation();
+    closeSessionWindowMenus();
+    toggleSessionWindowHeaderCollapsed(sid);
+  });
   actions.addEventListener('mousedown', (e) => e.stopPropagation());
   actions.addEventListener('click', (e) => {
     e.preventDefault();
@@ -11765,10 +11794,6 @@ function ensureSessionWindow(sessionId, meta = {}) {
     e.stopPropagation();
     setSessionWindowMenuOpen(sid, false);
     runSessionWindowAction(sid, item.dataset.sessionWindowAction);
-  });
-  headerToggle.addEventListener('click', (e) => {
-    e.stopPropagation();
-    toggleSessionWindowHeaderCollapsed(sid);
   });
   minimize.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -11818,7 +11843,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
-    headerToggle,
+    header,
     minimize,
     maximize,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
@@ -11909,11 +11934,8 @@ function updateSessionWindowHeaderCollapseState(sessionId) {
   if (!win) return;
   const collapsed = !!win.headerCollapsed;
   win.el.classList.toggle('header-collapsed', collapsed);
-  if (win.headerToggle) {
-    win.headerToggle.textContent = collapsed ? '\u25BE' : '\u25B4';
-    win.headerToggle.title = collapsed ? 'Expand header' : 'Collapse header';
-    win.headerToggle.setAttribute('aria-label', win.headerToggle.title);
-    win.headerToggle.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+  if (win.header) {
+    win.header.title = collapsed ? 'Click header to expand' : 'Click header to collapse';
   }
 }
 
