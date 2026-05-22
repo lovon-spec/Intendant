@@ -29,7 +29,9 @@ static NONCE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\$NONCE\[(\d+)\]").unwrap());
 
 struct PtySession {
-    writer: Box<dyn std::io::Write + Send>,
+    // Shared with the reader thread so it can answer terminal queries (see
+    // below) on the same PTY input stream that `exec_pty` writes commands to.
+    writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
     // All bytes the shell has emitted so far, accumulated by a dedicated
     // background reader thread (see `exec_pty`). A background thread — rather
     // than an inline blocking `read()` in the command loop — is what makes the
@@ -46,6 +48,19 @@ struct PtySession {
     // Keep master alive to prevent EOF
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
+
+/// Reply to a terminal Device Status Report (cursor-position) query.
+///
+/// Windows ConPTY emits `ESC[6n` (DSR-CPR) when a console app starts and
+/// *blocks waiting for the reply* before it will process stdin. A raw PTY
+/// consumer like this one is the "terminal" and must answer, or the shell
+/// (both cmd.exe and PowerShell) hangs at startup and never runs the commands
+/// we inject. We answer with a fixed cursor-at-origin report `ESC[1;1R`; the
+/// exact coordinates are irrelevant for our non-interactive marker-scrape use.
+/// On Unix this query effectively never fires at shell startup, so the scan is
+/// a cheap no-op and a stray reply would be harmless.
+const DSR_CPR_QUERY: &[u8] = b"\x1b[6n";
+const DSR_CPR_REPLY: &[u8] = b"\x1b[1;1R";
 
 const HUMAN_POLL_MS: u64 = 500;
 const LOG_TAIL_BYTES: u64 = 10 * 1024; // 10KB
@@ -651,26 +666,45 @@ impl Agent {
                 .master
                 .try_clone_reader()
                 .map_err(|e| AgentError::Process(format!("Failed to clone reader: {}", e)))?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|e| AgentError::Process(format!("Failed to take writer: {}", e)))?;
+            let writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(
+                std::sync::Mutex::new(pair.master.take_writer().map_err(|e| {
+                    AgentError::Process(format!("Failed to take writer: {}", e))
+                })?),
+            );
 
             // Dedicated blocking reader thread: drains the PTY into the shared
             // buffer for the session's lifetime. `exec_pty` polls the buffer
             // under an async deadline rather than blocking on `read()` itself,
             // so a quiet shell can never wedge the command loop. The thread
             // exits on EOF/error (when the shell dies and the master closes).
+            //
+            // It also answers ConPTY's startup `ESC[6n` cursor-position query
+            // (see DSR_CPR_*): both cmd.exe and PowerShell block waiting for
+            // that reply before processing injected stdin, so without this the
+            // shell never runs our commands. We scan each chunk (the sequence
+            // is tiny and arrives in one read in practice) and write the reply
+            // back through the shared writer.
             let output = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
             let output_for_thread = Arc::clone(&output);
+            let writer_for_thread = Arc::clone(&writer);
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            let chunk = &buf[..n];
+                            if chunk
+                                .windows(DSR_CPR_QUERY.len())
+                                .any(|w| w == DSR_CPR_QUERY)
+                            {
+                                if let Ok(mut w) = writer_for_thread.lock() {
+                                    let _ = w.write_all(DSR_CPR_REPLY);
+                                    let _ = w.flush();
+                                }
+                            }
                             if let Ok(mut o) = output_for_thread.lock() {
-                                o.extend_from_slice(&buf[..n]);
+                                o.extend_from_slice(chunk);
                             } else {
                                 break;
                             }
@@ -699,16 +733,22 @@ impl Agent {
         let start_marker = format!("__PTY_START_{}__", cmd.nonce);
         let marker = format!("__PTY_END_{}__", cmd.nonce);
 
-        // Write: echo start-marker, then command, then echo end-marker
+        // Write: echo start-marker, then command, then echo end-marker. The
+        // writer is shared with the reader thread (which answers DSR queries),
+        // so take the lock just for the duration of this write.
         let pty_input = format!("echo '{}'\n{}\necho '{}'\n", start_marker, command, marker);
-        session
-            .writer
-            .write_all(pty_input.as_bytes())
-            .map_err(|e| AgentError::Process(format!("Failed to write to PTY: {}", e)))?;
-        session
-            .writer
-            .flush()
-            .map_err(|e| AgentError::Process(format!("Failed to flush PTY: {}", e)))?;
+        {
+            let mut writer = session
+                .writer
+                .lock()
+                .map_err(|_| AgentError::Process("PTY writer poisoned".to_string()))?;
+            writer
+                .write_all(pty_input.as_bytes())
+                .map_err(|e| AgentError::Process(format!("Failed to write to PTY: {}", e)))?;
+            writer
+                .flush()
+                .map_err(|e| AgentError::Process(format!("Failed to flush PTY: {}", e)))?;
+        }
 
         // Poll the background-filled buffer until the end marker appears or the
         // deadline elapses. Only bytes produced since this session's last
