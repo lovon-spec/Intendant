@@ -182,17 +182,23 @@ impl MediaFoundationEncoder {
         // COM (MTA) + Media Foundation init. Both are reference-counted and
         // idempotent process-wide; we still track our own success so Drop pairs
         // the teardown exactly once.
+        // SAFETY: `CoInitializeEx` is a thread-local COM apartment init with no
+        // pointer arguments; calling it is always sound. Its return value tells
+        // us whether we took a reference to balance in `Drop` (tracked in
+        // `com_initialized`). S_OK / S_FALSE both took one; RPC_E_CHANGED_MODE
+        // (`is_ok()` false) did not, so we won't `CoUninitialize`.
         let com_initialized = unsafe {
             let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-            // S_OK (0) and S_FALSE (1, already-initialized) both indicate this
-            // call took a reference we must release. RPC_E_CHANGED_MODE means a
-            // different apartment was already chosen on this thread — MF still
-            // works, but we did NOT take a reference, so don't uninit.
             hr.is_ok()
         };
 
+        // SAFETY: `MFStartup` only requires a prior successful COM init on this
+        // thread (done above); the version constant is the value MF expects and
+        // the second arg (0) is the documented default flag.
         if let Err(e) = unsafe { MFStartup(MF_VERSION, 0) } {
             if com_initialized {
+                // SAFETY: paired with the `CoInitializeEx` above that returned a
+                // reference; this runs on the same thread that took it.
                 unsafe { CoUninitialize() };
             }
             return Err(format!(
@@ -206,6 +212,10 @@ impl MediaFoundationEncoder {
         let transform = match Self::create_transform(width, height, bitrate_kbps) {
             Ok(t) => t,
             Err(e) => {
+                // SAFETY: the struct (and thus its `Drop`) doesn't exist yet, so
+                // we hand-unwind here. `MFShutdown` pairs the `MFStartup` above;
+                // `CoUninitialize` pairs `CoInitializeEx` (only if it took a
+                // reference). Reverse init order, same thread that initialized.
                 unsafe {
                     let _ = MFShutdown();
                     if com_initialized {
@@ -240,6 +250,10 @@ impl MediaFoundationEncoder {
         // Tell the MFT streaming is about to begin. Order matters:
         // BEGIN_STREAMING then START_OF_STREAM. If either fails, returning `Err`
         // drops `enc`, whose `Drop` impl pairs MFShutdown + CoUninitialize.
+        //
+        // SAFETY: `enc.transform()` is the live `IMFTransform` set above (always
+        // `Some` pre-Drop). `ProcessMessage` takes only scalar args. We're on the
+        // encoder thread that initialized MF, the only thread that touches it.
         unsafe {
             enc.transform()
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
@@ -280,6 +294,11 @@ impl MediaFoundationEncoder {
 
         let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count: u32 = 0;
+        // SAFETY: `MFTEnumEx` writes a CoTaskMem-allocated array of `count`
+        // `Option<IMFActivate>` into `activates` (out-params we own). On success
+        // we own that block and every COM reference in it; the cleanup below
+        // releases each entry and frees the block. `&output_info` outlives the
+        // call.
         unsafe {
             MFTEnumEx(
                 MFT_CATEGORY_VIDEO_ENCODER,
@@ -296,6 +315,9 @@ impl MediaFoundationEncoder {
         if activates.is_null() || count == 0 {
             // Free the (empty) array if MF allocated one.
             if !activates.is_null() {
+                // SAFETY: `activates` is the non-null CoTaskMem block MFTEnumEx
+                // allocated; with `count == 0` it holds no live COM refs to
+                // release, so freeing the block alone is correct.
                 unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _)) };
             }
             return Err(
@@ -311,8 +333,13 @@ impl MediaFoundationEncoder {
         // then free the block itself. Move entry 0 out first to keep it.
         let mut chosen: Option<IMFActivate> = None;
         for i in 0..count as usize {
-            // `read` moves the Option out (transferring its owned ref) without
-            // dropping the in-place copy; the block memory is freed below.
+            // SAFETY: `i < count` and MFTEnumEx allocated `count` contiguous
+            // `Option<IMFActivate>` slots, so `activates.add(i)` is in-bounds.
+            // `read` bit-copies the `Option` out, transferring ownership of its
+            // one COM reference to `entry` without running a destructor on the
+            // source slot (its bytes are abandoned; the block is freed below
+            // without re-dropping, so each ref is released exactly once — kept
+            // for entry 0, dropped for the rest).
             let entry = unsafe { std::ptr::read(activates.add(i)) };
             if i == 0 {
                 chosen = entry; // keep the first; its ref transfers to `chosen`
@@ -320,11 +347,18 @@ impl MediaFoundationEncoder {
                 drop(entry); // Release the rest
             }
         }
+        // SAFETY: every COM reference in the block was moved out above (read once
+        // each), so freeing the underlying CoTaskMem allocation now leaks
+        // nothing and double-frees nothing.
         unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _)) };
 
         let activate = chosen.ok_or_else(|| "MFTEnumEx returned a null IMFActivate".to_string())?;
 
         // Activate the MFT into an IMFTransform.
+        //
+        // SAFETY: `activate` is a live `IMFActivate` (its owned ref was preserved
+        // above). `ActivateObject` returns a new `IMFTransform` owning its own
+        // reference, which the RAII wrapper releases on drop.
         let transform: IMFTransform = unsafe {
             activate
                 .ActivateObject::<IMFTransform>()
@@ -352,8 +386,14 @@ impl MediaFoundationEncoder {
         height: u32,
         bitrate_kbps: u32,
     ) -> Result<(), String> {
+        // SAFETY: `MFCreateMediaType` needs only a prior MF startup (done in
+        // `new` before any `create_transform` call) and returns a fresh
+        // RAII-owned `IMFMediaType`.
         let out_type: IMFMediaType =
             unsafe { MFCreateMediaType().map_err(|e| format!("MFCreateMediaType(out): {e}"))? };
+        // SAFETY: every call below is a setter on the live `out_type` /
+        // `transform` COM objects; the GUID/attribute-key references and the
+        // committed `out_type` all outlive the calls.
         unsafe {
             out_type
                 .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -418,8 +458,12 @@ impl MediaFoundationEncoder {
         width: u32,
         height: u32,
     ) -> Result<(), String> {
+        // SAFETY: see `configure_output_type` — MF is started, the returned
+        // `IMFMediaType` is RAII-owned.
         let in_type: IMFMediaType =
             unsafe { MFCreateMediaType().map_err(|e| format!("MFCreateMediaType(in): {e}"))? };
+        // SAFETY: setters on the live `in_type` / `transform` COM objects;
+        // all key references outlive the calls and `in_type` is committed last.
         unsafe {
             in_type
                 .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -466,6 +510,10 @@ impl MediaFoundationEncoder {
             );
             return;
         };
+        // SAFETY: `codec_api` is a live `ICodecAPI` view of the MFT. Each
+        // `SetValue` reads a CODECAPI GUID key and a `&VARIANT` we build inline
+        // (valid for the call); all are on the encoder thread. Failures are
+        // ignored by design (some keys are E_NOTIMPL on this MFT).
         unsafe {
             // Low-latency mode — required for per-frame output (see doc above).
             // `AVLowLatencyMode` is the one the MS H.264 encoder honors;
@@ -488,6 +536,10 @@ impl MediaFoundationEncoder {
     /// Wrap the NV12 scratch buffer into an `IMFSample` with one memory buffer.
     fn make_input_sample(&self, pts_ms: u64, duration_ms: u64) -> Result<IMFSample, String> {
         let len = self.nv12.len() as u32;
+        // SAFETY: all calls operate on COM objects we just created and own
+        // (RAII-released on the early-return / scope exit). The one raw write is
+        // the `copy_nonoverlapping` below, guarded by the `max_len` bounds check;
+        // `Lock` is always paired with `Unlock` before the buffer escapes.
         unsafe {
             let buffer = MFCreateMemoryBuffer(len)
                 .map_err(|e| format!("MFCreateMemoryBuffer({len}): {e}"))?;
@@ -505,6 +557,10 @@ impl MediaFoundationEncoder {
                     self.nv12.len()
                 ));
             }
+            // SAFETY: `Lock` populated `ptr` with a writable region of `max_len`
+            // bytes; we copy exactly `self.nv12.len()` bytes, which the check
+            // above proved fits. Source and destination cannot overlap (distinct
+            // allocations).
             std::ptr::copy_nonoverlapping(self.nv12.as_ptr(), ptr, self.nv12.len());
             buffer
                 .Unlock()
@@ -544,6 +600,8 @@ impl MediaFoundationEncoder {
             // The MS software H.264 encoder does NOT set
             // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, so the caller must allocate
             // the output sample/buffer. Size it from the stream info.
+            // SAFETY: `self.transform()` is the live MFT; `GetOutputStreamInfo`
+            // takes only a stream id and returns plain data.
             let stream_info = unsafe {
                 self.transform()
                     .GetOutputStreamInfo(STREAM_ID)
@@ -551,6 +609,9 @@ impl MediaFoundationEncoder {
             };
             let alloc_len = stream_info.cbSize.max(1);
 
+            // SAFETY: allocate the output sample/buffer the MFT will fill (it does
+            // not set MFT_OUTPUT_STREAM_PROVIDES_SAMPLES). All objects are
+            // RAII-owned; `AddBuffer` takes a borrow and keeps its own ref.
             let sample = unsafe {
                 let buffer = MFCreateMemoryBuffer(alloc_len)
                     .map_err(|e| format!("MFCreateMemoryBuffer(out {alloc_len}): {e}"))?;
@@ -569,11 +630,23 @@ impl MediaFoundationEncoder {
             }];
             let mut status: u32 = 0;
 
+            // SAFETY: `ProcessOutput` reads/writes the `MFT_OUTPUT_DATA_BUFFER`
+            // we own. The `windows` crate models `pSample`/`pEvents` as
+            // `ManuallyDrop<Option<…>>` because MF owns those slots across the
+            // call (it may keep our sample, swap in its own, and/or attach an
+            // events collection), so they must NOT auto-drop. We take exactly one
+            // owning reference back out of each slot on every match arm below
+            // (`ManuallyDrop::take`), which restores normal drop semantics and
+            // releases each COM ref exactly once. `&mut output`/`&mut status` are
+            // valid for the call.
             let hr = unsafe { self.transform().ProcessOutput(0, &mut output, &mut status) };
 
             match hr {
                 Ok(()) => {
-                    // Extract the produced sample's bytes.
+                    // SAFETY: take ownership of the produced sample and any events
+                    // out of their `ManuallyDrop` slots exactly once. After this
+                    // the slots are logically uninitialized and `output` is not
+                    // read again (a fresh array is built next iteration).
                     let produced = unsafe { std::mem::ManuallyDrop::take(&mut output[0].pSample) };
                     // Drop any events collection MF attached.
                     let _ = unsafe { std::mem::ManuallyDrop::take(&mut output[0].pEvents) };
@@ -587,11 +660,14 @@ impl MediaFoundationEncoder {
                     // Reclaim the sample we allocated. This is the normal
                     // "no more output for now" terminator — fed the next frame
                     // produces the next packet.
+                    // SAFETY: same single-take-per-slot contract as the Ok arm.
                     let _ = unsafe { std::mem::ManuallyDrop::take(&mut output[0].pSample) };
                     let _ = unsafe { std::mem::ManuallyDrop::take(&mut output[0].pEvents) };
                     break;
                 }
                 Err(e) => {
+                    // SAFETY: same single-take-per-slot contract; reclaim both
+                    // slots before propagating the error so nothing leaks.
                     let _ = unsafe { std::mem::ManuallyDrop::take(&mut output[0].pSample) };
                     let _ = unsafe { std::mem::ManuallyDrop::take(&mut output[0].pEvents) };
                     return Err(format!("ProcessOutput: {e} (status={status:#x})"));
@@ -609,6 +685,8 @@ impl MediaFoundationEncoder {
         duration_ms: u64,
     ) -> Result<Option<EncodedPacket>, String> {
         // Keyframe iff the sample is a clean point. Absent attribute → false.
+        // SAFETY: `sample` is a live `IMFSample`; `GetUINT32` reads one attribute
+        // key and returns a value or an error (the absent case).
         let is_keyframe = unsafe {
             sample
                 .GetUINT32(&MFSampleExtension_CleanPoint)
@@ -617,6 +695,11 @@ impl MediaFoundationEncoder {
         };
 
         // Flatten all buffers into one contiguous buffer, then copy out.
+        // SAFETY: `ConvertToContiguousBuffer` returns a RAII-owned buffer; `Lock`
+        // yields `ptr` valid for `cur_len` bytes until `Unlock`. We build the
+        // slice and copy it to an owned `Vec` (`.to_vec()`) while the lock is
+        // still held, then `Unlock` before the buffer drops, so no pointer
+        // outlives the lock.
         let annexb = unsafe {
             let buffer = sample
                 .ConvertToContiguousBuffer()
@@ -721,6 +804,8 @@ impl MediaFoundationEncoder {
     /// Best-effort: if `ICodecAPI` is unavailable the GOP cadence is relied on.
     fn force_keyframe(&self) {
         if let Some(codec_api) = &self.codec_api {
+            // SAFETY: `codec_api` is a live `ICodecAPI`; `SetValue` takes a GUID
+            // key and a `&VARIANT` valid for the call. Best-effort (ignored).
             unsafe {
                 let _ = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant_u32(1));
             }
@@ -830,6 +915,9 @@ impl Encoder for MediaFoundationEncoder {
 impl Drop for MediaFoundationEncoder {
     fn drop(&mut self) {
         // Signal end of stream so the MFT releases internal buffers cleanly.
+        // SAFETY: `transform` is still the live MFT (not yet taken); these are
+        // scalar-arg notifications on the encoder thread. Errors are ignored —
+        // teardown proceeds regardless.
         if let Some(transform) = self.transform.as_ref() {
             unsafe {
                 let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -848,11 +936,16 @@ impl Drop for MediaFoundationEncoder {
         // Tear down MF + COM in reverse init order, now that no COM object
         // we own outlives the apartment.
         if self.mf_started {
+            // SAFETY: pairs the `MFStartup` in `new`; every COM ref we owned was
+            // released just above, and this runs on the thread that started MF.
             unsafe {
                 let _ = MFShutdown();
             }
         }
         if self.com_initialized {
+            // SAFETY: pairs the `CoInitializeEx` in `new` (which took a
+            // reference); runs after MF shutdown on the same thread, with no
+            // remaining COM objects to outlive the apartment.
             unsafe { CoUninitialize() };
         }
     }
@@ -877,6 +970,8 @@ fn set_attribute_size(
     height: u32,
 ) -> Result<(), String> {
     let packed = ((width as u64) << 32) | (height as u64);
+    // SAFETY: `attrs` is a live `IMFMediaType`; `SetUINT64` stores a scalar under
+    // the borrowed `key` GUID.
     unsafe {
         attrs
             .SetUINT64(key, packed)
@@ -894,6 +989,8 @@ fn set_attribute_ratio(
     denominator: u32,
 ) -> Result<(), String> {
     let packed = ((numerator as u64) << 32) | (denominator as u64);
+    // SAFETY: `attrs` is a live `IMFMediaType`; `SetUINT64` stores a scalar under
+    // the borrowed `key` GUID.
     unsafe {
         attrs
             .SetUINT64(key, packed)
@@ -1088,6 +1185,8 @@ mod tests {
     #[test]
     fn variant_u32_sets_vt_and_value() {
         let v = variant_u32(7);
+        // SAFETY: `variant_u32` built the `VT_UI4` union arm, so reading `vt` and
+        // the matching `ulVal` field of the VARIANT union is the active variant.
         unsafe {
             let inner = &v.Anonymous.Anonymous;
             assert_eq!(inner.vt, VT_UI4);

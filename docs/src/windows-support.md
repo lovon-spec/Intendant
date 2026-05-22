@@ -6,11 +6,14 @@ known limitations of the Windows port.
 
 > **Maturity.** The Windows backends compile and link cleanly for
 > `x86_64-pc-windows-msvc` and mirror the structure of the X11/macOS backends.
-> Several runtime paths (live display capture, input injection, the voice audio
-> bridge) require an interactive desktop session and are pending end-to-end
-> validation on an interactive Windows host. Where a capability is not yet wired
-> up it is called out under [Known Limitations](#known-limitations) — the port
-> never panics or silently no-ops; unsupported paths return a clear error.
+> The display pipeline has been **live-validated** end-to-end on a real Windows
+> host: GDI `BitBlt` capture, Media Foundation H.264 encode, `SendInput`
+> keyboard/mouse injection, and the encrypted WebRTC transport all work with
+> real remote clients (display and input, over WebRTC). The voice **audio
+> bridge** (VB-CABLE / WASAPI) is the one runtime path still pending end-to-end
+> validation. Remaining gaps are called out under
+> [Known Limitations](#known-limitations) — the port never panics or silently
+> no-ops; unsupported paths return a clear error.
 
 ## Supported Target
 
@@ -98,17 +101,36 @@ Intendant prefers platform-agnostic code; where the OS forces a difference, the
 Windows implementation slots in behind the same trait or `cfg` gate the X11,
 Wayland, and macOS backends use. The Windows-specific backends are:
 
-### Capture — DXGI Desktop Duplication
+### Capture — GDI `BitBlt` (default) + DXGI Desktop Duplication (opt-in)
 
-`display/windows.rs` captures the desktop via **DXGI Desktop Duplication**
-(`IDXGIOutputDuplication`), the GPU-accelerated whole-desktop capture path on
-Windows 8+. The duplication interface, the Direct3D 11 device, and the device
-context are single-threaded COM objects that are not `Send` across `await`, so
-— exactly like the X11 backend's XShm connection — the capture loop runs on a
-dedicated `std::thread` and feeds the tokio runtime over a bounded `mpsc`
-channel (the same drop-on-full backpressure policy as the macOS and X11
-backends). Acquired GPU textures are copied into a CPU-readable staging texture,
-mapped, and emitted as BGRA frames into the existing `bgra_to_i420` converter.
+`display/windows.rs` ships two capture paths behind the same `DisplayBackend`
+seam, selected at runtime by the `INTENDANT_WINDOWS_CAPTURE` environment
+variable (`gdi` | `dxgi`, case-insensitive; anything unset or unrecognized uses
+the GDI default).
+
+**GDI `BitBlt` — the default.** `BitBlt` from the screen device context reads
+the **DWM-composed** desktop — the same pixels a user sees. Crucially it works
+on *every* display adapter, including the virtual / indirect displays an
+always-on host commonly runs on (RDP indirect display, cloud virtual display,
+headless). The capture loop runs on a dedicated `std::thread` (GDI `HDC` /
+`HBITMAP` handles are not `Send`) and `BitBlt`s the screen DC into a cached
+top-down 32-bit DIB (`SRCCOPY | CAPTUREBLT`, so layered/overlay windows are
+included). The DIB is BGRA8 top-down, so emitted rows are the identical
+`DXGI_FORMAT_B8G8R8A8_UNORM` byte layout the DXGI path produces and feed the
+existing `bgra_to_i420` / Media Foundation H.264 encoder unchanged.
+
+**DXGI Desktop Duplication — opt-in fast path.** `IDXGIOutputDuplication` is the
+GPU-accelerated path (zero-copy from the GPU into a CPU-readable staging
+texture, lowest overhead on physical hardware). It is retained as an **opt-in**
+fast path (`INTENDANT_WINDOWS_CAPTURE=dxgi`) for hosts with a real GPU/scanout.
+It is **not** the default because it captures **all-black** frames on
+virtual / RDP / cloud / headless adapters: those displays don't perform the
+real frame presentation/scanout that Desktop Duplication requires, so it
+"succeeds" yet duplicates black. Like the GDI path, the duplication interface,
+the Direct3D 11 device, and the device context are single-threaded COM objects
+that are not `Send` across `await`, so the loop runs on a dedicated
+`std::thread` and feeds the tokio runtime over a bounded `mpsc` channel (the
+same drop-on-full backpressure policy as the macOS and X11 backends).
 `DXGI_ERROR_ACCESS_LOST` (resolution change, full-screen exclusive app,
 secure-desktop/UAC transition, GPU mode switch) tears down and re-acquires the
 duplication on the next iteration.
@@ -132,12 +154,14 @@ Linux arms shell out to `pbcopy` / `wl-copy` / `xclip`.
 ### Encode — Media Foundation H264
 
 Windows video encode targets **Media Foundation H264** (with NVENC as a hardware
-path where available) rather than VP8/libvpx. The libvpx-backed VP8 encoder and
-the OpenSSL FFI crates are gated **off** Windows in `Cargo.toml`
-(`cfg(not(target_os = "windows"))`), so the MSVC build never tries to compile
-the `env-libvpx-sys` or `openssl-sys` C-FFI crates; the VP8 code paths are
-themselves `cfg`'d off Windows. See
-[Known Limitations](#known-limitations) for the current encode status.
+path where available) rather than VP8/libvpx, and is live-validated over the
+encrypted WebRTC transport with real clients. The libvpx-backed VP8 encoder is
+gated **off** Windows in `Cargo.toml` (`cfg(not(target_os = "windows"))`), so the
+MSVC build never tries to compile the `env-libvpx-sys` C-FFI crate (which needs a
+C toolchain plus the vpx headers); the VP8 code paths are themselves `cfg`'d off
+Windows. (The former OpenSSL C-FFI dependency is gone entirely — the LAN cert
+subsystem is now pure-Rust via `rcgen` + `p12-keystore` — so nothing OpenSSL
+needs gating on any platform.)
 
 ### Audio — ffmpeg + VB-CABLE WASAPI bridge
 
@@ -170,22 +194,24 @@ process and network helpers:
 These are tracked deferrals, not bugs. Each degrades with a clear error rather
 than a panic or silent no-op.
 
-- **Interactive session required for live capture/input/audio.** DXGI Desktop
-  Duplication, `SendInput`, and the WASAPI audio bridge all need an interactive
-  desktop session. They do **not** work on the headless / service /
-  disconnected-RDP "Session 0" desktop, where Desktop Duplication is
-  unavailable. End-to-end frame delivery, input injection, and voice are pending
-  validation on an interactive Windows host.
-- **Hardware-accelerated encode.** The Media Foundation H264 backend (and any
-  NVENC fast path) is the planned Windows encoder; until it lands, the encode
-  selection path on Windows falls through exactly as it does when no hardware
-  H264 encoder is available on Linux/macOS. VP8/libvpx is intentionally not
-  built on Windows.
-- **`intendant lan` is gated off Windows.** The mTLS + nginx LAN-access
-  subsystem depends on OpenSSL plus apt/brew and systemd/launchd service
-  management, none of which apply on Windows; the Windows `LanBackend` returns
-  `"intendant lan is not supported on Windows"`. To expose the dashboard to
-  other devices from a Windows host, use the `scripts/setup-lan.bat` orchestrator
+- **Interactive desktop session required.** Capture (`BitBlt` and DXGI),
+  `SendInput`, and the WASAPI audio bridge all need an interactive desktop
+  session. They do **not** work on the headless / service / disconnected-RDP
+  "Session 0" desktop. Within an interactive session, frame delivery, H.264
+  encode, input injection, and the encrypted WebRTC transport are
+  live-validated; only the **voice audio bridge** is still pending end-to-end
+  validation (see below).
+- **Voice audio bridge pending validation.** The `ffmpeg` + VB-CABLE / WASAPI
+  bridge is wired up but has not yet been validated end-to-end on a Windows
+  host. It also requires the manual VB-CABLE install (see
+  [Audio](#audio-ffmpeg--vb-cable-wasapi-bridge)).
+- **`intendant lan` is gated off Windows.** The mTLS LAN-access *setup* command
+  drives an nginx reverse proxy plus systemd/launchd service management and
+  apt/brew package installs — none of which apply on Windows — so the Windows
+  `LanBackend` returns `"intendant lan is not supported on Windows"`. (The
+  certificate generation itself is now pure-Rust and cross-platform; only the
+  proxy/service plumbing is Unix-specific.) To expose the dashboard to other
+  devices from a Windows host, use the `scripts/setup-lan.bat` orchestrator
   (which drives `intendant lan` on a Linux guest over SSH/WSL), or front the
   dashboard with your own reverse proxy.
 - **No virtual-display equivalent.** There is no Windows analogue of Xvfb, so

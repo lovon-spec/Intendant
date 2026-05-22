@@ -198,3 +198,11 @@ split-debuginfo = "unpacked"
 # [dependencies] and [dev-dependencies] for test/example builds — release builds still
 # get just the `full` feature set from line 18.
 tokio = { version = "1.0", features = ["test-util"] }
+
+# macOS-only test dependency: drives Apple's real `SecPKCS12Import` (Security.framework)
+# so a `#[cfg(target_os = "macos")]` test in `lan::certs` can prove the generated
+# `client.p12` is accepted by the actual OS importer — not just round-tripped through
+# the `p12-keystore` crate. Already in the dependency tree transitively (via
+# rustls-native-certs), so pinning it here adds no new crate to the lock.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework = "3"

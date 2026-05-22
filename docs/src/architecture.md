@@ -28,7 +28,7 @@ intendant (3 modes) --> detects project root (git) --> loads memory/knowledge/sk
   +--> MCP Client:      connects to external MCP servers (configured in intendant.toml)
   +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
   +--> Skills system:   SKILL.md-based instruction sets with YAML frontmatter
-  +--> Computer use:    provider-agnostic CU abstraction (X11/Wayland/macOS)
+  +--> Computer use:    provider-agnostic CU abstraction (X11/Wayland/macOS/Windows)
   +--> WebRTC display:  capture → VP8/H264 encode → per-peer streaming + remote input
   +--> Live audio:      Gemini Live / OpenAI Realtime voice sessions via audio bridge
   +--> Phone calls:     SIP outbound via pjsua + voice model + structured data extraction
@@ -161,8 +161,11 @@ When context usage reaches 90% (`usage_fraction() >= 0.90`), `conversation.auto_
 
 ## Environment
 
-- **OS:** macOS or Linux (Debian 12+)
+- **OS:** macOS or Linux (Debian 12+). Windows (`x86_64-pc-windows-msvc`) is
+  supported as an in-progress port — see [Windows Support](./windows-support.md)
 - **Runtime:** Tokio async (full features)
 - **Permissions:** Runs as unprivileged user with passwordless sudo (Linux)
-- **Display:** Auto-managed Xvfb (Linux), native display (macOS). See [Display Pipeline](./display-pipeline.md)
+- **Display:** Auto-managed Xvfb (Linux), native display (macOS), GDI/DXGI
+  desktop capture (Windows). See [Display Pipeline](./display-pipeline.md) and
+  [Windows Support](./windows-support.md)
 - **X11 auth:** At startup the runtime discovers active X displays and merges their xauth cookies into a session-scoped `session.Xauthority` file, passed as `XAUTHORITY` to all spawned commands

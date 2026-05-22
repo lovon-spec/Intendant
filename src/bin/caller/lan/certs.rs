@@ -485,6 +485,71 @@ mod tests {
         assert_eq!(ca1, ca2);
     }
 
+    /// **Real Apple importer acceptance.** Round-tripping through the
+    /// `p12-keystore` crate (see `p12_is_parseable_with_password`) only
+    /// proves *we* can read what *we* wrote — it doesn't prove Apple's
+    /// importer accepts our modern PBES2/AES + SHA-256 packaging. This test
+    /// drives the actual OS importer, `SecPKCS12Import` (Security.framework,
+    /// the same call Keychain Access on macOS 15+ and the iOS 18 profile
+    /// installer make), against the generated `client.p12`.
+    ///
+    /// It imports into a throwaway keychain created in a `TempDir` (never the
+    /// user's login keychain) so it leaves no trace and triggers no
+    /// interactive password prompt. A successful import that yields the
+    /// client identity plus its cert chain is the proof that a genuine Apple
+    /// importer — not just the `p12-keystore` reader — accepts the bundle.
+    ///
+    /// macOS-only: `SecPKCS12Import` and `SecKeychain` are Security.framework
+    /// APIs, so the test is gated to `target_os = "macos"`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn p12_imports_via_real_macos_keychain() {
+        use security_framework::import_export::Pkcs12ImportOptions;
+        use security_framework::os::macos::keychain::CreateOptions;
+
+        let tmp = TempDir::new().unwrap();
+        let state = ensure_certs(tmp.path(), "10.0.0.1", "keychain-import", false).unwrap();
+        let p12_bytes = std::fs::read(tmp.path().join(CLIENT_P12)).unwrap();
+
+        // A disposable, file-backed keychain in the temp dir. Its own
+        // password is unrelated to the .p12 password; creating it leaves the
+        // login keychain untouched and avoids any UI prompt. `.keychain(...)`
+        // is an inherent macOS-only method on `Pkcs12ImportOptions`.
+        let keychain = CreateOptions::new()
+            .password("intendant-test-keychain")
+            .create(tmp.path().join("import-test.keychain"))
+            .expect("create temporary keychain");
+
+        // Drive Apple's SecPKCS12Import. If our modern PBES2/AES + SHA-256
+        // packaging were not accepted by the real importer, this errors.
+        let identities = Pkcs12ImportOptions::new()
+            .passphrase(&state.p12_password)
+            .keychain(keychain)
+            .import(&p12_bytes)
+            .expect("SecPKCS12Import must accept the generated client.p12");
+
+        assert_eq!(
+            identities.len(),
+            1,
+            "expected exactly one imported identity from client.p12"
+        );
+        let imported = &identities[0];
+        assert!(
+            imported.identity.is_some(),
+            "imported item must carry a SecIdentity (private key + leaf cert)"
+        );
+        // Leaf (client) cert + CA in the validated chain.
+        let chain_len = imported
+            .cert_chain
+            .as_ref()
+            .map(|c| c.len())
+            .unwrap_or_default();
+        assert!(
+            chain_len >= 1,
+            "imported identity must carry at least the leaf cert in its chain, got {chain_len}"
+        );
+    }
+
     /// The generated PKCS#12 parses back with its password, yields the
     /// client identity, and carries the CA in the chain. Uses
     /// `p12-keystore`'s own reader (which understands the modern

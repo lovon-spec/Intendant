@@ -140,7 +140,25 @@ For accessing the web dashboard from phones, tablets, or other devices on your n
 ./scripts/setup-lan.sh
 ```
 
-This generates CA, server, and client certificates. The client certificate is exported as `.p12` for installation on iOS/Android/desktop browsers.
+This generates CA, server, and client certificates. The client certificate is exported as `client.p12` (a password-protected PKCS#12 bundle) for installation on iOS/Android/desktop browsers.
+
+### Apple device requirement (`client.p12` import)
+
+The `client.p12` bundle is packaged with **modern** PKCS#12 encryption — PBES2
+(PBKDF2-HMAC-SHA256 + AES-256-CBC) with a SHA-256 MAC. This is the algorithm set
+Apple's current importer (`SecPKCS12Import`, used by Keychain Access and the iOS
+profile installer) accepts.
+
+> **Supported environment:** importing `client.p12` on an Apple device requires
+> **macOS 15 (Sequoia) or later**, or **iOS / iPadOS 18 or later**.
+
+Older Apple releases predate this importer and only accept the legacy
+RC2-40 / 3DES + SHA-1 packaging, which Intendant intentionally no longer
+produces (dropping it is what let the cert subsystem become pure-Rust, with no
+OpenSSL dependency). Android, and desktop browsers such as Chrome and Firefox,
+import the modern bundle without a version floor. If you must serve a pre-15
+macOS or pre-18 iOS client, convert the bundle to the legacy format yourself
+with `openssl pkcs12 -legacy` on a machine that has OpenSSL.
 
 ## Testing
 

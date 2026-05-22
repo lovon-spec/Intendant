@@ -41,7 +41,7 @@ Intendant is built around several core ideas:
 
 - **Multi-provider LLM integration** with native tool calling, streaming, prompt caching, and computer use across OpenAI, Anthropic, and Gemini
 - **WebRTC display pipeline** with hardware H264 encoding, multi-monitor support, bidirectional clipboard sync, and remote input injection
-- **Computer use** via a provider-agnostic abstraction supporting X11, Wayland, and macOS backends
+- **Computer use** via a provider-agnostic abstraction supporting X11, Wayland, macOS, and Windows backends
 - **Live voice interaction** via Gemini Live and OpenAI Realtime, with a WASM-powered browser client
 - **Phone calls** via SIP (pjsua) with structured data extraction from voice conversations
 - **Multi-agent orchestration** with sub-agent spawning, git worktree isolation, and knowledge routing

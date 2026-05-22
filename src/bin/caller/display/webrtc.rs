@@ -1300,38 +1300,30 @@ fn srflx_candidate_init(mapped: SocketAddr, base: SocketAddr) -> RTCIceCandidate
     }
 }
 
-/// Maximum time we'll wait for a STUN Binding Success Response before
-/// giving up on srflx gathering for a socket. Short on purpose: srflx is
-/// an optimisation, and we must never block peer setup on a slow/blocked
-/// STUN server. On timeout we proceed with host + ICE-TCP candidates.
+/// How long, after sending its Binding Request, a UDP forwarder keeps
+/// watching for the matching STUN Binding Success Response before it
+/// stops trying to gather a srflx candidate for its socket.
+///
+/// This is NOT on the peer-setup critical path (see the srflx gathering
+/// block in the driver below): the SDP answer is created and returned to
+/// the signaling layer with host + ICE-TCP candidates *before* any STUN
+/// traffic is sent, and the forwarder keeps forwarding ICE/DTLS/media
+/// packets to the RTC core throughout this window. So a blocked or
+/// unreachable STUN server costs zero added setup latency — when the
+/// response never comes, this deadline simply elapses and no srflx
+/// candidate is trickled. A reachable server answers in a few ms and the
+/// srflx candidate is trickled to the peer well within it.
 const STUN_BINDING_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Send a STUN Binding Request from `socket` to `stun_addr` and parse the
-/// `XOR-MAPPED-ADDRESS` from the Binding Success Response, returning the
-/// public `IP:port` the STUN server saw for this socket's base.
+/// Build a STUN Binding Request, returning the wire bytes and the
+/// transaction ID a response must echo to be accepted.
 ///
-/// The request is built with `rtc::stun` (already a transitive dependency
-/// via the `rtc` meta-crate — no new dep): `Message::build` writes the
-/// 20-byte header with the magic cookie and a random transaction ID, sets
-/// the message type to `BINDING_REQUEST`, and `marshal_binary` yields the
-/// wire bytes. The response is validated by `unmarshal_binary` (which
-/// checks the magic cookie and message length) before
-/// `XorMappedAddress::get_from` decodes the attribute.
-///
-/// The same `socket` that ICE will use for the host candidate is reused
-/// here so the mapping the STUN server reports corresponds to that
-/// candidate's base — exactly the pairing a remote peer needs to reach us
-/// over UDP through a 1:1 NAT.
-///
-/// Errors (DNS failure, send/recv failure, timeout, malformed response,
-/// non-success class) are returned to the caller, which logs and degrades
-/// gracefully. This function never panics.
-async fn stun_binding_mapped_addr(
-    socket: &UdpSocket,
-    stun_addr: SocketAddr,
-) -> Result<SocketAddr, String> {
-    use rtc::stun::message::{Getter, Message, BINDING_REQUEST};
-    use rtc::stun::xoraddr::XorMappedAddress;
+/// Built with `rtc::stun` (already a transitive dependency via the `rtc`
+/// meta-crate — no new dep): `Message::build` writes the 20-byte header
+/// with the magic cookie and a random transaction ID, sets the message
+/// type to `BINDING_REQUEST`, and `marshal_binary` yields the wire bytes.
+fn build_stun_binding_request() -> Result<(Vec<u8>, rtc::stun::message::TransactionId), String> {
+    use rtc::stun::message::{Message, BINDING_REQUEST};
 
     let mut request = Message::new();
     request
@@ -1344,17 +1336,64 @@ async fn stun_binding_mapped_addr(
     let wire = request
         .marshal_binary()
         .map_err(|e| format!("marshal STUN binding request: {e}"))?;
+    Ok((wire, request_tid))
+}
 
+/// Try to interpret `buf` as the STUN Binding Success Response to a
+/// request we sent with `expected_tid`, returning the public `IP:port`
+/// from its `XOR-MAPPED-ADDRESS` attribute.
+///
+/// Returns `None` for anything that isn't our response — a non-STUN
+/// datagram (an ICE connectivity check the same socket also carries), a
+/// STUN message with a different transaction ID, a non-success class, or
+/// a missing/malformed `XOR-MAPPED-ADDRESS`. The caller forwards those
+/// `None` cases on to the RTC core unchanged, so folding this check into
+/// the UDP read path never drops connectivity-check traffic. Validated by
+/// `unmarshal_binary` (magic cookie + length) before
+/// `XorMappedAddress::get_from` decodes the attribute. Never panics.
+fn parse_stun_binding_response(
+    buf: &[u8],
+    expected_tid: rtc::stun::message::TransactionId,
+) -> Option<SocketAddr> {
+    use rtc::stun::message::{Getter, Message};
+    use rtc::stun::xoraddr::XorMappedAddress;
+
+    let mut response = Message::new();
+    if response.unmarshal_binary(buf).is_err() {
+        return None;
+    }
+    if response.transaction_id != expected_tid {
+        return None;
+    }
+    if response.typ != rtc::stun::message::BINDING_SUCCESS {
+        return None;
+    }
+    let mut mapped = XorMappedAddress::default();
+    if mapped.get_from(&response).is_err() {
+        return None;
+    }
+    Some(SocketAddr::new(mapped.ip, mapped.port))
+}
+
+/// Test-only round-trip helper: send a Binding Request from `socket` to
+/// `stun_addr` and await the matching Binding Success Response, returning
+/// the mapped address. Composes the same `build_stun_binding_request` /
+/// `parse_stun_binding_response` building blocks the production UDP
+/// forwarder folds into its read loop, so the tests exercise the real
+/// wire build + parse path. Production no longer uses a blocking
+/// round-trip (it would need a second reader on the ICE socket); the
+/// forwarder intercepts the response inline instead.
+#[cfg(test)]
+async fn stun_binding_mapped_addr(
+    socket: &UdpSocket,
+    stun_addr: SocketAddr,
+) -> Result<SocketAddr, String> {
+    let (wire, request_tid) = build_stun_binding_request()?;
     let exchange = async {
         socket
             .send_to(&wire, stun_addr)
             .await
             .map_err(|e| format!("send STUN binding request to {stun_addr}: {e}"))?;
-
-        // Loop in case an unrelated datagram (e.g. an early ICE
-        // connectivity check from the browser) arrives on the socket
-        // before the STUN response: skip anything that isn't a STUN
-        // Binding Success Response matching our transaction ID.
         let mut buf = [0u8; 1500];
         loop {
             let (n, from) = socket
@@ -1364,27 +1403,11 @@ async fn stun_binding_mapped_addr(
             if from != stun_addr {
                 continue;
             }
-            let mut response = Message::new();
-            if response.unmarshal_binary(&buf[..n]).is_err() {
-                continue;
+            if let Some(mapped) = parse_stun_binding_response(&buf[..n], request_tid) {
+                return Ok(mapped);
             }
-            if response.transaction_id != request_tid {
-                continue;
-            }
-            if response.typ != rtc::stun::message::BINDING_SUCCESS {
-                return Err(format!(
-                    "STUN server returned non-success class {:?}",
-                    response.typ
-                ));
-            }
-            let mut mapped = XorMappedAddress::default();
-            mapped
-                .get_from(&response)
-                .map_err(|e| format!("parse XOR-MAPPED-ADDRESS: {e}"))?;
-            return Ok(SocketAddr::new(mapped.ip, mapped.port));
         }
     };
-
     match tokio::time::timeout(STUN_BINDING_TIMEOUT, exchange).await {
         Ok(result) => result,
         Err(_) => Err(format!(
@@ -1744,11 +1767,12 @@ impl WebRtcPeer {
     /// broken stream — matches the "no compatible codec, clean
     /// reject" contract from the multi-viewer redesign.
     ///
-    /// `ice_tx` is accepted for API parity with earlier
-    /// implementations but is currently unused: local host
-    /// candidates are emitted inline in the answer SDP, so there is
-    /// nothing to trickle from the server side. The browser still
-    /// trickles its candidates via `add_ice_candidate`.
+    /// `ice_tx` carries server→browser trickle ICE candidates. Host and
+    /// ICE-TCP candidates are emitted inline in the answer SDP, but the
+    /// server-reflexive (srflx) candidate is gathered off the critical
+    /// path by the driver's UDP forwarders (see audit F8) and trickled
+    /// through this channel as it arrives. The browser also trickles its
+    /// own candidates back via `add_ice_candidate`.
     ///
     /// Returns `(peer, encoded_frame_tx, answer_sdp)`. The
     /// `encoded_frame_tx` is the sender side of the per-peer
@@ -1767,7 +1791,7 @@ impl WebRtcPeer {
         clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
         authority_handler: AuthorityChannelHandler,
         tile_control_handler: TileControlHandler,
-        _ice_tx: mpsc::Sender<(PeerId, String)>,
+        ice_tx: mpsc::Sender<(PeerId, String)>,
         keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     ) -> Result<(Self, mpsc::Sender<OutboundEncodedFrame>, String), CallerError> {
         if active_rids.is_empty() {
@@ -1942,13 +1966,12 @@ impl WebRtcPeer {
         // interface and emit a host candidate that exactly matches each
         // socket's local address.
         let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
-        // `(socket, host_base)` for the sockets we successfully added a host
-        // candidate for. Reused below for STUN srflx gathering so the
-        // server-reflexive mapping corresponds to a candidate base ICE
-        // already knows about.
-        let mut srflx_bases: Vec<(Arc<UdpSocket>, SocketAddr)> = Vec::new();
         // WebRTC needs loopback so a browser on the same machine can
-        // pair against the daemon's host candidates.
+        // pair against the daemon's host candidates. Each socket's local
+        // address is also the srflx host base: the driver's forwarders
+        // read it back via `local_addr()` when gathering the srflx
+        // candidate off the critical path (audit F8), so we don't need to
+        // carry the bases separately here.
         let local_addrs = crate::lan::routable_local_addrs(true);
         for iface_addr in &local_addrs {
             let bind_addr = SocketAddr::new(*iface_addr, 0);
@@ -1970,11 +1993,7 @@ impl WebRtcPeer {
             };
             let candidate = host_candidate_init(local, RTCIceProtocol::Udp);
             match rtc.add_local_candidate(candidate) {
-                Ok(()) => {
-                    let socket = Arc::new(socket);
-                    sockets.push(Arc::clone(&socket));
-                    srflx_bases.push((socket, local));
-                }
+                Ok(()) => sockets.push(Arc::new(socket)),
                 Err(e) => eprintln!("[display/webrtc] skipping UDP host candidate {local}: {e}"),
             }
         }
@@ -1997,59 +2016,30 @@ impl WebRtcPeer {
         // ICE will use, the mapping matches the candidate's base, so a 1:1
         // NAT (GCP) returns the public IP the browser can reach directly.
         //
-        // This is a best-effort optimisation layered on top of the host /
-        // ICE-TCP candidates already added above: if there's no STUN server
-        // configured, DNS fails, or the binding times out, we log and carry
-        // on with exactly the candidate set we had before. The query is
-        // time-boxed (`STUN_BINDING_TIMEOUT`) and runs concurrently across
-        // sockets so it never meaningfully delays the answer.
-        let stun_servers = resolve_stun_servers(ice_config).await;
-        if let Some(&stun_addr) = stun_servers.first() {
-            // One Binding Request per socket, run concurrently on a
-            // `JoinSet` (tokio, already a direct dep) so a slow/blocked
-            // socket can't stack its timeout on top of the others. We only
-            // need a single public mapping per base, so we use the first
-            // resolved STUN server address.
-            let mut gathers = tokio::task::JoinSet::new();
-            for (socket, base) in &srflx_bases {
-                let socket = Arc::clone(socket);
-                let base = *base;
-                gathers.spawn(async move {
-                    (base, stun_binding_mapped_addr(&socket, stun_addr).await)
-                });
-            }
-            while let Some(joined) = gathers.join_next().await {
-                let (base, result) = match joined {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        eprintln!("[display/webrtc] peer {peer_id}: srflx gather task failed: {e}");
-                        continue;
-                    }
-                };
-                match result {
-                    Ok(mapped) => {
-                        // Skip a degenerate mapping that equals the base
-                        // (no NAT in front, or STUN reflected loopback) —
-                        // it would duplicate the host candidate.
-                        if mapped == base {
-                            continue;
-                        }
-                        let candidate = srflx_candidate_init(mapped, base);
-                        match rtc.add_local_candidate(candidate) {
-                            Ok(()) => eprintln!(
-                                "[display/webrtc] peer {peer_id}: added srflx candidate {mapped} (base {base})"
-                            ),
-                            Err(e) => eprintln!(
-                                "[display/webrtc] peer {peer_id}: failed to add srflx candidate {mapped}: {e}"
-                            ),
-                        }
-                    }
-                    Err(e) => eprintln!(
-                        "[display/webrtc] peer {peer_id}: srflx gathering for base {base} failed: {e}"
-                    ),
-                }
-            }
-        }
+        // CRITICAL-PATH NOTE (audit F8): the gathering is deliberately NOT
+        // done here. Doing it on the answer path — even concurrently across
+        // sockets — meant every peer setup waited up to STUN_BINDING_TIMEOUT
+        // (1.5s) before `create_answer` whenever the STUN server was
+        // blocked/unreachable (e.g. UDP egress firewalled), since concurrency
+        // only dedupes the one timeout, it does not remove it from the path.
+        //
+        // Instead the srflx candidate is gathered and *trickled*: the answer
+        // below is created and returned to the signaling layer immediately
+        // with host + ICE-TCP candidates, and each per-socket UDP forwarder
+        // in the driver folds a STUN Binding exchange into its read loop
+        // (single reader → no recv race with the ICE traffic the same socket
+        // carries). When a mapping arrives the driver adds the srflx
+        // candidate to its `RTCPeerConnection` and sends it to the browser
+        // over the already-wired server→browser ICE trickle channel
+        // (`ice_tx` → web_gateway `display_ice` → `pc.addIceCandidate`,
+        // which the browser buffers until the answer is applied). A
+        // reachable STUN server therefore still advertises the srflx
+        // candidate (just off the critical path); an unreachable one adds
+        // zero setup latency because nothing on the answer path waits on it.
+        //
+        // The ICE sockets and the STUN server config (`ice_config`) are
+        // handed to the driver below to drive this; each forwarder derives
+        // its socket's host base from `local_addr()`.
 
         // --- ICE-TCP candidate (Host-header derived, pair-friendly) ------
         //
@@ -2251,6 +2241,13 @@ impl WebRtcPeer {
             keyframe_request_tx,
             observed_send_bitrate_tx,
             remote_inbound_health_tx,
+            // F8: srflx gathering is folded into the driver's UDP
+            // forwarders and trickled via `ice_tx`, off the answer path.
+            // `ice_config` carries the STUN server config the driver
+            // resolves (DNS) and queries off-path; cloning a small config
+            // struct keeps that resolution out of `create_answer`.
+            ice_config.clone(),
+            ice_tx,
             shutdown.clone(),
         ));
 
@@ -2819,6 +2816,12 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     keyframe_request_tx: mpsc::Sender<SimulcastRid>,
     observed_send_bitrate_tx: watch::Sender<Option<u64>>,
     remote_inbound_health_tx: watch::Sender<HashMap<SimulcastRid, PeerLayerHealth>>,
+    // F8: STUN config + server→browser trickle channel. The driver
+    // resolves the STUN server (DNS) and gathers the srflx candidate via
+    // its UDP forwarders, all off the peer-setup critical path; `ice_tx`
+    // delivers the resulting candidate to the browser as trickle ICE.
+    ice_config: IceConfig,
+    ice_tx: mpsc::Sender<(PeerId, String)>,
     shutdown: CancellationToken,
 ) {
     if rtp_config.encodings.is_empty() {
@@ -2898,6 +2901,28 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     // owns the connection's write half (see `TcpFrameSender`).
     let mut tcp_senders: HashMap<SocketAddr, TcpFrameSender> = HashMap::new();
 
+    // --- srflx (STUN) gathering, folded into the UDP forwarders ----------
+    //
+    // Audit F8: this is deliberately OFF the peer-setup critical path. By
+    // the time the driver runs, `build_with_codec_set` has already produced
+    // and returned the SDP answer (host + ICE-TCP candidates), so resolving
+    // the STUN server (DNS) and gathering the srflx mapping here add zero
+    // latency to answer creation — a blocked/unreachable STUN server never
+    // delays setup. When a mapping arrives the driver's select loop adds the
+    // srflx candidate to `rtc` and trickles it to the browser via `ice_tx`.
+    //
+    // The exchange is folded *into* each per-socket forwarder rather than
+    // run as a separate task because the forwarder is the single owner of
+    // its socket's `recv_from`; a second concurrent reader would race for
+    // the response (tokio wakes only one waiter, so either side could lose
+    // the datagram). The forwarder sends one Binding Request at startup,
+    // then in its normal read loop hands every datagram that ISN'T our
+    // Binding Success Response on to the RTC core unchanged (so ICE
+    // connectivity checks the same socket carries are never dropped) and
+    // reports the one matching response's mapped address back here.
+    let stun_addr = resolve_stun_servers(&ice_config).await.into_iter().next();
+    let (srflx_tx, mut srflx_rx) = mpsc::channel::<(SocketAddr, SocketAddr)>(sockets.len().max(1));
+
     // Spawn one forwarder task per UDP socket. Each forwarder reads packets
     // from its socket and pushes them into the shared inbound channel,
     // tagged with the socket's local address as the destination. The
@@ -2916,13 +2941,64 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
             Ok(a) => a,
             Err(_) => continue,
         };
+        let srflx_tx = srflx_tx.clone();
         forwarder_handles.push(tokio::spawn(async move {
+            // Fire one STUN Binding Request out this very socket so the
+            // mapping the server reports corresponds to this candidate's
+            // base (a 1:1 NAT returns the public IP:port the browser can
+            // reach directly). `srflx_pending` holds the transaction ID we
+            // expect a matching response to echo; it clears once we've
+            // gathered (or given up after `STUN_BINDING_TIMEOUT`) so we
+            // stop scanning datagrams. With no STUN server configured we
+            // never send and stay a plain forwarder.
+            let mut srflx_pending: Option<rtc::stun::message::TransactionId> = None;
+            if let Some(stun_addr) = stun_addr {
+                match build_stun_binding_request() {
+                    Ok((wire, tid)) => match sock.send_to(&wire, stun_addr).await {
+                        Ok(_) => srflx_pending = Some(tid),
+                        Err(e) => eprintln!(
+                            "[display/webrtc] forwarder {local_addr}: STUN send to {stun_addr} failed: {e}"
+                        ),
+                    },
+                    Err(e) => eprintln!(
+                        "[display/webrtc] forwarder {local_addr}: build STUN request failed: {e}"
+                    ),
+                }
+            }
+            // Off-critical-path deadline after which we stop trying to
+            // gather srflx (the answer is already out; nothing waits on
+            // this). `tokio::time::sleep` is created up front but only
+            // selected on while a request is in flight.
+            let srflx_deadline = tokio::time::sleep(STUN_BINDING_TIMEOUT);
+            tokio::pin!(srflx_deadline);
+
             let mut buf = vec![0u8; UDP_BUF_LEN];
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
+                    // Only armed while a Binding Request is outstanding.
+                    _ = &mut srflx_deadline, if srflx_pending.is_some() => {
+                        srflx_pending = None;
+                    }
                     recv = sock.recv_from(&mut buf) => match recv {
                         Ok((n, source)) => {
+                            // Intercept our own STUN Binding Success
+                            // Response (from the STUN server, matching txid)
+                            // for srflx; everything else — including STUN
+                            // connectivity checks from the browser — falls
+                            // through to the RTC core unchanged.
+                            if let Some(tid) = srflx_pending {
+                                if Some(source) == stun_addr {
+                                    if let Some(mapped) =
+                                        parse_stun_binding_response(&buf[..n], tid)
+                                    {
+                                        srflx_pending = None;
+                                        // Best-effort: driver may have gone.
+                                        let _ = srflx_tx.send((local_addr, mapped)).await;
+                                        continue;
+                                    }
+                                }
+                            }
                             let pkt = InboundPacket {
                                 proto: TransportProtocol::UDP,
                                 source,
@@ -2945,6 +3021,10 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
             }
         }));
     }
+    // The driver keeps no `srflx_tx` of its own; drop the template clone so
+    // `srflx_rx` closes once every forwarder has exited (gathered, given
+    // up, or shut down), letting its select-loop branch go dormant.
+    drop(srflx_tx);
 
     // Phase 4d.1: poll-driven observed-send-bitrate computation.
     // Each tick samples `bytes_sent` per outbound stream and computes
@@ -3199,6 +3279,60 @@ async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
                         let _ = h.await;
                     }
                     return;
+                }
+            }
+            // F8: a UDP forwarder gathered a srflx mapping for its socket.
+            // Add the candidate locally so ICE on the RTC side can form the
+            // srflx pair, and trickle it to the browser via `ice_tx` (the
+            // web gateway forwards it as a `display_ice` frame, which the
+            // browser feeds to `pc.addIceCandidate`, buffering until the
+            // answer is applied). This is best-effort: a failed add/trickle
+            // logs but never tears the peer down — host + ICE-TCP paths
+            // remain. `base` is the gathering socket's local address (the
+            // host candidate's base).
+            Some((base, mapped)) = srflx_rx.recv() => {
+                // Drop a degenerate mapping equal to the base (no NAT in
+                // front, or STUN reflected loopback) — it would duplicate
+                // the host candidate already in the answer SDP.
+                if mapped != base {
+                    let init = srflx_candidate_init(mapped, base);
+                    // Trickle the candidate to the browser using the
+                    // canonical RTCIceCandidate.toJSON() field names
+                    // (camelCase). A single video m-line means
+                    // sdpMLineIndex 0 routes it unambiguously; sdpMid is
+                    // null because the inline host candidates carry no
+                    // per-candidate mid either.
+                    let candidate_json = serde_json::json!({
+                        "candidate": init.candidate,
+                        "sdpMid": serde_json::Value::Null,
+                        "sdpMLineIndex": 0,
+                    })
+                    .to_string();
+                    match rtc.add_local_candidate(init) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[display/webrtc] peer {peer_id}: added srflx candidate {mapped} (base {base}), trickling to browser"
+                            );
+                            if ice_tx.send((peer_id, candidate_json)).await.is_err() {
+                                eprintln!(
+                                    "[display/webrtc] peer {peer_id}: srflx trickle channel closed; candidate added locally only"
+                                );
+                            }
+                            if let Err(e) = rtc.handle_timeout(Instant::now()) {
+                                eprintln!(
+                                    "[display/webrtc] peer {peer_id}: handle_timeout after srflx candidate failed: {e:?}"
+                                );
+                                shutdown.cancel();
+                                for h in forwarder_handles {
+                                    let _ = h.await;
+                                }
+                                return;
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "[display/webrtc] peer {peer_id}: failed to add srflx candidate {mapped}: {e}"
+                        ),
+                    }
                 }
             }
             // Phase 4d.1: observed-send-bitrate poll. Calls
@@ -5013,6 +5147,179 @@ mod tests {
             "returned promptly after timeout, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// `parse_stun_binding_response` is the load-bearing predicate that
+    /// lets the srflx gather be folded into the UDP forwarder's single
+    /// read loop (audit F8): it must return `Some(mapped)` ONLY for the
+    /// Binding Success Response matching the request's transaction ID, and
+    /// `None` for everything else so those datagrams fall through to the
+    /// RTC core. Builds a real `rtc::stun` Binding Success carrying a known
+    /// XOR-MAPPED-ADDRESS.
+    #[test]
+    fn parse_stun_binding_response_matches_only_our_success() {
+        use rtc::stun::message::{Message, Setter, BINDING_SUCCESS};
+        use rtc::stun::xoraddr::XorMappedAddress;
+        use std::net::Ipv4Addr;
+
+        let (_wire, tid) = build_stun_binding_request().expect("build request");
+        let mapped_ip = Ipv4Addr::new(203, 0, 113, 7);
+        let mapped_port = 51234u16;
+        let mut resp = Message::new();
+        resp.build(&[
+            Box::new(tid) as Box<dyn Setter>,
+            Box::new(BINDING_SUCCESS),
+            Box::new(XorMappedAddress {
+                ip: mapped_ip.into(),
+                port: mapped_port,
+            }),
+        ])
+        .unwrap();
+        let success = resp.marshal_binary().unwrap();
+
+        // Matching txid + success class -> the mapped address.
+        assert_eq!(
+            parse_stun_binding_response(&success, tid),
+            Some(SocketAddr::new(mapped_ip.into(), mapped_port)),
+            "matching Binding Success yields its XOR-MAPPED-ADDRESS"
+        );
+
+        // A *different* expected txid must not match (so two sockets'
+        // gathers can't steal each other's responses).
+        let (_w2, other_tid) = build_stun_binding_request().expect("build request");
+        assert_eq!(
+            parse_stun_binding_response(&success, other_tid),
+            None,
+            "transaction-id mismatch is rejected"
+        );
+
+        // A non-STUN datagram (e.g. an ICE connectivity check or media)
+        // must pass through (None) so the forwarder forwards it.
+        assert_eq!(
+            parse_stun_binding_response(b"not a stun message at all", tid),
+            None,
+            "non-STUN bytes are not mistaken for our response"
+        );
+
+        // A STUN Binding *Request* (wrong class) is also not our response.
+        let (request_wire, req_tid) = build_stun_binding_request().expect("build request");
+        assert_eq!(
+            parse_stun_binding_response(&request_wire, req_tid),
+            None,
+            "a non-success STUN class is rejected"
+        );
+    }
+
+    /// The srflx candidate trickled to the browser must carry the
+    /// canonical `RTCIceCandidate.toJSON()` field names so
+    /// `pc.addIceCandidate` accepts it: `candidate` (the SDP attribute
+    /// value), `sdpMid`, and `sdpMLineIndex`. This mirrors the JSON the
+    /// driver builds in the `srflx_rx` select branch; if that shape drifts
+    /// the browser silently drops the candidate and the off-path srflx
+    /// path stops advertising.
+    #[test]
+    fn srflx_trickle_json_has_canonical_candidate_fields() {
+        use std::net::Ipv4Addr;
+        let mapped = SocketAddr::new(Ipv4Addr::new(34, 173, 63, 221).into(), 50000);
+        let base = SocketAddr::new(Ipv4Addr::new(10, 128, 0, 2).into(), 40000);
+        let init = srflx_candidate_init(mapped, base);
+        let candidate_json = serde_json::json!({
+            "candidate": init.candidate,
+            "sdpMid": serde_json::Value::Null,
+            "sdpMLineIndex": 0,
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&candidate_json.to_string()).expect("valid JSON");
+        assert!(
+            v["candidate"]
+                .as_str()
+                .is_some_and(|s| s.contains("typ srflx")),
+            "candidate field carries the srflx SDP attribute: {v}"
+        );
+        assert!(v["sdpMid"].is_null(), "sdpMid present (null): {v}");
+        assert_eq!(
+            v["sdpMLineIndex"].as_u64(),
+            Some(0),
+            "sdpMLineIndex routes to the single video m-line: {v}"
+        );
+    }
+
+    /// Audit F8 regression guard: a blocked/unreachable STUN server must
+    /// NOT delay answer creation. Drives `build_with_codec_set` with a STUN
+    /// URL pointing at a real bound-but-SILENT local UDP socket (it accepts
+    /// the Binding Request but never replies — the same modelling
+    /// `stun_binding_times_out_against_silent_server` uses, robust across
+    /// OSes that would otherwise fast-fail an unroutable send) and asserts
+    /// the answer is produced far inside `STUN_BINDING_TIMEOUT`. The srflx
+    /// gather now runs in the spawned driver, off the critical path, so the
+    /// answer no longer waits on the 1.5s STUN timeout. Under the old
+    /// blocking code this socket forces the full timeout, so the assertion
+    /// fails loudly if blocking ever returns to the answer path. The answer
+    /// still advertises the host candidate inline.
+    #[tokio::test]
+    async fn build_with_codec_set_answer_not_blocked_by_unreachable_stun() {
+        ensure_rustls_crypto_provider();
+        let offer_sdp = synth_recvonly_video_offer_for_rtc();
+        let active_rids = vec![SimulcastRid::full()];
+        // Bound-but-silent UDP socket: accepts the request, never answers.
+        // Held for the duration so the OS keeps the port reserved.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        // Literal-IP STUN URL (no DNS on the path either).
+        let ice_config = IceConfig {
+            ice_servers: vec![crate::display::IceServer {
+                urls: vec![format!("stun:{}:{}", silent_addr.ip(), silent_addr.port())],
+                username: None,
+                credential: None,
+            }],
+        };
+        let input_handler: Arc<dyn Fn(InputEvent) + Send + Sync> = Arc::new(|_| {});
+        let clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync> = Arc::new(|_| {});
+        let authority_handler = noop_authority_handler();
+        let tile_control_handler = noop_tile_control_handler();
+        let (ice_tx, _ice_rx) = mpsc::channel::<(PeerId, String)>(8);
+        let (kf_tx, _kf_rx) = mpsc::channel::<SimulcastRid>(8);
+
+        let started = std::time::Instant::now();
+        let (peer, _frame_tx, answer_sdp) = WebRtcPeer::build_with_codec_set(
+            7,
+            &offer_sdp,
+            CodecKind::Vp8,
+            &active_rids,
+            &ice_config,
+            None,
+            None,
+            input_handler,
+            clipboard_handler,
+            authority_handler,
+            tile_control_handler,
+            ice_tx,
+            kf_tx,
+        )
+        .await
+        .expect("answer must be produced despite unreachable STUN");
+        let elapsed = started.elapsed();
+
+        // The whole point of F8: well under the STUN binding timeout. A
+        // generous fraction (half) leaves headroom for slow CI while still
+        // failing loudly if the blocking gather ever returns to the path.
+        assert!(
+            elapsed < STUN_BINDING_TIMEOUT / 2,
+            "answer creation blocked on STUN ({elapsed:?} >= {:?}/2)",
+            STUN_BINDING_TIMEOUT
+        );
+        // Host (UDP) candidate is still advertised inline in the answer.
+        assert!(
+            answer_sdp.contains("typ host"),
+            "answer advertises host candidate(s): {answer_sdp}"
+        );
+        // srflx is gathered off-path in the driver and would be trickled
+        // via `ice_tx` only if reachable — it must NOT appear inline.
+        assert!(
+            !answer_sdp.contains("typ srflx"),
+            "srflx is trickled, not emitted inline in the answer: {answer_sdp}"
+        );
+        peer.close().await;
     }
 
     #[test]

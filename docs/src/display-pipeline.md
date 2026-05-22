@@ -30,9 +30,13 @@ Uses PipeWire with DMA-BUF for zero-copy capture directly from the compositor. y
 
 Uses ScreenCaptureKit for capture and cliclick for input injection.
 
+### Windows
+
+Captures the DWM-composed desktop via GDI `BitBlt` by default — the path that works on virtual / RDP / cloud / headless adapters — with DXGI Desktop Duplication available as an opt-in GPU fast path (`INTENDANT_WINDOWS_CAPTURE=dxgi`) on hosts with real scanout. `SendInput` handles keyboard and mouse injection, and encode targets Media Foundation H264. See [Windows Support](./windows-support.md) for details and current maturity.
+
 ### Display Detection
 
-The `DisplayBackend` enum auto-detects the available backend at runtime. On Linux, it checks for Wayland (`WAYLAND_DISPLAY`) before falling back to X11 (`DISPLAY`). On macOS, the native backend is always used.
+The `DisplayBackend` enum auto-detects the available backend at runtime. On Linux, it checks for Wayland (`WAYLAND_DISPLAY`) before falling back to X11 (`DISPLAY`). On macOS and Windows, the native backend is always used.
 
 ## Video Encoding
 

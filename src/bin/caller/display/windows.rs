@@ -301,6 +301,11 @@ fn enumerate_displays_blocking() -> Vec<super::DisplayInfo> {
     // Adapter loop. In practice a single adapter drives every monitor on a
     // typical machine, but a multi-GPU host can spread outputs across
     // adapters, so we walk every adapter and keep a global output ordinal.
+    //
+    // SAFETY (whole loop): `factory` is the live DXGI factory; `EnumAdapters` /
+    // `EnumOutputs` are index-driven enumerators returning either a new
+    // RAII-owned interface or an error that terminates the walk. Each `output`
+    // passed to `get_output_desc` is the live interface just enumerated.
     let mut adapter_index = 0u32;
     loop {
         let adapter: IDXGIAdapter = match unsafe { factory.EnumAdapters(adapter_index) } {
@@ -377,6 +382,8 @@ fn device_name_from_desc(desc: &DXGI_OUTPUT_DESC) -> String {
 /// # Safety
 /// `output` must be a valid `IDXGIOutput`.
 unsafe fn get_output_desc(output: &IDXGIOutput) -> Option<DXGI_OUTPUT_DESC> {
+    // SAFETY: per the fn contract `output` is a valid `IDXGIOutput`; `GetDesc`
+    // returns the populated desc by value (no caller-supplied pointers).
     output.GetDesc().ok()
 }
 
@@ -384,6 +391,8 @@ unsafe fn get_output_desc(output: &IDXGIOutput) -> Option<DXGI_OUTPUT_DESC> {
 /// and capture setup.
 fn create_dxgi_factory() -> windows::core::Result<windows::Win32::Graphics::Dxgi::IDXGIFactory1>
 {
+    // SAFETY: `CreateDXGIFactory1` takes no arguments and returns a fresh
+    // RAII-owned factory interface.
     unsafe { windows::Win32::Graphics::Dxgi::CreateDXGIFactory1() }
 }
 
@@ -653,6 +662,8 @@ fn send_mouse_absolute(
 /// Read the virtual-screen extents (origin + size across all monitors).
 /// Returns `(left, top, width, height)` in physical pixels.
 fn virtual_screen_metrics() -> (i32, i32, i32, i32) {
+    // SAFETY: `GetSystemMetrics` takes a scalar metric index and returns an
+    // `i32` — no pointers, no state, always sound to call.
     unsafe {
         let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
         let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -724,6 +735,10 @@ fn map_normalized_to_virtualdesk_abs(
 /// Submit a single `INPUT` to `SendInput`, returning an error if the system
 /// rejected it (e.g. blocked by `UIPI`, or a higher-integrity foreground app).
 fn send_one_input(input: &INPUT) -> Result<(), CallerError> {
+    // SAFETY: `SendInput` reads a slice of `INPUT` structs whose count and
+    // element size we pass explicitly. We hand it a one-element slice and
+    // `size_of::<INPUT>()`, so the count/stride match the buffer exactly; the
+    // slice is valid for the duration of the (synchronous) call.
     let sent = unsafe { SendInput(&[*input], std::mem::size_of::<INPUT>() as i32) };
     if sent == 1 {
         Ok(())
@@ -766,6 +781,10 @@ fn init_duplication(
     let mut context: Option<ID3D11DeviceContext> = None;
     let mut feature_level = D3D_FEATURE_LEVEL::default();
 
+    // SAFETY: `&feature_levels` is a stack array we own; the device / context /
+    // feature-level out-params are `&mut Option<…>`/`&mut` locals D3D11 fills
+    // with RAII-owned interfaces (released on drop). No adapter or sw-rasterizer
+    // module is supplied (the `None`/`default` args), which is valid.
     let hr = unsafe {
         D3D11CreateDevice(
             None, // default adapter
@@ -788,6 +807,8 @@ fn init_duplication(
     let dxgi_device: IDXGIDevice = device
         .cast()
         .map_err(|e| format!("ID3D11Device -> IDXGIDevice: {e}"))?;
+    // SAFETY: `dxgi_device` is the live device cast from `device`; `GetAdapter`
+    // returns a new RAII-owned adapter interface.
     let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }
         .map_err(|e| format!("IDXGIDevice::GetAdapter: {e}"))?;
 
@@ -798,6 +819,10 @@ fn init_duplication(
     let output1: IDXGIOutput1 = output
         .cast()
         .map_err(|e| format!("IDXGIOutput -> IDXGIOutput1: {e}"))?;
+    // SAFETY: `output1` is the live output and `&device` the live device that
+    // will own the duplication; `DuplicateOutput` returns a RAII-owned
+    // `IDXGIOutputDuplication` (or an error on a headless/Session-0/exclusive
+    // host).
     let duplication = unsafe { output1.DuplicateOutput(&device) }.map_err(|e| {
         format!(
             "IDXGIOutput1::DuplicateOutput: {e} (Desktop Duplication is \
@@ -832,6 +857,9 @@ fn select_output(
     adapter: &IDXGIAdapter,
     target_output: Option<u32>,
 ) -> Result<(IDXGIOutput, i32, i32, u32, u32), String> {
+    // SAFETY (whole fn): `adapter` is the live adapter passed in; `EnumOutputs`
+    // returns a new RAII-owned output (or an error) for the given index, and
+    // each `get_output_desc` runs on the output just enumerated.
     if let Some(idx) = target_output {
         let output: IDXGIOutput = unsafe { adapter.EnumOutputs(idx) }
             .map_err(|e| format!("EnumOutputs({idx}): {e}"))?;
@@ -892,6 +920,9 @@ fn ensure_staging(dup: &mut Duplication, w: u32, h: u32) -> Result<ID3D11Texture
     };
 
     let mut texture: Option<ID3D11Texture2D> = None;
+    // SAFETY: `dup.device` is the live D3D11 device; `&desc` is a fully
+    // initialized descriptor we own and `&mut texture` an out-param the device
+    // fills with a RAII-owned texture (no initial data, hence `None`).
     unsafe {
         dup.device
             .CreateTexture2D(&desc, None, Some(&mut texture))
@@ -1082,6 +1113,10 @@ fn acquire_and_copy(
     let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
     let mut resource: Option<windows::Win32::Graphics::Dxgi::IDXGIResource> = None;
 
+    // SAFETY: `dup.duplication` is the live duplication interface; the out-params
+    // `frame_info`/`resource` are stack locals we own. On `Ok`, `resource` holds
+    // a new ref that the closure below releases (and `ReleaseFrame` pairs the
+    // acquire on every exit path).
     let acquire = unsafe {
         dup.duplication
             .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)
@@ -1108,6 +1143,8 @@ fn acquire_and_copy(
         // Read the source dimensions from its desc; the output rect can lag a
         // resolution change by a frame, so trust the texture.
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `src_texture` is the live texture cast from the acquired
+        // resource; `GetDesc` fills the `&mut src_desc` we own.
         unsafe { src_texture.GetDesc(&mut src_desc) };
         let width = src_desc.Width & !1;
         let height = src_desc.Height & !1;
@@ -1115,10 +1152,17 @@ fn acquire_and_copy(
         let staging = ensure_staging(dup, width, height).map_err(CaptureError::Fatal)?;
 
         // GPU copy from the acquired frame into the CPU-readable staging tex.
+        // SAFETY: both textures are live D3D11 resources on `dup.context`;
+        // `ensure_staging` sized `staging` to match `src_texture`, which is what
+        // `CopyResource` (a whole-resource copy) requires.
         unsafe { dup.context.CopyResource(&staging, &src_texture) };
 
         // Map and copy out the BGRA rows.
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: `staging` is a CPU-readable (D3D11_USAGE_STAGING + READ) live
+        // texture; `Map` fills `mapped` with a base pointer + row pitch valid
+        // until the paired `Unmap` below. Errors propagate without an Unmap
+        // (nothing was mapped on the error path).
         unsafe {
             dup.context
                 .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
@@ -1128,6 +1172,13 @@ fn acquire_and_copy(
         let stride = mapped.RowPitch;
         let row_bytes = (width as usize) * 4;
         let mut data = vec![0u8; row_bytes * height as usize];
+        // SAFETY: `mapped.pData` points at the mapped surface; each source row
+        // starts at `row * stride` (the driver-reported `RowPitch`, always
+        // >= `row_bytes`) and is valid for the `height` rows the surface holds.
+        // Each destination offset `row * row_bytes` is in-bounds for `data`
+        // (sized `row_bytes * height`), and we copy exactly `row_bytes` per row.
+        // Source and destination are distinct allocations. `Unmap` pairs the
+        // `Map` before the surface pointer goes out of use.
         unsafe {
             let src_base = mapped.pData as *const u8;
             for row in 0..height as usize {
@@ -1155,6 +1206,9 @@ fn acquire_and_copy(
     })();
 
     // Release the acquired frame unconditionally.
+    // SAFETY: pairs the successful `AcquireNextFrame` above (we only reach here
+    // after a non-error acquire); releasing exactly once per acquire is the
+    // documented contract.
     let _ = unsafe { dup.duplication.ReleaseFrame() };
 
     result.map(Some)
@@ -1195,6 +1249,11 @@ impl Drop for DesktopGuard {
     fn drop(&mut self) {
         if !self.handle.is_invalid() {
             // Best-effort: the thread is ending, so a failure here is inert.
+            // SAFETY: `self.handle` is the non-invalid `HDESK` this guard owns
+            // (from `OpenInputDesktop`/`OpenDesktopW`); closing it exactly once at
+            // drop matches the open. A close that fails because the desktop is
+            // still the thread's current desktop is harmless — the OS reclaims it
+            // as the thread exits.
             let _ = unsafe { CloseDesktop(self.handle) };
         }
     }
@@ -1232,6 +1291,9 @@ impl Drop for DesktopGuard {
 fn bind_thread_to_input_desktop(thread_label: &str) -> Option<DesktopGuard> {
     // `OpenInputDesktop` opens the desktop currently receiving input — the one
     // on screen. DESKTOP_READOBJECTS is the access needed to read its surface.
+    // SAFETY: `OpenInputDesktop` takes scalar flags/access args and returns a new
+    // `HDESK` we own; on success ownership passes to the `DesktopGuard` (or is
+    // explicitly closed on the `SetThreadDesktop` failure path below).
     let handle = match unsafe {
         OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS)
     } {
@@ -1258,6 +1320,11 @@ fn bind_thread_to_input_desktop(thread_label: &str) -> Option<DesktopGuard> {
         }
     };
 
+    // SAFETY: `handle` is the live, non-invalid `HDESK` opened just above.
+    // `SetThreadDesktop` associates it with the calling thread; on success the
+    // returned `DesktopGuard` keeps the handle alive (and closes it) for the
+    // whole capture loop, which is required because the binding must outlive
+    // every GDI/DXGI op on this thread.
     match unsafe { SetThreadDesktop(handle) } {
         Ok(()) => {
             eprintln!(
@@ -1273,6 +1340,8 @@ fn bind_thread_to_input_desktop(thread_label: &str) -> Option<DesktopGuard> {
                 "[display/windows] {thread_label}: SetThreadDesktop failed ({e}); \
                  capturing on the thread's existing desktop"
             );
+            // SAFETY: the bind failed so no `DesktopGuard` will own `handle`;
+            // close the handle we opened exactly once here to avoid leaking it.
             let _ = unsafe { CloseDesktop(handle) };
             None
         }
@@ -1285,6 +1354,9 @@ fn open_default_desktop() -> Option<HDESK> {
     // UTF-16, NUL-terminated "Default".
     let name: Vec<u16> = "Default\0".encode_utf16().collect();
     let pcwstr = windows::core::PCWSTR::from_raw(name.as_ptr());
+    // SAFETY: `pcwstr` points at `name`, a NUL-terminated UTF-16 buffer that
+    // outlives this call (it's still in scope). `OpenDesktopW` only reads the
+    // string and returns a new `HDESK` we own.
     match unsafe {
         OpenDesktopW(
             pcwstr,
@@ -1334,6 +1406,8 @@ fn resolve_capture_rect(target_output: Option<u32>) -> Result<(i32, i32, u32, u3
         }
     }
 
+    // SAFETY: `GetSystemMetrics` takes a scalar metric index and returns an
+    // `i32`; no pointers or state, always sound to call.
     let (w, h) = unsafe {
         (
             GetSystemMetrics(SM_CXSCREEN).max(0) as u32,
@@ -1354,6 +1428,9 @@ fn resolve_capture_rect(target_output: Option<u32>) -> Result<(i32, i32, u32, u3
 fn output_rect_for_ordinal(target: u32) -> Result<(i32, i32, u32, u32), String> {
     let factory = create_dxgi_factory().map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
 
+    // SAFETY (whole loop): `factory` is the live DXGI factory; `EnumAdapters` /
+    // `EnumOutputs` return a new RAII-owned interface or an error that ends the
+    // walk, and `get_output_desc` below runs on the live output just enumerated.
     let mut ordinal = 0u32;
     let mut adapter_index = 0u32;
     loop {
@@ -1421,13 +1498,19 @@ impl GdiCapture {
         // Whole-screen DC. `GetDC(None)` returns the DC for the entire screen
         // (the virtual desktop's primary surface); `BitBlt`'s source x/y then
         // index into it, so a secondary monitor's offset rect reads correctly.
+        // SAFETY: `GetDC(None)` takes no pointer args and returns the screen DC,
+        // which we own and release in `free`/`Drop` (or on the error paths below).
         let screen_dc = unsafe { GetDC(None) };
         if screen_dc.is_invalid() {
             return Err("GetDC(None) returned a null screen DC".into());
         }
 
+        // SAFETY: `screen_dc` is the valid DC just acquired; `CreateCompatibleDC`
+        // returns a memory DC we own.
         let mem_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
         if mem_dc.is_invalid() {
+            // SAFETY: release the screen DC we acquired before bailing; `screen_dc`
+            // is still valid and `None` matches the `GetDC(None)` window arg.
             unsafe {
                 ReleaseDC(None, screen_dc);
             }
@@ -1453,6 +1536,10 @@ impl GdiCapture {
         };
 
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `mem_dc` is valid and `&bmi` is a fully-initialized header we
+        // own; `CreateDIBSection` writes the DIB's pixel-storage pointer into
+        // `&mut bits` (GDI owns that memory for the `HBITMAP`'s lifetime) and
+        // returns the `HBITMAP` we own.
         let dib = unsafe {
             CreateDIBSection(
                 Some(mem_dc),
@@ -1466,6 +1553,8 @@ impl GdiCapture {
         .map_err(|e| format!("CreateDIBSection ({width}x{height}): {e}"))?;
 
         if dib.is_invalid() || bits.is_null() {
+            // SAFETY: nothing has been selected into `mem_dc` yet; delete it and
+            // release the screen DC (both still valid) before bailing.
             unsafe {
                 let _ = DeleteDC(mem_dc);
                 ReleaseDC(None, screen_dc);
@@ -1474,6 +1563,9 @@ impl GdiCapture {
         }
 
         // Select the DIB into the memory DC so BitBlt writes into its bits.
+        // SAFETY: `mem_dc` and `dib` are both valid; `SelectObject` returns the
+        // previously selected object, which we keep in `old_obj` to restore
+        // before deleting the DIB in `free` (a DIB still selected can't be freed).
         let old_obj = unsafe { SelectObject(mem_dc, HGDIOBJ::from(dib)) };
 
         Ok(Self {
@@ -1498,6 +1590,9 @@ impl GdiCapture {
     /// user sees -- the same flags PowerShell's `CopyFromScreen` uses under the
     /// hood and which captured the real desktop on the cloud VM.
     fn grab(&self) -> Result<Frame, String> {
+        // SAFETY: `mem_dc` (destination) and `screen_dc` (source) are the valid
+        // DCs this `GdiCapture` owns; the blit rect (`width`×`height` from the
+        // source `x`/`y`) was sized to match the DIB selected into `mem_dc`.
         unsafe {
             BitBlt(
                 self.mem_dc,
@@ -1519,6 +1614,11 @@ impl GdiCapture {
         // The DIB is top-down and tightly packed at 32bpp, so its stride is
         // exactly `width * 4` -- a single contiguous copy suffices (no per-row
         // RowPitch stride to step over, unlike the DXGI staging map).
+        // SAFETY: `self.bits` points at the GDI-owned DIB storage (still alive —
+        // the `HBITMAP` is selected into `mem_dc`), which holds exactly
+        // `width * height * 4` = `total` bytes; `data` is sized to `total`.
+        // Distinct allocations, so the copy can't overlap. The `BitBlt` above
+        // just refreshed those bits.
         unsafe {
             std::ptr::copy_nonoverlapping(self.bits as *const u8, data.as_mut_ptr(), total);
         }
@@ -1537,6 +1637,11 @@ impl GdiCapture {
     /// original selection, delete the DIB, delete the memory DC, release the
     /// screen DC. Idempotent enough for the single `Drop` call.
     fn free(&mut self) {
+        // SAFETY: each handle is checked non-invalid before use and freed exactly
+        // once (the fields are nulled afterward so a second `free` is a no-op).
+        // The order is the GDI-mandated reverse of `new`: restore the original
+        // selection so the DIB is no longer in use, delete the DIB, delete the
+        // memory DC, release the screen DC.
         unsafe {
             // Restore the previously selected object so the DIB is no longer in
             // use, then it can be deleted.

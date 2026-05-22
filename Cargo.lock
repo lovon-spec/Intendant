@@ -2129,6 +2129,7 @@ dependencies = [
  "rustls-pemfile",
  "schemars",
  "screencapturekit",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
