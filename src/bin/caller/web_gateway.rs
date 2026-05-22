@@ -29,10 +29,18 @@ static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION_SEARCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static EXTERNAL_TRANSCRIPT_CACHE: OnceLock<Mutex<HashMap<String, ExternalTranscriptCacheEntry>>> =
     OnceLock::new();
+static SESSION_LIST_ROW_CACHE: OnceLock<Mutex<HashMap<String, SessionListRowCacheEntry>>> =
+    OnceLock::new();
+static CODEX_SESSION_LIST_CACHE: OnceLock<Mutex<HashMap<String, CodexSessionListCacheEntry>>> =
+    OnceLock::new();
+static INTENDANT_SESSION_LIST_CACHE: OnceLock<
+    Mutex<HashMap<String, IntendantSessionListCacheEntry>>,
+> = OnceLock::new();
 
 const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
 const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
+const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_SOURCE_FLOOR: usize = 100;
 const SESSION_LOG_SEARCH_LIMIT: usize = 150;
@@ -55,6 +63,69 @@ struct ExternalTranscriptCacheKey {
 struct ExternalTranscriptCacheEntry {
     key: ExternalTranscriptCacheKey,
     entries: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionListCacheKey {
+    namespace: &'static str,
+    path: String,
+    len: u64,
+    mtime_nanos: u128,
+    ctime_nanos: i128,
+    dev: u64,
+    ino: u64,
+    extra: String,
+}
+
+#[derive(Clone, Debug)]
+struct SessionListRowCacheEntry {
+    key: SessionListCacheKey,
+    row: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+struct CodexSessionListSummary {
+    id: String,
+    created_at: Option<String>,
+    session_cwd: Option<String>,
+    effective_cwd: Option<String>,
+    model: Option<String>,
+    parent_id: Option<String>,
+    provider: Option<String>,
+    usage: SessionUsage,
+    task: Option<String>,
+    turns: u64,
+    file_updated_at: Option<String>,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CodexSessionListCacheEntry {
+    key: SessionListCacheKey,
+    summary: CodexSessionListSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionDirFingerprint {
+    path: String,
+    entries: Vec<SessionFileFingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionFileFingerprint {
+    rel: String,
+    len: u64,
+    mtime_nanos: u128,
+    ctime_nanos: i128,
+    dev: u64,
+    ino: u64,
+    is_dir: bool,
+}
+
+#[derive(Clone, Debug)]
+struct IntendantSessionListCacheEntry {
+    fingerprint: SessionDirFingerprint,
+    row: serde_json::Value,
 }
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
@@ -2608,6 +2679,24 @@ fn codex_line_may_affect_replay(line: &str) -> bool {
     }
 }
 
+fn codex_line_may_affect_session_list(line: &str) -> bool {
+    let Ok(kind) = serde_json::from_str::<ExternalJsonLineKind<'_>>(line) else {
+        return true;
+    };
+    let payload_kind = kind
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.kind.as_deref());
+    match (kind.kind.as_deref(), payload_kind) {
+        (Some("session_meta" | "turn_context"), _) => true,
+        (Some("event_msg"), _) => true,
+        (Some("response_item"), Some("message" | "function_call")) => true,
+        (Some("response_item"), None) => true,
+        (None, _) => true,
+        _ => false,
+    }
+}
+
 fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
     if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
         return None;
@@ -2784,6 +2873,146 @@ fn metadata_mtime_nanos(metadata: &std::fs::Metadata) -> u128 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+fn metadata_ctime_nanos(metadata: &std::fs::Metadata) -> i128 {
+    metadata.ctime() as i128 * 1_000_000_000 + metadata.ctime_nsec() as i128
+}
+
+fn session_list_path_key(path: &Path) -> String {
+    let normalized = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalized.to_string_lossy().to_string()
+}
+
+fn file_dependency_fingerprint(path: &Path) -> String {
+    let path_key = session_list_path_key(path);
+    match std::fs::metadata(path) {
+        Ok(metadata) => format!(
+            "{path_key}\0{}\0{}\0{}\0{}\0{}",
+            metadata.len(),
+            metadata_mtime_nanos(&metadata),
+            metadata_ctime_nanos(&metadata),
+            metadata.dev(),
+            metadata.ino()
+        ),
+        Err(_) => format!("{path_key}\0missing"),
+    }
+}
+
+fn session_list_cache_key(
+    namespace: &'static str,
+    path: &Path,
+    extra: impl Into<String>,
+) -> Option<SessionListCacheKey> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(SessionListCacheKey {
+        namespace,
+        path: session_list_path_key(path),
+        len: metadata.len(),
+        mtime_nanos: metadata_mtime_nanos(&metadata),
+        ctime_nanos: metadata_ctime_nanos(&metadata),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        extra: extra.into(),
+    })
+}
+
+fn session_list_cache_slot(key: &SessionListCacheKey) -> String {
+    format!("{}\0{}\0{}", key.namespace, key.path, key.extra)
+}
+
+fn session_list_row_cache() -> &'static Mutex<HashMap<String, SessionListRowCacheEntry>> {
+    SESSION_LIST_ROW_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_session_list_row(key: &SessionListCacheKey) -> Option<serde_json::Value> {
+    let slot = session_list_cache_slot(key);
+    let cache = session_list_row_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&slot)
+        .filter(|entry| &entry.key == key)
+        .map(|entry| entry.row.clone())
+}
+
+fn store_session_list_row(key: SessionListCacheKey, row: &serde_json::Value) {
+    let slot = session_list_cache_slot(&key);
+    let mut cache = session_list_row_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        SessionListRowCacheEntry {
+            key,
+            row: row.clone(),
+        },
+    );
+}
+
+fn codex_session_list_cache() -> &'static Mutex<HashMap<String, CodexSessionListCacheEntry>> {
+    CODEX_SESSION_LIST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_codex_session_list_entry(
+    key: &SessionListCacheKey,
+) -> Option<CodexSessionListCacheEntry> {
+    let slot = session_list_cache_slot(key);
+    let cache = codex_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.get(&slot).filter(|entry| &entry.key == key).cloned()
+}
+
+fn store_codex_session_list_entry(key: SessionListCacheKey, summary: CodexSessionListSummary) {
+    let slot = session_list_cache_slot(&key);
+    let mut cache = codex_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(slot, CodexSessionListCacheEntry { key, summary });
+}
+
+fn intendant_session_list_cache() -> &'static Mutex<HashMap<String, IntendantSessionListCacheEntry>>
+{
+    INTENDANT_SESSION_LIST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_intendant_session_list_row(
+    fingerprint: &SessionDirFingerprint,
+) -> Option<serde_json::Value> {
+    let cache = intendant_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&fingerprint.path)
+        .filter(|entry| &entry.fingerprint == fingerprint)
+        .map(|entry| entry.row.clone())
+}
+
+fn store_intendant_session_list_row(fingerprint: SessionDirFingerprint, row: &serde_json::Value) {
+    let slot = fingerprint.path.clone();
+    let mut cache = intendant_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        IntendantSessionListCacheEntry {
+            fingerprint,
+            row: row.clone(),
+        },
+    );
 }
 
 fn collect_recent_files(root: &Path, suffix: &str, limit: usize) -> Vec<PathBuf> {
@@ -3272,6 +3501,152 @@ fn resolve_codex_inherited_model(
     None
 }
 
+fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListSummary> {
+    let key = session_list_cache_key("codex", path, "")?;
+    if let Some(entry) = cached_codex_session_list_entry(&key) {
+        return Some(entry.summary);
+    }
+
+    let contents = read_text_head_tail(
+        path,
+        EXTERNAL_SESSION_READ_LIMIT,
+        EXTERNAL_SESSION_READ_LIMIT,
+    )?;
+    let mut id = None;
+    let mut created_at = None;
+    let mut session_cwd = None;
+    let mut turn_cwd = None;
+    let mut command_cwd = None;
+    let mut model = None;
+    let mut forked_from_id = None;
+    let mut provider = Some("Codex".to_string());
+    let mut usage = SessionUsage::default();
+    let mut task_started_turns = 0u64;
+    let mut saw_user_message_event = false;
+    let mut event_user_turns: Vec<Option<String>> = Vec::new();
+    let mut fallback_user_turns: Vec<Option<String>> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || !codex_line_may_affect_session_list(line) {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "session_meta" => {
+                if let Some(payload) = obj.get("payload") {
+                    id = id.or_else(|| value_str(payload, "id"));
+                    forked_from_id =
+                        forked_from_id.or_else(|| value_str(payload, "forked_from_id"));
+                    created_at = created_at.or_else(|| value_str(payload, "timestamp"));
+                    if let Some(value) = value_str(payload, "cwd") {
+                        if session_cwd.is_none() {
+                            session_cwd = Some(value);
+                        }
+                    }
+                    model = model.or_else(|| value_str(payload, "model"));
+                    provider = value_str(payload, "model_provider").or(provider);
+                }
+            }
+            "turn_context" => {
+                if let Some(payload) = obj.get("payload") {
+                    if let Some(value) = value_str(payload, "cwd") {
+                        if session_cwd.is_none() {
+                            session_cwd = Some(value.clone());
+                        }
+                        turn_cwd = Some(value);
+                    }
+                    model = model.or_else(|| value_str(payload, "model"));
+                }
+            }
+            "event_msg" => {
+                if let Some(payload) = obj.get("payload") {
+                    let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if payload_type.starts_with("exec_command") {
+                        if let Some(value) = value_str(payload, "cwd") {
+                            command_cwd = Some(value);
+                        }
+                    }
+                    match payload_type {
+                        "task_started" => {
+                            task_started_turns += 1;
+                        }
+                        "token_count" => {
+                            if let Some(parsed) = codex_session_usage_from_payload(payload) {
+                                usage = parsed;
+                            }
+                        }
+                        "user_message" => {
+                            saw_user_message_event = true;
+                            let text = value_str(payload, "message")
+                                .filter(|s| !s.trim().is_empty())
+                                .map(|s| compact_text(&s, 180));
+                            event_user_turns.push(text);
+                        }
+                        "thread_rolled_back" => {
+                            let num_turns = payload
+                                .get("num_turns")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            for _ in 0..num_turns {
+                                let _ = event_user_turns.pop();
+                                let _ = fallback_user_turns.pop();
+                            }
+                            task_started_turns = task_started_turns.saturating_sub(num_turns);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "response_item" => {
+                if let Some(payload) = obj.get("payload") {
+                    if let Some(value) = codex_exec_command_workdir(payload) {
+                        command_cwd = Some(value);
+                    }
+                    if let Some((role, text)) = codex_payload_text(payload) {
+                        if role == "user" && !is_codex_injected_user_text(&text) {
+                            fallback_user_turns.push(Some(compact_text(&text, 180)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let id = id?;
+    let task = event_user_turns
+        .iter()
+        .find_map(|t| t.clone())
+        .or_else(|| fallback_user_turns.iter().find_map(|t| t.clone()));
+    let turns = if saw_user_message_event {
+        event_user_turns.len() as u64
+    } else if task_started_turns > 0 {
+        task_started_turns
+    } else if !fallback_user_turns.is_empty() {
+        fallback_user_turns.len() as u64
+    } else {
+        0
+    };
+    let effective_cwd = command_cwd.or(turn_cwd).or_else(|| session_cwd.clone());
+    let summary = CodexSessionListSummary {
+        id,
+        created_at,
+        session_cwd,
+        effective_cwd,
+        model,
+        parent_id: forked_from_id,
+        provider,
+        usage,
+        task,
+        turns,
+        file_updated_at: file_mtime_string(path),
+        bytes: file_size(path),
+    };
+    store_codex_session_list_entry(key, summary.clone());
+    Some(summary)
+}
+
 fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
     let mut model_by_id: HashMap<String, String> = HashMap::new();
@@ -3323,119 +3698,14 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
     files.truncate(EXTERNAL_SESSION_SCAN_LIMIT);
     for path in files {
-        let Some(contents) = read_text_head_tail(
-            &path,
-            EXTERNAL_SESSION_READ_LIMIT,
-            EXTERNAL_SESSION_READ_LIMIT,
-        ) else {
+        let Some(summary) = codex_session_list_summary_from_file(&path) else {
             continue;
         };
-        let mut id = None;
-        let mut created_at = None;
-        let mut session_cwd = None;
-        let mut turn_cwd = None;
-        let mut command_cwd = None;
-        let mut model = None;
-        let mut forked_from_id = None;
-        let mut provider = Some("Codex".to_string());
-        let mut usage = SessionUsage::default();
-        let mut task_started_turns = 0u64;
-        let mut saw_user_message_event = false;
-        let mut event_user_turns: Vec<Option<String>> = Vec::new();
-        let mut fallback_user_turns: Vec<Option<String>> = Vec::new();
-        for line in contents.lines() {
-            let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                "session_meta" => {
-                    if let Some(payload) = obj.get("payload") {
-                        id = id.or_else(|| value_str(payload, "id"));
-                        forked_from_id =
-                            forked_from_id.or_else(|| value_str(payload, "forked_from_id"));
-                        created_at = created_at.or_else(|| value_str(payload, "timestamp"));
-                        if let Some(value) = value_str(payload, "cwd") {
-                            if session_cwd.is_none() {
-                                session_cwd = Some(value);
-                            }
-                        }
-                        model = model.or_else(|| value_str(payload, "model"));
-                        provider = value_str(payload, "model_provider").or(provider);
-                    }
-                }
-                "turn_context" => {
-                    if let Some(payload) = obj.get("payload") {
-                        if let Some(value) = value_str(payload, "cwd") {
-                            if session_cwd.is_none() {
-                                session_cwd = Some(value.clone());
-                            }
-                            turn_cwd = Some(value);
-                        }
-                        model = model.or_else(|| value_str(payload, "model"));
-                    }
-                }
-                "event_msg" => {
-                    if let Some(payload) = obj.get("payload") {
-                        let payload_type =
-                            payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        if payload_type.starts_with("exec_command") {
-                            if let Some(value) = value_str(payload, "cwd") {
-                                command_cwd = Some(value);
-                            }
-                        }
-                        match payload_type {
-                            "task_started" => {
-                                task_started_turns += 1;
-                            }
-                            "token_count" => {
-                                if let Some(parsed) = codex_session_usage_from_payload(payload) {
-                                    usage = parsed;
-                                }
-                            }
-                            "user_message" => {
-                                saw_user_message_event = true;
-                                let text = value_str(payload, "message")
-                                    .filter(|s| !s.trim().is_empty())
-                                    .map(|s| compact_text(&s, 180));
-                                event_user_turns.push(text);
-                            }
-                            "thread_rolled_back" => {
-                                let num_turns = payload
-                                    .get("num_turns")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                for _ in 0..num_turns {
-                                    let _ = event_user_turns.pop();
-                                    let _ = fallback_user_turns.pop();
-                                }
-                                task_started_turns = task_started_turns.saturating_sub(num_turns);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                "response_item" => {
-                    if let Some(payload) = obj.get("payload") {
-                        if let Some(value) = codex_exec_command_workdir(payload) {
-                            command_cwd = Some(value);
-                        }
-                        if let Some((role, text)) = codex_payload_text(payload) {
-                            if role == "user" && !is_codex_injected_user_text(&text) {
-                                fallback_user_turns.push(Some(compact_text(&text, 180)));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(id) = id else {
-            continue;
-        };
-        if let Some(model) = model.clone() {
+        let id = summary.id.clone();
+        if let Some(model) = summary.model.clone() {
             model_by_id.insert(id.clone(), model);
         }
-        if let Some(parent_id) = forked_from_id {
+        if let Some(parent_id) = summary.parent_id.clone() {
             parent_by_id.insert(id.clone(), parent_id);
         }
         let existing = rows.get(&id);
@@ -3444,27 +3714,21 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
             .filter(|s| !is_codex_injected_user_text(s));
         let existing_name = existing.and_then(|v| value_str(v, "name"));
         let existing_updated_at = existing.and_then(|v| value_str(v, "updated_at"));
-        let file_updated_at = file_mtime_string(&path);
-        let created_at = created_at.or_else(|| file_updated_at.clone());
-        let updated_at = file_updated_at
+        let created_at = summary
+            .created_at
+            .clone()
+            .or_else(|| summary.file_updated_at.clone());
+        let updated_at = summary
+            .file_updated_at
+            .clone()
             .or(existing_updated_at)
             .or_else(|| created_at.clone());
-        let task = event_user_turns
-            .iter()
-            .find_map(|t| t.clone())
-            .or_else(|| fallback_user_turns.iter().find_map(|t| t.clone()));
-        let turns = if saw_user_message_event {
-            event_user_turns.len() as u64
-        } else if task_started_turns > 0 {
-            task_started_turns
-        } else if !fallback_user_turns.is_empty() {
-            fallback_user_turns.len() as u64
-        } else {
-            0
-        };
-        let effective_cwd = command_cwd.or(turn_cwd).or_else(|| session_cwd.clone());
-        let project_root =
-            derive_project_root_from_cwd(session_cwd.as_deref().or(effective_cwd.as_deref()));
+        let project_root = derive_project_root_from_cwd(
+            summary
+                .session_cwd
+                .as_deref()
+                .or(summary.effective_cwd.as_deref()),
+        );
         let mut session = external_session_json(
             "codex",
             "Codex",
@@ -3473,16 +3737,16 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
             created_at,
             updated_at,
             existing_name,
-            task.or(existing_task),
-            provider.as_deref().unwrap_or("Codex"),
-            model.clone(),
-            turns,
+            summary.task.clone().or(existing_task),
+            summary.provider.as_deref().unwrap_or("Codex"),
+            summary.model.clone(),
+            summary.turns,
             project_root,
-            effective_cwd,
+            summary.effective_cwd.clone(),
             Some(path.to_string_lossy().to_string()),
-            file_size(&path),
+            summary.bytes,
         );
-        apply_session_usage(&mut session, usage, model.as_deref());
+        apply_session_usage(&mut session, summary.usage, summary.model.as_deref());
         rows.insert(id, session);
     }
 
@@ -3508,6 +3772,100 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     rows.into_values().collect()
 }
 
+fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
+    let key = session_list_cache_key("claude-code", path, "")?;
+    if let Some(row) = cached_session_list_row(&key) {
+        return Some(row);
+    }
+
+    let session_id = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut created_at = None;
+    let mut updated_at = None;
+    let mut session_cwd = None;
+    let mut cwd = None;
+    let mut task = None;
+    let mut model = None;
+    let mut usage = SessionUsage::default();
+    let mut seen_usage = HashSet::new();
+    let mut turns = 0u64;
+    for (line_idx, line_result) in reader.lines().enumerate() {
+        let Ok(line) = line_result else {
+            continue;
+        };
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        created_at = created_at.or_else(|| value_str(&obj, "timestamp"));
+        updated_at = value_str(&obj, "timestamp").or(updated_at);
+        if let Some(value) = value_str(&obj, "cwd") {
+            if session_cwd.is_none() {
+                session_cwd = Some(value.clone());
+            }
+            cwd = Some(value);
+        }
+        if obj.get("type").and_then(|v| v.as_str()) == Some("user") {
+            turns += 1;
+            if task.is_none() {
+                if let Some(msg) = obj.get("message") {
+                    if let Some(content) = msg.get("content").and_then(message_content_text) {
+                        task = Some(compact_text(&content, 180));
+                    }
+                }
+            }
+        }
+        if let Some(msg) = obj.get("message") {
+            if model.is_none() {
+                model = msg
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+            if let Some(parsed) = msg.get("usage").and_then(claude_usage_from_message_usage) {
+                let key = value_str(&obj, "requestId")
+                    .or_else(|| value_str(msg, "id"))
+                    .unwrap_or_else(|| format!("line-{line_idx}"));
+                if seen_usage.insert(key) {
+                    usage.add(parsed);
+                }
+            }
+        }
+    }
+    let effective_cwd = cwd.or_else(|| session_cwd.clone());
+    let project_root =
+        derive_project_root_from_cwd(session_cwd.as_deref().or(effective_cwd.as_deref()));
+    let mut session = external_session_json(
+        "claude-code",
+        "Claude Code",
+        session_id.clone(),
+        session_id,
+        created_at
+            .or_else(|| updated_at.clone())
+            .or_else(|| file_mtime_string(path)),
+        file_mtime_string(path).or(updated_at),
+        None,
+        task,
+        "Claude Code",
+        model.clone(),
+        turns,
+        project_root,
+        effective_cwd,
+        Some(path.to_string_lossy().to_string()),
+        file_size(path),
+    );
+    apply_session_usage(&mut session, usage, model.as_deref());
+    store_session_list_row(key, &session);
+    Some(session)
+}
+
 fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
     let files = collect_recent_files(
         &home.join(".claude").join("projects"),
@@ -3516,93 +3874,9 @@ fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
     );
     let mut rows = Vec::new();
     for path in files {
-        let session_id = path
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if session_id.is_empty() {
-            continue;
+        if let Some(session) = claude_session_list_row_from_file(&path) {
+            rows.push(session);
         }
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        let reader = std::io::BufReader::new(file);
-        let mut created_at = None;
-        let mut updated_at = None;
-        let mut session_cwd = None;
-        let mut cwd = None;
-        let mut task = None;
-        let mut model = None;
-        let mut usage = SessionUsage::default();
-        let mut seen_usage = HashSet::new();
-        let mut turns = 0u64;
-        for (line_idx, line_result) in reader.lines().enumerate() {
-            let Ok(line) = line_result else {
-                continue;
-            };
-            let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            created_at = created_at.or_else(|| value_str(&obj, "timestamp"));
-            updated_at = value_str(&obj, "timestamp").or(updated_at);
-            if let Some(value) = value_str(&obj, "cwd") {
-                if session_cwd.is_none() {
-                    session_cwd = Some(value.clone());
-                }
-                cwd = Some(value);
-            }
-            if obj.get("type").and_then(|v| v.as_str()) == Some("user") {
-                turns += 1;
-                if task.is_none() {
-                    if let Some(msg) = obj.get("message") {
-                        if let Some(content) = msg.get("content").and_then(message_content_text) {
-                            task = Some(compact_text(&content, 180));
-                        }
-                    }
-                }
-            }
-            if let Some(msg) = obj.get("message") {
-                if model.is_none() {
-                    model = msg
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
-                if let Some(parsed) = msg.get("usage").and_then(claude_usage_from_message_usage) {
-                    let key = value_str(&obj, "requestId")
-                        .or_else(|| value_str(msg, "id"))
-                        .unwrap_or_else(|| format!("line-{line_idx}"));
-                    if seen_usage.insert(key) {
-                        usage.add(parsed);
-                    }
-                }
-            }
-        }
-        let effective_cwd = cwd.or_else(|| session_cwd.clone());
-        let project_root =
-            derive_project_root_from_cwd(session_cwd.as_deref().or(effective_cwd.as_deref()));
-        let mut session = external_session_json(
-            "claude-code",
-            "Claude Code",
-            session_id.clone(),
-            session_id,
-            created_at
-                .or_else(|| updated_at.clone())
-                .or_else(|| file_mtime_string(&path)),
-            file_mtime_string(&path).or(updated_at),
-            None,
-            task,
-            "Claude Code",
-            model.clone(),
-            turns,
-            project_root,
-            effective_cwd,
-            Some(path.to_string_lossy().to_string()),
-            file_size(&path),
-        );
-        apply_session_usage(&mut session, usage, model.as_deref());
-        rows.push(session);
     }
     rows
 }
@@ -3627,8 +3901,91 @@ fn gemini_project_roots(home: &Path) -> HashMap<String, String> {
     out
 }
 
+fn gemini_session_list_row_from_file(
+    path: &Path,
+    roots: &HashMap<String, String>,
+    roots_fingerprint: &str,
+) -> Option<serde_json::Value> {
+    if path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        != Some("chats")
+    {
+        return None;
+    }
+    let key = session_list_cache_key("gemini", path, roots_fingerprint)?;
+    if let Some(row) = cached_session_list_row(&key) {
+        return Some(row);
+    }
+
+    let contents = std::fs::read_to_string(path).ok()?;
+    let obj = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    let session_id = value_str(&obj, "sessionId")?;
+    let alias = path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+    let mut task = None;
+    let mut turns = 0u64;
+    let mut model = value_str(&obj, "model");
+    let mut usage = SessionUsage::default();
+    if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            model = model.or_else(|| value_str(msg, "model"));
+            if let Some(parsed) = msg.get("tokens").and_then(gemini_usage_from_tokens) {
+                usage.add(parsed);
+            }
+            let role = msg
+                .get("role")
+                .or_else(|| msg.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if role == "user" {
+                turns += 1;
+                if task.is_none() {
+                    let text = msg
+                        .get("text")
+                        .or_else(|| msg.get("message"))
+                        .or_else(|| msg.get("content"))
+                        .and_then(message_content_text);
+                    if let Some(text) = text {
+                        task = Some(compact_text(&text, 180));
+                    }
+                }
+            }
+        }
+    }
+    let project_root = alias.as_ref().and_then(|a| roots.get(a).cloned());
+    let cwd = project_root.clone();
+    let mut session = external_session_json(
+        "gemini",
+        "Gemini CLI",
+        session_id.clone(),
+        session_id,
+        value_str(&obj, "startTime").or_else(|| file_mtime_string(path)),
+        file_mtime_string(path),
+        None,
+        task,
+        "Gemini CLI",
+        model.clone(),
+        turns,
+        project_root,
+        cwd,
+        Some(path.to_string_lossy().to_string()),
+        file_size(path),
+    );
+    apply_session_usage(&mut session, usage, model.as_deref());
+    store_session_list_row(key, &session);
+    Some(session)
+}
+
 fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
     let roots = gemini_project_roots(home);
+    let roots_fingerprint =
+        file_dependency_fingerprint(&home.join(".gemini").join("projects.json"));
     let files = collect_recent_files(
         &home.join(".gemini").join("tmp"),
         ".json",
@@ -3636,80 +3993,10 @@ fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
     );
     let mut rows = Vec::new();
     for path in files {
-        if path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            != Some("chats")
+        if let Some(session) = gemini_session_list_row_from_file(&path, &roots, &roots_fingerprint)
         {
-            continue;
+            rows.push(session);
         }
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&contents) else {
-            continue;
-        };
-        let Some(session_id) = value_str(&obj, "sessionId") else {
-            continue;
-        };
-        let alias = path
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string());
-        let mut task = None;
-        let mut turns = 0u64;
-        let mut model = value_str(&obj, "model");
-        let mut usage = SessionUsage::default();
-        if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
-            for msg in messages {
-                model = model.or_else(|| value_str(msg, "model"));
-                if let Some(parsed) = msg.get("tokens").and_then(gemini_usage_from_tokens) {
-                    usage.add(parsed);
-                }
-                let role = msg
-                    .get("role")
-                    .or_else(|| msg.get("type"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if role == "user" {
-                    turns += 1;
-                    if task.is_none() {
-                        let text = msg
-                            .get("text")
-                            .or_else(|| msg.get("message"))
-                            .or_else(|| msg.get("content"))
-                            .and_then(message_content_text);
-                        if let Some(text) = text {
-                            task = Some(compact_text(&text, 180));
-                        }
-                    }
-                }
-            }
-        }
-        let project_root = alias.as_ref().and_then(|a| roots.get(a).cloned());
-        let cwd = project_root.clone();
-        let mut session = external_session_json(
-            "gemini",
-            "Gemini CLI",
-            session_id.clone(),
-            session_id,
-            value_str(&obj, "startTime").or_else(|| file_mtime_string(&path)),
-            file_mtime_string(&path),
-            None,
-            task,
-            "Gemini CLI",
-            model.clone(),
-            turns,
-            project_root,
-            cwd,
-            Some(path.to_string_lossy().to_string()),
-            file_size(&path),
-        );
-        apply_session_usage(&mut session, usage, model.as_deref());
-        rows.push(session);
     }
     rows
 }
@@ -4314,6 +4601,456 @@ fn worktree_session_hints_from_home(
         .collect()
 }
 
+fn push_session_file_fingerprint(
+    entries: &mut Vec<SessionFileFingerprint>,
+    base: &Path,
+    path: &Path,
+    is_dir: bool,
+) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() != is_dir {
+        return;
+    }
+    let rel = path
+        .strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+    entries.push(SessionFileFingerprint {
+        rel,
+        len: metadata.len(),
+        mtime_nanos: metadata_mtime_nanos(&metadata),
+        ctime_nanos: metadata_ctime_nanos(&metadata),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        is_dir,
+    });
+}
+
+fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDirFingerprint> {
+    let mut entries = Vec::new();
+    push_session_file_fingerprint(&mut entries, dir, dir, true);
+
+    for name in [
+        "session.jsonl",
+        "session_meta.json",
+        "summary.json",
+        "conversation.jsonl",
+    ] {
+        let path = dir.join(name);
+        if path.is_file() {
+            push_session_file_fingerprint(&mut entries, dir, &path, false);
+        }
+    }
+
+    let recordings_dir = dir.join("recordings");
+    if let Ok(rd) = std::fs::read_dir(&recordings_dir) {
+        for re in rd.flatten() {
+            let recording_dir = re.path();
+            if !recording_dir.is_dir() {
+                continue;
+            }
+            push_session_file_fingerprint(&mut entries, dir, &recording_dir, true);
+            if let Ok(files) = std::fs::read_dir(&recording_dir) {
+                for file in files.flatten() {
+                    let path = file.path();
+                    let name = file.file_name().to_string_lossy().to_string();
+                    if name.starts_with("seg_") && path.is_file() {
+                        push_session_file_fingerprint(&mut entries, dir, &path, false);
+                    }
+                }
+            }
+        }
+    }
+
+    let frames_dir = dir.join("frames");
+    if let Ok(fd) = std::fs::read_dir(&frames_dir) {
+        for fe in fd.flatten() {
+            let path = fe.path();
+            if path.is_file() {
+                push_session_file_fingerprint(&mut entries, dir, &path, false);
+            }
+        }
+    }
+
+    let turns_dir = dir.join("turns");
+    if let Ok(td) = std::fs::read_dir(&turns_dir) {
+        for te in td.flatten() {
+            let path = te.path();
+            if path.is_file() {
+                push_session_file_fingerprint(&mut entries, dir, &path, false);
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel).then_with(|| a.is_dir.cmp(&b.is_dir)));
+    Some(SessionDirFingerprint {
+        path: session_list_path_key(dir),
+        entries,
+    })
+}
+
+fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<serde_json::Value> {
+    let fingerprint = intendant_session_dir_fingerprint(dir)?;
+    if let Some(row) = cached_intendant_session_list_row(&fingerprint) {
+        return Some(row);
+    }
+
+    let meta_path = dir.join("session_meta.json");
+    let mut name: Option<String> = None;
+    let mut task: Option<String> = None;
+    let mut created_at: Option<String> = None;
+    let mut project_root: Option<String> = None;
+    let cwd: Option<String> = None;
+    let mut provider: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut status = "in_progress".to_string();
+    let mut turns: u64 = 0;
+    let mut total_tokens: u64 = 0;
+    let mut prompt_tokens: u64 = 0;
+    let mut completion_tokens: u64 = 0;
+    let mut cached_tokens: u64 = 0;
+    let mut role: Option<String> = None;
+    let mut external_resume_id: Option<String> = None;
+    let mut external_source: Option<String> = None;
+    let mut updated_at_secs = file_mtime_secs(dir);
+
+    if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            task = meta
+                .get("task")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            created_at = meta
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            project_root = meta
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            name = meta
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| compact_text(s, 180));
+            if let Some(s) = meta.get("status").and_then(|v| v.as_str()) {
+                status = s.to_string();
+            }
+            if let Some(t) = meta.get("last_turn").and_then(|v| v.as_u64()) {
+                turns = t;
+            }
+            role = meta
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+
+    let jsonl_path = dir.join("session.jsonl");
+    if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+            let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+            match event {
+                "session_start" => {
+                    if created_at.is_none() {
+                        created_at = obj
+                            .get("ts")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                }
+                "info" | "debug" => {
+                    if event == "info" {
+                        if message.starts_with("Provider: ") && provider.is_none() {
+                            provider = Some(message.trim_start_matches("Provider: ").to_string());
+                        } else if message.starts_with("Model: ") && model.is_none() {
+                            model = Some(message.trim_start_matches("Model: ").to_string());
+                        } else if message.starts_with("Task: ") && task.is_none() {
+                            task = Some(message.trim_start_matches("Task: ").to_string());
+                        }
+                    }
+                    if external_resume_id.is_none() {
+                        external_resume_id = external_agent_thread_id_from_message(message);
+                    }
+                    if external_source.is_none() {
+                        external_source = external_agent_source_from_message(message);
+                    }
+                }
+                "turn_start" => {
+                    if let Some(t) = obj.get("turn").and_then(|v| v.as_u64()) {
+                        if t > turns {
+                            turns = t;
+                        }
+                    }
+                }
+                "model_response" => {
+                    if let Some(tok) = obj.get("data").and_then(|d| d.get("tokens")) {
+                        if let Some(t) = tok.get("total").and_then(|v| v.as_u64()) {
+                            total_tokens += t;
+                        }
+                        if let Some(p) = tok.get("prompt").and_then(|v| v.as_u64()) {
+                            prompt_tokens += p;
+                        }
+                        if let Some(c) = tok.get("completion").and_then(|v| v.as_u64()) {
+                            completion_tokens += c;
+                        }
+                        if let Some(cached) = tok.get("cached").and_then(|v| v.as_u64()) {
+                            cached_tokens += cached;
+                        }
+                    }
+                }
+                "task_complete" | "session_end" | "round_complete" => {
+                    status = "completed".to_string();
+                }
+                "interrupted" => {
+                    status = "interrupted".to_string();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if status != "completed" && dir.join("summary.json").exists() {
+        status = "completed".to_string();
+    }
+
+    let mut recording_count: u64 = 0;
+    let mut recording_bytes: u64 = 0;
+    let mut annotation_count: u64 = 0;
+    let mut clip_count: u64 = 0;
+    let mut frames_bytes: u64 = 0;
+    let mut turns_bytes: u64 = 0;
+    let mut logs_bytes: u64 = 0;
+
+    let recordings_dir = dir.join("recordings");
+    if recordings_dir.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(&recordings_dir) {
+            for re in rd.flatten() {
+                if re.path().is_dir() {
+                    recording_count += 1;
+                    if let Ok(files) = std::fs::read_dir(re.path()) {
+                        for f in files.flatten() {
+                            let name = f.file_name().to_string_lossy().to_string();
+                            if name.starts_with("seg_") {
+                                if let Ok(m) = f.metadata() {
+                                    if m.is_file() {
+                                        updated_at_secs =
+                                            updated_at_secs.max(metadata_mtime_secs(&m));
+                                        recording_bytes += m.len();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let frames_dir = dir.join("frames");
+    if frames_dir.is_dir() {
+        if let Ok(fd) = std::fs::read_dir(&frames_dir) {
+            let mut clip_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for fe in fd.flatten() {
+                let name = fe.file_name().to_string_lossy().to_string();
+                if name.starts_with("ann-") && name.ends_with(".jpg") {
+                    annotation_count += 1;
+                } else if name.starts_with("clip-") && name.ends_with(".jpg") {
+                    if let Some(pos) = name.rfind("-f") {
+                        clip_ids.insert(name[..pos].to_string());
+                    }
+                }
+                if let Ok(m) = fe.metadata() {
+                    if m.is_file() {
+                        updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
+                        frames_bytes += m.len();
+                    }
+                }
+            }
+            clip_count = clip_ids.len() as u64;
+        }
+    }
+
+    let turns_dir = dir.join("turns");
+    if turns_dir.is_dir() {
+        if let Ok(td) = std::fs::read_dir(&turns_dir) {
+            for te in td.flatten() {
+                if let Ok(m) = te.metadata() {
+                    if m.is_file() {
+                        updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
+                        turns_bytes += m.len();
+                    }
+                }
+            }
+        }
+    }
+
+    for name in [
+        "session.jsonl",
+        "session_meta.json",
+        "summary.json",
+        "conversation.jsonl",
+    ] {
+        if let Ok(m) = std::fs::metadata(dir.join(name)) {
+            if m.is_file() {
+                updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
+                logs_bytes += m.len();
+            }
+        }
+    }
+
+    let total_bytes = recording_bytes + frames_bytes + turns_bytes + logs_bytes;
+
+    if status != "completed" {
+        let has_model_work = turns > 0 || total_tokens > 0;
+        if !has_model_work {
+            let has_media = recording_count > 0 || annotation_count > 0 || clip_count > 0;
+            if task.is_some() || has_media {
+                status = "idle".to_string();
+            } else {
+                status = "abandoned".to_string();
+            }
+        }
+    }
+
+    if created_at.is_none() {
+        created_at = mtime_secs_to_string(file_mtime_secs(dir));
+    }
+
+    let estimated_cost = model.as_deref().and_then(|m| {
+        crate::app_state_pricing::estimate_session_cost(
+            m,
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            0,
+        )
+    });
+
+    let created_at = created_at.unwrap_or_default();
+    let updated_at = mtime_secs_to_string(updated_at_secs).unwrap_or_else(|| created_at.clone());
+    let backend_source_label: Option<String> = None;
+
+    let wrapper_session = serde_json::json!({
+        "source": "intendant",
+        "source_label": "Intendant",
+        "session_id": session_id,
+        "resume_id": session_id,
+        "backend_source": external_source.clone(),
+        "backend_source_label": backend_source_label,
+        "backend_session_id": external_resume_id.clone(),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "name": name,
+        "task": task,
+        "provider": provider,
+        "model": model,
+        "turns": turns,
+        "status": status,
+        "total_tokens": total_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_creation_tokens": 0,
+        "estimated_cost": estimated_cost.unwrap_or(0.0),
+        "pricing_known": estimated_cost.is_some(),
+        "role": role,
+        "recordings": recording_count,
+        "recording_bytes": recording_bytes,
+        "annotations": annotation_count,
+        "clips": clip_count,
+        "frames_bytes": frames_bytes,
+        "turns_bytes": turns_bytes,
+        "logs_bytes": logs_bytes,
+        "total_bytes": total_bytes,
+        "cwd": cwd.clone().or_else(|| project_root.clone()),
+        "project_root": project_root.clone(),
+        "path": dir.to_string_lossy().to_string(),
+        "can_delete": true,
+        "can_resume": true,
+    });
+
+    store_intendant_session_list_row(fingerprint, &wrapper_session);
+    Some(wrapper_session)
+}
+
+fn json_string_missing_or_empty(session: &serde_json::Value, key: &str) -> bool {
+    session
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::is_empty)
+        .unwrap_or(true)
+}
+
+fn insert_optional_string(session: &mut serde_json::Value, key: &str, value: Option<String>) {
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert(
+            key.to_string(),
+            value
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+}
+
+fn apply_external_context_to_intendant_wrapper(
+    wrapper_session: &mut serde_json::Value,
+    external_context_by_id: &HashMap<String, ExternalSessionContext>,
+) {
+    let external_resume_id = value_str(wrapper_session, "backend_session_id");
+    if let Some(external_id) = external_resume_id.as_deref() {
+        if let Some(context) = external_context_by_id.get(external_id) {
+            if json_string_missing_or_empty(wrapper_session, "project_root") {
+                insert_optional_string(
+                    wrapper_session,
+                    "project_root",
+                    context.project_root.clone(),
+                );
+            }
+            if json_string_missing_or_empty(wrapper_session, "cwd") {
+                insert_optional_string(
+                    wrapper_session,
+                    "cwd",
+                    context.cwd.clone().or_else(|| context.project_root.clone()),
+                );
+            }
+            if json_string_missing_or_empty(wrapper_session, "name") {
+                insert_optional_string(wrapper_session, "name", context.name.clone());
+            }
+            if json_string_missing_or_empty(wrapper_session, "backend_source") {
+                insert_optional_string(wrapper_session, "backend_source", context.source.clone());
+            }
+        }
+    }
+
+    let backend_source_label = value_str(wrapper_session, "backend_source").and_then(|source| {
+        external_resume_id
+            .as_deref()
+            .and_then(|external_id| external_context_by_id.get(external_id))
+            .and_then(|context| context.source_label.clone())
+            .or_else(|| Some(pretty_external_source_label(&source)))
+    });
+    insert_optional_string(
+        wrapper_session,
+        "backend_source_label",
+        backend_source_label,
+    );
+}
+
 fn list_sessions_from_home(home_path: &Path) -> String {
     let logs_dir = home_path.join(".intendant").join("logs");
     let mut external_sessions = Vec::new();
@@ -4345,347 +5082,33 @@ fn list_sessions_from_home(home_path: &Path) -> String {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Try to read session_meta.json first (fast path)
-        let meta_path = dir.join("session_meta.json");
-        let mut name: Option<String> = None;
-        let mut task: Option<String> = None;
-        let mut created_at: Option<String> = None;
-        let mut project_root: Option<String> = None;
-        let mut cwd: Option<String> = None;
-        let mut provider: Option<String> = None;
-        let mut model: Option<String> = None;
-        let mut status = "in_progress".to_string();
-        let mut turns: u64 = 0;
-        let mut total_tokens: u64 = 0;
-        let mut prompt_tokens: u64 = 0;
-        let mut completion_tokens: u64 = 0;
-        let mut cached_tokens: u64 = 0;
-        let mut role: Option<String> = None;
-        let mut external_resume_id: Option<String> = None;
-        let mut external_source: Option<String> = None;
-        let mut updated_at_secs = file_mtime_secs(&dir);
-
-        if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                task = meta
-                    .get("task")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                created_at = meta
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                project_root = meta
-                    .get("project_root")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                name = meta
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| compact_text(s, 180));
-                if let Some(s) = meta.get("status").and_then(|v| v.as_str()) {
-                    status = s.to_string();
-                }
-                if let Some(t) = meta.get("last_turn").and_then(|v| v.as_u64()) {
-                    turns = t;
-                }
-                role = meta
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            }
-        }
-
-        // Parse session.jsonl for provider, model, token totals, and any missing fields
-        let jsonl_path = dir.join("session.jsonl");
-        if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
-            for line in contents.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
-
-                match event {
-                    "session_start" => {
-                        if created_at.is_none() {
-                            created_at = obj
-                                .get("ts")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                        }
-                    }
-                    "info" | "debug" => {
-                        if event == "info" {
-                            if message.starts_with("Provider: ") && provider.is_none() {
-                                provider =
-                                    Some(message.trim_start_matches("Provider: ").to_string());
-                            } else if message.starts_with("Model: ") && model.is_none() {
-                                model = Some(message.trim_start_matches("Model: ").to_string());
-                            } else if message.starts_with("Task: ") && task.is_none() {
-                                task = Some(message.trim_start_matches("Task: ").to_string());
-                            }
-                        }
-                        if external_resume_id.is_none() {
-                            external_resume_id = external_agent_thread_id_from_message(message);
-                        }
-                        if external_source.is_none() {
-                            external_source = external_agent_source_from_message(message);
-                        }
-                    }
-                    "turn_start" => {
-                        if let Some(t) = obj.get("turn").and_then(|v| v.as_u64()) {
-                            if t > turns {
-                                turns = t;
-                            }
-                        }
-                    }
-                    "model_response" => {
-                        if let Some(tok) = obj.get("data").and_then(|d| d.get("tokens")) {
-                            if let Some(t) = tok.get("total").and_then(|v| v.as_u64()) {
-                                total_tokens += t;
-                            }
-                            if let Some(p) = tok.get("prompt").and_then(|v| v.as_u64()) {
-                                prompt_tokens += p;
-                            }
-                            if let Some(c) = tok.get("completion").and_then(|v| v.as_u64()) {
-                                completion_tokens += c;
-                            }
-                            if let Some(cached) = tok.get("cached").and_then(|v| v.as_u64()) {
-                                cached_tokens += cached;
-                            }
-                        }
-                    }
-                    "task_complete" | "session_end" | "round_complete" => {
-                        status = "completed".to_string();
-                    }
-                    "interrupted" => {
-                        status = "interrupted".to_string();
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some(external_id) = external_resume_id.as_deref() {
-            if let Some(context) = external_context_by_id.get(external_id) {
-                if project_root.is_none() {
-                    project_root = context.project_root.clone();
-                }
-                if cwd.is_none() {
-                    cwd = context.cwd.clone().or_else(|| context.project_root.clone());
-                }
-                if name.is_none() {
-                    name = context.name.clone();
-                }
-                if external_source.is_none() {
-                    external_source = context.source.clone();
-                }
-            }
-        }
-
-        let backend_source_label = external_source.as_deref().and_then(|source| {
-            external_resume_id
+        if let Some(mut wrapper_session) = intendant_session_list_row_from_dir(&dir, &session_id) {
+            apply_external_context_to_intendant_wrapper(
+                &mut wrapper_session,
+                &external_context_by_id,
+            );
+            let external_source = value_str(&wrapper_session, "backend_source");
+            let external_resume_id = value_str(&wrapper_session, "backend_session_id");
+            let merged_into_external = external_source
                 .as_deref()
-                .and_then(|external_id| external_context_by_id.get(external_id))
-                .and_then(|context| context.source_label.clone())
-                .or_else(|| Some(pretty_external_source_label(source)))
-        });
+                .zip(external_resume_id.as_deref())
+                .filter(|(source, external_id)| {
+                    crate::external_agent::source_session_id_is_canonical(source, external_id)
+                })
+                .and_then(|(source, external_id)| {
+                    external_sessions
+                        .iter_mut()
+                        .find(|session| external_session_row_matches(session, source, external_id))
+                })
+                .map(|external| {
+                    merge_intendant_wrapper_into_external_session(external, &wrapper_session);
+                })
+                .is_some();
 
-        // Check for summary.json (written on clean exit)
-        if status != "completed" && dir.join("summary.json").exists() {
-            status = "completed".to_string();
-        }
-
-        // Recording / annotation / clip stats from disk
-        let mut recording_count: u64 = 0;
-        let mut recording_bytes: u64 = 0;
-        let mut annotation_count: u64 = 0;
-        let mut clip_count: u64 = 0;
-        let mut frames_bytes: u64 = 0;
-        let mut turns_bytes: u64 = 0;
-        let mut logs_bytes: u64 = 0;
-
-        let recordings_dir = dir.join("recordings");
-        if recordings_dir.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(&recordings_dir) {
-                for re in rd.flatten() {
-                    if re.path().is_dir() {
-                        recording_count += 1;
-                        if let Ok(files) = std::fs::read_dir(re.path()) {
-                            for f in files.flatten() {
-                                let name = f.file_name().to_string_lossy().to_string();
-                                if name.starts_with("seg_") {
-                                    if let Ok(m) = f.metadata() {
-                                        if m.is_file() {
-                                            updated_at_secs =
-                                                updated_at_secs.max(metadata_mtime_secs(&m));
-                                            recording_bytes += m.len();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            if !merged_into_external {
+                sessions.push(wrapper_session);
             }
-        }
-
-        let frames_dir = dir.join("frames");
-        if frames_dir.is_dir() {
-            if let Ok(fd) = std::fs::read_dir(&frames_dir) {
-                let mut clip_ids: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for fe in fd.flatten() {
-                    let name = fe.file_name().to_string_lossy().to_string();
-                    if name.starts_with("ann-") && name.ends_with(".jpg") {
-                        annotation_count += 1;
-                    } else if name.starts_with("clip-") && name.ends_with(".jpg") {
-                        if let Some(pos) = name.rfind("-f") {
-                            clip_ids.insert(name[..pos].to_string());
-                        }
-                    }
-                    if let Ok(m) = fe.metadata() {
-                        if m.is_file() {
-                            updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
-                            frames_bytes += m.len();
-                        }
-                    }
-                }
-                clip_count = clip_ids.len() as u64;
-            }
-        }
-
-        // Turns directory size
-        let turns_dir = dir.join("turns");
-        if turns_dir.is_dir() {
-            if let Ok(td) = std::fs::read_dir(&turns_dir) {
-                for te in td.flatten() {
-                    if let Ok(m) = te.metadata() {
-                        if m.is_file() {
-                            updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
-                            turns_bytes += m.len();
-                        }
-                    }
-                }
-            }
-        }
-
-        // Root-level log files size
-        for name in &[
-            "session.jsonl",
-            "session_meta.json",
-            "summary.json",
-            "conversation.jsonl",
-        ] {
-            if let Ok(m) = std::fs::metadata(dir.join(name)) {
-                if m.is_file() {
-                    updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
-                    logs_bytes += m.len();
-                }
-            }
-        }
-
-        let total_bytes = recording_bytes + frames_bytes + turns_bytes + logs_bytes;
-
-        // Refine status for sessions that never did model work:
-        // - "idle": had some activity (recordings, display, task) but no model turns
-        // - "abandoned": no turns, no task, no media — MCP probes, brief connections
-        // Also override "interrupted" → "idle" when no model work happened
-        // (process was killed before any model interaction — nothing was interrupted)
-        if status != "completed" {
-            let has_model_work = turns > 0 || total_tokens > 0;
-            if !has_model_work {
-                let has_media = recording_count > 0 || annotation_count > 0 || clip_count > 0;
-                if task.is_some() || has_media {
-                    status = "idle".to_string();
-                } else {
-                    status = "abandoned".to_string();
-                }
-            }
-        }
-
-        // Fall back to directory mtime for created_at
-        if created_at.is_none() {
-            created_at = mtime_secs_to_string(file_mtime_secs(&dir));
-        }
-
-        // Estimate cost using the model's pricing.
-        let estimated_cost = model.as_deref().and_then(|m| {
-            crate::app_state_pricing::estimate_session_cost(
-                m,
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-                0,
-            )
-        });
-
-        let created_at = created_at.unwrap_or_default();
-        let updated_at =
-            mtime_secs_to_string(updated_at_secs).unwrap_or_else(|| created_at.clone());
-
-        let wrapper_session = serde_json::json!({
-            "source": "intendant",
-            "source_label": "Intendant",
-            "session_id": session_id.clone(),
-            "resume_id": session_id.clone(),
-            "backend_source": external_source.clone(),
-            "backend_source_label": backend_source_label,
-            "backend_session_id": external_resume_id.clone(),
-            "created_at": created_at,
-            "updated_at": updated_at,
-            "name": name,
-            "task": task,
-            "provider": provider,
-            "model": model,
-            "turns": turns,
-            "status": status,
-            "total_tokens": total_tokens,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "cached_tokens": cached_tokens,
-            "cache_creation_tokens": 0,
-            "estimated_cost": estimated_cost.unwrap_or(0.0),
-            "pricing_known": estimated_cost.is_some(),
-            "role": role,
-            "recordings": recording_count,
-            "recording_bytes": recording_bytes,
-            "annotations": annotation_count,
-            "clips": clip_count,
-            "frames_bytes": frames_bytes,
-            "turns_bytes": turns_bytes,
-            "logs_bytes": logs_bytes,
-            "total_bytes": total_bytes,
-            "cwd": cwd.clone().or_else(|| project_root.clone()),
-            "project_root": project_root.clone(),
-            "path": dir.to_string_lossy().to_string(),
-            "can_delete": true,
-            "can_resume": true,
-        });
-
-        let merged_into_external = external_source
-            .as_deref()
-            .zip(external_resume_id.as_deref())
-            .filter(|(source, external_id)| {
-                crate::external_agent::source_session_id_is_canonical(source, external_id)
-            })
-            .and_then(|(source, external_id)| {
-                external_sessions
-                    .iter_mut()
-                    .find(|session| external_session_row_matches(session, source, external_id))
-            })
-            .map(|external| {
-                merge_intendant_wrapper_into_external_session(external, &wrapper_session);
-            })
-            .is_some();
-
-        if !merged_into_external {
-            sessions.push(wrapper_session);
+            continue;
         }
     }
 
@@ -13511,6 +13934,60 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_cache_invalidates_intendant_log_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "intendant-cache-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00",
+                "status": "running"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let write_task = |task: &str| {
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                serde_json::json!({
+                    "ts": "2026-05-17T20:45:00",
+                    "event": "info",
+                    "message": format!("Task: {task}")
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_task("First cache task");
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        let row = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .unwrap();
+        assert_eq!(
+            row.get("task").and_then(|v| v.as_str()),
+            Some("First cache task")
+        );
+
+        write_task("Second cache invalidated task");
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        let row = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .unwrap();
+        assert_eq!(
+            row.get("task").and_then(|v| v.as_str()),
+            Some("Second cache invalidated task")
+        );
+    }
+
+    #[test]
     fn session_log_search_finds_intendant_log_content_not_summary() {
         let home = tempfile::tempdir().unwrap();
         let session_id = "intendant-search-session";
@@ -13916,6 +14393,74 @@ mod tests {
         );
         assert_eq!(session.get("name").and_then(|v| v.as_str()), None);
         assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn list_codex_sessions_cache_invalidates_when_file_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let id = "019e37ae-cache-invalidates";
+        let session_path = sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl"));
+
+        let write_task = |task: &str| {
+            let lines = [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": id,
+                        "timestamp": "2026-05-17T20:44:33Z",
+                        "cwd": "/repo"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T20:45:21Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": task
+                    }
+                }),
+            ];
+            std::fs::write(
+                &session_path,
+                lines
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+        };
+
+        write_task("First cached Codex task");
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap();
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("First cached Codex task")
+        );
+
+        write_task("Second invalidated Codex task");
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap();
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Second invalidated Codex task")
+        );
     }
 
     #[test]

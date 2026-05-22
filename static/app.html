@@ -8066,6 +8066,10 @@ async function main() {
         if (earlySessions && !sessionsListCache.has(selfPeerId)) {
           sessionsListCache.set(selfPeerId, earlySessions);
         }
+        const earlySessionsInflight = sessionsListInflight.get(previousSelfPeerId);
+        if (earlySessionsInflight && !sessionsListInflight.has(selfPeerId)) {
+          sessionsListInflight.set(selfPeerId, earlySessionsInflight);
+        }
       }
       selfHostLabel = card.label;
       const el = document.getElementById('sb-host-label');
@@ -16648,6 +16652,8 @@ function switchSessionsSubtab(name) {
     loadWorktrees({ forceScan: !worktreesLoaded });
   } else if (!sessionsLoaded) {
     loadSessions();
+  } else {
+    renderSessionsViews();
   }
 }
 
@@ -21059,6 +21065,50 @@ document.getElementById('settings-save-keys').addEventListener('click', saveApiK
 // between hosts in the Stats picker is instant after first fetch.
 // Keyed by host_id; the primary is cached under selfPeerId.
 const sessionsListCache = new Map();
+const sessionsListInflight = new Map();
+
+function fetchSessionsForHost(hostId, options = {}) {
+  hostId = hostId || selfPeerId;
+  const cached = sessionsListCache.get(hostId);
+  if (cached && !options.force) {
+    return Promise.resolve(cached);
+  }
+  const inflight = sessionsListInflight.get(hostId);
+  if (inflight) {
+    return inflight;
+  }
+
+  let baseUrl = '';
+  if (hostId !== selfPeerId) {
+    const d = daemons.find(x => x.host_id === hostId);
+    if (!d) return Promise.reject(new Error('Unknown daemon host'));
+    baseUrl = d.url.replace(/\/$/, '');
+  }
+
+  const request = hostId === selfPeerId
+    ? authedFetch('/api/sessions')
+    : fetch(baseUrl + '/api/sessions');
+  const promise = request
+    .then(r => {
+      if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
+      return r.json();
+    })
+    .then(sessions => {
+      if (!Array.isArray(sessions)) {
+        throw new Error('/api/sessions returned a non-array payload');
+      }
+      sessionsListCache.set(hostId, sessions);
+      if (hostId === selfPeerId) cacheSessionWindowMetadata(sessions);
+      return sessions;
+    })
+    .finally(() => {
+      if (sessionsListInflight.get(hostId) === promise) {
+        sessionsListInflight.delete(hostId);
+      }
+    });
+  sessionsListInflight.set(hostId, promise);
+  return promise;
+}
 
 function currentStatsHostKey() {
   return activeStatsHost || selfPeerId;
@@ -21278,34 +21328,8 @@ function renderSessionStatsFallback(sessions) {
 // mixed content. Same rules as fetching the remote's agent card on add.
 function loadAllSessionsUsage(hostId, options = {}) {
   hostId = hostId || selfPeerId;
-  const cached = sessionsListCache.get(hostId);
-  if (cached && !options.force) {
-    renderAllSessionsUsage(cached);
-    renderDiskUsage(cached);
-    return;
-  }
-
-  let baseUrl = '';
-  if (hostId !== selfPeerId) {
-    const d = daemons.find(x => x.host_id === hostId);
-    if (!d) return;
-    baseUrl = d.url.replace(/\/$/, '');
-  }
-
-  const request = hostId === selfPeerId
-    ? authedFetch('/api/sessions')
-    : fetch(baseUrl + '/api/sessions');
-  request
-    .then(r => {
-      if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
-      return r.json();
-    })
+  fetchSessionsForHost(hostId, { force: !!options.force })
     .then(sessions => {
-      if (!Array.isArray(sessions)) {
-        throw new Error('/api/sessions returned a non-array payload');
-      }
-      sessionsListCache.set(hostId, sessions);
-      if (hostId === selfPeerId) cacheSessionWindowMetadata(sessions);
       // Only render if the user is still viewing this host. A slow
       // fetch that finishes after the user switched away would
       // otherwise stomp the current view.
@@ -22400,6 +22424,7 @@ let sessionsLoaded = false;
 let _cachedSessions = [];
 let worktreesLoaded = false;
 let _cachedWorktreeScan = null;
+let _sessionsLoadToken = 0;
 let _sessionDeepSearchToken = 0;
 let _sessionDeepSearchAbort = null;
 let _sessionDeepSearch = {
@@ -22417,43 +22442,58 @@ let _sessionDeepSearch = {
   results: new Map(),
 };
 
-function loadSessions() {
+function applyLoadedSessions(sessions, aggEl) {
+  sessionsLoaded = true;
+  _cachedSessions = sessions;
+  updateNewSessionProjectPrefills(sessions);
+  cacheSessionWindowMetadata(sessions);
+  renderSessionsAggregate(sessions, aggEl);
+  renderSessionsViews();
+}
+
+function loadSessions(options = {}) {
   const listEl = document.getElementById('sessions-list');
   const aggEl = document.getElementById('sessions-aggregate');
-  if (listEl) listEl.innerHTML = '<div class="empty-state">Loading sessions...</div>';
+  const cached = sessionsListCache.get(selfPeerId);
+  if (cached) {
+    applyLoadedSessions(cached, aggEl);
+  } else if (listEl) {
+    listEl.innerHTML = '<div class="empty-state">Loading sessions...</div>';
+  }
 
-  authedFetch('/api/sessions')
-    .then(r => r.json())
+  const token = ++_sessionsLoadToken;
+  fetchSessionsForHost(selfPeerId, { force: options.force !== false })
     .then(sessions => {
-      sessionsLoaded = true;
-      _cachedSessions = sessions;
-      updateNewSessionProjectPrefills(sessions);
-      cacheSessionWindowMetadata(sessions);
-      renderSessionsAggregate(sessions, aggEl);
-      renderSessionsViews();
+      if (token !== _sessionsLoadToken) return;
+      applyLoadedSessions(sessions, aggEl);
     })
     .catch(() => {
-      if (listEl) listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
+      if (!cached && listEl) {
+        listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
+      }
     });
 }
 
 function renderSessionsViews() {
-  renderSessionsList(_cachedSessions, document.getElementById('sessions-list'), {
-    mode: 'recent',
-    query: sessionSearchQuery(),
-    sourceFilter: sessionSourceFilterValue(),
-    statusFilter: sessionStatusFilterValue(),
-    sortValue: document.getElementById('sort-sessions')?.value || 'updated-desc',
-    deepSearchOnly: false,
-  });
-  renderSessionsList(_cachedSessions, document.getElementById('sessions-deep-list'), {
-    mode: 'deep',
-    query: sessionDeepResultSearchQuery(),
-    sourceFilter: sessionDeepSourceFilterValue(),
-    statusFilter: sessionDeepStatusFilterValue(),
-    sortValue: document.getElementById('sort-sessions-deep')?.value || 'updated-desc',
-    deepSearchOnly: true,
-  });
+  if (activeSessionsSubtab === 'recent') {
+    renderSessionsList(_cachedSessions, document.getElementById('sessions-list'), {
+      mode: 'recent',
+      query: sessionSearchQuery(),
+      sourceFilter: sessionSourceFilterValue(),
+      statusFilter: sessionStatusFilterValue(),
+      sortValue: document.getElementById('sort-sessions')?.value || 'updated-desc',
+      deepSearchOnly: false,
+    });
+  } else if (activeSessionsSubtab === 'deep') {
+    renderSessionsList(_cachedSessions, document.getElementById('sessions-deep-list'), {
+      mode: 'deep',
+      query: sessionDeepResultSearchQuery(),
+      sourceFilter: sessionDeepSourceFilterValue(),
+      statusFilter: sessionDeepStatusFilterValue(),
+      sortValue: document.getElementById('sort-sessions-deep')?.value || 'updated-desc',
+      deepSearchOnly: true,
+    });
+  }
 }
 
 function _refilterSessions() {
@@ -23053,6 +23093,7 @@ function renderSessionsList(sessions, el, options = {}) {
   const statusFilter = options.statusFilter || [];
   const deepSearchActive = deepSearchOnly && _sessionDeepSearch.active;
   let visibleCount = 0;
+  const fragment = document.createDocumentFragment();
 
   for (const s of sorted) {
     const source = s.source || 'intendant';
@@ -23387,7 +23428,7 @@ function renderSessionsList(sessions, el, options = {}) {
 
     card.appendChild(meta);
     card.addEventListener('click', () => openSessionDetail(s));
-    el.appendChild(card);
+    fragment.appendChild(card);
   }
 
   if (visibleCount === 0) {
@@ -23399,6 +23440,8 @@ function renderSessionsList(sessions, el, options = {}) {
       ? 'No sessions match your search'
       : 'No sessions match the active filters';
     el.appendChild(empty);
+  } else {
+    el.appendChild(fragment);
   }
 }
 
