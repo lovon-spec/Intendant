@@ -9734,7 +9734,10 @@ async fn main() -> Result<(), CallerError> {
         None
     };
     if web_tls_acceptor.is_some() {
-        eprintln!("[web_gateway] TLS enabled — dashboard served over HTTPS/WSS on port {web_port}");
+        eprintln!(
+            "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
+             (cleartext HTTP/WS connections are refused)"
+        );
     }
 
     let provider_result = provider::select_provider();
