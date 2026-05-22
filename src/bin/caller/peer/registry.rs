@@ -253,7 +253,8 @@ impl PeerRegistry {
         override_pinned_fingerprints: Vec<String>,
         browser_tcp_via_url: Option<String>,
     ) -> Result<PeerId, PeerError> {
-        let mut card = fetch_card(card_url, bearer_token.as_deref()).await?;
+        let mut card =
+            fetch_card(card_url, bearer_token.as_deref(), &override_pinned_fingerprints).await?;
         // Apply the via-URL override to the initial card so the
         // first PeerSnapshot the dashboard sees (before the actor
         // completes its first connect) shows the operator's URL
@@ -515,9 +516,34 @@ fn spawn_event_forwarder(handle: PeerHandle, events: broadcast::Sender<RegistryE
 /// (as provided by a user adding a peer). Small duplication; kept
 /// here so the registry doesn't depend on a specific transport
 /// implementation for its discovery step.
-async fn fetch_card(card_url: &str, bearer_token: Option<&str>) -> Result<AgentCard, PeerError> {
-    let client = reqwest::Client::builder()
-        .timeout(CARD_FETCH_TIMEOUT)
+///
+/// When `pinned_fingerprints` is non-empty, the HTTP client is built
+/// with the same custom rustls config the transport's
+/// [`IntendantWsTransport::fetch_agent_card`] uses — pinning the
+/// server cert's SHA-256 fingerprint instead of validating against
+/// the webpki root store. Without this, an operator who supplies
+/// out-of-band fingerprints for a self-signed-TLS peer (the only
+/// thing they *can* supply, since the cert isn't CA-issued) would
+/// still hit a cert-validation failure on this discovery fetch
+/// before the pin-aware transport layer ever runs. Threading the
+/// pin here keeps the discovery fetch and the connect fetch on the
+/// same trust decision.
+async fn fetch_card(
+    card_url: &str,
+    bearer_token: Option<&str>,
+    pinned_fingerprints: &[String],
+) -> Result<AgentCard, PeerError> {
+    let mut client_builder = reqwest::Client::builder().timeout(CARD_FETCH_TIMEOUT);
+    if !pinned_fingerprints.is_empty() {
+        let verifier =
+            crate::peer::transport::pinning::PinnedFingerprintVerifier::from_strings(
+                pinned_fingerprints,
+            )
+            .map_err(|e| PeerError::CardFetch(format!("invalid pinned fingerprint: {e}")))?;
+        let config = crate::peer::transport::pinning::pinned_client_config(verifier);
+        client_builder = client_builder.use_preconfigured_tls(config);
+    }
+    let client = client_builder
         .build()
         .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
     let mut request = client.get(card_url);
