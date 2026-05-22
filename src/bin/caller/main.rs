@@ -7187,10 +7187,16 @@ async fn run_with_presence(
                                 headless: false,
                                 context_injection: &context_injection,
                             };
+                            // `turn_bus_rx` was subscribed before the
+                            // `/side` request was broadcast, so it may still
+                            // contain the triggering CodexThreadActionRequested
+                            // event. Use a fresh receiver for the child drain
+                            // to avoid dispatching `/side` a second time.
+                            let mut side_bus_rx = bus.subscribe();
                             drain_external_side_turn(
                                 agent,
                                 event_rx,
-                                &mut turn_bus_rx,
+                                &mut side_bus_rx,
                                 &drain_config,
                                 &mut cumulative_stats,
                                 &mut persistent_diff_tracker,
@@ -8484,10 +8490,16 @@ async fn run_external_agent_mode(
                                     child_thread_id,
                                 } = effect
                                 {
+                                    // `turn_bus_rx` can still have the
+                                    // triggering `/side` event queued because
+                                    // the idle loop consumed it through a
+                                    // separate receiver. A fresh receiver keeps
+                                    // the side drain from replaying the action.
+                                    let mut side_bus_rx = bus.subscribe();
                                     drain_external_side_turn(
                                         &mut agent,
                                         &mut event_rx,
-                                        &mut turn_bus_rx,
+                                        &mut side_bus_rx,
                                         &drain_config,
                                         &mut stats,
                                         &mut diff_tracker,
