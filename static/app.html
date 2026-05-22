@@ -6471,6 +6471,10 @@ html, body {
             <div class="sessions-new-panel">
               <span class="sessions-title">New Session</span>
               <div class="sessions-new-task">
+                <label class="sessions-new-session-field" for="new-session-name">
+                  Session name
+                  <input id="new-session-name" class="sessions-project-input" type="text" maxlength="180" autocomplete="off" spellcheck="false" placeholder="Optional display name">
+                </label>
                 <label class="sessions-new-session-field sessions-new-session-task" for="new-session-input">
                   Initial message
                   <textarea id="new-session-input" class="sessions-new-task-input" rows="4" placeholder="Initial message..."></textarea>
@@ -22804,6 +22808,8 @@ async function startNewSession() {
   const task = input.value.trim();
   if (!task) return;
   if (app) {
+    const nameInput = document.getElementById('new-session-name');
+    const sessionName = nameInput?.value.trim() || '';
     const direct = document.getElementById('direct-mode-toggle')?.checked || false;
     const attachments = pendingAttachments.map(a => a.frameId);
     const attachmentReceipt = pendingAttachments.slice();
@@ -22811,6 +22817,7 @@ async function startNewSession() {
     const projectRoot = await ensureNewSessionProjectDirectory(requestedProjectRoot);
     if (requestedProjectRoot && !projectRoot) return;
     const msg = { action: 'create_session', task: task };
+    if (sessionName) msg.name = sessionName;
     if (projectRoot) msg.project_root = projectRoot;
     const agentValue = document.getElementById('new-session-agent')?.value || '';
     const selectedAgent = normalizeAgentId(agentValue);
@@ -22824,6 +22831,7 @@ async function startNewSession() {
     if (direct) msg.direct = true;
     if (attachments.length > 0) msg.attachments = attachments;
     clearTaskTextarea(input);
+    if (nameInput) nameInput.value = '';
     app.send_server_action(msg);
     if (attachments.length > 0) {
       renderAttachmentReceipt(task, attachmentReceipt, 'Sent');

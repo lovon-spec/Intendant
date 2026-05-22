@@ -44,6 +44,7 @@ struct SupervisorState {
 struct ManagedSession {
     session_id: String,
     source: String,
+    name: Option<String>,
     project_root: PathBuf,
     session_dir: PathBuf,
     follow_up_tx: mpsc::Sender<FollowUpMessage>,
@@ -157,6 +158,7 @@ impl SessionSupervisor {
         match msg {
             event::ControlMsg::CreateSession {
                 task,
+                name,
                 project_root,
                 agent,
                 agent_command,
@@ -171,6 +173,7 @@ impl SessionSupervisor {
                         || display_target.is_some()
                         || agent.is_some()
                         || agent_command.is_some()
+                        || name.is_some()
                     {
                         self.warn(
                             "Slash command dropped new-session metadata; routing to active Codex session",
@@ -181,6 +184,7 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    name,
                     project_root,
                     agent,
                     agent_command,
@@ -230,6 +234,7 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    None,
                     None,
                     None,
                     None,
@@ -334,6 +339,7 @@ impl SessionSupervisor {
     async fn start_new_session(
         &self,
         task: String,
+        name: Option<String>,
         project_root: Option<String>,
         agent: Option<String>,
         agent_command: Option<String>,
@@ -343,6 +349,13 @@ impl SessionSupervisor {
         display_target: Option<String>,
         attachments: Vec<String>,
     ) {
+        let session_name = match normalize_session_name_option(name.as_deref()) {
+            Ok(name) => name,
+            Err(e) => {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        };
         let log_dir = session_log::SessionLog::resolve_path(None);
         let session_log = match session_log::SessionLog::open(log_dir.clone()) {
             Ok(log) => Arc::new(Mutex::new(log)),
@@ -372,7 +385,12 @@ impl SessionSupervisor {
             }
         };
 
-        write_session_meta(&session_log, &project.root, Some(&task));
+        write_session_meta(
+            &session_log,
+            &project.root,
+            Some(&task),
+            session_name.as_deref(),
+        );
         self.activate_shared_session(session_log.clone()).await;
 
         if !reference_frame_ids.is_empty() {
@@ -478,6 +496,7 @@ impl SessionSupervisor {
             backend,
             use_direct,
             attachments_for_agent,
+            session_name,
             None,
             emit_session_started_after_identity,
         )
@@ -565,7 +584,7 @@ impl SessionSupervisor {
                     }
                 };
 
-                write_session_meta(&session_log, &project.root, None);
+                write_session_meta(&session_log, &project.root, None, None);
                 self.activate_shared_session(session_log.clone()).await;
                 self.spawn_agent_session(
                     resume_token.clone(),
@@ -577,6 +596,7 @@ impl SessionSupervisor {
                     external_backend.clone(),
                     direct.unwrap_or(true),
                     UserAttachments::default(),
+                    None,
                     Some(resume_token.clone()),
                     false,
                 )
@@ -634,7 +654,7 @@ impl SessionSupervisor {
             }
         };
 
-        write_session_meta(&session_log, &project.root, Some(&resume_task));
+        write_session_meta(&session_log, &project.root, Some(&resume_task), None);
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
             session_id: live_session_id.clone(),
@@ -652,6 +672,7 @@ impl SessionSupervisor {
             external_backend,
             direct.unwrap_or(true),
             UserAttachments::default(),
+            None,
             Some(resume_token),
             false,
         )
@@ -691,6 +712,7 @@ impl SessionSupervisor {
         backend: Option<external_agent::AgentBackend>,
         use_direct: bool,
         attachments: UserAttachments,
+        session_name: Option<String>,
         resume_token: Option<String>,
         emit_session_started_after_identity: bool,
     ) {
@@ -704,6 +726,7 @@ impl SessionSupervisor {
             log_dir.clone(),
             follow_up_tx,
             approval_registry.clone(),
+            session_name,
         )
         .await;
 
@@ -1290,45 +1313,65 @@ impl SessionSupervisor {
             return;
         }
 
-        let mut state = self.state.lock().await;
-        let Some(current_key) = state.resolve_session_id(&session_id) else {
-            return;
-        };
-        if current_key == backend_session_id {
-            state
-                .session_aliases
-                .insert(session_id, backend_session_id.clone());
-            return;
-        }
-        if state.sessions.contains_key(&backend_session_id) {
-            state
-                .session_aliases
-                .insert(session_id.clone(), backend_session_id.clone());
-            state
-                .session_aliases
-                .insert(current_key, backend_session_id.clone());
-            if state.active_session_id.as_deref() == Some(&session_id) {
-                state.active_session_id = Some(backend_session_id);
+        let name_to_persist = {
+            let mut state = self.state.lock().await;
+            let Some(current_key) = state.resolve_session_id(&session_id) else {
+                return;
+            };
+            if current_key == backend_session_id {
+                state
+                    .session_aliases
+                    .insert(session_id, backend_session_id.clone());
+                state
+                    .sessions
+                    .get(&backend_session_id)
+                    .and_then(|session| session.name.clone())
+            } else if state.sessions.contains_key(&backend_session_id) {
+                let name = state
+                    .sessions
+                    .get(&backend_session_id)
+                    .and_then(|session| session.name.clone())
+                    .or_else(|| {
+                        state
+                            .sessions
+                            .get(&current_key)
+                            .and_then(|session| session.name.clone())
+                    });
+                state
+                    .session_aliases
+                    .insert(session_id.clone(), backend_session_id.clone());
+                state
+                    .session_aliases
+                    .insert(current_key, backend_session_id.clone());
+                if state.active_session_id.as_deref() == Some(&session_id) {
+                    state.active_session_id = Some(backend_session_id.clone());
+                }
+                name
+            } else {
+                let Some(mut session) = state.sessions.remove(&current_key) else {
+                    return;
+                };
+                let name = session.name.clone();
+                session.session_id = backend_session_id.clone();
+                session.source = source.clone();
+                state.sessions.insert(backend_session_id.clone(), session);
+                state
+                    .session_aliases
+                    .insert(session_id.clone(), backend_session_id.clone());
+                state
+                    .session_aliases
+                    .insert(current_key.clone(), backend_session_id.clone());
+                if state.active_session_id.as_deref() == Some(&session_id)
+                    || state.active_session_id.as_deref() == Some(&current_key)
+                {
+                    state.active_session_id = Some(backend_session_id.clone());
+                }
+                name
             }
-            return;
-        }
-
-        let Some(mut session) = state.sessions.remove(&current_key) else {
-            return;
         };
-        session.session_id = backend_session_id.clone();
-        session.source = source;
-        state.sessions.insert(backend_session_id.clone(), session);
-        state
-            .session_aliases
-            .insert(session_id.clone(), backend_session_id.clone());
-        state
-            .session_aliases
-            .insert(current_key.clone(), backend_session_id.clone());
-        if state.active_session_id.as_deref() == Some(&session_id)
-            || state.active_session_id.as_deref() == Some(&current_key)
-        {
-            state.active_session_id = Some(backend_session_id);
+
+        if let Some(name) = name_to_persist {
+            persist_external_session_name(&self.config.bus, &source, &backend_session_id, &name);
         }
     }
 
@@ -1351,6 +1394,7 @@ impl SessionSupervisor {
         session_dir: PathBuf,
         follow_up_tx: mpsc::Sender<FollowUpMessage>,
         approval_registry: event::ApprovalRegistry,
+        name: Option<String>,
     ) {
         let mut state = self.state.lock().await;
         state.active_session_id = Some(session_id.clone());
@@ -1360,6 +1404,7 @@ impl SessionSupervisor {
             ManagedSession {
                 session_id,
                 source,
+                name,
                 project_root,
                 session_dir,
                 follow_up_tx,
@@ -1577,6 +1622,13 @@ fn normalize_session_agent_command(command: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn normalize_session_name_option(name: Option<&str>) -> Result<Option<String>, String> {
+    match name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => crate::session_names::normalize_session_name(name).map(Some),
+        None => Ok(None),
+    }
+}
+
 fn apply_session_agent_command(
     project: &mut Project,
     backend: &external_agent::AgentBackend,
@@ -1599,9 +1651,29 @@ fn write_session_meta(
     session_log: &Arc<std::sync::Mutex<session_log::SessionLog>>,
     project_root: &Path,
     task: Option<&str>,
+    name: Option<&str>,
 ) {
     if let Ok(log) = session_log.lock() {
-        log.write_meta(Some(project_root), task);
+        log.write_meta_with_name(Some(project_root), task, name);
+    }
+}
+
+fn persist_external_session_name(bus: &EventBus, source: &str, session_id: &str, name: &str) {
+    let source = crate::session_names::normalize_source(source);
+    if source == "intendant" || name.trim().is_empty() {
+        return;
+    }
+    let result = dirs::home_dir()
+        .ok_or_else(|| "could not resolve home directory".to_string())
+        .and_then(|home| crate::session_names::rename_session(&home, &source, session_id, name));
+    if let Err(message) = result {
+        bus.send(AppEvent::LogEntry {
+            session_id: Some(session_id.to_string()),
+            level: "warn".to_string(),
+            source: "session-supervisor".to_string(),
+            content: format!("Failed to persist session name: {}", message),
+            turn: None,
+        });
     }
 }
 
@@ -1811,6 +1883,7 @@ mod tests {
         ManagedSession {
             session_id: id.to_string(),
             source: source.to_string(),
+            name: None,
             project_root: PathBuf::from("/tmp/project"),
             session_dir: PathBuf::from("/tmp/session"),
             follow_up_tx: tx,
@@ -1921,5 +1994,15 @@ mod tests {
             project.config.agent.claude_code.command,
             "/opt/claude/bin/claude"
         );
+    }
+
+    #[test]
+    fn normalizes_optional_session_name() {
+        assert_eq!(
+            normalize_session_name_option(Some("  Dashboard   work  ")).unwrap(),
+            Some("Dashboard work".to_string())
+        );
+        assert_eq!(normalize_session_name_option(Some("   ")).unwrap(), None);
+        assert_eq!(normalize_session_name_option(None).unwrap(), None);
     }
 }

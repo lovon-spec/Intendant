@@ -210,7 +210,17 @@ impl SessionLog {
     /// Write session metadata to `session_meta.json`.
     /// Call after open() to persist session identity and context.
     pub fn write_meta(&self, project_root: Option<&Path>, task: Option<&str>) {
-        self.write_meta_with_role(project_root, task, None);
+        self.write_meta_with_name_and_role(project_root, task, None, None);
+    }
+
+    /// Write session metadata with an optional user-facing session name.
+    pub fn write_meta_with_name(
+        &self,
+        project_root: Option<&Path>,
+        task: Option<&str>,
+        name: Option<&str>,
+    ) {
+        self.write_meta_with_name_and_role(project_root, task, name, None);
     }
 
     /// Write session metadata with an optional role field.
@@ -220,11 +230,25 @@ impl SessionLog {
         task: Option<&str>,
         role: Option<&str>,
     ) {
+        self.write_meta_with_name_and_role(project_root, task, None, role);
+    }
+
+    fn write_meta_with_name_and_role(
+        &self,
+        project_root: Option<&Path>,
+        task: Option<&str>,
+        name: Option<&str>,
+        role: Option<&str>,
+    ) {
+        let existing_name = fs::read_to_string(self.dir.join("session_meta.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+            .and_then(|meta| meta.name);
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             project_root: project_root.map(|p| p.to_string_lossy().to_string()),
-            name: None,
+            name: name.map(|n| n.to_string()).or(existing_name),
             task: task.map(|t| t.to_string()),
             status: Some("running".to_string()),
             last_turn: None,
@@ -3160,6 +3184,25 @@ mod tests {
         assert_eq!(meta.project_root.as_deref(), Some("/tmp/project"));
         assert_eq!(meta.task.as_deref(), Some("test task"));
         assert_eq!(meta.status.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn write_meta_with_name_persists_and_preserves_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta_with_name(
+            Some(Path::new("/tmp/project")),
+            Some("test task"),
+            Some("Named session"),
+        );
+        log.write_meta(Some(Path::new("/tmp/project")), Some("follow-up task"));
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.name.as_deref(), Some("Named session"));
+        assert_eq!(meta.task.as_deref(), Some("follow-up task"));
     }
 
     #[test]

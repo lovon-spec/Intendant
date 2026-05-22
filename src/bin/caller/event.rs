@@ -969,6 +969,11 @@ pub enum ControlMsg {
     /// continue whichever session a legacy frontend considers active.
     CreateSession {
         task: String,
+        /// Optional display name for the session. The session id remains the
+        /// stable identity; this is only persisted metadata used by
+        /// dashboards/session listings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         /// Directory to use as the new session's project root. When omitted,
         /// the session supervisor uses the project root of this Intendant
         /// instance.
@@ -2517,6 +2522,7 @@ mod tests {
             ControlMsg::GetControllerLoopStatus,
             ControlMsg::CreateSession {
                 task: "start fresh".to_string(),
+                name: Some("Fresh start".to_string()),
                 project_root: None,
                 agent: Some("codex".to_string()),
                 agent_command: Some("/opt/codex/bin/codex".to_string()),
@@ -2718,11 +2724,12 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
                 task,
+                name,
                 project_root,
                 agent,
                 agent_command,
@@ -2733,6 +2740,7 @@ mod tests {
                 attachments,
             } => {
                 assert_eq!(task, "fix bug");
+                assert_eq!(name.as_deref(), Some("Bugfix work"));
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));
                 assert_eq!(agent_command.as_deref(), Some("/opt/codex/bin/codex"));
