@@ -6971,6 +6971,7 @@ let foregroundSessionFullId = '';
 let maximizedSessionWindowId = '';
 const sessionWindows = new Map();
 let processingLogReplay = false;
+let logReplayAppendBatch = null;
 const sessionMetadataById = new Map();
 const sessionUsageById = new Map();
 let latestGlobalUsage = null;
@@ -8099,14 +8100,25 @@ async function main() {
 // ── UiCommand Processor ──
 function processCommands(cmds) {
   if (!Array.isArray(cmds)) return;
-  for (const c of cmds) {
-    switch (c.cmd) {
+  const previousLogReplayBatch = logReplayAppendBatch;
+  const createdLogReplayBatch = processingLogReplay && !logReplayAppendBatch;
+  if (createdLogReplayBatch) logReplayAppendBatch = createLogReplayAppendBatch();
+  try {
+    for (const c of cmds) {
+      switch (c.cmd) {
       case 'add_log_entry': renderLogEntry(c); break;
       case 'mark_activity_context_rewind':
+        flushLogReplayAppendBatch();
         markActivityContextRewind(c.session_id, c.user_turn_index, c.turns_removed);
         break;
-      case 'clear_logs': clearLogs({ clearSessionWindows: !processingLogReplay }); break;
-      case 'add_turn_separator': renderTurnSeparator(c.turn); break;
+      case 'clear_logs':
+        flushLogReplayAppendBatch();
+        clearLogs({ clearSessionWindows: !processingLogReplay });
+        break;
+      case 'add_turn_separator':
+        flushLogReplayAppendBatch();
+        renderTurnSeparator(c.turn);
+        break;
       case 'update_status_bar': updateStatusBar(c); break;
       case 'set_phase': setPhase(c.phase); break;
       case 'show_approval': showApproval(c.id, c.command, c.category, c.session_id); break;
@@ -8235,6 +8247,12 @@ function processCommands(cmds) {
         // PeerDisplayConnection / handlePeerWebRtcSignal below.
         handlePeerWebRtcSignal(c.host_id, c.display_id, c.session_id, c.signal);
         break;
+      }
+    }
+  } finally {
+    if (createdLogReplayBatch) {
+      flushLogReplayAppendBatch();
+      logReplayAppendBatch = previousLogReplayBatch;
     }
   }
 }
@@ -10838,7 +10856,44 @@ document.getElementById('concurrent-log-maximize')?.addEventListener('click', (e
 });
 window.addEventListener('resize', () => applySessionWindowGridHeight());
 
-function appendLogEntryToSessionWindow(entry) {
+function createLogReplayAppendBatch() {
+  return {
+    mainFragment: document.createDocumentFragment(),
+    sessionFragments: new Map(),
+    added: 0,
+  };
+}
+
+function flushLogReplayAppendBatch() {
+  const batch = logReplayAppendBatch;
+  if (!batch || batch.added <= 0) return;
+
+  const stream = document.getElementById('log-stream');
+  if (stream && batch.mainFragment.childNodes.length > 0) {
+    stream.appendChild(batch.mainFragment);
+    while (logEntryCount > 10000) {
+      const first = stream.querySelector('.log-entry, .log-turn-sep');
+      if (!first) break;
+      stream.removeChild(first);
+      logEntryCount--;
+    }
+    if (autoScroll) stream.scrollTop = stream.scrollHeight;
+    batch.mainFragment = document.createDocumentFragment();
+  }
+
+  for (const state of batch.sessionFragments.values()) {
+    if (!state.win || !state.win.log || state.fragment.childNodes.length === 0) continue;
+    state.win.log.appendChild(state.fragment);
+    while (state.win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
+      state.win.log.removeChild(state.win.log.firstElementChild);
+    }
+    state.win.log.scrollTop = state.win.log.scrollHeight;
+  }
+  batch.sessionFragments.clear();
+  batch.added = 0;
+}
+
+function appendLogEntryToSessionWindow(entry, batch = null) {
   const sid = entry?.dataset?.sessionId || '';
   if (!sid) return;
   const win = ensureSessionWindow(sid);
@@ -10849,6 +10904,15 @@ function appendLogEntryToSessionWindow(entry) {
   clone.removeAttribute('id');
   clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
   wireSessionWindowLogClone(clone, entry);
+  if (batch) {
+    let state = batch.sessionFragments.get(sid);
+    if (!state || state.win !== win) {
+      state = { win, fragment: document.createDocumentFragment() };
+      batch.sessionFragments.set(sid, state);
+    }
+    state.fragment.appendChild(clone);
+    return;
+  }
   win.log.appendChild(clone);
   while (win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
     win.log.removeChild(win.log.firstElementChild);
@@ -11176,6 +11240,15 @@ function createLogScaffold(c, extraClass) {
 }
 
 function appendLogEntryElement(entry) {
+  if (logReplayAppendBatch && !entry.classList.contains('command-output-group')) {
+    logReplayAppendBatch.mainFragment.appendChild(entry);
+    appendLogEntryToSessionWindow(entry, logReplayAppendBatch);
+    logEntryCount++;
+    logReplayAppendBatch.added++;
+    return;
+  }
+  if (logReplayAppendBatch) flushLogReplayAppendBatch();
+
   const stream = document.getElementById('log-stream');
   stream.appendChild(entry);
   appendLogEntryToSessionWindow(entry);

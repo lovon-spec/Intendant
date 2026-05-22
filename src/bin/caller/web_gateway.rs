@@ -3,12 +3,13 @@ use crate::presence::{self, AgentStateSnapshot};
 use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 // Phase 5a.1: the display input authority map is read from a synchronous
 // `Fn() -> bool` closure on the WebRTC data-channel input hot path, so
 // it can't live behind a `tokio::sync::RwLock` (no `.read().await` from
@@ -26,9 +27,12 @@ use tokio_tungstenite::tungstenite::Message;
 /// stable identity within a display session.
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION_SEARCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static EXTERNAL_TRANSCRIPT_CACHE: OnceLock<Mutex<HashMap<String, ExternalTranscriptCacheEntry>>> =
+    OnceLock::new();
 
 const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
+const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_SOURCE_FLOOR: usize = 100;
 const SESSION_LOG_SEARCH_LIMIT: usize = 150;
@@ -37,6 +41,21 @@ const SESSION_LOG_SEARCH_FIELD_CHARS: usize = 8 * 1024;
 const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
 const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
 const FS_LIST_LIMIT: usize = 500;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalTranscriptCacheKey {
+    source: String,
+    session_id: String,
+    path: String,
+    len: u64,
+    mtime_nanos: u128,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalTranscriptCacheEntry {
+    key: ExternalTranscriptCacheKey,
+    entries: Vec<serde_json::Value>,
+}
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
 /// Only one connection can be active at a time; all others are "passive" (TUI-only).
@@ -1079,9 +1098,11 @@ const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.j
 const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
-// 0 means replay the full compact transcript. External activity replay
-// intentionally includes only user/assistant messages, not tool events or output.
+// 0 means replay every renderable entry from the external audit transcript.
+// External activity replay intentionally includes only user/assistant messages
+// and explicit context-rewind markers, not tool events or tool output.
 const EXTERNAL_ACTIVITY_REPLAY_LIMIT: usize = 0;
+const EXTERNAL_TRANSCRIPT_SEMANTICS: &str = "full_audit_transcript";
 
 /// Session-specific state that changes when a new agent session starts.
 /// Wrapped in `Arc<tokio::sync::RwLock<...>>` so the web gateway can observe
@@ -2557,6 +2578,36 @@ fn message_content_text(content: &serde_json::Value) -> Option<String> {
     }
 }
 
+#[derive(Deserialize)]
+struct ExternalJsonLineKind<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    payload: Option<ExternalJsonPayloadKind<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ExternalJsonPayloadKind<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+}
+
+fn codex_line_may_affect_replay(line: &str) -> bool {
+    let Ok(kind) = serde_json::from_str::<ExternalJsonLineKind<'_>>(line) else {
+        return true;
+    };
+    let payload_kind = kind
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.kind.as_deref());
+    match (kind.kind.as_deref(), payload_kind) {
+        (_, Some("thread_rolled_back" | "user_message" | "agent_message" | "message")) => true,
+        (Some("event_msg" | "response_item"), None) => true,
+        (None, _) => true,
+        _ => false,
+    }
+}
+
 fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
     if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
         return None;
@@ -2723,6 +2774,15 @@ fn metadata_mtime_secs(metadata: &std::fs::Metadata) -> u64 {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn metadata_mtime_nanos(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
         .unwrap_or(0)
 }
 
@@ -3709,6 +3769,7 @@ fn external_session_detail_from_home(
     Some(
         serde_json::json!({
             "session_id": session_id,
+            "transcript_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
             "entries": entries,
             "frames": [],
         })
@@ -3725,203 +3786,329 @@ fn external_transcript_source(provider_source: &str, role: &str) -> String {
     }
 }
 
+fn external_transcript_cache() -> &'static Mutex<HashMap<String, ExternalTranscriptCacheEntry>> {
+    EXTERNAL_TRANSCRIPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn external_transcript_path_key(path: &Path) -> String {
+    let normalized = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalized.to_string_lossy().to_string()
+}
+
+fn external_transcript_cache_key(
+    source: &str,
+    session_id: &str,
+    path: &Path,
+) -> Option<ExternalTranscriptCacheKey> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(ExternalTranscriptCacheKey {
+        source: source.to_string(),
+        session_id: session_id.to_string(),
+        path: external_transcript_path_key(path),
+        len: metadata.len(),
+        mtime_nanos: metadata_mtime_nanos(&metadata),
+    })
+}
+
+fn external_transcript_cache_slot(key: &ExternalTranscriptCacheKey) -> String {
+    format!("{}\0{}\0{}", key.source, key.session_id, key.path)
+}
+
+fn cached_external_transcript_entries(
+    key: &ExternalTranscriptCacheKey,
+) -> Option<Vec<serde_json::Value>> {
+    let slot = external_transcript_cache_slot(key);
+    let cache = external_transcript_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&slot)
+        .filter(|entry| &entry.key == key)
+        .map(|entry| entry.entries.clone())
+}
+
+fn store_external_transcript_entries(
+    key: ExternalTranscriptCacheKey,
+    entries: &[serde_json::Value],
+) {
+    let slot = external_transcript_cache_slot(&key);
+    let mut cache = external_transcript_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= EXTERNAL_TRANSCRIPT_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        ExternalTranscriptCacheEntry {
+            key,
+            entries: entries.to_vec(),
+        },
+    );
+}
+
+fn push_codex_transcript_message(
+    entries: &mut Vec<serde_json::Value>,
+    seen_messages: &mut HashSet<(String, String)>,
+    user_turn_index: &mut u32,
+    pending_replacement_for_user_turn: &mut Option<u32>,
+    ts: &str,
+    role: &str,
+    text: String,
+) {
+    if push_external_transcript_entry(entries, seen_messages, "codex", ts, role, text)
+        && role == "user"
+    {
+        *user_turn_index = user_turn_index.saturating_add(1);
+        if let Some(entry) = entries.last_mut() {
+            entry["user_turn_index"] = serde_json::json!(*user_turn_index);
+            if let Some(turn) = pending_replacement_for_user_turn.take() {
+                entry["replacement_for_user_turn_index"] = serde_json::json!(turn);
+            }
+        }
+    }
+}
+
+fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut user_turn_index = 0u32;
+    let mut pending_replacement_for_user_turn: Option<u32> = None;
+    let mut seen_messages = HashSet::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !codex_line_may_affect_replay(trimmed) {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg") {
+            if let Some(payload) = obj.get("payload") {
+                if payload.get("type").and_then(|v| v.as_str()) == Some("thread_rolled_back") {
+                    let turns = payload
+                        .get("num_turns")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let ts = value_str(&obj, "timestamp").unwrap_or_default();
+                    let mut superseded_user_turns = Vec::new();
+                    for _ in 0..turns {
+                        if let Some(turn) = mark_latest_external_turn_superseded(
+                            &mut entries,
+                            &mut seen_messages,
+                            &ts,
+                        ) {
+                            superseded_user_turns.push(turn);
+                            user_turn_index = user_turn_index.saturating_sub(1);
+                        }
+                    }
+                    if let Some(replacement_turn) = superseded_user_turns.iter().copied().min() {
+                        pending_replacement_for_user_turn = Some(replacement_turn);
+                    }
+                    if turns > 0 {
+                        entries.push(serde_json::json!({
+                            "ts": ts,
+                            "level": "warn",
+                            "source": "system",
+                            "content": if turns == 1 {
+                                "Rewound 1 user turn; overwritten entries are no longer active context.".to_string()
+                            } else {
+                                format!("Rewound {turns} user turns; overwritten entries are no longer active context.")
+                            },
+                            "kind": "rollback_marker",
+                            "rollback_turns": turns,
+                        }));
+                    }
+                    continue;
+                }
+            }
+        }
+        let ts = value_str(&obj, "timestamp").unwrap_or_default();
+        if let Some(payload) = obj.get("payload") {
+            if let Some((role, text)) = codex_event_message_text(payload) {
+                push_codex_transcript_message(
+                    &mut entries,
+                    &mut seen_messages,
+                    &mut user_turn_index,
+                    &mut pending_replacement_for_user_turn,
+                    &ts,
+                    &role,
+                    text,
+                );
+            }
+            if let Some((role, text)) = codex_payload_text(payload) {
+                push_codex_transcript_message(
+                    &mut entries,
+                    &mut seen_messages,
+                    &mut user_turn_index,
+                    &mut pending_replacement_for_user_turn,
+                    &ts,
+                    &role,
+                    text,
+                );
+            }
+        }
+    }
+
+    Some(entries)
+}
+
+fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut entries = Vec::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(kind) = serde_json::from_str::<ExternalJsonLineKind<'_>>(trimmed) else {
+            continue;
+        };
+        let typ = kind.kind.as_deref().unwrap_or("");
+        if typ != "user" && typ != "assistant" {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let text = obj
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(message_content_text)
+            .unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "ts": value_str(&obj, "timestamp").unwrap_or_default(),
+            "level": if typ == "assistant" { "model" } else { "info" },
+            "source": external_transcript_source("claude", typ),
+            "content": text,
+        }));
+    }
+
+    Some(entries)
+}
+
+fn parse_gemini_session_entries(path: &Path, session_id: &str) -> Option<Vec<serde_json::Value>> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let obj = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    if value_str(&obj, "sessionId").as_deref() != Some(session_id) {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            let role = msg
+                .get("role")
+                .or_else(|| msg.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("message");
+            let text = msg
+                .get("text")
+                .or_else(|| msg.get("message"))
+                .or_else(|| msg.get("content"))
+                .and_then(message_content_text)
+                .unwrap_or_default();
+            if text.is_empty() {
+                continue;
+            }
+            entries.push(serde_json::json!({
+                "ts": value_str(msg, "timestamp").unwrap_or_default(),
+                "level": if role == "assistant" || role == "model" { "model" } else { "info" },
+                "source": external_transcript_source("gemini", role),
+                "content": text,
+            }));
+        }
+    }
+
+    Some(entries)
+}
+
+fn find_claude_session_file_for_transcript(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    collect_files(&home.join(".claude").join("projects"), ".jsonl", &mut files);
+    files
+        .into_iter()
+        .find(|path| path.file_stem().and_then(|n| n.to_str()) == Some(session_id))
+}
+
+fn find_gemini_session_file_for_transcript(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    collect_files(&home.join(".gemini").join("tmp"), ".json", &mut files);
+    files.into_iter().find(|path| {
+        if path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            != Some("chats")
+        {
+            return false;
+        }
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&contents)
+            .ok()
+            .and_then(|obj| value_str(&obj, "sessionId"))
+            .as_deref()
+            == Some(session_id)
+    })
+}
+
+fn parse_external_session_entries_from_file(
+    source: &str,
+    session_id: &str,
+    path: &Path,
+) -> Option<Vec<serde_json::Value>> {
+    match source {
+        "codex" => parse_codex_session_entries(path),
+        "claude-code" => parse_claude_session_entries(path),
+        "gemini" => parse_gemini_session_entries(path, session_id),
+        _ => None,
+    }
+}
+
+fn external_session_entries_from_file(
+    source: &str,
+    session_id: &str,
+    path: &Path,
+) -> Option<Vec<serde_json::Value>> {
+    let key = external_transcript_cache_key(source, session_id, path)?;
+    if let Some(entries) = cached_external_transcript_entries(&key) {
+        return Some(entries);
+    }
+
+    let entries = parse_external_session_entries_from_file(source, session_id, path)?;
+    store_external_transcript_entries(key, &entries);
+    Some(entries)
+}
+
 fn external_session_entries_from_home(
     home: &Path,
     source: &str,
     session_id: &str,
 ) -> Option<Vec<serde_json::Value>> {
-    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let source = crate::session_names::normalize_source(source);
+    let path = match source.as_str() {
+        "codex" => find_codex_session_file(home, session_id),
+        "claude-code" => find_claude_session_file_for_transcript(home, session_id),
+        "gemini" => find_gemini_session_file_for_transcript(home, session_id),
+        _ => None,
+    }?;
 
-    match source {
-        "codex" => {
-            let path = find_codex_session_file(home, session_id)?;
-            let Ok(contents) = std::fs::read_to_string(&path) else {
-                return None;
-            };
-            let mut user_turn_index = 0u32;
-            let mut pending_replacement_for_user_turn: Option<u32> = None;
-            let mut seen_messages = HashSet::new();
-            for line in contents.lines() {
-                let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg") {
-                    if let Some(payload) = obj.get("payload") {
-                        if payload.get("type").and_then(|v| v.as_str())
-                            == Some("thread_rolled_back")
-                        {
-                            let turns = payload
-                                .get("num_turns")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            let ts = value_str(&obj, "timestamp").unwrap_or_default();
-                            let mut superseded_user_turns = Vec::new();
-                            for _ in 0..turns {
-                                if let Some(turn) = mark_latest_external_turn_superseded(
-                                    &mut entries,
-                                    &mut seen_messages,
-                                    &ts,
-                                ) {
-                                    superseded_user_turns.push(turn);
-                                    user_turn_index = user_turn_index.saturating_sub(1);
-                                }
-                            }
-                            if let Some(replacement_turn) =
-                                superseded_user_turns.iter().copied().min()
-                            {
-                                pending_replacement_for_user_turn = Some(replacement_turn);
-                            }
-                            if turns > 0 {
-                                entries.push(serde_json::json!({
-                                    "ts": ts,
-                                    "level": "warn",
-                                    "source": "system",
-                                    "content": if turns == 1 {
-                                        "Rewound 1 user turn; overwritten entries are no longer active context.".to_string()
-                                    } else {
-                                        format!("Rewound {turns} user turns; overwritten entries are no longer active context.")
-                                    },
-                                    "kind": "rollback_marker",
-                                    "rollback_turns": turns,
-                                }));
-                            }
-                            continue;
-                        }
-                    }
-                }
-                let ts = value_str(&obj, "timestamp").unwrap_or_default();
-                if let Some(payload) = obj.get("payload") {
-                    if let Some((role, text)) = codex_event_message_text(payload) {
-                        if push_external_transcript_entry(
-                            &mut entries,
-                            &mut seen_messages,
-                            "codex",
-                            &ts,
-                            &role,
-                            text,
-                        ) && role == "user"
-                        {
-                            user_turn_index = user_turn_index.saturating_add(1);
-                            if let Some(entry) = entries.last_mut() {
-                                entry["user_turn_index"] = serde_json::json!(user_turn_index);
-                                if let Some(turn) = pending_replacement_for_user_turn.take() {
-                                    entry["replacement_for_user_turn_index"] =
-                                        serde_json::json!(turn);
-                                }
-                            }
-                        }
-                    }
-                    if let Some((role, text)) = codex_payload_text(payload) {
-                        if push_external_transcript_entry(
-                            &mut entries,
-                            &mut seen_messages,
-                            "codex",
-                            &ts,
-                            &role,
-                            text,
-                        ) && role == "user"
-                        {
-                            user_turn_index = user_turn_index.saturating_add(1);
-                            if let Some(entry) = entries.last_mut() {
-                                entry["user_turn_index"] = serde_json::json!(user_turn_index);
-                                if let Some(turn) = pending_replacement_for_user_turn.take() {
-                                    entry["replacement_for_user_turn_index"] =
-                                        serde_json::json!(turn);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        "claude-code" => {
-            let mut files = Vec::new();
-            collect_files(&home.join(".claude").join("projects"), ".jsonl", &mut files);
-            for path in files {
-                if path.file_stem().and_then(|n| n.to_str()) != Some(session_id) {
-                    continue;
-                }
-                let Ok(contents) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                for line in contents.lines() {
-                    let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
-                        continue;
-                    };
-                    let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if typ != "user" && typ != "assistant" {
-                        continue;
-                    }
-                    let text = obj
-                        .get("message")
-                        .and_then(|m| m.get("content"))
-                        .and_then(message_content_text)
-                        .unwrap_or_default();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    entries.push(serde_json::json!({
-                        "ts": value_str(&obj, "timestamp").unwrap_or_default(),
-                        "level": if typ == "assistant" { "model" } else { "info" },
-                        "source": external_transcript_source("claude", typ),
-                        "content": text,
-                    }));
-                }
-                break;
-            }
-        }
-        "gemini" => {
-            let mut files = Vec::new();
-            collect_files(&home.join(".gemini").join("tmp"), ".json", &mut files);
-            for path in files {
-                if path
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    != Some("chats")
-                {
-                    continue;
-                }
-                let Ok(contents) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(obj) = serde_json::from_str::<serde_json::Value>(&contents) else {
-                    continue;
-                };
-                if value_str(&obj, "sessionId").as_deref() != Some(session_id) {
-                    continue;
-                }
-                if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
-                    for msg in messages {
-                        let role = msg
-                            .get("role")
-                            .or_else(|| msg.get("type"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("message");
-                        let text = msg
-                            .get("text")
-                            .or_else(|| msg.get("message"))
-                            .or_else(|| msg.get("content"))
-                            .and_then(message_content_text)
-                            .unwrap_or_default();
-                        if text.is_empty() {
-                            continue;
-                        }
-                        entries.push(serde_json::json!({
-                            "ts": value_str(msg, "timestamp").unwrap_or_default(),
-                            "level": if role == "assistant" || role == "model" { "model" } else { "info" },
-                            "source": external_transcript_source("gemini", role),
-                            "content": text,
-                        }));
-                    }
-                }
-                break;
-            }
-        }
-        _ => return None,
-    }
-
-    Some(entries)
+    external_session_entries_from_file(&source, session_id, &path)
 }
 
 fn external_session_activity_replay(
@@ -3949,18 +4136,25 @@ fn external_session_activity_replay_from_home_with_attach(
     limit: usize,
     include_attached: bool,
 ) -> Option<String> {
-    let mut transcript = external_session_entries_from_home(home, source, session_id)?;
+    let source = crate::session_names::normalize_source(source);
+    let mut transcript = external_session_entries_from_home(home, &source, session_id)?;
     if limit > 0 && transcript.len() > limit {
         transcript = transcript.split_off(transcript.len() - limit);
     }
 
     let mut entries = Vec::with_capacity(transcript.len() + 2);
-    entries.push(serde_json::json!({ "event": "replay_start" }));
+    entries.push(serde_json::json!({
+        "event": "replay_start",
+        "session_id": session_id,
+        "source": source,
+        "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+    }));
     if include_attached {
         entries.push(serde_json::json!({
             "event": "session_attached",
             "session_id": session_id,
             "source": source,
+            "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
         }));
     }
 
@@ -3974,8 +4168,9 @@ fn external_session_activity_replay_from_home_with_attach(
             "session_id": session_id,
             "ts": entry.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
             "level": entry.get("level").and_then(|v| v.as_str()).unwrap_or("info"),
-            "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(source),
+            "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(source.as_str()),
             "content": content,
+            "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
             "user_turn_index": entry.get("user_turn_index").and_then(|v| v.as_u64()),
             "replacement_for_user_turn_index": entry
                 .get("replacement_for_user_turn_index")
@@ -3994,6 +4189,7 @@ fn external_session_activity_replay_from_home_with_attach(
     Some(
         serde_json::json!({
             "t": "log_replay",
+            "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
             "entries": entries,
         })
         .to_string(),
@@ -14711,6 +14907,62 @@ mod tests {
     }
 
     #[test]
+    fn external_transcript_cache_invalidates_when_source_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-cache-invalidation";
+        let path = sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl"));
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        });
+        let first_message = serde_json::json!({
+            "timestamp": "2026-05-17T16:49:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "first cached message" }]
+            }
+        });
+        let second_message = serde_json::json!({
+            "timestamp": "2026-05-17T16:49:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "second uncached message" }]
+            }
+        });
+
+        std::fs::write(&path, format!("{session_meta}\n{first_message}\n")).unwrap();
+        let first = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("first load should resolve");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["content"], "first cached message");
+
+        std::fs::write(
+            &path,
+            format!("{session_meta}\n{first_message}\n{second_message}\n"),
+        )
+        .unwrap();
+        let second = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("second load should resolve");
+        let contents: Vec<_> = second
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(
+            contents,
+            vec!["first cached message", "second uncached message"]
+        );
+    }
+
+    #[test]
     fn external_activity_replay_uses_compact_session_transcript() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join(".codex").join("sessions");
@@ -14756,9 +15008,14 @@ mod tests {
                 .expect("codex session should replay");
         let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
         assert_eq!(replay["t"], "log_replay");
+        assert_eq!(replay["replay_semantics"], EXTERNAL_TRANSCRIPT_SEMANTICS);
 
         let entries = replay["entries"].as_array().unwrap();
         assert_eq!(entries[0]["event"], "replay_start");
+        assert_eq!(
+            entries[0]["replay_semantics"],
+            EXTERNAL_TRANSCRIPT_SEMANTICS
+        );
         assert_eq!(entries[1]["event"], "session_attached");
         assert_eq!(entries[1]["session_id"], session_id);
         assert_eq!(entries[1]["source"], "codex");
