@@ -31,6 +31,21 @@ use tokio::sync::{mpsc, RwLock};
 /// whole terminal history in memory.
 const SCROLLBACK_LIMIT: usize = 32 * 1024;
 
+/// Device Status Report (cursor position) query / reply.
+///
+/// Windows ConPTY emits `ESC[6n` when a console app starts and blocks until
+/// the terminal replies before processing stdin, so a shell would hang at
+/// startup if nobody answers. In production the browser's xterm.js answers,
+/// but we also answer server-side: the reply is consumed by conhost (the
+/// component that issued the query) rather than delivered to the shell as
+/// input, so it's safe even alongside the client's reply, and it keeps the
+/// shell usable before any client has attached. On Unix the query doesn't fire
+/// at startup, so the scan is a no-op.
+#[cfg(windows)]
+const DSR_CPR_QUERY: &[u8] = b"\x1b[6n";
+#[cfg(windows)]
+const DSR_CPR_REPLY: &[u8] = b"\x1b[1;1R";
+
 /// Composite session identifier. `host_id` is always `"local"` today but
 /// keys the map so that multi-host phase 1 can add sibling daemons
 /// without retrofitting the single-host assumption.
@@ -175,6 +190,16 @@ impl PtySession {
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = buf[..n].to_vec();
+                    // Answer ConPTY's startup cursor-position query so the shell
+                    // doesn't block waiting for it (Windows only; no-op on Unix
+                    // where the slice is never present).
+                    #[cfg(windows)]
+                    if chunk.windows(DSR_CPR_QUERY.len()).any(|w| w == DSR_CPR_QUERY) {
+                        if let Ok(mut w) = session.writer.lock() {
+                            let _ = w.write_all(DSR_CPR_REPLY);
+                            let _ = w.flush();
+                        }
+                    }
                     if let Ok(mut sb) = session.scrollback.lock() {
                         sb.push(&chunk);
                     }
@@ -326,7 +351,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         session.attach(tx);
 
-        session.write_input(b"echo hello_from_pty\n");
+        // A terminal client sends CR (the Enter key), not LF — required for
+        // ConPTY to submit the line on Windows; harmless on Unix.
+        session.write_input(b"echo hello_from_pty\r");
 
         // Drain events until we see the expected echo, with a bounded wait.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -356,7 +383,8 @@ mod tests {
         // Drive a command through the first listener, then detach.
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         session.attach(tx1);
-        session.write_input(b"echo scroll_token_abc\n");
+        // CR (Enter), not LF — see open_attach_write_and_receive_output.
+        session.write_input(b"echo scroll_token_abc\r");
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         while tokio::time::Instant::now() < deadline {
