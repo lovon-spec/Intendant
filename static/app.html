@@ -1501,6 +1501,14 @@ html, body {
   border-color: color-mix(in srgb, var(--teal) 62%, var(--surface1));
   box-shadow: inset 0 0 0 1px rgba(148, 226, 213, 0.18);
 }
+.session-window.prompt-target {
+  border-color: color-mix(in srgb, var(--session-badge-fg, var(--blue)) 78%, var(--surface1));
+  background: color-mix(in srgb, var(--session-badge-bg, rgba(137, 180, 250, 0.08)) 36%, var(--mantle));
+  box-shadow:
+    inset 0 0 0 2px color-mix(in srgb, var(--session-badge-border, rgba(137, 180, 250, 0.62)) 72%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--session-badge-border, rgba(137, 180, 250, 0.62)) 30%, transparent),
+    0 0 18px color-mix(in srgb, var(--session-badge-fg, var(--blue)) 26%, transparent);
+}
 .session-window.minimized {
   min-height: 36px;
   max-height: 36px;
@@ -10691,6 +10699,7 @@ function markSessionWindowPendingActive(sessionId) {
 }
 
 function updateTaskTargetChip() {
+  updatePromptTargetSessionHighlight();
   const chip = document.getElementById('task-target-chip');
   if (!chip) return;
   const sid = resolvePromptTargetSessionId();
@@ -10716,6 +10725,13 @@ function updateTaskTargetChip() {
   const title = `Prompt target: ${sid}`;
   chip.title = title;
   chip.setAttribute('aria-label', title);
+}
+
+function updatePromptTargetSessionHighlight() {
+  const target = resolvePromptTargetSessionId();
+  for (const [sid, win] of sessionWindows) {
+    win.el.classList.toggle('prompt-target', !!target && sid === target && !win.ended);
+  }
 }
 
 function resolvePromptTargetSessionId() {
@@ -11761,6 +11777,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   el.className = 'session-window';
   el.dataset.sessionId = sid;
   el.tabIndex = 0;
+  applySessionBadgeStyle(el, sid);
 
   const header = document.createElement('div');
   header.className = 'session-window-header';
