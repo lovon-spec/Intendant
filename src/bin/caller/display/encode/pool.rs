@@ -2112,7 +2112,8 @@ impl Drop for EncoderPoolInner {
 /// [`EncoderHandle`]. The thread:
 ///
 /// 1. Constructs the codec's encoder backend via
-///    [`super::select_codec_for_mime`].
+///    [`super::select_codec_for_mime`] — **on the encoder thread
+///    itself** (see below).
 /// 2. Subscribes to the pool's I420 broadcast.
 /// 3. In a `blocking_recv` loop: pulls the next I420 frame, swaps the
 ///    `force_keyframe` flag, calls `encoder.encode(...)`, and
@@ -2121,18 +2122,33 @@ impl Drop for EncoderPoolInner {
 /// 4. Exits when `shutdown` is cancelled OR the I420 broadcast closes
 ///    (sender dropped at pool drop).
 ///
-/// Synchronously probes the encoder backend via
-/// [`super::select_codec_for_mime`] and spawns the driver thread only
-/// if construction succeeded. Returns the `EncoderHandle` on `Ok`,
-/// propagates the construction error on `Err` — callers (the pool's
-/// on-demand subscribe path) use the error to skip the codec rather
-/// than return a ghost subscription.
+/// **Construct-on-the-driver-thread.** The encoder is built inside the
+/// spawned thread and then *used and dropped* on that same thread for
+/// its entire life. This is load-bearing for the Windows Media
+/// Foundation backend ([`super::h264_windows`]), whose `new()` calls
+/// `CoInitializeEx` + `MFStartup` and whose `Drop` calls `MFShutdown` +
+/// `CoUninitialize` — COM init/teardown is **per-thread**, so the same
+/// thread that initializes COM must be the one that touches and releases
+/// the COM objects. The other backends (VP8/libvpx, VideoToolbox,
+/// ffmpeg) have no per-thread state and are unaffected; their
+/// construction code is unchanged — only the thread on which
+/// `select_codec_for_mime` runs has moved.
 ///
-/// Replaces the earlier in-thread construction that logged failures
-/// and silently exited after the handle had already been published to
-/// subscribers. That behavior surfaced as "the peer negotiated a
-/// codec the system can't actually produce" — which was one of the
-/// root causes the encoder-pool redesign exists to fix.
+/// **No ghost handles.** Construction can still fail (a host without a
+/// usable H.264 MFT, libvpx ABI mismatch, …) and the contract is that a
+/// failed construct must *not* publish an [`EncoderHandle`] — callers
+/// (the on-demand subscribe path) rely on the error to exclude the codec
+/// from the subscription set rather than hand back a subscription to an
+/// encoder that will never emit a frame. To keep that contract while
+/// moving construction onto the thread, the thread reports the
+/// construction outcome back over a one-shot startup channel and this
+/// function blocks until it arrives: on `Err` we return the error (the
+/// thread has already exited, nothing was published); on `Ok` we return
+/// the `EncoderHandle`. This replaces the original design where the
+/// caller constructed synchronously and moved the boxed encoder into the
+/// thread — which worked for libvpx/VideoToolbox/ffmpeg but constructed
+/// the Windows MF encoder on a Tokio worker only to use and drop it on
+/// the encoder thread, a latent cross-thread-COM hazard.
 fn try_spawn_encoder_thread(
     id: EncoderId,
     layer: LayerSpec,
@@ -2142,25 +2158,22 @@ fn try_spawn_encoder_thread(
     duration_ms: u64,
     counters: &Arc<crate::display::DisplayMetricsCounters>,
 ) -> Result<EncoderHandle, String> {
-    // Synchronous construction probe. If this fails, we never spawn
-    // the thread, never publish a handle, and the caller knows to
-    // exclude this codec from the subscription set.
-    let (encoder, _) = super::select_codec_for_mime(
-        id.codec.mime(),
-        layer.width,
-        layer.height,
-        layer.target_bitrate_kbps,
-    )?;
-    Ok(spawn_encoder_thread_with(
+    // The construction parameters captured for the driver thread. The
+    // thread runs `select_codec_for_mime` so any per-thread codec state
+    // (Windows COM/MF) is initialized on the thread that will use it.
+    let mime = id.codec.mime();
+    let (cw, ch, cbr) = (layer.width, layer.height, layer.target_bitrate_kbps);
+    let construct = move || super::select_codec_for_mime(mime, cw, ch, cbr).map(|(enc, _)| enc);
+    spawn_encoder_thread_with(
         id,
         layer,
         source_w,
         source_h,
-        encoder,
+        construct,
         i420_tx,
         duration_ms,
         counters,
-    ))
+    )
 }
 
 /// 3c.3b.4f: per-encoder silent-output watchdog.
@@ -2287,19 +2300,25 @@ fn try_h264_fallback_for_layer(
     None
 }
 
-/// Spawn the encoder driver thread with a pre-constructed [`super::Encoder`].
-/// Returns immediately; the thread runs until `shutdown.cancel()` or the
-/// i420 broadcast closes.
+/// Spawn the encoder driver thread, constructing the [`super::Encoder`]
+/// **inside that thread** via the `construct` closure.
+///
+/// Blocks until the thread reports its construction outcome over a
+/// one-shot startup channel: returns `Err` (and publishes no handle) if
+/// `construct` failed, or the running [`EncoderHandle`] once the encoder
+/// is built. Constructing on the thread that will use and drop the
+/// encoder is what makes the Windows MF backend's per-thread COM
+/// init/teardown correct; see [`try_spawn_encoder_thread`].
 fn spawn_encoder_thread_with(
     id: EncoderId,
     layer: LayerSpec,
     source_w: u32,
     source_h: u32,
-    encoder: Box<dyn super::Encoder>,
+    construct: impl FnOnce() -> Result<Box<dyn super::Encoder>, String> + Send + 'static,
     i420_tx: &broadcast::Sender<I420Frame>,
     duration_ms: u64,
     counters: &Arc<crate::display::DisplayMetricsCounters>,
-) -> EncoderHandle {
+) -> Result<EncoderHandle, String> {
     let (frames_tx, _) = broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
     let force_keyframe = Arc::new(AtomicBool::new(false));
     // Phase 4d.0: paused defaults to false. Layer-selection policy
@@ -2339,8 +2358,37 @@ fn spawn_encoder_thread_with(
     // (encode_drops). Counter is shared with DisplaySession via Arc.
     let counters_for_thread = Arc::clone(counters);
 
+    // One-shot startup channel: the thread constructs the encoder and
+    // reports `Ok(())` / `Err(reason)` back here before entering its
+    // loop. Sized 1 — exactly one message is ever sent. This lets us
+    // construct on the encoder thread (correct for Windows per-thread
+    // COM/MF) yet still propagate a construction failure to the caller
+    // synchronously, so no handle is published for an encoder that
+    // could not be built.
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
     std::thread::spawn(move || {
-        let mut encoder = encoder;
+        // Construct on THIS thread so any per-thread codec state
+        // (Windows COM apartment + Media Foundation) is initialized,
+        // used, and torn down all on one thread. On failure, report the
+        // error and exit without ever touching the i420 broadcast.
+        let mut encoder = match construct() {
+            Ok(enc) => {
+                // Report success first; if the receiver is already gone
+                // (caller dropped), there's nothing to drive, so exit.
+                if startup_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                enc
+            }
+            Err(e) => {
+                let _ = startup_tx.send(Err(e));
+                return;
+            }
+        };
+        // Drop the startup sender now that the outcome is delivered; the
+        // encoder's lifetime is owned entirely by this thread from here.
+        drop(startup_tx);
         let mut watchdog = WatchdogState::new();
         // Windows black-frame diagnostic: count encode calls so the
         // hop-by-hop avg-byte logging below self-limits to the first few
@@ -2569,13 +2617,23 @@ fn spawn_encoder_thread_with(
         }
     });
 
-    EncoderHandle {
-        id,
-        layer,
-        frames: frames_tx,
-        force_keyframe,
-        paused,
-        shutdown,
+    // Block until the thread reports its construction outcome. A
+    // `RecvError` here means the thread panicked or exited before
+    // sending — treat that as a construction failure rather than
+    // publishing a handle to a dead thread.
+    match startup_rx.recv() {
+        Ok(Ok(())) => Ok(EncoderHandle {
+            id,
+            layer,
+            frames: frames_tx,
+            force_keyframe,
+            paused,
+            shutdown,
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(format!(
+            "encoder {id} thread exited before reporting construction outcome"
+        )),
     }
 }
 

@@ -94,13 +94,57 @@ function Update-SessionPath {
     }
 }
 
-# Is a Chocolatey package installed? (`choco list --local-only` is the
-# pre-2.0 form; `choco list` is local-only by default on 2.x. Probe both.)
+# Is a Chocolatey package installed? `choco list` is local-only by default on
+# 2.x (the pre-2.0 `--local-only` flag was *removed* and now errors), so probe
+# the modern form only.
 function Test-ChocoPkg($name) {
     if (-not (Test-Cmd choco)) { return $false }
-    $listed = & choco list --local-only --exact $name 2>$null
-    if (-not $listed) { $listed = & choco list --exact $name 2>$null }
+    $listed = & choco list --exact $name 2>$null
     return [bool]($listed | Select-String -SimpleMatch -Quiet $name)
+}
+
+# Ensure `nasm` is callable. The choco `nasm` package installs nasm.exe into a
+# fixed directory (C:\Program Files\NASM) and amends the *machine* PATH -- but
+# that change only lands in newly-spawned shells, so the very shell that ran the
+# install (and a fresh-machine `-Check`) can have nasm.exe on disk yet not on
+# PATH. If `nasm` doesn't resolve, locate the install dir, prepend it to this
+# session's PATH, persist it (machine if elevated, else user), and re-probe.
+# Returns $true if nasm is callable afterward.
+function Resolve-Nasm {
+    if (Test-Cmd nasm) { return $true }
+
+    $candidates = @(
+        (Join-Path $env:ProgramFiles "NASM"),
+        (Join-Path ${env:ProgramFiles(x86)} "NASM"),
+        (Join-Path $env:ProgramData "chocolatey\bin")  # choco shim dir
+    ) | Where-Object { $_ } | Select-Object -Unique
+
+    $nasmDir = $candidates | Where-Object {
+        Test-Path -LiteralPath (Join-Path $_ "nasm.exe")
+    } | Select-Object -First 1
+
+    if (-not $nasmDir) { return $false }
+
+    # Prepend to this process's PATH for an immediate re-probe.
+    if (($env:Path -split ';') -notcontains $nasmDir) {
+        $env:Path = "$nasmDir;$env:Path"
+    }
+
+    # Persist so future shells (and the cargo build below) resolve nasm without
+    # this dance. Machine scope needs admin; fall back to user scope otherwise.
+    $scope = if (Test-Admin) { "Machine" } else { "User" }
+    $persisted = [Environment]::GetEnvironmentVariable("Path", $scope)
+    if (($persisted -split ';') -notcontains $nasmDir) {
+        $newPath = if ($persisted) { "$persisted;$nasmDir" } else { $nasmDir }
+        try {
+            [Environment]::SetEnvironmentVariable("Path", $newPath, $scope)
+            Info "added $nasmDir to the $scope PATH (NASM was installed but not on PATH)"
+        } catch {
+            Warn "could not persist $nasmDir to the $scope PATH: $($_.Exception.Message)"
+        }
+    }
+
+    return (Test-Cmd nasm)
 }
 
 # Whether the Server-Media-Foundation feature is needed (Windows Server only)
@@ -122,13 +166,15 @@ function Test-MediaFoundation {
 function Check-Core {
     $allOk = $true
     Write-Host ""
-    Write-Host "Build toolchain:"
+    Write-Host "Build toolchain (required to build):"
 
+    # Chocolatey is only the *installer* this script uses, not a build input --
+    # a machine with rustup/MSVC/NASM/git installed by other means builds fine
+    # without it. Report it, but do NOT count its absence as a build failure.
     if (Test-Cmd choco) {
-        Ok "Chocolatey"
+        Ok "Chocolatey (installer)"
     } else {
-        Miss "Chocolatey" "https://chocolatey.org/install"
-        $allOk = $false
+        Warn "   - Chocolatey -- not installed (only needed to auto-install the deps below; https://chocolatey.org/install)"
     }
 
     if ((Test-Cmd rustc) -and (Test-Cmd cargo)) {
@@ -158,8 +204,10 @@ function Check-Core {
         $allOk = $false
     }
 
-    # NASM is required to build the `ring` crypto crate on windows-msvc.
-    if (Test-Cmd nasm) {
+    # NASM is required to build the `ring` crypto crate on windows-msvc. It is
+    # commonly installed (C:\Program Files\NASM) but absent from PATH; resolve
+    # that case before declaring it missing.
+    if (Resolve-Nasm) {
         Ok "NASM ($((nasm -v) -replace '^NASM version\s+(\S+).*', '$1'))"
     } else {
         Miss "NASM" "choco install nasm (required by the ring crate; must be on PATH)"
@@ -170,6 +218,16 @@ function Check-Core {
         Ok "git"
     } else {
         Miss "git" "choco install git"
+        $allOk = $false
+    }
+
+    # Shell sanity. The runtime shells out via cmd/PowerShell (never bash on
+    # Windows), both of which ship with the OS -- so this is effectively always
+    # OK, but verify rather than assume.
+    if ((Test-Cmd powershell) -or (Test-Cmd cmd)) {
+        Ok "Windows shell (powershell/cmd)"
+    } else {
+        Miss "Windows shell" "neither powershell nor cmd resolved -- PATH is badly broken"
         $allOk = $false
     }
 
@@ -204,13 +262,13 @@ function Check-Wasm {
 function Check-Runtime {
     $allOk = $true
     Write-Host ""
-    Write-Host "Runtime dependencies:"
+    Write-Host "Runtime dependencies (optional -- not required to build):"
 
     # ffmpeg/ffplay back the audio bridge (no PulseAudio/CoreAudio on Windows).
     if (Test-Cmd ffmpeg) {
         Ok "ffmpeg (on PATH)"
     } else {
-        Miss "ffmpeg" "choco install ffmpeg (the audio bridge shells out to ffmpeg/ffplay)"
+        Miss "ffmpeg" "choco install ffmpeg (audio bridge only; not needed to build)"
         $allOk = $false
     }
     if (Test-Cmd ffplay) {
@@ -231,11 +289,13 @@ function Check-Runtime {
         $allOk = $false
     }
 
-    # VB-CABLE: no package/CLI installer; surface its presence either way.
+    # VB-CABLE: no package/CLI installer; surface its presence either way. A
+    # missing cable is a manual follow-up for voice, NOT a build/toolchain
+    # failure -- it must never gate the -Check exit code.
     if (Test-VbCable) {
         Ok "VB-CABLE virtual audio device"
     } else {
-        Miss "VB-CABLE" "manual install -- https://vb-audio.com/Cable/ (set as default playback device)"
+        Miss "VB-CABLE" "manual install for voice only -- https://vb-audio.com/Cable/ (not needed to build)"
         $allOk = $false
     }
 
@@ -282,9 +342,22 @@ function Install-ChocoPkg {
         Info "$Package already present ($ProbeCmd found), skipping"
         return
     }
+    # If the choco package is recorded as installed but the probe command still
+    # doesn't resolve, the package landed but its dir isn't on this session's
+    # PATH yet. Refresh the session PATH and re-probe before trusting it --
+    # otherwise we'd skip an install whose tool is unusable (the NASM-off-PATH
+    # trap). If it still won't resolve, fall through and (re)install.
     if (Test-ChocoPkg $Package) {
-        Info "$Package already installed (choco), skipping"
-        return
+        if (-not $ProbeCmd) {
+            Info "$Package already installed (choco), skipping"
+            return
+        }
+        Update-SessionPath
+        if (Test-Cmd $ProbeCmd) {
+            Info "$Package already installed (choco), skipping"
+            return
+        }
+        Warn "$Package recorded as installed but '$ProbeCmd' is not on PATH -- reinstalling to repair"
     }
     Info "installing $Package..."
     & choco install -y $Package
@@ -403,26 +476,35 @@ function Run-Check {
     Write-Host "  Intendant Windows Dependency Check" -ForegroundColor Cyan
     Write-Host "========================================================" -ForegroundColor Cyan
 
-    $coreOk    = Check-Core
+    # Only the build toolchain gates the exit code. WASM tooling and the runtime
+    # deps (ffmpeg, Media Foundation, VB-CABLE) are optional/runtime/manual --
+    # a missing VB-CABLE is not a toolchain failure and must not fail -Check.
+    # Coerce to a single boolean: a function returns its whole output stream, so
+    # guard the exit-code decision against any stray emitted value by taking the
+    # last element (the `return $allOk`) and casting.
+    $coreOk    = [bool](@(Check-Core)[-1])
     $null      = Check-Wasm
-    $runtimeOk = Check-Runtime
+    $null      = Check-Runtime
 
     Write-Host ""
     Write-Host "--------------------------------------------------------"
 
     if ($coreOk) {
-        Write-Host "  Build toolchain:   ready"
+        Write-Host "  Build toolchain (required):   ready" -ForegroundColor Green
     } else {
-        Write-Host "  Build toolchain:   missing dependencies (run without -Check to install)"
+        Write-Host "  Build toolchain (required):   MISSING dependencies (run without -Check to install)" -ForegroundColor Red
     }
-
-    if ($runtimeOk) {
-        Write-Host "  Runtime:           ready"
-    } else {
-        Write-Host "  Runtime:           missing dependencies (see VB-CABLE / ffmpeg notes above)"
-    }
-
+    Write-Host "  Optional/runtime deps:        see notes above (wasm-pack, ffmpeg, VB-CABLE -- not required to build)"
     Write-Host ""
+
+    # Return a nonzero exit code iff a *required build* dependency is missing or
+    # unusable, so CI/automation can't read a false pass. Optional and runtime
+    # deps never affect the exit code.
+    if (-not $coreOk) {
+        Write-Host "Required build dependencies are missing. Re-run without -Check to install them." -ForegroundColor Red
+        exit 1
+    }
+    exit 0
 }
 
 function Run-Install {
@@ -443,9 +525,14 @@ function Run-Install {
     # Phase 2: build toolchain via Chocolatey
     Info "installing build toolchain packages..."
     Install-ChocoPkg -Package "git" -ProbeCmd "git"
-    # NASM is required to assemble the `ring` crate on windows-msvc; the choco
-    # package adds it to the machine PATH.
+    # NASM is required to assemble the `ring` crate on windows-msvc. The choco
+    # package amends the *machine* PATH, which this shell won't see until
+    # Resolve-Nasm prepends the install dir (and persists it) so the cargo build
+    # below can find nasm.exe.
     Install-ChocoPkg -Package "nasm" -ProbeCmd "nasm"
+    if (-not (Resolve-Nasm)) {
+        Die "NASM not callable after install -- nasm.exe was not found in C:\Program Files\NASM or the choco shim dir"
+    }
     # The C++ workload provides cl.exe / link.exe / the Windows SDK -- required
     # even for `cargo check`. No reliable bare-command probe (cl.exe lives off
     # PATH outside a Developer prompt), so gate on the package + vswhere.

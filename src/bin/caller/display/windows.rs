@@ -60,9 +60,14 @@
 //! `SendInput` injects synthesized keyboard and mouse events. Keyboard events
 //! carry a Win32 virtual-key code (see [`super::windows_keymap`]) plus the
 //! `KEYEVENTF_EXTENDEDKEY` flag for keys in the extended block. Mouse moves use
-//! `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`, with the normalized
-//! `0.0..1.0` browser coordinates scaled to the `0..65535` absolute coordinate
-//! space that `SendInput` expects across the entire virtual desktop.
+//! `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`. The normalized `0.0..1.0`
+//! browser coordinates are relative to the **captured monitor**, so they are
+//! first placed inside that monitor's rect on the virtual desktop (using the
+//! capture rect's origin, tracked alongside its dimensions), then scaled to the
+//! `0..65535` absolute coordinate space `SendInput` expects across the entire
+//! virtual desktop. This makes clicks land on the correct monitor when a
+//! secondary output is streamed; capturing the primary / whole virtual desktop
+//! leaves the mapping unchanged.
 //!
 //! ## Status
 //!
@@ -75,7 +80,7 @@
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
 use crate::error::CallerError;
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -154,6 +159,19 @@ impl CaptureMethod {
     }
 }
 
+/// The rectangle currently being captured, expressed in **virtual-desktop**
+/// pixel coordinates (the same space `DXGI_OUTPUT_DESC::DesktopCoordinates` and
+/// `GetSystemMetrics(SM_X/YVIRTUALSCREEN)` use). `(left, top)` is the monitor's
+/// offset within the virtual desktop -- `(0, 0)` for the primary / whole-desktop
+/// capture, and negative for a monitor placed left of or above the primary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaptureRect {
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+}
+
 /// Windows screen capture and input injection backend.
 ///
 /// Captures the full desktop via GDI `BitBlt` (default) or DXGI Desktop
@@ -161,11 +179,22 @@ impl CaptureMethod {
 /// scroll via `SendInput`. Resolution is resolved when `start_capture()` runs
 /// (from `GetSystemMetrics` for the primary GDI path, or the monitor/output
 /// rect when a specific monitor is targeted); `with_output_index` targets a
-/// specific monitor by its DXGI output ordinal.
+/// specific monitor by its DXGI output ordinal. The resolved capture rect's
+/// origin is also tracked (`capture_left`/`capture_top`) so input injection can
+/// map normalized coordinates into the captured monitor on a multi-monitor
+/// virtual desktop.
 pub struct WindowsBackend {
     capture: Mutex<Option<CaptureState>>,
     width: Arc<AtomicU32>,
     height: Arc<AtomicU32>,
+    /// Top-left of the active capture rect in **virtual-desktop** pixel
+    /// coordinates (the `(left, top)` `resolve_capture_rect` produced for the
+    /// targeted output). Together with `width`/`height` this is the rectangle
+    /// normalized input coordinates are mapped into; for the primary / whole
+    /// virtual desktop it is `(0, 0)` and behavior is unchanged. Signed because
+    /// a monitor left/above the primary has negative virtual-desktop offsets.
+    capture_left: Arc<AtomicI32>,
+    capture_top: Arc<AtomicI32>,
     shutdown: Arc<AtomicBool>,
     /// Target DXGI output index on adapter 0. `None` captures the primary /
     /// first available output (backwards-compatible single-monitor behavior).
@@ -189,6 +218,18 @@ impl WindowsBackend {
         Self::with_method(Some(output_index), CaptureMethod::from_env_or_default())
     }
 
+    /// The active capture rectangle in virtual-desktop pixel coordinates, as a
+    /// snapshot of the shared atomics the capture thread keeps current. Used by
+    /// input injection to map normalized coordinates into the captured monitor.
+    fn captured_rect(&self) -> CaptureRect {
+        CaptureRect {
+            left: self.capture_left.load(Ordering::SeqCst),
+            top: self.capture_top.load(Ordering::SeqCst),
+            width: self.width.load(Ordering::SeqCst),
+            height: self.height.load(Ordering::SeqCst),
+        }
+    }
+
     /// Create a backend with an explicit output target and capture method.
     /// Lets callers force the DXGI fast path (e.g. on a known-good GPU host)
     /// without relying on the environment override.
@@ -197,6 +238,8 @@ impl WindowsBackend {
             capture: Mutex::new(None),
             width: Arc::new(AtomicU32::new(0)),
             height: Arc::new(AtomicU32::new(0)),
+            capture_left: Arc::new(AtomicI32::new(0)),
+            capture_top: Arc::new(AtomicI32::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             target_output_index,
             method,
@@ -360,6 +403,8 @@ impl DisplayBackend for WindowsBackend {
         let shutdown_flag = Arc::clone(&self.shutdown);
         let shared_w = Arc::clone(&self.width);
         let shared_h = Arc::clone(&self.height);
+        let shared_left = Arc::clone(&self.capture_left);
+        let shared_top = Arc::clone(&self.capture_top);
         let target_output = self.target_output_index;
         let method = self.method;
 
@@ -381,6 +426,8 @@ impl DisplayBackend for WindowsBackend {
                     target_output,
                     shared_w,
                     shared_h,
+                    shared_left,
+                    shared_top,
                     init_tx,
                 );
             }
@@ -392,6 +439,8 @@ impl DisplayBackend for WindowsBackend {
                     target_output,
                     shared_w,
                     shared_h,
+                    shared_left,
+                    shared_top,
                     init_tx,
                 );
             }
@@ -445,10 +494,15 @@ impl DisplayBackend for WindowsBackend {
     }
 
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
-        // SendInput is synchronous and cheap; run it inline. The normalized
-        // mouse coordinates are scaled against the virtual-desktop extents
-        // queried at injection time (so they track resolution / monitor-layout
-        // changes without restarting capture).
+        // SendInput is synchronous and cheap; run it inline. Normalized mouse
+        // coordinates are mapped into the **captured monitor's** rect (the one
+        // `resolve_capture_rect` produced, tracked in `capture_left/top` +
+        // `width/height` and refreshed on resize), then normalized against the
+        // virtual-desktop extents queried at injection time. This is what makes
+        // clicks land on the right monitor when a secondary output is streamed;
+        // for the primary / whole virtual desktop the rect is (0,0,vw,vh) and
+        // the mapping is unchanged.
+        let rect = self.captured_rect();
         match event {
             InputEvent::KeyDown { ref code, .. } => {
                 inject_key(code, false)?;
@@ -462,13 +516,13 @@ impl DisplayBackend for WindowsBackend {
                 // state from the preceding down event), so `buttons` is
                 // advisory only and does not change the flags.
                 let _ = buttons;
-                send_mouse_absolute(x, y, MOUSEEVENTF_MOVE, 0)?;
+                send_mouse_absolute(x, y, rect, MOUSEEVENTF_MOVE, 0)?;
             }
             InputEvent::MouseDown { x, y, b } => {
-                send_mouse_absolute(x, y, MOUSEEVENTF_MOVE | mouse_down_flag(b), 0)?;
+                send_mouse_absolute(x, y, rect, MOUSEEVENTF_MOVE | mouse_down_flag(b), 0)?;
             }
             InputEvent::MouseUp { x, y, b } => {
-                send_mouse_absolute(x, y, MOUSEEVENTF_MOVE | mouse_up_flag(b), 0)?;
+                send_mouse_absolute(x, y, rect, MOUSEEVENTF_MOVE | mouse_up_flag(b), 0)?;
             }
             InputEvent::Scroll { x, y, dx, dy } => {
                 // One WHEEL_DELTA (120) per unit line. Browser convention:
@@ -479,10 +533,10 @@ impl DisplayBackend for WindowsBackend {
                 let vwheel = -(dy.round() as i32) * WHEEL_DELTA as i32;
                 let hwheel = (dx.round() as i32) * WHEEL_DELTA as i32;
                 if vwheel != 0 {
-                    send_mouse_absolute(x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_WHEEL, vwheel)?;
+                    send_mouse_absolute(x, y, rect, MOUSEEVENTF_MOVE | MOUSEEVENTF_WHEEL, vwheel)?;
                 }
                 if hwheel != 0 {
-                    send_mouse_absolute(x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_HWHEEL, hwheel)?;
+                    send_mouse_absolute(x, y, rect, MOUSEEVENTF_MOVE | MOUSEEVENTF_HWHEEL, hwheel)?;
                 }
             }
         }
@@ -562,21 +616,24 @@ fn inject_key(code: &str, key_up: bool) -> Result<(), CallerError> {
 }
 
 /// Send a mouse event at the given normalized coordinates with the supplied
-/// flags. `mouse_data` carries the wheel delta for `MOUSEEVENTF_WHEEL` /
+/// flags. `rect` is the monitor currently being captured (virtual-desktop
+/// pixels); `mouse_data` carries the wheel delta for `MOUSEEVENTF_WHEEL` /
 /// `MOUSEEVENTF_HWHEEL` (ignored otherwise).
 ///
-/// The `0.0..1.0` browser coordinates are mapped onto the virtual desktop:
+/// The `0.0..1.0` browser coordinates are relative to the captured monitor, so
+/// we first place the point inside that monitor's pixel rect on the virtual
+/// desktop, then normalize against the virtual-screen extents:
 /// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` interprets `dx`/`dy` as a
-/// `0..65535` fraction of the **entire** virtual screen (all monitors), so we
-/// first place the point inside the captured monitor's pixel rect, then
-/// normalize that against the virtual-screen extents.
+/// `0..65535` fraction of the **entire** virtual screen (all monitors).
 fn send_mouse_absolute(
     x: f64,
     y: f64,
+    rect: CaptureRect,
     flags: MOUSE_EVENT_FLAGS,
     mouse_data: i32,
 ) -> Result<(), CallerError> {
-    let (abs_x, abs_y) = normalized_to_virtual_abs(x, y);
+    let virtual_screen = virtual_screen_metrics();
+    let (abs_x, abs_y) = map_normalized_to_virtualdesk_abs(x, y, rect, virtual_screen);
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -605,29 +662,57 @@ fn virtual_screen_metrics() -> (i32, i32, i32, i32) {
     }
 }
 
-/// Convert normalized `0.0..1.0` coordinates (relative to the captured
-/// monitor, whose top-left we treat as the virtual-screen origin for the
-/// single-monitor case) into the `0..65535` absolute space `SendInput`
-/// expects with `MOUSEEVENTF_VIRTUALDESK`.
+/// Map normalized `0.0..1.0` coordinates -- relative to the **captured
+/// monitor** `rect` -- into the `0..65535` absolute space `SendInput` expects
+/// with `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`.
 ///
-/// For the common single-monitor / primary-output case the captured rect is
-/// the whole virtual screen with origin `(0,0)`, so this reduces to
-/// `coord * 65535 / (extent - 1)`. For a secondary monitor the normalized
-/// coordinate is relative to that monitor and would need its offset added; the
-/// current backend captures the primary output, where the offset is zero.
-fn normalized_to_virtual_abs(x: f64, y: f64) -> (i32, i32) {
-    let (vleft, vtop, vwidth, vheight) = virtual_screen_metrics();
+/// `virtual_screen` is `(left, top, width, height)` from
+/// [`virtual_screen_metrics`]; `rect` is the monitor being streamed, in the
+/// same virtual-desktop pixel space. Two steps:
+///
+/// 1. **Normalized -> virtual-desktop pixel.** Place the point inside the
+///    captured monitor: `px = rect.left + x * rect.width`. For a secondary
+///    monitor `rect.left`/`top` are its offset within the desktop (negative if
+///    it sits left of / above the primary), which is exactly what was missing
+///    before -- the old code scaled against the *whole* virtual screen, so a
+///    click meant for a right-hand monitor landed on the primary.
+/// 2. **Virtual-desktop pixel -> 0..65535.** Subtract the virtual-screen origin
+///    so the point is in `[0, extent]`, then apply the documented SendInput
+///    formula `(coord * 65535) / (extent - 1)`.
+///
+/// For the primary / whole-desktop capture `rect` is `(0, 0, vwidth, vheight)`
+/// and this reduces to the previous behavior. If `rect` has a zero dimension
+/// (capture not yet started, atomics unpopulated) we fall back to the full
+/// virtual screen so a stray pre-capture event still maps sanely.
+fn map_normalized_to_virtualdesk_abs(
+    x: f64,
+    y: f64,
+    rect: CaptureRect,
+    virtual_screen: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (vleft, vtop, vwidth, vheight) = virtual_screen;
     // Guard against a zero/negative extent (no desktop): fall back to a
     // full-range mapping so we never divide by zero.
-    let vwidth = if vwidth > 1 { vwidth } else { 1 };
-    let vheight = if vheight > 1 { vheight } else { 1 };
+    let vwidth = vwidth.max(1);
+    let vheight = vheight.max(1);
 
-    // Pixel position within the virtual desktop. The captured primary output
-    // sits at (0,0); `vleft`/`vtop` are typically <= 0 when secondary
-    // monitors extend left/up, so subtract them to land in the [0, extent]
-    // range SendInput normalizes against.
-    let px = (x.clamp(0.0, 1.0) * vwidth as f64) as i32 - vleft;
-    let py = (y.clamp(0.0, 1.0) * vheight as f64) as i32 - vtop;
+    // The captured rect drives the mapping. If it is empty (capture not started
+    // yet) fall back to the whole virtual desktop -- origin at the virtual
+    // screen's top-left -- which reproduces the legacy whole-desktop behavior.
+    let (rleft, rtop, rwidth, rheight) = if rect.width > 0 && rect.height > 0 {
+        (rect.left, rect.top, rect.width as i32, rect.height as i32)
+    } else {
+        (vleft, vtop, vwidth, vheight)
+    };
+
+    // Step 1: normalized -> absolute virtual-desktop pixel within the monitor.
+    let vx = rleft as f64 + x.clamp(0.0, 1.0) * rwidth as f64;
+    let vy = rtop as f64 + y.clamp(0.0, 1.0) * rheight as f64;
+
+    // Step 2: virtual-desktop pixel -> [0, extent], offsetting by the virtual
+    // screen origin (`vleft`/`vtop` are <= 0 when monitors extend left/up).
+    let px = vx.round() as i32 - vleft;
+    let py = vy.round() as i32 - vtop;
 
     // Normalize to 0..65535 across the virtual screen, per the documented
     // SendInput formula `(coord * 65535) / (extent - 1)`.
@@ -669,8 +754,11 @@ struct Duplication {
 
 /// Initialize D3D11 + DXGI Desktop Duplication for the requested output.
 ///
-/// Returns the live `Duplication` plus the output's pixel dimensions.
-fn init_duplication(target_output: Option<u32>) -> Result<(Duplication, u32, u32), String> {
+/// Returns the live `Duplication`, the output's top-left in virtual-desktop
+/// pixels, and its pixel dimensions: `(dup, left, top, width, height)`.
+fn init_duplication(
+    target_output: Option<u32>,
+) -> Result<(Duplication, i32, i32, u32, u32), String> {
     // 1. Create a hardware D3D11 device with BGRA support (required for the
     //    Desktop Duplication B8G8R8A8 surface).
     let feature_levels = [D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0];
@@ -704,7 +792,7 @@ fn init_duplication(target_output: Option<u32>) -> Result<(Duplication, u32, u32
         .map_err(|e| format!("IDXGIDevice::GetAdapter: {e}"))?;
 
     // 3. Pick the target output (default: first attached output).
-    let (output, width, height) = select_output(&adapter, target_output)?;
+    let (output, left, top, width, height) = select_output(&adapter, target_output)?;
 
     // 4. Upgrade to IDXGIOutput1 and duplicate the desktop.
     let output1: IDXGIOutput1 = output
@@ -728,25 +816,30 @@ fn init_duplication(target_output: Option<u32>) -> Result<(Duplication, u32, u32
             width,
             height,
         },
+        left,
+        top,
         width,
         height,
     ))
 }
 
-/// Select a DXGI output on the adapter, returning the output plus its pixel
-/// dimensions. `target_output` is an ordinal on this adapter; `None` picks the
-/// first attached output.
+/// Select a DXGI output on the adapter, returning the output, its top-left in
+/// virtual-desktop pixels, and its pixel dimensions: `(output, left, top, w,
+/// h)`. `target_output` is an ordinal on this adapter; `None` picks the first
+/// attached output. The origin lets input injection map normalized coordinates
+/// into the captured monitor's slice of the virtual desktop.
 fn select_output(
     adapter: &IDXGIAdapter,
     target_output: Option<u32>,
-) -> Result<(IDXGIOutput, u32, u32), String> {
+) -> Result<(IDXGIOutput, i32, i32, u32, u32), String> {
     if let Some(idx) = target_output {
         let output: IDXGIOutput = unsafe { adapter.EnumOutputs(idx) }
             .map_err(|e| format!("EnumOutputs({idx}): {e}"))?;
         let desc = unsafe { get_output_desc(&output) }
             .ok_or_else(|| format!("GetDesc on output {idx} failed"))?;
-        let (w, h) = output_dimensions(&desc.DesktopCoordinates, desc.Rotation);
-        return Ok((output, w & !1, h & !1));
+        let rect = &desc.DesktopCoordinates;
+        let (w, h) = output_dimensions(rect, desc.Rotation);
+        return Ok((output, rect.left, rect.top, w & !1, h & !1));
     }
 
     // Default: first output that is attached to the desktop.
@@ -756,11 +849,11 @@ fn select_output(
             Ok(output) => {
                 if let Some(desc) = unsafe { get_output_desc(&output) } {
                     if desc.AttachedToDesktop.as_bool() {
-                        let (w, h) =
-                            output_dimensions(&desc.DesktopCoordinates, desc.Rotation);
+                        let rect = &desc.DesktopCoordinates;
+                        let (w, h) = output_dimensions(rect, desc.Rotation);
                         // VP8/I420 require even dimensions; enforce here as the
                         // backends do elsewhere.
-                        return Ok((output, w & !1, h & !1));
+                        return Ok((output, rect.left, rect.top, w & !1, h & !1));
                     }
                 }
                 idx += 1;
@@ -825,6 +918,8 @@ fn run_dxgi_capture(
     target_output: Option<u32>,
     shared_width: Arc<AtomicU32>,
     shared_height: Arc<AtomicU32>,
+    shared_left: Arc<AtomicI32>,
+    shared_top: Arc<AtomicI32>,
     init_tx: tokio::sync::oneshot::Sender<Result<(u32, u32), String>>,
 ) {
     let frame_interval =
@@ -842,7 +937,14 @@ fn run_dxgi_capture(
     let _desktop_guard = bind_thread_to_input_desktop("DXGI");
 
     let mut dup = match init_duplication(target_output) {
-        Ok((dup, w, h)) => {
+        Ok((dup, left, top, w, h)) => {
+            // Publish the resolved capture rect (origin + size) so input
+            // injection maps normalized coordinates into this monitor's slice
+            // of the virtual desktop rather than the whole desktop.
+            shared_width.store(w, Ordering::SeqCst);
+            shared_height.store(h, Ordering::SeqCst);
+            shared_left.store(left, Ordering::SeqCst);
+            shared_top.store(top, Ordering::SeqCst);
             let _ = init_tx.send(Ok((w, h)));
             dup
         }
@@ -914,10 +1016,12 @@ fn run_dxgi_capture(
                 // Drop the old duplication and re-init. A transient failure
                 // (e.g. mid secure-desktop transition) is retried.
                 match init_duplication(target_output) {
-                    Ok((new_dup, w, h)) => {
+                    Ok((new_dup, left, top, w, h)) => {
                         dup = new_dup;
                         shared_width.store(w, Ordering::SeqCst);
                         shared_height.store(h, Ordering::SeqCst);
+                        shared_left.store(left, Ordering::SeqCst);
+                        shared_top.store(top, Ordering::SeqCst);
                         consecutive_errors = 0;
                     }
                     Err(e) => {
@@ -1505,6 +1609,8 @@ fn run_gdi_capture(
     target_output: Option<u32>,
     shared_width: Arc<AtomicU32>,
     shared_height: Arc<AtomicU32>,
+    shared_left: Arc<AtomicI32>,
+    shared_top: Arc<AtomicI32>,
     init_tx: tokio::sync::oneshot::Sender<Result<(u32, u32), String>>,
 ) {
     let frame_interval =
@@ -1528,6 +1634,13 @@ fn run_gdi_capture(
 
     let mut capture = match GdiCapture::new(rect_x, rect_y, init_w, init_h) {
         Ok(c) => {
+            // Publish the resolved capture rect (origin + size) so input
+            // injection maps normalized coordinates into this monitor's slice
+            // of the virtual desktop rather than the whole desktop.
+            shared_width.store(init_w, Ordering::SeqCst);
+            shared_height.store(init_h, Ordering::SeqCst);
+            shared_left.store(rect_x, Ordering::SeqCst);
+            shared_top.store(rect_y, Ordering::SeqCst);
             let _ = init_tx.send(Ok((init_w, init_h)));
             c
         }
@@ -1564,6 +1677,10 @@ fn run_gdi_capture(
                         rect_y = ny;
                         shared_width.store(nw, Ordering::SeqCst);
                         shared_height.store(nh, Ordering::SeqCst);
+                        // Keep the capture-rect origin current too, so input
+                        // injection follows a monitor re-arrange / mode switch.
+                        shared_left.store(nx, Ordering::SeqCst);
+                        shared_top.store(ny, Ordering::SeqCst);
                         last_frame = None;
                     }
                     Err(e) => {
@@ -1775,5 +1892,244 @@ mod tests {
         assert_eq!(hdr.biHeight.unsigned_abs(), h);
         // Emitted stride matches what the DXGI path produced: width * 4.
         assert_eq!((w as usize) * 4, 6400);
+    }
+
+    // -- Multi-monitor input-coordinate mapping (F6 regression coverage) -----
+    //
+    // `map_normalized_to_virtualdesk_abs` must place normalized `0..1`
+    // coordinates inside the *captured* monitor's slice of the virtual desktop,
+    // not stretch them across the whole desktop. These cases pin a normalized
+    // center to the captured monitor's center -- first as the expected
+    // virtual-desktop pixel (step 1: monitor offset applied), then as the
+    // expected `0..65535` value (step 2: normalized against the virtual-screen
+    // extents). Before the fix the center of a right-hand secondary always
+    // landed near the *middle of the whole desktop*, i.e. on the primary.
+
+    /// Mirror of step 2: a virtual-desktop pixel `(vpx, vpy)` -> `0..65535`,
+    /// given the virtual-screen `(left, top, width, height)`. Independent of the
+    /// function under test so a bug in the production formula can't hide here.
+    fn expected_abs(vpx: i32, vpy: i32, vs: (i32, i32, i32, i32)) -> (i32, i32) {
+        let (vleft, vtop, vwidth, vheight) = vs;
+        let px = vpx - vleft;
+        let py = vpy - vtop;
+        let ax = ((px as i64 * 65535) / (vwidth as i64 - 1).max(1)) as i32;
+        let ay = ((py as i64 * 65535) / (vheight as i64 - 1).max(1)) as i32;
+        (ax.clamp(0, 65535), ay.clamp(0, 65535))
+    }
+
+    #[test]
+    fn map_primary_only_is_full_range_and_unchanged() {
+        // Single 1920x1080 monitor: rect == virtual screen, origin (0,0).
+        let vs = (0, 0, 1920, 1080);
+        let rect = CaptureRect {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        // Corners hit the documented full-range endpoints.
+        assert_eq!(map_normalized_to_virtualdesk_abs(0.0, 0.0, rect, vs), (0, 0));
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(1.0, 1.0, rect, vs),
+            (65535, 65535)
+        );
+        // Center maps to the monitor center in pixels (960, 540), then to the
+        // abs value of that pixel across the (here identical) virtual screen.
+        let got = map_normalized_to_virtualdesk_abs(0.5, 0.5, rect, vs);
+        assert_eq!(got, expected_abs(960, 540, vs));
+        // Sanity: a single monitor's center is ~mid-range on both axes.
+        assert!((32_000..=33_500).contains(&got.0), "center x ~32767, got {}", got.0);
+        assert!((32_000..=33_500).contains(&got.1), "center y ~32767, got {}", got.1);
+    }
+
+    #[test]
+    fn map_secondary_to_the_right() {
+        // Primary 1920x1080 at (0,0); secondary 1920x1080 to its right at
+        // (1920,0). Virtual screen spans 0..3840 wide. Capturing the secondary,
+        // a normalized center must land at the secondary's center pixel
+        // (1920 + 960 = 2880, 540) -- i.e. in the RIGHT half of the desktop.
+        let vs = (0, 0, 3840, 1080);
+        let rect = CaptureRect {
+            left: 1920,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let center = map_normalized_to_virtualdesk_abs(0.5, 0.5, rect, vs);
+        assert_eq!(center, expected_abs(2880, 540, vs));
+        // The whole captured monitor maps to the right half (abs_x >= ~32767);
+        // pre-fix this would have spanned the full 0..65535 across both panels.
+        assert!(
+            center.0 > 32_767,
+            "secondary-right center must be past desktop midline, got {}",
+            center.0
+        );
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(0.0, 0.0, rect, vs),
+            expected_abs(1920, 0, vs),
+            "top-left of the right monitor is the desktop midpoint"
+        );
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(1.0, 1.0, rect, vs),
+            (65535, 65535),
+            "bottom-right of the right monitor is the desktop's far corner"
+        );
+    }
+
+    #[test]
+    fn map_secondary_to_the_left() {
+        // Secondary 1920x1080 placed LEFT of the primary => negative origin.
+        // Virtual screen: left=-1920, width=3840. Capturing the secondary, the
+        // normalized center is its center pixel (-1920 + 960 = -960, 540),
+        // which sits in the LEFT half of the desktop (abs_x < midline).
+        let vs = (-1920, 0, 3840, 1080);
+        let rect = CaptureRect {
+            left: -1920,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let center = map_normalized_to_virtualdesk_abs(0.5, 0.5, rect, vs);
+        assert_eq!(center, expected_abs(-960, 540, vs));
+        assert!(
+            center.0 < 32_767,
+            "secondary-left center must be before desktop midline, got {}",
+            center.0
+        );
+        // Top-left of the left monitor is the virtual-screen origin -> abs 0.
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(0.0, 0.0, rect, vs),
+            (0, 0)
+        );
+        // Bottom-right of the left monitor is the desktop midpoint on x.
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(1.0, 1.0, rect, vs),
+            expected_abs(0, 1080, vs)
+        );
+    }
+
+    #[test]
+    fn map_secondary_above() {
+        // Secondary stacked ABOVE the primary => negative top. Virtual screen:
+        // top=-1080, height=2160. Capturing the secondary, the normalized
+        // center is its center pixel (960, -1080 + 540 = -540), in the TOP half.
+        let vs = (0, -1080, 1920, 2160);
+        let rect = CaptureRect {
+            left: 0,
+            top: -1080,
+            width: 1920,
+            height: 1080,
+        };
+        let center = map_normalized_to_virtualdesk_abs(0.5, 0.5, rect, vs);
+        assert_eq!(center, expected_abs(960, -540, vs));
+        assert!(
+            center.1 < 32_767,
+            "monitor-above center must be in the top half, got {}",
+            center.1
+        );
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(0.0, 0.0, rect, vs),
+            (0, 0),
+            "top-left of the upper monitor is the virtual-screen origin"
+        );
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(1.0, 1.0, rect, vs),
+            expected_abs(1920, 0, vs),
+            "bottom of the upper monitor is the desktop's vertical midpoint"
+        );
+    }
+
+    #[test]
+    fn map_secondary_below() {
+        // Secondary stacked BELOW the primary at (0,1080). Virtual screen:
+        // top=0, height=2160. Capturing the secondary, the normalized center is
+        // its center pixel (960, 1080 + 540 = 1620), in the BOTTOM half.
+        let vs = (0, 0, 1920, 2160);
+        let rect = CaptureRect {
+            left: 0,
+            top: 1080,
+            width: 1920,
+            height: 1080,
+        };
+        let center = map_normalized_to_virtualdesk_abs(0.5, 0.5, rect, vs);
+        assert_eq!(center, expected_abs(960, 1620, vs));
+        assert!(
+            center.1 > 32_767,
+            "monitor-below center must be in the bottom half, got {}",
+            center.1
+        );
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(0.0, 0.0, rect, vs),
+            expected_abs(0, 1080, vs),
+            "top of the lower monitor is the desktop's vertical midpoint"
+        );
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(1.0, 1.0, rect, vs),
+            (65535, 65535),
+            "bottom-right of the lower monitor is the desktop's far corner"
+        );
+    }
+
+    #[test]
+    fn map_out_of_range_normalized_is_clamped_to_monitor() {
+        // Inputs outside 0..1 are clamped to the captured monitor's edges, not
+        // allowed to wander onto an adjacent monitor.
+        let vs = (0, 0, 3840, 1080);
+        let rect = CaptureRect {
+            left: 1920,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        // x < 0 clamps to the monitor's left edge (its origin pixel).
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(-0.5, 0.5, rect, vs),
+            expected_abs(1920, 540, vs)
+        );
+        // x > 1 clamps to the monitor's right edge (the far desktop corner x).
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(1.5, 0.5, rect, vs).0,
+            65535
+        );
+    }
+
+    #[test]
+    fn map_empty_rect_falls_back_to_full_virtual_desktop() {
+        // Before capture starts the rect atomics are zero; the mapping must not
+        // divide by zero or collapse to the origin -- it falls back to the whole
+        // virtual desktop (legacy whole-desktop behavior).
+        let vs = (-1920, 0, 3840, 1080);
+        let empty = CaptureRect {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        };
+        // Center over the full fallback desktop == its midpoint pixel.
+        let got = map_normalized_to_virtualdesk_abs(0.5, 0.5, empty, vs);
+        assert_eq!(got, expected_abs(0, 540, vs));
+        // Corners still hit the full range without panicking.
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(0.0, 0.0, empty, vs),
+            (0, 0)
+        );
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(1.0, 1.0, empty, vs),
+            (65535, 65535)
+        );
+    }
+
+    #[test]
+    fn map_degenerate_virtual_screen_does_not_panic() {
+        // A 0/1-px virtual screen (no real desktop) must not divide by zero.
+        let rect = CaptureRect {
+            left: 0,
+            top: 0,
+            width: 1,
+            height: 1,
+        };
+        let got = map_normalized_to_virtualdesk_abs(0.5, 0.5, rect, (0, 0, 0, 0));
+        assert!((0..=65535).contains(&got.0));
+        assert!((0..=65535).contains(&got.1));
     }
 }

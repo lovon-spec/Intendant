@@ -1076,6 +1076,11 @@ a=rtpmap:97 VP8/90000\r\n";
         assert!(codecs.is_empty());
     }
 
+    // VP8/libvpx encoder tests — gated off Windows, where the libvpx
+    // backend is unavailable (Tier-0) and `Vp8Encoder::new` always
+    // returns `Err`. The Windows H.264 baseline is covered by the
+    // `h264_windows` encoder tests and the H.264 pool tests.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn vp8_encoder_produces_output() {
         let mut enc = Vp8Encoder::new(320, 240, 500).expect("encoder creation");
@@ -1098,6 +1103,7 @@ a=rtpmap:97 VP8/90000\r\n";
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn vp8_encoder_force_keyframe_on_demand() {
         let mut enc = Vp8Encoder::new(320, 240, 500).expect("encoder creation");

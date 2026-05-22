@@ -51,16 +51,25 @@
 //!
 //! ## COM / MF lifecycle and threading
 //!
-//! The `Encoder` trait's `encode()` runs synchronously on the dedicated
-//! `std::thread` that [`super::pool`] spawns per encoder — there are no
-//! `.await` points in the encoder's lifetime, so the `IMFTransform` is only
-//! ever touched from one thread once constructed. We initialize COM as
-//! multithreaded (MTA) and call `MFStartup` at construction; both are
-//! reference-counted process-wide and apartment-agnostic for MTA, so it is
-//! safe that `new()` runs on a tokio worker while `encode()` runs on the
-//! encoder thread. `MFShutdown`/`CoUninitialize` are paired in `Drop`. The
-//! encoder is `unsafe impl Send` for the same reason VideoToolbox/VP8 are: it
-//! is moved to the encoder thread at construction and never shared.
+//! Construction, every `encode()`, and `Drop` all run on the **same**
+//! dedicated `std::thread` that [`super::pool`] spawns per encoder. The pool
+//! builds the encoder *inside* that thread (via the construct-on-the-driver-
+//! thread path in [`super::pool::try_spawn_encoder_thread`]), so the whole
+//! sequence `CoInitializeEx` + `MFStartup` (in `new()`) → use → `MFShutdown` +
+//! `CoUninitialize` (in `Drop`) is confined to one thread. This is a
+//! correctness requirement, not just a convenience: COM init and teardown are
+//! **per-thread**, so the thread that initializes the apartment must be the
+//! one that releases the `IMFTransform` and uninitializes — even for MTA,
+//! where the apartment itself is process-wide, the `CoInitializeEx`/
+//! `CoUninitialize` *reference* and the MF startup count are tracked
+//! per-thread. There are no `.await` points in the encoder's lifetime, so the
+//! `IMFTransform` is only ever touched from this one thread. `MFShutdown`/
+//! `CoUninitialize` are paired in `Drop`. The encoder is `unsafe impl Send`
+//! for the same reason VideoToolbox/VP8 are: ownership stays on the encoder
+//! thread for the encoder's whole life and it is never shared. (`Send` is
+//! still *required* because [`super::Encoder`] has it as a supertrait, so
+//! `Box<dyn Encoder>` — the type the pool's construct closure returns — is
+//! `Send`; the encoder doesn't actually move between threads.)
 
 use super::{EncodedPacket, Encoder, PayloadSpec};
 
@@ -144,11 +153,13 @@ pub struct MediaFoundationEncoder {
     com_initialized: bool,
 }
 
-// The `IMFTransform` and friends are COM objects created and used entirely on
-// the single encoder thread (see module docs). They are moved to that thread
-// at construction and never shared, so transferring ownership across the
-// construction→thread boundary is safe — same contract as
-// `VideoToolboxEncoder` and `Vp8Encoder`.
+// The `IMFTransform` and friends are COM objects created, used, and dropped
+// entirely on the single encoder thread (see module docs) — the encoder is
+// constructed inside that thread and never crosses a thread boundary or is
+// shared. The `Send` bound is nonetheless required because [`super::Encoder`]
+// has `Send` as a supertrait (so `Box<dyn Encoder>` is `Send`), and it is
+// sound to assert here for the same reason it is for `VideoToolboxEncoder` and
+// `Vp8Encoder`: ownership stays on one thread for the encoder's whole life.
 unsafe impl Send for MediaFoundationEncoder {}
 
 impl MediaFoundationEncoder {

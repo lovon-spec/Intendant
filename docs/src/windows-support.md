@@ -38,15 +38,30 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -Check
 ```
 
-`setup-windows.ps1` installs (idempotently, via Chocolatey where sensible):
+`-Check` separates **required-to-build** dependencies from optional/runtime
+ones and sets its **exit code accordingly**: it exits **nonzero** if any
+required build dependency is missing or unusable, and **0** when they are all
+present — so CI and automation can gate on it. A missing optional dependency
+(wasm-pack, ffmpeg, VB-CABLE) is reported but never fails the check.
+
+`setup-windows.ps1` installs (idempotently, via Chocolatey where sensible).
+
+**Required to build** (a missing/unusable one fails `-Check`):
 
 - **rustup** with the default host set to `x86_64-pc-windows-msvc`
 - **Visual Studio 2022 Build Tools** with the C++ workload
   (`visualstudio2022-workload-vctools`) — provides `cl.exe`, `link.exe`, and
   the Windows SDK. Required even for `cargo check`.
-- **NASM** — required to assemble the `ring` crypto crate on windows-msvc, and
-  placed on `PATH`.
+- **NASM** — required to assemble the `ring` crypto crate on windows-msvc. The
+  Chocolatey package installs it to `C:\Program Files\NASM` and amends the
+  *machine* `PATH`, which a freshly-spawned shell may not yet see; the script
+  detects that case, adds the install directory to `PATH` (persisting it), and
+  re-probes — so `-Check` recognizes NASM even when it isn't on the current
+  `PATH`.
 - **git**
+
+**Optional / runtime / manual** (reported, but never fail `-Check`):
+
 - **wasm-pack** (optional) — for rebuilding the presence-web WASM bundle.
 - **ffmpeg** — the voice audio bridge shells out to `ffmpeg`/`ffplay`.
 - **Media Foundation** — built into Windows client SKUs; on Windows Server the
