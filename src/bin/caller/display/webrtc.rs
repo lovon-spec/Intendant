@@ -5476,6 +5476,15 @@ mod tests {
     /// Pre-fix behavior would either time out (intake stuck waiting
     /// on a closed Receiver) or shut the peer down (treating Closed
     /// as fatal). Either fires this test's assertion.
+    ///
+    /// VP8-specific (gated off Windows): like the other `pool_intake_*`
+    /// tests below, it drives a VP8 always-on/on-demand pool and
+    /// subscribes with a VP8 preference. Windows has no VP8 backend
+    /// (`Vp8Encoder::new` always `Err`s and VP8 is not on-demand
+    /// spawnable), so `pool.subscribe(VP8)` cannot succeed there. The
+    /// `pool_frame_intake` resubscribe/forward/lossy-drop semantics are
+    /// codec-agnostic and fully exercised on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_resubscribes_when_initial_subs_already_closed() {
         use crate::display::encode::pool::{EncoderPool, LayerSpec};
@@ -5555,6 +5564,12 @@ mod tests {
     /// than leaving the stream black. Mirror image of the
     /// happy-path test above — Closed should not always escalate,
     /// but it MUST escalate when there's no recovery available.
+    ///
+    /// VP8-specific (gated off Windows): seeds the intake from a VP8
+    /// on-demand subscription (no VP8 backend on Windows). The
+    /// Closed → resubscribe → NoCompatibleCodec → shutdown escalation it
+    /// pins is codec-agnostic and exercised on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_shuts_down_peer_when_resubscribe_finds_no_codec() {
         use crate::display::encode::pool::EncoderPool;
@@ -5650,6 +5665,12 @@ mod tests {
     /// `pool_intake_forwards_only_one_layer_with_simulcast_set`
     /// (deleted with this commit) — the inverse contract is now in
     /// effect.
+    ///
+    /// VP8-specific (gated off Windows): the multi-forwarder contract is
+    /// inherently about VP8 simulcast (3 always-on layers); Windows runs
+    /// a single full-res H.264 layer with no simulcast and no VP8
+    /// backend. Exercised on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_forwards_all_active_codec_layers() {
         use crate::display::encode::pool::{EncoderPool, LayerSpec};
@@ -5767,6 +5788,12 @@ mod tests {
     ///      blocked-on).
     ///   4. Asserting `shutdown.cancel()` causes the intake to exit
     ///      within a tight bound (parked-send would exceed it).
+    ///
+    /// VP8-specific (gated off Windows): drives a VP8 always-on pool and
+    /// subscribes with a VP8 preference (no VP8 backend on Windows). The
+    /// lossy try_send + prompt-cancel behavior is codec-agnostic and
+    /// exercised on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_drops_lossily_when_driver_mpsc_full() {
         use crate::display::encode::pool::{EncoderPool, LayerSpec};
@@ -5870,6 +5897,12 @@ mod tests {
     /// `pool_intake_wraps_forwarded_frames_with_active_subscription_rid`
     /// (which assumed single-active-subscription) — the multi-rid
     /// version pins per-forwarder rid integrity.
+    ///
+    /// VP8-specific (gated off Windows): per-forwarder rid integrity is
+    /// a multi-layer VP8-simulcast property; Windows runs a single
+    /// full-res H.264 layer with no VP8 backend. Exercised on
+    /// macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_intake_wraps_forwarded_frames_with_per_subscription_rid() {
         use crate::display::encode::pool::{EncoderPool, LayerSpec};
