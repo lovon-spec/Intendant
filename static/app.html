@@ -10629,10 +10629,13 @@ function hasPendingActiveSessionWindow(sessionId) {
   return true;
 }
 
-function isSessionWindowEffectivelyActive(sessionId, fallbackPhase = currentPhase) {
+function isSessionWindowEffectivelyActive(sessionId) {
   const sid = String(sessionId || '').trim();
-  if (sid && hasPendingActiveSessionWindow(sid)) return true;
-  const phase = sid ? (sessionWindows.get(sid)?.phase || fallbackPhase) : fallbackPhase;
+  if (!sid) return isAgentActivePhase(currentPhase);
+  if (hasPendingActiveSessionWindow(sid)) return true;
+  const win = sessionWindows.get(sid);
+  if (!win || !win.phase) return false;
+  const phase = win.phase;
   return isAgentActivePhase(phase);
 }
 
@@ -22729,7 +22732,7 @@ window.submitActivityOrSteer = function() {
     return;
   }
   const targetSessionId = resolvePromptTargetSessionId();
-  if (targetSessionId && isSessionWindowEffectivelyActive(targetSessionId, currentPhase)) {
+  if (targetSessionId && isSessionWindowEffectivelyActive(targetSessionId)) {
     // Mid-turn steer path. JS generates the id locally and we render an
     // optimistic pending row immediately — the backend round-trips a
     // steer_requested echo that updates the same row by id (idempotent
@@ -22776,7 +22779,7 @@ function updateSubmitButtonLabel(phase) {
   btn.classList.remove('edit-mode');
   const targetSessionId = resolvePromptTargetSessionId();
   const active = targetSessionId
-    ? isSessionWindowEffectivelyActive(targetSessionId, phase)
+    ? isSessionWindowEffectivelyActive(targetSessionId)
     : isAgentActivePhase(phase);
   if (active) {
     btn.innerHTML = '\u2197 Steer';
@@ -25429,7 +25432,7 @@ function updateStopButtonVisibility(phase) {
   const key = (phase || '').toLowerCase();
   const targetSessionId = resolvePromptTargetSessionId();
   const show = targetSessionId
-    ? isSessionWindowEffectivelyActive(targetSessionId, key)
+    ? isSessionWindowEffectivelyActive(targetSessionId)
     : isAgentActivePhase(key);
   btn.style.display = show ? '' : 'none';
   // Only `interrupting` should show the disabled "Interrupting..." label.

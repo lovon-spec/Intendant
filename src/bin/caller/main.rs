@@ -1006,8 +1006,39 @@ struct DrainConfig<'a> {
 }
 
 struct PendingRuntimeSteer {
+    session_id: Option<String>,
     id: String,
     text: String,
+}
+
+fn pending_runtime_steer_targets_session(
+    pending: &PendingRuntimeSteer,
+    session_id: &Option<String>,
+) -> bool {
+    pending.session_id.as_deref() == session_id.as_deref()
+}
+
+fn flush_pending_runtime_steers_for_session(
+    bus: &EventBus,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    session_id: &Option<String>,
+) -> usize {
+    let mut delivered = 0usize;
+    let mut retained = std::collections::VecDeque::with_capacity(pending_runtime_steers.len());
+    while let Some(pending) = pending_runtime_steers.pop_front() {
+        if pending_runtime_steer_targets_session(&pending, session_id) {
+            delivered += 1;
+            bus.send(AppEvent::SteerDelivered {
+                session_id: pending.session_id,
+                id: pending.id,
+                mid_turn: true,
+            });
+        } else {
+            retained.push_back(pending);
+        }
+    }
+    *pending_runtime_steers = retained;
+    delivered
 }
 
 const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
@@ -1788,6 +1819,7 @@ async fn drain_external_agent_events(
                         match agent.steer_turn(&text).await {
                             Ok(()) => {
                                 pending_runtime_steers.push_back(PendingRuntimeSteer {
+                                    session_id: local_session_id.clone(),
                                     id: id.clone(),
                                     text: text.clone(),
                                 });
@@ -1886,7 +1918,10 @@ async fn drain_external_agent_events(
             external_agent::AgentEvent::UserMessage { text } => {
                 if let Some(pos) = pending_runtime_steers
                     .iter()
-                    .position(|pending| pending.text == text || pending.text.trim() == text.trim())
+                    .position(|pending| {
+                        pending_runtime_steer_targets_session(pending, &local_session_id)
+                            && (pending.text == text || pending.text.trim() == text.trim())
+                    })
                 {
                     let Some(pending) = pending_runtime_steers.remove(pos) else {
                         continue;
@@ -1895,7 +1930,7 @@ async fn drain_external_agent_events(
                         l.info(&format!("Steer observed in {} conversation", agent.name()))
                     });
                     config.bus.send(AppEvent::SteerDelivered {
-                        session_id: local_session_id.clone(),
+                        session_id: pending.session_id.or_else(|| local_session_id.clone()),
                         id: pending.id,
                         mid_turn: true,
                     });
@@ -2354,6 +2389,20 @@ async fn drain_external_agent_events(
                         reason: "user requested".into(),
                     });
                     return DrainOutcome::Interrupted { reason };
+                }
+                let delivered = flush_pending_runtime_steers_for_session(
+                    config.bus,
+                    pending_runtime_steers,
+                    &local_session_id,
+                );
+                if delivered > 0 {
+                    slog(config.session_log, |l| {
+                        l.info(&format!(
+                            "Marked {} accepted {} steer(s) delivered at turn completion",
+                            delivered,
+                            agent.name()
+                        ))
+                    });
                 }
                 return DrainOutcome::TurnCompleted {
                     message,
@@ -5367,6 +5416,45 @@ Also: {"source": "bare"}"#;
             }
         }
         assert_eq!(delivered_ids, vec!["s1".to_string(), "s2".to_string()]);
+    }
+
+    #[test]
+    fn flush_pending_runtime_steers_delivers_only_matching_session() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut pending = std::collections::VecDeque::from([
+            PendingRuntimeSteer {
+                session_id: Some("parent".to_string()),
+                id: "steer-parent".to_string(),
+                text: "parent steer".to_string(),
+            },
+            PendingRuntimeSteer {
+                session_id: Some("side".to_string()),
+                id: "steer-side".to_string(),
+                text: "side steer".to_string(),
+            },
+        ]);
+
+        let delivered =
+            flush_pending_runtime_steers_for_session(&bus, &mut pending, &Some("side".into()));
+
+        assert_eq!(delivered, 1);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "steer-parent");
+
+        let ev = rx.try_recv().expect("SteerDelivered event");
+        match ev {
+            AppEvent::SteerDelivered {
+                session_id,
+                id,
+                mid_turn,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("side"));
+                assert_eq!(id, "steer-side");
+                assert!(mid_turn);
+            }
+            other => panic!("expected SteerDelivered, got {:?}", other),
+        }
     }
 }
 
