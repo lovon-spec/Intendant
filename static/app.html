@@ -1481,6 +1481,10 @@ html, body {
   overflow: visible;
   z-index: 45;
 }
+.session-window.relationship-ephemeral {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--mauve) 52%, var(--surface1));
+}
 .session-window.foreground {
   border-color: var(--blue);
   box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.35);
@@ -1507,6 +1511,15 @@ html, body {
 .session-window.minimized .session-window-header {
   height: 36px;
   border-bottom: 0;
+}
+.session-window.header-collapsed:not(.minimized) {
+  min-height: 130px;
+}
+.session-window.header-collapsed .session-window-task {
+  display: none;
+}
+.session-window.header-collapsed .session-window-title {
+  gap: 1px;
 }
 .session-window.minimized .session-window-title {
   flex-direction: row;
@@ -1537,6 +1550,8 @@ html, body {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  flex-wrap: wrap;
+  row-gap: 2px;
 }
 .session-window-id {
   flex-shrink: 1;
@@ -1562,8 +1577,11 @@ html, body {
   align-items: center;
   gap: 3px;
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 .session-window-relation-chip {
+  flex-shrink: 0;
   border: 1px solid var(--surface1);
   border-radius: 999px;
   padding: 1px 5px;
@@ -1612,6 +1630,7 @@ html, body {
 .session-window-cwd {
   min-width: 0;
   flex: 1;
+  max-width: min(280px, 100%);
   font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -11276,8 +11295,13 @@ function applySessionRelationshipMetadata(rel) {
   sessionMetadataById.set(rel.parentId, { ...parentMeta, children: parentChildren });
 
   const childMeta = sessionMetadataById.get(rel.childId) || {};
+  const inheritedMeta = {};
+  for (const key of ['projectRoot', 'projectLabel', 'cwd', 'cwdLabel', 'source', 'sourceLabel', 'backendSource']) {
+    if (!childMeta[key] && parentMeta[key]) inheritedMeta[key] = parentMeta[key];
+  }
   sessionMetadataById.set(rel.childId, {
     ...childMeta,
+    ...inheritedMeta,
     parentId: rel.parentId,
     relationshipKind: rel.kind,
     relationshipEphemeral: rel.ephemeral,
@@ -11285,6 +11309,10 @@ function applySessionRelationshipMetadata(rel) {
 
   updateSessionRelationshipBadges(rel.parentId);
   updateSessionRelationshipBadges(rel.childId);
+  if (sessionWindows.has(rel.childId) && Object.keys(inheritedMeta).length > 0) {
+    updateSessionWindow(rel.childId, inheritedMeta);
+  }
+  updateSessionWindowRelationshipStyle(rel.childId);
 }
 
 function activeSessionRelationshipIds() {
@@ -11359,6 +11387,40 @@ function updateSessionRelationshipBadges(sessionId) {
     });
     win.relationStrip.appendChild(el);
   }
+}
+
+function updateSessionWindowRelationshipStyle(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  win.el.classList.toggle('relationship-ephemeral', !!meta.relationshipEphemeral);
+}
+
+function sideCloseParamsForSession(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const meta = sessionMetadataById.get(sid) || {};
+  if (meta.relationshipKind !== 'side' || !meta.parentId) return null;
+  const parentMeta = sessionMetadataById.get(meta.parentId) || {};
+  const parentThreadId = parentMeta.backendSessionId || meta.parentId;
+  if (!parentThreadId) return null;
+  return {
+    parentSessionId: meta.parentId,
+    params: {
+      threadId: sid,
+      parentThreadId,
+    },
+  };
+}
+
+function maybeDispatchSideClose(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!sid || win?.ended) return;
+  const close = sideCloseParamsForSession(sid);
+  if (!close) return;
+  dispatchCodexThreadAction('side-close', close.params, close.parentSessionId);
 }
 
 function scheduleSessionRelationshipRender() {
@@ -11587,6 +11649,13 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const status = document.createElement('span');
   status.className = 'session-window-status';
   status.textContent = normalizeSessionPhase(meta.phase || 'idle');
+  const headerToggle = document.createElement('button');
+  headerToggle.className = 'session-window-action session-window-header-toggle';
+  headerToggle.type = 'button';
+  headerToggle.title = 'Collapse header';
+  headerToggle.setAttribute('aria-label', headerToggle.title);
+  headerToggle.setAttribute('aria-pressed', 'false');
+  headerToggle.textContent = '\u25B4';
   const minimize = document.createElement('button');
   minimize.className = 'session-window-action session-window-minimize';
   minimize.type = 'button';
@@ -11643,6 +11712,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   close.textContent = '\u00d7';
   header.appendChild(title);
   header.appendChild(status);
+  header.appendChild(headerToggle);
   header.appendChild(minimize);
   header.appendChild(actions);
   header.appendChild(maximize);
@@ -11673,6 +11743,10 @@ function ensureSessionWindow(sessionId, meta = {}) {
     setSessionWindowMenuOpen(sid, false);
     runSessionWindowAction(sid, item.dataset.sessionWindowAction);
   });
+  headerToggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleSessionWindowHeaderCollapsed(sid);
+  });
   minimize.addEventListener('click', (e) => {
     e.stopPropagation();
     closeSessionWindowMenus();
@@ -11686,6 +11760,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   close.addEventListener('click', (e) => {
     e.stopPropagation();
     setSessionWindowMenuOpen(sid, false);
+    maybeDispatchSideClose(sid);
     el.remove();
     sessionWindows.delete(sid);
     if (maximizedSessionWindowId === sid) maximizedSessionWindowId = '';
@@ -11720,12 +11795,14 @@ function ensureSessionWindow(sessionId, meta = {}) {
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
+    headerToggle,
     minimize,
     maximize,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
     pendingActiveUntil: 0,
     ended: false,
     minimized: false,
+    headerCollapsed: false,
   };
   sessionWindows.set(sid, win);
   syncSessionWindowMetadataRefresh();
@@ -11742,6 +11819,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (!win) return;
   const merged = mergeSessionWindowMetadata(sid, meta);
   meta = merged.meta;
+  updateSessionWindowRelationshipStyle(sid);
   const signature = sessionWindowMetadataSignature(meta);
   if (win.metadataSignature === signature) return;
   win.metadataSignature = signature;
@@ -11800,6 +11878,36 @@ function updateSessionWindowMinimizeState(sessionId) {
     win.minimize.setAttribute('aria-label', win.minimize.title);
     win.minimize.setAttribute('aria-pressed', minimized ? 'true' : 'false');
   }
+}
+
+function updateSessionWindowHeaderCollapseState(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  const collapsed = !!win.headerCollapsed;
+  win.el.classList.toggle('header-collapsed', collapsed);
+  if (win.headerToggle) {
+    win.headerToggle.textContent = collapsed ? '\u25BE' : '\u25B4';
+    win.headerToggle.title = collapsed ? 'Expand header' : 'Collapse header';
+    win.headerToggle.setAttribute('aria-label', win.headerToggle.title);
+    win.headerToggle.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+  }
+}
+
+function setSessionWindowHeaderCollapsed(sessionId, collapsed) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  win.headerCollapsed = !!collapsed;
+  updateSessionWindowHeaderCollapseState(sid);
+  scheduleSessionRelationshipRender();
+}
+
+function toggleSessionWindowHeaderCollapsed(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  setSessionWindowHeaderCollapsed(sid, !win.headerCollapsed);
 }
 
 function setSessionWindowMinimized(sessionId, minimized) {
