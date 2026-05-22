@@ -315,8 +315,19 @@ impl SessionLog {
             return Some(direct);
         }
 
-        // Backward compat: if session_id contains '/', treat as direct path
-        if session_id.contains('/') {
+        // Backward compat: if session_id looks like a path (absolute, or
+        // containing any path separator on this platform), treat it as a
+        // direct path. A bare UUID prefix has no separators and is not
+        // absolute, so it falls through to the prefix scan below. Checking
+        // for both '/' and the platform separator keeps Windows absolute
+        // paths (`C:\...`, which use '\\') from being misclassified.
+        let looks_like_path = {
+            let p = Path::new(session_id);
+            p.is_absolute()
+                || session_id.contains('/')
+                || session_id.contains(std::path::MAIN_SEPARATOR)
+        };
+        if looks_like_path {
             let dir = PathBuf::from(session_id);
             if dir.is_dir() {
                 return Some(dir);

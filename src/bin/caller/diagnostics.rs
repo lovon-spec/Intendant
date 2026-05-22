@@ -55,7 +55,8 @@ pub fn visual_freshness_path(session_id: &str) -> Option<PathBuf> {
     let slug = sanitize_session_id(session_id)?;
     Some(
         intendant_state_dir()
-            .join("diagnostics/visual-freshness")
+            .join("diagnostics")
+            .join("visual-freshness")
             .join(format!("{slug}.ndjson")),
     )
 }
@@ -144,14 +145,21 @@ mod tests {
     #[test]
     fn visual_freshness_path_uses_intendant_state_dir() {
         let p = visual_freshness_path("abc-123").expect("non-empty after sanitize");
-        let s = p.to_string_lossy();
+        // Assert on path components rather than a hardcoded '/'-joined
+        // string so the test holds on Windows (separator '\\') as well as
+        // POSIX. `visual_freshness_path` builds the path with `PathBuf::join`,
+        // so it is already platform-correct.
+        let expected_tail: PathBuf = ["diagnostics", "visual-freshness", "abc-123.ndjson"]
+            .iter()
+            .collect();
         assert!(
-            s.ends_with("/diagnostics/visual-freshness/abc-123.ndjson"),
-            "unexpected path tail: {s}"
+            p.ends_with(&expected_tail),
+            "unexpected path tail: {p:?}"
         );
         assert!(
-            s.contains("/.intendant/"),
-            "path should be under .intendant state dir: {s}"
+            p.components()
+                .any(|c| c.as_os_str() == std::ffi::OsStr::new(".intendant")),
+            "path should be under .intendant state dir: {p:?}"
         );
     }
 

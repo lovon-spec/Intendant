@@ -258,6 +258,11 @@ mod tests {
     #[test]
     fn daemon_recordings_dir_exists() {
         let dir = daemon_recordings_dir();
-        assert!(dir.to_str().unwrap().contains(".intendant/recordings"));
+        // Build the expected tail with the platform separator so the
+        // assertion holds on Windows (where `join` yields '\\') as well as
+        // POSIX. `daemon_recordings_dir` itself uses `PathBuf::join`, so it
+        // is already platform-correct; only the literal here was POSIX-only.
+        let tail: PathBuf = [".intendant", "recordings"].iter().collect();
+        assert!(dir.ends_with(&tail), "unexpected recordings dir: {dir:?}");
     }
 }

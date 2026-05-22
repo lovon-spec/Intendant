@@ -3673,16 +3673,25 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn inject_project_context_adds_memory_file() {
+        let root = std::path::PathBuf::from("/tmp/proj");
         let project = Project {
-            root: std::path::PathBuf::from("/tmp/proj"),
+            root: root.clone(),
             config: project::ProjectConfig::default(),
         };
         let input = r#"{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"test","memory_summary":"hello"}]}"#;
         let result = inject_project_context(input, &project);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // Build the expected path the same platform-aware way production does
+        // (via `PathBuf::join`) instead of hardcoding '/'-joined POSIX text,
+        // so the assertion holds on Windows (separator '\\') too.
+        let expected = root
+            .join(".intendant")
+            .join("memory.json")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             parsed["commands"][0]["memory_file"].as_str().unwrap(),
-            "/tmp/proj/.intendant/memory.json"
+            expected
         );
     }
 
