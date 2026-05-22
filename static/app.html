@@ -1642,6 +1642,7 @@ html, body {
 .log-entry.level-warn { border-left-color: rgba(249, 226, 175, 0.5); }
 .log-entry.level-error { border-left-color: rgba(243, 139, 168, 0.65); }
 .log-entry.source-user { border-left-color: rgba(250, 179, 135, 0.55); }
+.log-entry.source-diff { border-left-color: rgba(137, 180, 250, 0.72); }
 .log-entry.superseded {
   background: rgba(243, 139, 168, 0.08);
   border-left-color: rgba(243, 139, 168, 0.85);
@@ -1935,6 +1936,106 @@ html, body {
 }
 .command-output-group.expanded .collapse-toggle .arrow { display: none; }
 .command-output-group:not(.expanded) .collapse-toggle .arrow-up { display: none; }
+.log-entry.diff-log-entry {
+  background: rgba(24, 24, 37, 0.42);
+}
+.diff-log-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  white-space: normal;
+  word-break: normal;
+}
+.diff-log-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--subtext1);
+  font-size: 11px;
+}
+.diff-log-summary .status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--blue);
+  box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.13);
+  flex-shrink: 0;
+}
+.diff-log-summary-main {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.diff-log-summary-paths {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--overlay1);
+}
+.diff-log-summary-add { color: var(--green); }
+.diff-log-summary-del { color: var(--red); }
+.diff-log-body {
+  max-height: 460px;
+  overflow: auto;
+  border: 1px solid var(--surface0);
+  border-radius: 5px;
+  background: rgba(17, 17, 27, 0.82);
+  white-space: normal;
+}
+.diff-log-entry:not(.expanded) .diff-log-body {
+  display: none;
+}
+.diff-log-entry .collapse-toggle {
+  color: var(--blue);
+  font-size: 11px;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.diff-log-entry.expanded .collapse-toggle .arrow { display: none; }
+.diff-log-entry:not(.expanded) .collapse-toggle .arrow-up { display: none; }
+.diff-log-file + .diff-log-file {
+  border-top: 1px solid var(--surface0);
+}
+.diff-log-file-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 9px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.diff-log-file-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.diff-log-file-stats {
+  flex-shrink: 0;
+  color: var(--subtext0);
+}
+.diff-log-lines {
+  margin: 0;
+  padding: 4px 0 7px;
+  min-width: max-content;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: normal;
+}
+.diff-log-lines .diff-line {
+  grid-template-columns: 38px 38px minmax(max-content, 1fr);
+}
 .output-line { display: block; min-height: 1.35em; }
 .output-line-error { color: var(--red); }
 .output-line-warn { color: var(--yellow); }
@@ -3078,6 +3179,12 @@ html, body {
 .session-detail-logs .log-ts { color: var(--overlay1); width: 70px; flex-shrink: 0; font-size: 11px; }
 .session-detail-logs .log-level { width: 52px; flex-shrink: 0; font-weight: 600; font-size: 11px; text-transform: uppercase; }
 .session-detail-logs .log-content { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.session-detail-logs .diff-log-wrap,
+.session-detail-logs .diff-log-body,
+.session-detail-logs .diff-log-lines {
+  white-space: normal;
+  word-break: normal;
+}
 .session-detail-logs .log-turn-sep { padding: 6px 0 2px; font-size: 11px; color: var(--overlay0); border-top: 1px solid var(--surface0); margin-top: 4px; }
 #session-detail-recordings .recording-player-wrap { max-height: 40vh; }
 #session-detail-recordings .session-rec-header {
@@ -9540,6 +9647,146 @@ function renderDiffLines(diffText) {
   }).join('');
 }
 
+function normalizeDiffPath(raw) {
+  const path = String(raw || '').split('\t')[0].trim();
+  if (!path || path === '/dev/null') return '';
+  return path
+    .replace(/^"|"$/g, '')
+    .replace(/^(a|b)\//, '');
+}
+
+function parseDiffGitLine(line) {
+  const match = String(line || '').match(/^diff --git\s+(.+?)\s+(.+)$/);
+  if (!match) return { oldPath: '', newPath: '' };
+  return {
+    oldPath: normalizeDiffPath(match[1]),
+    newPath: normalizeDiffPath(match[2]),
+  };
+}
+
+function createParsedDiffFile(oldPath = '', newPath = '') {
+  return {
+    oldPath,
+    newPath,
+    path: newPath || oldPath || 'diff',
+    lines: [],
+    added: 0,
+    removed: 0,
+    seenOldHeader: false,
+    seenNewHeader: false,
+  };
+}
+
+function parseUnifiedDiff(diffText) {
+  const text = String(diffText || '');
+  const files = [];
+  let current = null;
+  const lines = text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n');
+  const pushFile = (oldPath = '', newPath = '') => {
+    current = createParsedDiffFile(oldPath, newPath);
+    files.push(current);
+    return current;
+  };
+  const ensureFile = () => current || pushFile();
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      const parsed = parseDiffGitLine(line);
+      pushFile(parsed.oldPath, parsed.newPath).lines.push(line);
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      if (!current || current.seenOldHeader || current.lines.some(l => l.startsWith('@@'))) {
+        pushFile();
+      }
+      current.oldPath = normalizeDiffPath(line.slice(4));
+      current.path = current.newPath || current.oldPath || current.path;
+      current.seenOldHeader = true;
+      current.lines.push(line);
+      continue;
+    }
+    if (line.startsWith('+++ ')) {
+      ensureFile();
+      current.newPath = normalizeDiffPath(line.slice(4));
+      current.path = current.newPath || current.oldPath || current.path;
+      current.seenNewHeader = true;
+      current.lines.push(line);
+      continue;
+    }
+
+    ensureFile().lines.push(line);
+    if (line.startsWith('+')) current.added += 1;
+    else if (line.startsWith('-')) current.removed += 1;
+  }
+
+  const visibleFiles = files.filter(file => file.lines.length > 0);
+  const totalAdded = visibleFiles.reduce((sum, file) => sum + file.added, 0);
+  const totalRemoved = visibleFiles.reduce((sum, file) => sum + file.removed, 0);
+  return { files: visibleFiles, added: totalAdded, removed: totalRemoved };
+}
+
+function diffLogContent(c) {
+  const content = String(c?.content || '');
+  const source = String(c?.source || '').toLowerCase();
+  if (source === 'diff') return content;
+  if (!content.startsWith('External agent diff')) return content;
+  const firstLineEnd = content.indexOf('\n');
+  return firstLineEnd >= 0 ? content.slice(firstLineEnd + 1) : '';
+}
+
+function isDiffLog(c) {
+  const content = String(c?.content || '');
+  const source = String(c?.source || '').toLowerCase();
+  if (source === 'diff') return true;
+  if (!content.startsWith('External agent diff')) return false;
+  const diffText = diffLogContent(c);
+  return /(^|\n)(diff --git |--- |\+\+\+ |@@ )/.test(diffText);
+}
+
+function diffLogSummaryHtml(parsed) {
+  const files = parsed.files || [];
+  const fileCount = files.length;
+  const displayFileCount = fileCount || 1;
+  const fileLabel = `${displayFileCount} file${displayFileCount === 1 ? '' : 's'}`;
+  const paths = files
+    .map(file => file.path)
+    .filter(Boolean);
+  const pathText = paths.length > 3
+    ? `${paths.slice(0, 3).join(', ')} +${paths.length - 3} more`
+    : paths.join(', ');
+  const stats = `<span class="diff-log-summary-add">+${parsed.added || 0}</span> <span class="diff-log-summary-del">-${parsed.removed || 0}</span>`;
+  return `<span class="status-dot"></span><span class="diff-log-summary-main">diff &middot; ${escapeHtml(fileLabel)} &middot; ${stats}</span>`
+    + (pathText ? `<span class="diff-log-summary-paths" title="${escapeHtml(paths.join(', '))}">${escapeHtml(pathText)}</span>` : '');
+}
+
+function renderDiffLogBody(body, parsed) {
+  body.innerHTML = '';
+  const files = parsed.files && parsed.files.length ? parsed.files : [createParsedDiffFile('', '')];
+  for (const file of files) {
+    const fileEl = document.createElement('div');
+    fileEl.className = 'diff-log-file';
+
+    const header = document.createElement('div');
+    header.className = 'diff-log-file-header';
+    const path = document.createElement('span');
+    path.className = 'diff-log-file-path';
+    path.textContent = file.path || 'diff';
+    path.title = [file.oldPath, file.newPath].filter(Boolean).join(' -> ') || file.path || 'diff';
+    const stats = document.createElement('span');
+    stats.className = 'diff-log-file-stats';
+    stats.textContent = `+${file.added || 0} / -${file.removed || 0}`;
+    header.appendChild(path);
+    header.appendChild(stats);
+    fileEl.appendChild(header);
+
+    const lines = document.createElement('pre');
+    lines.className = 'diff-log-lines';
+    lines.innerHTML = renderDiffLines((file.lines || []).join('\n'));
+    fileEl.appendChild(lines);
+    body.appendChild(fileEl);
+  }
+}
+
 function resetSessionWindowLog(win) {
   if (!win || !win.log) return;
   win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
@@ -9583,6 +9830,7 @@ function renderTurnSeparator(turn) {
 const _logImageStore = new WeakMap();
 const _wiredCollapsibleLogEntries = new WeakSet();
 const _wiredCommandOutputLogEntries = new WeakSet();
+const _wiredDiffLogEntries = new WeakSet();
 
 function appendDeferredLogImages(entry, cnt) {
   if (!entry || !cnt || !_logImageStore.has(entry)) return;
@@ -9618,6 +9866,10 @@ function wireSessionWindowLogClone(clone, sourceEntry) {
   if (!clone) return;
   if (clone.classList.contains('command-output-group')) {
     wireCommandOutputGroupClone(clone, sourceEntry);
+    return;
+  }
+  if (clone.classList.contains('diff-log-entry')) {
+    wireDiffLogEntry(clone);
     return;
   }
   if (!clone.classList.contains('collapsible')) return;
@@ -11319,6 +11571,15 @@ function wireCommandOutputGroupClone(clone, sourceEntry) {
   clone.addEventListener('click', () => toggleCommandOutputView(group, view));
 }
 
+function wireDiffLogEntry(entry) {
+  if (!entry || _wiredDiffLogEntries.has(entry)) return;
+  _wiredDiffLogEntries.add(entry);
+  entry.addEventListener('click', (event) => {
+    if (event.target?.closest?.('a, button')) return;
+    entry.classList.toggle('expanded');
+  });
+}
+
 function appendCommandOutputChunk(group, c) {
   const text = c.content || '';
   if (c.output_id && !group.outputIdSet.has(c.output_id)) {
@@ -11449,6 +11710,32 @@ async function toggleCommandOutputView(group, view) {
 
 async function toggleCommandOutputGroup(group) {
   await toggleCommandOutputView(group, group);
+}
+
+function renderDiffLogEntry(c) {
+  finalizeActiveCommandOutputGroup();
+  const diffText = diffLogContent(c);
+  const parsed = parseUnifiedDiff(diffText);
+  const { entry } = createLogScaffold(c, 'diff-log-entry');
+
+  const wrap = document.createElement('span');
+  wrap.className = 'log-content diff-log-wrap';
+  const summary = document.createElement('span');
+  summary.className = 'diff-log-summary';
+  summary.innerHTML = diffLogSummaryHtml(parsed);
+  const body = document.createElement('span');
+  body.className = 'diff-log-body';
+  renderDiffLogBody(body, parsed);
+  wrap.appendChild(summary);
+  wrap.appendChild(body);
+
+  const toggle = document.createElement('span');
+  toggle.className = 'collapse-toggle';
+  toggle.innerHTML = '<span class="arrow">\u25B8 diff</span><span class="arrow-up">\u25BE hide</span>';
+  entry.appendChild(wrap);
+  entry.appendChild(toggle);
+  wireDiffLogEntry(entry);
+  appendLogEntryElement(entry);
 }
 
 function shouldRenderMarkdownLog(c) {
@@ -11599,6 +11886,11 @@ function renderLogEntry(c) {
   if (isCommandOutputLog(c)) {
     inferSessionPhaseFromLog(c);
     renderCommandOutputEntry(c);
+    return;
+  }
+  if (isDiffLog(c)) {
+    inferSessionPhaseFromLog(c);
+    renderDiffLogEntry(c);
     return;
   }
   finalizeActiveCommandOutputGroup();
@@ -23965,6 +24257,31 @@ function renderSessionDetailEntries(entries, el) {
     lvl.className = 'log-level';
     lvl.textContent = sourceLabels[e.source] || e.source || '\u2139';
     lvl.style.color = levelColors[level] || 'var(--text)';
+
+    if (isDiffLog({ level, source: e.source || '', content: e.content || '' })) {
+      entry.classList.add('diff-log-entry');
+      const parsed = parseUnifiedDiff(diffLogContent({ source: e.source || '', content: e.content || '' }));
+      const wrap = document.createElement('span');
+      wrap.className = 'log-content diff-log-wrap';
+      const summary = document.createElement('span');
+      summary.className = 'diff-log-summary';
+      summary.innerHTML = diffLogSummaryHtml(parsed);
+      const body = document.createElement('span');
+      body.className = 'diff-log-body';
+      renderDiffLogBody(body, parsed);
+      wrap.appendChild(summary);
+      wrap.appendChild(body);
+      const toggle = document.createElement('span');
+      toggle.className = 'collapse-toggle';
+      toggle.innerHTML = '<span class="arrow">\u25B8 diff</span><span class="arrow-up">\u25BE hide</span>';
+      entry.appendChild(ts);
+      entry.appendChild(lvl);
+      entry.appendChild(wrap);
+      entry.appendChild(toggle);
+      wireDiffLogEntry(entry);
+      el.appendChild(entry);
+      continue;
+    }
 
     const cnt = document.createElement('span');
     cnt.className = 'log-content';

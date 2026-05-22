@@ -1714,6 +1714,15 @@ async fn drain_external_agent_events(
                     slog(config.session_log, |l| {
                         l.info(&format!("{}\n{}", header, unified_diff));
                     });
+                    if !unified_diff.trim().is_empty() {
+                        config.bus.send(AppEvent::LogEntry {
+                            session_id: config.session_id.clone(),
+                            level: "info".to_string(),
+                            source: "Diff".to_string(),
+                            content: unified_diff,
+                            turn: None,
+                        });
+                    }
                 }
             }
             external_agent::AgentEvent::TurnCompleted { message } => {
