@@ -1575,7 +1575,7 @@ async fn drain_external_side_turn(
             }
             child_config.bus.send(AppEvent::LogEntry {
                 session_id: child_config.session_id.clone(),
-                level: "detail".to_string(),
+                level: "info".to_string(),
                 source: "Codex".to_string(),
                 content: "Round complete: side conversation ready for follow-up".to_string(),
                 turn: None,
@@ -1586,7 +1586,7 @@ async fn drain_external_side_turn(
                 session_id: child_config.session_id.clone(),
                 level: "warn".to_string(),
                 source: "Codex".to_string(),
-                content: format!("Side conversation interrupted: {}", reason),
+                content: format!("Agent interrupted: side conversation stopped: {}", reason),
                 turn: None,
             });
         }
