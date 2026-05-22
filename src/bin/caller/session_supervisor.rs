@@ -115,6 +115,22 @@ impl SessionSupervisor {
                         self.apply_session_identity(session_id, source, backend_session_id)
                             .await;
                     }
+                    Ok(AppEvent::SessionRelationship {
+                        parent_session_id,
+                        child_session_id,
+                        relationship,
+                        ..
+                    }) => {
+                        self.apply_session_relationship(
+                            parent_session_id,
+                            child_session_id,
+                            relationship,
+                        )
+                        .await;
+                    }
+                    Ok(AppEvent::SessionEnded { session_id, .. }) => {
+                        self.remove_session_alias(&session_id).await;
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -140,6 +156,22 @@ impl SessionSupervisor {
                     }) => {
                         self.apply_session_identity(session_id, source, backend_session_id)
                             .await;
+                    }
+                    Ok(AppEvent::SessionRelationship {
+                        parent_session_id,
+                        child_session_id,
+                        relationship,
+                        ..
+                    }) => {
+                        self.apply_session_relationship(
+                            parent_session_id,
+                            child_session_id,
+                            relationship,
+                        )
+                        .await;
+                    }
+                    Ok(AppEvent::SessionEnded { session_id, .. }) => {
+                        self.remove_session_alias(&session_id).await;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -912,13 +944,14 @@ impl SessionSupervisor {
                     s.project_root.clone(),
                     s.session_dir.clone(),
                     s.follow_up_tx.clone(),
+                    requested_id.clone(),
                 )
             });
             (target_id, entry)
         };
 
         match entry {
-            Some((managed_id, source, project_root, session_dir, tx)) => {
+            Some((managed_id, source, project_root, session_dir, tx, requested_id)) => {
                 if let Some(parsed) = parse_codex_slash_command(&text) {
                     match parsed {
                         Ok(command) => {
@@ -975,7 +1008,8 @@ impl SessionSupervisor {
                 let msg = FollowUpMessage::with_attachments(
                     text,
                     UserAttachments::from_items(resolved_attachments),
-                );
+                )
+                .for_target(Some(requested_id));
                 if tx.send(msg).await.is_err() {
                     self.warn(&format!(
                         "FollowUp dropped: {} session {} in {} is not accepting input",
@@ -1081,6 +1115,7 @@ impl SessionSupervisor {
     }
 
     async fn route_interrupt(&self, session_id: Option<String>) {
+        let requested_id = session_id.clone();
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Interrupt dropped: no active managed session");
             return;
@@ -1093,7 +1128,7 @@ impl SessionSupervisor {
             return;
         }
         self.config.bus.send(AppEvent::InterruptRequested {
-            session_id: Some(target_id),
+            session_id: requested_id.or(Some(target_id)),
         });
     }
 
@@ -1104,6 +1139,7 @@ impl SessionSupervisor {
         id: Option<String>,
         attachments: Vec<String>,
     ) {
+        let requested_id = session_id.clone();
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Steer dropped: no active managed session");
             return;
@@ -1132,9 +1168,10 @@ impl SessionSupervisor {
         };
 
         let steer_id = id.unwrap_or_default();
+        let event_session_id = requested_id.clone().or(Some(managed_id.clone()));
         if attachments.is_empty() {
             self.config.bus.send(AppEvent::SteerRequested {
-                session_id: Some(managed_id),
+                session_id: event_session_id,
                 text,
                 id: steer_id,
             });
@@ -1161,7 +1198,8 @@ impl SessionSupervisor {
             text,
             UserAttachments::from_items(resolved_attachments),
             steer_id.clone(),
-        );
+        )
+        .for_target(requested_id.clone().or(Some(managed_id.clone())));
         if tx.send(msg).await.is_err() {
             self.warn(&format!(
                 "Steer dropped: {} session {} in {} is not accepting input",
@@ -1172,7 +1210,7 @@ impl SessionSupervisor {
             return;
         }
         self.config.bus.send(AppEvent::SteerQueued {
-            session_id: Some(managed_id),
+            session_id: requested_id.or(Some(managed_id)),
             id: steer_id,
             reason: "attachments are queued for the next turn".to_string(),
         });
@@ -1373,6 +1411,37 @@ impl SessionSupervisor {
         if let Some(name) = name_to_persist {
             persist_external_session_name(&self.config.bus, &source, &backend_session_id, &name);
         }
+    }
+
+    async fn apply_session_relationship(
+        &self,
+        parent_session_id: String,
+        child_session_id: String,
+        relationship: String,
+    ) {
+        if relationship.trim().to_ascii_lowercase() != "side" {
+            return;
+        }
+        let parent = parent_session_id.trim();
+        let child = child_session_id.trim();
+        if parent.is_empty() || child.is_empty() || parent == child {
+            return;
+        }
+
+        let mut state = self.state.lock().await;
+        let Some(parent_key) = state.resolve_session_id(parent) else {
+            return;
+        };
+        state.session_aliases.insert(child.to_string(), parent_key);
+    }
+
+    async fn remove_session_alias(&self, session_id: &str) {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        state.session_aliases.remove(session_id);
     }
 
     async fn resolve_target_session_id(&self, session_id: Option<String>) -> Option<String> {
@@ -1918,6 +1987,25 @@ mod tests {
         assert!(removed.is_some());
         assert!(!state.session_is_managed("wrapper"));
         assert!(!state.session_is_managed("backend"));
+    }
+
+    #[test]
+    fn supervisor_state_resolves_side_child_alias_to_parent_session() {
+        let mut state = SupervisorState::default();
+        state
+            .sessions
+            .insert("parent".to_string(), managed_session("parent", "codex"));
+        state
+            .session_aliases
+            .insert("side-child".to_string(), "parent".to_string());
+
+        assert_eq!(
+            state.resolve_session_id("side-child").as_deref(),
+            Some("parent")
+        );
+        state.session_aliases.remove("side-child");
+        assert!(!state.session_is_managed("side-child"));
+        assert!(state.session_is_managed("parent"));
     }
 
     #[test]
