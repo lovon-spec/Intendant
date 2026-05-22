@@ -96,6 +96,27 @@ pub fn pty_shell_fallback() -> Option<(&'static str, Vec<String>)> {
     }
 }
 
+/// Line terminator to write into a PTY to *submit* a typed command line.
+///
+/// A PTY models a terminal, and the byte that means "Enter was pressed" is the
+/// carriage return `\r` (0x0D), not the newline `\n` (0x0A). On Unix the line
+/// discipline maps the incoming `\r` to `\n` for the shell, and historically
+/// the runtime wrote `\n` directly, which bash also accepts — so `\n` worked
+/// there. Windows ConPTY does *not* perform that translation: cmd.exe and
+/// PowerShell only treat `\r` as line submission, and a `\n` leaves the
+/// injected command unsubmitted (the shell just keeps buffering). Use `\r` on
+/// Windows; keep `\n` on Unix to preserve the exact pre-existing byte stream.
+pub fn pty_line_ending() -> &'static str {
+    #[cfg(windows)]
+    {
+        "\r"
+    }
+    #[cfg(not(windows))]
+    {
+        "\n"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +180,13 @@ mod tests {
         {
             assert!(pty_shell_fallback().is_none());
         }
+    }
+
+    #[test]
+    fn pty_line_ending_is_cr_on_windows_lf_elsewhere() {
+        #[cfg(windows)]
+        assert_eq!(pty_line_ending(), "\r");
+        #[cfg(not(windows))]
+        assert_eq!(pty_line_ending(), "\n");
     }
 }

@@ -735,8 +735,17 @@ impl Agent {
 
         // Write: echo start-marker, then command, then echo end-marker. The
         // writer is shared with the reader thread (which answers DSR queries),
-        // so take the lock just for the duration of this write.
-        let pty_input = format!("echo '{}'\n{}\necho '{}'\n", start_marker, command, marker);
+        // so take the lock just for the duration of this write. Each line is
+        // terminated with the platform PTY submit byte (`\r` on Windows so
+        // ConPTY treats it as Enter; `\n` on Unix, unchanged).
+        let nl = crate::utils::pty_line_ending();
+        let pty_input = format!(
+            "echo '{start}'{nl}{cmd}{nl}echo '{end}'{nl}",
+            start = start_marker,
+            cmd = command,
+            end = marker,
+            nl = nl,
+        );
         {
             let mut writer = session
                 .writer
