@@ -206,10 +206,10 @@ mod tests {
         let untouched_lum = 64u8;
         // Far corner.
         assert_eq!(y[(h - 1) * w + (w - 1)], untouched_lum);
-        // Just past the marker's right edge, on its top row.
-        assert_eq!(y[0 * w + MARKER_W], untouched_lum);
-        // Just past the marker's bottom edge, on its left column.
-        assert_eq!(y[MARKER_H * w + 0], untouched_lum);
+        // Just past the marker's right edge, on its top row (row 0, col MARKER_W).
+        assert_eq!(y[MARKER_W], untouched_lum);
+        // Just past the marker's bottom edge, on its left column (row MARKER_H, col 0).
+        assert_eq!(y[MARKER_H * w], untouched_lum);
         // One row before that, just past the right edge: also untouched.
         assert_eq!(y[(MARKER_H - 1) * w + MARKER_W], untouched_lum);
     }

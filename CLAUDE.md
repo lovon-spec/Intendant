@@ -202,7 +202,19 @@ cargo test --test e2e test_voice -- --nocapture           # Tier 3: needs Xvfb +
 - snake_case functions/modules, PascalCase types, SCREAMING_SNAKE_CASE constants
 - `thiserror`-based error enums (`AgentError`, `CallerError`)
 - tokio (full features), `Arc<RwLock/Mutex<T>>` for shared state, `mpsc` for channels
-- No `unsafe` code
+- Pure-safe Rust by default. The Unix (macOS / Linux) code paths contain no
+  `unsafe` beyond a handful of well-documented libc existence/identity probes
+  in `platform.rs`. The Windows backends are the deliberate exception: capture,
+  input injection, and H.264 encoding necessarily go through Win32/COM/Media
+  Foundation FFI (`display/windows.rs`, `display/encode/h264_windows.rs`,
+  `platform.rs`), which has no safe alternative. Confine that `unsafe` to those
+  `#[cfg(windows)]` blocks, keep each block as small as the FFI call it wraps,
+  prefer the `windows` crate's RAII interface types (which Release COM refs on
+  drop) and small safe wrappers / RAII guards over hand-rolled lifetime
+  management, and annotate every `unsafe` block with a `// SAFETY:` comment
+  stating the invariant that makes it sound (handle/pointer validity, COM
+  refcount/ownership, buffer bounds, thread/apartment affinity). Do not
+  introduce `unsafe` on the cross-platform or Unix paths.
 - Tests: inline `#[cfg(test)]` modules only
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
 - When adding a new system / `-sys` crate dependency, update **both**
