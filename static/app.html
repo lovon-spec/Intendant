@@ -2767,6 +2767,9 @@ html, body {
   font-family: inherit;
   font-size: 11px;
   text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   cursor: pointer;
   position: relative;
 }
@@ -2815,6 +2818,26 @@ html, body {
 .sessions-multi-filter-menu input {
   margin: 0;
   accent-color: var(--blue);
+}
+.sessions-project-filter-menu {
+  min-width: 320px;
+  max-width: min(560px, calc(100vw - 32px));
+  max-height: 360px;
+  overflow-y: auto;
+}
+.sessions-project-filter-menu label {
+  max-width: 100%;
+}
+.sessions-project-filter-menu .project-option-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sessions-multi-filter-empty {
+  padding: 6px 7px;
+  color: var(--overlay0);
+  font-size: 12px;
 }
 .sessions-toggle {
   display: flex;
@@ -6447,12 +6470,11 @@ html, body {
                   <span>Quick search</span>
                   <input type="search" id="sessions-search" placeholder="ID, name, task, model, path..." autocomplete="off" spellcheck="false">
                 </label>
-                <label class="sessions-control sessions-project-filter" for="filter-session-project">
+                <div class="sessions-control sessions-multi-filter sessions-project-filter" data-session-filter="project">
                   <span>Project</span>
-                  <select id="filter-session-project">
-                    <option value="">All projects</option>
-                  </select>
-                </label>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-project" aria-haspopup="true" aria-expanded="false">All projects</button>
+                  <div class="sessions-multi-filter-menu sessions-project-filter-menu hidden" id="filter-session-project-menu" role="menu" aria-label="Project filters"></div>
+                </div>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="source">
                   <span>Source</span>
                   <button type="button" class="sessions-multi-filter-btn" id="filter-session-source" aria-haspopup="true" aria-expanded="false">All sources</button>
@@ -6567,12 +6589,11 @@ html, body {
                   <span>Result filter</span>
                   <input type="search" id="sessions-deep-result-search" placeholder="ID, name, task, model, path..." autocomplete="off" spellcheck="false">
                 </label>
-                <label class="sessions-control sessions-project-filter" for="filter-session-deep-project">
+                <div class="sessions-control sessions-multi-filter sessions-project-filter" data-session-filter="deep-project">
                   <span>Project</span>
-                  <select id="filter-session-deep-project">
-                    <option value="">All projects</option>
-                  </select>
-                </label>
+                  <button type="button" class="sessions-multi-filter-btn" id="filter-session-deep-project" aria-haspopup="true" aria-expanded="false">All projects</button>
+                  <div class="sessions-multi-filter-menu sessions-project-filter-menu hidden" id="filter-session-deep-project-menu" role="menu" aria-label="Deep search project filters"></div>
+                </div>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="deep-source">
                   <span>Source</span>
                   <button type="button" class="sessions-multi-filter-btn" id="filter-session-deep-source" aria-haspopup="true" aria-expanded="false">All sources</button>
@@ -7429,6 +7450,7 @@ const SESSION_STATUS_FILTER_OPTIONS = [
   { value: 'abandoned', label: 'Abandoned', plural: 'statuses' },
   { value: 'interrupted', label: 'Interrupted', plural: 'statuses' },
 ];
+let sessionProjectFilterOptionsCache = [];
 
 // Current Activity host filter selection. Empty string = show all
 // hosts. Otherwise matches log entries whose `data-host-id` equals
@@ -17908,8 +17930,6 @@ function restoreClientToggles() {
   restoreSessionMultiFilter('status');
   restoreSessionMultiFilter('deep-source');
   restoreSessionMultiFilter('deep-status');
-  restoreSessionProjectFilter('recent');
-  restoreSessionProjectFilter('deep');
 
   // Host filter (Activity tab). The dropdown's option list is built
   // later by refreshHostFilterOptions() — that function reads from
@@ -23668,21 +23688,6 @@ function _refreshSessionsFilters() {
   _refilterSessions();
 }
 
-function sessionProjectFilterConfig(scope) {
-  if (scope === 'deep') {
-    return {
-      key: SESSIONS_DEEP_FILTER_PROJECT_KEY,
-      selectId: 'filter-session-deep-project',
-      allLabel: 'All projects',
-    };
-  }
-  return {
-    key: SESSIONS_FILTER_PROJECT_KEY,
-    selectId: 'filter-session-project',
-    allLabel: 'All projects',
-  };
-}
-
 function sessionProjectDirectory(session) {
   return compactSessionText(
     session?.project_root ||
@@ -23696,6 +23701,14 @@ function sessionProjectDirectory(session) {
   );
 }
 
+function sessionChangedSortValue(session) {
+  return Math.max(
+    sessionDateSortValue(session, 'updated_at'),
+    sessionDateSortValue(session, 'changed_at'),
+    sessionDateSortValue(session, 'created_at')
+  );
+}
+
 function sessionProjectFilterOptions(sessions) {
   const buckets = new Map();
   for (const session of Array.isArray(sessions) ? sessions : []) {
@@ -23705,67 +23718,94 @@ function sessionProjectFilterOptions(sessions) {
       path,
       label: compactPathLabel(path, true) || path,
       count: 0,
+      latestChanged: 0,
     };
     existing.count += 1;
+    existing.latestChanged = Math.max(existing.latestChanged, sessionChangedSortValue(session));
     buckets.set(path, existing);
   }
   return Array.from(buckets.values()).sort((a, b) => {
+    const byChanged = b.latestChanged - a.latestChanged;
+    if (byChanged) return byChanged;
     const byLabel = a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
     return byLabel || a.path.localeCompare(b.path);
   });
 }
 
-function updateSessionProjectFilterOptions(sessions = _cachedSessions) {
-  const options = sessionProjectFilterOptions(sessions);
-  for (const scope of ['recent', 'deep']) {
-    const cfg = sessionProjectFilterConfig(scope);
-    const select = document.getElementById(cfg.selectId);
-    if (!select) continue;
-    const stored = localStorage.getItem(cfg.key) || '';
-    const current = select.value || stored;
-    select.innerHTML = '';
+function sessionProjectMultiFilterOptions(sessions) {
+  return sessionProjectFilterOptions(sessions).map(item => ({
+    value: item.path,
+    label: `${item.label} (${item.count.toLocaleString()})`,
+    title: item.path,
+    plural: 'projects',
+  }));
+}
 
-    const all = document.createElement('option');
-    all.value = '';
-    all.textContent = cfg.allLabel;
-    select.appendChild(all);
+function renderSessionProjectFilterMenu(kind) {
+  const cfg = sessionMultiFilterConfig(kind);
+  const menu = document.getElementById(cfg.menuId);
+  if (!menu) return;
+  const selected = new Set(parseStoredSessionMultiFilter(kind));
+  menu.innerHTML = '';
 
-    for (const item of options) {
-      const opt = document.createElement('option');
-      opt.value = item.path;
-      opt.textContent = `${item.label} (${item.count.toLocaleString()})`;
-      opt.title = item.path;
-      select.appendChild(opt);
-    }
-
-    const hasCurrent = current && options.some(item => item.path === current);
-    select.value = hasCurrent ? current : '';
-    select.title = select.value || cfg.allLabel;
-    if (current && !hasCurrent) localStorage.removeItem(cfg.key);
+  if (cfg.options.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'sessions-multi-filter-empty';
+    empty.textContent = 'No project directories';
+    menu.appendChild(empty);
   }
+
+  for (const opt of cfg.options) {
+    const label = document.createElement('label');
+    if (opt.title) label.title = opt.title;
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = opt.value;
+    input.checked = selected.has(opt.value);
+    const text = document.createElement('span');
+    text.className = 'project-option-text';
+    text.textContent = opt.label;
+    label.appendChild(input);
+    label.appendChild(text);
+    menu.appendChild(label);
+  }
+
+  const validSelected = Array.from(selected).filter(value =>
+    cfg.options.some(opt => opt.value === value)
+  );
+  if (validSelected.length > 0) {
+    localStorage.setItem(cfg.key, JSON.stringify(validSelected));
+  } else {
+    localStorage.removeItem(cfg.key);
+  }
+  setSessionMultiFilterValues(kind, validSelected);
 }
 
-function restoreSessionProjectFilter(scope) {
-  const cfg = sessionProjectFilterConfig(scope);
-  const select = document.getElementById(cfg.selectId);
-  if (!select) return;
-  select.value = localStorage.getItem(cfg.key) || '';
-  select.title = select.value || cfg.allLabel;
-}
-
-function setupSessionProjectFilter(scope) {
-  const cfg = sessionProjectFilterConfig(scope);
-  const select = document.getElementById(cfg.selectId);
-  if (!select) return;
-  select.addEventListener('change', () => {
-    if (select.value) localStorage.setItem(cfg.key, select.value);
-    else localStorage.removeItem(cfg.key);
-    select.title = select.value || cfg.allLabel;
-    _refilterSessions();
-  });
+function updateSessionProjectFilterOptions(sessions = _cachedSessions) {
+  sessionProjectFilterOptionsCache = sessionProjectMultiFilterOptions(sessions);
+  renderSessionProjectFilterMenu('project');
+  renderSessionProjectFilterMenu('deep-project');
 }
 
 function sessionMultiFilterConfig(kind) {
+  if (kind === 'project') {
+    return {
+      key: SESSIONS_FILTER_PROJECT_KEY,
+      buttonId: 'filter-session-project',
+      menuId: 'filter-session-project-menu',
+      allLabel: 'All projects',
+      options: sessionProjectFilterOptionsCache,
+    };
+  }
+  if (kind === 'deep-project') {
+    return {
+      key: SESSIONS_DEEP_FILTER_PROJECT_KEY,
+      buttonId: 'filter-session-deep-project',
+      menuId: 'filter-session-deep-project-menu',
+      allLabel: 'All projects',
+      options: sessionProjectFilterOptionsCache,
+    };
+  }
   if (kind === 'source') {
     return {
       key: SESSIONS_FILTER_SOURCE_KEY,
@@ -23868,7 +23908,7 @@ function restoreSessionMultiFilter(kind) {
 }
 
 function closeSessionMultiFilterMenus(exceptKind = '') {
-  ['source', 'status', 'deep-source', 'deep-status'].forEach(kind => {
+  ['project', 'source', 'status', 'deep-project', 'deep-source', 'deep-status'].forEach(kind => {
     if (kind === exceptKind) return;
     const cfg = sessionMultiFilterConfig(kind);
     document.getElementById(cfg.menuId)?.classList.add('hidden');
@@ -23904,10 +23944,10 @@ function setupSessionMultiFilter(kind, onChange) {
 
 setupSessionMultiFilter('source', _refreshSessionsFilters);
 setupSessionMultiFilter('status', _refilterSessions);
+setupSessionMultiFilter('project', _refreshSessionsFilters);
+setupSessionMultiFilter('deep-project', _refilterSessions);
 setupSessionMultiFilter('deep-source', _refilterSessions);
 setupSessionMultiFilter('deep-status', _refilterSessions);
-setupSessionProjectFilter('recent');
-setupSessionProjectFilter('deep');
 document.addEventListener('click', () => closeSessionMultiFilterMenus());
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') closeSessionMultiFilterMenus();
@@ -23989,7 +24029,7 @@ function sessionDeepResultSearchQuery() {
 }
 
 function sessionProjectFilterValue() {
-  return document.getElementById('filter-session-project')?.value || '';
+  return sessionMultiFilterValues('project');
 }
 
 function sessionSourceFilterValue() {
@@ -24009,12 +24049,13 @@ function sessionDeepStatusFilterValue() {
 }
 
 function sessionDeepProjectFilterValue() {
-  return document.getElementById('filter-session-deep-project')?.value || '';
+  return sessionMultiFilterValues('deep-project');
 }
 
 function sessionMatchesProjectFilter(session, filter) {
-  if (!filter) return true;
-  return sessionProjectDirectory(session) === filter;
+  const filters = Array.isArray(filter) ? filter : (filter && filter !== 'all' ? [filter] : []);
+  if (filters.length === 0) return true;
+  return filters.includes(sessionProjectDirectory(session));
 }
 
 function sessionMatchesSourceFilter(source, filter) {
@@ -24368,6 +24409,7 @@ function renderSessionsList(sessions, el, options = {}) {
   const projectFilter = options.projectFilter || '';
   const sourceFilter = options.sourceFilter || [];
   const statusFilter = options.statusFilter || [];
+  const hasProjectFilter = Array.isArray(projectFilter) ? projectFilter.length > 0 : !!projectFilter;
   const deepSearchActive = deepSearchOnly && _sessionDeepSearch.active;
   let visibleCount = 0;
   const fragment = document.createDocumentFragment();
@@ -24716,8 +24758,8 @@ function renderSessionsList(sessions, el, options = {}) {
       ? 'No sessions match the deep search results'
       : query
       ? 'No sessions match your search'
-      : projectFilter
-      ? 'No sessions match the selected project'
+      : hasProjectFilter
+      ? 'No sessions match the selected projects'
       : 'No sessions match the active filters';
     el.appendChild(empty);
   } else {
