@@ -1608,6 +1608,7 @@ async fn reader_task(
     pending_requests: PendingRequests,
     pending_approvals: PendingApprovals,
     approval_counter: Arc<AtomicU64>,
+    active_thread_id: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
     model: Option<String>,
@@ -1738,26 +1739,49 @@ async fn reader_task(
         // Track active turn id so interrupt_turn() has a target to cancel.
         // Codex emits turn_id in several shapes across versions; accept any
         // top-level `turnId` / `turn_id` / `turn.id` / `thread.lastTurnId`.
+        //
+        // The app-server stream can include notifications for Codex collab
+        // subagent threads. A child or stale terminal notification must not
+        // clear the active parent turn or complete the parent drain.
+        let active_thread_snapshot = active_thread_id.lock().await.clone();
+        let active_turn_snapshot = active_turn_id.lock().await.clone();
+        let targets_active_thread =
+            codex_notification_targets_active_thread(&params, active_thread_snapshot.as_deref());
+        let targets_active_turn = codex_terminal_notification_targets_active_turn(
+            &params,
+            active_thread_snapshot.as_deref(),
+            active_turn_snapshot.as_deref(),
+        );
         match method {
             "turn/started" | "thread/started" => {
-                if let Some(id) = extract_turn_id(&params) {
-                    *active_turn_id.lock().await = Some(id);
+                if targets_active_thread {
+                    if let Some(id) = extract_turn_id(&params) {
+                        *active_turn_id.lock().await = Some(id);
+                    }
                 }
             }
             "turn/completed" | "turn/interrupted" | "turn/failed" => {
-                active_turn_id.lock().await.take();
+                if targets_active_turn {
+                    active_turn_id.lock().await.take();
+                }
             }
             "thread/status/changed" => {
-                // Only clear if the status signals the turn actually ended.
-                // "running" / "paused" / "busy" keep the active turn alive so
-                // a subsequent interrupt still has a target.
-                if let Some(status) = params.get("status").and_then(|v| v.as_str()) {
-                    if matches!(status, "completed" | "idle" | "failed") {
-                        active_turn_id.lock().await.take();
+                // Only clear if the status signals the active parent turn
+                // actually ended. "running" / "paused" / "busy" keep the
+                // active turn alive so a subsequent interrupt still has a target.
+                if targets_active_turn {
+                    if let Some(status) = codex_thread_status_type(&params) {
+                        if matches!(status, "completed" | "idle" | "failed" | "systemError") {
+                            active_turn_id.lock().await.take();
+                        }
                     }
                 }
             }
             _ => {}
+        }
+
+        if codex_terminal_method(method) && !targets_active_turn {
+            continue;
         }
 
         translate_notification(method, &params, &event_tx);
@@ -1783,6 +1807,53 @@ fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+fn codex_thread_status_type(params: &serde_json::Value) -> Option<&str> {
+    match params.get("status")? {
+        serde_json::Value::String(status) => Some(status.as_str()),
+        serde_json::Value::Object(status) => status.get("type").and_then(|v| v.as_str()),
+        _ => None,
+    }
+}
+
+fn codex_terminal_method(method: &str) -> bool {
+    matches!(
+        method,
+        "turn/completed" | "turn/interrupted" | "turn/failed" | "thread/status/changed"
+    )
+}
+
+fn codex_notification_targets_active_thread(
+    params: &serde_json::Value,
+    active_thread_id: Option<&str>,
+) -> bool {
+    match (extract_thread_id(params), active_thread_id) {
+        (Some(event_thread_id), Some(active_thread_id)) => event_thread_id == active_thread_id,
+        _ => true,
+    }
+}
+
+fn codex_terminal_notification_targets_active_turn(
+    params: &serde_json::Value,
+    active_thread_id: Option<&str>,
+    active_turn_id: Option<&str>,
+) -> bool {
+    if let (Some(event_thread_id), Some(active_thread_id)) =
+        (extract_thread_id(params), active_thread_id)
+    {
+        if event_thread_id != active_thread_id {
+            return false;
+        }
+    }
+
+    if let (Some(event_turn_id), Some(active_turn_id)) = (extract_turn_id(params), active_turn_id) {
+        if event_turn_id != active_turn_id {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn non_empty_string_at(value: &serde_json::Value, paths: &[&str]) -> Option<String> {
@@ -2382,7 +2453,7 @@ fn translate_notification(
         // thread/status/changed may signal turn or thread completion.
         // Codex v2 uses this alongside (or instead of) turn/completed.
         "thread/status/changed" => {
-            if let Some(status) = params.get("status").and_then(|v| v.as_str()) {
+            if let Some(status) = codex_thread_status_type(params) {
                 if status == "completed" || status == "idle" {
                     let _ = event_tx.send(AgentEvent::TurnCompleted { message: None });
                 }
@@ -2631,6 +2702,7 @@ impl ExternalAgent for CodexAgent {
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let approval_counter = Arc::new(AtomicU64::new(1));
         let active_turn_id = Arc::clone(&self.active_turn_id);
+        let active_thread_id = Arc::clone(&self.active_thread_id);
         let latest_token_usage = Arc::clone(&self.latest_token_usage);
         let model = self.model.clone();
 
@@ -2640,6 +2712,7 @@ impl ExternalAgent for CodexAgent {
             pending_requests,
             pending_approvals,
             approval_counter,
+            active_thread_id,
             active_turn_id,
             latest_token_usage,
             model,
@@ -4177,6 +4250,20 @@ mod tests {
     }
 
     #[test]
+    fn translate_thread_status_changed_idle_object() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({"status": {"type": "idle"}});
+        translate_notification("thread/status/changed", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::TurnCompleted { message } => {
+                assert_eq!(message, None);
+            }
+            other => panic!("expected TurnCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn translate_thread_status_changed_running_no_event() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({"status": "running"});
@@ -4185,6 +4272,45 @@ mod tests {
             rx.try_recv().is_err(),
             "running status should not emit TurnCompleted"
         );
+    }
+
+    #[test]
+    fn terminal_notification_rejects_child_thread_completion() {
+        let params = serde_json::json!({
+            "threadId": "child-thread",
+            "turn": {"id": "child-turn"}
+        });
+        assert!(!codex_terminal_notification_targets_active_turn(
+            &params,
+            Some("parent-thread"),
+            Some("parent-turn")
+        ));
+    }
+
+    #[test]
+    fn terminal_notification_rejects_stale_turn_completion() {
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "turn": {"id": "old-turn"}
+        });
+        assert!(!codex_terminal_notification_targets_active_turn(
+            &params,
+            Some("parent-thread"),
+            Some("new-turn")
+        ));
+    }
+
+    #[test]
+    fn terminal_notification_accepts_active_turn_completion() {
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "turn": {"id": "parent-turn"}
+        });
+        assert!(codex_terminal_notification_targets_active_turn(
+            &params,
+            Some("parent-thread"),
+            Some("parent-turn")
+        ));
     }
 
     #[test]
