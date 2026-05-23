@@ -83,6 +83,7 @@ static INTENDANT_SESSION_LIST_CACHE: OnceLock<
 const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
 const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
+const EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS: i64 = 2_000;
 const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_SOURCE_FLOOR: usize = 100;
@@ -2901,8 +2902,11 @@ fn push_external_transcript_entry(
     }
     if entries.last().is_some_and(|entry| {
         external_transcript_entry_role(entry) == Some(role.as_str())
-            && entry.get("ts").and_then(|v| v.as_str()) == Some(ts)
             && entry.get("content").and_then(|v| v.as_str()) == Some(text.as_str())
+            && external_transcript_entries_are_temporal_duplicates(
+                entry.get("ts").and_then(|v| v.as_str()),
+                ts,
+            )
     }) {
         return false;
     }
@@ -2913,6 +2917,28 @@ fn push_external_transcript_entry(
         "content": text,
     }));
     true
+}
+
+fn external_transcript_entries_are_temporal_duplicates(
+    previous_ts: Option<&str>,
+    current_ts: &str,
+) -> bool {
+    let Some(previous_ts) = previous_ts else {
+        return false;
+    };
+    if previous_ts == current_ts {
+        return true;
+    }
+    let Ok(previous) = chrono::DateTime::parse_from_rfc3339(previous_ts) else {
+        return false;
+    };
+    let Ok(current) = chrono::DateTime::parse_from_rfc3339(current_ts) else {
+        return false;
+    };
+    previous
+        .timestamp_millis()
+        .abs_diff(current.timestamp_millis())
+        <= EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS as u64
 }
 
 fn external_transcript_entry_role(entry: &serde_json::Value) -> Option<&'static str> {
@@ -16143,17 +16169,17 @@ mod tests {
                     }
                 }),
                 serde_json::json!({
-                    "timestamp": "2026-05-17T16:49:00Z",
+                    "timestamp": "2026-05-17T16:49:00.013Z",
                     "type": "event_msg",
                     "payload": { "type": "user_message", "message": "Visible prompt" }
                 }),
                 serde_json::json!({
-                    "timestamp": "2026-05-17T16:49:04Z",
+                    "timestamp": "2026-05-17T16:49:04.276Z",
                     "type": "event_msg",
                     "payload": { "type": "agent_message", "message": "Visible answer" }
                 }),
                 serde_json::json!({
-                    "timestamp": "2026-05-17T16:49:04Z",
+                    "timestamp": "2026-05-17T16:49:04.289Z",
                     "type": "response_item",
                     "payload": {
                         "type": "message",
@@ -16246,6 +16272,49 @@ mod tests {
             contents,
             vec!["first cached message", "second uncached message"]
         );
+    }
+
+    #[test]
+    fn codex_transcript_keeps_repeated_messages_outside_dedupe_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-transcript-repeat";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "Still working" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:10Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "Still working" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should resolve");
+        let contents: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(contents, vec!["Still working", "Still working"]);
     }
 
     #[test]
