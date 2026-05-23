@@ -11563,11 +11563,45 @@ function activeSessionRelationshipIds() {
   return { parents, children, activeKeys };
 }
 
+function pruneClosedSideChildrenForParent(parentId, meta) {
+  const sid = String(parentId || '').trim();
+  if (!sid || !meta || !Array.isArray(meta.children)) return meta || {};
+  let changed = false;
+  const children = [];
+  for (const child of meta.children) {
+    const childId = String(child?.id || '').trim();
+    const kind = String(child?.kind || '').trim().toLowerCase();
+    const childWin = childId ? sessionWindows.get(childId) : null;
+    const closedSideChild = kind === 'side' && (!childId || !childWin || childWin.ended);
+    if (closedSideChild) {
+      changed = true;
+      if (childId) {
+        sessionRelationships.delete(sessionRelationshipKey(sid, childId, kind));
+        const childMeta = sessionMetadataById.get(childId);
+        if (childMeta && childMeta.parentId === sid && childMeta.relationshipKind === kind) {
+          const nextChildMeta = { ...childMeta };
+          delete nextChildMeta.parentId;
+          delete nextChildMeta.relationshipKind;
+          delete nextChildMeta.relationshipEphemeral;
+          sessionMetadataById.set(childId, nextChildMeta);
+        }
+      }
+      continue;
+    }
+    children.push(child);
+  }
+  if (!changed) return meta;
+  const nextMeta = { ...meta, children };
+  sessionMetadataById.set(sid, nextMeta);
+  scheduleSessionRelationshipRender();
+  return nextMeta;
+}
+
 function updateSessionRelationshipBadges(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win || !win.relationStrip) return;
-  const meta = sessionMetadataById.get(sid) || {};
+  const meta = pruneClosedSideChildrenForParent(sid, sessionMetadataById.get(sid) || {});
   const chips = [];
   if (meta.relationshipKind && meta.parentId) {
     chips.push({
@@ -12056,6 +12090,9 @@ function ensureSessionWindow(sessionId, meta = {}) {
     e.stopPropagation();
     setSessionWindowMenuOpen(sid, false);
     maybeDispatchSideClose(sid);
+    if ((sessionMetadataById.get(sid) || {}).relationshipKind === 'side') {
+      removeSessionRelationshipsForSession(sid);
+    }
     removeSessionWindow(sid);
   });
 
