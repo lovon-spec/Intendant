@@ -1806,13 +1806,21 @@ impl DisplaySession {
         // encoder can produce, so an incompatible H.264 variant is
         // excluded here rather than producing a black stream after the
         // driver drops mismatched frames downstream.
-        let prefs = forward::codec_preferences_from_offer(sdp);
+        let mut prefs = forward::codec_preferences_from_offer(sdp);
         if prefs.is_empty() {
             return Err(CallerError::WebRtc(format!(
                 "pool-mode: peer offer has no compatible codecs (offered: {:?})",
                 encode::parse_offered_codecs(sdp),
             )));
         }
+        // Mark federated viewers (offer without `a=simulcast:recv`, the
+        // `PeerDisplayConnection`-over-TURN signature) so the pool spawns
+        // the loss-resilient quarter-resolution / capped-bitrate on-demand
+        // H.264 layer instead of the full-resolution one. Local
+        // `DisplaySlot` offers inject `a=simulcast:recv f;h;q` and stay
+        // non-federated. The same discriminator drives the single-RID vs
+        // multi-RID answer path in `WebRtcPeer::new`.
+        prefs.federated = self::webrtc::offer_is_federated(sdp);
 
         let (subs, lease) = pool.subscribe(&prefs).map_err(|e| {
             CallerError::WebRtc(format!(

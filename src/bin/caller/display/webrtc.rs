@@ -2073,6 +2073,15 @@ fn first_video_mid_from_offer(sdp: &str) -> Option<String> {
 /// "best available floor" — when the source resolution is too small for
 /// quarter (per `MIN_LAYER_DIM` filter in `LayerSpec::vp8_simulcast`),
 /// last is `h` or `f`. Caller guarantees `pool_rids` is non-empty.
+///
+/// **Federated H.264.** When the active codec is H.264 the pool produces a
+/// single on-demand layer at the `fed` RID
+/// ([`crate::display::encode::pool::SimulcastRid::federated`]), already at
+/// quarter resolution + a capped bitrate via `LayerSpec::single_federated`
+/// — so `pool_rids` is `[fed]` and `last()` returns it. The loss math
+/// above (small IDR survives the relay) is achieved at the encoder for
+/// H.264 rather than by floor-picking among simulcast tiers as it is for
+/// VP8; this function just returns the one RID the H.264 pool offered.
 fn select_single_rid_for_federated_offer(pool_rids: &[SimulcastRid]) -> SimulcastRid {
     pool_rids
         .last()
@@ -2152,6 +2161,25 @@ fn parse_offer_simulcast_recv_rids(sdp: &str) -> Option<Vec<SimulcastRid>> {
         }
     }
     None
+}
+
+/// Whether an offer is from a **federated** viewer (a
+/// `PeerDisplayConnection` reaching us over the TURN relay), as opposed to
+/// a local `DisplaySlot`.
+///
+/// The discriminator is the same one [`WebRtcPeer::new`] already uses to
+/// decide between the single-RID and multi-RID answer paths: the local
+/// `DisplaySlot` injects `a=simulcast:recv full;half;quarter` into its
+/// offer before `setLocalDescription`, whereas the federated
+/// `PeerDisplayConnection` offer carries no `a=simulcast:recv` directive.
+/// So "no recv-simulcast line" ≡ "federated single-encoding peer".
+///
+/// `handle_offer_pool_mode` consults this to mark the peer's
+/// [`PeerCodecPreferences`] federated, which makes the pool spawn the
+/// loss-resilient quarter-resolution / capped-bitrate on-demand H.264
+/// layer ([`crate::display::encode::pool::LayerSpec::single_federated`]).
+pub(crate) fn offer_is_federated(offer_sdp: &str) -> bool {
+    parse_offer_simulcast_recv_rids(offer_sdp).is_none()
 }
 
 #[cfg(test)]
@@ -2485,12 +2513,42 @@ impl WebRtcPeer {
         //
         //   `Registry::new() → configure_rtcp_reports(.) →
         //    configure_twcc_sender_only(.) →
+        //    .with(NackResponderBuilder::new().with_size(2048).build()) →
         //    .with(|inner| TwccTapInterceptor::new(inner, tx))`
         //
         // produces a chain whose outermost layer is the tap. The tap
-        // observes, then forwards to twcc_sender_only, then
-        // rtcp_reports, then rtc's internals — keeping the existing
-        // stack's behaviour intact. The tap mutates nothing.
+        // observes, then forwards to the NACK responder, then
+        // twcc_sender_only, then rtcp_reports, then rtc's internals —
+        // keeping the existing stack's behaviour intact. The tap
+        // mutates nothing.
+        //
+        // **NACK retransmission (loss recovery).** `video_rtcp_feedback`
+        // advertises `a=rtcp-fb ... nack`, so a browser receiver sends
+        // RTCP `TransportLayerNack` for gaps. Until now nothing handled
+        // them — the answer promised retransmission and delivered none.
+        // The rtc 0.9 `NackResponderInterceptor` (added here via
+        // `NackResponderBuilder::new().with_size(2048).build()`)
+        // `bind_local_stream`s every outbound video stream whose
+        // negotiated feedback includes generic `nack` (it does), buffers
+        // each outbound RTP packet on `handle_write`, and on inbound
+        // NACK retransmits the requested sequence numbers from that
+        // buffer. We never configure an RTX SSRC / payload type, so the
+        // responder retransmits same-SSRC, in-band (rtc-interceptor 0.9
+        // `nack/responder.rs`: "No RTX: retransmit original packet
+        // as-is") — no SDP change is needed and `sanitize_answer_sdp`
+        // (which only rewrites `a=rid:` / `a=simulcast:` lines) leaves
+        // the advertised `a=rtcp-fb nack` intact. `with_size(2048)`
+        // (a power of two, the responder's hard constraint) buffers
+        // ~2048 packets per stream — at the federated floor's small
+        // packetization that comfortably covers the round-trip a NACK
+        // needs to arrive while the packet is still retransmittable.
+        //
+        // Placed INSIDE the tap (applied before `.with(tap)`) so the
+        // tap stays the documented outermost observer; the responder
+        // sits between the tap and `twcc_sender_only`. Retransmitted
+        // packets the responder injects are drained via its
+        // `poll_write` and flow inward to rtc's transport, exactly like
+        // primary RTP.
         //
         // The aggregator that consumes `twcc_tap_rx` is spawned
         // below, after `shutdown` is created, so it shares the
@@ -2508,6 +2566,8 @@ impl WebRtcPeer {
                 &mut media_engine,
             )
             .map_err(|e| CallerError::WebRtc(format!("configure twcc: {e}")))?;
+        let registry = registry
+            .with(rtc::interceptor::NackResponderBuilder::new().with_size(2048).build());
         let registry = registry.with(|inner| {
             crate::display::twcc_tap::TwccTapInterceptor::new(inner, twcc_tap_tx.clone())
         });
@@ -5147,14 +5207,21 @@ fn filter_prefs_to_negotiated(
     original_prefs: &PeerCodecPreferences,
     actual_codecs: &[CodecKind],
 ) -> PeerCodecPreferences {
-    PeerCodecPreferences::new(
-        original_prefs
-            .supported
-            .iter()
-            .copied()
-            .filter(|c| actual_codecs.contains(c))
-            .collect(),
-    )
+    let supported: Vec<CodecKind> = original_prefs
+        .supported
+        .iter()
+        .copied()
+        .filter(|c| actual_codecs.contains(c))
+        .collect();
+    // Preserve the federated flag so every resubscribe the intake makes
+    // (resize / Closed-recovery) keeps spawning the federated-shaped
+    // (quarter-res / capped-bitrate) on-demand H.264 layer rather than
+    // silently reverting to the full-resolution `LayerSpec::single`.
+    if original_prefs.federated {
+        PeerCodecPreferences::new_federated(supported)
+    } else {
+        PeerCodecPreferences::new(supported)
+    }
 }
 
 /// Partition pool subscriptions by active codec, dropping the inactive
@@ -6471,6 +6538,54 @@ mod tests {
         let original = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
         let filtered = filter_prefs_to_negotiated(&original, &[]);
         assert!(filtered.is_empty());
+    }
+
+    /// The federated flag must survive the filter — every resubscribe the
+    /// intake makes carries `negotiated_prefs`, and if the flag were
+    /// dropped the on-demand H.264 layer would silently revert from the
+    /// quarter-res / capped federated shape to full resolution on the
+    /// first resize / Closed-recovery.
+    #[test]
+    fn filter_prefs_to_negotiated_preserves_federated_flag() {
+        let federated = PeerCodecPreferences::new_federated(vec![CodecKind::H264, CodecKind::Vp8]);
+        let filtered = filter_prefs_to_negotiated(&federated, &[CodecKind::H264, CodecKind::Vp8]);
+        assert!(filtered.federated, "federated flag must be preserved");
+        assert_eq!(filtered.supported, vec![CodecKind::H264, CodecKind::Vp8]);
+
+        let local = PeerCodecPreferences::new(vec![CodecKind::H264]);
+        let filtered_local = filter_prefs_to_negotiated(&local, &[CodecKind::H264]);
+        assert!(
+            !filtered_local.federated,
+            "non-federated flag must be preserved too"
+        );
+    }
+
+    /// `offer_is_federated` is the discriminator that flips
+    /// `PeerCodecPreferences::federated`. A local `DisplaySlot` offer
+    /// carries `a=simulcast:recv f;h;q` → not federated; a
+    /// `PeerDisplayConnection` offer omits it → federated.
+    #[test]
+    fn offer_is_federated_distinguishes_local_from_federated() {
+        let local_offer = "v=0\r\n\
+                           m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                           a=mid:0\r\n\
+                           a=rtpmap:96 VP8/90000\r\n\
+                           a=simulcast:recv f;h;q\r\n\
+                           a=recvonly\r\n";
+        assert!(
+            !offer_is_federated(local_offer),
+            "offer with a=simulcast:recv is a local DisplaySlot, not federated"
+        );
+
+        let federated_offer = "v=0\r\n\
+                              m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                              a=mid:0\r\n\
+                              a=rtpmap:96 VP8/90000\r\n\
+                              a=recvonly\r\n";
+        assert!(
+            offer_is_federated(federated_offer),
+            "offer without a=simulcast:recv is a federated PeerDisplayConnection"
+        );
     }
 
     // -----------------------------------------------------------------------

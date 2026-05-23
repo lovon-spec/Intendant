@@ -20401,6 +20401,30 @@ function tileTestEnabled() {
   return false;
 }
 
+// Per-session, per-viewer override that PREFERS H.264 for a federated
+// `PeerDisplayConnection`, independent of the gateway-wide
+// `[webrtc].federation_allow_h264` config flag. Activated via
+// `?federation-h264=1` OR `localStorage.federationH264 === '1'`.
+//
+// Why a per-session toggle: the federated H.264-under-loss A/B needs to
+// flip one viewer to H.264 without changing the daemon default (which
+// stays VP8 unless the operator sets the config flag). The gateway flag
+// is process-wide and applies to every federated viewer; this override is
+// scoped to the browser/tab running the test, and OR's with the flag — so
+// it only ever ADDS H.264 preference, never removes it, and leaves the
+// VP8 default untouched when neither is set. Mirrors `tileTestEnabled`'s
+// dual URL-param / localStorage shape.
+function federationH264TestEnabled() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('federation-h264') === '1') return true;
+  } catch { /* fall through */ }
+  try {
+    if (window.localStorage && window.localStorage.getItem('federationH264') === '1') return true;
+  } catch { /* fall through */ }
+  return false;
+}
+
 // Bootstrap the synthetic harness — appended to body as a fixed-
 // position pane so it doesn't collide with the existing dashboard
 // chrome. CanvasFreshnessSampler activates only if `?diag=1` is also
@@ -20715,7 +20739,19 @@ class PeerDisplayConnection {
     // that don't implement it (rare in 2026 — Safari/WebKit, Chrome,
     // Firefox all support it); guard so a no-op fallback leaves the
     // transceiver at its browser default.
-    const allowFederationH264 = !!(gatewayConfig && gatewayConfig.federation_allow_h264);
+    // Gateway-wide config flag OR the per-session test override
+    // (`?federation-h264=1` / `localStorage.federationH264='1'`). The
+    // override only ADDS H.264 preference for this tab — it never disables
+    // the VP8 default, so federation stays VP8 unless one of the two is
+    // explicitly set. See `federationH264TestEnabled`.
+    const sessionH264Override = federationH264TestEnabled();
+    const allowFederationH264 =
+      !!(gatewayConfig && gatewayConfig.federation_allow_h264) || sessionH264Override;
+    if (sessionH264Override) {
+      this._log('info',
+        'federation H.264 enabled for this session via ' +
+        '?federation-h264=1 / localStorage.federationH264 (per-viewer test override)');
+    }
     if (allowFederationH264 && videoTransceiver && typeof videoTransceiver.setCodecPreferences === 'function') {
       const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities)
         ? RTCRtpReceiver.getCapabilities('video')

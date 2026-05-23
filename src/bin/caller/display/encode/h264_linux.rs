@@ -7,16 +7,21 @@
 //! This approach avoids complex FFI bindings to NVENC/libva while still
 //! getting hardware acceleration when available.
 //!
-//! **Loss-resilience.** All three encoders are configured for *intra
-//! refresh* rather than periodic full IDRs: after the single seed IDR at
-//! stream start, recovery points are signalled by a sliding wave of intra
-//! macroblocks (and a recovery-point SEI) instead of a fat keyframe. A
-//! full-resolution IDR is hundreds of RTP packets; on a lossy federated
-//! path (browser → TURN → remote peer) the probability of reassembling
-//! every packet of a periodic IDR collapses, freezing the stream. Intra
-//! refresh spreads that cost across the GOP so no single access unit is
-//! large enough to be un-reassemblable, and the decoder still gets a clean
-//! recovery point every `-g` frames.
+//! **Loss-resilience.** All three encoders use a *finite, bounded GOP*
+//! ([`GOP_PERIOD_FRAMES`]) so a decoder that has desynced — fresh peer
+//! join, or a transport gap that outran NACK retransmission — gets a real
+//! IDR within ~1-2 s rather than waiting indefinitely. The complementary
+//! half of the strategy lives elsewhere: the federated H.264 layer is
+//! encoded at quarter resolution + a capped bitrate (see
+//! `LayerSpec::single` / `single_federated` in `encode/pool.rs`), so even
+//! the periodic IDR is only a handful of RTP packets and survives the
+//! lossy `browser → TURN → remote peer` relay; and `slice-max-size=1200`
+//! (libx264) keeps each NAL inside a single ~MTU RTP payload so a lost
+//! packet costs one slice, not a frame. An earlier iteration replaced the
+//! periodic IDR with libx264 *intra refresh* / an infinite NVENC GOP, but
+//! that left a desynced decoder with no clean recovery point (Linux ffmpeg
+//! ignores PLI on a long-lived stdin pipe, so there was no on-demand
+//! keyframe either) — the finite GOP restores recoverability.
 
 use super::{EncodedPacket, Encoder, PayloadSpec};
 use std::io::{Read, Write};
@@ -465,9 +470,9 @@ impl Encoder for FfmpegH264Encoder {
     ) -> Result<Vec<EncodedPacket>, String> {
         // NOTE: `force_keyframe` cannot be honored on a long-running ffmpeg
         // stdin pipe -- there is no way to inject per-frame "emit IDR now"
-        // metadata through rawvideo.  We rely on the intra-refresh wave
-        // (`-g 30` refresh period) configured at spawn time to bound how
-        // long a fresh peer waits for a clean recovery point.
+        // metadata through rawvideo.  We rely on the finite GOP
+        // (`-g GOP_PERIOD_FRAMES`) configured at spawn time to bound how
+        // long a fresh or desynced decoder waits for a clean IDR.
         if i420.len() < self.frame_size {
             return Err(format!(
                 "I420 buffer too small: {} < {}",
@@ -569,31 +574,19 @@ impl Drop for FfmpegH264Encoder {
     }
 }
 
-/// Refresh-wave period in frames for libx264 / VA-API.
+/// GOP length in frames (the `-g` interval) for all three H.264 arms.
 ///
-/// With intra refresh this is the length of one full top-to-bottom intra
-/// sweep (and the cadence of recovery-point SEI), not a periodic-IDR
-/// interval — libx264 honours `intra-refresh=1` and suppresses periodic
-/// IDRs while still completing a refresh wave every `-g` frames. At the
-/// 30 fps feed rate that's a clean recovery point ~once per second.
-const REFRESH_PERIOD_FRAMES: &str = "30";
-
-/// GOP length for the NVENC arm: effectively infinite.
-///
-/// **Why NVENC differs from libx264.** NVENC's `-intra-refresh 1` adds a
-/// rolling intra-refresh wave *within* a GOP, but — unlike libx264 — it
-/// still emits a full IDR at every `-g` boundary. Empirically (ffmpeg
-/// 4.4.2, RTX A4000) `-g 30 -intra-refresh 1` produces IDRs at frames
-/// 0/30/60/90; only an effectively-infinite GOP lets the rolling refresh
-/// be the *sole* recovery mechanism, yielding exactly one seed IDR (frame
-/// 0) and a continuous stream of recovery-point SEI thereafter. A
-/// full-resolution periodic IDR is the un-reassemblable access unit the
-/// whole loss-resilience effort exists to eliminate, so for NVENC we set
-/// the GOP huge and rely entirely on the refresh wave. The decoder still
-/// gets dense recovery points (one SEI per refreshed region), just never a
-/// fat IDR. `i32::MAX`-ish; ffmpeg also accepts `-1` as "infinite", but a
-/// large explicit value is unambiguous across builds.
-const NVENC_GOP_INFINITE: &str = "1000000";
+/// A finite, bounded GOP guarantees a desynced decoder a real IDR within
+/// `GOP_PERIOD_FRAMES` frames. At the 30 fps feed rate, 60 frames is a
+/// keyframe every ~2 s — short enough that a fresh peer or a
+/// post-loss-burst decoder recovers promptly, long enough that periodic
+/// IDRs don't dominate the bitrate. Combined with the quarter-resolution
+/// + capped-bitrate federated layer (`encode/pool.rs`), each such IDR is
+/// only a handful of RTP packets, so it survives the lossy relay it has
+/// to cross. Replaces the earlier intra-refresh experiment, which left a
+/// desynced decoder with no clean recovery point (Linux ffmpeg ignores
+/// PLI on a long-lived stdin pipe — see the module docs).
+const GOP_PERIOD_FRAMES: &str = "60";
 
 /// Probe whether this ffmpeg build includes the `h264_nvenc` encoder.
 ///
@@ -620,20 +613,21 @@ fn nvenc_encoder_available() -> bool {
 
 /// ffmpeg argument vector for the software libx264 encoder.
 ///
-/// **Intra refresh (loss-resilience).** `intra-refresh=1` replaces periodic
-/// fat IDRs with a sliding wave of intra macroblocks: after the seed IDR at
-/// frame 0 there are no further type-5 IDRs — the decoder recovers via the
-/// refresh wave plus a recovery-point SEI. `slice-max-size=1200` keeps each
-/// slice small enough to fit a single ~1200-byte RTP payload, so a lost
-/// packet costs one slice, not a frame. `ref=1` + `bframes=0` are required:
-/// intra refresh needs a single reference and no B-frames (and
-/// `ultrafast`'s default open-GOP is incompatible with intra refresh, so
-/// the explicit `bframes=0` / `ref=1` here pin the closed-GOP shape it
-/// needs). `-g` is now the refresh-wave period, not an IDR interval.
+/// **Loss-resilience.** `-g GOP_PERIOD_FRAMES` gives a finite, bounded GOP
+/// so a desynced decoder gets a real IDR within ~2 s (the federated layer
+/// is quarter-res + bitrate-capped upstream, so that IDR is only a handful
+/// of RTP packets and survives the lossy relay). `slice-max-size=1200`
+/// keeps each slice small enough to fit a single ~1200-byte RTP payload,
+/// so a lost packet costs one slice, not a frame, and composes with the
+/// reduced resolution. `ref=1` + `bframes=0` pin the closed-GOP, single-
+/// reference shape (`ultrafast`/`zerolatency` already imply no B-frames;
+/// the explicit values keep the GOP closed so each IDR is a clean,
+/// self-contained recovery point).
 ///
 /// `repeat-headers=1` keeps SPS/PPS in-band (defense-in-depth alongside the
-/// `build_packet` daemon-side prepend). Input stays `rawvideo`/`yuv420p`;
-/// output is Constrained-Baseline Annex-B.
+/// `build_packet` daemon-side prepend, which guarantees SPS/PPS precede
+/// every periodic IDR even if libx264 omits them on the long-lived pipe).
+/// Input stays `rawvideo`/`yuv420p`; output is Constrained-Baseline Annex-B.
 fn x264_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> {
     [
         "-hide_banner",
@@ -662,15 +656,16 @@ fn x264_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> {
         "-tune",
         "zerolatency",
         "-g",
-        REFRESH_PERIOD_FRAMES,
+        GOP_PERIOD_FRAMES,
         "-bf",
         "0",
-        // Intra refresh + small slices for loss-resilience, plus in-band
-        // parameter sets. `intra-refresh=1` requires `bframes=0`; `ref=1`
-        // and the explicit `bframes=0` also override `ultrafast`'s open-GOP
-        // default which conflicts with intra refresh. See fn doc.
+        // Finite GOP (above) + small slices for loss-resilience, plus
+        // in-band parameter sets. `slice-max-size=1200` caps each NAL to a
+        // single ~MTU RTP payload; `ref=1` + `bframes=0` pin a closed,
+        // single-reference GOP so each periodic IDR is a clean recovery
+        // point. See fn doc.
         "-x264-params",
-        "intra-refresh=1:slice-max-size=1200:ref=1:bframes=0:repeat-headers=1",
+        "slice-max-size=1200:ref=1:bframes=0:repeat-headers=1",
         // Output: raw H264 Annex-B to stdout
         "-f",
         "h264",
@@ -693,16 +688,16 @@ fn x264_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> {
 /// baseline` produces a Constrained-Baseline Annex-B stream that matches
 /// the existing SPS/PPS-prepend + NAL-reader expectations exactly.
 ///
-/// **Intra refresh:** `-intra-refresh 1` enables the rolling refresh, but
-/// NVENC still emits a periodic IDR at every `-g` boundary, so the GOP is
-/// pinned effectively-infinite ([`NVENC_GOP_INFINITE`]) and `-no-scenecut
-/// 1` / `-forced-idr 0` stop NVENC re-introducing IDRs at scene cuts. The
-/// net result is a single seed IDR (frame 0) and recovery via rolling
-/// intra-refresh + recovery-point SEI thereafter — see
-/// [`NVENC_GOP_INFINITE`] for the empirical justification. Unlike libx264
-/// there is no `slice-max-size` knob here; NVENC emits one slice per frame
-/// and spreads intra macroblocks across frames internally, so no single
-/// access unit is a fat keyframe.
+/// **Loss-resilience:** `-g GOP_PERIOD_FRAMES` gives a finite, bounded GOP
+/// so NVENC emits a periodic IDR every ~2 s — a real recovery point for a
+/// desynced decoder. Loss-survivability comes from the upstream
+/// quarter-resolution + capped-bitrate federated layer (`encode/pool.rs`),
+/// which keeps that IDR small enough to reassemble on the lossy relay. An
+/// earlier iteration pinned an effectively-infinite GOP + `-intra-refresh
+/// 1` (plus `-no-scenecut 1` / `-forced-idr 0`) to suppress all post-seed
+/// IDRs, but that left a desynced decoder with no clean recovery point
+/// (NVENC ignores PLI on this long-lived stdin pipe just as libx264 does),
+/// so the finite GOP is restored here.
 fn nvenc_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> {
     [
         "-hide_banner",
@@ -739,17 +734,13 @@ fn nvenc_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> 
         &format!("{}k", bitrate_kbps / 2),
         "-profile:v",
         "baseline",
-        // Infinite GOP + intra refresh = no periodic IDRs (see
-        // NVENC_GOP_INFINITE). no-scenecut/forced-idr keep it that way.
+        // Finite, bounded GOP: a periodic IDR every GOP_PERIOD_FRAMES so a
+        // desynced decoder gets a real recovery point (the federated layer
+        // is quarter-res + bitrate-capped upstream, keeping that IDR small
+        // on the wire). See fn doc + GOP_PERIOD_FRAMES.
         "-g",
-        NVENC_GOP_INFINITE,
+        GOP_PERIOD_FRAMES,
         "-bf",
-        "0",
-        "-intra-refresh",
-        "1",
-        "-no-scenecut",
-        "1",
-        "-forced-idr",
         "0",
         // Output: raw H264 Annex-B to stdout
         "-f",
@@ -1378,24 +1369,28 @@ mod tests {
     }
 
     #[test]
-    fn x264_args_enable_intra_refresh() {
+    fn x264_args_use_finite_gop_and_small_slices() {
         let args = x264_ffmpeg_args(1280, 720, 2000);
         // Codec + baseline profile + zerolatency tune preserved.
         assert!(has_flag_value(&args, "-c:v", "libx264"));
         assert!(has_flag_value(&args, "-profile:v", "baseline"));
         assert!(has_flag_value(&args, "-tune", "zerolatency"));
-        // B-frames off (required by intra-refresh).
+        // B-frames off.
         assert!(has_flag_value(&args, "-bf", "0"));
-        // -g is the refresh-wave period.
-        assert!(has_flag_value(&args, "-g", "30"));
-        // The x264-params string carries the full intra-refresh config,
-        // and keeps repeat-headers.
+        // -g is a finite, bounded GOP (periodic IDR for recoverability),
+        // not an intra-refresh / infinite period.
+        assert!(has_flag_value(&args, "-g", GOP_PERIOD_FRAMES));
+        // The x264-params string keeps small slices + closed-GOP pin +
+        // in-band headers, but NO intra-refresh (periodic IDRs restored).
         let params_idx = args
             .iter()
             .position(|a| a == "-x264-params")
             .expect("-x264-params present");
         let params = &args[params_idx + 1];
-        assert!(params.contains("intra-refresh=1"), "params: {params}");
+        assert!(
+            !params.contains("intra-refresh"),
+            "intra-refresh must be gone (periodic IDR restored): {params}"
+        );
         assert!(params.contains("slice-max-size=1200"), "params: {params}");
         assert!(params.contains("ref=1"), "params: {params}");
         assert!(params.contains("bframes=0"), "params: {params}");
@@ -1409,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_args_enable_intra_refresh_and_baseline() {
+    fn nvenc_args_use_finite_gop_and_baseline() {
         let args = nvenc_ffmpeg_args(1920, 1080, 4000);
         // NVENC codec + low-latency preset/tune.
         assert!(has_flag_value(&args, "-c:v", "h264_nvenc"));
@@ -1421,18 +1416,26 @@ mod tests {
         assert!(has_flag_value(&args, "-b:v", "4000k"));
         assert!(has_flag_value(&args, "-maxrate", "4000k"));
         assert!(has_flag_value(&args, "-bufsize", "2000k"));
-        // Constrained-Baseline Annex-B, intra refresh, no B-frames.
+        // Constrained-Baseline Annex-B, no B-frames.
         assert!(has_flag_value(&args, "-profile:v", "baseline"));
-        assert!(has_flag_value(&args, "-intra-refresh", "1"));
         assert!(has_flag_value(&args, "-bf", "0"));
         assert!(has_flag_value(&args, "-f", "h264"));
-        // NVENC needs an effectively-infinite GOP for intra refresh to be
-        // the SOLE recovery mechanism (it still emits a periodic IDR at a
-        // finite -g boundary). no-scenecut/forced-idr keep it IDR-free
-        // after the seed. See NVENC_GOP_INFINITE.
-        assert!(has_flag_value(&args, "-g", NVENC_GOP_INFINITE));
-        assert!(has_flag_value(&args, "-no-scenecut", "1"));
-        assert!(has_flag_value(&args, "-forced-idr", "0"));
+        // Finite, bounded GOP (periodic IDR for recoverability) — the
+        // intra-refresh + infinite-GOP + no-scenecut/forced-idr config is
+        // gone.
+        assert!(has_flag_value(&args, "-g", GOP_PERIOD_FRAMES));
+        assert!(
+            !has_arg(&args, "-intra-refresh"),
+            "intra-refresh must be gone (periodic IDR restored): {args:?}"
+        );
+        assert!(
+            !has_arg(&args, "-no-scenecut"),
+            "no-scenecut must be gone: {args:?}"
+        );
+        assert!(
+            !has_arg(&args, "-forced-idr"),
+            "forced-idr must be gone: {args:?}"
+        );
         // NVENC ingests I420 directly: rawvideo/yuv420p input and NO
         // VA-API-only nv12/hwupload filter.
         assert!(has_flag_value(&args, "-f", "rawvideo"));
@@ -1459,19 +1462,20 @@ mod tests {
         assert!(has_flag_value(&args, "-profile:v", "constrained_baseline"));
     }
 
-    /// End-to-end intra-refresh check against the *real* encoder selected by
-    /// `FfmpegH264Encoder::new` (nvenc → vaapi → libx264). Feeds ~90 frames
+    /// End-to-end periodic-IDR check against the *real* encoder selected by
+    /// `FfmpegH264Encoder::new` (nvenc → vaapi → libx264). Feeds ~150 frames
     /// of synthetic, slowly-changing I420 and asserts the emitted packets
-    /// contain exactly one keyframe (the seed) and no post-seed keyframe —
-    /// i.e. intra refresh is actually suppressing periodic IDRs on whichever
-    /// encoder this host uses.
+    /// contain the seed IDR at frame 0 PLUS at least one further IDR within
+    /// the GOP cadence — i.e. the finite GOP is actually producing the
+    /// periodic recovery keyframes a desynced decoder relies on, on
+    /// whichever encoder this host uses.
     ///
     /// `#[ignore]` because it spawns ffmpeg and needs a working H.264
     /// encoder; run explicitly on a build box:
-    ///   `cargo test --release intra_refresh_real_encoder -- --ignored --nocapture`
+    ///   `cargo test --release periodic_idr_real_encoder -- --ignored --nocapture`
     #[test]
     #[ignore]
-    fn intra_refresh_real_encoder_emits_no_post_seed_idr() {
+    fn periodic_idr_real_encoder_emits_recurring_idrs() {
         let (w, h, kbps) = (640u32, 480u32, 2000u32);
         let mut enc = match FfmpegH264Encoder::new(w, h, kbps) {
             Ok(e) => e,
@@ -1485,10 +1489,11 @@ mod tests {
         let mut frames_emitted = 0usize;
         let mut first_keyframe_at: Option<usize> = None;
         let mut last_keyframe_at: Option<usize> = None;
-        let total_frames = 90usize;
+        // Feed more than 2× the GOP so we observe at least a second IDR.
+        let total_frames = 150usize;
         for i in 0..total_frames {
             // Slowly varying luma so the encoder has real content (a flat
-            // frame can be coded as skip and never exercise refresh).
+            // frame can be coded as skip and never exercise the GOP).
             let mut buf = vec![0u8; frame_size];
             let luma = w as usize * h as usize;
             let v = (i * 3) as u8;
@@ -1511,23 +1516,20 @@ mod tests {
         // Drop the encoder to flush; one or two trailing frames may remain
         // in ffmpeg's pipeline and are not required for the assertion.
         eprintln!(
-            "[intra_refresh_real_encoder] emitted {frames_emitted} frames, \
+            "[periodic_idr_real_encoder] emitted {frames_emitted} frames, \
              {keyframes} keyframe(s), first@{first_keyframe_at:?} last@{last_keyframe_at:?}",
-        );
-        assert!(
-            keyframes >= 1,
-            "expected at least one (seed) keyframe, got 0"
         );
         assert_eq!(
             first_keyframe_at,
             Some(0),
             "the seed keyframe must be the very first emitted frame"
         );
-        assert_eq!(
-            keyframes, 1,
-            "intra refresh must emit exactly ONE keyframe (the seed) — \
-             {keyframes} means periodic IDRs are still being produced \
-             (last post-seed keyframe at frame {last_keyframe_at:?})"
+        assert!(
+            keyframes >= 2,
+            "finite GOP must emit recurring IDRs — got only {keyframes} \
+             keyframe(s) over {frames_emitted} frames, which means periodic \
+             IDRs are NOT being produced (a desynced decoder would never \
+             recover)"
         );
     }
 }

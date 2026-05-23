@@ -194,6 +194,22 @@ pub const RID_HALF: &str = "h";
 /// resolution).
 pub const RID_QUARTER: &str = "q";
 
+/// RID for the on-demand *federated* H.264 layer (quarter resolution +
+/// capped bitrate — see [`LayerSpec::single_federated`]). Distinct from
+/// [`RID_FULL`] so a federated H.264 encoder keys a different pool slot
+/// (`EncoderId { H264, RID_FEDERATED }`) than a local full-resolution
+/// H.264 encoder (`EncoderId { H264, RID_FULL }`) — the two never share
+/// a refcounted slot, so a federated viewer can never be handed a
+/// full-resolution H.264 encoder a local viewer spawned, or vice versa.
+///
+/// Single-encoding only: the federated path narrows to one RID, the
+/// track is built with a single encoding, and rtc 0.9 emits NO
+/// `a=rid` / `a=simulcast` lines for a single encoding (see
+/// `add_sender_sdp`'s `is_simulcast = encodings.len() > 1` gate). So this
+/// non-canonical RID is purely an internal routing/slot key and never
+/// reaches the wire — no `from_str_loose` round-trip is required.
+pub const RID_FEDERATED: &str = "fed";
+
 /// PLI/FIR coalesce window. Within this duration, multiple keyframe
 /// requests for the same `(codec, rid)` collapse into one request to
 /// the encoder. 50 ms is short enough that perceived recovery latency
@@ -331,6 +347,14 @@ impl SimulcastRid {
         Self(RID_QUARTER.to_string())
     }
 
+    /// `RID_FEDERATED` — the on-demand federated H.264 layer (quarter
+    /// resolution + capped bitrate). Keeps the federated H.264 slot
+    /// distinct from a local full-resolution H.264 slot. See
+    /// [`RID_FEDERATED`].
+    pub fn federated() -> Self {
+        Self(RID_FEDERATED.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -389,6 +413,17 @@ pub struct LayerSpec {
 /// a normal `RecvError::Closed` and resubscribe via the
 /// pool-frame-intake reconnect path.
 pub const MIN_LAYER_DIM: u32 = 16;
+
+/// Target bitrate (kbps) for the on-demand federated H.264 layer
+/// ([`LayerSpec::single_federated`]). Roughly double the VP8 quarter
+/// floor's 125 kbps — H.264 carries more per-frame overhead (SPS/PPS
+/// repeated before every periodic IDR, slice headers from
+/// `slice-max-size=1200`) than VP8 at the same resolution, so a slightly
+/// higher cap holds equivalent quality at quarter resolution while
+/// keeping each IDR small enough to reassemble under relay loss. Well
+/// below the 2500 kbps full-resolution [`LayerSpec::single`] cap that
+/// produces the un-reassemblable seed IDR this layer exists to avoid.
+pub const FEDERATED_H264_BITRATE_KBPS: u32 = 250;
 
 /// Normalize a `(width, height)` pair to the constraints both
 /// VP8 encoder construction and [`super::downscale_i420`] require:
@@ -479,6 +514,62 @@ impl LayerSpec {
             width,
             height,
             target_bitrate_kbps: bitrate,
+            framerate,
+        }
+    }
+
+    /// Single-layer spec for the on-demand **federated** H.264 layer:
+    /// quarter resolution + a capped bitrate, mirroring the VP8 federated
+    /// floor that already works under loss.
+    ///
+    /// **Why this exists.** A federated viewer reaches the daemon over a
+    /// `browser → TURN relay → remote peer` path where moderate sustained
+    /// packet loss (~5-20 %) is the operational baseline. A full-resolution
+    /// 2500 kbps H.264 stream ([`Self::single`]) produces a seed IDR of
+    /// hundreds of RTP packets — at ~17 % loss the probability of
+    /// reassembling every packet is effectively zero, so the stream never
+    /// bootstraps (`framesDecoded == 0`). The working VP8 federated floor
+    /// is quarter-resolution / 125 kbps (~17-packet IDR, ~24 % intact
+    /// arrival); this gives federated H.264 the same shape: quarter the
+    /// source dimensions (`source / 4`, rounded to the same even /
+    /// [`MIN_LAYER_DIM`] constraints as [`Self::vp8_simulcast`]'s quarter
+    /// layer via [`normalize_layer_dims`]) and a bitrate capped at
+    /// [`FEDERATED_H264_BITRATE_KBPS`]. Combined with the finite-GOP
+    /// periodic IDR (`encode/h264_linux.rs`) and same-SSRC NACK
+    /// retransmission (`display/webrtc.rs`), the small IDR both survives
+    /// the relay and is recoverable.
+    ///
+    /// **Distinct RID.** The layer carries [`SimulcastRid::federated`], not
+    /// [`SimulcastRid::full`], so its pool slot
+    /// (`EncoderId { H264, RID_FEDERATED }`) is never shared with a local
+    /// full-resolution H.264 slot — see [`RID_FEDERATED`].
+    ///
+    /// **Single-RID, not simulcast.** H.264 stays single-encoding (the
+    /// pool's `try_spawn_encoder_thread` / libx264 broken-pipe constraint
+    /// makes parallel H.264 encoders fragile); this is one capped layer,
+    /// not an added simulcast tier. H.264 is the only codec that takes
+    /// this federated path (VP8 federation uses its own quarter tier from
+    /// [`Self::vp8_simulcast`]), so this constructor is codec-implicit —
+    /// no `codec` argument.
+    ///
+    /// Degrades safely: if `source / 4` falls below [`MIN_LAYER_DIM`]
+    /// (tiny source / mid-resize transient), falls back to the largest
+    /// encodable dims at or below source rather than dropping the layer —
+    /// a federated peer that negotiated H.264 must get *a* stream, never
+    /// an empty layer set.
+    pub fn single_federated(source_w: u32, source_h: u32, framerate: u32) -> LayerSpec {
+        // Quarter resolution, same even / MIN_LAYER_DIM normalization as
+        // the VP8 quarter floor. Fall back to normalized source dims if
+        // the quarter is too small to encode, and finally to the raw
+        // source so we always return an encodable layer.
+        let (width, height) = normalize_layer_dims(source_w / 4, source_h / 4)
+            .or_else(|| normalize_layer_dims(source_w, source_h))
+            .unwrap_or((source_w, source_h));
+        LayerSpec {
+            rid: SimulcastRid::federated(),
+            width,
+            height,
+            target_bitrate_kbps: FEDERATED_H264_BITRATE_KBPS,
             framerate,
         }
     }
@@ -630,11 +721,36 @@ pub struct EncoderSubscription {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerCodecPreferences {
     pub supported: Vec<CodecKind>,
+    /// True when this peer is a **federated** viewer (its offer has no
+    /// `a=simulcast:recv` directive — the signature of a
+    /// `PeerDisplayConnection` reaching us over the TURN relay). The pool
+    /// uses this to spawn the on-demand H.264 layer at the loss-resilient
+    /// quarter-resolution / capped-bitrate shape
+    /// ([`LayerSpec::single_federated`]) instead of the full-resolution
+    /// [`LayerSpec::single`]. Carried through every resubscribe so the
+    /// federated peer keeps getting a federated-shaped encoder across
+    /// resize / Closed-recovery epochs.
+    pub federated: bool,
 }
 
 impl PeerCodecPreferences {
+    /// Local (non-federated) peer preferences — the on-demand H.264 layer
+    /// is built at full resolution ([`LayerSpec::single`]).
     pub fn new(supported: Vec<CodecKind>) -> Self {
-        Self { supported }
+        Self {
+            supported,
+            federated: false,
+        }
+    }
+
+    /// Federated peer preferences — the on-demand H.264 layer is built at
+    /// the loss-resilient quarter-resolution / capped-bitrate shape
+    /// ([`LayerSpec::single_federated`]). See the `federated` field doc.
+    pub fn new_federated(supported: Vec<CodecKind>) -> Self {
+        Self {
+            supported,
+            federated: true,
+        }
     }
 
     pub fn supports(&self, codec: CodecKind) -> bool {
@@ -1629,7 +1745,20 @@ impl EncoderPool {
                 if !Self::on_demand_spawnable(codec) {
                     continue;
                 }
-                let rid = SimulcastRid::full();
+                // A federated H.264 peer gets the loss-resilient
+                // quarter-resolution / capped-bitrate layer on a DISTINCT
+                // RID (`RID_FEDERATED`), so its slot never aliases a local
+                // full-resolution H.264 slot (`RID_FULL`). Every other
+                // on-demand codec/peer keeps the full-resolution single
+                // layer on `RID_FULL`. The slot key (`EncoderId`) and the
+                // constructed layer must agree on the RID — they're
+                // derived together here.
+                let federated_h264 = prefs.federated && codec == CodecKind::H264;
+                let rid = if federated_h264 {
+                    SimulcastRid::federated()
+                } else {
+                    SimulcastRid::full()
+                };
                 let id = EncoderId::new(codec, rid);
                 if let Some(slot) = on_demand.get_mut(&id) {
                     slot.refcount += 1;
@@ -1643,12 +1772,20 @@ impl EncoderPool {
                     // Use the dimensions from the snapshot captured
                     // at function entry — same gen, same dims,
                     // checked together by pass 3.
-                    let layer = LayerSpec::single(
-                        codec,
-                        source_at_start.width,
-                        source_at_start.height,
-                        self.inner.framerate,
-                    );
+                    let layer = if federated_h264 {
+                        LayerSpec::single_federated(
+                            source_at_start.width,
+                            source_at_start.height,
+                            self.inner.framerate,
+                        )
+                    } else {
+                        LayerSpec::single(
+                            codec,
+                            source_at_start.width,
+                            source_at_start.height,
+                            self.inner.framerate,
+                        )
+                    };
                     to_construct.push((codec, id, layer));
                 }
             }
@@ -1664,12 +1801,15 @@ impl EncoderPool {
             match try_spawn_encoder_thread(
                 id.clone(),
                 layer.clone(),
-                // On-demand encoders are always at source dim
-                // (LayerSpec::single uses snapshot dims), so
-                // needs_downscale is false for them — passing
-                // source dims here is a no-op the encoder thread
-                // never exercises. Threading them anyway keeps
-                // the API uniform with the always-on case.
+                // The encoder thread downscales source → layer dims when
+                // they differ. A full-resolution on-demand layer
+                // (`LayerSpec::single`) matches the source dims, so
+                // needs_downscale is false and these are a no-op. A
+                // federated H.264 layer (`LayerSpec::single_federated`) is
+                // quarter-resolution, so passing the SOURCE dims here is
+                // load-bearing: the thread's `needs_downscale` path scales
+                // each source frame down to the layer's quarter dims
+                // before encode.
                 source_at_start.width,
                 source_at_start.height,
                 &self.inner.i420_tx,
@@ -2726,6 +2866,81 @@ mod logic_tests {
         // Bitrate strictly descending — smaller layers are cheap.
         assert!(layers[0].target_bitrate_kbps > layers[1].target_bitrate_kbps);
         assert!(layers[1].target_bitrate_kbps > layers[2].target_bitrate_kbps);
+    }
+
+    #[test]
+    fn single_full_layer_is_source_res_and_full_rid() {
+        // The local (non-federated) on-demand H.264 layer: source
+        // resolution, the full 2.5 Mbps cap, on the `full` RID.
+        let layer = LayerSpec::single(CodecKind::H264, 1920, 1080, 30);
+        assert_eq!((layer.width, layer.height), (1920, 1080));
+        assert_eq!(layer.target_bitrate_kbps, 2500);
+        assert_eq!(layer.rid, SimulcastRid::full());
+    }
+
+    #[test]
+    fn single_federated_layer_is_quarter_res_capped_bitrate_federated_rid() {
+        // The federated on-demand H.264 layer mirrors the VP8 quarter
+        // floor: quarter the source dims (even-rounded) + the capped
+        // bitrate, on the distinct `fed` RID.
+        let layer = LayerSpec::single_federated(1920, 1080, 30);
+        assert_eq!(
+            (layer.width, layer.height),
+            (480, 270),
+            "federated H.264 must be quarter of 1920x1080"
+        );
+        assert_eq!(layer.target_bitrate_kbps, FEDERATED_H264_BITRATE_KBPS);
+        assert!(
+            layer.target_bitrate_kbps < 2500,
+            "federated bitrate must be well below the full-res 2500 kbps cap"
+        );
+        assert_eq!(
+            layer.rid,
+            SimulcastRid::federated(),
+            "federated layer must use RID_FEDERATED, not RID_FULL, so its \
+             pool slot never aliases a local full-res H.264 slot"
+        );
+        // The federated RID is distinct from the full RID — the property
+        // that keeps the two EncoderId slots separate.
+        assert_ne!(SimulcastRid::federated(), SimulcastRid::full());
+        assert_eq!(SimulcastRid::federated().as_str(), RID_FEDERATED);
+    }
+
+    #[test]
+    fn single_federated_odd_source_dims_round_to_even() {
+        // 1366x768 quarter = 341x192; 341 is odd → must round down to 340
+        // (the same even-dim constraint vp8_simulcast enforces, so the
+        // downscale + encoder accept the dims).
+        let layer = LayerSpec::single_federated(1366, 768, 30);
+        assert_eq!((layer.width, layer.height), (340, 192));
+        assert_eq!(layer.width % 2, 0, "width must be even");
+        assert_eq!(layer.height % 2, 0, "height must be even");
+    }
+
+    #[test]
+    fn single_federated_tiny_source_falls_back_to_encodable_dims() {
+        // A source whose quarter would fall below MIN_LAYER_DIM must still
+        // yield an encodable layer (a federated H.264 peer needs *a*
+        // stream), not panic or produce sub-minimum dims.
+        let layer = LayerSpec::single_federated(40, 40, 30);
+        // Quarter (10x10) is below MIN_LAYER_DIM=16 → falls back to the
+        // normalized source dims (40x40, both even and >= 16).
+        assert!(layer.width >= MIN_LAYER_DIM && layer.height >= MIN_LAYER_DIM);
+        assert_eq!((layer.width, layer.height), (40, 40));
+    }
+
+    #[test]
+    fn peer_codec_preferences_federated_flag() {
+        // `new` is non-federated; `new_federated` sets the flag. Both keep
+        // the supported-codec list intact.
+        let local = PeerCodecPreferences::new(vec![CodecKind::H264, CodecKind::Vp8]);
+        assert!(!local.federated);
+        assert!(local.supports(CodecKind::H264));
+
+        let fed = PeerCodecPreferences::new_federated(vec![CodecKind::H264, CodecKind::Vp8]);
+        assert!(fed.federated);
+        assert!(fed.supports(CodecKind::H264));
+        assert_eq!(fed.supported, local.supported);
     }
 }
 
