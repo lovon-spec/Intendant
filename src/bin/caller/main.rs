@@ -532,7 +532,9 @@ impl UserTurnRevisionState {
 
 fn is_codex_injected_user_text_for_main(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("# AGENTS.md instructions for ") || trimmed.starts_with("<turn_aborted>")
+    trimmed.starts_with("# AGENTS.md instructions for ")
+        || trimmed.starts_with("<turn_aborted>")
+        || trimmed.starts_with("<subagent_notification>")
 }
 
 fn codex_user_turn_state_from_history(session_id: &str) -> Option<UserTurnRevisionState> {
@@ -4717,6 +4719,16 @@ mod tests {
         let stale = state.validate_expected_revision(1, Some(1)).unwrap_err();
         assert!(stale.contains("stale"), "got: {stale}");
         assert!(state.validate_expected_revision(1, Some(2)).is_ok());
+    }
+
+    #[test]
+    fn codex_injected_user_text_filters_subagent_notifications() {
+        assert!(is_codex_injected_user_text_for_main(
+            "<subagent_notification>\n{\"agent_path\":\"child\"}\n</subagent_notification>"
+        ));
+        assert!(!is_codex_injected_user_text_for_main(
+            "please inspect subagent_notification handling"
+        ));
     }
 
     #[test]

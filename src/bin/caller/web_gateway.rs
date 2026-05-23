@@ -2880,7 +2880,9 @@ fn codex_event_message_text(payload: &serde_json::Value) -> Option<(String, Stri
 
 fn is_codex_injected_user_text(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("# AGENTS.md instructions for ") || trimmed.starts_with("<turn_aborted>")
+    trimmed.starts_with("# AGENTS.md instructions for ")
+        || trimmed.starts_with("<turn_aborted>")
+        || trimmed.starts_with("<subagent_notification>")
 }
 
 fn codex_thread_display_name(value: Option<String>) -> Option<String> {
@@ -16179,6 +16181,18 @@ mod tests {
                     }
                 }),
                 serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:55Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<subagent_notification>\n{\"agent_path\":\"child\",\"status\":{\"completed\":\"done\"}}\n</subagent_notification>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
                     "timestamp": "2026-05-17T16:49:00Z",
                     "type": "response_item",
                     "payload": {
@@ -17611,7 +17625,13 @@ mod tests {
     fn test_build_config_no_model() {
         // With no model and no env vars set in a predictable way,
         // this should default to gemini
-        let config = build_config(None, None, false, crate::display::IceConfig::default(), false);
+        let config = build_config(
+            None,
+            None,
+            false,
+            crate::display::IceConfig::default(),
+            false,
+        );
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
     }
