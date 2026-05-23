@@ -11625,6 +11625,42 @@ function updateSessionWindowRelationshipStyle(sessionId) {
   win.el.classList.toggle('relationship-ephemeral', !!meta.relationshipEphemeral);
 }
 
+function removeSessionRelationshipsForSession(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const affected = new Set([sid]);
+  for (const [key, rel] of Array.from(sessionRelationships.entries())) {
+    if (rel.parentId !== sid && rel.childId !== sid) continue;
+    sessionRelationships.delete(key);
+    affected.add(rel.parentId);
+    affected.add(rel.childId);
+
+    const parentMeta = sessionMetadataById.get(rel.parentId);
+    if (parentMeta && Array.isArray(parentMeta.children)) {
+      sessionMetadataById.set(rel.parentId, {
+        ...parentMeta,
+        children: parentMeta.children.filter(child => !(child.id === rel.childId && child.kind === rel.kind)),
+      });
+    }
+
+    if (rel.childId === sid) {
+      const childMeta = sessionMetadataById.get(rel.childId);
+      if (childMeta) {
+        const nextChildMeta = { ...childMeta };
+        delete nextChildMeta.parentId;
+        delete nextChildMeta.relationshipKind;
+        delete nextChildMeta.relationshipEphemeral;
+        sessionMetadataById.set(rel.childId, nextChildMeta);
+      }
+    }
+  }
+  for (const id of affected) {
+    updateSessionRelationshipBadges(id);
+    updateSessionWindowRelationshipStyle(id);
+  }
+  scheduleSessionRelationshipRender();
+}
+
 function sideCloseParamsForSession(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
@@ -11649,6 +11685,38 @@ function maybeDispatchSideClose(sessionId) {
   const close = sideCloseParamsForSession(sid);
   if (!close) return;
   dispatchCodexThreadAction('side-close', close.params, close.parentSessionId);
+}
+
+function removeSessionWindow(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  const win = sessionWindows.get(sid);
+  if (win) {
+    win.el.remove();
+    sessionWindows.delete(sid);
+  }
+  if (maximizedSessionWindowId === sid) maximizedSessionWindowId = '';
+  if (foregroundSessionFullId === sid) {
+    const next = sessionWindows.keys().next().value || '';
+    if (next) focusSessionWindow(next);
+    else {
+      foregroundSessionFullId = '';
+      if (currentSessionFullId === sid) {
+        currentSessionFullId = '';
+      }
+      updateTaskTargetChip();
+    }
+  } else if (currentSessionFullId === sid) {
+    currentSessionFullId = '';
+    updateTaskTargetChip();
+  }
+  const grid = document.getElementById('session-window-grid');
+  if (grid && !grid.querySelector('.session-window')) grid.classList.add('hidden');
+  updateSessionWindowMaximizeState();
+  syncSessionWindowGridControls();
+  syncSessionWindowMetadataRefresh();
+  scheduleSessionRelationshipRender();
+  return !!win;
 }
 
 function scheduleSessionRelationshipRender() {
@@ -11988,25 +12056,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     e.stopPropagation();
     setSessionWindowMenuOpen(sid, false);
     maybeDispatchSideClose(sid);
-    el.remove();
-    sessionWindows.delete(sid);
-    if (maximizedSessionWindowId === sid) maximizedSessionWindowId = '';
-    if (foregroundSessionFullId === sid) {
-      const next = sessionWindows.keys().next().value || '';
-      if (next) focusSessionWindow(next);
-      else {
-        foregroundSessionFullId = '';
-        if (currentSessionFullId === sid) {
-          currentSessionFullId = '';
-        }
-        updateTaskTargetChip();
-      }
-    }
-    if (!grid.querySelector('.session-window')) grid.classList.add('hidden');
-    updateSessionWindowMaximizeState();
-    syncSessionWindowGridControls();
-    syncSessionWindowMetadataRefresh();
-    scheduleSessionRelationshipRender();
+    removeSessionWindow(sid);
   });
 
   grid.appendChild(el);
@@ -22730,7 +22780,18 @@ function onSessionAttached(sessionId, source) {
 }
 
 function onSessionEnded(sessionId, reason) {
-  if (sessionId) updateSessionWindow(sessionId, { phase: 'done', ended: true });
+  const sid = String(sessionId || '').trim();
+  const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  const shouldRemoveSideWindow = sid && (
+    meta.relationshipKind === 'side' ||
+    String(reason || '').toLowerCase().includes('side conversation closed')
+  );
+  if (shouldRemoveSideWindow) {
+    removeSessionRelationshipsForSession(sid);
+    removeSessionWindow(sid);
+  } else if (sid) {
+    updateSessionWindow(sid, { phase: 'done', ended: true });
+  }
   if (!sessionId || sessionId === currentSessionFullId) {
     currentSessionFullId = '';
   }
