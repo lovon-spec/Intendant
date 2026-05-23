@@ -1033,6 +1033,9 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--session-badge-border, rgba(137, 180, 250, 0.62)) 38%, transparent),
+    0 0 10px color-mix(in srgb, var(--session-badge-fg, var(--blue)) 22%, transparent);
 }
 .task-target-chip:hover .task-target-session-badge {
   border-color: var(--session-badge-fg, var(--blue));
@@ -1865,6 +1868,11 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
   margin-top: 2px;
+}
+.log-entry .log-session.prompt-target-log {
+  border-color: color-mix(in srgb, var(--session-badge-fg, var(--blue)) 54%, var(--session-badge-border, transparent));
+  background: color-mix(in srgb, var(--session-badge-bg, var(--surface0)) 76%, var(--surface0));
+  box-shadow: 0 0 7px color-mix(in srgb, var(--session-badge-fg, var(--blue)) 16%, transparent);
 }
 /* Hide host badges entirely when no secondaries are configured —
    keeps single-host dashboards visually clean. JS adds the
@@ -10718,6 +10726,7 @@ function markSessionWindowPendingActive(sessionId) {
 
 function updateTaskTargetChip() {
   updatePromptTargetSessionHighlight();
+  updatePromptTargetLogSessionBadges();
   const chip = document.getElementById('task-target-chip');
   if (!chip) return;
   const sid = resolvePromptTargetSessionId();
@@ -10749,6 +10758,23 @@ function updatePromptTargetSessionHighlight() {
   const target = resolvePromptTargetSessionId();
   for (const [sid, win] of sessionWindows) {
     win.el.classList.toggle('prompt-target', !!target && sid === target && !win.ended);
+  }
+}
+
+function updatePromptTargetLogSessionBadges() {
+  const target = resolvePromptTargetSessionId();
+  document.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
+    applyPromptTargetLogSessionBadgeState(entry, target);
+  });
+}
+
+function applyPromptTargetLogSessionBadgeState(entry, target = resolvePromptTargetSessionId()) {
+  const sid = String(entry?.dataset?.sessionId || '').trim();
+  const highlighted = !!target && sid === target;
+  for (const child of entry?.children || []) {
+    if (child.classList?.contains('log-session')) {
+      child.classList.toggle('prompt-target-log', highlighted);
+    }
   }
 }
 
@@ -10821,6 +10847,7 @@ function refreshSessionIdentityLabels(sessionId) {
     for (const child of entry.children) {
       if (child.classList?.contains('log-session')) {
         renderSessionIdentity(child, sid, { showName: false });
+        applyPromptTargetLogSessionBadgeState(entry);
       }
     }
   });
@@ -12598,7 +12625,10 @@ function createLogScaffold(c, extraClass) {
   entry.appendChild(icon);
   entry.appendChild(ts);
   entry.appendChild(host);
-  if (sid) entry.appendChild(session);
+  if (sid) {
+    entry.appendChild(session);
+    applyPromptTargetLogSessionBadgeState(entry);
+  }
   entry.appendChild(lvl);
   return { entry, hostId };
 }
