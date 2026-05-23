@@ -90,18 +90,18 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_11_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90,
-    DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_MODE_ROTATION_ROTATE90,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
@@ -114,10 +114,10 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
@@ -336,8 +336,8 @@ fn enumerate_displays_blocking() -> Vec<super::DisplayInfo> {
             // still advance the ordinal so a targeted index stays stable.
             if desc.AttachedToDesktop.as_bool() {
                 let (width, height) = output_dimensions(&desc.DesktopCoordinates, desc.Rotation);
-                let is_primary = desc.DesktopCoordinates.left == 0
-                    && desc.DesktopCoordinates.top == 0;
+                let is_primary =
+                    desc.DesktopCoordinates.left == 0 && desc.DesktopCoordinates.top == 0;
                 let id = if is_primary {
                     0
                 } else {
@@ -389,8 +389,7 @@ unsafe fn get_output_desc(output: &IDXGIOutput) -> Option<DXGI_OUTPUT_DESC> {
 
 /// Create a DXGI 1.1 factory (`CreateDXGIFactory1`), used for both enumeration
 /// and capture setup.
-fn create_dxgi_factory() -> windows::core::Result<windows::Win32::Graphics::Dxgi::IDXGIFactory1>
-{
+fn create_dxgi_factory() -> windows::core::Result<windows::Win32::Graphics::Dxgi::IDXGIFactory1> {
     // SAFETY: `CreateDXGIFactory1` takes no arguments and returns a fresh
     // RAII-owned factory interface.
     unsafe { windows::Win32::Graphics::Dxgi::CreateDXGIFactory1() }
@@ -800,8 +799,7 @@ fn init_duplication(
     };
     hr.map_err(|e| format!("D3D11CreateDevice: {e}"))?;
     let device = device.ok_or_else(|| "D3D11CreateDevice returned null device".to_string())?;
-    let context =
-        context.ok_or_else(|| "D3D11CreateDevice returned null context".to_string())?;
+    let context = context.ok_or_else(|| "D3D11CreateDevice returned null context".to_string())?;
 
     // 2. From the device, reach the DXGI adapter to enumerate outputs.
     let dxgi_device: IDXGIDevice = device
@@ -809,8 +807,8 @@ fn init_duplication(
         .map_err(|e| format!("ID3D11Device -> IDXGIDevice: {e}"))?;
     // SAFETY: `dxgi_device` is the live device cast from `device`; `GetAdapter`
     // returns a new RAII-owned adapter interface.
-    let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter() }
-        .map_err(|e| format!("IDXGIDevice::GetAdapter: {e}"))?;
+    let adapter: IDXGIAdapter =
+        unsafe { dxgi_device.GetAdapter() }.map_err(|e| format!("IDXGIDevice::GetAdapter: {e}"))?;
 
     // 3. Pick the target output (default: first attached output).
     let (output, left, top, width, height) = select_output(&adapter, target_output)?;
@@ -861,8 +859,8 @@ fn select_output(
     // returns a new RAII-owned output (or an error) for the given index, and
     // each `get_output_desc` runs on the output just enumerated.
     if let Some(idx) = target_output {
-        let output: IDXGIOutput = unsafe { adapter.EnumOutputs(idx) }
-            .map_err(|e| format!("EnumOutputs({idx}): {e}"))?;
+        let output: IDXGIOutput =
+            unsafe { adapter.EnumOutputs(idx) }.map_err(|e| format!("EnumOutputs({idx}): {e}"))?;
         let desc = unsafe { get_output_desc(&output) }
             .ok_or_else(|| format!("GetDesc on output {idx} failed"))?;
         let rect = &desc.DesktopCoordinates;
@@ -1041,9 +1039,7 @@ fn run_dxgi_capture(
                 }
             }
             Err(CaptureError::AccessLost) => {
-                eprintln!(
-                    "[display/windows] DXGI_ERROR_ACCESS_LOST -- re-acquiring duplication",
-                );
+                eprintln!("[display/windows] DXGI_ERROR_ACCESS_LOST -- re-acquiring duplication",);
                 // Drop the old duplication and re-init. A transient failure
                 // (e.g. mid secure-desktop transition) is retried.
                 match init_duplication(target_output) {
@@ -1106,10 +1102,7 @@ enum CaptureError {
 /// Returns `Ok(None)` on `DXGI_ERROR_WAIT_TIMEOUT` (no desktop change within
 /// the timeout). Always pairs a successful `AcquireNextFrame` with
 /// `ReleaseFrame`.
-fn acquire_and_copy(
-    dup: &mut Duplication,
-    timeout_ms: u32,
-) -> Result<Option<Frame>, CaptureError> {
+fn acquire_and_copy(dup: &mut Duplication, timeout_ms: u32) -> Result<Option<Frame>, CaptureError> {
     let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
     let mut resource: Option<windows::Win32::Graphics::Dxgi::IDXGIResource> = None;
 
@@ -1184,11 +1177,7 @@ fn acquire_and_copy(
             for row in 0..height as usize {
                 let src_row = src_base.add(row * stride as usize);
                 let dst_off = row * row_bytes;
-                std::ptr::copy_nonoverlapping(
-                    src_row,
-                    data.as_mut_ptr().add(dst_off),
-                    row_bytes,
-                );
+                std::ptr::copy_nonoverlapping(src_row, data.as_mut_ptr().add(dst_off), row_bytes);
             }
             dup.context.Unmap(&staging, 0);
         }
@@ -1294,31 +1283,30 @@ fn bind_thread_to_input_desktop(thread_label: &str) -> Option<DesktopGuard> {
     // SAFETY: `OpenInputDesktop` takes scalar flags/access args and returns a new
     // `HDESK` we own; on success ownership passes to the `DesktopGuard` (or is
     // explicitly closed on the `SetThreadDesktop` failure path below).
-    let handle = match unsafe {
-        OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS)
-    } {
-        Ok(h) if !h.is_invalid() => h,
-        Ok(_) => {
-            eprintln!(
-                "[display/windows] {thread_label}: OpenInputDesktop returned a null \
+    let handle =
+        match unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) } {
+            Ok(h) if !h.is_invalid() => h,
+            Ok(_) => {
+                eprintln!(
+                    "[display/windows] {thread_label}: OpenInputDesktop returned a null \
                  desktop; trying OpenDesktopW(\"Default\")"
-            );
-            match open_default_desktop() {
-                Some(h) => h,
-                None => return None,
+                );
+                match open_default_desktop() {
+                    Some(h) => h,
+                    None => return None,
+                }
             }
-        }
-        Err(e) => {
-            eprintln!(
-                "[display/windows] {thread_label}: OpenInputDesktop failed ({e}); \
+            Err(e) => {
+                eprintln!(
+                    "[display/windows] {thread_label}: OpenInputDesktop failed ({e}); \
                  trying OpenDesktopW(\"Default\")"
-            );
-            match open_default_desktop() {
-                Some(h) => h,
-                None => return None,
+                );
+                match open_default_desktop() {
+                    Some(h) => h,
+                    None => return None,
+                }
             }
-        }
-    };
+        };
 
     // SAFETY: `handle` is the live, non-invalid `HDESK` opened just above.
     // `SetThreadDesktop` associates it with the calling thread; on success the
@@ -1540,17 +1528,9 @@ impl GdiCapture {
         // own; `CreateDIBSection` writes the DIB's pixel-storage pointer into
         // `&mut bits` (GDI owns that memory for the `HBITMAP`'s lifetime) and
         // returns the `HBITMAP` we own.
-        let dib = unsafe {
-            CreateDIBSection(
-                Some(mem_dc),
-                &bmi,
-                DIB_RGB_COLORS,
-                &mut bits,
-                None,
-                0,
-            )
-        }
-        .map_err(|e| format!("CreateDIBSection ({width}x{height}): {e}"))?;
+        let dib =
+            unsafe { CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .map_err(|e| format!("CreateDIBSection ({width}x{height}): {e}"))?;
 
         if dib.is_invalid() || bits.is_null() {
             // SAFETY: nothing has been selected into `mem_dc` yet; delete it and
@@ -1828,9 +1808,7 @@ fn run_gdi_capture(
                 // stay off the hot path.
                 if frame_count <= 3 || frame_count % 600 == 0 {
                     let avg = sampled_avg_byte(&frame.data);
-                    eprintln!(
-                        "[display/windows] GDI frame #{frame_count} avg_byte={avg}"
-                    );
+                    eprintln!("[display/windows] GDI frame #{frame_count} avg_byte={avg}");
                 }
 
                 last_frame = Some(clone_frame(&frame));
@@ -1846,9 +1824,7 @@ fn run_gdi_capture(
                     let _ = tx.try_send(hb);
                 }
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    eprintln!(
-                        "[display/windows] GDI giving up after {consecutive_errors} errors",
-                    );
+                    eprintln!("[display/windows] GDI giving up after {consecutive_errors} errors",);
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1881,7 +1857,10 @@ mod tests {
             bottom: 1080,
         };
         assert_eq!(
-            output_dimensions(&rect, windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_IDENTITY),
+            output_dimensions(
+                &rect,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_IDENTITY
+            ),
             (1920, 1080)
         );
     }
@@ -2033,7 +2012,10 @@ mod tests {
             height: 1080,
         };
         // Corners hit the documented full-range endpoints.
-        assert_eq!(map_normalized_to_virtualdesk_abs(0.0, 0.0, rect, vs), (0, 0));
+        assert_eq!(
+            map_normalized_to_virtualdesk_abs(0.0, 0.0, rect, vs),
+            (0, 0)
+        );
         assert_eq!(
             map_normalized_to_virtualdesk_abs(1.0, 1.0, rect, vs),
             (65535, 65535)
@@ -2043,8 +2025,16 @@ mod tests {
         let got = map_normalized_to_virtualdesk_abs(0.5, 0.5, rect, vs);
         assert_eq!(got, expected_abs(960, 540, vs));
         // Sanity: a single monitor's center is ~mid-range on both axes.
-        assert!((32_000..=33_500).contains(&got.0), "center x ~32767, got {}", got.0);
-        assert!((32_000..=33_500).contains(&got.1), "center y ~32767, got {}", got.1);
+        assert!(
+            (32_000..=33_500).contains(&got.0),
+            "center x ~32767, got {}",
+            got.0
+        );
+        assert!(
+            (32_000..=33_500).contains(&got.1),
+            "center y ~32767, got {}",
+            got.1
+        );
     }
 
     #[test]

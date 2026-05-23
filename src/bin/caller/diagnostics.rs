@@ -152,10 +152,7 @@ mod tests {
         let expected_tail: PathBuf = ["diagnostics", "visual-freshness", "abc-123.ndjson"]
             .iter()
             .collect();
-        assert!(
-            p.ends_with(&expected_tail),
-            "unexpected path tail: {p:?}"
-        );
+        assert!(p.ends_with(&expected_tail), "unexpected path tail: {p:?}");
         assert!(
             p.components()
                 .any(|c| c.as_os_str() == std::ffi::OsStr::new(".intendant")),

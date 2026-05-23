@@ -1615,6 +1615,7 @@ async fn reader_task(
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
+    let mut turn_terminal_observed = false;
 
     loop {
         let line = match lines.next_line().await {
@@ -1724,6 +1725,37 @@ async fn reader_task(
         // 3. Notification (has method, no id)
         let params = msg.params.unwrap_or(serde_json::Value::Null);
 
+        // Track active turn id so interrupt_turn() has a target to cancel.
+        // Codex emits turn_id in several shapes across versions; accept any
+        // top-level `turnId` / `turn_id` / `turn.id` / `thread.lastTurnId`.
+        //
+        // The app-server stream can include notifications for Codex collab
+        // subagent threads. Child or stale scoped notifications must not
+        // appear in the active parent turn, mutate parent usage, or complete
+        // the parent drain.
+        let active_thread_snapshot = active_thread_id.lock().await.clone();
+        let active_turn_snapshot = active_turn_id.lock().await.clone();
+        let targets_active_thread =
+            codex_notification_targets_active_thread(&params, active_thread_snapshot.as_deref());
+        let targets_active_turn = codex_notification_targets_active_turn(
+            &params,
+            active_thread_snapshot.as_deref(),
+            active_turn_snapshot.as_deref(),
+        );
+        if !targets_active_thread || !targets_active_turn {
+            continue;
+        }
+
+        let status_can_complete_turn = method != "thread/status/changed"
+            || codex_thread_status_can_complete_turn(
+                &params,
+                active_turn_snapshot.as_deref(),
+                turn_terminal_observed,
+            );
+        if method == "thread/status/changed" && !status_can_complete_turn {
+            continue;
+        }
+
         if method == "thread/tokenUsage/updated" {
             let usage = params
                 .get("tokenUsage")
@@ -1736,52 +1768,22 @@ async fn reader_task(
             }
         }
 
-        // Track active turn id so interrupt_turn() has a target to cancel.
-        // Codex emits turn_id in several shapes across versions; accept any
-        // top-level `turnId` / `turn_id` / `turn.id` / `thread.lastTurnId`.
-        //
-        // The app-server stream can include notifications for Codex collab
-        // subagent threads. A child or stale terminal notification must not
-        // clear the active parent turn or complete the parent drain.
-        let active_thread_snapshot = active_thread_id.lock().await.clone();
-        let active_turn_snapshot = active_turn_id.lock().await.clone();
-        let targets_active_thread =
-            codex_notification_targets_active_thread(&params, active_thread_snapshot.as_deref());
-        let targets_active_turn = codex_terminal_notification_targets_active_turn(
-            &params,
-            active_thread_snapshot.as_deref(),
-            active_turn_snapshot.as_deref(),
-        );
         match method {
             "turn/started" | "thread/started" => {
-                if targets_active_thread {
-                    if let Some(id) = extract_turn_id(&params) {
-                        *active_turn_id.lock().await = Some(id);
-                    }
+                turn_terminal_observed = false;
+                if let Some(id) = extract_turn_id(&params) {
+                    *active_turn_id.lock().await = Some(id);
                 }
             }
             "turn/completed" | "turn/interrupted" | "turn/failed" => {
-                if targets_active_turn {
-                    active_turn_id.lock().await.take();
-                }
+                active_turn_id.lock().await.take();
+                turn_terminal_observed = true;
             }
             "thread/status/changed" => {
-                // Only clear if the status signals the active parent turn
-                // actually ended. "running" / "paused" / "busy" keep the
-                // active turn alive so a subsequent interrupt still has a target.
-                if targets_active_turn {
-                    if let Some(status) = codex_thread_status_type(&params) {
-                        if matches!(status, "completed" | "idle" | "failed" | "systemError") {
-                            active_turn_id.lock().await.take();
-                        }
-                    }
-                }
+                active_turn_id.lock().await.take();
+                turn_terminal_observed = true;
             }
             _ => {}
-        }
-
-        if codex_terminal_method(method) && !targets_active_turn {
-            continue;
         }
 
         translate_notification(method, &params, &event_tx);
@@ -1817,13 +1819,6 @@ fn codex_thread_status_type(params: &serde_json::Value) -> Option<&str> {
     }
 }
 
-fn codex_terminal_method(method: &str) -> bool {
-    matches!(
-        method,
-        "turn/completed" | "turn/interrupted" | "turn/failed" | "thread/status/changed"
-    )
-}
-
 fn codex_notification_targets_active_thread(
     params: &serde_json::Value,
     active_thread_id: Option<&str>,
@@ -1834,7 +1829,7 @@ fn codex_notification_targets_active_thread(
     }
 }
 
-fn codex_terminal_notification_targets_active_turn(
+fn codex_notification_targets_active_turn(
     params: &serde_json::Value,
     active_thread_id: Option<&str>,
     active_turn_id: Option<&str>,
@@ -1854,6 +1849,24 @@ fn codex_terminal_notification_targets_active_turn(
     }
 
     true
+}
+
+fn codex_thread_status_can_complete_turn(
+    params: &serde_json::Value,
+    active_turn_id: Option<&str>,
+    turn_terminal_observed: bool,
+) -> bool {
+    let Some(status) = codex_thread_status_type(params) else {
+        return false;
+    };
+    if !matches!(status, "completed" | "idle") {
+        return false;
+    }
+    if turn_terminal_observed {
+        return false;
+    }
+
+    active_turn_id.is_some() || extract_turn_id(params).is_some()
 }
 
 fn non_empty_string_at(value: &serde_json::Value, paths: &[&str]) -> Option<String> {
@@ -4275,12 +4288,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_notification_rejects_child_thread_completion() {
+    fn scoped_notification_rejects_child_thread_item() {
         let params = serde_json::json!({
             "threadId": "child-thread",
             "turn": {"id": "child-turn"}
         });
-        assert!(!codex_terminal_notification_targets_active_turn(
+        assert!(!codex_notification_targets_active_thread(
+            &params,
+            Some("parent-thread")
+        ));
+        assert!(!codex_notification_targets_active_turn(
             &params,
             Some("parent-thread"),
             Some("parent-turn")
@@ -4288,12 +4305,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_notification_rejects_stale_turn_completion() {
+    fn scoped_notification_rejects_stale_turn_item() {
         let params = serde_json::json!({
             "threadId": "parent-thread",
             "turn": {"id": "old-turn"}
         });
-        assert!(!codex_terminal_notification_targets_active_turn(
+        assert!(codex_notification_targets_active_thread(
+            &params,
+            Some("parent-thread")
+        ));
+        assert!(!codex_notification_targets_active_turn(
             &params,
             Some("parent-thread"),
             Some("new-turn")
@@ -4301,16 +4322,67 @@ mod tests {
     }
 
     #[test]
-    fn terminal_notification_accepts_active_turn_completion() {
+    fn scoped_notification_accepts_active_turn_item() {
         let params = serde_json::json!({
             "threadId": "parent-thread",
             "turn": {"id": "parent-turn"}
         });
-        assert!(codex_terminal_notification_targets_active_turn(
+        assert!(codex_notification_targets_active_thread(
+            &params,
+            Some("parent-thread")
+        ));
+        assert!(codex_notification_targets_active_turn(
             &params,
             Some("parent-thread"),
             Some("parent-turn")
         ));
+    }
+
+    #[test]
+    fn thread_status_idle_can_complete_known_active_turn_without_turn_id() {
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "status": {"type": "idle"}
+        });
+        assert!(codex_thread_status_can_complete_turn(
+            &params,
+            Some("parent-turn"),
+            false
+        ));
+    }
+
+    #[test]
+    fn thread_status_idle_can_complete_known_active_turn_with_turn_id() {
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "turnId": "parent-turn",
+            "status": {"type": "idle"}
+        });
+        assert!(codex_thread_status_can_complete_turn(
+            &params,
+            Some("parent-turn"),
+            false
+        ));
+    }
+
+    #[test]
+    fn thread_status_idle_can_complete_unknown_active_turn_with_turn_id() {
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "turnId": "parent-turn",
+            "status": {"type": "idle"}
+        });
+        assert!(codex_thread_status_can_complete_turn(&params, None, false));
+    }
+
+    #[test]
+    fn thread_status_idle_does_not_duplicate_observed_turn_completion() {
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "turnId": "parent-turn",
+            "status": {"type": "idle"}
+        });
+        assert!(!codex_thread_status_can_complete_turn(&params, None, true));
     }
 
     #[test]

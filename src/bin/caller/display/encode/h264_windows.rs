@@ -74,22 +74,21 @@
 use super::{EncodedPacket, Encoder, PayloadSpec};
 
 use windows::core::Interface;
+use windows::Win32::Foundation::{VARIANT_BOOL, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
-    ICodecAPI, IMFActivate, IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup, MFTEnumEx,
-    MFSampleExtension_CleanPoint, CODECAPI_AVEncCommonRateControlMode,
-    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, MFMediaType_Video,
+    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_ConstrainedBase,
+    CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
+    IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTEnumEx,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_VERSION, CODECAPI_AVEncCommonLowLatency, CODECAPI_AVLowLatencyMode,
-    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_ConstrainedBase,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_REGISTER_TYPE_INFO, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_VERSION,
 };
-use windows::Win32::Foundation::{VARIANT_BOOL, VARIANT_TRUE};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{
     VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4,

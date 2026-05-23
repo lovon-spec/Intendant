@@ -194,7 +194,10 @@ impl PtySession {
                     // doesn't block waiting for it (Windows only; no-op on Unix
                     // where the slice is never present).
                     #[cfg(windows)]
-                    if chunk.windows(DSR_CPR_QUERY.len()).any(|w| w == DSR_CPR_QUERY) {
+                    if chunk
+                        .windows(DSR_CPR_QUERY.len())
+                        .any(|w| w == DSR_CPR_QUERY)
+                    {
                         if let Ok(mut w) = session.writer.lock() {
                             let _ = w.write_all(DSR_CPR_REPLY);
                             let _ = w.flush();

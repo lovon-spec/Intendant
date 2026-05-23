@@ -666,11 +666,10 @@ impl Agent {
                 .master
                 .try_clone_reader()
                 .map_err(|e| AgentError::Process(format!("Failed to clone reader: {}", e)))?;
-            let writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(
-                std::sync::Mutex::new(pair.master.take_writer().map_err(|e| {
-                    AgentError::Process(format!("Failed to take writer: {}", e))
-                })?),
-            );
+            let writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>> =
+                Arc::new(std::sync::Mutex::new(pair.master.take_writer().map_err(
+                    |e| AgentError::Process(format!("Failed to take writer: {}", e)),
+                )?));
 
             // Dedicated blocking reader thread: drains the PTY into the shared
             // buffer for the session's lifetime. `exec_pty` polls the buffer

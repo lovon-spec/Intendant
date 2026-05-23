@@ -1360,8 +1360,7 @@ mod tests {
     /// Models ffmpeg's `-flag value` arg pairing so a test can assert a
     /// specific option value, not just the flag's presence.
     fn has_flag_value(args: &[String], flag: &str, value: &str) -> bool {
-        args.windows(2)
-            .any(|w| w[0] == flag && w[1] == value)
+        args.windows(2).any(|w| w[0] == flag && w[1] == value)
     }
 
     fn has_arg(args: &[String], arg: &str) -> bool {
@@ -1457,7 +1456,11 @@ mod tests {
         // -g (no intra-refresh flag on the VA-API arm).
         let args = vaapi_ffmpeg_args(1280, 720, 2000);
         assert!(has_flag_value(&args, "-c:v", "h264_vaapi"));
-        assert!(has_flag_value(&args, "-vaapi_device", "/dev/dri/renderD128"));
+        assert!(has_flag_value(
+            &args,
+            "-vaapi_device",
+            "/dev/dri/renderD128"
+        ));
         assert!(has_flag_value(&args, "-vf", "format=nv12,hwupload"));
         assert!(has_flag_value(&args, "-profile:v", "constrained_baseline"));
     }

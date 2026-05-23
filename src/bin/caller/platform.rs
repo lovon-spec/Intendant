@@ -243,7 +243,9 @@ unsafe fn query_cmdline_nt(handle: windows_sys::Win32::Foundation::HANDLE) -> Op
     // Any status other than the length-mismatch sentinel (e.g. invalid info
     // class on a pre-8.1 kernel, or access denied) means we can't use this
     // path — let the caller fall back to the image path.
-    if status != STATUS_INFO_LENGTH_MISMATCH || (needed as usize) < std::mem::size_of::<UNICODE_STRING>() {
+    if status != STATUS_INFO_LENGTH_MISMATCH
+        || (needed as usize) < std::mem::size_of::<UNICODE_STRING>()
+    {
         return None;
     }
 
@@ -559,8 +561,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cmdline_of_current_process_is_nonempty_and_exe_like() {
-        let cmdline = process_cmdline(std::process::id())
-            .expect("own cmdline should be readable on Windows");
+        let cmdline =
+            process_cmdline(std::process::id()).expect("own cmdline should be readable on Windows");
         assert!(!cmdline.trim().is_empty(), "cmdline should not be blank");
         assert!(
             cmdline.to_ascii_lowercase().contains(".exe"),

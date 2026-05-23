@@ -24,19 +24,19 @@
 pub fn dom_code_to_vk(code: &str) -> Option<u16> {
     Some(match code {
         // Row 0 -- Escape + Function keys
-        "Escape" => 0x1B,    // VK_ESCAPE
-        "F1" => 0x70,        // VK_F1
-        "F2" => 0x71,        // VK_F2
-        "F3" => 0x72,        // VK_F3
-        "F4" => 0x73,        // VK_F4
-        "F5" => 0x74,        // VK_F5
-        "F6" => 0x75,        // VK_F6
-        "F7" => 0x76,        // VK_F7
-        "F8" => 0x77,        // VK_F8
-        "F9" => 0x78,        // VK_F9
-        "F10" => 0x79,       // VK_F10
-        "F11" => 0x7A,       // VK_F11
-        "F12" => 0x7B,       // VK_F12
+        "Escape" => 0x1B, // VK_ESCAPE
+        "F1" => 0x70,     // VK_F1
+        "F2" => 0x71,     // VK_F2
+        "F3" => 0x72,     // VK_F3
+        "F4" => 0x73,     // VK_F4
+        "F5" => 0x74,     // VK_F5
+        "F6" => 0x75,     // VK_F6
+        "F7" => 0x76,     // VK_F7
+        "F8" => 0x77,     // VK_F8
+        "F9" => 0x78,     // VK_F9
+        "F10" => 0x79,    // VK_F10
+        "F11" => 0x7A,    // VK_F11
+        "F12" => 0x7B,    // VK_F12
 
         // Row 1 -- Digits and top-row punctuation
         "Backquote" => 0xC0, // VK_OEM_3
@@ -55,17 +55,17 @@ pub fn dom_code_to_vk(code: &str) -> Option<u16> {
         "Backspace" => 0x08, // VK_BACK
 
         // Row 2 -- QWERTY
-        "Tab" => 0x09,       // VK_TAB
-        "KeyQ" => 0x51,      // 'Q'
-        "KeyW" => 0x57,      // 'W'
-        "KeyE" => 0x45,      // 'E'
-        "KeyR" => 0x52,      // 'R'
-        "KeyT" => 0x54,      // 'T'
-        "KeyY" => 0x59,      // 'Y'
-        "KeyU" => 0x55,      // 'U'
-        "KeyI" => 0x49,      // 'I'
-        "KeyO" => 0x4F,      // 'O'
-        "KeyP" => 0x50,      // 'P'
+        "Tab" => 0x09,          // VK_TAB
+        "KeyQ" => 0x51,         // 'Q'
+        "KeyW" => 0x57,         // 'W'
+        "KeyE" => 0x45,         // 'E'
+        "KeyR" => 0x52,         // 'R'
+        "KeyT" => 0x54,         // 'T'
+        "KeyY" => 0x59,         // 'Y'
+        "KeyU" => 0x55,         // 'U'
+        "KeyI" => 0x49,         // 'I'
+        "KeyO" => 0x4F,         // 'O'
+        "KeyP" => 0x50,         // 'P'
         "BracketLeft" => 0xDB,  // VK_OEM_4
         "BracketRight" => 0xDD, // VK_OEM_6
         "Backslash" => 0xDC,    // VK_OEM_5
@@ -86,17 +86,17 @@ pub fn dom_code_to_vk(code: &str) -> Option<u16> {
         "Enter" => 0x0D,     // VK_RETURN
 
         // Row 4 -- ZXCV
-        "ShiftLeft" => 0xA0, // VK_LSHIFT
-        "KeyZ" => 0x5A,      // 'Z'
-        "KeyX" => 0x58,      // 'X'
-        "KeyC" => 0x43,      // 'C'
-        "KeyV" => 0x56,      // 'V'
-        "KeyB" => 0x42,      // 'B'
-        "KeyN" => 0x4E,      // 'N'
-        "KeyM" => 0x4D,      // 'M'
-        "Comma" => 0xBC,     // VK_OEM_COMMA
-        "Period" => 0xBE,    // VK_OEM_PERIOD
-        "Slash" => 0xBF,     // VK_OEM_2
+        "ShiftLeft" => 0xA0,  // VK_LSHIFT
+        "KeyZ" => 0x5A,       // 'Z'
+        "KeyX" => 0x58,       // 'X'
+        "KeyC" => 0x43,       // 'C'
+        "KeyV" => 0x56,       // 'V'
+        "KeyB" => 0x42,       // 'B'
+        "KeyN" => 0x4E,       // 'N'
+        "KeyM" => 0x4D,       // 'M'
+        "Comma" => 0xBC,      // VK_OEM_COMMA
+        "Period" => 0xBE,     // VK_OEM_PERIOD
+        "Slash" => 0xBF,      // VK_OEM_2
         "ShiftRight" => 0xA1, // VK_RSHIFT
 
         // Row 5 -- Bottom (modifiers + space)

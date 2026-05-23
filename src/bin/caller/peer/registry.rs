@@ -253,8 +253,12 @@ impl PeerRegistry {
         override_pinned_fingerprints: Vec<String>,
         browser_tcp_via_url: Option<String>,
     ) -> Result<PeerId, PeerError> {
-        let mut card =
-            fetch_card(card_url, bearer_token.as_deref(), &override_pinned_fingerprints).await?;
+        let mut card = fetch_card(
+            card_url,
+            bearer_token.as_deref(),
+            &override_pinned_fingerprints,
+        )
+        .await?;
         // Apply the via-URL override to the initial card so the
         // first PeerSnapshot the dashboard sees (before the actor
         // completes its first connect) shows the operator's URL
@@ -535,11 +539,10 @@ async fn fetch_card(
 ) -> Result<AgentCard, PeerError> {
     let mut client_builder = reqwest::Client::builder().timeout(CARD_FETCH_TIMEOUT);
     if !pinned_fingerprints.is_empty() {
-        let verifier =
-            crate::peer::transport::pinning::PinnedFingerprintVerifier::from_strings(
-                pinned_fingerprints,
-            )
-            .map_err(|e| PeerError::CardFetch(format!("invalid pinned fingerprint: {e}")))?;
+        let verifier = crate::peer::transport::pinning::PinnedFingerprintVerifier::from_strings(
+            pinned_fingerprints,
+        )
+        .map_err(|e| PeerError::Auth(format!("invalid pinned fingerprint: {e}")))?;
         let config = crate::peer::transport::pinning::pinned_client_config(verifier);
         client_builder = client_builder.use_preconfigured_tls(config);
     }

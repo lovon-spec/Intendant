@@ -14066,6 +14066,30 @@ mod tests {
     use crate::types::OutboundEvent;
     use tokio::io::AsyncWriteExt;
 
+    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
@@ -20411,6 +20435,8 @@ mod tests {
     /// POST /session returns 502 when no API key is configured.
     #[tokio::test]
     async fn test_post_session_no_api_key() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _gemini_key = EnvVarGuard::unset("GEMINI_API_KEY");
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
@@ -21642,11 +21668,6 @@ mod tests {
         );
     }
 
-    /// **F-1 invariant pin**: federated input authorizer is
-    /// deny-by-default in F-1.3b. F-2 will replace this with a real
-    /// registry-backed predicate; this test exists so any premature
-    /// flip fires loudly.
-    #[test]
     /// F-2: positive — an authority entry of `FederatedWebRtc` matching
     /// this closure's `(federation_connection_id, session_id)`
     /// authorizes input. Mirrors the local 5c

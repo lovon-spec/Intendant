@@ -21,9 +21,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use p12_keystore::{
-    Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain,
-};
+use p12_keystore::{Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, SanType,
@@ -102,13 +100,7 @@ pub fn ensure_certs(
     write_pem_private_key(&cert_dir.join(CLIENT_KEY), &client_key)?;
 
     let password = random_password(12);
-    let p12_bytes = build_modern_p12(
-        &client_key,
-        &client_cert,
-        &[ca_cert],
-        label,
-        &password,
-    )?;
+    let p12_bytes = build_modern_p12(&client_key, &client_cert, &[ca_cert], label, &password)?;
     std::fs::write(cert_dir.join(CLIENT_P12), &p12_bytes)?;
     state::write_p12_password(cert_dir, &password)?;
 
@@ -190,8 +182,8 @@ pub fn current_cert_ip(cert_dir: &Path) -> LanResult<String> {
     use x509_parser::prelude::*;
 
     let der = read_cert_der(&cert_dir.join(SERVER_CRT))?;
-    let (_, cert) = X509Certificate::from_der(&der)
-        .map_err(|e| LanError(format!("parse server cert: {e}")))?;
+    let (_, cert) =
+        X509Certificate::from_der(&der).map_err(|e| LanError(format!("parse server cert: {e}")))?;
     for attr in cert.subject().iter_common_name() {
         if let Ok(cn) = attr.as_str() {
             return Ok(cn.to_string());
@@ -213,8 +205,8 @@ fn cert_needs_regen_for_ip(cert_dir: &Path, lan_ip: &str) -> LanResult<bool> {
 /// Build the `CertificateParams` for the CA. Factored out so the same
 /// shape is used whether we're self-signing or rederiving an issuer.
 fn ca_params_for(label: &str) -> LanResult<CertificateParams> {
-    let mut params = CertificateParams::new(vec![])
-        .map_err(|e| LanError(format!("ca params: {e}")))?;
+    let mut params =
+        CertificateParams::new(vec![]).map_err(|e| LanError(format!("ca params: {e}")))?;
     params
         .distinguished_name
         .push(DnType::CommonName, format!("Intendant CA ({label})"));
@@ -237,12 +229,8 @@ fn generate_ca(label: &str) -> LanResult<(Certificate, KeyPair)> {
 /// key pair. Used both right after generation and on the `recert` path
 /// where the CA is read back from disk. The issuer captures the CA's
 /// subject DN and key-usage extensions from the parsed cert.
-fn issuer_from_pem(
-    ca_pem: &str,
-    ca_key: KeyPair,
-) -> LanResult<Issuer<'static, KeyPair>> {
-    Issuer::from_ca_cert_pem(ca_pem, ca_key)
-        .map_err(|e| LanError(format!("load CA issuer: {e}")))
+fn issuer_from_pem(ca_pem: &str, ca_key: KeyPair) -> LanResult<Issuer<'static, KeyPair>> {
+    Issuer::from_ca_cert_pem(ca_pem, ca_key).map_err(|e| LanError(format!("load CA issuer: {e}")))
 }
 
 fn generate_server_cert(
@@ -325,8 +313,7 @@ fn build_modern_p12(
     );
     for c in chain {
         certs.push(
-            P12Certificate::from_der(c.der())
-                .map_err(|e| LanError(format!("p12 ca cert: {e}")))?,
+            P12Certificate::from_der(c.der()).map_err(|e| LanError(format!("p12 ca cert: {e}")))?,
         );
     }
 
@@ -566,11 +553,7 @@ mod tests {
             .expect("private key chain missing from p12");
         assert!(!chain.key().is_empty(), "client key missing from p12");
         // Leaf (client) + CA.
-        assert_eq!(
-            chain.chain().len(),
-            2,
-            "expected client + CA in the chain"
-        );
+        assert_eq!(chain.chain().len(), 2, "expected client + CA in the chain");
     }
 
     #[test]

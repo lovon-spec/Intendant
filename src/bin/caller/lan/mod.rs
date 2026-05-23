@@ -28,10 +28,10 @@ pub mod backend;
 // cert/p12 *generation* functions are exercised solely by the still-deferred
 // `lan setup` nginx flow, so they compile-but-are-unused there. Silence those
 // dead-code warnings on Windows; every item is live on macOS/Linux.
-#[cfg_attr(target_os = "windows", allow(dead_code))]
-pub mod certs;
 #[cfg(not(target_os = "windows"))]
 pub mod cert_server;
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub mod certs;
 #[cfg(not(target_os = "windows"))]
 pub mod instructions;
 #[cfg(not(target_os = "windows"))]
@@ -582,7 +582,9 @@ mod tests {
             "expected at least one non-loopback routable interface address"
         );
         assert!(
-            addrs.iter().all(|ip| !ip.is_loopback() && !ip.is_unspecified()),
+            addrs
+                .iter()
+                .all(|ip| !ip.is_loopback() && !ip.is_unspecified()),
             "every address must be routable (non-loopback, non-unspecified): {addrs:?}"
         );
     }

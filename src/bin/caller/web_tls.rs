@@ -284,9 +284,7 @@ mod tests {
     #[test]
     fn tls_client_hello_detection() {
         // Real ClientHello prefix: handshake record, TLS 1.2 record version.
-        assert!(looks_like_tls_client_hello(&[
-            0x16, 0x03, 0x01, 0x02, 0x00
-        ]));
+        assert!(looks_like_tls_client_hello(&[0x16, 0x03, 0x01, 0x02, 0x00]));
         assert!(looks_like_tls_client_hello(&[0x16, 0x03, 0x03]));
     }
 

@@ -1198,8 +1198,7 @@ impl DisplaySession {
         // rationale — so the always-on bank is one layer the Media
         // Foundation encoder serves.
         #[cfg(not(target_os = "windows"))]
-        let layer_factory =
-            move |w: u32, h: u32| encode::pool::LayerSpec::vp8_simulcast(w, h, fps);
+        let layer_factory = move |w: u32, h: u32| encode::pool::LayerSpec::vp8_simulcast(w, h, fps);
         #[cfg(target_os = "windows")]
         let layer_factory = move |w: u32, h: u32| {
             vec![encode::pool::LayerSpec::single(

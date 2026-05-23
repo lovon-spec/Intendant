@@ -1619,7 +1619,10 @@ async fn resolve_turn_servers(ice_config: &IceConfig) -> Vec<TurnServerCfg> {
 /// the host but the trailing `:port` (outside the brackets) is honored.
 fn parse_turn_host_port(authority: &str) -> (String, u16) {
     const DEFAULT_TURN_PORT: u16 = 3478;
-    if let Some(close) = authority.strip_prefix('[').and_then(|_| authority.find(']')) {
+    if let Some(close) = authority
+        .strip_prefix('[')
+        .and_then(|_| authority.find(']'))
+    {
         // IPv6 literal: `[<addr>]` optionally followed by `:port`.
         let host = authority[1..close].to_string();
         let after = &authority[close + 1..];
@@ -1765,9 +1768,7 @@ async fn run_turn_relay(
                     break;
                 }
                 TurnEvent::AllocateError(_, e) => {
-                    eprintln!(
-                        "[display/webrtc] peer {peer_id}: TURN allocate rejected: {e}"
-                    );
+                    eprintln!("[display/webrtc] peer {peer_id}: TURN allocate rejected: {e}");
                     return;
                 }
                 _ => {}
@@ -2566,8 +2567,11 @@ impl WebRtcPeer {
                 &mut media_engine,
             )
             .map_err(|e| CallerError::WebRtc(format!("configure twcc: {e}")))?;
-        let registry = registry
-            .with(rtc::interceptor::NackResponderBuilder::new().with_size(2048).build());
+        let registry = registry.with(
+            rtc::interceptor::NackResponderBuilder::new()
+                .with_size(2048)
+                .build(),
+        );
         let registry = registry.with(|inner| {
             crate::display::twcc_tap::TwccTapInterceptor::new(inner, twcc_tap_tx.clone())
         });
