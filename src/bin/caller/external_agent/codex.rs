@@ -1005,6 +1005,7 @@ impl CodexAgent {
             params,
         };
         let line = serde_json::to_string(&request)?;
+        eprintln!("[CODEX-WIRE] out request: {}", line.chars().take(600).collect::<String>());
 
         let writer = self
             .writer
@@ -1032,6 +1033,7 @@ impl CodexAgent {
             params,
         };
         let line = serde_json::to_string(&notification)?;
+        eprintln!("[CODEX-WIRE] out notification: {}", line.chars().take(600).collect::<String>());
 
         let writer = self
             .writer
@@ -1056,6 +1058,7 @@ impl CodexAgent {
             result,
         };
         let line = serde_json::to_string(&response)?;
+        eprintln!("[CODEX-WIRE] out response id={}: {}", id, line.chars().take(600).collect::<String>());
 
         let writer = self
             .writer
@@ -1715,6 +1718,16 @@ async fn reader_task(
         }
 
         let method = msg.method.as_deref().unwrap_or("");
+
+        eprintln!(
+            "[CODEX-WIRE] in method={:?} id={:?} params={}",
+            msg.method,
+            msg.id,
+            msg.params
+                .as_ref()
+                .map(|p| p.to_string().chars().take(700).collect::<String>())
+                .unwrap_or_default()
+        );
 
         // 2. Server-to-client request (has method AND id) -- approval requests
         if let Some(jsonrpc_id) = msg.id {

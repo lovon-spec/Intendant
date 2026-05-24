@@ -244,6 +244,7 @@ impl SessionSupervisor {
     }
 
     async fn handle_control_msg(&self, msg: event::ControlMsg) {
+        eprintln!("[APPROVAL-DIAG] supervisor.handle_control_msg: {:?}", msg);
         match msg {
             event::ControlMsg::CreateSession {
                 task,
@@ -1252,6 +1253,7 @@ impl SessionSupervisor {
     }
 
     async fn route_interrupt(&self, session_id: Option<String>) {
+        eprintln!("[APPROVAL-DIAG] route_interrupt called session_id={:?}", session_id);
         let requested_id = session_id.clone();
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Interrupt dropped: no active managed session");
@@ -1390,6 +1392,10 @@ impl SessionSupervisor {
         response: event::ApprovalResponse,
         action: &str,
     ) {
+        eprintln!(
+            "[APPROVAL-DIAG] supervisor.resolve_approval session_id={:?} approval_id={} response={:?} action={}",
+            session_id, approval_id, response, action
+        );
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Approval response dropped: no active managed session");
             return;
