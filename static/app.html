@@ -3492,7 +3492,14 @@ html, body {
   border-left: 2px solid transparent;
 }
 .session-detail-logs .log-entry:hover { background: var(--mantle); }
-.session-detail-logs .log-ts { color: var(--overlay1); width: 70px; flex-shrink: 0; font-size: 11px; }
+.session-detail-logs .log-ts {
+  color: var(--overlay1);
+  width: 142px;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .session-detail-logs .log-level { width: 52px; flex-shrink: 0; font-weight: 600; font-size: 11px; text-transform: uppercase; }
 .session-detail-logs .log-content { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
 .session-detail-logs .diff-log-wrap,
@@ -5815,6 +5822,7 @@ html, body {
   .tab-btn { padding: 8px 12px; font-size: 12px; }
   .log-entry { padding: 1px 8px; }
   .log-entry .log-ts { width: 55px; font-size: 10px; }
+  .session-detail-logs .log-ts { width: 118px; font-size: 10px; }
   .log-entry .log-level { width: 44px; font-size: 10px; }
   .usage-card { min-width: unset; }
   .usage-cards { flex-direction: column; }
@@ -16383,6 +16391,14 @@ function currentLogTime() {
   return new Date().toTimeString().slice(0, 8);
 }
 
+function formatSessionDetailTimestamp(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const iso = raw.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/);
+  if (iso) return `${iso[1]} ${iso[2]}`;
+  return raw;
+}
+
 const pendingAttachmentLogReceipts = [];
 const ATTACHMENT_RECEIPT_DEDUPE_MS = 30000;
 
@@ -26086,7 +26102,8 @@ function renderSessionDetailEntries(entries, el) {
 
     const ts = document.createElement('span');
     ts.className = 'log-ts';
-    ts.textContent = (e.ts || '').substring(0, 8);
+    ts.textContent = formatSessionDetailTimestamp(e.ts);
+    if (e.ts && ts.textContent !== String(e.ts)) ts.title = String(e.ts);
 
     const lvl = document.createElement('span');
     lvl.className = 'log-level';
