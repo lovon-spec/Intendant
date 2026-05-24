@@ -59,6 +59,7 @@ struct ManagedSession {
     session_id: String,
     source: String,
     name: Option<String>,
+    phase: String,
     project_root: PathBuf,
     session_dir: PathBuf,
     follow_up_tx: mpsc::Sender<FollowUpMessage>,
@@ -150,34 +151,39 @@ impl SessionSupervisor {
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(AppEvent::ControlCommand(msg)) => {
-                        self.handle_control_msg(msg).await;
+                    Ok(event) => {
+                        self.observe_lifecycle_event(&event).await;
+                        match event {
+                            AppEvent::ControlCommand(msg) => {
+                                self.handle_control_msg(msg).await;
+                            }
+                            AppEvent::SessionIdentity {
+                                session_id,
+                                source,
+                                backend_session_id,
+                            } => {
+                                self.apply_session_identity(session_id, source, backend_session_id)
+                                    .await;
+                            }
+                            AppEvent::SessionRelationship {
+                                parent_session_id,
+                                child_session_id,
+                                relationship,
+                                ..
+                            } => {
+                                self.apply_session_relationship(
+                                    parent_session_id,
+                                    child_session_id,
+                                    relationship,
+                                )
+                                .await;
+                            }
+                            AppEvent::SessionEnded { session_id, .. } => {
+                                self.remove_session_alias(&session_id).await;
+                            }
+                            _ => {}
+                        }
                     }
-                    Ok(AppEvent::SessionIdentity {
-                        session_id,
-                        source,
-                        backend_session_id,
-                    }) => {
-                        self.apply_session_identity(session_id, source, backend_session_id)
-                            .await;
-                    }
-                    Ok(AppEvent::SessionRelationship {
-                        parent_session_id,
-                        child_session_id,
-                        relationship,
-                        ..
-                    }) => {
-                        self.apply_session_relationship(
-                            parent_session_id,
-                            child_session_id,
-                            relationship,
-                        )
-                        .await;
-                    }
-                    Ok(AppEvent::SessionEnded { session_id, .. }) => {
-                        self.remove_session_alias(&session_id).await;
-                    }
-                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -190,36 +196,41 @@ impl SessionSupervisor {
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(AppEvent::ControlCommand(msg)) => {
-                        if self.should_handle_session_control(&msg).await {
-                            self.handle_control_msg(msg).await;
+                    Ok(event) => {
+                        self.observe_lifecycle_event(&event).await;
+                        match event {
+                            AppEvent::ControlCommand(msg) => {
+                                if self.should_handle_session_control(&msg).await {
+                                    self.handle_control_msg(msg).await;
+                                }
+                            }
+                            AppEvent::SessionIdentity {
+                                session_id,
+                                source,
+                                backend_session_id,
+                            } => {
+                                self.apply_session_identity(session_id, source, backend_session_id)
+                                    .await;
+                            }
+                            AppEvent::SessionRelationship {
+                                parent_session_id,
+                                child_session_id,
+                                relationship,
+                                ..
+                            } => {
+                                self.apply_session_relationship(
+                                    parent_session_id,
+                                    child_session_id,
+                                    relationship,
+                                )
+                                .await;
+                            }
+                            AppEvent::SessionEnded { session_id, .. } => {
+                                self.remove_session_alias(&session_id).await;
+                            }
+                            _ => {}
                         }
                     }
-                    Ok(AppEvent::SessionIdentity {
-                        session_id,
-                        source,
-                        backend_session_id,
-                    }) => {
-                        self.apply_session_identity(session_id, source, backend_session_id)
-                            .await;
-                    }
-                    Ok(AppEvent::SessionRelationship {
-                        parent_session_id,
-                        child_session_id,
-                        relationship,
-                        ..
-                    }) => {
-                        self.apply_session_relationship(
-                            parent_session_id,
-                            child_session_id,
-                            relationship,
-                        )
-                        .await;
-                    }
-                    Ok(AppEvent::SessionEnded { session_id, .. }) => {
-                        self.remove_session_alias(&session_id).await;
-                    }
-                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -813,6 +824,11 @@ impl SessionSupervisor {
         self.register_session(
             session_id.clone(),
             source.clone(),
+            if task.trim().is_empty() {
+                "idle".to_string()
+            } else {
+                "thinking".to_string()
+            },
             project.root.clone(),
             log_dir.clone(),
             follow_up_tx,
@@ -1564,6 +1580,53 @@ impl SessionSupervisor {
         }
     }
 
+    async fn observe_lifecycle_event(&self, event: &AppEvent) {
+        match event {
+            AppEvent::SessionStarted { session_id, .. } => {
+                self.update_session_phase(Some(session_id), "thinking")
+                    .await;
+            }
+            AppEvent::TurnStarted { session_id, .. } => {
+                self.update_session_phase(session_id.as_deref(), "thinking")
+                    .await;
+            }
+            AppEvent::AgentStarted { session_id, .. }
+            | AppEvent::AgentOutput { session_id, .. } => {
+                self.update_session_phase(session_id.as_deref(), "running")
+                    .await;
+            }
+            AppEvent::ApprovalRequired { session_id, .. } => {
+                self.update_session_phase(session_id.as_deref(), "waiting_approval")
+                    .await;
+            }
+            AppEvent::HumanQuestionDetected { .. } => {
+                self.update_session_phase(None, "waiting_human").await;
+            }
+            AppEvent::InterruptRequested { session_id } => {
+                self.update_session_phase(session_id.as_deref(), "interrupting")
+                    .await;
+            }
+            AppEvent::Interrupted { session_id, .. } => {
+                self.update_session_phase(session_id.as_deref(), "interrupted")
+                    .await;
+            }
+            AppEvent::RoundComplete { session_id, .. } => {
+                self.update_session_phase(session_id.as_deref(), "idle")
+                    .await;
+            }
+            AppEvent::TaskComplete { session_id, .. } => {
+                self.update_session_phase(session_id.as_deref(), "done")
+                    .await;
+            }
+            AppEvent::StatusUpdate {
+                session_id, phase, ..
+            } => {
+                self.update_session_phase(Some(session_id), phase).await;
+            }
+            _ => {}
+        }
+    }
+
     async fn apply_session_relationship(
         &self,
         parent_session_id: String,
@@ -1584,6 +1647,20 @@ impl SessionSupervisor {
         state.related_sessions.remove(session_id);
     }
 
+    async fn update_session_phase(&self, session_id: Option<&str>, phase: &str) {
+        let phase = normalize_supervisor_phase(phase);
+        let mut state = self.state.lock().await;
+        let target_id = session_id
+            .and_then(|id| state.resolve_session_id(id))
+            .or_else(|| state.active_session_id.clone());
+        let Some(target_id) = target_id else {
+            return;
+        };
+        if let Some(session) = state.sessions.get_mut(&target_id) {
+            session.phase = phase;
+        }
+    }
+
     async fn resolve_target_session_id(&self, session_id: Option<String>) -> Option<String> {
         let state = self.state.lock().await;
         let requested = session_id.or_else(|| state.active_session_id.clone())?;
@@ -1599,6 +1676,7 @@ impl SessionSupervisor {
         &self,
         session_id: String,
         source: String,
+        phase: String,
         project_root: PathBuf,
         session_dir: PathBuf,
         follow_up_tx: mpsc::Sender<FollowUpMessage>,
@@ -1615,6 +1693,7 @@ impl SessionSupervisor {
                 session_id,
                 source,
                 name,
+                phase,
                 project_root,
                 session_dir,
                 follow_up_tx,
@@ -1747,13 +1826,29 @@ impl SessionSupervisor {
 
     async fn emit_attached_status(&self, session_id: &str, source: &str) {
         let autonomy = self.config.autonomy.read().await.level.to_string();
+        let phase = {
+            let state = self.state.lock().await;
+            state
+                .resolve_session_id(session_id)
+                .and_then(|id| state.sessions.get(&id).map(|session| session.phase.clone()))
+                .unwrap_or_else(|| "idle".to_string())
+        };
         self.config.bus.send(AppEvent::StatusUpdate {
             turn: 0,
-            phase: "waiting-follow-up".to_string(),
+            phase,
             autonomy,
             session_id: session_id.to_string(),
             task: format!("Open {} session {}", source, short_session(session_id)),
         });
+    }
+}
+
+fn normalize_supervisor_phase(phase: &str) -> String {
+    match phase.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" => "idle".to_string(),
+        "running_agent" => "running".to_string(),
+        "waiting_follow_up" | "waiting_followup" => "idle".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -2167,6 +2262,7 @@ mod tests {
             session_id: id.to_string(),
             source: source.to_string(),
             name: None,
+            phase: "idle".to_string(),
             project_root: PathBuf::from("/tmp/project"),
             session_dir: PathBuf::from("/tmp/session"),
             follow_up_tx: tx,

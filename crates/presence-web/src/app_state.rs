@@ -1587,10 +1587,13 @@ impl AppState {
             }
 
             "interrupt_requested" => {
-                // Log entry only — the `status` event carrying phase="interrupting"
-                // drives the UI state transition. Keeping the log entry visible at
-                // normal verbosity so users see their click was received.
                 cmds.extend(self.add_log("info", "Interrupt requested", None, "system"));
+                if current_session_event {
+                    self.phase = "interrupting".to_string();
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "interrupting".into(),
+                    });
+                }
             }
 
             "interrupted" => {
@@ -4680,6 +4683,11 @@ mod tests {
         let mut s = AppState::new();
         let msg = json!({"event": "interrupt_requested"});
         let cmds = s.handle_message(&msg);
+        assert_eq!(s.phase, "interrupting");
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SetPhase { phase } if phase == "interrupting"
+        )));
         assert!(cmds.iter().any(|c| matches!(
             c,
             UiCommand::AddLogEntry { content, .. } if content == "Interrupt requested"
