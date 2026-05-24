@@ -1117,6 +1117,57 @@ impl CodexAgent {
         };
         Ok((thread_id, turn_id))
     }
+
+    async fn resume_thread_for_followup(&mut self, thread_id: &str) -> Result<(), CallerError> {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "threadId".into(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+        params.insert("excludeTurns".into(), serde_json::Value::Bool(true));
+        params.insert(
+            "approvalPolicy".into(),
+            serde_json::Value::String(self.approval_policy.clone()),
+        );
+        params.insert(
+            "sandbox".into(),
+            serde_json::Value::String(self.sandbox.clone()),
+        );
+        if let Some(ref model) = self.model {
+            params.insert("model".into(), serde_json::Value::String(model.clone()));
+        }
+
+        let response = self
+            .send_request("thread/resume", Some(serde_json::Value::Object(params)))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/resume: {e}")))?;
+        let resumed_thread_id = response
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                CallerError::ExternalAgent(
+                    "thread/resume response missing 'thread.id' field".into(),
+                )
+            })?;
+        if resumed_thread_id != thread_id {
+            return Err(CallerError::ExternalAgent(format!(
+                "thread/resume returned thread {resumed_thread_id}, expected {thread_id}"
+            )));
+        }
+
+        let active_turn = self.active_turns.lock().await.get(thread_id).cloned();
+        *self.active_turn_id.lock().await = active_turn;
+        *self.active_thread_id.lock().await = Some(thread_id.to_string());
+        Ok(())
+    }
+}
+
+fn codex_turn_start_thread_not_found(err: &CallerError) -> bool {
+    let CallerError::ExternalAgent(message) = err else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("thread not found")
 }
 
 struct CodexRequestPayloadSnapshot {
@@ -3138,7 +3189,14 @@ impl ExternalAgent for CodexAgent {
         // The response carries the turn id; cache it so interrupt_turn() can
         // target this specific turn. Fall back to the reader task's
         // turn/started notification hook if the response shape differs.
-        let response = self.send_request("turn/start", Some(params)).await?;
+        let response = match self.send_request("turn/start", Some(params.clone())).await {
+            Ok(response) => response,
+            Err(err) if codex_turn_start_thread_not_found(&err) => {
+                self.resume_thread_for_followup(&thread.thread_id).await?;
+                self.send_request("turn/start", Some(params)).await?
+            }
+            Err(err) => return Err(err),
+        };
         if let Some(id) = extract_turn_id(&response) {
             self.active_turns
                 .lock()
@@ -4758,6 +4816,22 @@ mod tests {
         assert!(agent.writer.is_none());
         assert!(agent.event_tx.is_none());
         assert!(agent.reader_handle.is_none());
+    }
+
+    #[test]
+    fn turn_start_thread_not_found_error_is_resumable() {
+        let err = CallerError::ExternalAgent(
+            "JSON-RPC error -32600: thread not found: 019e-child".to_string(),
+        );
+        assert!(codex_turn_start_thread_not_found(&err));
+    }
+
+    #[test]
+    fn unrelated_external_error_is_not_resumable_thread_not_found() {
+        let err = CallerError::ExternalAgent(
+            "JSON-RPC error -32600: cannot start turn while closing".to_string(),
+        );
+        assert!(!codex_turn_start_thread_not_found(&err));
     }
 
     #[test]

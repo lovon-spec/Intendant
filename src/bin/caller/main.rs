@@ -2127,11 +2127,6 @@ fn codex_subagent_terminal_reason(state: &external_agent::SubAgentState) -> Opti
         .map(str::trim)
         .filter(|s| !s.is_empty());
     match status {
-        "completed" => Some(
-            message
-                .map(|message| format!("Codex subagent completed: {message}"))
-                .unwrap_or_else(|| "Codex subagent completed".to_string()),
-        ),
         "interrupted" => Some(
             message
                 .map(|message| format!("Codex subagent interrupted: {message}"))
@@ -5229,16 +5224,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_subagent_terminal_reason_includes_final_message() {
+    fn codex_subagent_completed_is_not_terminal() {
         let state = external_agent::SubAgentState {
             thread_id: "child".to_string(),
             status: "completed".to_string(),
             message: Some("done".to_string()),
         };
-        assert_eq!(
-            codex_subagent_terminal_reason(&state).as_deref(),
-            Some("Codex subagent completed: done")
-        );
+        assert!(codex_subagent_terminal_reason(&state).is_none());
 
         let running = external_agent::SubAgentState {
             thread_id: "child".to_string(),

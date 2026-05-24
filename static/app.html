@@ -12488,6 +12488,17 @@ function pruneClosedSideChildrenForParent(parentId, meta) {
   return nextMeta;
 }
 
+function sessionRelationshipSubagentIsActive(childId) {
+  const sid = String(childId || '').trim();
+  if (!sid) return false;
+  const win = sessionWindows.get(sid);
+  const meta = sessionMetadataById.get(sid) || {};
+  if (win?.ended || meta.ended) return false;
+  if (hasPendingActiveSessionWindow(sid)) return true;
+  const phase = normalizeSessionPhase(win?.phase || meta.phase || '');
+  return isAgentActivePhase(phase);
+}
+
 function updateSessionRelationshipBadges(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
@@ -12503,21 +12514,27 @@ function updateSessionRelationshipBadges(sessionId) {
     });
   }
   const children = Array.isArray(meta.children) ? meta.children : [];
-  if (children.length > 0) {
-    const sides = children.filter(child => child.kind === 'side').length;
-    const forks = children.filter(child => child.kind === 'fork').length;
-    const subs = children.filter(child => child.kind === 'subagent').length;
+  const activeChildren = children.filter(child => {
+    const kind = String(child?.kind || '').trim().toLowerCase();
+    return kind !== 'subagent' || sessionRelationshipSubagentIsActive(child.id);
+  });
+  if (activeChildren.length > 0) {
+    const sides = activeChildren.filter(child => child.kind === 'side').length;
+    const forks = activeChildren.filter(child => child.kind === 'fork').length;
+    const subs = activeChildren.filter(child => child.kind === 'subagent').length;
     const label = [
       sides ? `${sides} side` : '',
       forks ? `${forks} fork` : '',
       subs ? `${subs} sub` : '',
     ].filter(Boolean).join(' ');
-    chips.push({
-      kind: 'children',
-      text: label || `${children.length} child`,
-      title: `${children.length} related session${children.length === 1 ? '' : 's'}. Click to highlight children.`,
-      target: '',
-    });
+    if (label) {
+      chips.push({
+        kind: 'children',
+        text: label,
+        title: `${activeChildren.length} active related session${activeChildren.length === 1 ? '' : 's'}. Click to highlight children.`,
+        target: '',
+      });
+    }
   }
 
   win.relationStrip.replaceChildren();
@@ -13111,6 +13128,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   }
   updateSessionWindowActionMenuVisibility(sid);
   updateSessionRelationshipBadges(sid);
+  if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
   scheduleSessionRelationshipRender();
   persistSessionWindowState();
 }
