@@ -2724,6 +2724,13 @@ async fn drain_external_agent_events(
         handle: Some(watcher_handle),
     };
 
+    // Per-session "Approve all": once the user approves-all for this external
+    // session, auto-accept subsequent approval requests without prompting until
+    // the session ends. Scoped to this session — does not touch global autonomy.
+    // (Codex doesn't honor `acceptForSession` as a session-wide grant, so
+    // Intendant enforces the session-wide accept itself.)
+    let mut approve_all_session = false;
+
     loop {
         let event = tokio::select! {
             biased;
@@ -3315,7 +3322,7 @@ async fn drain_external_agent_events(
                     }
                 };
                 let decision = { config.autonomy.read().await.external_approval_decision(cat) };
-                if decision == autonomy::ExternalApprovalDecision::AutoApprove {
+                if approve_all_session || decision == autonomy::ExternalApprovalDecision::AutoApprove {
                     config.bus.send(AppEvent::AutoApproved {
                         preview: command.clone(),
                     });
@@ -3385,10 +3392,16 @@ async fn drain_external_agent_events(
                                 event::ApprovalResponse::Approve => {
                                     (external_agent::ApprovalDecision::Accept, "approve")
                                 }
-                                event::ApprovalResponse::ApproveAll => (
-                                    external_agent::ApprovalDecision::AcceptForSession,
-                                    "approve_all",
-                                ),
+                                event::ApprovalResponse::ApproveAll => {
+                                    // Grant session-wide auto-approval; enforced
+                                    // by Intendant for every later request in
+                                    // this session (see `approve_all_session`).
+                                    approve_all_session = true;
+                                    (
+                                        external_agent::ApprovalDecision::AcceptForSession,
+                                        "approve_all",
+                                    )
+                                }
                                 event::ApprovalResponse::Deny => {
                                     (external_agent::ApprovalDecision::Decline, "deny")
                                 }
@@ -3431,7 +3444,7 @@ async fn drain_external_agent_events(
                 let decision = { config.autonomy.read().await.external_approval_decision(cat) };
                 let preview = format!("file change: {}", path);
 
-                if decision == autonomy::ExternalApprovalDecision::AutoApprove {
+                if approve_all_session || decision == autonomy::ExternalApprovalDecision::AutoApprove {
                     config.bus.send(AppEvent::AutoApproved {
                         preview: preview.clone(),
                     });
@@ -3501,10 +3514,16 @@ async fn drain_external_agent_events(
                                 event::ApprovalResponse::Approve => {
                                     (external_agent::ApprovalDecision::Accept, "approve")
                                 }
-                                event::ApprovalResponse::ApproveAll => (
-                                    external_agent::ApprovalDecision::AcceptForSession,
-                                    "approve_all",
-                                ),
+                                event::ApprovalResponse::ApproveAll => {
+                                    // Grant session-wide auto-approval; enforced
+                                    // by Intendant for every later request in
+                                    // this session (see `approve_all_session`).
+                                    approve_all_session = true;
+                                    (
+                                        external_agent::ApprovalDecision::AcceptForSession,
+                                        "approve_all",
+                                    )
+                                }
                                 event::ApprovalResponse::Deny => {
                                     (external_agent::ApprovalDecision::Decline, "deny")
                                 }
