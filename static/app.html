@@ -7513,6 +7513,7 @@ let restoredPersistedSessionWindows = false;
 let restoringPersistedSessionWindows = false;
 const sessionWindowRestoreInFlight = new Set();
 let currentSessionDetail = null;
+let currentSessionDetailContext = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
 let steerCounter = 0;
@@ -26568,21 +26569,51 @@ function renderSessionDetailTitle(session) {
   }
 }
 
+function sessionDetailContextForSubtab(subtab) {
+  const targetSubtab = subtab === 'deep' ? 'deep' : 'recent';
+  const pane = document.getElementById(`sessions-pane-${targetSubtab}`);
+  if (!pane) return null;
+  return {
+    subtab: targetSubtab,
+    pane,
+    headerEl: pane.querySelector('.sessions-header'),
+    listEl: document.getElementById(targetSubtab === 'deep' ? 'sessions-deep-list' : 'sessions-list'),
+    aggEl: targetSubtab === 'recent' ? document.getElementById('sessions-aggregate') : null,
+  };
+}
+
+function restoreSessionDetailContext(ctx) {
+  if (!ctx) return;
+  if (ctx.listEl) ctx.listEl.style.display = '';
+  if (ctx.aggEl) ctx.aggEl.style.display = '';
+  if (ctx.headerEl) ctx.headerEl.style.display = '';
+}
+
+function prepareSessionDetailContext(ctx, detailEl) {
+  if (!ctx || !detailEl) return false;
+  restoreSessionDetailContext(currentSessionDetailContext);
+  if (detailEl.parentElement !== ctx.pane) {
+    ctx.pane.appendChild(detailEl);
+  }
+  if (ctx.listEl) ctx.listEl.style.display = 'none';
+  if (ctx.aggEl) ctx.aggEl.style.display = 'none';
+  if (ctx.headerEl) ctx.headerEl.style.display = 'none';
+  currentSessionDetailContext = ctx;
+  return true;
+}
+
 function openSessionDetail(sessionOrId, taskArg) {
   const session = typeof sessionOrId === 'object'
     ? sessionOrId
     : { session_id: sessionOrId, task: taskArg, source: 'intendant' };
   const sessionId = session.session_id;
   const source = session.source || 'intendant';
-  const listEl = document.getElementById('sessions-list');
-  const aggEl = document.getElementById('sessions-aggregate');
-  const headerEl = document.querySelector('.sessions-header');
   const detailEl = document.getElementById('session-detail');
   const logsEl = document.getElementById('session-detail-logs');
+  const detailSubtab = activeSessionsSubtab === 'deep' ? 'deep' : 'recent';
+  const detailContext = sessionDetailContextForSubtab(detailSubtab);
+  if (!detailEl || !logsEl || !prepareSessionDetailContext(detailContext, detailEl)) return;
 
-  listEl.style.display = 'none';
-  aggEl.style.display = 'none';
-  headerEl.style.display = 'none';
   detailEl.style.display = 'flex';
   currentSessionDetail = { ...session, source };
   renderSessionDetailTitle(currentSessionDetail);
@@ -26629,11 +26660,10 @@ function closeSessionDetail() {
   document.getElementById('sd-recordings').style.display = 'none';
   document.getElementById('sd-frames').style.display = 'none';
 
-  document.getElementById('sessions-list').style.display = '';
-  document.getElementById('sessions-aggregate').style.display = '';
-  document.querySelector('.sessions-header').style.display = '';
+  restoreSessionDetailContext(currentSessionDetailContext || sessionDetailContextForSubtab(activeSessionsSubtab));
   document.getElementById('session-detail').style.display = 'none';
   currentSessionDetail = null;
+  currentSessionDetailContext = null;
 }
 window.closeSessionDetail = closeSessionDetail;
 window.loadSessions = loadSessions;
