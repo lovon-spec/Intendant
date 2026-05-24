@@ -473,6 +473,92 @@ pub async fn spawn_detached_restart(cmd: &str) -> Result<u32, String> {
         .ok_or_else(|| "Detached restart child has no PID".to_string())
 }
 
+/// Build a [`tokio::process::Command`] for an external program, resolving the
+/// program name in a platform-correct way.
+///
+/// External-agent CLIs (codex, gemini, claude) are configured by name and
+/// default to bare names ("codex" / "gemini" / "claude"). Callers chain the
+/// usual builder methods (`.args()`, `.current_dir()`, `.stdin()`, …) onto the
+/// returned `Command` and then `.spawn()`.
+///
+/// - **Unix**: returns `Command::new(program)` unchanged — the OS resolves a
+///   bare name against `PATH` itself, so there is zero behavior change here.
+/// - **Windows**: npm installs these CLIs as `.cmd`/`.bat` batch shims (e.g.
+///   `codex.cmd` in the npm prefix, which is on `PATH`). But `CreateProcess`
+///   — what `Command::new` calls — only appends `.exe`; it does *not* do the
+///   shell's `PATHEXT` resolution for `.cmd`/`.bat`, so a bare `"codex"` fails
+///   with "program not found" even though `codex.cmd` is right there. This
+///   path resolves the name via the PATHEXT-aware [`which`] crate and, for a
+///   batch shim, runs it through `cmd.exe /C` so the batch interpreter handles
+///   it. See the `#[cfg(windows)]` body for the resolution rules.
+#[cfg(not(windows))]
+pub fn spawn_command(program: &str) -> tokio::process::Command {
+    tokio::process::Command::new(program)
+}
+
+/// Windows implementation of [`spawn_command`]. See the non-Windows doc comment
+/// for the cross-platform contract.
+///
+/// Resolution rules (first match wins):
+/// 1. If `program` already contains a path separator (`/` or `\`) or ends in
+///    `.exe`/`.com` (case-insensitive), it is an explicit executable target —
+///    use `Command::new(program)` directly. This is the robust path: pointing
+///    `[agent.<x>] command` at a real `.exe` "just works", with no shimming.
+/// 2. Otherwise resolve the bare name via the PATHEXT-aware [`which`] crate:
+///    - resolves to `.exe`/`.com` → `Command::new(resolved)` directly;
+///    - resolves to `.cmd`/`.bat` → a `cmd.exe /C <resolved>` command, so the
+///      caller's subsequent `.args(...)` append *after* the script path
+///      (i.e. `cmd /C <path-to-codex.cmd> <original args...>`), letting the
+///      batch interpreter run the shim.
+/// 3. If `which` resolution fails, fall back to `Command::new(program)` so the
+///    error behavior is identical to the pre-fix code (a clear NotFound from
+///    the eventual `.spawn()`).
+///
+/// NOTE: the `cmd /C` shim path can mis-quote arguments that contain embedded
+/// double quotes (e.g. codex's `-c key="val"` flags), because `cmd.exe`
+/// argument escaping does not follow the C runtime rules `Command` quotes for.
+/// We deliberately do *not* try to fully solve `cmd.exe` escaping here — the
+/// reliable answer for such cases is to set `[agent.<x>] command` to the real
+/// executable path, which takes rule 1's `.exe`-direct path and never touches
+/// `cmd.exe`.
+#[cfg(windows)]
+pub fn spawn_command(program: &str) -> tokio::process::Command {
+    // Rule 1: an explicit path or a real executable extension — no shimming.
+    let lower = program.to_ascii_lowercase();
+    if program.contains('/')
+        || program.contains('\\')
+        || lower.ends_with(".exe")
+        || lower.ends_with(".com")
+    {
+        return tokio::process::Command::new(program);
+    }
+
+    // Rule 2: PATHEXT-aware resolution of the bare name.
+    match which::which(program) {
+        Ok(resolved) => {
+            let ext = resolved
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            match ext.as_deref() {
+                // Batch shim: run through the command interpreter so it can
+                // execute the `.cmd`/`.bat`. The caller's `.args()` chain
+                // appends after the resolved script path.
+                Some("cmd") | Some("bat") => {
+                    let mut command = tokio::process::Command::new("cmd.exe");
+                    command.arg("/C").arg(resolved);
+                    command
+                }
+                // A real executable (or anything else PATHEXT yielded) can be
+                // spawned directly.
+                _ => tokio::process::Command::new(resolved),
+            }
+        }
+        // Rule 3: unresolved — preserve the original NotFound-at-spawn behavior.
+        Err(_) => tokio::process::Command::new(program),
+    }
+}
+
 // ── Cross-platform std::fs::Metadata extras ────────────────────────────────
 //
 // `std::os::unix::fs::MetadataExt` exposes inode-level fields (ctime, dev,
@@ -665,5 +751,44 @@ mod tests {
             cmdline.to_ascii_lowercase().contains(".exe"),
             "cmdline should reference the test executable, got: {cmdline:?}"
         );
+    }
+
+    // On Unix `spawn_command` must be a pure passthrough to `Command::new` —
+    // the program is whatever was passed, no path resolution or shimming, so
+    // the external-agent spawn behavior is byte-for-byte unchanged from before.
+    #[cfg(not(windows))]
+    #[test]
+    fn spawn_command_is_passthrough_on_unix() {
+        for name in ["codex", "gemini", "claude", "/usr/local/bin/codex"] {
+            let cmd = spawn_command(name);
+            assert_eq!(
+                cmd.as_std().get_program(),
+                std::ffi::OsStr::new(name),
+                "Unix spawn_command should construct Command::new({name:?}) verbatim"
+            );
+        }
+    }
+
+    // On Windows an explicit executable target (a path, or a name already
+    // ending in .exe/.com) must be spawned directly — never wrapped in
+    // `cmd.exe /C` — regardless of what `which` would resolve. These inputs
+    // exercise rule 1, which is deterministic and needs nothing on PATH.
+    #[cfg(windows)]
+    #[test]
+    fn spawn_command_uses_explicit_executable_directly() {
+        for name in [
+            r"C:\tools\codex.cmd",
+            "some/dir/gemini",
+            "claude.exe",
+            "Foo.EXE",
+            "thing.com",
+        ] {
+            let cmd = spawn_command(name);
+            assert_eq!(
+                cmd.as_std().get_program(),
+                std::ffi::OsStr::new(name),
+                "explicit-path/exe input {name:?} should be spawned directly, not via cmd.exe"
+            );
+        }
     }
 }

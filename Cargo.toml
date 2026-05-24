@@ -38,6 +38,11 @@ ratatui-textarea = "0.9"
 tokio-stream = "0.1"
 futures-util = "0.3"
 dirs = "6"
+# PATHEXT-aware executable resolution. Used by `platform::spawn_command` to
+# resolve bare program names (e.g. "codex") to npm's `.cmd`/`.bat` shims on
+# Windows, which `CreateProcess` (and thus `Command::new`) does not do. Pure
+# Rust, so no setup-script changes are needed.
+which = "8"
 rmcp = { version = "0.16", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 base64 = "0.22"

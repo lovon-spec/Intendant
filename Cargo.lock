@@ -353,7 +353,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "shlex",
  "syn 2.0.116",
- "which",
+ "which 4.4.2",
 ]
 
 [[package]]
@@ -2146,6 +2146,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "uuid",
+ "which 8.0.2",
  "windows 0.59.0",
  "windows-sys 0.59.0",
  "x11rb",
@@ -5731,6 +5732,15 @@ dependencies = [
  "home",
  "once_cell",
  "rustix 0.38.44",
+]
+
+[[package]]
+name = "which"
+version = "8.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81995fafaaaf6ae47a7d0cc83c67caf92aeb7e5331650ae6ff856f7c0c60c459"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

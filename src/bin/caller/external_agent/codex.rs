@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::CallerError;
@@ -2704,7 +2704,7 @@ impl ExternalAgent for CodexAgent {
                 quoted.join(", ")
             ));
         }
-        let mut command = Command::new(&self.command);
+        let mut command = crate::platform::spawn_command(&self.command);
         command
             .args(&args)
             .current_dir(&config.working_dir)
