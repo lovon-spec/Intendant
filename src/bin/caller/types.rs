@@ -105,6 +105,20 @@ impl Verbosity {
 // Outbound events (control socket / web gateway / MCP)
 // ---------------------------------------------------------------------------
 
+/// Per-session frontend affordances advertised by the controller.
+/// Missing capabilities mean the frontend should keep its legacy defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionCapabilities {
+    #[serde(default)]
+    pub follow_up: bool,
+    #[serde(default)]
+    pub steer: bool,
+    #[serde(default)]
+    pub interrupt: bool,
+    #[serde(default)]
+    pub codex_thread_actions: Vec<String>,
+}
+
 /// Events sent to connected control socket clients, web gateway, and MCP.
 ///
 /// Also deserialized by `crate::peer::upcast::OutboundEventUpcaster`
@@ -166,6 +180,10 @@ pub enum OutboundEvent {
         child_session_id: String,
         relationship: String,
         ephemeral: bool,
+    },
+    SessionCapabilities {
+        session_id: String,
+        capabilities: SessionCapabilities,
     },
     SessionAttached {
         session_id: String,
@@ -605,6 +623,18 @@ pub enum OutboundEvent {
         session_id: Option<String>,
         id: String,
         mid_turn: bool,
+    },
+    /// Status for an ordinary follow-up that was queued because the target
+    /// session was active but does not support native mid-turn steering.
+    FollowUpStatus {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     // --- Peer registry push events ---
     //

@@ -2009,6 +2009,7 @@ async fn handle_control_command_mcp(
                         reference_frame_ids: vec![],
                         display_target: None,
                         attachments: vec![],
+                        follow_up_id: None,
                     }));
                     emit_control_result(
                         control_tx,
@@ -2230,6 +2231,7 @@ pub fn spawn_event_listener(
                     | AppEvent::CodexThreadActionResult { .. }
                     | AppEvent::SessionIdentity { .. }
                     | AppEvent::SessionRelationship { .. }
+                    | AppEvent::SessionCapabilities { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::GeminiConfigChanged { .. }
                     | AppEvent::GeminiThreadActionRequested { .. }
@@ -2805,6 +2807,28 @@ pub fn spawn_event_listener(
                         s.push_log(
                             LogLevel::Info,
                             format!("Steer delivered{} ({})", id_part, mode),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
+                    AppEvent::FollowUpStatus {
+                        ref id,
+                        ref status,
+                        ref reason,
+                        ..
+                    } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        let suffix = reason
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!(": {}", s))
+                            .unwrap_or_default();
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Follow-up {}{}{}", status, id_part, suffix),
                         );
                         resource_changed = Some("intendant://logs");
                     }
@@ -3672,6 +3696,7 @@ impl IntendantServer {
                     reference_frame_ids: params.reference_frame_ids,
                     display_target: params.display_target,
                     attachments: vec![],
+                    follow_up_id: None,
                 }));
             return "ok (CU task dispatched)".to_string();
         }

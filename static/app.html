@@ -1244,6 +1244,7 @@ html, body {
 .steer-row.accepted { color: var(--blue); border-left-color: var(--blue); }
 .steer-row.queued { color: var(--yellow); border-left-color: var(--yellow); }
 .steer-row.delivered { color: var(--green); border-left-color: var(--green); }
+.steer-row.failed { color: var(--red); border-left-color: var(--red); }
 .steer-row.fading { opacity: 0; }
 .steer-icon { margin-right: 4px; flex-shrink: 0; }
 .steer-text {
@@ -1759,6 +1760,14 @@ html, body {
 }
 .session-window-menu button:hover {
   background: var(--surface0);
+}
+.session-window-menu button:disabled {
+  color: var(--overlay0);
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+.session-window-menu button:disabled:hover {
+  background: transparent;
 }
 .session-window-menu-separator {
   height: 1px;
@@ -7405,6 +7414,7 @@ let currentSessionDetail = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
 let steerCounter = 0;
+let followUpCounter = 0;
 let editMessageDraft = null;
 const approvalSessionIds = new Map();
 let spinnerIdx = 0;
@@ -7967,6 +7977,13 @@ async function main() {
       }
       if (d.event === 'session_relationship') {
         applySessionRelationship(d);
+      }
+      if (d.event === 'session_capabilities') {
+        applySessionCapabilities(d);
+      }
+      if (d.event === 'follow_up_status') {
+        onSteerStatusUpdate(d.id, d.text || '', d.status, d.reason);
+        return;
       }
       if (d.event === 'approval_required' && d.id !== undefined && d.session_id) {
         approvalSessionIds.set(String(d.id), d.session_id);
@@ -8564,6 +8581,7 @@ function processCommands(cmds) {
       case 'recording_error': /* logged via add_log_entry */ break;
       case 'session_started': onSessionStarted(c.session_id, c.task); break;
       case 'session_relationship': applySessionRelationship(c); break;
+      case 'session_capabilities': applySessionCapabilities(c); break;
       case 'session_attached': onSessionAttached(c.session_id, c.source); break;
       case 'session_ended': onSessionEnded(c.session_id, c.reason); break;
       case 'external_agent_changed': updateStatusBar({ external_agent: c.agent }); break;
@@ -8627,6 +8645,9 @@ function processCommands(cmds) {
       // delivered (agent got it).
       case 'steer_status_update':
         onSteerStatusUpdate(c.id, c.text, c.status, c.reason);
+        break;
+      case 'follow_up_status':
+        onSteerStatusUpdate(c.id, c.text || '', c.status, c.reason);
         break;
       // Per-peer event stream (phase B of the secondary migration).
       // Each command carries `host_id` as a typed field so we route
@@ -9516,6 +9537,11 @@ function dispatchCodexThreadAction(op, params, sessionId = '') {
   const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
   if (sid && sessionWindowIsSide(sid) && !codexThreadActionAllowedForSide(op)) {
     showControlToast('error', `/${op} is not available in a /side window; use the parent thread`);
+    return false;
+  }
+  const actionState = sid ? codexThreadActionStateForSession(sid, op) : { allowed: true, reason: '' };
+  if (sid && !actionState.allowed) {
+    showControlToast('error', `/${op} is not available here: ${actionState.reason}`);
     return false;
   }
   if (
@@ -11446,6 +11472,13 @@ function sessionWindowIsSide(sessionId) {
   return meta.relationshipKind === 'side';
 }
 
+function sessionWindowIsSubagent(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  const meta = sessionMetadataById.get(sid) || {};
+  return meta.relationshipKind === 'subagent';
+}
+
 function sessionWindowShouldStartHeaderCollapsed(meta = {}) {
   return String(meta.relationshipKind || '').trim().toLowerCase() === 'subagent';
 }
@@ -11453,6 +11486,72 @@ function sessionWindowShouldStartHeaderCollapsed(meta = {}) {
 function codexThreadActionAllowedForSide(op) {
   const normalized = String(op || '').trim().toLowerCase().replace(/_/g, '-');
   return normalized === 'side-close' || normalized === 'undo';
+}
+
+function normalizeSessionCapabilities(raw = null) {
+  if (!raw || typeof raw !== 'object') return null;
+  const actions = raw.codex_thread_actions || raw.codexThreadActions;
+  return {
+    followUp: raw.follow_up ?? raw.followUp ?? true,
+    steer: raw.steer ?? false,
+    interrupt: raw.interrupt ?? false,
+    codexThreadActions: Array.isArray(actions)
+      ? actions.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
+      : null,
+  };
+}
+
+function applySessionCapabilities(evt = {}) {
+  const sid = String(evt.session_id || evt.sessionId || '').trim();
+  if (!sid) return;
+  const capabilities = normalizeSessionCapabilities(evt.capabilities || evt);
+  if (!capabilities) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  sessionMetadataById.set(sid, { ...meta, capabilities });
+  updateSessionWindowActionMenuVisibility(sid);
+  updateStopButtonVisibility(currentPhase);
+  updateSubmitButtonLabel(currentPhase);
+}
+
+function getSessionCapabilities(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const meta = sessionMetadataById.get(sid) || {};
+  if (meta.capabilities) return meta.capabilities;
+  if (meta.relationshipKind === 'subagent') {
+    return { followUp: true, steer: false, interrupt: false, codexThreadActions: [] };
+  }
+  return null;
+}
+
+function sessionSupportsSteer(sessionId) {
+  const capabilities = getSessionCapabilities(sessionId);
+  return capabilities ? capabilities.steer !== false : true;
+}
+
+function sessionSupportsInterrupt(sessionId) {
+  const capabilities = getSessionCapabilities(sessionId);
+  return capabilities ? capabilities.interrupt !== false : true;
+}
+
+function codexThreadActionStateForSession(sessionId, op) {
+  const normalized = String(op || '').trim().toLowerCase().replace(/_/g, '-');
+  if (sessionWindowIsSide(sessionId)) {
+    return codexThreadActionAllowedForSide(normalized)
+      ? { allowed: true, reason: '' }
+      : { allowed: false, reason: 'Unsupported in a /side window' };
+  }
+  const capabilities = getSessionCapabilities(sessionId);
+  if (capabilities && Array.isArray(capabilities.codexThreadActions)) {
+    const allowed = capabilities.codexThreadActions.includes(normalized);
+    return allowed
+      ? { allowed: true, reason: '' }
+      : { allowed: false, reason: 'Unsupported for this session' };
+  }
+  if (sessionWindowIsSubagent(sessionId)) {
+    return { allowed: false, reason: 'Unsupported for Codex subagent threads' };
+  }
+  return { allowed: true, reason: '' };
 }
 
 function closeSessionWindowMenus(exceptSessionId = '') {
@@ -11498,7 +11597,13 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   win.actionMenuButton.title = 'Session actions';
   win.actionMenuButton.setAttribute('aria-label', win.actionMenuButton.title);
   win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
+    const op = item.dataset.sessionWindowAction || '';
+    const spec = SESSION_WINDOW_CODEX_ACTIONS.find(action => action.op === op);
+    const state = codexThreadActionStateForSession(sid, op);
     item.classList.toggle('hidden', !isCodex || isSide);
+    item.disabled = isCodex && !isSide ? !state.allowed : false;
+    item.title = state.allowed ? (spec?.title || '') : state.reason;
+    item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-separator]').forEach(item => {
     item.classList.toggle('hidden', !isCodex || isSide);
@@ -11940,6 +12045,11 @@ function runSessionWindowCodexAction(sessionId, op) {
   if (!sid || !spec) return;
   if (!sessionWindowIsCodex(sid)) {
     showControlToast('error', 'Codex actions are only available for Codex sessions');
+    return;
+  }
+  const actionState = codexThreadActionStateForSession(sid, op);
+  if (!actionState.allowed) {
+    showControlToast('error', `/${op} is not available here: ${actionState.reason}`);
     return;
   }
   const params = promptCodexThreadActionParams(spec);
@@ -23071,7 +23181,7 @@ function wireTaskTextarea(id, submit) {
   resizeTaskTextarea(input);
 }
 
-window.submitActivityTask = function() {
+window.submitActivityTask = function(options = {}) {
   const input = document.getElementById('activity-task-input');
   if (!input || !app) return;
   const text = input.value.trim();
@@ -23090,6 +23200,17 @@ window.submitActivityTask = function() {
   const msg = targetSessionId
     ? { action: 'start_task', task: text, session_id: targetSessionId }
     : { action: 'create_session', task: text };
+  if (targetSessionId && options.queuedFollowUp) {
+    followUpCounter = (followUpCounter + 1) >>> 0;
+    const id = 'follow-' + Date.now() + '-' + followUpCounter;
+    msg.follow_up_id = id;
+    onSteerStatusUpdate(
+      id,
+      attachments.length > 0 ? `${text} (${attachments.length} attachment${attachments.length === 1 ? '' : 's'})` : text,
+      'queued',
+      'queued for next turn'
+    );
+  }
   if (direct) msg.direct = true;
   if (attachments.length > 0) msg.attachments = attachments;
   app.send_server_action(msg);
@@ -23130,7 +23251,11 @@ window.submitActivityOrSteer = function() {
     return;
   }
   const targetSessionId = resolvePromptTargetSessionId();
-  if (targetSessionId && isSessionWindowEffectivelyActive(targetSessionId)) {
+  if (
+    targetSessionId &&
+    isSessionWindowEffectivelyActive(targetSessionId) &&
+    sessionSupportsSteer(targetSessionId)
+  ) {
     // Mid-turn steer path. JS generates the id locally and we render an
     // optimistic pending row immediately — the backend round-trips a
     // steer_requested echo that updates the same row by id (idempotent
@@ -23157,7 +23282,13 @@ window.submitActivityOrSteer = function() {
     clearTaskTextarea(input);
   } else {
     // Normal task / follow-up path.
-    submitActivityTask();
+    submitActivityTask({
+      queuedFollowUp: !!(
+        targetSessionId &&
+        isSessionWindowEffectivelyActive(targetSessionId) &&
+        !sessionSupportsSteer(targetSessionId)
+      ),
+    });
   }
 };
 
@@ -23179,7 +23310,8 @@ function updateSubmitButtonLabel(phase) {
   const active = targetSessionId
     ? isSessionWindowEffectivelyActive(targetSessionId)
     : isAgentActivePhase(phase);
-  if (active) {
+  const canSteer = targetSessionId ? sessionSupportsSteer(targetSessionId) : true;
+  if (active && canSteer) {
     btn.innerHTML = '\u2197 Steer';
     btn.classList.add('steer-mode');
     btn.title = 'Send a mid-turn message to the agent. May be queued until the current turn ends.';
@@ -23222,7 +23354,7 @@ function onSteerStatusUpdate(id, text, status, reason) {
   const el = entry.el;
   el.className = 'steer-row ' + status;
   // Icons chosen to match the WASM-side log lines so the strip and the log tell the same story.
-  const iconByStatus = { pending: '\u23F3', accepted: '\u21AA', queued: '\u23F0', delivered: '\u2713' };
+  const iconByStatus = { pending: '\u23F3', accepted: '\u21AA', queued: '\u23F0', delivered: '\u2713', failed: '\u2715' };
   el.querySelector('.steer-icon').textContent = iconByStatus[status] || '';
   el.querySelector('.steer-text').textContent = text || '';
   el.querySelector('.steer-reason').textContent = reason ? ('— ' + reason) : '';
@@ -25993,7 +26125,7 @@ function updateStopButtonVisibility(phase) {
   const key = (phase || '').toLowerCase();
   const targetSessionId = resolvePromptTargetSessionId();
   const show = targetSessionId
-    ? isSessionWindowEffectivelyActive(targetSessionId)
+    ? isSessionWindowEffectivelyActive(targetSessionId) && sessionSupportsInterrupt(targetSessionId)
     : isAgentActivePhase(key);
   btn.style.display = show ? '' : 'none';
   // Only `interrupting` should show the disabled "Interrupting..." label.

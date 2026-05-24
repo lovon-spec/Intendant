@@ -541,6 +541,14 @@ pub trait ExternalAgent: Send + Sync {
         ))
     }
 
+    /// Restore the backend adapter's notion of the active thread after a
+    /// targeted child-thread turn. This is local adapter state: it does not
+    /// send a provider request.
+    async fn activate_thread(&mut self, thread_id: &str) -> Result<(), CallerError> {
+        let _ = thread_id;
+        Ok(())
+    }
+
     /// Shut down the agent process.
     async fn shutdown(&mut self) -> Result<(), CallerError>;
 }

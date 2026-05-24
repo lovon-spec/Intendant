@@ -498,6 +498,7 @@ impl PeerTransport for IntendantWsTransport {
                     session_id: None,
                     text,
                     direct: None,
+                    follow_up_id: None,
                 })
                 .await?;
                 let seq = self.next_out_seq();
@@ -512,6 +513,7 @@ impl PeerTransport for IntendantWsTransport {
                     reference_frame_ids: Vec::new(),
                     display_target: None,
                     attachments: Vec::new(),
+                    follow_up_id: None,
                 })
                 .await?;
                 let seq = self.next_out_seq();

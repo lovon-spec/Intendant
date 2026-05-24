@@ -3024,6 +3024,12 @@ impl ExternalAgent for CodexAgent {
         Ok(())
     }
 
+    async fn activate_thread(&mut self, thread_id: &str) -> Result<(), CallerError> {
+        self.active_turn_id.lock().await.take();
+        *self.active_thread_id.lock().await = Some(thread_id.to_string());
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Result<(), CallerError> {
         // Abort reader task
         if let Some(handle) = self.reader_handle.take() {

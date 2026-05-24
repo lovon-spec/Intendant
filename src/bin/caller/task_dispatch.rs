@@ -100,6 +100,7 @@ impl Dispatcher {
                 reference_frame_ids,
                 display_target,
                 attachments,
+                follow_up_id,
             } => {
                 let is_direct = direct.unwrap_or(false) || orchestrate == Some(false);
                 let has_metadata = !reference_frame_ids.is_empty()
@@ -136,7 +137,13 @@ impl Dispatcher {
                 }
 
                 if let Some(ref tx) = self.follow_up_tx {
-                    if tx.try_send(FollowUpMessage::text(task.clone())).is_ok() {
+                    if tx
+                        .try_send(
+                            FollowUpMessage::text(task.clone())
+                                .with_follow_up_id(follow_up_id.clone()),
+                        )
+                        .is_ok()
+                    {
                         return;
                     }
                 }
@@ -149,7 +156,12 @@ impl Dispatcher {
                 // to choose the log dir, project root, and backend-native id.
             }
 
-            ControlMsg::FollowUp { text, direct, .. } => {
+            ControlMsg::FollowUp {
+                text,
+                direct,
+                follow_up_id,
+                ..
+            } => {
                 let is_direct = direct.unwrap_or(false);
 
                 if !is_direct {
@@ -176,7 +188,13 @@ impl Dispatcher {
                 }
 
                 if let Some(ref tx) = self.follow_up_tx {
-                    if tx.try_send(FollowUpMessage::text(text.clone())).is_ok() {
+                    if tx
+                        .try_send(
+                            FollowUpMessage::text(text.clone())
+                                .with_follow_up_id(follow_up_id.clone()),
+                        )
+                        .is_ok()
+                    {
                         return;
                     }
                 }
@@ -314,6 +332,7 @@ mod tests {
             reference_frame_ids: vec!["f1".into()],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -352,6 +371,7 @@ mod tests {
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
 
         let text = tokio::time::timeout(std::time::Duration::from_millis(200), presence_rx.recv())
@@ -385,6 +405,7 @@ mod tests {
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -415,6 +436,7 @@ mod tests {
             session_id: None,
             text: "more please".into(),
             direct: Some(true),
+            follow_up_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -443,6 +465,7 @@ mod tests {
             session_id: None,
             text: "keep going".into(),
             direct: None,
+            follow_up_id: None,
         }));
 
         let msg = tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
@@ -475,6 +498,7 @@ mod tests {
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(follow_up_rx.try_recv().is_err());
@@ -503,6 +527,7 @@ mod tests {
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())

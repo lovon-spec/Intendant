@@ -276,6 +276,8 @@ impl AppEventUpcaster {
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::SessionIdentity { .. }
             | AppEvent::SessionRelationship { .. }
+            | AppEvent::SessionCapabilities { .. }
+            | AppEvent::FollowUpStatus { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::FileChanged { .. }
             | AppEvent::UploadReady { .. }
@@ -1353,6 +1355,8 @@ impl WireEventUpcaster {
             | OutboundEvent::ConversationRolledBack { .. }
             | OutboundEvent::SessionIdentity { .. }
             | OutboundEvent::SessionRelationship { .. }
+            | OutboundEvent::SessionCapabilities { .. }
+            | OutboundEvent::FollowUpStatus { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }

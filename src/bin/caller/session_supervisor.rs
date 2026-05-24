@@ -38,7 +38,21 @@ pub struct SessionSupervisor {
 struct SupervisorState {
     sessions: HashMap<String, ManagedSession>,
     session_aliases: HashMap<String, String>,
+    related_sessions: HashMap<String, RelatedSession>,
     active_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RelatedSession {
+    parent_session_id: String,
+    relationship: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelatedSessionRecord {
+    parent_session_id: String,
+    child_session_id: String,
+    relationship: String,
 }
 
 struct ManagedSession {
@@ -77,11 +91,43 @@ impl SupervisorState {
         self.resolve_session_id(session_id).is_some()
     }
 
+    fn apply_related_session(
+        &mut self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        relationship: &str,
+    ) -> bool {
+        let relationship = relationship.trim().to_ascii_lowercase();
+        if !matches!(relationship.as_str(), "side" | "subagent") {
+            return false;
+        }
+        let parent = parent_session_id.trim();
+        let child = child_session_id.trim();
+        if parent.is_empty() || child.is_empty() || parent == child {
+            return false;
+        }
+        let Some(parent_key) = self.resolve_session_id(parent) else {
+            return false;
+        };
+        self.session_aliases
+            .insert(child.to_string(), parent_key.clone());
+        self.related_sessions.insert(
+            child.to_string(),
+            RelatedSession {
+                parent_session_id: parent_key,
+                relationship,
+            },
+        );
+        true
+    }
+
     fn remove_session(&mut self, session_id: &str) -> Option<(String, ManagedSession)> {
         let canonical = self.resolve_session_id(session_id)?;
         let removed = self.sessions.remove(&canonical)?;
         self.session_aliases
             .retain(|alias, target| alias != &canonical && target != &canonical);
+        self.related_sessions
+            .retain(|child, rel| child != &canonical && rel.parent_session_id != canonical);
         if self.active_session_id.as_deref() == Some(&canonical)
             || self.active_session_id.as_deref() == Some(session_id)
         {
@@ -211,7 +257,8 @@ impl SessionSupervisor {
                             "Slash command dropped new-session metadata; routing to active Codex session",
                         );
                     }
-                    self.route_follow_up(None, task, direct, attachments).await;
+                    self.route_follow_up(None, task, direct, attachments, None)
+                        .await;
                     return;
                 }
                 self.start_new_session(
@@ -235,6 +282,7 @@ impl SessionSupervisor {
                 reference_frame_ids,
                 display_target,
                 attachments,
+                follow_up_id,
                 ..
             } => {
                 if !reference_frame_ids.is_empty() || display_target.is_some() {
@@ -243,7 +291,7 @@ impl SessionSupervisor {
                         short_session(&session_id)
                     ));
                 }
-                self.route_follow_up(Some(session_id), task, direct, attachments)
+                self.route_follow_up(Some(session_id), task, direct, attachments, follow_up_id)
                     .await;
             }
             event::ControlMsg::StartTask {
@@ -254,6 +302,7 @@ impl SessionSupervisor {
                 reference_frame_ids,
                 display_target,
                 attachments,
+                follow_up_id: _,
             } => {
                 if parse_codex_slash_command(&task).is_some() {
                     if !reference_frame_ids.is_empty() || display_target.is_some() {
@@ -261,7 +310,8 @@ impl SessionSupervisor {
                             "Slash command dropped reference frame/display metadata; routing to active Codex session",
                         );
                     }
-                    self.route_follow_up(None, task, direct, attachments).await;
+                    self.route_follow_up(None, task, direct, attachments, None)
+                        .await;
                     return;
                 }
                 self.start_new_session(
@@ -293,8 +343,10 @@ impl SessionSupervisor {
                 session_id,
                 text,
                 direct,
+                follow_up_id,
             } => {
-                self.route_follow_up(session_id, text, direct, vec![]).await;
+                self.route_follow_up(session_id, text, direct, vec![], follow_up_id)
+                    .await;
             }
             event::ControlMsg::EditUserMessage {
                 session_id,
@@ -932,6 +984,7 @@ impl SessionSupervisor {
         text: String,
         _direct: Option<bool>,
         attachments: Vec<String>,
+        follow_up_id: Option<String>,
     ) {
         let (target_id, entry) = {
             let state = self.state.lock().await;
@@ -945,6 +998,7 @@ impl SessionSupervisor {
                 .resolve_session_id(&requested_id)
                 .unwrap_or_else(|| requested_id.clone());
             let entry = state.sessions.get(&target_id).map(|s| {
+                let relation = state.related_sessions.get(&requested_id).cloned();
                 (
                     s.session_id.clone(),
                     s.source.clone(),
@@ -952,17 +1006,29 @@ impl SessionSupervisor {
                     s.session_dir.clone(),
                     s.follow_up_tx.clone(),
                     requested_id.clone(),
+                    relation,
                 )
             });
             (target_id, entry)
         };
 
         match entry {
-            Some((managed_id, source, project_root, session_dir, tx, requested_id)) => {
+            Some((managed_id, source, project_root, session_dir, tx, requested_id, relation)) => {
                 if let Some(parsed) = parse_codex_slash_command(&text) {
                     match parsed {
                         Ok(command) => {
                             if source == "codex" {
+                                if relation
+                                    .as_ref()
+                                    .is_some_and(|rel| rel.relationship == "subagent")
+                                {
+                                    self.warn(&format!(
+                                        "Slash command /{} is not supported for Codex subagent session {}",
+                                        command.op,
+                                        short_session(&requested_id)
+                                    ));
+                                    return;
+                                }
                                 if !attachments.is_empty() {
                                     self.warn(&format!(
                                         "Slash command /{} for Codex session {} ignored {} attachment(s)",
@@ -1013,20 +1079,46 @@ impl SessionSupervisor {
                     ));
                 }
                 let msg = FollowUpMessage::with_attachments(
-                    text,
+                    text.clone(),
                     UserAttachments::from_items(resolved_attachments),
                 )
-                .for_target(Some(requested_id));
+                .for_target(Some(requested_id.clone()))
+                .with_follow_up_id(follow_up_id.clone());
                 if tx.send(msg).await.is_err() {
+                    emit_follow_up_status(
+                        &self.config.bus,
+                        Some(requested_id.clone()),
+                        &follow_up_id,
+                        None,
+                        "failed",
+                        Some("target session is not accepting input"),
+                    );
                     self.warn(&format!(
                         "FollowUp dropped: {} session {} in {} is not accepting input",
                         source,
                         short_session(&managed_id),
                         project_root.display()
                     ));
+                } else {
+                    emit_follow_up_status(
+                        &self.config.bus,
+                        Some(requested_id),
+                        &follow_up_id,
+                        Some(&text),
+                        "queued",
+                        Some("queued for next turn"),
+                    );
                 }
             }
             None => {
+                emit_follow_up_status(
+                    &self.config.bus,
+                    Some(target_id.clone()),
+                    &follow_up_id,
+                    Some(&text),
+                    "failed",
+                    Some("target session is not managed by this daemon"),
+                );
                 self.warn(&format!(
                     "FollowUp dropped: session {} is not managed by this daemon",
                     short_session(&target_id)
@@ -1149,6 +1241,21 @@ impl SessionSupervisor {
             self.warn("Interrupt dropped: no active managed session");
             return;
         };
+        if let Some(requested_id) = requested_id.as_deref() {
+            let state = self.state.lock().await;
+            if state
+                .related_sessions
+                .get(requested_id)
+                .is_some_and(|rel| rel.relationship == "subagent")
+            {
+                drop(state);
+                self.warn(&format!(
+                    "Interrupt dropped: Codex subagent session {} does not support interrupts",
+                    short_session(requested_id)
+                ));
+                return;
+            }
+        }
         if !self.session_is_managed(&target_id).await {
             self.warn(&format!(
                 "Interrupt dropped: session {} is not managed by this daemon",
@@ -1179,22 +1286,37 @@ impl SessionSupervisor {
                 .resolve_session_id(&target_id)
                 .unwrap_or_else(|| target_id.clone());
             state.sessions.get(&target_id).map(|s| {
+                let relation = requested_id
+                    .as_deref()
+                    .and_then(|id| state.related_sessions.get(id))
+                    .cloned();
                 (
                     s.session_id.clone(),
                     s.source.clone(),
                     s.project_root.clone(),
                     s.session_dir.clone(),
                     s.follow_up_tx.clone(),
+                    relation,
                 )
             })
         };
-        let Some((managed_id, source, project_root, session_dir, tx)) = entry else {
+        let Some((managed_id, source, project_root, session_dir, tx, relation)) = entry else {
             self.warn(&format!(
                 "Steer dropped: session {} is not managed by this daemon",
                 short_session(&target_id)
             ));
             return;
         };
+        if relation
+            .as_ref()
+            .is_some_and(|rel| rel.relationship == "subagent")
+        {
+            self.warn(&format!(
+                "Steer dropped: Codex subagent session {} does not support mid-turn steering; send a follow-up instead",
+                short_session(requested_id.as_deref().unwrap_or(&managed_id))
+            ));
+            return;
+        }
 
         let steer_id = id.unwrap_or_default();
         let event_session_id = requested_id.clone().or(Some(managed_id.clone()));
@@ -1448,20 +1570,8 @@ impl SessionSupervisor {
         child_session_id: String,
         relationship: String,
     ) {
-        if relationship.trim().to_ascii_lowercase() != "side" {
-            return;
-        }
-        let parent = parent_session_id.trim();
-        let child = child_session_id.trim();
-        if parent.is_empty() || child.is_empty() || parent == child {
-            return;
-        }
-
         let mut state = self.state.lock().await;
-        let Some(parent_key) = state.resolve_session_id(parent) else {
-            return;
-        };
-        state.session_aliases.insert(child.to_string(), parent_key);
+        state.apply_related_session(&parent_session_id, &child_session_id, &relationship);
     }
 
     async fn remove_session_alias(&self, session_id: &str) {
@@ -1471,6 +1581,7 @@ impl SessionSupervisor {
         }
         let mut state = self.state.lock().await;
         state.session_aliases.remove(session_id);
+        state.related_sessions.remove(session_id);
     }
 
     async fn resolve_target_session_id(&self, session_id: Option<String>) -> Option<String> {
@@ -1494,6 +1605,7 @@ impl SessionSupervisor {
         approval_registry: event::ApprovalRegistry,
         name: Option<String>,
     ) {
+        let rehydrated_related = load_related_sessions_from_log(&session_dir);
         let mut state = self.state.lock().await;
         state.active_session_id = Some(session_id.clone());
         state.session_aliases.remove(&session_id);
@@ -1509,6 +1621,13 @@ impl SessionSupervisor {
                 approval_registry,
             },
         );
+        for rel in rehydrated_related {
+            state.apply_related_session(
+                &rel.parent_session_id,
+                &rel.child_session_id,
+                &rel.relationship,
+            );
+        }
     }
 
     async fn finish_session(
@@ -1968,6 +2087,72 @@ fn short_session(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
 
+fn emit_follow_up_status(
+    bus: &EventBus,
+    session_id: Option<String>,
+    id: &Option<String>,
+    text: Option<&str>,
+    status: &str,
+    reason: Option<&str>,
+) {
+    let Some(id) = id.as_deref().map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::FollowUpStatus {
+        session_id,
+        id: id.to_string(),
+        text: text.map(str::to_string),
+        status: status.to_string(),
+        reason: reason.map(str::to_string),
+    });
+}
+
+fn load_related_sessions_from_log(session_dir: &Path) -> Vec<RelatedSessionRecord> {
+    let path = session_dir.join("session.jsonl");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_relationship"))
+        .filter_map(|entry| {
+            let data = entry.get("data")?;
+            let parent_session_id = data
+                .get("parent_session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let child_session_id = data
+                .get("child_session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let relationship = data
+                .get("relationship")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if parent_session_id.is_empty()
+                || child_session_id.is_empty()
+                || parent_session_id == child_session_id
+                || !matches!(relationship.as_str(), "side" | "subagent")
+            {
+                return None;
+            }
+            Some(RelatedSessionRecord {
+                parent_session_id,
+                child_session_id,
+                relationship,
+            })
+        })
+        .collect()
+}
+
 fn short_text(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
@@ -2035,6 +2220,60 @@ mod tests {
         state.session_aliases.remove("side-child");
         assert!(!state.session_is_managed("side-child"));
         assert!(state.session_is_managed("parent"));
+    }
+
+    #[test]
+    fn supervisor_state_tracks_subagent_child_as_related_parent_target() {
+        let mut state = SupervisorState::default();
+        state
+            .sessions
+            .insert("parent".to_string(), managed_session("parent", "codex"));
+        assert!(state.apply_related_session("parent", "sub-child", "subagent"));
+
+        assert_eq!(
+            state.resolve_session_id("sub-child").as_deref(),
+            Some("parent")
+        );
+        assert_eq!(
+            state
+                .related_sessions
+                .get("sub-child")
+                .map(|rel| rel.relationship.as_str()),
+            Some("subagent")
+        );
+
+        let removed = state.remove_session("parent");
+        assert!(removed.is_some());
+        assert!(!state.session_is_managed("sub-child"));
+        assert!(!state.related_sessions.contains_key("sub-child"));
+    }
+
+    #[test]
+    fn loads_related_sessions_from_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.session_relationship("parent", "sub-child", "subagent", false);
+        log.session_relationship("parent", "side-child", "side", true);
+        log.session_relationship("parent", "fork-child", "fork", false);
+        drop(log);
+
+        let related = load_related_sessions_from_log(&log_dir);
+        assert_eq!(
+            related,
+            vec![
+                RelatedSessionRecord {
+                    parent_session_id: "parent".to_string(),
+                    child_session_id: "sub-child".to_string(),
+                    relationship: "subagent".to_string(),
+                },
+                RelatedSessionRecord {
+                    parent_session_id: "parent".to_string(),
+                    child_session_id: "side-child".to_string(),
+                    relationship: "side".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

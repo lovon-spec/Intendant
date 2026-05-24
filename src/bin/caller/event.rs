@@ -6,7 +6,7 @@
 
 use crate::autonomy::ActionCategory;
 use crate::provider::TokenUsage;
-use crate::types::LogLevel;
+use crate::types::{LogLevel, SessionCapabilities};
 use crossterm::event::KeyEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -230,6 +230,17 @@ pub enum AppEvent {
         id: String,
         mid_turn: bool,
     },
+    /// Ordinary follow-up lifecycle for targets that cannot be steered
+    /// mid-turn. Frontends use this to show "queued for next turn" rather
+    /// than making a subagent appear unresponsive while the parent loop is
+    /// still draining the current child turn.
+    FollowUpStatus {
+        session_id: Option<String>,
+        id: String,
+        text: Option<String>,
+        status: String,
+        reason: Option<String>,
+    },
     SessionStarted {
         session_id: String,
         task: Option<String>,
@@ -251,6 +262,13 @@ pub enum AppEvent {
         child_session_id: String,
         relationship: String,
         ephemeral: bool,
+    },
+    /// Describes which frontend actions are supported for a visible session.
+    /// Synthetic child sessions can use this to expose follow-ups while
+    /// disabling controls the underlying backend cannot honor for that target.
+    SessionCapabilities {
+        session_id: String,
+        capabilities: SessionCapabilities,
     },
     SessionAttached {
         session_id: String,
@@ -1045,6 +1063,10 @@ pub enum ControlMsg {
         /// (Codex `LocalImage`, Gemini ACP `ContentBlock::Image`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<String>,
+        /// Optional client-generated id for a follow-up that the frontend
+        /// knows will be queued rather than steered mid-turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        follow_up_id: Option<String>,
     },
     ResumeSession {
         /// Session source: "intendant", "codex", "claude-code", or "gemini".
@@ -1080,6 +1102,9 @@ pub enum ControlMsg {
         /// (or `Some(false)`) means route through presence as before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direct: Option<bool>,
+        /// Optional client-generated id for queued-follow-up status updates.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        follow_up_id: Option<String>,
     },
     /// Replace a previous user message by rewinding the target session to the
     /// selected user turn and submitting replacement text.
@@ -1408,6 +1433,19 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             id: id.clone(),
             mid_turn: *mid_turn,
         }),
+        AppEvent::FollowUpStatus {
+            session_id,
+            id,
+            text,
+            status,
+            reason,
+        } => Some(OutboundEvent::FollowUpStatus {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            text: text.clone(),
+            status: status.clone(),
+            reason: reason.clone(),
+        }),
         AppEvent::SessionStarted { session_id, task } => Some(OutboundEvent::SessionStarted {
             session_id: session_id.clone(),
             task: task.clone(),
@@ -1431,6 +1469,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             child_session_id: child_session_id.clone(),
             relationship: relationship.clone(),
             ephemeral: *ephemeral,
+        }),
+        AppEvent::SessionCapabilities {
+            session_id,
+            capabilities,
+        } => Some(OutboundEvent::SessionCapabilities {
+            session_id: session_id.clone(),
+            capabilities: capabilities.clone(),
         }),
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
@@ -1979,6 +2024,32 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
         AppEvent::SessionStarted { session_id, task } => {
             log.session_started(session_id, task.as_deref());
+        }
+        AppEvent::SessionIdentity {
+            session_id,
+            source,
+            backend_session_id,
+        } => {
+            log.session_identity(session_id, source, backend_session_id);
+        }
+        AppEvent::SessionRelationship {
+            parent_session_id,
+            child_session_id,
+            relationship,
+            ephemeral,
+        } => {
+            log.session_relationship(
+                parent_session_id,
+                child_session_id,
+                relationship,
+                *ephemeral,
+            );
+        }
+        AppEvent::SessionCapabilities {
+            session_id,
+            capabilities,
+        } => {
+            log.session_capabilities(session_id, capabilities);
         }
         AppEvent::SessionAttached { session_id, source } => {
             log.info(&format!("Session attached: {} ({})", session_id, source));
@@ -2569,11 +2640,13 @@ mod tests {
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachments: vec![],
+                follow_up_id: None,
             },
             ControlMsg::FollowUp {
                 session_id: None,
                 text: "continue working".to_string(),
                 direct: None,
+                follow_up_id: None,
             },
             ControlMsg::QueryDetail {
                 scope: "diff".to_string(),
@@ -2813,6 +2886,7 @@ mod tests {
             reference_frame_ids: vec!["display_99-f00001".to_string()],
             display_target: Some("user_session".to_string()),
             attachments: vec!["ann-recording-1".to_string(), "ann-recording-2".to_string()],
+            follow_up_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&json).unwrap();
@@ -2854,6 +2928,7 @@ mod tests {
             session_id: Some("sess-123".to_string()),
             text: "more detail".to_string(),
             direct: Some(true),
+            follow_up_id: Some("follow-1".to_string()),
         };
         let follow_json = serde_json::to_string(&follow).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&follow_json).unwrap();
@@ -2862,10 +2937,12 @@ mod tests {
                 session_id,
                 text,
                 direct,
+                follow_up_id,
             } => {
                 assert_eq!(session_id.as_deref(), Some("sess-123"));
                 assert_eq!(text, "more detail");
                 assert_eq!(direct, Some(true));
+                assert_eq!(follow_up_id.as_deref(), Some("follow-1"));
             }
             _ => panic!("expected FollowUp"),
         }
@@ -3223,6 +3300,45 @@ mod tests {
         assert!(json.contains("\"child_session_id\":\"child-1\""));
         assert!(json.contains("\"relationship\":\"side\""));
         assert!(json.contains("\"ephemeral\":true"));
+    }
+
+    #[test]
+    fn outbound_session_capabilities_preserves_controls() {
+        let event = AppEvent::SessionCapabilities {
+            session_id: "child-1".to_string(),
+            capabilities: SessionCapabilities {
+                follow_up: true,
+                steer: false,
+                interrupt: false,
+                codex_thread_actions: vec!["undo".to_string()],
+            },
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"session_capabilities\""));
+        assert!(json.contains("\"session_id\":\"child-1\""));
+        assert!(json.contains("\"follow_up\":true"));
+        assert!(json.contains("\"steer\":false"));
+        assert!(json.contains("\"codex_thread_actions\":[\"undo\"]"));
+    }
+
+    #[test]
+    fn outbound_follow_up_status_preserves_correlation() {
+        let event = AppEvent::FollowUpStatus {
+            session_id: Some("subagent-1".to_string()),
+            id: "follow-1".to_string(),
+            text: Some("next step".to_string()),
+            status: "queued".to_string(),
+            reason: Some("queued for next turn".to_string()),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"follow_up_status\""));
+        assert!(json.contains("\"session_id\":\"subagent-1\""));
+        assert!(json.contains("\"id\":\"follow-1\""));
+        assert!(json.contains("\"text\":\"next step\""));
+        assert!(json.contains("\"status\":\"queued\""));
+        assert!(json.contains("\"reason\":\"queued for next turn\""));
     }
 
     #[test]

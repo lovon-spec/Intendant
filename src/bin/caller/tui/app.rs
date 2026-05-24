@@ -1032,6 +1032,7 @@ impl App {
                             session_id: None,
                             text: text.clone(),
                             direct: None,
+                            follow_up_id: None,
                         }));
                     self.log(
                         LogLevel::Info,
@@ -1674,6 +1675,7 @@ impl App {
                             reference_frame_ids: vec![],
                             display_target: None,
                             attachments: vec![],
+                            follow_up_id: None,
                         });
                     }
                     Err(e) => {
@@ -2373,6 +2375,7 @@ impl App {
             | AppEvent::LogEntry { .. }
             | AppEvent::UserMessageRewind { .. }
             | AppEvent::UserMessageLog { .. }
+            | AppEvent::FollowUpStatus { .. }
             | AppEvent::LiveUsageUpdate { .. }
             | AppEvent::DisplayMetrics { .. }
             | AppEvent::DisplayResize { .. }
@@ -2476,6 +2479,9 @@ impl App {
                 // Frontend-neutral metadata: the web dashboard uses this to
                 // map Intendant wrapper sessions to backend-native thread ids.
                 // The terminal TUI has no separate rendering for it.
+            }
+            AppEvent::SessionCapabilities { .. } => {
+                // Frontend-neutral metadata for dashboard controls.
             }
             AppEvent::SessionAttached {
                 ref session_id,

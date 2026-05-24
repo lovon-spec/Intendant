@@ -1142,6 +1142,76 @@ impl SessionLog {
         });
     }
 
+    /// Link an Intendant-visible session id to a backend-native id.
+    pub fn session_identity(&mut self, session_id: &str, source: &str, backend_session_id: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_identity".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Session identity: {} -> {}:{}",
+                session_id, source, backend_session_id
+            )),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "source": source,
+                "backend_session_id": backend_session_id,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Persist a visible parent/child session relationship.
+    pub fn session_relationship(
+        &mut self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        relationship: &str,
+        ephemeral: bool,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_relationship".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Session relationship: {} -> {} ({})",
+                parent_session_id, child_session_id, relationship
+            )),
+            data: Some(serde_json::json!({
+                "parent_session_id": parent_session_id,
+                "child_session_id": child_session_id,
+                "relationship": relationship,
+                "ephemeral": ephemeral,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Persist per-session frontend affordances.
+    pub fn session_capabilities(
+        &mut self,
+        session_id: &str,
+        capabilities: &crate::types::SessionCapabilities,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_capabilities".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Session capabilities: {}", session_id)),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "capabilities": capabilities,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a session ending (MCP multi-task).
     pub fn session_ended(&mut self, session_id: &str, reason: &str) {
         self.emit(LogEvent {
@@ -2315,7 +2385,7 @@ pub fn session_log_entry_to_app_event(
 ) -> Option<crate::event::AppEvent> {
     use crate::event::AppEvent;
     use crate::provider::TokenUsage;
-    use crate::types::LogLevel;
+    use crate::types::{LogLevel, SessionCapabilities};
 
     let event_type = entry.get("event").and_then(|v| v.as_str())?;
     let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -2575,6 +2645,70 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_str())
                 .map(String::from);
             Some(AppEvent::SessionStarted { session_id, task })
+        }
+        "session_identity" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let backend_session_id = data
+                .and_then(|d| d.get("backend_session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AppEvent::SessionIdentity {
+                session_id,
+                source,
+                backend_session_id,
+            })
+        }
+        "session_relationship" => {
+            let parent_session_id = data
+                .and_then(|d| d.get("parent_session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let child_session_id = data
+                .and_then(|d| d.get("child_session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let relationship = data
+                .and_then(|d| d.get("relationship"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ephemeral = data
+                .and_then(|d| d.get("ephemeral"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Some(AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            })
+        }
+        "session_capabilities" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let capabilities = data
+                .and_then(|d| d.get("capabilities"))
+                .and_then(|v| serde_json::from_value::<SessionCapabilities>(v.clone()).ok())
+                .unwrap_or_default();
+            Some(AppEvent::SessionCapabilities {
+                session_id,
+                capabilities,
+            })
         }
         "session_ended" => {
             let session_id = data
@@ -4014,6 +4148,70 @@ mod tests {
                 assert_eq!(turns_in_round, 5);
             }
             other => panic!("expected RoundComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_session_metadata_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.session_identity("child", "codex", "thread-child");
+        log.session_relationship("parent", "child", "subagent", false);
+        log.session_capabilities(
+            "child",
+            &crate::types::SessionCapabilities {
+                follow_up: true,
+                steer: false,
+                interrupt: false,
+                codex_thread_actions: vec![],
+            },
+        );
+        drop(log);
+
+        let identity = read_last_event(&log_dir, "session_identity");
+        match session_log_entry_to_app_event(&identity, &log_dir).unwrap() {
+            AppEvent::SessionIdentity {
+                session_id,
+                source,
+                backend_session_id,
+            } => {
+                assert_eq!(session_id, "child");
+                assert_eq!(source, "codex");
+                assert_eq!(backend_session_id, "thread-child");
+            }
+            other => panic!("expected SessionIdentity, got {:?}", other),
+        }
+
+        let relationship = read_last_event(&log_dir, "session_relationship");
+        match session_log_entry_to_app_event(&relationship, &log_dir).unwrap() {
+            AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            } => {
+                assert_eq!(parent_session_id, "parent");
+                assert_eq!(child_session_id, "child");
+                assert_eq!(relationship, "subagent");
+                assert!(!ephemeral);
+            }
+            other => panic!("expected SessionRelationship, got {:?}", other),
+        }
+
+        let capabilities = read_last_event(&log_dir, "session_capabilities");
+        match session_log_entry_to_app_event(&capabilities, &log_dir).unwrap() {
+            AppEvent::SessionCapabilities {
+                session_id,
+                capabilities,
+            } => {
+                assert_eq!(session_id, "child");
+                assert!(capabilities.follow_up);
+                assert!(!capabilities.steer);
+                assert!(!capabilities.interrupt);
+                assert!(capabilities.codex_thread_actions.is_empty());
+            }
+            other => panic!("expected SessionCapabilities, got {:?}", other),
         }
     }
 

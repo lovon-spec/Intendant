@@ -1871,8 +1871,17 @@ fn emit_codex_subagent_started(
         Some(parent_session_id),
         child_thread_id,
         "subagent",
-        true,
+        false,
     );
+    config.bus.send(AppEvent::SessionCapabilities {
+        session_id: child_thread_id.to_string(),
+        capabilities: types::SessionCapabilities {
+            follow_up: true,
+            steer: false,
+            interrupt: false,
+            codex_thread_actions: Vec::new(),
+        },
+    });
     config.bus.send(AppEvent::SessionStarted {
         session_id: child_thread_id.to_string(),
         task: Some(
@@ -2164,7 +2173,7 @@ fn collab_agent_tool_preview(
     }
 }
 
-async fn drain_external_side_turn(
+async fn drain_external_child_turn(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
     bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
@@ -2173,11 +2182,12 @@ async fn drain_external_side_turn(
     diff_tracker: &mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
     child_thread_id: String,
+    conversation_kind: &str,
 ) {
     slog(config.session_log, |l| {
         l.info(&format!(
-            "Draining Codex side conversation {}",
-            child_thread_id
+            "Draining Codex {} conversation {}",
+            conversation_kind, child_thread_id
         ))
     });
 
@@ -2223,7 +2233,10 @@ async fn drain_external_side_turn(
                 session_id: child_config.session_id.clone(),
                 level: "info".to_string(),
                 source: "Codex".to_string(),
-                content: "Round complete: side conversation ready for follow-up".to_string(),
+                content: format!(
+                    "Round complete: {} conversation ready for follow-up",
+                    conversation_kind
+                ),
                 turn: None,
             });
         }
@@ -2232,21 +2245,27 @@ async fn drain_external_side_turn(
                 session_id: child_config.session_id.clone(),
                 level: "warn".to_string(),
                 source: "Codex".to_string(),
-                content: format!("Agent interrupted: side conversation stopped: {}", reason),
+                content: format!(
+                    "Agent interrupted: {} conversation stopped: {}",
+                    conversation_kind, reason
+                ),
                 turn: None,
             });
         }
         DrainOutcome::Terminated { reason, exit_code } => {
             slog(config.session_log, |l| {
                 l.warn(&format!(
-                    "Codex terminated during side conversation: {} (exit code: {:?})",
-                    reason, exit_code
+                    "Codex terminated during {} conversation: {} (exit code: {:?})",
+                    conversation_kind, reason, exit_code
                 ))
             });
         }
         DrainOutcome::ChannelClosed => {
             slog(config.session_log, |l| {
-                l.warn("Codex side conversation event channel closed")
+                l.warn(&format!(
+                    "Codex {} conversation event channel closed",
+                    conversation_kind
+                ))
             });
         }
     }
@@ -2687,13 +2706,20 @@ async fn drain_external_agent_events(
                     if child_thread_id.is_empty() || child_thread_id == sender_thread_id.trim() {
                         continue;
                     }
+                    let sender_thread_id = sender_thread_id.trim();
+                    if !sender_thread_id.is_empty() {
+                        stats
+                            .codex_subagent_parent_threads
+                            .entry(child_thread_id.to_string())
+                            .or_insert_with(|| sender_thread_id.to_string());
+                    }
                     if stats
                         .codex_subagent_sessions
                         .insert(child_thread_id.to_string())
                     {
                         emit_codex_subagent_started(
                             config,
-                            &sender_thread_id,
+                            sender_thread_id,
                             child_thread_id,
                             prompt_ref,
                             model.as_deref(),
@@ -3220,6 +3246,69 @@ fn drain_steer_queue_as_followup(
     }
 }
 
+fn emit_follow_up_status(
+    bus: &EventBus,
+    session_id: Option<&str>,
+    id: &Option<String>,
+    text: Option<&str>,
+    status: &str,
+    reason: Option<&str>,
+) {
+    let Some(id) = id.as_deref().map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::FollowUpStatus {
+        session_id: session_id.map(str::to_string),
+        id: id.to_string(),
+        text: text.map(str::to_string),
+        status: status.to_string(),
+        reason: reason.map(str::to_string),
+    });
+}
+
+fn codex_subagent_parent_threads_from_log(log_dir: &std::path::Path) -> HashMap<String, String> {
+    let path = log_dir.join("session.jsonl");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+
+    let mut parents = HashMap::new();
+    for line in contents.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry.get("event").and_then(|v| v.as_str()) != Some("session_relationship") {
+            continue;
+        }
+        let Some(data) = entry.get("data") else {
+            continue;
+        };
+        let relationship = data
+            .get("relationship")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if relationship != "subagent" {
+            continue;
+        }
+        let parent = data
+            .get("parent_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let child = data
+            .get("child_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if parent.is_empty() || child.is_empty() || parent == child {
+            continue;
+        }
+        parents.insert(child.to_string(), parent.to_string());
+    }
+    parents
+}
+
 /// Configuration for `run_daemon_loop`.
 struct DaemonConfig {
     bus: EventBus,
@@ -3291,6 +3380,8 @@ struct LoopStats {
     rounds: usize,
     usage: provider::TokenUsage,
     codex_subagent_sessions: std::collections::HashSet<String>,
+    codex_subagent_parent_threads: std::collections::HashMap<String, String>,
+    codex_subagent_rounds: std::collections::HashMap<String, usize>,
     codex_subagent_terminal_sessions: std::collections::HashSet<String>,
     codex_subagent_transcript_offsets: std::collections::HashMap<String, usize>,
     /// Last model response content (for sub-agent result summaries).
@@ -3351,6 +3442,7 @@ struct FollowUpMessage {
     text: String,
     attachments: UserAttachments,
     steer_id: Option<String>,
+    follow_up_id: Option<String>,
     edit_user_turn_index: Option<u32>,
     edit_user_turn_revision: Option<u32>,
     target_session_id: Option<String>,
@@ -3362,6 +3454,7 @@ impl FollowUpMessage {
             text,
             attachments: UserAttachments::default(),
             steer_id: None,
+            follow_up_id: None,
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
             target_session_id: None,
@@ -3373,6 +3466,7 @@ impl FollowUpMessage {
             text,
             attachments,
             steer_id: None,
+            follow_up_id: None,
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
             target_session_id: None,
@@ -3384,6 +3478,7 @@ impl FollowUpMessage {
             text,
             attachments,
             steer_id: Some(steer_id),
+            follow_up_id: None,
             edit_user_turn_index: None,
             edit_user_turn_revision: None,
             target_session_id: None,
@@ -3400,6 +3495,7 @@ impl FollowUpMessage {
             text,
             attachments,
             steer_id: None,
+            follow_up_id: None,
             edit_user_turn_index: Some(user_turn_index),
             edit_user_turn_revision: Some(user_turn_revision),
             target_session_id: None,
@@ -3408,6 +3504,11 @@ impl FollowUpMessage {
 
     fn for_target(mut self, target_session_id: Option<String>) -> Self {
         self.target_session_id = target_session_id;
+        self
+    }
+
+    fn with_follow_up_id(mut self, follow_up_id: Option<String>) -> Self {
+        self.follow_up_id = follow_up_id;
         self
     }
 }
@@ -7910,6 +8011,14 @@ async fn run_round_loop(
                                 mid_turn: false,
                             });
                         }
+                        emit_follow_up_status(
+                            bus,
+                            local_session_id.as_deref(),
+                            &message.follow_up_id,
+                            Some(&message.text),
+                            "delivered",
+                            None,
+                        );
                     }
                     None => {
                         // Channel closed — user quit or sender dropped
@@ -8576,7 +8685,7 @@ async fn run_with_presence(
                             // event. Use a fresh receiver for the child drain
                             // to avoid dispatching `/side` a second time.
                             let mut side_bus_rx = bus.subscribe();
-                            drain_external_side_turn(
+                            drain_external_child_turn(
                                 agent,
                                 event_rx,
                                 &mut side_bus_rx,
@@ -8585,6 +8694,7 @@ async fn run_with_presence(
                                 &mut persistent_diff_tracker,
                                 &mut persistent_pending_runtime_steers,
                                 child_thread_id,
+                                "side",
                             )
                             .await;
                         } else {
@@ -9778,6 +9888,12 @@ async fn run_external_agent_mode(
     };
     let mut round = user_turn_revisions.active_count() as usize;
     let mut stats = LoopStats::default();
+    if backend == external_agent::AgentBackend::Codex {
+        stats.codex_subagent_parent_threads = codex_subagent_parent_threads_from_log(&_log_dir);
+        for child_id in stats.codex_subagent_parent_threads.keys().cloned() {
+            stats.codex_subagent_rounds.entry(child_id).or_insert(0);
+        }
+    }
     let mut diff_tracker = ExternalDiffDeltaTracker::default();
     let mut pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
         std::collections::VecDeque::new();
@@ -9928,7 +10044,7 @@ async fn run_external_agent_mode(
                                     // separate receiver. A fresh receiver keeps
                                     // the side drain from replaying the action.
                                     let mut side_bus_rx = bus.subscribe();
-                                    drain_external_side_turn(
+                                    drain_external_child_turn(
                                         &mut agent,
                                         &mut event_rx,
                                         &mut side_bus_rx,
@@ -9937,6 +10053,7 @@ async fn run_external_agent_mode(
                                         &mut diff_tracker,
                                         &mut pending_runtime_steers,
                                         child_thread_id,
+                                        "side",
                                     )
                                     .await;
                                 } else if let ExternalThreadActionEffect::SideTurnClosed {
@@ -9976,6 +10093,7 @@ async fn run_external_agent_mode(
         let turn_text = followup.text;
         let attachments = followup.attachments;
         let steer_id = followup.steer_id;
+        let follow_up_id = followup.follow_up_id;
         let edit_user_turn_index = followup.edit_user_turn_index;
         let edit_user_turn_revision = followup.edit_user_turn_revision;
         let target_session_id = followup.target_session_id.clone();
@@ -10066,12 +10184,28 @@ async fn run_external_agent_mode(
                     .await
             };
             if let Err(e) = send_result {
+                emit_follow_up_status(
+                    &bus,
+                    Some(&side_thread_id),
+                    &follow_up_id,
+                    Some(&turn_text),
+                    "failed",
+                    Some("failed to send side follow-up"),
+                );
                 bus.send(AppEvent::LoopError(format!(
                     "Failed to send side follow-up: {}",
                     e
                 )));
                 continue;
             }
+            emit_follow_up_status(
+                &bus,
+                Some(&side_thread_id),
+                &follow_up_id,
+                Some(&turn_text),
+                "delivered",
+                None,
+            );
             if let Some(id) = steer_id {
                 bus.send(AppEvent::SteerDelivered {
                     session_id: Some(side_thread_id.clone()),
@@ -10080,7 +10214,7 @@ async fn run_external_agent_mode(
                 });
             }
             let mut side_bus_rx = bus.subscribe();
-            drain_external_side_turn(
+            drain_external_child_turn(
                 &mut agent,
                 &mut event_rx,
                 &mut side_bus_rx,
@@ -10089,8 +10223,113 @@ async fn run_external_agent_mode(
                 &mut diff_tracker,
                 &mut pending_runtime_steers,
                 side_thread_id,
+                "side",
             )
             .await;
+            turn_bus_rx = bus.subscribe();
+            continue;
+        }
+
+        if let Some(subagent_thread_id) = target_session_id
+            .as_deref()
+            .filter(|id| stats.codex_subagent_parent_threads.contains_key(*id))
+            .map(str::to_string)
+        {
+            if edit_user_turn_index.is_some() {
+                let message = format!(
+                    "User-message rewind is not supported for Codex subagent session {}",
+                    subagent_thread_id.chars().take(8).collect::<String>()
+                );
+                slog(&session_log, |l| l.warn(&message));
+                bus.send(AppEvent::LoopError(message));
+                continue;
+            }
+
+            let subagent_round = stats
+                .codex_subagent_rounds
+                .entry(subagent_thread_id.clone())
+                .or_insert(0);
+            *subagent_round += 1;
+            emit_user_message_log(
+                &bus,
+                &session_log,
+                Some(&subagent_thread_id),
+                Some(*subagent_round as u32),
+                None,
+                None,
+                &turn_text,
+            );
+            let merged = drain_steer_queue_as_followup(
+                &context_injection,
+                &turn_text,
+                &bus,
+                Some(&subagent_thread_id),
+            )
+            .unwrap_or_else(|| turn_text.clone());
+            let subagent_thread = external_agent::AgentThread {
+                thread_id: subagent_thread_id.clone(),
+            };
+            let parent_thread_id = stats
+                .codex_subagent_parent_threads
+                .get(&subagent_thread_id)
+                .cloned()
+                .unwrap_or_else(|| thread.thread_id.clone());
+            let send_result = if attachments.is_empty() {
+                agent.send_message(&subagent_thread, &merged).await
+            } else {
+                agent
+                    .send_message_with_attachments(&subagent_thread, &merged, &attachments.items)
+                    .await
+            };
+            if let Err(e) = send_result {
+                let _ = agent.activate_thread(&parent_thread_id).await;
+                emit_follow_up_status(
+                    &bus,
+                    Some(&subagent_thread_id),
+                    &follow_up_id,
+                    Some(&turn_text),
+                    "failed",
+                    Some("failed to send subagent follow-up"),
+                );
+                bus.send(AppEvent::LoopError(format!(
+                    "Failed to send subagent follow-up: {}",
+                    e
+                )));
+                continue;
+            }
+            emit_follow_up_status(
+                &bus,
+                Some(&subagent_thread_id),
+                &follow_up_id,
+                Some(&turn_text),
+                "delivered",
+                None,
+            );
+            if let Some(id) = steer_id {
+                bus.send(AppEvent::SteerDelivered {
+                    session_id: Some(subagent_thread_id.clone()),
+                    id,
+                    mid_turn: false,
+                });
+            }
+            let mut subagent_bus_rx = bus.subscribe();
+            drain_external_child_turn(
+                &mut agent,
+                &mut event_rx,
+                &mut subagent_bus_rx,
+                &drain_config,
+                &mut stats,
+                &mut diff_tracker,
+                &mut pending_runtime_steers,
+                subagent_thread_id,
+                "subagent",
+            )
+            .await;
+            if let Err(e) = agent.activate_thread(&parent_thread_id).await {
+                let message = format!("Failed to restore Codex parent thread: {}", e);
+                slog(&session_log, |l| l.warn(&message));
+                bus.send(AppEvent::LoopError(message));
+            }
             turn_bus_rx = bus.subscribe();
             continue;
         }
@@ -10208,6 +10447,14 @@ async fn run_external_agent_mode(
                 .await
         };
         if let Err(e) = send_result {
+            emit_follow_up_status(
+                &bus,
+                live_session_id.as_deref(),
+                &follow_up_id,
+                Some(&turn_text),
+                "failed",
+                Some("failed to send follow-up"),
+            );
             if round == 1 {
                 return Err(e);
             }
@@ -10217,6 +10464,14 @@ async fn run_external_agent_mode(
             )));
             break;
         }
+        emit_follow_up_status(
+            &bus,
+            live_session_id.as_deref(),
+            &follow_up_id,
+            Some(&turn_text),
+            "delivered",
+            None,
+        );
         if let Some(id) = steer_id {
             bus.send(AppEvent::SteerDelivered {
                 session_id: live_session_id.clone(),
