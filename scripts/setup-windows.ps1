@@ -7,16 +7,17 @@
     (x86_64-pc-windows-msvc). The Windows counterpart to setup-linux.sh
     and setup-macos.sh.
 
-    Installs the build toolchain (rustup, Visual Studio 2022 Build Tools
-    C++ workload, NASM, git), optional WASM tooling (wasm-pack), and the
-    runtime dependencies the agent shells out to (ffmpeg, Media Foundation).
-    Prefers Chocolatey for installs with existence checks so re-runs are
-    no-ops, and clearly calls out the one manual step it cannot automate
-    (the VB-CABLE virtual audio cable).
+    Installs or verifies the build toolchain (rustup, Visual Studio 2022
+    Build Tools C++ workload, NASM, git), optional WASM tooling (wasm-pack),
+    and the runtime dependencies the agent shells out to (ffmpeg, Media
+    Foundation). Package-managed installs use the selected PackageManager
+    policy so re-runs are no-ops and the script does not silently bootstrap a
+    package manager unless Chocolatey is explicitly selected. VB-CABLE remains
+    a manual, optional voice step.
 
-    Run from an elevated (Administrator) PowerShell — Chocolatey installs,
-    the Visual Studio Build Tools workload, and the Windows Server
-    Media Foundation feature all require it.
+    Run from an elevated (Administrator) PowerShell -- Visual Studio Build
+    Tools, Chocolatey installs, machine PATH repair, and the Windows Server
+    Media Foundation feature may require it.
 
 .PARAMETER Check
     Report what is installed without changing anything.
@@ -29,9 +30,22 @@
 .PARAMETER NoBuild
     Install dependencies but skip the cargo build at the end.
 
+.PARAMETER PackageManager
+    Package install policy: Auto, Winget, Chocolatey, or None. Auto uses an
+    already-installed winget first, then Chocolatey. It does not install
+    Chocolatey by surprise. Use -PackageManager Chocolatey to preserve the old
+    one-command bootstrap behavior when Chocolatey is missing.
+
+.PARAMETER SkipSmoke
+    Skip the post-build runtime hello smoke check.
+
 .EXAMPLE
     .\setup-windows.ps1
-    Install all dependencies and build.
+    Install dependencies with an existing winget/choco and build.
+
+.EXAMPLE
+    .\setup-windows.ps1 -PackageManager Chocolatey
+    Install Chocolatey if needed, install dependencies, and build.
 
 .EXAMPLE
     .\setup-windows.ps1 -Check
@@ -41,7 +55,10 @@
 param(
     [switch]$Check,
     [switch]$SkipWasm,
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [ValidateSet("Auto", "Winget", "Chocolatey", "None")]
+    [string]$PackageManager = "Auto",
+    [switch]$SkipSmoke
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,6 +70,7 @@ $RepoRoot  = Split-Path -Parent $ScriptDir
 # Track whether a manual follow-up (VB-CABLE) is still outstanding so the
 # final summary can surface it.
 $script:NeedsManual = @()
+$script:PackageProvider = $null
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -103,14 +121,65 @@ function Test-ChocoPkg($name) {
     return [bool]($listed | Select-String -SimpleMatch -Quiet $name)
 }
 
+function Show-PackageManagerStatus {
+    Write-Host ""
+    Write-Host "Package installer policy:"
+    Write-Host "   Selected policy: $PackageManager"
+    if (Test-Cmd winget) {
+        Ok "winget available"
+    } else {
+        Warn "   - winget -- not found"
+    }
+    if (Test-Cmd choco) {
+        Ok "Chocolatey available"
+    } else {
+        Warn "   - Chocolatey -- not found"
+    }
+    if ($PackageManager -eq "Auto") {
+        Write-Host "   Auto uses an existing winget first, then Chocolatey. It does not install Chocolatey automatically."
+    } elseif ($PackageManager -eq "Chocolatey") {
+        Write-Host "   Chocolatey mode will install Chocolatey if it is missing."
+    } elseif ($PackageManager -eq "None") {
+        Write-Host "   None mode never installs package-managed dependencies; missing build deps must already be present or be installed manually."
+    }
+}
+
+function Resolve-PackageProvider {
+    switch ($PackageManager) {
+        "Winget" {
+            if (-not (Test-Cmd winget)) {
+                Die "PackageManager=Winget selected, but winget is not on PATH. Install App Installer/winget or rerun with -PackageManager Chocolatey/None."
+            }
+            return "Winget"
+        }
+        "Chocolatey" {
+            Install-Chocolatey
+            return "Chocolatey"
+        }
+        "None" {
+            return "None"
+        }
+        default {
+            if (Test-Cmd winget) { return "Winget" }
+            if (Test-Cmd choco) { return "Chocolatey" }
+            Warn "No supported package manager found. Continuing without package-managed installs."
+            Warn "Install winget/choco, install missing dependencies manually, or rerun with -PackageManager Chocolatey to bootstrap Chocolatey."
+            return "None"
+        }
+    }
+}
+
 # Ensure `nasm` is callable. The choco `nasm` package installs nasm.exe into a
 # fixed directory (C:\Program Files\NASM) and amends the *machine* PATH -- but
 # that change only lands in newly-spawned shells, so the very shell that ran the
 # install (and a fresh-machine `-Check`) can have nasm.exe on disk yet not on
-# PATH. If `nasm` doesn't resolve, locate the install dir, prepend it to this
-# session's PATH, persist it (machine if elevated, else user), and re-probe.
+# PATH. If `nasm` doesn't resolve, locate the install dir and prepend it to this
+# session's PATH. Install mode can also persist that repair (machine if elevated,
+# else user); check mode keeps the fix process-local so `-Check` stays read-only.
 # Returns $true if nasm is callable afterward.
 function Resolve-Nasm {
+    param([switch]$Persist)
+
     if (Test-Cmd nasm) { return $true }
 
     $candidates = @(
@@ -128,6 +197,10 @@ function Resolve-Nasm {
     # Prepend to this process's PATH for an immediate re-probe.
     if (($env:Path -split ';') -notcontains $nasmDir) {
         $env:Path = "$nasmDir;$env:Path"
+    }
+
+    if (-not $Persist) {
+        return (Test-Cmd nasm)
     }
 
     # Persist so future shells (and the cargo build below) resolve nasm without
@@ -168,15 +241,6 @@ function Check-Core {
     Write-Host ""
     Write-Host "Build toolchain (required to build):"
 
-    # Chocolatey is only the *installer* this script uses, not a build input --
-    # a machine with rustup/MSVC/NASM/git installed by other means builds fine
-    # without it. Report it, but do NOT count its absence as a build failure.
-    if (Test-Cmd choco) {
-        Ok "Chocolatey (installer)"
-    } else {
-        Warn "   - Chocolatey -- not installed (only needed to auto-install the deps below; https://chocolatey.org/install)"
-    }
-
     if ((Test-Cmd rustc) -and (Test-Cmd cargo)) {
         $ver = (rustc --version) -replace '^rustc\s+(\S+).*', '$1'
         Ok "Rust toolchain ($ver)"
@@ -200,7 +264,7 @@ function Check-Core {
     } elseif (Test-VsCppWorkload) {
         Ok "Visual Studio 2022 C++ build tools (VC++ workload installed)"
     } else {
-        Miss "Visual Studio 2022 C++ build tools" "choco install visualstudio2022-workload-vctools"
+        Miss "Visual Studio 2022 C++ build tools" "install VS 2022 Build Tools with the C++ workload"
         $allOk = $false
     }
 
@@ -210,14 +274,14 @@ function Check-Core {
     if (Resolve-Nasm) {
         Ok "NASM ($((nasm -v) -replace '^NASM version\s+(\S+).*', '$1'))"
     } else {
-        Miss "NASM" "choco install nasm (required by the ring crate; must be on PATH)"
+        Miss "NASM" "install NASM and ensure nasm.exe is on PATH (required by the ring crate)"
         $allOk = $false
     }
 
     if (Test-Cmd git) {
         Ok "git"
     } else {
-        Miss "git" "choco install git"
+        Miss "git" "install Git for Windows"
         $allOk = $false
     }
 
@@ -268,7 +332,7 @@ function Check-Runtime {
     if (Test-Cmd ffmpeg) {
         Ok "ffmpeg (on PATH)"
     } else {
-        Miss "ffmpeg" "choco install ffmpeg (audio bridge only; not needed to build)"
+        Miss "ffmpeg" "install Gyan.FFmpeg/ffmpeg (audio bridge only; not needed to build)"
         $allOk = $false
     }
     if (Test-Cmd ffplay) {
@@ -363,6 +427,140 @@ function Install-ChocoPkg {
     & choco install -y $Package
     if ($LASTEXITCODE -ne 0) { Die "choco install $Package failed (exit $LASTEXITCODE)" }
     Update-SessionPath
+}
+
+function Install-WingetPkg {
+    param(
+        [string]$Name,
+        [string]$Id,
+        [string]$ProbeCmd = "",
+        [string]$Override = ""
+    )
+    if ($ProbeCmd -and (Test-Cmd $ProbeCmd)) {
+        Info "$Name already present ($ProbeCmd found), skipping"
+        return
+    }
+    Info "installing $Name via winget ($Id)..."
+    $args = @(
+        "install",
+        "--id", $Id,
+        "--exact",
+        "--source", "winget",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+        "--silent"
+    )
+    if ($Override) {
+        $args += @("--override", $Override)
+    }
+    & winget @args
+    if ($LASTEXITCODE -ne 0) { Die "winget install $Name ($Id) failed (exit $LASTEXITCODE)" }
+    Update-SessionPath
+}
+
+function Install-ManagedPackage {
+    param(
+        [string]$Name,
+        [string]$ProbeCmd,
+        [string]$WingetId,
+        [string]$ChocoPackage,
+        [string]$ManualHint,
+        [string]$WingetOverride = ""
+    )
+
+    if ($ProbeCmd -and (Test-Cmd $ProbeCmd)) {
+        Info "$Name already present ($ProbeCmd found), skipping"
+        return
+    }
+
+    switch ($script:PackageProvider) {
+        "Winget" {
+            Install-WingetPkg -Name $Name -Id $WingetId -ProbeCmd $ProbeCmd -Override $WingetOverride
+        }
+        "Chocolatey" {
+            Install-ChocoPkg -Package $ChocoPackage -ProbeCmd $ProbeCmd
+        }
+        "None" {
+            Die "$Name is missing and PackageManager=$PackageManager will not install package-managed dependencies. $ManualHint"
+        }
+        default {
+            Die "internal error: package provider has not been resolved"
+        }
+    }
+}
+
+function Install-VsCppWorkload {
+    if (Test-VsCppWorkload) {
+        Info "Visual Studio 2022 C++ build tools already present, skipping"
+        return
+    }
+
+    switch ($script:PackageProvider) {
+        "Winget" {
+            Install-WingetPkg `
+                -Name "Visual Studio 2022 Build Tools C++ workload" `
+                -Id "Microsoft.VisualStudio.2022.BuildTools" `
+                -Override "--wait --quiet --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+        }
+        "Chocolatey" {
+            Install-ChocoPkg -Package "visualstudio2022-workload-vctools"
+        }
+        "None" {
+            Die "Visual Studio 2022 C++ build tools are missing and PackageManager=$PackageManager will not install them. Install Visual Studio 2022 Build Tools with the C++ workload, then rerun this script."
+        }
+        default {
+            Die "internal error: package provider has not been resolved"
+        }
+    }
+
+    if (-not (Test-VsCppWorkload)) {
+        Die "Visual Studio 2022 C++ workload was not detected after install. Open a new Administrator PowerShell or inspect the Visual Studio Installer."
+    }
+}
+
+function Install-FfmpegToolchain {
+    if ((Test-Cmd ffmpeg) -and (Test-Cmd ffplay)) {
+        Info "ffmpeg toolchain already present (ffmpeg/ffplay found), skipping"
+        return
+    }
+
+    $manualFfmpeg = "Install a full ffmpeg distribution that includes ffmpeg.exe and ffplay.exe for the optional Windows voice audio bridge."
+
+    switch ($script:PackageProvider) {
+        "Winget" {
+            Info "installing optional ffmpeg toolchain via winget (Gyan.FFmpeg)..."
+            & winget install --id "Gyan.FFmpeg" --exact --source "winget" --accept-package-agreements --accept-source-agreements --silent
+            if ($LASTEXITCODE -ne 0) {
+                Warn "winget install Gyan.FFmpeg failed (exit $LASTEXITCODE); continuing because voice audio is optional."
+                $script:NeedsManual += $manualFfmpeg
+                return
+            }
+            Update-SessionPath
+        }
+        "Chocolatey" {
+            Info "installing optional ffmpeg toolchain via Chocolatey..."
+            & choco install -y ffmpeg
+            if ($LASTEXITCODE -ne 0) {
+                Warn "choco install ffmpeg failed (exit $LASTEXITCODE); continuing because voice audio is optional."
+                $script:NeedsManual += $manualFfmpeg
+                return
+            }
+            Update-SessionPath
+        }
+        "None" {
+            Warn "ffmpeg/ffplay are missing and PackageManager=$PackageManager will not install them. Voice audio will be unavailable until they are installed manually."
+            $script:NeedsManual += $manualFfmpeg
+            return
+        }
+        default {
+            Die "internal error: package provider has not been resolved"
+        }
+    }
+
+    if (-not ((Test-Cmd ffmpeg) -and (Test-Cmd ffplay))) {
+        Warn "ffmpeg package install completed, but ffmpeg.exe and ffplay.exe were not both detected on PATH. Voice audio will remain unavailable until both are present."
+        $script:NeedsManual += $manualFfmpeg
+    }
 }
 
 function Install-Rust {
@@ -466,6 +664,91 @@ function Build-Intendant {
     Write-Host ""
     Ok "intendant          -> $binDir\intendant.exe"
     Ok "intendant-runtime  -> $binDir\intendant-runtime.exe"
+    Test-PostBuildSmoke -BinDir $binDir
+}
+
+function Test-PostBuildSmoke {
+    param([string]$BinDir)
+
+    $intendant = Join-Path $BinDir "intendant.exe"
+    $runtime = Join-Path $BinDir "intendant-runtime.exe"
+
+    Write-Host ""
+    Write-Host "Post-build smoke check:"
+    if (-not (Test-Path -LiteralPath $intendant)) {
+        Die "expected binary missing: $intendant"
+    }
+    if (-not (Test-Path -LiteralPath $runtime)) {
+        Die "expected binary missing: $runtime"
+    }
+    Ok "release binaries exist"
+
+    if ($SkipSmoke) {
+        Info "skipping runtime smoke check (-SkipSmoke)"
+        return
+    }
+
+    Info "running intendant-runtime hello check..."
+    $marker = "intendant-runtime-smoke"
+    $payload = '{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo intendant-runtime-smoke"}]}'
+    $output = $payload | & $runtime 2>&1
+    $exit = $LASTEXITCODE
+    $text = ($output | Out-String)
+    if ($exit -ne 0) {
+        Die "runtime smoke check failed (exit $exit): $text"
+    }
+    if ($text -match $marker) {
+        Ok "runtime hello protocol succeeded"
+    } else {
+        Warn "runtime smoke check exited successfully but did not echo the expected marker"
+    }
+}
+
+function Show-CompletionSummary {
+    param([bool]$Built)
+
+    Write-Host ""
+    Write-Host "========================================================" -ForegroundColor Green
+    Write-Host "  Setup complete" -ForegroundColor Green
+    Write-Host "========================================================" -ForegroundColor Green
+    Write-Host ""
+
+    if ($script:NeedsManual.Count -gt 0) {
+        Warn "Manual steps still required:"
+        foreach ($step in $script:NeedsManual) {
+            Write-Host "   - $step" -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
+
+    $binDir = Join-Path $RepoRoot "target\x86_64-pc-windows-msvc\release"
+    Write-Host "  Status:" -ForegroundColor White
+    if ($Built) {
+        Ok "Build ready: $binDir\intendant.exe"
+    } else {
+        Warn "   - Build skipped (-NoBuild); run cargo build --release --target x86_64-pc-windows-msvc when ready."
+    }
+    Ok "Web/display path: run from an interactive desktop session, then open the dashboard."
+
+    if ((Test-Cmd ffmpeg) -and (Test-Cmd ffplay) -and (Test-VbCable)) {
+        Ok "Voice prerequisites detected: ffmpeg/ffplay and VB-CABLE are present (Windows voice bridge still needs end-to-end validation)."
+    } else {
+        Warn "   - Voice optional: needs ffmpeg/ffplay plus manual VB-CABLE setup; Windows voice bridge is still pending end-to-end validation."
+    }
+    Warn "   - LAN setup: native 'intendant lan' is unsupported on Windows; use scripts\setup-lan.bat with WSL/a Linux guest or your own reverse proxy."
+
+    Write-Host ""
+    Write-Host "  Add an API key, then run intendant:" -ForegroundColor White
+    Write-Host ""
+    Write-Host "    cd `"$RepoRoot`""
+    Write-Host "    notepad .env        # add OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY"
+    Write-Host "    .\target\x86_64-pc-windows-msvc\release\intendant.exe `"your task here`""
+    Write-Host ""
+    Write-Host "  Other modes:" -ForegroundColor White
+    Write-Host "    .\target\x86_64-pc-windows-msvc\release\intendant.exe --web"
+    Write-Host "    .\target\x86_64-pc-windows-msvc\release\intendant.exe --direct `"task`""
+    Write-Host "    .\target\x86_64-pc-windows-msvc\release\intendant.exe --no-tui `"task`""
+    Write-Host ""
 }
 
 # ── Modes ──────────────────────────────────────────────────────────────────
@@ -475,6 +758,8 @@ function Run-Check {
     Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host "  Intendant Windows Dependency Check" -ForegroundColor Cyan
     Write-Host "========================================================" -ForegroundColor Cyan
+
+    Show-PackageManagerStatus
 
     # Only the build toolchain gates the exit code. WASM tooling and the runtime
     # deps (ffmpeg, Media Foundation, VB-CABLE) are optional/runtime/manual --
@@ -492,7 +777,7 @@ function Run-Check {
     if ($coreOk) {
         Write-Host "  Build toolchain (required):   ready" -ForegroundColor Green
     } else {
-        Write-Host "  Build toolchain (required):   MISSING dependencies (run without -Check to install)" -ForegroundColor Red
+        Write-Host "  Build toolchain (required):   MISSING dependencies (run without -Check to install, or install manually)" -ForegroundColor Red
     }
     Write-Host "  Optional/runtime deps:        see notes above (wasm-pack, ffmpeg, VB-CABLE -- not required to build)"
     Write-Host ""
@@ -509,7 +794,7 @@ function Run-Check {
 
 function Run-Install {
     if (-not (Test-Admin)) {
-        Die "this script must run as Administrator (Chocolatey, the VS Build Tools workload, and Server-Media-Foundation all require it). Right-click PowerShell -> Run as administrator."
+        Die "this script must run as Administrator (Visual Studio Build Tools, Chocolatey installs, machine PATH repair, and Server-Media-Foundation may require it). Right-click PowerShell -> Run as administrator."
     }
 
     Write-Host ""
@@ -517,30 +802,40 @@ function Run-Install {
     Write-Host "  Intendant Windows Setup" -ForegroundColor Cyan
     Write-Host "========================================================" -ForegroundColor Cyan
 
-    # Phase 1: Chocolatey
-    Info "checking Chocolatey..."
-    Install-Chocolatey
+    # Phase 1: Package install policy
+    Show-PackageManagerStatus
+    $script:PackageProvider = Resolve-PackageProvider
+    Info "package-managed installs: $($script:PackageProvider)"
     Update-SessionPath
 
-    # Phase 2: build toolchain via Chocolatey
+    # Phase 2: build toolchain via the selected package policy
     Info "installing build toolchain packages..."
-    Install-ChocoPkg -Package "git" -ProbeCmd "git"
+    Install-ManagedPackage `
+        -Name "git" `
+        -ProbeCmd "git" `
+        -WingetId "Git.Git" `
+        -ChocoPackage "git" `
+        -ManualHint "Install Git for Windows and ensure git.exe is on PATH."
     # NASM is required to assemble the `ring` crate on windows-msvc. The choco
-    # package amends the *machine* PATH, which this shell won't see until
-    # Resolve-Nasm prepends the install dir (and persists it) so the cargo build
-    # below can find nasm.exe.
-    Install-ChocoPkg -Package "nasm" -ProbeCmd "nasm"
-    if (-not (Resolve-Nasm)) {
-        Die "NASM not callable after install -- nasm.exe was not found in C:\Program Files\NASM or the choco shim dir"
+    # package amends the *machine* PATH; the winget package can behave the same.
+    # Resolve-Nasm repairs the current session before the cargo build below.
+    if (Resolve-Nasm -Persist) {
+        Info "NASM already present"
+    } else {
+        Install-ManagedPackage `
+            -Name "NASM" `
+            -ProbeCmd "nasm" `
+            -WingetId "NASM.NASM" `
+            -ChocoPackage "nasm" `
+            -ManualHint "Install NASM, then add the directory containing nasm.exe to PATH."
+        if (-not (Resolve-Nasm -Persist)) {
+            Die "NASM not callable after install -- nasm.exe was not found in C:\Program Files\NASM or the package-manager shim dir"
+        }
     }
     # The C++ workload provides cl.exe / link.exe / the Windows SDK -- required
     # even for `cargo check`. No reliable bare-command probe (cl.exe lives off
     # PATH outside a Developer prompt), so gate on the package + vswhere.
-    if (Test-VsCppWorkload) {
-        Info "Visual Studio 2022 C++ build tools already present, skipping"
-    } else {
-        Install-ChocoPkg -Package "visualstudio2022-workload-vctools"
-    }
+    Install-VsCppWorkload
 
     # Phase 3: Rust (rustup, MSVC host)
     Write-Host ""
@@ -553,49 +848,23 @@ function Run-Install {
     # Phase 5: runtime deps
     Write-Host ""
     Info "installing runtime dependencies..."
-    Install-ChocoPkg -Package "ffmpeg" -ProbeCmd "ffmpeg"
+    Install-FfmpegToolchain
     Install-MediaFoundation
     Show-VbCableInstructions
 
     # Phase 6: build
+    $built = $false
     if ($NoBuild) {
         Write-Host ""
         Info "skipping build (-NoBuild)"
     } else {
         Write-Host ""
         Build-Intendant
+        $built = $true
     }
 
     # Phase 7: summary
-    Write-Host ""
-    Write-Host "========================================================" -ForegroundColor Green
-    Write-Host "  Setup complete!" -ForegroundColor Green
-    Write-Host "========================================================" -ForegroundColor Green
-    Write-Host ""
-
-    if ($script:NeedsManual.Count -gt 0) {
-        Warn "Manual steps still required:"
-        foreach ($step in $script:NeedsManual) {
-            Write-Host "   - $step" -ForegroundColor Yellow
-        }
-        Write-Host ""
-    }
-
-    Write-Host "  Add an API key, then run intendant:" -ForegroundColor White
-    Write-Host ""
-    Write-Host "    cd `"$RepoRoot`""
-    Write-Host "    notepad .env        # add OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY"
-    Write-Host "    .\target\x86_64-pc-windows-msvc\release\intendant.exe `"your task here`""
-    Write-Host ""
-    Write-Host "  Other modes:" -ForegroundColor White
-    Write-Host "    intendant.exe --web              # Web dashboard"
-    Write-Host "    intendant.exe --direct `"task`"     # Single-agent"
-    Write-Host "    intendant.exe --no-tui `"task`"     # Headless"
-    Write-Host ""
-    Write-Host "  NOTE: live display capture, input injection, and the voice audio"
-    Write-Host "  bridge require an interactive desktop session (not a headless"
-    Write-Host "  service / Session 0). See docs: Windows Support."
-    Write-Host ""
+    Show-CompletionSummary -Built $built
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────

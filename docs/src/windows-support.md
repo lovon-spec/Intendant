@@ -28,39 +28,75 @@ The MSVC ABI is required: the Windows-only crates (`windows`, `windows-sys`,
 Windows SDK import libraries. The `x86_64-pc-windows-gnu` target is not
 supported.
 
-## Building and Running
+## Quickstart
 
-The fastest path is the setup script, which is the Windows counterpart to
-`scripts/setup-linux.sh` and `scripts/setup-macos.sh`:
+The supported Windows path is still a source-build bootstrap. Run the setup
+script from an elevated (Administrator) PowerShell in the repo root:
 
 ```powershell
-# From an elevated (Administrator) PowerShell, in the repo root:
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
 
-# Or just check what's already installed without changing anything:
+# Read-only dependency check:
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -Check
 ```
+
+By default, the script uses `-PackageManager Auto`: it uses an already-installed
+`winget` first, then an already-installed Chocolatey. It does **not** install
+Chocolatey by surprise. If you want the old one-command bootstrap behavior, make
+that explicit:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -PackageManager Chocolatey
+```
+
+Other useful modes:
+
+```powershell
+# Verify/install dependencies but skip the cargo build:
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -NoBuild
+
+# Never install package-managed dependencies; report manual fixes instead:
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -PackageManager None
+
+# Skip the runtime hello smoke check after build:
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -SkipSmoke
+```
+
+After a successful build, the script verifies that both release binaries exist
+and runs a small `intendant-runtime` hello-command smoke check. It then prints a
+status summary split into build, web/display, voice, and LAN readiness.
+
+## Package Manager Policy
+
+| Policy | Behavior |
+|---|---|
+| `Auto` | Use existing `winget`; else existing Chocolatey; else continue without package-managed installs and fail with manual instructions for missing deps. |
+| `Winget` | Require `winget`; install packages through the Windows Package Manager. |
+| `Chocolatey` | Install Chocolatey if missing, then install packages through Chocolatey. |
+| `None` | Do not install package-managed dependencies; required build deps must already be present or the script reports manual fixes. |
 
 `-Check` separates **required-to-build** dependencies from optional/runtime
 ones and sets its **exit code accordingly**: it exits **nonzero** if any
 required build dependency is missing or unusable, and **0** when they are all
 present — so CI and automation can gate on it. A missing optional dependency
-(wasm-pack, ffmpeg, VB-CABLE) is reported but never fails the check.
+(`wasm-pack`, `ffmpeg`/`ffplay`, VB-CABLE) is reported but never fails the
+check.
 
-`setup-windows.ps1` installs (idempotently, via Chocolatey where sensible).
+## What Gets Installed
 
 **Required to build** (a missing/unusable one fails `-Check`):
 
 - **rustup** with the default host set to `x86_64-pc-windows-msvc`
 - **Visual Studio 2022 Build Tools** with the C++ workload
-  (`visualstudio2022-workload-vctools`) — provides `cl.exe`, `link.exe`, and
-  the Windows SDK. Required even for `cargo check`.
+  (`Microsoft.VisualStudio.Workload.VCTools`; Chocolatey package
+  `visualstudio2022-workload-vctools`) — provides `cl.exe`, `link.exe`, and the
+  Windows SDK. Required even for `cargo check`.
 - **NASM** — required to assemble the `ring` crypto crate on windows-msvc. The
-  Chocolatey package installs it to `C:\Program Files\NASM` and amends the
-  *machine* `PATH`, which a freshly-spawned shell may not yet see; the script
-  detects that case, adds the install directory to `PATH` (persisting it), and
-  re-probes — so `-Check` recognizes NASM even when it isn't on the current
-  `PATH`.
+  installer commonly places it in `C:\Program Files\NASM` and amends the
+  *machine* `PATH`, which the current shell may not yet see; the script detects
+  that case, adds the install directory to the current process `PATH`, and
+  re-probes so `-Check` recognizes NASM even when it is not on the current
+  `PATH`. Install mode also persists that PATH repair for future shells.
 - **git**
 
 **Optional / runtime / manual** (reported, but never fail `-Check`):
@@ -69,6 +105,8 @@ present — so CI and automation can gate on it. A missing optional dependency
 - **ffmpeg** — the voice audio bridge shells out to `ffmpeg`/`ffplay`.
 - **Media Foundation** — built into Windows client SKUs; on Windows Server the
   script enables the `Server-Media-Foundation` feature.
+- **VB-CABLE** — manual, voice-only virtual audio cable setup. The script cannot
+  install the vendor driver.
 
 It then runs `cargo build --release --target x86_64-pc-windows-msvc`, producing:
 
@@ -77,7 +115,8 @@ It then runs `cargo build --release --target x86_64-pc-windows-msvc`, producing:
 
 One step the script **cannot** automate is the **VB-CABLE** virtual audio cable
 (the vendor ships a manual installer, not a package). The script prints
-instructions and flags it in the final summary. See
+instructions and flags it in the final summary, but voice remains optional and
+the Windows voice bridge is still pending end-to-end validation. See
 [Audio](#audio-ffmpeg--vb-cable-wasapi-bridge) below.
 
 Manual build, if you already have the toolchain:
