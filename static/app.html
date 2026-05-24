@@ -38,6 +38,8 @@
   --log-detail: #a2a8be;
   --log-debug: var(--overlay1);
   --log-presence: var(--green);
+  --concurrent-view-bg: color-mix(in srgb, var(--mantle) 92%, transparent);
+  --concurrent-view-hover-bg: color-mix(in srgb, var(--mantle) 96%, transparent);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1287,6 +1289,7 @@ html, body {
   flex: 1;
   min-height: 0;
   flex-direction: column;
+  background: var(--concurrent-view-bg);
 }
 .concurrent-log-label {
   position: absolute;
@@ -1299,7 +1302,7 @@ html, body {
   padding: 1px 4px 1px 6px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
-  background: var(--mantle);
+  background: var(--concurrent-view-hover-bg);
   color: var(--overlay1);
   font-size: 10px;
   font-weight: 600;
@@ -1841,6 +1844,7 @@ html, body {
   border-left: 2px solid transparent;
 }
 .log-entry:hover { background: var(--mantle); }
+.concurrent-log-region .log-entry:hover { background: var(--concurrent-view-hover-bg); }
 .log-entry.level-model { border-left-color: rgba(137, 180, 250, 0.55); }
 .log-entry.level-agent { border-left-color: rgba(148, 226, 213, 0.55); }
 .log-entry.level-warn { border-left-color: rgba(249, 226, 175, 0.5); }
