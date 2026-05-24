@@ -656,9 +656,58 @@ pub fn metadata_on_disk_bytes(metadata: &std::fs::Metadata) -> u64 {
     }
 }
 
+/// Resolve the current user's home directory as a `PathBuf`.
+///
+/// This is the single source of truth for "where does `~/.intendant` and
+/// `~/.codex` live" across the caller. It exists because the historical
+/// `std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())` pattern is
+/// Unix-only: Windows does not set `HOME`, so that pattern silently resolved
+/// to `C:\tmp`, while external agents (Codex, Claude Code, Gemini) and the
+/// session-log writer use the *real* user profile (`C:\Users\<user>`). The
+/// mismatch meant the dashboard scanned the wrong directory on Windows and
+/// never discovered standalone external-agent sessions.
+///
+/// - **Unix/macOS**: preserve the exact prior behavior — honor `$HOME` first
+///   (so test overrides via `set_var("HOME", ...)` keep working), then fall
+///   back to `/tmp` when it is unset.
+/// - **Windows**: prefer `%USERPROFILE%`, then the platform-resolved home
+///   (`dirs::home_dir()`, which also consults `USERPROFILE`/`HOMEDRIVE`),
+///   then `$HOME` if a Unix-style env was injected, and only `C:\tmp` as a
+///   last resort to mirror the Unix fallback.
+pub fn home_dir() -> std::path::PathBuf {
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
+        )
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.trim().is_empty() {
+                return std::path::PathBuf::from(profile);
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                return std::path::PathBuf::from(home);
+            }
+        }
+        std::path::PathBuf::from("C:\\tmp")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_dir_is_nonempty() {
+        assert!(!home_dir().as_os_str().is_empty());
+    }
 
     #[test]
     fn current_process_is_alive() {

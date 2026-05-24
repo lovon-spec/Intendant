@@ -91,13 +91,13 @@ pub fn append_visual_freshness_record(session_id: &str, body: &[u8]) -> std::io:
     Ok(body.len())
 }
 
-/// Resolve the Intendant state directory (`$HOME/.intendant`) with the
-/// same fallback the session-log writer uses (`/tmp/.intendant` when
-/// HOME is unset). Pulled into its own helper so test code can override
-/// HOME and verify path construction without touching production calls.
+/// Resolve the Intendant state directory (`~/.intendant`) via the shared
+/// cross-platform `platform::home_dir()` helper (honoring `$HOME` on Unix,
+/// `%USERPROFILE%` on Windows). Pulled into its own helper so test code can
+/// override the home env and verify path construction without touching
+/// production calls.
 fn intendant_state_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    Path::new(&home).join(".intendant")
+    crate::platform::home_dir().join(".intendant")
 }
 
 #[cfg(test)]
