@@ -7418,7 +7418,6 @@ const sessionUsageById = new Map();
 let latestGlobalUsage = null;
 let dashboardProjectRoot = '';
 let sessionRelationshipRenderHandle = 0;
-const SESSION_WINDOW_LOG_LIMIT = 600;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
 const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3';
@@ -12622,9 +12621,6 @@ function flushLogReplayAppendBatch() {
   for (const state of batch.sessionFragments.values()) {
     if (!state.win || !state.win.log || state.fragment.childNodes.length === 0) continue;
     state.win.log.appendChild(state.fragment);
-    while (state.win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
-      state.win.log.removeChild(state.win.log.firstElementChild);
-    }
     applySessionWindowOutputScroll(state.win, state.shouldFollow);
   }
   batch.sessionFragments.clear();
@@ -12653,9 +12649,6 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
     return;
   }
   win.log.appendChild(clone);
-  while (win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
-    win.log.removeChild(win.log.firstElementChild);
-  }
   applySessionWindowOutputScroll(win, shouldFollow);
 }
 
