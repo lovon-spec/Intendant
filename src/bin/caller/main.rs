@@ -2387,10 +2387,18 @@ async fn drain_external_agent_events(
                             &watcher_alias_session_id,
                         ) =>
                     {
+                        eprintln!(
+                            "[APPROVAL-DIAG] codex approval watcher: InterruptRequested matched session_id={:?} (watcher session={:?} alias={:?}) -> draining + denying pending approvals",
+                            session_id, watcher_session_id, watcher_alias_session_id
+                        );
                         let pending: Vec<_> = {
                             let mut reg = registry.lock().unwrap();
                             reg.drain().collect()
                         };
+                        eprintln!(
+                            "[APPROVAL-DIAG] codex approval watcher: drained {} pending approval(s) -> Deny",
+                            pending.len()
+                        );
                         for (_, sender) in pending {
                             let _ = sender.send(event::ApprovalResponse::Deny);
                         }
@@ -2953,6 +2961,10 @@ async fn drain_external_agent_events(
                         .await;
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[APPROVAL-DIAG] external ApprovalRequest(command-exec): registered id={} session={:?} category={:?}, awaiting frontend response",
+                        id, config.session_id, cat
+                    );
                     config.bus.send(AppEvent::ApprovalRequired {
                         session_id: config.session_id.clone(),
                         id,

@@ -209,6 +209,10 @@ impl Dispatcher {
                 // Re-emit as AppEvent::InterruptRequested so agent loops can subscribe
                 // and cancel their own work. The dispatcher itself doesn't hold loop
                 // handles — loops register interest via the bus.
+                eprintln!(
+                    "[APPROVAL-DIAG] task_dispatch re-emit InterruptRequested session_id={:?}",
+                    session_id
+                );
                 bus.send(AppEvent::InterruptRequested { session_id });
             }
 
