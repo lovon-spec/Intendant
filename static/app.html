@@ -7426,7 +7426,10 @@ const sessionUsageById = new Map();
 let latestGlobalUsage = null;
 let dashboardProjectRoot = '';
 let sessionRelationshipRenderHandle = 0;
-const SESSION_WINDOW_LOG_LIMIT = 600;
+const SESSION_WINDOW_RENDER_LIMIT = 600;
+const SESSION_WINDOW_PREPEND_CHUNK = 300;
+const SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX = 64;
+const SESSION_WINDOW_STATE_KEY = 'intendant_session_windows_v1';
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
 const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3';
@@ -7442,6 +7445,9 @@ let sessionMetadataRefreshInFlight = null;
 let sessionWindowGridHeightPx = readStoredSessionWindowGridHeight();
 let sessionWindowGridResizeDrag = null;
 let concurrentLogMode = CONCURRENT_LOG_MODE_NORMAL;
+let restoredPersistedSessionWindows = false;
+let restoringPersistedSessionWindows = false;
+const sessionWindowRestoreInFlight = new Set();
 let currentSessionDetail = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
@@ -8305,6 +8311,7 @@ async function main() {
     // Bootstrap/reconnect: populate the timeline from whatever the
     // server has now so users coming in mid-session see it immediately.
     if (typeof refreshHistory === 'function') refreshHistory();
+    restorePersistedSessionWindowsSoon();
   });
 
   app.set_on_server_event((evt) => {
@@ -10549,6 +10556,8 @@ function renderDiffLogBody(body, parsed, options = {}) {
 
 function resetSessionWindowLog(win) {
   if (!win || !win.log) return;
+  win.logHistory = [];
+  win.renderStart = 0;
   win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
   win.followOutput = true;
   win.pendingOutput = false;
@@ -10757,8 +10766,14 @@ function applySessionIdentity(meta = {}) {
       intendantSessionId: sid,
       ...(backendSource ? { backendSource, source: backendSource } : {}),
     });
+    if (sessionWindows.has(backendSessionId)) {
+      updateSessionWindow(backendSessionId, {
+        ...(backendSource ? { backendSource, source: backendSource } : {}),
+      });
+    }
   }
   if (sessionWindows.has(sid)) updateSessionWindow(sid, next);
+  persistSessionWindowState();
 }
 
 function phaseKey(phase) {
@@ -11088,6 +11103,125 @@ function cacheSessionWindowMetadata(sessions) {
         backend_source_label: session.backend_source_label,
       });
     }
+  }
+  persistSessionWindowState();
+}
+
+function readPersistedSessionWindowState() {
+  try {
+    const raw = localStorage.getItem(SESSION_WINDOW_STATE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed?.windows) ? parsed.windows : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function sessionWindowPersistedSource(sessionId, win = null) {
+  const sid = String(sessionId || '').trim();
+  const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  return normalizeAgentId(
+    meta.backendSource ||
+    meta.source ||
+    meta.sourceLabel ||
+    win?.source ||
+    ''
+  );
+}
+
+function persistSessionWindowState() {
+  if (restoringPersistedSessionWindows) return;
+  const windows = [];
+  for (const [sid, win] of sessionWindows) {
+    const source = sessionWindowPersistedSource(sid, win);
+    if (!source) continue;
+    windows.push({ session_id: sid, source });
+  }
+  try {
+    if (windows.length) {
+      localStorage.setItem(SESSION_WINDOW_STATE_KEY, JSON.stringify({ windows }));
+    } else {
+      localStorage.removeItem(SESSION_WINDOW_STATE_KEY);
+    }
+  } catch (_) {}
+}
+
+function restorePersistedSessionWindowsSoon(delay = 1200) {
+  if (restoredPersistedSessionWindows) return;
+  restoredPersistedSessionWindows = true;
+  setTimeout(() => { restorePersistedSessionWindows(); }, delay);
+}
+
+async function restorePersistedSessionWindows() {
+  const records = readPersistedSessionWindowState()
+    .map(record => ({
+      sessionId: String(record?.session_id || record?.id || '').trim(),
+      source: normalizeAgentId(record?.source || record?.backendSource || ''),
+    }))
+    .filter(record => record.sessionId && record.source);
+  if (!records.length) return;
+  restoringPersistedSessionWindows = true;
+  try {
+    await Promise.all(records.map(record => restorePersistedSessionWindow(record)));
+  } finally {
+    restoringPersistedSessionWindows = false;
+    persistSessionWindowState();
+  }
+}
+
+async function restorePersistedSessionWindow(record) {
+  const sid = String(record?.sessionId || '').trim();
+  const source = normalizeAgentId(record?.source || '');
+  if (!sid || !source || sessionWindowRestoreInFlight.has(sid)) return;
+  const existing = sessionWindows.get(sid);
+  if (existing && ensureSessionWindowHistory(existing).length > 0) return;
+  sessionWindowRestoreInFlight.add(sid);
+  try {
+    const win = ensureSessionWindow(sid, {
+      source,
+      source_label: prettyAgentName(source),
+      phase: 'idle',
+      ended: false,
+    });
+    if (!win) return;
+    const resp = await authedFetch(`/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(source)}`);
+    const data = await resp.json();
+    if (!resp.ok || data?.error) return;
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    if (!entries.length) return;
+
+    resetSessionWindowLog(win);
+    if (logReplayAppendBatch && logReplayAppendBatch.added > 0) flushLogReplayAppendBatch();
+    const previousBatch = logReplayAppendBatch;
+    const wasProcessingLogReplay = processingLogReplay;
+    logReplayAppendBatch = createLogReplayAppendBatch();
+    processingLogReplay = true;
+    try {
+      for (const entry of entries) {
+        renderSessionWindowLogEntryOnly({
+          ...entry,
+          session_id: sid,
+          level: entry.level || 'info',
+          source: entry.source || source,
+          content: entry.content || entry.summary || '',
+        });
+      }
+      flushLogReplayAppendBatch();
+    } finally {
+      logReplayAppendBatch = previousBatch;
+      processingLogReplay = wasProcessingLogReplay;
+    }
+    updateSessionWindow(sid, {
+      source,
+      source_label: prettyAgentName(source),
+      phase: 'idle',
+      ended: false,
+    });
+  } catch (err) {
+    console.warn('Failed to restore session window', sid, err);
+  } finally {
+    sessionWindowRestoreInFlight.delete(sid);
   }
 }
 
@@ -11553,6 +11687,67 @@ function sessionWindowShouldFollowNextOutput(win) {
   return !!win.followOutput || sessionWindowLogIsAtBottom(win.log);
 }
 
+function ensureSessionWindowHistory(win) {
+  if (!win) return [];
+  if (!Array.isArray(win.logHistory)) win.logHistory = [];
+  if (!Number.isInteger(win.renderStart) || win.renderStart < 0) win.renderStart = 0;
+  return win.logHistory;
+}
+
+function renderSessionWindowRange(win, start) {
+  if (!win || !win.log) return;
+  const history = ensureSessionWindowHistory(win);
+  if (history.length === 0) {
+    win.renderStart = 0;
+    win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+    return;
+  }
+  const safeStart = Math.max(0, Math.min(Number(start) || 0, history.length));
+  win.renderStart = safeStart;
+  win.log.replaceChildren(...history.slice(safeStart));
+}
+
+function renderSessionWindowTail(win) {
+  if (!win) return;
+  const history = ensureSessionWindowHistory(win);
+  renderSessionWindowRange(win, Math.max(0, history.length - SESSION_WINDOW_RENDER_LIMIT));
+}
+
+function appendSessionWindowHistory(win, entry, shouldFollow) {
+  if (!win || !entry) return;
+  const history = ensureSessionWindowHistory(win);
+  entry.dataset.sessionWindowHistory = '1';
+  history.push(entry);
+  if (shouldFollow) {
+    renderSessionWindowTail(win);
+  }
+  applySessionWindowOutputScroll(win, shouldFollow);
+}
+
+function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
+  if (!win || !Array.isArray(entries) || entries.length === 0) return;
+  const history = ensureSessionWindowHistory(win);
+  for (const entry of entries) {
+    if (!entry) continue;
+    entry.dataset.sessionWindowHistory = '1';
+    history.push(entry);
+  }
+  renderSessionWindowTail(win);
+  applySessionWindowOutputScroll(win, shouldFollow);
+}
+
+function loadOlderSessionWindowEntries(win) {
+  if (!win || !win.log) return false;
+  const history = ensureSessionWindowHistory(win);
+  if (win.renderStart <= 0 || history.length === 0) return false;
+  if (win.log.scrollTop > SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX) return false;
+  const previousHeight = win.log.scrollHeight;
+  const previousTop = win.log.scrollTop;
+  renderSessionWindowRange(win, Math.max(0, win.renderStart - SESSION_WINDOW_PREPEND_CHUNK));
+  win.log.scrollTop = previousTop + Math.max(0, win.log.scrollHeight - previousHeight);
+  return true;
+}
+
 function updateSessionWindowJumpButton(win) {
   if (!win || !win.jumpBottom) return;
   const show = !!win.pendingOutput && !win.followOutput && !win.minimized;
@@ -11562,6 +11757,7 @@ function updateSessionWindowJumpButton(win) {
 
 function scrollSessionWindowToBottom(win) {
   if (!win || !win.log) return;
+  renderSessionWindowTail(win);
   win.log.scrollTop = win.log.scrollHeight;
   win.followOutput = true;
   win.pendingOutput = false;
@@ -11581,6 +11777,7 @@ function applySessionWindowOutputScroll(win, shouldFollow) {
 
 function updateSessionWindowFollowFromScroll(win) {
   if (!win || !win.log) return;
+  loadOlderSessionWindowEntries(win);
   if (sessionWindowLogIsAtBottom(win.log)) {
     win.followOutput = true;
     win.pendingOutput = false;
@@ -11966,6 +12163,9 @@ function removeSessionWindow(sessionId) {
   if (!sid) return false;
   const win = sessionWindows.get(sid);
   if (win) {
+    for (const entry of win.logHistory || []) {
+      if (entry?.dataset) delete entry.dataset.sessionWindowHistory;
+    }
     win.el.remove();
     sessionWindows.delete(sid);
   }
@@ -11990,6 +12190,7 @@ function removeSessionWindow(sessionId) {
   syncSessionWindowGridControls();
   syncSessionWindowMetadataRefresh();
   scheduleSessionRelationshipRender();
+  persistSessionWindowState();
   return !!win;
 }
 
@@ -12386,6 +12587,8 @@ function ensureSessionWindow(sessionId, meta = {}) {
     minimized: false,
     followOutput: true,
     pendingOutput: false,
+    logHistory: [],
+    renderStart: 0,
     headerCollapsed: startHeaderCollapsed,
   };
   sessionWindows.set(sid, win);
@@ -12406,7 +12609,10 @@ function updateSessionWindow(sessionId, meta = {}) {
   meta = merged.meta;
   updateSessionWindowRelationshipStyle(sid);
   const signature = sessionWindowMetadataSignature(meta);
-  if (win.metadataSignature === signature) return;
+  if (win.metadataSignature === signature) {
+    persistSessionWindowState();
+    return;
+  }
   win.metadataSignature = signature;
   const displayName = compactSessionText(meta.name);
   renderSessionIdentity(win.id, sid, { order: 'id-name' });
@@ -12449,6 +12655,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   updateSessionWindowActionMenuVisibility(sid);
   updateSessionRelationshipBadges(sid);
   scheduleSessionRelationshipRender();
+  persistSessionWindowState();
 }
 
 function updateSessionWindowMinimizeState(sessionId) {
@@ -12651,12 +12858,8 @@ function flushLogReplayAppendBatch() {
   }
 
   for (const state of batch.sessionFragments.values()) {
-    if (!state.win || !state.win.log || state.fragment.childNodes.length === 0) continue;
-    state.win.log.appendChild(state.fragment);
-    while (state.win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
-      state.win.log.removeChild(state.win.log.firstElementChild);
-    }
-    applySessionWindowOutputScroll(state.win, state.shouldFollow);
+    if (!state.win || !state.win.log || !state.items || state.items.length === 0) continue;
+    appendSessionWindowHistoryBatch(state.win, state.items, state.shouldFollow);
   }
   batch.sessionFragments.clear();
   batch.added = 0;
@@ -12677,17 +12880,13 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   if (batch) {
     let state = batch.sessionFragments.get(sid);
     if (!state || state.win !== win) {
-      state = { win, fragment: document.createDocumentFragment(), shouldFollow };
+      state = { win, items: [], shouldFollow };
       batch.sessionFragments.set(sid, state);
     }
-    state.fragment.appendChild(clone);
+    state.items.push(clone);
     return;
   }
-  win.log.appendChild(clone);
-  while (win.log.children.length > SESSION_WINDOW_LOG_LIMIT) {
-    win.log.removeChild(win.log.firstElementChild);
-  }
-  applySessionWindowOutputScroll(win, shouldFollow);
+  appendSessionWindowHistory(win, clone, shouldFollow);
 }
 
 function inferSessionPhaseFromLog(c) {
@@ -13038,7 +13237,7 @@ function appendLogEntryElement(entry) {
 
 function commandOutputCloneViews(group) {
   if (!group || !Array.isArray(group.clones)) return [];
-  group.clones = group.clones.filter(view => view.entry?.isConnected);
+  group.clones = group.clones.filter(view => view.entry?.isConnected || view.entry?.dataset?.sessionWindowHistory === '1');
   return group.clones;
 }
 
@@ -13404,6 +13603,22 @@ function markActivityContextRewind(sessionId, userTurnIndex, turnsRemoved) {
       if (inRewoundRegion) markLogEntrySuperseded(entry);
     }
   }
+  for (const win of sessionWindows.values()) {
+    let inRewoundRegion = false;
+    const entries = ensureSessionWindowHistory(win);
+    for (const entry of entries) {
+      if (entry.dataset.sessionId !== sid) continue;
+      const turn = Number(entry.dataset.userTurnIndex || 0);
+      if (Number.isInteger(turn) && turn > 0) {
+        if (!inRewoundRegion && turn >= startTurn && turn <= endTurn) {
+          inRewoundRegion = true;
+        } else if (inRewoundRegion && turn > endTurn) {
+          break;
+        }
+      }
+      if (inRewoundRegion) markLogEntrySuperseded(entry);
+    }
+  }
 }
 
 function isEditableUserMessage(c) {
@@ -13495,6 +13710,52 @@ function renderLogEntry(c) {
   }
 
   appendLogEntryElement(entry);
+}
+
+function appendSessionWindowOnlyLogEntry(entry) {
+  appendLogEntryToSessionWindow(entry, logReplayAppendBatch);
+  if (logReplayAppendBatch) logReplayAppendBatch.added++;
+}
+
+function renderSessionWindowLogEntryOnly(c) {
+  if (!c || !c.session_id) return;
+  const content = c.content || '';
+  if (!content && c.kind !== 'rollback_marker') return;
+  inferSessionPhaseFromLog(c);
+  if (isDiffLog(c)) {
+    const diffText = diffLogContent(c);
+    const parsed = parseUnifiedDiff(diffText);
+    const { entry } = createLogScaffold(c, 'diff-log-entry');
+    const wrap = document.createElement('span');
+    wrap.className = 'log-content diff-log-wrap';
+    const summary = document.createElement('span');
+    summary.className = 'diff-log-summary';
+    summary.innerHTML = diffLogSummaryHtml(parsed);
+    const body = document.createElement('span');
+    body.className = 'diff-log-body';
+    renderDiffLogBody(body, parsed, { sessionId: c.session_id || '' });
+    wrap.appendChild(summary);
+    wrap.appendChild(body);
+    const toggle = document.createElement('span');
+    toggle.className = 'collapse-toggle';
+    toggle.innerHTML = '<span class="arrow">\u25B8 diff</span><span class="arrow-up">\u25BE hide</span>';
+    entry.appendChild(wrap);
+    entry.appendChild(toggle);
+    appendCopyLogEntryButton(entry, diffText);
+    wireDiffLogEntry(entry);
+    appendSessionWindowOnlyLogEntry(entry);
+    return;
+  }
+
+  const { entry } = createLogScaffold(c, '');
+  const cnt = document.createElement('span');
+  cnt.className = 'log-content';
+  renderLogContentElement(cnt, c);
+  appendLogStateBadges(cnt, c);
+  entry.appendChild(cnt);
+  appendCopyLogEntryButton(entry, c.content ?? '');
+  appendEditUserMessageButton(entry, c);
+  appendSessionWindowOnlyLogEntry(entry);
 }
 
 function setContextUsagePct(pct) {
