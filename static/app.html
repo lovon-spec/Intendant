@@ -10761,10 +10761,19 @@ function applySessionIdentity(meta = {}) {
   if (sessionWindows.has(sid)) updateSessionWindow(sid, next);
 }
 
+function phaseKey(phase) {
+  return String(phase || 'idle').toLowerCase().trim().replace(/-/g, '_');
+}
+
+function isWaitingFollowUpPhase(phase) {
+  const p = phaseKey(phase);
+  return p === 'waiting_followup' || p === 'waiting_follow_up';
+}
+
 function normalizeSessionPhase(phase) {
-  const p = String(phase || 'idle').toLowerCase();
+  const p = phaseKey(phase);
   if (p === 'running_agent') return 'running';
-  if (p === 'waiting_followup') return 'idle';
+  if (isWaitingFollowUpPhase(p)) return 'idle';
   return p || 'idle';
 }
 
@@ -10795,6 +10804,20 @@ function isSessionWindowEffectivelyActive(sessionId) {
   if (!win || !win.phase) return false;
   const phase = win.phase;
   return isAgentActivePhase(phase);
+}
+
+function isSteerPhase(phase) {
+  const p = phaseKey(phase);
+  return isAgentActivePhase(p) && p !== 'interrupting';
+}
+
+function isSessionWindowSteerActive(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return isSteerPhase(currentPhase);
+  if (hasPendingActiveSessionWindow(sid)) return true;
+  const win = sessionWindows.get(sid);
+  if (!win || !win.phase) return false;
+  return isSteerPhase(win.phase);
 }
 
 function markSessionWindowPendingActive(sessionId) {
@@ -13617,13 +13640,16 @@ function normalizeAutonomyLabel(raw) {
 }
 
 function setPhase(phase) {
-  currentPhase = phase;
+  const key = phaseKey(phase);
+  currentPhase = key;
   const phaseSessionId = resolvePromptTargetSessionId();
-  if (phaseSessionId) updateSessionWindow(phaseSessionId, { phase });
+  if (phaseSessionId) updateSessionWindow(phaseSessionId, { phase: key });
   const banner = document.getElementById('phase-banner');
   const text = document.getElementById('phase-text');
   banner.className = 'phase-banner';
-  const np = phase.replace('waiting_', 'waiting').replace('running_', 'running');
+  const np = isWaitingFollowUpPhase(key)
+    ? 'waitingfollowup'
+    : key.replace('waiting_', 'waiting').replace('running_', 'running');
   const labels = {
     idle: 'Idle', thinking: 'Thinking...', running: 'Running Agent', runningagent: 'Running Agent',
     waiting: 'Waiting for Input', waitingapproval: 'Waiting for Approval',
@@ -13636,13 +13662,13 @@ function setPhase(phase) {
     np === 'interrupting' ? 'waiting' :
     np === 'interrupted' ? 'done' : np;
   banner.classList.add('phase-' + cat);
-  text.textContent = labels[np] || labels[phase] || phase;
+  text.textContent = labels[np] || labels[key] || key;
 
-  if (phase === 'idle' || phase === 'done' || phase === 'interrupted') {
+  if (key === 'idle' || key === 'done' || key === 'interrupted') {
     if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
     const spinnerEl = document.getElementById('phase-spinner');
-    spinnerEl.textContent = phase === 'done' ? '\u2713'
-      : phase === 'interrupted' ? '\u25A0'
+    spinnerEl.textContent = key === 'done' ? '\u2713'
+      : key === 'interrupted' ? '\u25A0'
       : '';
   } else if (!spinnerInterval) {
     const el = document.getElementById('phase-spinner');
@@ -13651,18 +13677,17 @@ function setPhase(phase) {
       el.textContent = SPINNER_FRAMES[spinnerIdx];
     }, 80);
   }
-  updateStopButtonVisibility(phase);
+  updateStopButtonVisibility(key);
   // Flip the submit button between "Send" (start task / follow-up) and
   // "↗ Steer" (inject mid-turn) so the user sees which action will fire
-  // on the next click. Driven by the same active-phase allowlist as the
-  // Stop button for consistency.
-  updateSubmitButtonLabel(phase);
+  // on the next click. Interrupting is intentionally Send/queue, not Steer.
+  updateSubmitButtonLabel(key);
   // Control sub-tab: highlight the "applies on next task" note while a
   // task is genuinely active so the user knows their toggle is queued,
   // not live. Must match the Stop button's allowlist exactly — any
   // denylist here would misclassify `waiting` / `waiting_followup` /
   // similar between-task states as "running".
-  const phaseIsActive = isAgentActivePhase(phase);
+  const phaseIsActive = isAgentActivePhase(key);
   if (phaseIsActive !== controlBackendActive) {
     controlBackendActive = phaseIsActive;
     updateControlAppliesNote();
@@ -23143,7 +23168,9 @@ function onSessionStarted(sessionId, task) {
 function onSessionAttached(sessionId, source) {
   currentSessionFullId = sessionId || '';
   if (sessionId) {
-    ensureSessionWindow(sessionId, { source: source || 'session', phase: 'idle', ended: false });
+    const existingPhase = sessionWindows.get(sessionId)?.phase;
+    const phase = existingPhase && existingPhase !== 'done' ? existingPhase : 'idle';
+    ensureSessionWindow(sessionId, { source: source || 'session', phase, ended: false });
     focusSessionWindow(sessionId);
   } else {
     updateTaskTargetChip();
@@ -23354,10 +23381,12 @@ window.submitActivityTask = function(options = {}) {
 // When the agent is idle / done / interrupted / waiting-follow-up, the
 // click starts a new task (the existing submitActivityTask path).
 // When the agent is actively working (thinking / running / orchestrating /
-// waiting-approval / waiting-human / interrupting), the click injects a
+// waiting-approval / waiting-human), the click injects a
 // mid-turn steer via a session-scoped server action, which round-trips
 // through the backend as ControlMsg::Steer and comes back as steer_requested /
 // steer_accepted / steer_queued / steer_delivered events.
+// While an interrupt is already in flight, input is queued as the next
+// follow-up instead of trying to steer a turn that is being cancelled.
 //
 // The submit button's label tracks the phase (Send vs ↗ Steer) so the
 // user sees which behavior will fire before clicking.
@@ -23381,7 +23410,7 @@ window.submitActivityOrSteer = function() {
   const targetSessionId = resolvePromptTargetSessionId();
   if (
     targetSessionId &&
-    isSessionWindowEffectivelyActive(targetSessionId) &&
+    isSessionWindowSteerActive(targetSessionId) &&
     sessionSupportsSteer(targetSessionId)
   ) {
     // Mid-turn steer path. JS generates the id locally and we render an
@@ -23414,7 +23443,7 @@ window.submitActivityOrSteer = function() {
       queuedFollowUp: !!(
         targetSessionId &&
         isSessionWindowEffectivelyActive(targetSessionId) &&
-        !sessionSupportsSteer(targetSessionId)
+        (!sessionSupportsSteer(targetSessionId) || !isSessionWindowSteerActive(targetSessionId))
       ),
     });
   }
@@ -23436,8 +23465,8 @@ function updateSubmitButtonLabel(phase) {
   btn.classList.remove('edit-mode');
   const targetSessionId = resolvePromptTargetSessionId();
   const active = targetSessionId
-    ? isSessionWindowEffectivelyActive(targetSessionId)
-    : isAgentActivePhase(phase);
+    ? isSessionWindowSteerActive(targetSessionId)
+    : isSteerPhase(phase);
   const canSteer = targetSessionId ? sessionSupportsSteer(targetSessionId) : true;
   if (active && canSteer) {
     btn.innerHTML = '\u2197 Steer';
@@ -26245,13 +26274,13 @@ const AGENT_ACTIVE_PHASES = new Set([
   'waiting_approval', 'waiting_human', 'interrupting',
 ]);
 function isAgentActivePhase(phase) {
-  return AGENT_ACTIVE_PHASES.has((phase || '').toLowerCase());
+  return AGENT_ACTIVE_PHASES.has(phaseKey(phase));
 }
 
 function updateStopButtonVisibility(phase) {
   const btn = document.getElementById('stop-btn');
   if (!btn) return;
-  const key = (phase || '').toLowerCase();
+  const key = phaseKey(phase);
   const targetSessionId = resolvePromptTargetSessionId();
   const show = targetSessionId
     ? isSessionWindowEffectivelyActive(targetSessionId) && sessionSupportsInterrupt(targetSessionId)

@@ -5046,6 +5046,10 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                             model = Some(message.trim_start_matches("Model: ").to_string());
                         } else if message.starts_with("Task: ") && task.is_none() {
                             task = Some(message.trim_start_matches("Task: ").to_string());
+                        } else if message.starts_with("Interrupted: ")
+                            || message.starts_with("External agent interrupted: ")
+                        {
+                            status = "interrupted".to_string();
                         }
                     }
                     if external_resume_id.is_none() {
@@ -5056,6 +5060,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                     }
                 }
                 "turn_start" => {
+                    status = "in_progress".to_string();
                     if let Some(t) = obj.get("turn").and_then(|v| v.as_u64()) {
                         if t > turns {
                             turns = t;
@@ -5078,11 +5083,13 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                         }
                     }
                 }
-                "task_complete" | "session_end" | "round_complete" => {
+                "task_complete" | "session_end" | "session_ended" => {
                     status = "completed".to_string();
                 }
-                "interrupted" => {
-                    status = "interrupted".to_string();
+                "round_complete" => {
+                    if status != "interrupted" {
+                        status = "idle".to_string();
+                    }
                 }
                 _ => {}
             }
@@ -17762,6 +17769,48 @@ mod tests {
             round.get("turns_in_round").and_then(|v| v.as_u64()),
             Some(3)
         );
+    }
+
+    #[test]
+    fn session_list_round_complete_is_idle_not_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.round_complete(1, 3);
+        drop(log);
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "session").unwrap();
+        assert_eq!(row["status"].as_str(), Some("idle"));
+    }
+
+    #[test]
+    fn session_list_preserves_user_interrupted_status_after_round_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.info("External agent interrupted: user requested");
+        log.round_complete(1, 2);
+        drop(log);
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "session").unwrap();
+        assert_eq!(row["status"].as_str(), Some("interrupted"));
+    }
+
+    #[test]
+    fn session_list_new_turn_after_interrupt_returns_to_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.info("Interrupted: user requested");
+        log.round_complete(1, 1);
+        log.turn_start(2, 0.0, 100_000);
+        drop(log);
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "session").unwrap();
+        assert_eq!(row["status"].as_str(), Some("in_progress"));
     }
 
     #[test]

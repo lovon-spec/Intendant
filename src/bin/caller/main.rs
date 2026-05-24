@@ -1112,6 +1112,13 @@ fn pending_runtime_steer_targets_session(
     pending.session_id.as_deref() == session_id.as_deref()
 }
 
+fn has_queued_steers(context_injection: &event::ContextInjectionQueue) -> bool {
+    context_injection
+        .lock()
+        .map(|queue| queue.iter().any(|injection| injection.steer_id.is_some()))
+        .unwrap_or(false)
+}
+
 fn flush_pending_runtime_steers_for_session(
     bus: &EventBus,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
@@ -3204,11 +3211,9 @@ async fn drain_external_agent_events(
 /// caller's `followup` text — the result is sent as a single external agent
 /// message so the agent sees both in the same turn's input.
 ///
-/// When `followup` is empty the return is `None`, meaning "nothing to send"
-/// — this lets callers avoid an empty `send_message` when the follow-up
-/// was purely a delivery of queued steers (the external agent loop does
-/// not distinguish "steer only" from "user message", so we skip the send
-/// and wait for the next follow-up).
+/// When `followup` is empty and queued steer text exists, the queued steer
+/// text becomes the whole follow-up. When both are empty, the return is
+/// `None`, meaning "nothing to send".
 fn drain_steer_queue_as_followup(
     context_injection: &event::ContextInjectionQueue,
     followup: &str,
@@ -9934,6 +9939,9 @@ async fn run_external_agent_mode(
         let followup = match next_turn.take() {
             Some(turn) => turn,
             None => loop {
+                if has_queued_steers(&context_injection) {
+                    break FollowUpMessage::text(String::new());
+                }
                 tokio::select! {
                     maybe_followup = follow_up_rx.recv() => {
                         match maybe_followup {
@@ -10399,15 +10407,6 @@ async fn run_external_agent_mode(
         let user_turn_revision = user_turn_revisions.record_active_turn(round as u32);
         stats.turns = 0;
         let attachment_count = attachments.len();
-        emit_user_message_log(
-            &bus,
-            &session_log,
-            live_session_id.as_deref(),
-            Some(round as u32),
-            Some(user_turn_revision),
-            replacement_for_user_turn_index,
-            &turn_text,
-        );
         let merged = drain_steer_queue_as_followup(
             &context_injection,
             &turn_text,
@@ -10415,6 +10414,20 @@ async fn run_external_agent_mode(
             live_session_id.as_deref(),
         )
         .unwrap_or_else(|| turn_text.clone());
+        let user_log_text = if turn_text.trim().is_empty() {
+            &merged
+        } else {
+            &turn_text
+        };
+        emit_user_message_log(
+            &bus,
+            &session_log,
+            live_session_id.as_deref(),
+            Some(round as u32),
+            Some(user_turn_revision),
+            replacement_for_user_turn_index,
+            user_log_text,
+        );
         slog(&session_log, |l| {
             if round == 1 {
                 l.info(&format!(
