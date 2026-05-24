@@ -1649,9 +1649,8 @@ fn current_agent_output_response_for_ids(ids: Vec<String>, log_dir: &Path) -> St
         return upload_error_response("400 Bad Request", "missing output ids");
     }
 
-    let fallback_logs_dir = std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".intendant").join("logs"));
+    let fallback_logs_dir =
+        Some(crate::platform::home_dir().join(".intendant").join("logs"));
     let chunks = agent_output_chunks_with_fallback(log_dir, &ids, fallback_logs_dir.as_deref());
     let found: HashSet<&str> = chunks
         .iter()
@@ -1934,8 +1933,14 @@ fn resume_session_activity_replay(
     task: Option<&str>,
     limit: usize,
 ) -> Option<String> {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
-    resume_session_activity_replay_from_home(&home, source, session_id, resume_id, task, limit)
+    resume_session_activity_replay_from_home(
+        &crate::platform::home_dir(),
+        source,
+        session_id,
+        resume_id,
+        task,
+        limit,
+    )
 }
 
 fn resume_session_activity_replay_from_home(
@@ -2173,8 +2178,7 @@ fn resolve_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBu
 }
 
 fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    resolve_session_dir_from_home(&PathBuf::from(home), session_id)
+    resolve_session_dir_from_home(&crate::platform::home_dir(), session_id)
 }
 
 /// List recording streams from a recordings directory on disk.
@@ -2253,8 +2257,7 @@ fn get_session_detail(session_id: &str) -> String {
 }
 
 fn session_log_search_from_request(request_line: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let home_path = PathBuf::from(&home);
+    let home_path = crate::platform::home_dir();
     let query = query_param(request_line, "q").unwrap_or_default();
     let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
     let mode = query_param(request_line, "mode").unwrap_or_default();
@@ -4338,8 +4341,7 @@ fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
 }
 
 fn external_session_detail(source: &str, session_id: &str) -> Option<String> {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
-    external_session_detail_from_home(&home, source, session_id)
+    external_session_detail_from_home(&crate::platform::home_dir(), source, session_id)
 }
 
 fn external_session_detail_from_home(
@@ -4719,8 +4721,12 @@ fn external_session_activity_replay(
     session_id: &str,
     limit: usize,
 ) -> Option<String> {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
-    external_session_activity_replay_from_home(&home, source, session_id, limit)
+    external_session_activity_replay_from_home(
+        &crate::platform::home_dir(),
+        source,
+        session_id,
+        limit,
+    )
 }
 
 fn external_session_activity_replay_from_home(
@@ -4840,9 +4846,7 @@ fn session_ended_id_from_wire(line: &str) -> Option<String> {
 }
 
 fn list_sessions() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let home_path = PathBuf::from(&home);
-    list_sessions_from_home(&home_path)
+    list_sessions_from_home(&crate::platform::home_dir())
 }
 
 fn empty_worktree_inventory_response() -> String {

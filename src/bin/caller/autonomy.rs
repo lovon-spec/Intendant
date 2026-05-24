@@ -317,6 +317,51 @@ impl AutonomyState {
             }
         }
     }
+
+    /// Decide how to handle an approval request that an *external agent*
+    /// (Codex / Gemini / Claude Code) explicitly emitted.
+    ///
+    /// This is deliberately distinct from [`Self::needs_approval`], which
+    /// classifies actions that intendant itself initiates. The external
+    /// agent only sends an approval request when its own `approval_policy`
+    /// has already decided the action warrants human review (e.g. Codex
+    /// running with `on-request`). That escalation must not be silently
+    /// swallowed by a category whose intendant-side default is `Auto`
+    /// (`CommandExec`/`NetworkRequest` default to `Auto`) — the request
+    /// arriving at all is the signal that a human should decide.
+    ///
+    /// Semantics:
+    /// - `Full` autonomy → auto-approve (no human in the loop at all).
+    /// - An explicit category `Deny` rule → reject.
+    /// - Everything else → surface to the frontend `y/s/a/n` gate.
+    pub fn external_approval_decision(
+        &self,
+        category: ActionCategory,
+    ) -> ExternalApprovalDecision {
+        // Full autonomy keeps the human entirely out of the loop.
+        if self.level == AutonomyLevel::Full {
+            return ExternalApprovalDecision::AutoApprove;
+        }
+
+        // An explicit per-category Deny rule rejects outright.
+        if self.rules.rule_for(category) == ApprovalRule::Deny {
+            return ExternalApprovalDecision::Reject;
+        }
+
+        // The external agent asked: let the human decide.
+        ExternalApprovalDecision::Ask
+    }
+}
+
+/// Outcome of routing an external-agent approval request through autonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalApprovalDecision {
+    /// Auto-approve without prompting (Full autonomy).
+    AutoApprove,
+    /// Reject without prompting (explicit category `Deny`).
+    Reject,
+    /// Surface the request to the frontend approval gate.
+    Ask,
 }
 
 /// Shared autonomy state wrapped in Arc<RwLock> for concurrent access.
@@ -924,5 +969,70 @@ destructive = "deny"
         });
         let cats = classify_command(&cmd);
         assert!(!cats.contains(&ActionCategory::DisplayControl));
+    }
+
+    #[test]
+    fn external_approval_asks_at_high_for_command_exec() {
+        // Regression: an external agent (e.g. Codex on-request) explicitly
+        // asking for command-exec approval must reach the frontend at High,
+        // even though CommandExec's intendant-side default rule is Auto.
+        let state = AutonomyState::new(AutonomyLevel::High, ApprovalConfig::default());
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::CommandExec),
+            ExternalApprovalDecision::Ask
+        );
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::FileWrite),
+            ExternalApprovalDecision::Ask
+        );
+    }
+
+    #[test]
+    fn external_approval_asks_at_medium_and_low() {
+        for level in [AutonomyLevel::Low, AutonomyLevel::Medium] {
+            let state = AutonomyState::new(level, ApprovalConfig::default());
+            assert_eq!(
+                state.external_approval_decision(ActionCategory::CommandExec),
+                ExternalApprovalDecision::Ask,
+                "level {:?} should surface external command approvals",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn external_approval_full_auto_approves() {
+        let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::CommandExec),
+            ExternalApprovalDecision::AutoApprove
+        );
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::FileWrite),
+            ExternalApprovalDecision::AutoApprove
+        );
+    }
+
+    #[test]
+    fn external_approval_deny_rule_rejects() {
+        let mut rules = ApprovalConfig::default();
+        rules.command_exec = ApprovalRule::Deny;
+        let state = AutonomyState::new(AutonomyLevel::High, rules);
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::CommandExec),
+            ExternalApprovalDecision::Reject
+        );
+    }
+
+    #[test]
+    fn external_approval_full_overrides_deny() {
+        // Full keeps the human out of the loop entirely, even past a Deny rule.
+        let mut rules = ApprovalConfig::default();
+        rules.command_exec = ApprovalRule::Deny;
+        let state = AutonomyState::new(AutonomyLevel::Full, rules);
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::CommandExec),
+            ExternalApprovalDecision::AutoApprove
+        );
     }
 }

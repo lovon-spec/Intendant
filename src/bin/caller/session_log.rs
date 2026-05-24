@@ -274,8 +274,10 @@ impl SessionLog {
 
         // Create a new session directory with UUID for each top-level caller invocation.
         let session_id = Uuid::new_v4().to_string();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let dir = PathBuf::from(format!("{}/.intendant/logs/{}", home, session_id));
+        let dir = crate::platform::home_dir()
+            .join(".intendant")
+            .join("logs")
+            .join(&session_id);
         let _ = fs::create_dir_all(&dir);
         dir
     }
@@ -284,8 +286,7 @@ impl SessionLog {
     /// Scans `~/.intendant/logs/*/session_meta.json`, filters by project_root,
     /// and returns the most recently created session.
     pub fn find_latest_session(project_root: &Path) -> Option<(String, PathBuf)> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+        let logs_dir = crate::platform::home_dir().join(".intendant").join("logs");
         if !logs_dir.is_dir() {
             return None;
         }
@@ -330,8 +331,7 @@ impl SessionLog {
     /// Find a session by its ID (UUID prefix or full UUID).
     /// Checks `~/.intendant/logs/{id}/` directly, then scans for prefix matches.
     pub fn find_session_by_id(session_id: &str) -> Option<PathBuf> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+        let logs_dir = crate::platform::home_dir().join(".intendant").join("logs");
 
         // Direct match (dir name == session_id)
         let direct = logs_dir.join(session_id);

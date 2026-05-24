@@ -2913,8 +2913,8 @@ async fn drain_external_agent_events(
                         autonomy::ActionCategory::FileWrite
                     }
                 };
-                let needs = { config.autonomy.read().await.needs_approval(cat) };
-                if !needs {
+                let decision = { config.autonomy.read().await.external_approval_decision(cat) };
+                if decision == autonomy::ExternalApprovalDecision::AutoApprove {
                     config.bus.send(AppEvent::AutoApproved {
                         preview: command.clone(),
                     });
@@ -2927,6 +2927,18 @@ async fn drain_external_agent_events(
                             l.warn(&format!("Failed to auto-approve: {}", e))
                         });
                     }
+                } else if decision == autonomy::ExternalApprovalDecision::Reject {
+                    slog(config.session_log, |l| {
+                        l.warn(&format!("Policy auto-deny (category Deny): {}", command))
+                    });
+                    config.bus.send(AppEvent::ApprovalResolved {
+                        session_id: config.session_id.clone(),
+                        id: 0,
+                        action: "deny".to_string(),
+                    });
+                    let _ = agent
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
+                        .await;
                 } else if config.headless && config.json_approval.is_none() {
                     slog(config.session_log, |l| {
                         l.warn(&format!("Headless auto-deny: {}", command))
@@ -3012,10 +3024,10 @@ async fn drain_external_agent_events(
                 diff,
             } => {
                 let cat = autonomy::ActionCategory::FileWrite;
-                let needs = { config.autonomy.read().await.needs_approval(cat) };
+                let decision = { config.autonomy.read().await.external_approval_decision(cat) };
                 let preview = format!("file change: {}", path);
 
-                if !needs {
+                if decision == autonomy::ExternalApprovalDecision::AutoApprove {
                     config.bus.send(AppEvent::AutoApproved {
                         preview: preview.clone(),
                     });
@@ -3028,6 +3040,18 @@ async fn drain_external_agent_events(
                             l.warn(&format!("Failed to auto-approve file change: {}", e))
                         });
                     }
+                } else if decision == autonomy::ExternalApprovalDecision::Reject {
+                    slog(config.session_log, |l| {
+                        l.warn(&format!("Policy auto-deny (category Deny): {}", preview))
+                    });
+                    config.bus.send(AppEvent::ApprovalResolved {
+                        session_id: config.session_id.clone(),
+                        id: 0,
+                        action: "deny".to_string(),
+                    });
+                    let _ = agent
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
+                        .await;
                 } else if config.headless && config.json_approval.is_none() {
                     slog(config.session_log, |l| {
                         l.warn(&format!("Headless auto-deny: {}", preview))

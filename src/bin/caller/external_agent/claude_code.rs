@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::CallerError;
@@ -461,7 +461,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         }
 
         // Spawn the process
-        let mut child = Command::new(&self.command)
+        let mut child = crate::platform::spawn_command(&self.command)
             .args(&args)
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())

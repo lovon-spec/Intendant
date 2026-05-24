@@ -109,6 +109,19 @@ fn substitute_platform(prompt: &str) -> String {
              but `cliclick` uses logical (1x) coordinates. Divide screenshot pixel coordinates \
              by 2 before passing to `cliclick`.",
         )
+    } else if cfg!(target_os = "windows") {
+        (
+            "Windows",
+            "You run as a local user with no `sudo`. Your default shell is \
+             cmd.exe; for anything beyond trivial commands, call PowerShell \
+             explicitly (`powershell -NoProfile -Command` followed by your \
+             script). For commands containing quotes, `$`, or other special \
+             characters, pass them via PowerShell `-EncodedCommand` (base64 of \
+             the UTF-16LE text) to avoid cmd.exe quote-mangling. There is no \
+             X11 — do NOT use xdotool, xrandr, import, screencapture, or \
+             `sudo`; your home directory is %USERPROFILE%. Use your native \
+             click/type/screenshot actions for the desktop.",
+        )
     } else {
         (
             "Debian 12",
