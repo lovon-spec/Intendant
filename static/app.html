@@ -14444,35 +14444,58 @@ function setPhase(phase) {
 
 // Cross-tab pending-approval indicator: badge the favicon + prefix the page
 // title so a pending approval is visible even when this tab is in the
-// background. The favicon is redrawn on a canvas (app icon + attention dot);
-// if canvas is unavailable the title change still signals it.
+// background. Browsers (esp. Chrome) ignore an in-place href change on the
+// existing <link rel=icon>, so we remove it and append a fresh <link> each
+// time. The badged icon is composited on a canvas (app icon + attention dot),
+// with a solid-tile fallback if the base icon can't load; the title change
+// signals it regardless of canvas support.
 const _origDocTitle = document.title;
 let _approvalIndicatorOn = false;
+
+function _swapFavicon(href) {
+  document.querySelectorAll("link[rel~='icon']").forEach(el => el.remove());
+  const link = document.createElement('link');
+  link.id = 'favicon';
+  link.rel = 'icon';
+  link.type = 'image/png';
+  link.href = href;
+  document.head.appendChild(link);
+}
+
+function _drawApprovalBadge(ctx, size) {
+  // bottom-right attention dot with a dark ring so it reads on any icon
+  const r = size * 0.30, cx = size - r - 1, cy = size - r - 1;
+  ctx.beginPath(); ctx.arc(cx, cy, r + 3, 0, 2 * Math.PI);
+  ctx.fillStyle = '#1e1e2e'; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+  ctx.fillStyle = '#f38ba0'; ctx.fill();
+}
+
 function setApprovalIndicator(pending) {
   if (pending === _approvalIndicatorOn) return;
   _approvalIndicatorOn = pending;
   document.title = pending ? '● Approval needed — ' + _origDocTitle : _origDocTitle;
-  const link = document.getElementById('favicon');
-  if (!link) return;
-  if (!pending) { link.href = '/icon-128.png'; return; }
-  try {
-    const img = new Image();
-    img.onload = function() {
-      const c = document.createElement('canvas');
-      c.width = 64; c.height = 64;
-      const ctx = c.getContext('2d');
-      ctx.drawImage(img, 0, 0, 64, 64);
-      ctx.beginPath();
-      ctx.arc(47, 17, 15, 0, 2 * Math.PI);
-      ctx.fillStyle = '#f38ba0';
-      ctx.fill();
-      ctx.lineWidth = 5;
-      ctx.strokeStyle = '#1e1e2e';
-      ctx.stroke();
-      if (_approvalIndicatorOn) link.href = c.toDataURL('image/png');
-    };
-    img.src = '/icon-128.png';
-  } catch (_) { /* canvas unavailable — title change still signals */ }
+  if (!pending) { _swapFavicon('/icon-128.png'); return; }
+  const size = 64;
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const ctx = c.getContext('2d');
+  const finish = function() {
+    try { if (_approvalIndicatorOn) _swapFavicon(c.toDataURL('image/png')); } catch (_) {}
+  };
+  const img = new Image();
+  img.onload = function() {
+    try { ctx.drawImage(img, 0, 0, size, size); } catch (_) {}
+    _drawApprovalBadge(ctx, size);
+    finish();
+  };
+  img.onerror = function() {
+    ctx.fillStyle = '#313244';
+    ctx.fillRect(0, 0, size, size);
+    _drawApprovalBadge(ctx, size);
+    finish();
+  };
+  img.src = '/icon-128.png';
 }
 
 function clearPendingApproval() {
