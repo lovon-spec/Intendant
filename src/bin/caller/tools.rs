@@ -371,7 +371,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     // 13. spawn_live_audio (caller-handled, untrusted live audio sub-agent)
     tools.push(ToolDefinition {
         name: "spawn_live_audio".to_string(),
-        description: "Spawn an untrusted live audio sub-agent to conduct a voice conversation through an app on the display. Connects to a live audio model (Gemini Live or OpenAI Realtime) and routes audio through virtual devices (PulseAudio on Linux, BlackHole on macOS). Requires virtual audio driver to be installed. The sub-agent has zero tools and zero file access. Returns structured data matching the response_schema, or quarantine references for unexpected content.".to_string(),
+        description: "Spawn an untrusted live audio sub-agent to conduct a voice conversation through an app on the display. Connects to a live audio model (Gemini Live or OpenAI Realtime) and routes audio through virtual devices (PulseAudio on Linux, Vortex Audio on macOS). Requires virtual audio driver to be installed. The sub-agent has zero tools and zero file access. Returns structured data matching the response_schema, or quarantine references for unexpected content.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {

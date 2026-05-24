@@ -1,167 +1,278 @@
 # Computer Use & Live Audio
 
+This page covers three related capabilities: the provider-agnostic **computer
+use** (CU) abstraction that lets a model see and drive a desktop, the
+**live audio** system that connects an untrusted voice model to an application
+through a virtual audio bridge, and the **phone-call** / **voice-call-app**
+skills built on top of live audio.
+
+For the WebRTC capture/encode/stream stack that puts pixels on screen for a
+human viewer, see [Display Pipeline](./display-pipeline.md). This page is about
+the *model* seeing and acting, not the human-facing video transport.
+
 ## Computer Use
 
-Intendant provides a provider-agnostic computer use (CU) abstraction that lets AI models see and interact with graphical desktops.
+The CU abstraction (`src/bin/caller/computer_use.rs`) gives any provider a
+common set of actions (click, type, key, scroll, move, drag, screenshot) and
+dispatches them through a platform backend. Provider-specific parsing of CU tool
+calls (OpenAI computer-use, Anthropic computer-use, Gemini) lives in
+`provider.rs`; the executor here is provider-neutral.
 
-### Architecture
+### Backends
 
-```
-Model (CU actions) → computer_use.rs → DisplayBackend → platform tools
-                                            │
-                              ┌──────────────┼──────────────┐
-                              │              │              │
-                           X11           Wayland         macOS
-                        (xdotool)       (ydotool)      (cliclick)
-                      (ImageMagick)      (grim)      (screencapture)
-```
+`DisplayBackend` (in `computer_use.rs`) is detected at runtime by
+`DisplayBackend::detect()` — macOS → `MacOS`; otherwise `WAYLAND_DISPLAY` set →
+`Wayland`; else `X11`. It can be forced via the `backend` config value.
 
-The `DisplayBackend` enum detects the available backend at runtime:
+| Backend | Screenshot capture       | Input injection | Platform        |
+|---------|--------------------------|-----------------|-----------------|
+| X11     | ImageMagick `import`     | `xdotool`       | Linux (X11)     |
+| Wayland | `grim`                   | `ydotool`       | Linux (Wayland) |
+| MacOS   | `screencapture`          | `cliclick`      | macOS           |
 
-| Backend | Capture | Input | Platform |
-|---------|---------|-------|----------|
-| X11 | ImageMagick `import` | xdotool | Linux (X11) |
-| Wayland | grim | ydotool | Linux (Wayland) |
-| macOS | screencapture | cliclick | macOS |
+> **Status note:** The `Wayland` backend's input path (`ydotool`, requires
+> `/dev/uinput`) is marked *not yet implemented* in the source. Virtual displays
+> are always Xvfb (X11), so even on a Wayland host a `Virtual` target is driven
+> with X11 tooling (`import` + `xdotool`).
+
+Coordinates from the model are in the provider's logical screenshot space and
+are scaled to the backend's actual pixel/point space before dispatch (important
+on HiDPI and under the Wayland portal, which reports its own stream size).
 
 ### Display Targets
 
-CU actions operate on a `DisplayTarget`:
+CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
 
-- **`Virtual { id }`** — an Xvfb-managed virtual display (`:99`, `:100`, etc.)
-- **`UserSession`** — the user's real desktop, requires explicit `DisplayControl` autonomy grant
+- **`Virtual { id }`** — an Xvfb-managed virtual display (`:99`, `:100`, …).
+  `display_env_string()` → `":<id>"`.
+- **`UserSession`** — the user's real desktop. On Linux X11 it resolves the
+  login session's `DISPLAY` (falling back to `:0`); on macOS the primary display
+  doesn't use `DISPLAY`. Requires an explicit `DisplayControl` grant via the
+  autonomy system.
 
-User session display access uses a session-grant model: approve once via the `d` hotkey in the TUI or the dashboard, revoke anytime. On grant, the display becomes available for CU actions and WebRTC streaming.
+User-session access uses a **session-grant** model: approve once (the `d` hotkey
+in the TUI, or the dashboard control), and the grant holds for the rest of the
+session until revoked. See [TUI & Autonomy](./tui.md) for the approval surface.
 
 ### CU-First Routing
 
-When the presence layer submits a task, it can include a `display_target` hint. Display-oriented tasks (clicking buttons, filling forms, navigating apps) are routed to a fast CU model first, with automatic escalation to the heavy coding agent if the task requires code changes.
+Display-oriented work is routed to a fast CU model first, with escalation to the
+heavy agent for anything that turns out to need code changes. The routing
+decision lives in the session supervisor (`session_supervisor.rs`,
+`start_new_session` → `spawn_cu_task`):
 
-The routing heuristic:
-1. `submit_task` includes `display_target` → route to CU model
-2. `submit_task` includes `reference_frame_ids` → route to CU model
-3. Otherwise → route to main agent
+```
+submit_task / StartTask
+        │
+        ▼
+ reference_frame_ids non-empty?
+        │
+        ├── yes ─▶ spawn_cu_task  (fast CU model, with the referenced frames
+        │             │            resolved to images as visual context)
+        │             │
+        │             └── CU model decides it's not a display task
+        │                  → calls escalate_to_agent → heavy agent runs it
+        │
+        └── no  ─▶ normal agent / orchestrator path
+```
+
+The gate is **`reference_frame_ids` being non-empty** (the frames the user was
+looking at, supplied by [presence](./presence.md)'s `submit_task`); the
+`display_target` hint is carried through to tell the CU pipeline which display
+to act on. Earlier docs implied `display_target` alone triggers CU routing — the
+actual trigger is the presence of reference frames. The CU provider is given
+native CU tools plus a single `escalate_to_agent` function tool; calling it ends
+the CU run with `CuTaskResult::Escalate` and hands the task to the main agent.
 
 ### Configuration
 
 ```toml
 [computer_use]
-provider = "gemini"        # provider for CU model (optional)
-model = "gemini-3-flash"   # model for CU tasks (optional)
-backend = "auto"           # "x11", "wayland", "macos", or "auto" (default)
+provider = "gemini"          # optional; default = CU_PROVIDER / PROVIDER env, else auto
+model = "gemini-3-flash-preview"  # optional; gemini default shown
+backend = "auto"             # "x11" | "wayland" | "macos" | "auto" (default)
 ```
+
+Provider/model resolution (`provider::select_cu_provider`): config → `CU_PROVIDER`
+/ `CU_MODEL` env → `PROVIDER` env → auto. Default models when unset: gemini
+`gemini-3-flash-preview`, anthropic / openai use their CU-capable defaults.
 
 ## Live Audio
 
-The `spawn_live_audio` tool connects to voice AI APIs (Gemini Live or OpenAI Realtime) and pipes audio through a virtual audio bridge on the host system.
+`spawn_live_audio` is an **agent tool** (defined in `src/bin/caller/tools.rs`),
+not a CLI flag. It spins up an *untrusted* voice sub-agent that talks to Gemini
+Live or OpenAI Realtime and exchanges audio with an application through a virtual
+audio bridge.
 
 ### How It Works
 
 ```
-AI Voice Model ──WebSocket──▶ Intendant ──audio bridge──▶ Application
-     │                            │                          │
-     │   structured responses     │   virtual mic/speaker    │
-     │   (validated + quarantined)│   (PulseAudio/BlackHole) │
-     │◀──────────────────────────│◀─────────────────────────│
+voice model ──WebSocket──▶ Intendant ──audio bridge──▶ application
+   │  PCM16 mono 24 kHz        │   virtual mic/speaker      │
+   │  structured tool calls    │   (Vortex shm / PulseAudio)│
+   │◀─────────────────────────│◀──────────────────────────│
 ```
 
-1. The agent calls `spawn_live_audio` with a provider, playbook, and optional response schema
-2. Intendant creates a virtual audio bridge connecting the voice model to the target application
-3. The voice model follows the playbook (e.g., conducting a phone call, navigating a voice menu)
-4. Model responses are validated against the declared schema
-5. The tool returns structured data when the conversation completes
+1. The agent calls `spawn_live_audio` with `id`, `provider`, `playbook`, and a
+   mandatory `response_schema` (plus optional `timeout_secs`, `voice`,
+   `display_id`, `initial_message`).
+2. Intendant opens an audio bridge and connects to the voice model with a
+   *whitelisted* tool set generated from the response schema.
+3. The model follows the playbook; its turns are bridged as audio to/from the
+   app, and inbound audio is also teed to Whisper for a transcript.
+4. When the model calls `submit_response`, the data is validated against the
+   schema; the tool returns a `LiveAudioResult` with a `status` of `Completed`,
+   `TimedOut`, or `SchemaError`.
 
-### Security
+### Security Model — Untrusted, Schema-Validated, Quarantined
 
-Live audio sessions are **untrusted**: the voice model has zero tools and zero file access. All safety measures:
+The voice model is treated as hostile input. It has **zero tools** beyond the
+two generated from the schema (`submit_response`, `end_call`) and **zero file
+access**. Three layers protect the rest of the system:
 
-- **Schema validation** (`schema_validator.rs`): Responses are checked against the declared schema, with oversized fields truncated
-- **Quarantine** (`quarantine.rs`): Unexpected content (tool call attempts, oversized strings, off-schema data) is written to `~/.intendant/quarantine/<session_id>/` and never exposed to the agent
-- **Sandbox**: When Landlock is enabled, live audio processes can only write to the session log dir and quarantine dir — no project root, no `/tmp`
-
-### Audio Routing
-
-The virtual audio bridge creates bidirectional audio channels so applications "hear" model audio as microphone input, and the model captures application audio as speaker output.
-
-| Platform | Implementation |
-|----------|---------------|
-| Linux | PulseAudio null sinks via `pactl`/`parec`/`pacat` |
-| macOS | BlackHole 2ch + 16ch with SwitchAudioSource + sox, or Vortex Audio (preferred, shared memory ring buffers) |
-
-Audio routing is optional — browser-based voice interaction (Gemini Live / OpenAI Realtime via the web dashboard) works without it.
+- **Whitelisted tools + schema validation** (`schema_validator.rs`): the model
+  can only call the response tool; submitted data is checked against the
+  declared `ResponseSchema`, with oversized fields truncated and off-schema data
+  rejected.
+- **Quarantine** (`quarantine.rs`): any unexpected content — a tool-call attempt
+  for an unknown tool, oversized strings, off-schema payloads — is written to
+  `~/.intendant/quarantine/<live_audio_id>/<payload_id>.json` and **only a
+  reference is returned**; the raw content is never surfaced to the agent.
+- **Sandbox**: under Landlock, live-audio processes can write only to the session
+  log and quarantine directories — no project root, no `/tmp`.
 
 ### Silence Watchdog
 
-A watchdog monitors live audio sessions for prolonged silence or unresponsive model turns. After 6 consecutive unresponsive turns, a JSON nudge is injected to prompt the model to continue.
+The session loop runs a time-based watchdog (`live_audio.rs`): if there has been
+**no model output for 15 seconds**, it sends one nudge ("Are you still there?
+Please continue the conversation.") to unstick a frozen model, and resets when
+output resumes. A separate turn counter nudges the model toward emitting its JSON
+response after enough turns. (Earlier docs described "6 consecutive unresponsive
+turns" — the real mechanism is the 15-second silence timer.)
+
+### Audio Bridge — Per Platform
+
+The bridge is selected at spawn time by probing for the Vortex shared-memory
+segment (`shm_open("/vortex-audio")`). The preferred path on **both** macOS and
+Linux is the **Vortex Audio HAL plugin via a direct POSIX shared-memory bridge**
+(`start_vortex_shm_bridge`, `shm_open` + `mmap`, no daemon/socket). If the Vortex
+segment isn't present, it falls back to the per-OS device bridge:
+
+| Path                  | Implementation |
+|-----------------------|----------------|
+| Vortex (preferred)    | Direct POSIX shm ring buffers shared with the Vortex HAL plugin (`start_vortex_shm_bridge`). Converts Vortex Float32 stereo 48 kHz ↔ model PCM16 mono 24 kHz. POSIX-only. |
+| Linux fallback        | PulseAudio null sinks via `pactl` (virtual mic/speaker, set as default for the session, restored on drop). |
+| macOS fallback        | BlackHole virtual device + `SwitchAudioSource` (legacy). |
+
+> **Doc-vs-code note:** the `spawn_live_audio` *tool description* in `tools.rs`
+> still says audio routes through "PulseAudio on Linux, BlackHole on macOS". The
+> macOS reality is the Vortex HAL plugin over the POSIX shm bridge; BlackHole is
+> only the legacy fallback. There is also a TCP "bh-bridge" network bridge for
+> routing audio to a host outside the VM.
+
+Audio routing is only needed for the app-to-model bridge. Browser voice
+interaction through the [dashboard](./web-dashboard.md) (Gemini Live / OpenAI
+Realtime) needs none of this.
 
 ### Configuration
 
 ```toml
 [live_audio]
-enabled = true
-default_timeout_secs = 300     # session timeout (default: 5 minutes)
-gemini_model = "gemini-2.5-flash-native-audio-preview-12-2025"
-openai_model = "gpt-4o-realtime-preview"
-sample_rate = 24000            # audio sample rate (default: 24000)
+enabled = false                # default: false
+default_timeout_secs = 300     # default: 300 (5 minutes)
+gemini_model = "gemini-2.5-flash-native-audio-preview-12-2025"  # optional
+openai_model = "gpt-4o-realtime-preview"                        # optional
+sample_rate = 24000            # default: 24000
 ```
 
-## Phone Calls
+`LiveAudioSpawn` is its own [autonomy category](./tui.md#action-classification),
+so spawning a voice session can be gated independently of other actions.
 
-The phone-call skill combines `spawn_live_audio` with SIP telephony to make outbound phone calls:
+## Phone Calls (`phone-call` skill)
+
+`skills/phone-call/SKILL.md` places an outbound SIP call and conducts the
+conversation with a voice model. **macOS only**; requires the Vortex Audio HAL
+plugin, `pjsua`, and a GUI session with TCC mic permission.
 
 ```
-AI Voice Model ──shared memory──▶ Vortex Audio ──▶ pjsua (SIP/SRTP) ──▶ Phone
-     │                                                                      │
-     │◀─────────────────────────────────────────────────────────────────────│
+voice model ──shm──▶ Vortex Audio (default in/out) ──▶ pjsua (SIP/SRTP) ──▶ phone
+   │                                                                          │
+   │◀────────────────────────────────────────────────────────────────────────│
 ```
 
-### How It Works
+How it works:
 
-1. The agent invokes the `phone-call` skill with a phone number, playbook, and response schema
-2. A SIP call is placed via pjsua with audio routed through Vortex Audio (macOS) or PulseAudio (Linux)
-3. The voice model conducts the conversation following the playbook
-4. On call completion, structured data is extracted per the response schema
-5. User-provided content from the call is flagged as "tainted" in the response
+1. Find the Vortex device index (`pjsua --null-audio | grep vortex`).
+2. Start `pjsua` with Vortex as both `--capture-dev` and `--playback-dev`,
+   SRTP enabled, dialing the target SIP URI.
+3. **Immediately** call `spawn_live_audio` (`provider: openai`) — do not wait
+   for the call to connect; the shm bridge polls and works before connect.
+4. The model conducts the call per the playbook and returns structured data.
+5. Clean up `pjsua`.
 
-### Playbook Format
+`response_schema` is **mandatory** — without it the call is rejected with a parse
+error. Do **not** set `initial_message`: the model starts speaking when it hears
+the callee.
 
-The playbook is a natural language script that tells the voice model how to conduct the call:
+## Voice Calls Through Any App (`voice-call-app` skill)
 
-- Greeting and introduction
-- Questions to ask
-- How to handle different responses
-- When to end the call
-- What data to extract
+`skills/voice-call-app/SKILL.md` makes a voice call through **any** app (Element,
+FaceTime, WhatsApp, …) by combining [computer use](#computer-use) to drive the
+UI with `spawn_live_audio` for the conversation. **macOS or Linux with a
+display**; requires the Vortex Audio HAL plugin and a GUI/TCC mic permission.
 
-### Response Schema
+How it works:
 
-A typed schema defines what structured data to extract from the call:
+1. Prepare the `spawn_live_audio` arguments (playbook, schema, voice, id)
+   *before* dialing, so they fire the instant the call connects.
+2. Use CU actions to foreground the app, navigate to the contact, and click the
+   call button. (`take_display_control` is **not** required for
+   `execute_cu_actions` — only take it if you need exclusive input.)
+3. Call `spawn_live_audio` (ideally in the same turn as the call click to
+   minimize dead air).
+4. Write the result from `response_data` immediately; hang up on completion.
+
+The voice model has two generated functions here: `submit_response` (the schema
+fields) and `end_call`. It submits data, then signals `end_call`.
+
+### Response Schema Format
+
+Both skills use the same `ResponseSchema` shape (`live_audio_types.rs`). Each
+field nests its type under `field_type`:
 
 ```json
 {
   "fields": [
-    {"name": "confirmed", "type": "boolean", "description": "Whether the appointment was confirmed"},
-    {"name": "new_time", "type": "string", "description": "Rescheduled time if changed", "tainted": true}
+    {"name": "guest_name",       "field_type": {"type": "string",  "max_length": 100, "tainted": true}, "required": true,  "description": "Guest name"},
+    {"name": "party_size",       "field_type": {"type": "integer", "min": 1, "max": 50},                "required": true,  "description": "Number of guests"},
+    {"name": "reservation_time", "field_type": {"type": "string",  "max_length": 50,  "tainted": true}, "required": true,  "description": "Confirmed time"},
+    {"name": "confirmed",        "field_type": {"type": "boolean"},                                     "required": true,  "description": "Whether confirmed"},
+    {"name": "special_requests", "field_type": {"type": "string",  "max_length": 200, "tainted": true}, "required": false, "description": "Any special requests"}
   ]
 }
 ```
 
-Fields marked `tainted: true` contain user-provided content and are handled with appropriate caution.
+Field types: `string` (`max_length`, `allowed_values`, `tainted`), `integer`
+(`min`, `max`), `boolean`, `array`. The voice model cannot submit until all
+`required: true` fields are filled. Fields marked **`tainted: true`** carry
+user-/callee-provided content and are treated as untrusted data, never as
+instructions.
 
-## Transcription
+## Browser Microphone Transcription
 
-Server-side audio transcription via the Whisper API processes browser microphone audio:
-
-1. The web gateway buffers `user_audio` WebSocket messages in ~3-second chunks
-2. Chunks are filtered by RMS energy to skip silence
-3. Audio is wrapped in WAV format and sent to the transcription API
-4. Transcripts are broadcast as `user_transcript` events
+Separately from live audio, the server can transcribe the *user's* dashboard
+microphone via Whisper (`transcription.rs`). Off by default. The web gateway
+buffers `user_audio` WebSocket frames into ~3-second chunks, filters silence by
+RMS energy, wraps them as WAV, sends them to the transcription API, and
+broadcasts `user_transcript` events.
 
 ```toml
 [transcription]
 enabled = true
 provider = "openai"
-model = "whisper-1"
-language = "en"              # ISO-639-1 hint (optional)
-# endpoint = "http://..."    # custom endpoint for self-hosted whisper.cpp
+model = "whisper-1"          # default
+language = "en"              # optional ISO-639-1 hint
+# endpoint = "http://..."    # optional; custom/self-hosted whisper-compatible endpoint
 ```
+
+Requires `OPENAI_API_KEY` (or a custom `endpoint`).

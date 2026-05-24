@@ -202,6 +202,15 @@ Windows. (The former OpenSSL C-FFI dependency is gone entirely — the LAN cert
 subsystem is now pure-Rust via `rcgen` + `p12-keystore` — so nothing OpenSSL
 needs gating on any platform.)
 
+Because VP8 is unavailable, H.264 is also the **always-on baseline codec** in the
+shared encoder pool on Windows (where macOS/Linux use VP8 simulcast as the
+baseline) — a single full-resolution H.264 layer the Media Foundation encoder
+serves, rather than a simulcast set. A baseline construction failure on Windows
+degrades gracefully (the Video tab reports no stream; the rest of the dashboard
+stays up) instead of panicking, because the pool is built eagerly at `--web`
+startup. See [Display Pipeline](./display-pipeline.md#the-encoder-pool) for the
+pool architecture.
+
 ### Audio — ffmpeg + VB-CABLE WASAPI bridge
 
 There is no PulseAudio (Linux) or CoreAudio/BlackHole (macOS) on Windows. The
@@ -250,9 +259,11 @@ than a panic or silent no-op.
   `LanBackend` returns `"intendant lan is not supported on Windows"`. (The
   certificate generation itself is now pure-Rust and cross-platform; only the
   proxy/service plumbing is Unix-specific.) To expose the dashboard to other
-  devices from a Windows host, use the `scripts/setup-lan.bat` orchestrator
-  (which drives `intendant lan` on a Linux guest over SSH/WSL), or front the
-  dashboard with your own reverse proxy.
+  devices from a Windows host, use native HTTPS/WSS via `--tls` (also pure-Rust
+  and cross-platform), use the `scripts/setup-lan.bat` orchestrator (which drives
+  `intendant lan` on a Linux guest over SSH/WSL), or front the dashboard with your
+  own reverse proxy. See [Peer Federation](./peer-federation.md#lan-access-and-tls)
+  for the full LAN/TLS and federation auth story.
 - **No virtual-display equivalent.** There is no Windows analogue of Xvfb, so
   the lazily-launched virtual displays the Linux pipeline uses do not exist on
   Windows. Capture targets the real interactive desktop only.
@@ -262,5 +273,6 @@ than a panic or silent no-op.
 ## See Also
 
 - [Getting Started](./getting-started.md) — building, the `.env` file, and run modes
-- [Display Pipeline](./display-pipeline.md) — capture/encode/WebRTC architecture
+- [Display Pipeline](./display-pipeline.md) — capture/encode/WebRTC architecture and the encoder pool
+- [Peer Federation](./peer-federation.md) — LAN/TLS, `--tls`, and cross-machine display
 - [Computer Use & Live Audio](./computer-use-and-audio.md) — input and voice

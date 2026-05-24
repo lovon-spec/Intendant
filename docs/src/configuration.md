@@ -1,139 +1,439 @@
 # Configuration
 
-## CLI Flags
+Intendant is configured through three layers, in increasing specificity:
 
-| Flag | Description |
-|------|-------------|
-| `--provider <name>` | Force provider (`openai`, `anthropic`, or `gemini`) |
-| `--model <name>` | Override model name |
-| `--verbose` / `-v` | Show debug-level log entries in TUI |
-| `--no-tui` | Disable TUI, use plain text output |
-| `--autonomy <level>` | Set autonomy level (`low`, `medium`, `high`, `full`) |
-| `--log-file <dir>` | Override session log directory |
-| `--mcp` | Run as MCP server on stdio (replaces TUI) |
-| `--control-socket` | Enable Unix control socket at `/tmp/intendant-<pid>.sock` |
-| `--json` | JSONL structured output to stdout (implies `--no-tui`) |
-| `--sandbox` | Enable Landlock filesystem sandboxing (Linux kernel 5.13+) |
-| `--direct` | Force single-agent direct mode (skip orchestrator even for complex tasks) |
-| `--no-presence` | Disable the presence layer (direct agent interaction) |
-| `--continue` / `-c` | Resume most recent session for this project |
-| `--resume <id>` / `-r <id>` | Resume specific session by ID or prefix |
-| `--web [PORT]` | Start web dashboard (default port 8765) |
-| `--transcription` | Enable server-side audio transcription (Whisper API) |
+1. **`intendant.toml`** in the project root — the durable, per-project config
+   (structure in `src/bin/caller/project.rs`).
+2. **Environment variables** (often via `.env`) — keys, provider/model
+   overrides, and a few runtime toggles.
+3. **CLI flags** — per-invocation overrides (see
+   [Getting Started](./getting-started.md#cli-flag-reference)).
 
-The TUI launches only when both stdin and stdout are terminals. When piping input/output or in sub-agent mode, `intendant` falls back to headless mode.
+CLI flags win over env vars where they overlap (`--provider` sets `PROVIDER`,
+`--model` sets `MODEL_NAME`). `intendant.toml` and `.env` are both git-ignored.
 
-## Environment Variables
+## Environment variables
+
+The controller reads these from the process environment (populated from `.env`;
+see [Getting Started](./getting-started.md#api-keys-env) for the search order).
+
+### Keys and provider selection
+
+| Variable | Alias | Default | Description |
+|----------|-------|---------|-------------|
+| `OPENAI_API_KEY` | `OPENAI` | — | OpenAI key |
+| `ANTHROPIC_API_KEY` | `ANTHROPIC` | — | Anthropic key |
+| `GEMINI_API_KEY` | `GEMINI` | — | Google AI (Gemini) key |
+| `PROVIDER` | — | auto-detect | `openai`, `anthropic`, or `gemini` — which provider to use when multiple keys are set |
+| `MODEL_NAME` | — | per-provider | Main model name |
+
+**Auto-detection** (when `PROVIDER` is unset): if an OpenAI key is present it is
+used first, then Anthropic, then Gemini. Setting `PROVIDER` explicitly forces
+that provider (and errors if its key is missing).
+
+**Per-provider default models** (used when `MODEL_NAME` is unset):
+
+| Provider | Default model |
+|----------|---------------|
+| OpenAI | `gpt-5.5` |
+| Anthropic | `claude-sonnet-4-5-20250929` |
+| Gemini | `gemini-2.5-pro` |
+
+### Model and behavior tuning
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAI_API_KEY` / `OPENAI` | — | OpenAI API key |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC` | — | Anthropic API key |
-| `GEMINI_API_KEY` | — | Google AI (Gemini) API key |
-| `PROVIDER` | auto-detect | `"openai"`, `"anthropic"`, or `"gemini"` (used when multiple keys are set) |
-| `MODEL_NAME` | per-provider default | Model to use |
-| `USE_NATIVE_TOOLS` | `true` | Enable native API tool calling; `false` falls back to text-based JSON extraction |
-| `MODEL_CONTEXT_WINDOW` | per-model default | Context window size in tokens |
-| `MAX_OUTPUT_TOKENS` | per-model default | Max output tokens per API call (sent to API) |
-| `STRUCTURED_OUTPUT` | `true` for gpt-5+/o3/o4 | Enable JSON object mode for deterministic parsing |
-| `REASONING_EFFORT` | — | Reasoning effort for reasoning models (`low`, `medium`, `high`) |
-| `REASONING_SUMMARY` | — | Reasoning summary mode (`auto`, `concise`, `detailed`) |
-| `PRESENCE_PROVIDER` | — | Override provider for the presence layer (fallback: `PROVIDER`) |
-| `PRESENCE_MODEL` | — | Override model for the presence layer |
-| `INTENDANT_LOG_DIR` | auto | Session log directory (set automatically by caller for the runtime) |
+| `MODEL_CONTEXT_WINDOW` | per-model | Context window in tokens (also settable via `[model] context_window`) |
+| `MAX_OUTPUT_TOKENS` | per-model | Max output tokens per API call (also `[model] max_output_tokens`) |
+| `USE_NATIVE_TOOLS` | `true` | Use the provider's native tool-calling API; `false` falls back to text-based JSON extraction |
+| `STRUCTURED_OUTPUT` | provider-dependent | Enable JSON object mode for deterministic parsing |
+| `REASONING_EFFORT` | — | For reasoning models: `low`, `medium`, `high` |
+| `REASONING_SUMMARY` | — | Reasoning summary mode: `auto`, `concise`, `detailed` |
 
-### Sub-Agent Environment Variables
+`[model] context_window` / `max_output_tokens` from `intendant.toml` are applied
+into `MODEL_CONTEXT_WINDOW` / `MAX_OUTPUT_TOKENS` only when those env vars are
+not already set, so env/CLI always win.
 
-These are set automatically when spawning sub-agents (see [Multi-Agent Orchestration](./multi-agent.md)):
+### Presence and computer-use overrides
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PRESENCE_PROVIDER` | falls back to `PROVIDER` | Override the presence layer's provider |
+| `PRESENCE_MODEL` | falls back to `PRESENCE_PROVIDER`'s default | Override the presence model |
+| `CU_PROVIDER` | falls back to `PROVIDER` | Override the computer-use model's provider |
+| `CU_MODEL` | — | Override the computer-use model |
+
+These mirror the `[presence]` and `[computer_use]` sections below; the
+precedence is **explicit config > env var > auto-detect**.
+
+### Sub-agent variables (set automatically)
+
+When the orchestrator spawns sub-agents it sets these in the child environment;
+you normally never set them by hand (see
+[Multi-Agent Orchestration](./multi-agent.md)):
 
 | Variable | Description |
 |----------|-------------|
 | `INTENDANT_ROLE` | Sub-agent role (`orchestrator`, `research`, `implementation`, `testing`) |
 | `INTENDANT_ID` | Unique sub-agent identifier |
-| `INTENDANT_TASK` | Task description for the sub-agent |
-| `INTENDANT_RESULT_FILE` | Path for sub-agent to write final results |
-| `INTENDANT_PROGRESS_FILE` | Path for sub-agent to write periodic progress |
-| `INTENDANT_PARENT_KNOWLEDGE` | Path to parent's knowledge store for inheritance |
+| `INTENDANT_TASK` | Task description |
+| `INTENDANT_RESULT_FILE` | Where the sub-agent writes its final result |
+| `INTENDANT_PROGRESS_FILE` | Where the sub-agent writes periodic progress |
+| `INTENDANT_PARENT_KNOWLEDGE` | Path to the parent's knowledge store for inheritance |
 | `INTENDANT_INHERIT_MEMORY` | `1` to inherit project memory |
-| `INTENDANT_SANDBOX_WRITE_PATHS` | Landlock write paths (set by caller when sandboxing) |
-| `INTENDANT_MCP_RELOAD` | `1` when process was exec'd for MCP hot-reload |
+| `INTENDANT_SANDBOX_WRITE_PATHS` | Landlock write paths (set by the caller when sandboxing) |
+| `INTENDANT_MAX_PARALLEL_AGENTS` | Max concurrent sub-agents (from `[orchestrator]`) |
+| `INTENDANT_MCP_RELOAD` | `1` when the process was `exec()`'d for MCP hot-reload |
+| `INTENDANT_LOG_DIR` | Session log directory (set by the caller for the runtime) |
 
-The agent runner hard timeout is 120s default, automatically extended to 600s when `askHuman` is present in the command batch.
+## `intendant.toml`
 
-## Project Configuration
+Create `intendant.toml` in your project root (the git top-level). Every section
+is optional; an absent section uses its defaults. The structure and defaults
+below are taken directly from `src/bin/caller/project.rs`.
 
-Create `intendant.toml` in the project root:
+### `[memory]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Enable the persistent project memory store (`.intendant/memory.json`) |
+
+### `[model]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `context_window` | int | per-model | Override the model's context window (tokens) |
+| `max_output_tokens` | int | per-model | Override max output tokens per call |
+
+### `[orchestrator]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_parallel_agents` | int | unset | Cap on concurrent sub-agents |
+| `sub_agent_dir` | string | `.intendant/subagents` | Directory (relative to project root) for sub-agent workspaces |
+
+### `[approval]`
+
+Per-category approval rules. Each value is `auto` (run without asking), `ask`
+(prompt the human), or `deny` (refuse). These are layered under the global
+`--autonomy` level — see [Autonomy and approval](#autonomy-and-approval).
+
+| Key | Type | Default | Category |
+|-----|------|---------|----------|
+| `file_read` | rule | `auto` | FileRead |
+| `file_write` | rule | `ask` | FileWrite |
+| `file_delete` | rule | `ask` | FileDelete |
+| `command_exec` | rule | `auto` | CommandExec |
+| `network` | rule | `auto` | NetworkRequest |
+| `destructive` | rule | `ask` | Destructive |
+| `display_control` | rule | `ask` | DisplayControl |
+
+The `HumanInput` and `LiveAudioSpawn` categories always require a human and are
+not configurable here.
+
+### `[presence]`
+
+The conversational presence layer that mediates between you and the worker
+agent (see [Presence Layer](./presence.md)).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Enable the presence layer |
+| `provider` | string | auto-detect | Provider for text-mode presence |
+| `model` | string | `gemini-3-flash-preview` | Text-mode presence model |
+| `context_window` | int | `1048576` | Context window for text-mode presence |
+| `live_provider` | string | auto-detect | Provider for browser-side live (voice) presence |
+| `live_model` | string | provider default | Live presence model |
+| `live_context_window` | int | `32768` | Context window for live presence |
+
+> The compiled-in default text presence model is `gemini-3-flash-preview`. Text
+> presence auto-detection prefers Gemini when `GEMINI_API_KEY` is set.
+
+### `[transcription]`
+
+Server-side speech-to-text via the Whisper API (or a compatible endpoint). See
+[Web Dashboard](./web-dashboard.md#server-side-transcription).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` (within a present section) | Enable server-side transcription |
+| `provider` | string | `openai` | Transcription provider |
+| `model` | string | `whisper-1` | Transcription model |
+| `endpoint` | string | OpenAI default | Custom endpoint URL (e.g. self-hosted whisper.cpp) |
+| `language` | string | auto-detect | ISO-639-1 language hint |
+| `buffer_secs` | float | `3.0` | Audio buffered before each API call (seconds) |
+
+> Note on the `enabled` default: when the entire `[transcription]` section is
+> **absent**, the field's struct default applies. When the section is
+> **present** but `enabled` is omitted, the bool defaults to `false`. The CLI
+> `--transcription` flag and a present `enabled = true` both turn it on.
+
+### `[recording]`
+
+ffmpeg-based recording of agent displays (see
+[Integrations](./integrations.md#recording-ffmpeg)).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable display recording |
+| `framerate` | int | `15` | Capture frames per second |
+| `segment_duration_secs` | int | `60` | Length of each recording segment |
+| `quality` | string | `medium` | `low` (CRF 35), `medium` (CRF 28), `high` (CRF 20) |
+| `max_retention_hours` | int | unset | Auto-delete segments older than this |
+
+### `[computer_use]`
+
+Provider/model used for visual-grounding (computer-use) tasks. See
+[Computer Use & Live Audio](./computer-use-and-audio.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `provider` | string | auto-detect | CU model provider |
+| `model` | string | auto-detect | CU model |
+| `backend` | string | `auto` | Input/screenshot backend: `x11`, `wayland`, `macos`, or `auto` |
+
+### `[agent]` and external backends
+
+Routes coding tasks to an external CLI agent instead of the native loop (see
+[Integrations](./integrations.md#external-coding-agent-clis)).
+
+`[agent]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `default_backend` | string | unset (use native) | `codex`, `claude-code`, or `gemini` |
+
+`[agent.codex]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | string | `codex` | Path or command name for the Codex binary |
+| `model` | string | unset | Model override |
+| `approval_policy` | string | `on-request` | `untrusted`, `on-request`, or `never` (UI set; `on-failure` is deprecated upstream) |
+| `sandbox` | string | `workspace-write` | `read-only`, `workspace-write`, or `danger-full-access` |
+| `reasoning_effort` | string | unset (model default) | `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `web_search` | bool | `false` | Enable the Responses-API `web_search` tool (`codex --search`) |
+| `network_access` | bool | `false` | Allow outbound network in `workspace-write` sandbox (ignored for `read-only` / `danger-full-access`) |
+| `writable_roots` | array | `[]` | Extra writable roots, each passed as `--add-dir` (absolute, or resolved against project root) |
+
+`[agent.claude_code]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | string | `claude` | Path or command name |
+| `model` | string | unset | Model override |
+| `permission_mode` | string | `auto` | `default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions` |
+| `allowed_tools` | array | `[]` (all) | Restrict the tool set |
+
+`[agent.gemini_cli]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | string | `gemini` | Path or command name |
+| `model` | string | unset | Model override |
+| `approval_mode` | string | `default` | `default`, `auto_edit`, `yolo`, `plan` (matches `gemini --approval-mode`) |
+| `sandbox` | bool | `false` | Pass `--sandbox` when spawning Gemini |
+| `extensions` | array | `[]` (all) | Extension names to enable (`--extensions`) |
+| `allowed_mcp_servers` | array | `[]` (all) | MCP server allowlist (`--allowed-mcp-server-names`); include `intendant` if you set one |
+| `include_directories` | array | `[]` | Extra workspace roots (`--include-directories`, absolute) |
+| `debug` | bool | `false` | Open Gemini's DevTools console (`--debug`) |
+
+Unknown or empty values for `approval_policy`, `sandbox`, `reasoning_effort`,
+and Gemini's `approval_mode` are normalized to the safe default so a config typo
+cannot silently escalate privileges.
+
+### `[live_audio]`
+
+Untrusted voice sub-agent (zero tools, schema-validated) used for phone calls
+and live voice (see [Computer Use & Live Audio](./computer-use-and-audio.md)).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable live-audio sessions |
+| `default_timeout_secs` | int | `300` | Session timeout |
+| `gemini_model` | string | unset | Gemini Live model |
+| `openai_model` | string | unset | OpenAI Realtime model |
+| `sample_rate` | int | `24000` | Audio sample rate (Hz) |
+
+### `[sandbox]`
+
+Landlock filesystem sandboxing for the runtime (Linux). Also enabled by
+`--sandbox`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable Landlock sandboxing |
+| `extra_write_paths` | array | `[]` | Extra writable paths beyond project root, `/tmp`, the log dir, and `~/.intendant` |
+
+On kernels without Landlock support, sandboxing is silently skipped.
+
+### `[webrtc]`
+
+ICE servers for the WebRTC display transport (see
+[Display Pipeline](./display-pipeline.md)).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `ice_servers` | array of tables | `[]` (local-only) | STUN/TURN servers |
+| `federation_allow_h264` | bool | `false` | Allow the federated (peer-to-peer) display path to negotiate H.264; default pins VP8 for lossy TURN-relayed paths. The local same-machine path is unaffected |
+
+Each `ice_servers` entry: `urls` (array, required), optional `username`,
+optional `credential`.
+
+### `[server]` (daemon and federation)
+
+What this daemon advertises to peers and requires of inbound connections. Most
+deployments only ever touch `[server.tls]`.
+
+`[server]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `advertise` | array | `[]` (auto-detect) | WebSocket URLs to advertise in this daemon's Agent Card, preference order. The CLI `--advertise-url` is additive over this |
+
+`[server.tls]` — native HTTPS/WSS for the dashboard (pure-Rust `rustls` +
+`rcgen`, all platforms; ORed with the `--tls` flag):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Serve the dashboard over HTTPS/WSS |
+| `cert` | string | auto self-signed | PEM cert (chain) overriding the self-signed cert; pair with `key` |
+| `key` | string | — | PEM private key (PKCS#8, PKCS#1, or SEC1) matching `cert` |
+| `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
+
+`[server.auth]` — inbound auth this daemon enforces on federation peers:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `bearer_token` | string | none | Require `Authorization: Bearer <token>` on inbound HTTP/WS; wrong/missing → 401 |
+| `advertised_transport` | string | `none` | What the Agent Card advertises: `none`, `mutual-tls`, or `pin-self-cert` |
+
+### `[[peer]]` — federated peers
+
+Each `[[peer]]` block auto-registers a remote daemon at startup. Only `card_url`
+is required.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `card_url` | string | (required) | URL of the peer's Agent Card (`.../.well-known/agent-card.json`) |
+| `label` | string | from card | Display label override in the dashboard's Daemons panel |
+| `bearer_token` | string | none | Outbound token this daemon sends to the peer (must match the peer's `[server.auth] bearer_token`) |
+| `pinned_fingerprints` | array | `[]` | Operator-pinned SHA-256 cert fingerprints; when set, replaces the card's `auth.transport` claim |
+| `browser_tcp_via_url` | string | from primary | Explicit URL the browser uses to reach this peer's HTTP port for WebRTC ICE-TCP |
+
+Peers added through the dashboard at runtime live only in the in-memory registry
+(and the browser's localStorage); they are not written back to `intendant.toml`.
+
+### `mcp_servers`
+
+External MCP servers to connect to as a client (see
+[Integrations](./integrations.md#mcp-client) and the trust note below). Each is
+an array-of-tables entry.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | (required) | Server name; tools are exposed as `mcp__<name>_<tool>` |
+| `command` | string | (required) | Executable to spawn |
+| `args` | array | `[]` | Arguments |
+| `env` | table | `{}` | Environment for the child process |
+
+> **Trust model:** an `mcp_servers` entry is spawned as a child process with
+> your full privileges (`Command::new(command).args(args)`). Intendant performs
+> **no** checksum, signature, or sandbox check on it — adding one is equivalent
+> to adding a line to your `~/.zshrc` that runs a binary. The default is
+> `mcp_servers = []`, and `intendant.toml` is git-ignored, so the repo ships no
+> MCP servers. Treat copying an `intendant.toml` between machines like copying
+> shell rc files: read it before sourcing. See [MCP Server](./mcp-server.md).
+
+## Worked example
+
+A reasonably full `intendant.toml`:
 
 ```toml
 [memory]
-enabled = true  # default: true
+enabled = true
 
 [model]
-context_window = 200000       # override per-model default
-max_output_tokens = 8192      # override per-model default
+context_window = 200000
+max_output_tokens = 8192
 
 [orchestrator]
-max_parallel_agents = 4       # max concurrent sub-agents
-sub_agent_dir = ".intendant/subagents"  # where sub-agent workspaces are created
+max_parallel_agents = 4
+sub_agent_dir = ".intendant/subagents"
 
 [approval]
-file_read = "auto"            # auto-approve file reads
-file_write = "ask"            # ask before file writes (default)
-file_delete = "ask"           # ask before file deletes (default)
-command_exec = "auto"         # auto-approve command execution
-network = "auto"              # auto-approve network requests
-destructive = "ask"           # ask before destructive commands (default)
-display_control = "ask"       # ask before user display access (default)
+file_read = "auto"
+file_write = "ask"
+file_delete = "ask"
+command_exec = "auto"
+network = "auto"
+destructive = "ask"
+display_control = "ask"
 
 [presence]
-enabled = true                # enable the conversational presence layer (default: true)
-provider = "gemini"           # provider for the presence model (optional)
-model = "gemini-2.5-flash"    # model for the presence layer (optional)
-context_window = 1048576      # context window for text presence (default: 1048576)
-live_provider = "gemini"      # provider for browser-side live presence (optional)
-live_model = "gemini-2.5-flash-native-audio-preview-12-2025"  # model for browser-side live (optional)
-live_context_window = 32768   # context window for live presence (default: 32768)
+enabled = true
+provider = "gemini"
+model = "gemini-3-flash-preview"
+context_window = 1048576
+live_provider = "gemini"
+live_model = "gemini-2.5-flash-native-audio-preview-12-2025"
+live_context_window = 32768
 
 [transcription]
-enabled = false               # enable server-side audio transcription (default: false)
-provider = "openai"           # transcription provider (default: "openai")
-model = "whisper-1"           # transcription model (default: "whisper-1")
-language = "en"               # ISO-639-1 language hint (optional, auto-detect if omitted)
-# endpoint = "http://..."     # custom endpoint for self-hosted whisper.cpp
+enabled = false
+provider = "openai"
+model = "whisper-1"
+language = "en"
+# endpoint = "http://localhost:8080/v1/audio/transcriptions"
 
 [recording]
-enabled = false               # enable display recording (default: false)
-framerate = 15                # frames per second (default: 15)
-segment_duration_secs = 60    # segment duration in seconds (default: 60)
-quality = "medium"            # "low" (CRF 35), "medium" (CRF 28), "high" (CRF 20)
-# max_retention_hours = 24    # auto-delete recordings older than this (optional)
+enabled = false
+framerate = 15
+segment_duration_secs = 60
+quality = "medium"
+# max_retention_hours = 24
 
 [computer_use]
-provider = "gemini"           # provider for CU model (optional)
-model = "gemini-3-flash"      # model for CU tasks (optional)
-backend = "auto"              # "x11", "wayland", "macos", or "auto" (default)
+provider = "gemini"
+model = "gemini-2.5-flash"
+backend = "auto"
 
 [agent]
-default_backend = "codex"     # "codex", "claude-code", "gemini", or omitted
+default_backend = "codex"
 
 [agent.codex]
-command = "codex"             # binary path or command name (default: "codex")
-model = "gpt-5"               # optional model override
+command = "codex"
+model = "gpt-5.5"
 approval_policy = "on-request"
 sandbox = "workspace-write"
+reasoning_effort = "medium"
+web_search = false
+network_access = false
+writable_roots = []
+
+[agent.claude_code]
+command = "claude"
+permission_mode = "auto"
+allowed_tools = []
+
+[agent.gemini_cli]
+command = "gemini"
+approval_mode = "default"
 
 [live_audio]
-enabled = false               # enable live audio sessions (default: false)
-default_timeout_secs = 300    # session timeout (default: 300)
+enabled = false
+default_timeout_secs = 300
 gemini_model = "gemini-2.5-flash-native-audio-preview-12-2025"
 openai_model = "gpt-4o-realtime-preview"
-sample_rate = 24000           # audio sample rate (default: 24000)
+sample_rate = 24000
 
 [sandbox]
-enabled = false               # enable Landlock filesystem sandboxing (default: false)
-extra_write_paths = ["/var/log"]  # additional writable paths beyond project root, /tmp, log dir
+enabled = false
+extra_write_paths = ["/var/log"]
 
 [webrtc]
+federation_allow_h264 = false
+
 [[webrtc.ice_servers]]
 urls = ["stun:stun.l.google.com:19302"]
 
@@ -142,7 +442,22 @@ urls = ["stun:stun.l.google.com:19302"]
 # username = "user"
 # credential = "pass"
 
-# External MCP servers to connect to as a client
+[server]
+advertise = ["ws://192.168.1.42:8765/ws"]
+
+[server.tls]
+enabled = false
+# cert = "/etc/intendant/server.crt"
+# key  = "/etc/intendant/server.key"
+
+[server.auth]
+advertised_transport = "none"
+# bearer_token = "long-random-secret"
+
+# [[peer]]
+# card_url = "https://peer.example.com/.well-known/agent-card.json"
+# bearer_token = "matching-secret-from-the-peer-side"
+
 [[mcp_servers]]
 name = "filesystem"
 command = "npx"
@@ -157,14 +472,33 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 GITHUB_TOKEN = "ghp_..."
 ```
 
+## Autonomy and approval
+
+Approval is decided by a three-layer model (full UI details in
+[TUI & Autonomy](./tui.md)):
+
+1. **Global autonomy** — `--autonomy <low|medium|high|full>` (defaults to
+   `medium`). `low` asks for everything except file reads; `full` keeps the
+   human entirely out of the loop (auto-approve) except for `HumanInput`.
+2. **Category rules** — the `[approval]` section above (`auto`/`ask`/`deny`) per
+   category.
+3. **Per-action approval** — `y` / `s` / `a` / `n` (approve / skip / approve-all
+   / deny) prompts in any frontend.
+
+The nine action categories are: `FileRead`, `FileWrite`, `FileDelete`,
+`CommandExec`, `NetworkRequest`, `Destructive`, `HumanInput`, `LiveAudioSpawn`,
+`DisplayControl`. `DisplayControl` uses a session-grant model — approve once and
+subsequent display actions skip the prompt (revocable in-frontend).
+`HumanInput` and `LiveAudioSpawn` always require a human regardless of autonomy
+level or category rule.
+
 ## Skills
 
-Skills are named instruction sets stored as `SKILL.md` files with YAML frontmatter. They are discovered from two directories (project-scoped first):
+Skills are named instruction sets stored as `SKILL.md` files with YAML
+frontmatter, discovered from two directories (project-scoped first):
 
-1. `<project_root>/.intendant/skills/<name>/SKILL.md`
+1. `<project-root>/.intendant/skills/<name>/SKILL.md`
 2. `~/.intendant/skills/<name>/SKILL.md`
-
-Example `SKILL.md`:
 
 ```yaml
 ---
@@ -181,39 +515,40 @@ disable-auto-invocation: true
 3. Deploy to server
 ```
 
-Frontmatter fields:
-- `name` — skill identifier (required)
-- `description` — shown in skill catalog (required)
-- `autonomy` — override session autonomy level when active (optional)
-- `disable-auto-invocation` — if `true`, only user can trigger this skill (optional, default `false`)
-- `disable-model-invocation` — if `true`, runs without LLM calls (optional, default `false`)
-- `sandbox` — override session sandbox setting (optional)
-- `compatibility` — required system tools (optional)
-- `allowed-tools` — restrict which tools are available (optional)
+Frontmatter fields: `name` (required), `description` (required), `autonomy`
+(override session autonomy when active), `disable-auto-invocation` (only the
+user can trigger it), `disable-model-invocation` (run without LLM calls),
+`sandbox` (override the session sandbox setting), `compatibility` (required
+system tools), `allowed-tools` (restrict the available tool set). Project skills
+take precedence over personal skills of the same name.
 
-Project skills take precedence over personal skills with the same name. Available skills are formatted into a catalog and injected into the agent's conversation.
+## INTENDANT.md project instructions
 
-When sandboxing is enabled (via `--sandbox` or `[sandbox].enabled = true`), runtime command execution is restricted to read-only filesystem access plus writes to project root, `/tmp`, session log directory, `~/.intendant`, and `extra_write_paths`. On kernels without Landlock support, sandboxing is silently skipped.
+Place `INTENDANT.md` in your project root or at
+`~/.config/intendant/INTENDANT.md` for global instructions. Both are loaded if
+present (global first, project-local second) and injected into the conversation
+at session start, before knowledge/memory.
 
-## INTENDANT.md Project Instructions
+## System prompts
 
-Place an `INTENDANT.md` file in your project root or at `~/.config/intendant/INTENDANT.md` for global instructions. These are injected into the conversation at session start, before knowledge/memory. Both files are loaded if present (global first, project-local second).
+System prompts are compiled into the binary, so `intendant` works from any
+directory. Two base variants exist:
 
-## System Prompts
+- `SysPrompt.md` — full prompt with JSON schema and per-function docs (used with
+  text-based JSON extraction).
+- `SysPrompt_tools.md` — condensed prompt for native tool calling (function docs
+  live in the API tool definitions).
 
-System prompts are compiled into the binary at build time, so `intendant` works from any directory without needing the source tree. Two base prompt variants exist:
+The active variant is chosen automatically based on whether the provider has
+native tool calling enabled. Prompts resolve via a 3-layer cascade (highest
+priority first):
 
-- **`SysPrompt.md`** — Full prompt with JSON schema and per-function documentation (used with text-based JSON extraction)
-- **`SysPrompt_tools.md`** — Condensed prompt for native tool calling mode (function docs live in API tool definitions, reducing system prompt tokens)
-
-The active variant is selected automatically based on whether the provider has native tool calling enabled.
-
-Prompts are resolved using a 3-layer cascade (highest priority first):
-
-1. **Project root** — `<git-root>/SysPrompt.md` or `SysPrompt_tools.md` (per-project customization)
-2. **Global config** — `~/.config/intendant/SysPrompt.md` or `SysPrompt_tools.md` (user-wide customization)
+1. **Project root** — `<git-root>/SysPrompt.md` (or `SysPrompt_tools.md`)
+2. **Global config** — `~/.config/intendant/SysPrompt.md`
 3. **Compiled-in default** — always available, zero-config
 
-Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`, `SysPrompt_implementation.md`) follow the same cascade and are appended to the base prompt. The presence layer uses its own standalone prompt (`SysPrompt_presence.md`). The live audio voice agent uses `SysPromptLiveAudio.md` with `{PLAYBOOK}` and `{RESPONSE_SCHEMA}` placeholders substituted at runtime.
-
-To customize prompts for a specific project, place your modified `.md` files in the project's git root. For user-wide customization, place them in `~/.config/intendant/`.
+Role-specific prompts (`SysPrompt_orchestrator.md`, `SysPrompt_research.md`,
+`SysPrompt_implementation.md`) follow the same cascade and append to the base.
+The presence layer uses `SysPrompt_presence.md`; the live-audio voice agent uses
+`SysPromptLiveAudio.md` with `{PLAYBOOK}` / `{RESPONSE_SCHEMA}` placeholders
+substituted at runtime.

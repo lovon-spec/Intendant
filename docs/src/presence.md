@@ -1,196 +1,358 @@
 # Presence Layer
 
-The presence layer is the conversational interface between the user and the agent system. It mediates all interaction: the user talks to presence, presence delegates work via `submit_task`, and narrates progress as events stream back from the agent loop.
+The presence layer is the conversational front-end of Intendant. The user talks
+to *presence*, not directly to the worker agent. Presence speaks as Intendant in
+the first person ("I'm working on that now", not "the agent is working on
+that"), decides whether to answer directly or delegate work, dispatches tasks to
+the agent loop, narrates progress as events stream back, and mediates approvals
+and questions on the user's behalf.
 
-The presence layer speaks as Intendant in first person — "I'm working on that now", not "the agent is working on that." It is the user-facing identity of the system.
+## Why a Separate AI
 
-## Architecture
+Presence is a distinct model with its own conversation, system prompt, tool set,
+and token budget — **not** a chat wrapper around the worker agent. Two reasons:
 
-Only one presence model is active at a time — either server-side text presence OR browser-side live presence (Gemini Live / OpenAI Realtime). Never both simultaneously.
+1. **Latency and cost.** Presence runs a small, fast model (a Gemini Flash by
+   default). It can answer "what's the status?" or narrate a phase change
+   instantly without burning the heavy coding model's budget or context.
+2. **Separation of concerns.** The worker agent focuses on the task; presence
+   focuses on the human relationship — interjections, approvals, recall, and
+   keeping a continuous conversational thread across many tasks.
+
+Presence dispatches work to the agent loop the same way a human frontend does:
+by emitting a [`ControlMsg`](./integrations.md) onto the EventBus (see
+[Tool Dispatch](#tool-dispatch) below). It never executes commands itself.
+
+## Two Modes
+
+Presence runs in one of two modes:
+
+- **Server-side text presence** (`src/bin/caller/presence.rs`) — the default.
+  A native Rust `PresenceLayer` driving a text model. Used by the TUI and by the
+  web dashboard when no browser voice session is connected.
+- **Browser-side live presence** (`crates/presence-web/`, WASM) — when a browser
+  connects a live voice/realtime model (Gemini Live or OpenAI Realtime), that
+  model becomes the conversational front-end directly from the browser.
+
+These are **not strictly mutually exclusive**. Server-side narration is
+*ref-count paused* while one or more browsers hold an active voice session, and
+resumes automatically when they disconnect. The same `presence-core` logic
+(tool definitions, dispatch, prompt, event formatting) backs both modes, so the
+behavior is identical whichever model is driving.
 
 ```
-User input ──▶ [Presence Layer] ──▶ submit_task ──▶ Agent Loop
-                     │                                  │
-                     │◀── events (phase, approval, etc) ◀┘
-                     │
-                     ▼
-              Narration to user (TUI / Web)
+                        ┌──────────────────────────────────┐
+   user (text/voice) ──▶│            Presence               │
+                        │  (text model OR browser voice)    │
+                        └──────────────┬───────────────────┘
+                                       │ submit_task / approve / …
+                                       │ → ControlMsg on EventBus
+                                       ▼
+                              ┌──────────────────┐
+                              │   Agent loop /    │
+                              │ session supervisor│
+                              └────────┬─────────┘
+                                       │ filtered PresenceEvents
+                                       ▼
+                          narration back to the user
 ```
 
 ## Server-Side Text Presence
 
-The default mode. `PresenceLayer` wraps a small/fast text model (e.g., `gemini-3.0-flash`) and maintains its own `Conversation` separate from the agent's.
+`PresenceLayer` (`src/bin/caller/presence.rs`) wraps a `ChatProvider` and keeps
+its own `Conversation`, separate from the agent's. Its responsibilities:
 
-### Behavior
+- **`process_user_input()`** — runs the model on a user message; the model
+  decides whether to respond directly or call a tool (e.g. `submit_task`).
+- **`handle_event()`** — receives a filtered `PresenceEvent` from the agent loop
+  and lets the model narrate it. Phase-change narrations are debounced
+  (`NARRATION_DEBOUNCE_MS` = 500 ms) so rapid phase flips don't spam the user.
+- **`run()`** — the loop: `select!` over user input and incoming events.
 
-- Processes user input via `process_user_input()` — decides whether to handle directly or delegate to the agent loop
-- Narrates agent events via `handle_event()` — translates phase changes, approvals, completions into conversational updates
-- Handles status queries, memory recall, and autonomy changes directly without involving the agent loop
-- Uses its own system prompt (`SysPrompt_presence.md`) — standalone, not appended to the base agent prompt
-- Follow-up input in the TUI is routed through the presence layer when active
-- Display state is pull-based via `check_status` → `available_displays` field (no proactive inference on display events)
+Each turn runs `run_model_loop()`, which calls the model, dispatches any tool
+calls through `presence-core`, feeds results back, and repeats up to 10 tool
+rounds before returning text. Token usage is accumulated and emitted as
+`PresenceUsageUpdate` events so the dashboard can show presence's own cost.
 
-### Configuration
+### Model and Configuration
+
+The text model is chosen by `provider::select_presence_provider()`. Default
+selection (no config, no env): auto-detect, **preferring Gemini** when a key is
+present. Per-provider defaults:
+
+| Provider  | Default model                | Constant / literal                       |
+|-----------|------------------------------|------------------------------------------|
+| gemini    | `gemini-3-flash-preview`     | `presence_core::DEFAULT_TEXT_MODEL`      |
+| anthropic | `claude-haiku-4-5-20251001`  | literal in `select_presence_provider`    |
+| openai    | `gpt-4.1-mini`               | literal in `select_presence_provider`    |
+
+> **Note:** `DEFAULT_TEXT_PROVIDER` is `"gemini"`. The default text model is
+> `gemini-3-flash-preview` — earlier docs that said `gemini-3.0-flash` or
+> `gemini-2.5-flash` were stale (the `gemini-2.5-flash` string still appears in
+> a doc-comment on `PresenceConfig::model` in `crates/presence-core/src/types.rs`
+> but is not the value actually used).
 
 ```toml
 [presence]
-enabled = true                # default: true
-provider = "gemini"           # provider for the presence model (optional)
-model = "gemini-3.0-flash"    # model for the presence layer (optional)
-context_window = 1048576      # context window for presence conversation (default: 1048576)
+enabled = true                # default: true (disable with --no-presence)
+provider = "gemini"           # optional; default auto-detect (prefers gemini)
+model = "gemini-3-flash-preview"   # optional; default per table above
+context_window = 1048576      # default: 1_048_576
 ```
 
-Or via environment variables:
-- `PRESENCE_PROVIDER` — override provider (fallback: `PROVIDER`)
-- `PRESENCE_MODEL` — override model
+Environment overrides (take precedence over auto-detect, below explicit config):
+`PRESENCE_PROVIDER` and `PRESENCE_MODEL`. API keys are read from
+`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` (or the bare
+`OPENAI` / `ANTHROPIC` / `GEMINI` variants).
 
-Disable with `--no-presence` flag or `[presence] enabled = false` in `intendant.toml`.
+Disable presence with the `--no-presence` flag or `[presence] enabled = false`.
+If no API key is available for presence, Intendant degrades gracefully: it runs
+without narration, and dashboard chat / tasks dispatch directly to the worker.
 
 ## Browser-Side Live Presence
 
-When `--web` is used and a browser connects a live model (Gemini Live / OpenAI Realtime), the browser sends a `presence_connect` message over WebSocket. The server pauses `PresenceLayer` and sends a `presence_welcome` message with the current state, missed events, and conversation context. The browser's live model takes over as the conversational front-end, using the same tools via the WebSocket tool request/response protocol.
+When the dashboard is open with voice enabled, the browser connects directly to
+Gemini Live or OpenAI Realtime (the API key lives in browser `localStorage` and
+is **never sent to the Intendant server**). The browser's voice model becomes
+presence, calling the exact same tools over the WebSocket tool request/response
+protocol.
 
-When the browser's live model disconnects (page close, error), a `presence_disconnect` message is sent and server-side presence resumes automatically.
+The default live models (browser-side, in `crates/presence-web/src/lib.rs`):
 
-### Configuration
+| Provider | Default live model                                  |
+|----------|-----------------------------------------------------|
+| gemini   | `gemini-2.5-flash-native-audio-preview-12-2025`     |
+| openai   | `gpt-4o-realtime-preview`                            |
 
 ```toml
 [presence]
-live_provider = "gemini"                                    # provider for browser-side live presence
-live_model = "gemini-2.5-flash-native-audio-preview-12-2025"  # model for browser-side live presence
-live_context_window = 32768                                  # context window for live presence (default: 32768)
+live_provider = "gemini"
+live_model = "gemini-2.5-flash-native-audio-preview-12-2025"
+live_context_window = 32768   # default: 32_768
 ```
 
-Voice requires an API key (Gemini or OpenAI), stored in browser localStorage. The key is used browser-side only — it is never sent to the Intendant server.
+### Ref-Counted Pause (not mutual exclusion)
 
-### Active/Passive Multi-Browser
+The server-side `PresenceLayer` holds an `Arc<AtomicUsize>` *pause counter*
+(`PresenceLayer::paused`, exposed via `paused_flag()` / `is_paused()`). When a
+browser starts an active voice session, the counter is incremented; when it
+ends, it is decremented. While the counter is `> 0`:
 
-Only one browser connection can be "active" (controlling the voice model) at a time. Other connections are passive observers:
+- `process_user_input()` returns immediately with an empty string (input is
+  dropped — the browser voice model is handling the user).
+- `handle_event()` returns `Ok(None)` (no server narration).
 
-- **Active browser**: Pauses server-side presence, receives tool responses, controls the voice session
-- **Passive browsers**: Receive TUI frames and events but don't affect server-side presence
-- **Handover**: A passive browser can request active status via `{"t":"make_active"}`, which force-disconnects the previous active browser and sends an `active_granted` message with handover context
+This is a *ref count*, not a boolean, precisely because multiple browsers may be
+connected. The browser voice model dispatches tasks directly via the same task
+channel, so nothing is lost — the server is simply quiet. Earlier docs called
+this "mutual exclusion / never both simultaneously"; the accurate description is
+a ref-counted pause.
+
+The wire handshake (handled in `web_gateway.rs`):
+
+```
+1. Browser connects voice  → {"t":"presence_connect"}
+2. Gateway emits AppEvent::PresenceConnected → pause counter incremented
+3. Server replies          → {"t":"presence_welcome", state, events, summary}
+4. Browser voice model is now presence (narration, tools, user interaction)
+5. Browser disconnects      → {"t":"presence_disconnect"}
+6. Gateway emits AppEvent::PresenceDisconnected → pause counter decremented
+```
+
+### Active / Passive Multi-Browser
+
+Only one browser connection can be **active** (controlling the voice model) at a
+time; others are passive observers:
+
+- **Active browser** — increments the pause counter, receives tool responses,
+  drives the voice session.
+- **Passive browsers** — receive TUI frames and events but do not pause the
+  server presence.
+- **Handover** — a passive browser sends `{"t":"make_active"}` to take over; the
+  gateway force-disconnects the previous active browser and grants the new one
+  active status with handover context. (Voice reconnect after handover does not
+  double-count the pause — the gateway tracks who is already active.)
 
 ### Session Continuity
 
-The presence session protocol maintains voice context across reconnects:
+The presence session protocol (`PresenceSession`, `PresenceEventWindow` in
+`presence-core`) maintains voice context across reconnects:
 
-1. The server maintains a `PresenceSession` with an event window and checkpoint state
-2. Browsers send periodic `presence_checkpoint` messages with a conversation summary and `last_event_seq`
-3. On reconnect, the `presence_welcome` includes events since `last_event_seq` and the last checkpoint summary
-4. Conversation context from recent voice transcripts is also included for smooth resumption
+1. The server keeps a bounded ring of sequenced events
+   (`PresenceEventWindow`, default capacity 200).
+2. Browsers periodically send `{"t":"presence_checkpoint"}` with a conversation
+   summary and `last_event_seq`.
+3. On reconnect, `presence_welcome` carries every event since `last_event_seq`
+   plus the last checkpoint summary, so the voice model resumes mid-thread.
 
 ## Presence Tools
 
-The presence layer has 12 tools, defined in the `presence-core` workspace crate:
+Presence has **12 tools**, defined once in `crates/presence-core/src/tools.rs`
+(`presence_tools()`) and shared by both modes. The main crate re-exports them
+and converts the provider-agnostic `ToolDefinition` to the provider-specific
+format.
 
-### Action Tools
+### Action tools (mutate state via `ControlMsg`)
 
-| Tool | Description |
-|------|-------------|
-| `submit_task` | Submit a new task to the agent loop (with optional `display_target`, `context_hints`, `reference_frame_ids`) |
-| `approve_action` | Approve a pending action |
-| `deny_action` | Deny a pending action |
-| `skip_action` | Skip a pending action |
-| `respond_to_question` | Answer an `askHuman` question |
-| `set_autonomy` | Change autonomy level |
-| `send_message` | Send a mid-task interjection to the running agent |
+| Tool                  | Effect |
+|-----------------------|--------|
+| `submit_task`         | Submit a task to the agent loop. Optional `force_direct`, `context_hints`, `reference_frame_ids`, `display_target`. |
+| `approve_action`      | Approve a pending action by `id`. |
+| `deny_action`         | Deny a pending action by `id` (stops the command). |
+| `skip_action`         | Skip a pending action by `id` (continue with the next). |
+| `respond_to_question` | Answer an `askHuman` question (`text`). |
+| `set_autonomy`        | Change the autonomy level (`low`/`medium`/`high`/`full`). |
+| `send_message`        | Mid-task interjection injected into the running worker's conversation at its next turn. Optional `frame_ids` to attach HQ images. |
 
-Action tools dispatch via the EventBus as `ControlMsg` — the same path as TUI key presses and control socket commands.
+### Query tools (read-only, server I/O)
 
-### Query Tools
+| Tool            | Effect |
+|-----------------|--------|
+| `check_status`  | Read the current `AgentStateSnapshot` — phase, turn, budget, last command/output, workers, pending approval, and **`available_displays`**. |
+| `query_detail`  | Detailed lookups by `scope`: `current_turn`, `last_output`, `worker`, `diff`, `logs`, `file` (needs `target`), `task_result`. |
+| `recall_memory` | Search the tagged knowledge store (by `keywords`, optional `tags`/`channel`); falls back to the session log. |
 
-| Tool | Description |
-|------|-------------|
-| `check_status` | Read current `AgentStateSnapshot` (phase, turn, budget, pending approval/question, available displays) |
-| `query_detail` | Get git diff, file contents, task results, or log details from the project |
-| `recall_memory` | Search the knowledge store by keywords, with optional channel/tag filters; falls back to session log |
+### Video / frame tools (read-only, server I/O)
 
-Query tools are handled synchronously server-side. They are shared between `PresenceLayer` and the web gateway via standalone functions in `presence.rs`.
+| Tool             | Effect |
+|------------------|--------|
+| `inspect_frame`  | Fetch the HQ version of a frame (`frame_id`, or latest if omitted); the image is injected into context after the response. |
+| `inspect_frames` | Search past frames by time range / stream / description; returns metadata only (no images). |
 
-### Video Tools
+Display state is **pull-based**: presence learns about displays via
+`check_status` → `available_displays`, not from proactive display-event
+narration. Frame IDs surfaced by `inspect_frames`/`inspect_frame` can be passed
+back into `submit_task` via `reference_frame_ids` to give the worker (and the
+[CU runner](./computer-use-and-audio.md)) visual context about what the user was
+looking at.
 
-| Tool | Description |
-|------|-------------|
-| `inspect_frame` | Examine a specific frame from the frame registry by ID |
-| `inspect_frames` | Examine multiple recent frames for visual context |
+## Tool Dispatch
 
-Video tools provide the presence layer with visual awareness of what's happening on screen. Frame IDs can be referenced when submitting tasks (`reference_frame_ids`) to provide visual context to the agent.
+Dispatch is a two-stage design that keeps `presence-core` free of I/O so it can
+compile to WASM. `presence_core::dispatch_tool_call(name, args, state)` returns
+a pure `PresenceAction` enum:
+
+```
+tool call (text model OR browser voice model)
+        │
+        ▼
+ dispatch_tool_call()  →  PresenceAction
+        │
+        ├── TextResult(text)        — resolved locally, returned immediately
+        │       └── check_status is computed purely from the state snapshot
+        ├── SubmitTask(TaskEnvelope)
+        ├── Approve { id } / Deny { id } / Skip { id }
+        ├── Respond { text }
+        ├── SetAutonomy { level }
+        └── NeedsIO { tool_name, args }  — platform must do I/O:
+                 query_detail · recall_memory · send_message
+                 · inspect_frame · inspect_frames
+```
+
+On the native side, `presence::action_to_control_msg()` turns the
+state-mutating variants into `ControlMsg`s on the EventBus — the **same path** a
+TUI keypress or control-socket command takes:
+
+| `PresenceAction`     | `ControlMsg`         |
+|----------------------|----------------------|
+| `SubmitTask`         | `StartTask { … }`    |
+| `Approve`            | `Approve { id }`     |
+| `Deny`               | `Deny { id }`        |
+| `Skip`               | `Skip { id }`        |
+| `Respond`            | `Input { text }`     |
+| `SetAutonomy`        | `SetAutonomy { level }` |
+
+`TextResult` and `NeedsIO` have no `ControlMsg` — `TextResult` is returned to the
+model directly, and `NeedsIO` is executed by the platform's I/O handler
+(`handle_tool_query()` in `presence.rs`, or a server round-trip in the browser).
+Note that `send_message` is a `NeedsIO` tool (it injects into the worker's
+context-injection queue), not a direct `ControlMsg`.
+
+`submit_task` is guarded: if the agent is **busy** (not idle / not in a
+follow-up-ready state), a new `submit_task` is rejected to stop the presence
+model from hallucinating an unrelated task over active work. Idle, completed,
+and follow-up-waiting states accept it — which is exactly how follow-up dispatch
+works.
 
 ## Event Filtering
 
-Not all agent events are worth narrating. The presence layer classifies events as:
+`filter_event()` (`presence.rs`) decides which `AppEvent`s become a narratable
+`PresenceEvent`. Roughly:
 
-**Push-worthy** (trigger narration):
-- `TaskSubmitted`, `TaskComplete`
-- `ApprovalRequired`, `HumanQuestion`
-- `PhaseChanged` (debounced to avoid rapid phase flip noise)
-- `ContextManagement`
+**Narrated:** `TaskSubmitted`/task start, `TaskComplete`, `ApprovalRequired`,
+`HumanQuestion`, `PhaseChanged` (debounced), `RoundComplete`, budget warnings,
+errors, display-grant/-revoke. `PresenceConnected`/`PresenceDisconnected` are
+*not* narrated.
 
-**Pull-only** (available on request via `check_status`):
-- Status snapshots, log entries, token usage updates
-- Display state (`available_displays` in status response)
+**Not narrated (pull-only):** raw agent output, status snapshots, token-usage
+updates, and display readiness — these are available on demand via
+`check_status` / `query_detail`.
 
-## Mutual Exclusion
+## The `presence-core` Crate
 
-The presence layer enforces mutual exclusion between server-side and browser-side presence:
+`crates/presence-core/` is the WASM-compatible core. Minimal deps (serde +
+serde_json + wasm-bindgen — no tokio/reqwest). Compiles to both native and
+`wasm32-unknown-unknown`. Modules:
 
-1. Browser connects live model → sends `{"t":"presence_connect"}`
-2. Web gateway emits `AppEvent::PresenceConnected` → pauses server-side presence
-3. Server sends `{"t":"presence_welcome"}` with state, event replay, and conversation context
-4. Server-side `PresenceLayer::handle_event()` returns `Ok(None)` while paused
-5. Browser live model handles all presence duties (narration, tool calls, user interaction)
-6. Browser disconnects → sends `{"t":"presence_disconnect"}`
-7. Web gateway emits `AppEvent::PresenceDisconnected` → resumes server-side presence
+- **types.rs** — `PresenceConfig`, `TaskEnvelope`, `PresenceEvent`,
+  `AgentStateSnapshot`, `PendingApprovalSnapshot`, `PresenceUsage`, the session
+  protocol types (`PresenceConnect`, `PresenceWelcome`, `SequencedPresenceEvent`,
+  `PresenceCheckpoint`, `PresenceEventWindow`), frame types (`FrameMeta`,
+  `VideoState`), and constants (`DEFAULT_TEXT_MODEL`, `DEFAULT_TEXT_PROVIDER`,
+  `NARRATION_DEBOUNCE_MS`, `PRESENCE_TURN_OFFSET`). `AgentStateSnapshot::update_from_server_event()`
+  is the shared state machine that both native and WASM use to fold server
+  events into the snapshot.
+- **dispatch.rs** — `PresenceAction` enum + `dispatch_tool_call()` (pure logic)
+  and `action_confirmation()`.
+- **tools.rs** — the 12 `ToolDefinition`s.
+- **format.rs** — `format_event()`, `format_agent_output()`, unicode-safe
+  `truncate()`.
+- **prompt.rs** — `DEFAULT_PRESENCE_PROMPT` via `include_str!` of
+  `crates/presence-core/prompts/SysPrompt_presence.md`.
+- **wasm.rs** (`#[cfg(target_arch = "wasm32")]`) — `WasmPresence` object plus
+  `get_presence_tools()`, `get_presence_prompt()`, `wasm_truncate()`. Data
+  crosses the WASM boundary via `serde-wasm-bindgen`.
 
-## presence-core Crate
+The WASM boundary guarantee: because the *same* `dispatch_tool_call`, tool
+definitions, prompt, and event formatter are compiled into both the native
+binary and the browser bundle, presence behaves identically whether the text
+model or the browser voice model is driving.
 
-The `crates/presence-core/` workspace crate contains the WASM-compatible core logic:
+## The `presence-web` Crate
 
-- **Types**: `PresenceConfig`, `TaskEnvelope`, `PresenceEvent`, `AgentStateSnapshot`, `PresenceSession`, `PresenceCheckpoint`, `PresenceConnect`, `PresenceWelcome`, constants
-- **Dispatch**: `PresenceAction` enum, `dispatch_tool_call()` — pure logic dispatch
-- **Tools**: 12 presence tool definitions (provider-agnostic `ToolDefinition` format)
-- **Format**: `format_event()`, `truncate()` (unicode-safe)
-- **Prompt**: `DEFAULT_PRESENCE_PROMPT` via `include_str!`
-- **Session protocol**: `PresenceSession` tracking event windows/checkpoints
-- **WASM**: `WasmPresence` object, `get_presence_tools()`, `get_presence_prompt()` — browser-side presence logic
+`crates/presence-web/` is the browser-side WASM layer. Modules (declared in
+`crates/presence-web/src/lib.rs`):
 
-Minimal dependencies (serde + serde_json + wasm-bindgen, no tokio/reqwest). Compiles to both native and `wasm32-unknown-unknown`. The main crate re-exports its types and converts `ToolDefinition` to the provider-specific format.
-
-## presence-web Crate
-
-The `crates/presence-web/` crate provides the browser-side WASM layer:
-
-- **app_state.rs** — Pure-Rust app state for the web dashboard. All event routing, log filtering, usage tracking, and cost calculation. Methods return `Vec<UiCommand>` which the thin JS layer applies to the DOM. Includes a per-model pricing table covering OpenAI, Anthropic, and Gemini models.
-- **app_web.rs** — Browser-side app dashboard entry point. WASM<->DOM bridge, tab management, WebSocket event dispatch.
-- **server.rs** — WebSocket connection to the Intendant server, message routing.
-- **gemini.rs** — Gemini Live API integration (BidiGenerateContent), dual-mode auth (API key + ephemeral token).
-- **openai.rs** — OpenAI Realtime API integration.
+- **lib.rs** — the WASM entry point and `#[wasm_bindgen]` surface: voice
+  connect/disconnect, voice-provider selection and the default-model fallback
+  table, and the WASM↔DOM bridge.
+- **app_state.rs** — pure-Rust dashboard state: event routing, log filtering,
+  usage tracking, and cost calculation (includes a per-model pricing table for
+  OpenAI / Anthropic / Gemini). Methods return `Vec<UiCommand>` for a thin JS
+  layer to apply to the DOM.
+- **server.rs** — the WebSocket connection to the Intendant server and message
+  routing.
+- **gemini.rs** — Gemini Live (BidiGenerateContent), dual-mode auth (API key +
+  ephemeral token).
+- **openai.rs** — OpenAI Realtime integration.
 - **callbacks.rs** — JS callback management for voice/tool events.
 
-Build: `wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web` from `crates/presence-web/`.
+Build (does **not** happen during `cargo build`):
 
-## Tool Dispatch Flow
-
-Tool dispatch uses `presence_core::dispatch_tool_call()` which returns a `PresenceAction` enum:
-
-```
-Tool call arrives (from text model or browser live model)
-    │
-    ▼
-dispatch_tool_call() → PresenceAction
-    │
-    ├── TextResult(text) → return immediately
-    ├── SubmitTask(envelope) → send to EventBus
-    ├── Approve/Deny/Skip → send ControlMsg to EventBus
-    ├── SendMessage(text) → inject into agent conversation
-    ├── SetAutonomy(level) → send ControlMsg to EventBus
-    └── NeedsIO(query) → platform layer handles:
-         ├── check_status → read AgentStateSnapshot
-         ├── query_detail → read files, git diff, task results
-         ├── recall_memory → search knowledge store + session log
-         ├── inspect_frame → read frame from registry
-         └── inspect_frames → read multiple frames from registry
+```bash
+cd crates/presence-web
+wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
+cargo build --release -p intendant   # re-embed the compiled WASM
 ```
 
-Pure-logic tools return `TextResult`/`SubmitTask`/`Approve`/etc. I/O-dependent tools return `NeedsIO` for the platform layer to handle, keeping `presence-core` free of I/O dependencies.
+The `static/wasm-web/` files are pre-compiled artifacts; any change to
+`presence-web/` or `presence-core/` requires the `wasm-pack` step plus a
+re-embed build.
+
+## See Also
+
+- [TUI & Autonomy](./tui.md) — how presence narration and approvals surface in
+  the terminal UI.
+- [Web Dashboard](./web-dashboard.md) — the dashboard host for browser voice.
+- [Computer Use & Live Audio](./computer-use-and-audio.md) — where
+  `display_target` / `reference_frame_ids` from `submit_task` route.

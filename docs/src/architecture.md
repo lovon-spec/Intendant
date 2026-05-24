@@ -2,170 +2,334 @@
 
 ## Overview
 
-Intendant is a two-binary system: a sandboxed **runtime** that executes commands, and a **controller** that drives it via AI model APIs.
+Intendant is a two-binary system: a sandboxed **runtime** that executes
+commands, and a **controller** that drives it via AI model APIs. That split is
+the original security boundary and it is unchanged. What has grown is the
+controller: it is no longer a single agent loop with a TUI bolted on. It is a
+multi-session, multi-backend orchestration host built around a shared
+**EventBus**, a single-writer **control plane**, and a long-lived **session
+supervisor** that owns the lifecycle of every session launched at runtime.
 
 ```
-stdin (JSON) --> intendant-runtime --> executes commands sequentially (blocking)
-                  |                    (Landlock sandboxed on Linux)
-                  +--> in-memory process state (HashMap<nonce, ProcessInfo>)
-                  +--> $INTENDANT_LOG_DIR/  (stdout/stderr logs per nonce)
-                  |
-                  +--> stdout (result lines with exit code, stdout/stderr tail)
-
-intendant (3 modes) --> detects project root (git) --> loads memory/knowledge/skills
-  |
-  +--> User Mode:       spawns orchestrator subprocess, monitors progress (no API calls)
-  +--> Sub-Agent Mode:  scoped task, writes results/progress, isolated context
-  +--> Direct Mode:     single-loop execution for simple tasks
-  |
-  +--> Presence layer:  conversational mediator between user and agent loop
-  +--> Native tool calling (OpenAI/Anthropic/Gemini) with text extraction fallback
-  +--> Streaming output:  SSE-based token streaming for all 3 providers
-  +--> Ratatui TUI:     status bar, scrollable log, approval panel, askHuman input
-  +--> Web dashboard:   multi-tab app with WebRTC display streaming and live voice
-  +--> Live voice:      Gemini Live / OpenAI Realtime via browser, active/passive multi-browser
-  +--> MCP Server:      --mcp flag, stdio transport, full parity with TUI (tools + resources)
-  +--> MCP Client:      connects to external MCP servers (configured in intendant.toml)
-  +--> Autonomy system: Low/Medium/High/Full + per-category rules from intendant.toml
-  +--> Skills system:   SKILL.md-based instruction sets with YAML frontmatter
-  +--> Computer use:    provider-agnostic CU abstraction (X11/Wayland/macOS/Windows)
-  +--> WebRTC display:  capture → VP8/H264 encode → per-peer streaming + remote input
-  +--> Live audio:      Gemini Live / OpenAI Realtime voice sessions via audio bridge
-  +--> Phone calls:     SIP outbound via pjsua + voice model + structured data extraction
-  +--> Transcription:   server-side Whisper API for browser audio transcription
-  +--> Landlock sandbox: filesystem restrictions on agent runtime (Linux)
-  +--> Prompt caching:  Anthropic cache_control, OpenAI/Gemini implicit caching
-  +--> Auto-compaction: triggers at 90% context usage, preserves system+tail messages
-  +--> Control socket:  /tmp/intendant-<pid>.sock (JSON-line protocol)
-  +--> Token budget tracking (context-window-aware loop termination)
-  +--> Session resume:  --continue (most recent) or --resume <id> (specific session)
-  +--> Git worktree isolation for implementation agents
-  +--> Tagged knowledge store with pub/sub channels between agents
-  +--> Recording:       segmented MP4 via ffmpeg (x11grab / avfoundation)
+                              ┌──────────────────────────────────────────────┐
+   stdin (JSON commands)      │            intendant  (controller)            │
+        │                     │                                               │
+        ▼                     │   Frontends (display-only: render + emit       │
+┌───────────────────┐         │   intents; never write shared state)           │
+│ intendant-runtime │◀────────┤     ├─ ratatui TUI    ─┐                        │
+│  (sandboxed exec) │  Agent  │     ├─ Web dashboard  ─┤ ControlMsg            │
+│                   │  Input  │     ├─ MCP server      ─┤  (intents)            │
+│  - Landlock (Lx)  │  (JSON) │     └─ Control socket  ─┘     │                 │
+│  - no API keys    │────────▶│                                ▼                 │
+│  - exec/edit/PTY  │ results │            ┌──────────────────────────────┐    │
+│  - screenshot     │         │            │          EventBus            │    │
+│  - in-mem proc map│         │            │  broadcast::channel<AppEvent>│    │
+└───────────────────┘         │            │  (ControlMsg ⊂ AppEvent)     │    │
+        │                     │            └──────────────────────────────┘    │
+        ▼                     │             │            │             │        │
+$INTENDANT_LOG_DIR/           │             ▼            ▼             ▼        │
+ (per-session dir:            │      ┌────────────┐ ┌──────────┐ ┌──────────┐  │
+  session.jsonl, turns/,      │      │  Control   │ │ Session  │ │   Task   │  │
+  <nonce>_stdout.log, …)      │      │   Plane    │ │Supervisor│ │ Dispatch │  │
+                              │      │(single     │ │(owns     │ │(presence/│  │
+                              │      │ writer of  │ │ session  │ │ task/    │  │
+                              │      │ shared     │ │ graph +  │ │ follow-up│  │
+                              │      │ state)     │ │ lifecycle│ │ routing) │  │
+                              │      └────────────┘ └──────────┘ └──────────┘  │
+                              │                            │                    │
+                              │     Per-session agent loops (one of four modes):│
+                              │     Direct · External-Agent · User · Sub-Agent  │
+                              │                            │                    │
+                              │   Cross-cutting subsystems:                     │
+                              │     Presence layer · WebRTC display · Live audio │
+                              │     · Phone (SIP) · File watcher (rewind) ·      │
+                              │     Knowledge store · Peer federation (A2A) ·    │
+                              │     Cost accounting · Session logging            │
+        ┌─────────────────────┴───────────────────────────────────────────────┘
+        ▼ model APIs (OpenAI Responses · Anthropic Messages · Gemini)  ── streaming SSE
 ```
+
+Two facts about this diagram drive everything below:
+
+1. **Frontends are display-only.** The TUI, web dashboard, MCP server, and
+   control socket all *render* state and *emit intents* (`ControlMsg`) onto the
+   EventBus. None of them mutate shared state directly. The single writer is the
+   [control plane](./control-plane-and-daemon.md).
+2. **The EventBus is the spine.** It is one `tokio::sync::broadcast` channel
+   (`event.rs`, `EventBus`) carrying `AppEvent`. `ControlMsg` intents travel as
+   `AppEvent::ControlCommand`. Every long-lived subsystem subscribes to the bus;
+   adding a frontend or a backend means adding a subscriber, not rewiring the
+   others.
 
 ## Security Model
 
 The two-binary split is a deliberate security boundary:
 
-- **intendant-runtime** executes arbitrary shell commands but runs under Landlock filesystem restrictions and never holds API keys
-- **intendant** (controller) holds API keys and manages model conversations but never executes user-requested shell commands directly
+- **intendant-runtime** executes arbitrary shell commands but runs under
+  Landlock filesystem restrictions (Linux) and **never holds API keys**. It
+  reads JSON commands from stdin, executes them sequentially, and writes results
+  to stdout.
+- **intendant** (the controller) holds API keys and manages model conversations
+  but **never executes user-requested shell commands directly** — it pipes them
+  to the runtime subprocess.
 
-This means a compromised model conversation cannot directly access API keys, and the runtime process cannot exfiltrate data through model APIs.
+A compromised model conversation therefore cannot reach API keys, and the
+runtime process cannot exfiltrate data through a model API. See
+[Runtime Protocol](./runtime-protocol.md) for the wire format and
+[TUI & Autonomy](./tui.md) plus [Configuration](./configuration.md) for the
+layered approval system that gates what the runtime is even asked to do.
 
-## Process State
+## Runtime: Process State and Execution Model
 
-In-memory `HashMap<u64, ProcessInfo>` tracking nonce, PID, status, exit code, and timestamp. Ephemeral — does not survive binary restarts. Each runtime invocation starts with an empty process map.
+The runtime keeps an in-memory `HashMap<u64, ProcessInfo>` keyed by command
+*nonce* (PID, status, exit code, timestamp). It is ephemeral — it does not
+survive a runtime restart, and each runtime invocation starts with an empty map.
 
-## Session Directory
-
-Per-session directory at `~/.intendant/logs/<uuid>/` with UUID-based naming. Contains per-nonce stdout/stderr log files, structured session logs (`session.jsonl`), conversation history, turn data, recording segments, and askHuman IPC files. The log directory is passed to the runtime via `INTENDANT_LOG_DIR`.
-
-## Execution Model
-
-Commands are processed sequentially. Each command blocks until completion and returns its result directly (exit code, stdout tail, stderr tail). The runtime exits after processing all commands. Daemons backgrounded in bash continue after the tool returns.
+Commands are processed **sequentially**. Each blocks until completion and
+returns its result directly (exit code, stdout tail, stderr tail). The runtime
+exits after processing the batch. Daemons backgrounded in a shell continue after
+the tool returns. Per-nonce stdout/stderr go to `<nonce>_stdout.log` /
+`<nonce>_stderr.log` inside the session directory the controller passes via
+`INTENDANT_LOG_DIR`.
 
 ## Execution Modes
 
-`intendant` operates in one of three modes, selected automatically based on task complexity and environment:
+The controller runs one of **four** execution modes. The current code selects
+them in `main.rs`; the trusted summary of "three modes" in older docs is stale —
+external-agent supervision is now a first-class fourth mode.
 
-### Direct Mode
+### Direct Mode (`run_direct_mode`)
 
-Activated for simple tasks, or forced with `--direct`:
-- Single-loop execution with the selected model
-- Budget-aware loop: stops at context exhaustion, `done` signal, or 500-turn safety cap
-- Used for short tasks that don't need multi-agent orchestration
+Single in-process agent loop driving Intendant's own provider abstraction
+(OpenAI / Anthropic / Gemini). Selected for simple tasks, forced with `--direct`,
+or chosen automatically when a task looks simple (`is_simple_task`). Budget-aware:
+stops at context exhaustion, an explicit `done` signal, or a 500-turn safety cap
+(`SAFETY_CAP`). This is the loop documented step-by-step below.
 
-### User Mode
+### External-Agent Mode (`run_external_agent_mode`)
 
-Activated for complex tasks without `INTENDANT_ROLE`:
-- Pure subprocess monitor — makes zero model API calls at Layer 0
-- Spawns an orchestrator sub-agent as a child process via `tokio::process::Command`
-- Polls the orchestrator's progress file every 500ms, relays status to the TUI or stdout
-- Reads the orchestrator's result file on exit; synthesizes a failure if the process crashes
-- `kill_on_drop(true)` ensures the orchestrator is terminated if the user quits the TUI
+Selected with `--agent <backend>` or when an external backend is configured.
+Instead of running Intendant's own loop, the controller spawns and supervises an
+external coding CLI as a subordinate worker (`external_agent::AgentBackend`):
+`Codex`, `ClaudeCode`, or `GeminiCli`. Intendant translates its task,
+approval, and attachment surface onto each backend's native protocol (Codex
+app-server JSON-RPC, Claude Code, Gemini ACP) and surfaces their events back
+onto the EventBus so every frontend renders them identically. This is a
+master/worker relationship — see [Multi-Agent Orchestration](./multi-agent.md).
 
-### Sub-Agent Mode
+### User Mode (`run_user_mode`)
 
-Activated when `INTENDANT_ROLE` env var is set:
-- Runs as a child agent with a scoped task
-- Writes periodic progress to `INTENDANT_PROGRESS_FILE`
-- Writes final results (summary, findings, artifacts, token usage) to `INTENDANT_RESULT_FILE`
-- Uses role-specific system prompts (`SysPrompt_research.md`, `SysPrompt_implementation.md`, etc.)
+Selected for complex tasks without `--direct`. The controller becomes a pure
+subprocess monitor (zero model API calls at this layer): it spawns an
+**orchestrator** sub-agent as a child `intendant` process, polls its progress
+file, and reads its result file on exit. The orchestrator decomposes the task
+and delegates to specialized sub-agents (research, implementation, testing)
+running in isolated git worktrees. Full detail in
+[Multi-Agent Orchestration](./multi-agent.md).
 
-See [Multi-Agent Orchestration](./multi-agent.md) for the full sub-agent architecture.
+### Sub-Agent Mode (`run_sub_agent_mode`)
 
-## How It Works (Direct Mode)
+Activated when the `INTENDANT_ROLE` env var is set (`detect_sub_agent_mode`).
+The process runs as a scoped child agent with a role-specific system prompt
+(`SysPrompt_research.md`, `SysPrompt_implementation.md`, …), writing periodic
+progress to `INTENDANT_PROGRESS_FILE` and final results to
+`INTENDANT_RESULT_FILE`. This is the mode every orchestrator-spawned worker runs
+in.
 
-1. Loads `.env` and selects the API provider (OpenAI, Anthropic, or Gemini). OpenAI uses the Responses API (`/v1/responses`), Anthropic uses the Messages API, Gemini uses the `generateContent` endpoint. All providers support streaming via SSE
-2. Configures structured output (JSON mode), reasoning controls, native tool calling, prompt caching (Anthropic `cache_control`), and max output tokens based on model capabilities and env vars
-3. Detects the project root (via `git rev-parse --show-toplevel`, falls back to cwd)
-4. Resolves role-appropriate system prompt via cascade: project root → `~/.config/intendant/` → compiled-in default. When native tools are enabled, uses the condensed `SysPrompt_tools.md` (tool docs live in API tool definitions instead of prose)
-5. Injects the project working directory into the conversation so the model knows which project to work in
-6. Loads knowledge from `<project>/.intendant/memory.json`, injects into conversation
-7. Loads `INTENDANT.md` project instructions (global then project-local), injects into conversation
-8. Logs the full messages array to `turn_NNN_messages.json` before each API call
-9. Sends the task to the chat API via streaming (`chat_stream()`), with `max_tokens`/`max_output_tokens`, optional `reasoning`, optional JSON format, and native tool definitions when enabled. API requests use exponential backoff retry (up to 5 retries) for rate-limit (429) and server errors (5xx). Text deltas are forwarded to the TUI in real-time
-10. Logs reasoning content (both summary and full text) to `turn_NNN_reasoning.txt` when available
-11. Processes the model's response via one of two paths:
-    - **Native tool call path** (when response contains tool calls): Collects individual tool calls, assembles them into an `AgentInput` batch, pipes to the runtime, maps results back to per-tool-call responses. Handles `manage_context` and `signal_done` tool calls caller-side. Raw API output items (reasoning + function_call) are preserved for verbatim echo-back in subsequent requests
-    - **Legacy text extraction path** (fallback): Extracts JSON from the response text (handles structured output, code fences, and bare JSON), checks for explicit `done` signal (`{"done": true}`)
-12. Applies context directives (`drop_turns`, `summarize`) to the conversation
-13. Injects project context (`memory_file`) into relevant commands
-14. Classifies commands by action category (file read/write/delete, exec, network, destructive, display control, live audio) and checks autonomy rules
-15. If approval is required:
-    - TUI mode: emits an approval request and waits for user response
-    - Headless mode: denies execution (no implicit auto-approve fallback)
-16. Pipes the JSON to the `intendant-runtime` binary and waits for completion with a hard timeout (120s default, 600s for `askHuman`)
-17. Feeds the agent output back as the next user message (text path) or as individual tool results (tool call path), appending a token budget summary
-18. Repeats until the model signals done, responds with no JSON, or the context budget is exhausted
-19. In headless mode, if the model emits `askHuman`, the loop sends a recovery prompt back to the model (continue with explicit assumptions) instead of blocking on human-input timeout
+> **Peer federation is orthogonal to all four.** The `peer/` module federates
+> with *other* autonomous daemons (other Intendants, A2A-speaking peers,
+> MCP-shaped peers) as equals, where `external_agent` supervises a *subordinate*
+> CLI. The two compose: a peer Intendant can itself supervise a Codex subprocess
+> while being driven from this side as a peer. Federation is in progress.
 
-## Frontend Parity
+## The Control Plane, Session Supervisor, and Daemon
 
-The `UserAction` enum in `frontend.rs` is a compile-time contract between all interfaces. The TUI, web dashboard, MCP server, and control socket all produce the same variants. Adding a new action type forces all frontends to handle it via Rust's exhaustive match — no wildcard arms allowed. This guarantees every interface is functionally equivalent.
+These three pieces are the architectural shift the rest of the docs build on, so
+they get their own chapter:
+[Control Plane & Persistent Daemon](./control-plane-and-daemon.md).
+
+In brief:
+
+- **Control plane** (`control_plane.rs`) is the *single writer* of shared mutable
+  state: autonomy level, the active external-agent backend, and the runtime
+  Codex/Gemini configuration. It subscribes to the bus and is the only place
+  `ControlMsg` mutations land, so a setting changed from the dashboard, the TUI,
+  or MCP takes effect identically (and persists to `intendant.toml` where
+  relevant).
+- **Session supervisor** (`session_supervisor.rs`) is the long-lived owner of
+  every session launched at runtime. It handles `CreateSession`, `StartTask`,
+  `ResumeSession`, and targeted follow-ups off the bus, creates per-session
+  resources (log dir, approval registry, follow-up channel), and tracks the
+  parent/child/related-session graph plus the active session.
+- **Task dispatch** (`task_dispatch.rs`) routes a task to the right channel —
+  presence, task envelope, or follow-up — replacing the dispatch logic that used
+  to live in the TUI.
+- An **idle `--web` launch starts a headless daemon** (`run_daemon_loop`,
+  gated by `should_start_idle_web_daemon`): no terminal TUI, the supervisor owns
+  all launches, and tasks arrive over WebSocket/control-socket.
+- **Not yet built:** there is no recurring/scheduled-task facility. The only
+  scheduling primitive is the one-shot `ScheduleControllerRestart`
+  (`event.rs` / `mcp.rs`).
+
+## How It Works (Direct Mode loop)
+
+The Direct-Mode loop is the canonical agent loop; the other modes wrap or
+delegate it. Verified against `main.rs`:
+
+1. Loads `.env` and selects the provider. OpenAI uses the Responses API
+   (`/v1/responses`), Anthropic the Messages API, Gemini `generateContent`. All
+   three stream via SSE.
+2. Configures structured output, reasoning controls, native tool calling,
+   prompt caching, and max output tokens from model capabilities and env vars.
+3. Detects the project root (`git rev-parse --show-toplevel`, falling back to
+   cwd).
+4. Resolves the role-appropriate system prompt via a cascade: project root →
+   `~/.config/intendant/` → compiled-in default. With native tools enabled it
+   uses the condensed `SysPrompt_tools.md` (tool docs live in the API tool
+   definitions, not prose).
+5. Injects the project working directory so the model knows where to work.
+6. Loads tagged knowledge from the project memory store and injects it.
+7. Loads `INTENDANT.md` project instructions (global then project-local) and
+   injects them.
+8. Logs the full messages array to `turns/turn_NNN_messages.json` before each
+   API call.
+9. Sends the task via `chat_stream()` with `max_tokens`/`max_output_tokens`,
+   optional reasoning, optional JSON format, and native tool definitions.
+   Requests use exponential-backoff retry (up to 5 attempts) for 429 and 5xx.
+   Text deltas stream to the frontends in real time.
+10. Logs reasoning content (summary + full text) to `turns/turn_NNN_reasoning.txt`
+    when the provider returns it.
+11. Processes the response on one of two paths:
+    - **Native tool-call path**: collects tool calls, assembles an `AgentInput`
+      batch, pipes it to the runtime, maps results back per tool call. Handles
+      `manage_context` / `signal_done` caller-side. Raw API output items
+      (reasoning + function_call) are preserved for verbatim echo-back.
+    - **Legacy text-extraction path** (fallback): extracts JSON from the
+      response text (structured output, code fences, or bare JSON) and checks
+      for an explicit `{"done": true}` signal.
+12. Applies context directives (`drop_turns`, `summarize`).
+13. Injects project context into relevant commands.
+14. Classifies each command by action category (file read/write/delete, exec,
+    network, destructive, display control, live audio, human input) and checks
+    autonomy rules.
+15. If approval is required: interactive frontends (TUI/web/MCP via the EventBus)
+    surface an approval request and wait; headless mode denies (no implicit
+    auto-approve).
+16. Pipes the JSON to `intendant-runtime` and waits with a hard timeout (120s
+    default; 600s for `askHuman`).
+17. Feeds output back as the next user message (text path) or as individual tool
+    results (tool-call path), appending a token-budget summary.
+18. Repeats until done, no JSON / no commands, the budget is exhausted, or the
+    safety cap is hit.
+19. In headless mode, if the model emits `askHuman`, the loop sends a recovery
+    prompt ("continue with explicit assumptions") instead of blocking on the
+    human-input timeout.
+
+## Frontend Parity (corrected)
+
+Older docs claimed a single `UserAction` enum was the contract across *all* four
+frontends. That is not accurate. There are **two** parity contracts:
+
+- **`UserAction` (in `frontend.rs`)** is the compile-time contract shared by the
+  **TUI and the MCP server**. Adding a variant forces both the TUI key handler
+  and the MCP tool handler to produce it, and the shared action handler to
+  process it — no `_ =>` wildcards allowed.
+- **`ControlMsg` (in `event.rs`)** is the intent contract used by the **web
+  dashboard and the control socket** (and how MCP/TUI ultimately reach the
+  control plane and session supervisor). The control socket parses `ControlMsg`
+  JSON and republishes it as `AppEvent::ControlCommand`; the web gateway emits
+  `ControlMsg` directly.
+
+The two meet on the EventBus. The practical guarantee is the same — capabilities
+reach every interface — but it is enforced by *two* exhaustive enums, not one.
 
 ## askHuman Behavior
 
-- In **TUI mode**, `askHuman` opens the input panel and writes your answer to the session-scoped response file.
-- Empty submit is rejected in the TUI; you must provide non-empty input or press `Esc` to cancel.
-- In **headless mode** (`--no-tui` or non-interactive stdin), `askHuman` cannot be answered interactively. The loop tells the model to continue with explicit assumptions instead of waiting for the runtime timeout.
-- Runtime-level timeout for unanswered `askHuman` remains 5 minutes.
+- In **TUI mode**, `askHuman` opens the input panel and writes your answer to the
+  session-scoped response file. Empty submit is rejected; provide non-empty input
+  or press `Esc` to cancel.
+- In **headless mode** (`--no-tui` or non-interactive stdin), `askHuman` cannot
+  be answered interactively, so the loop tells the model to continue with
+  explicit assumptions rather than wait.
+- The runtime-level timeout for an unanswered `askHuman` is 5 minutes (600s at
+  the controller's per-command timeout).
 
 ## Streaming
 
-All three providers support streaming via `chat_stream()` on the `ChatProvider` trait:
+All three providers stream via `chat_stream()` on the `ChatProvider` trait:
 
-- **Anthropic**: `stream: true` on Messages API, parses `content_block_delta`, `content_block_start/stop`, `message_delta`
-- **OpenAI**: `stream: true` on Responses API, parses `response.output_text.delta`, `response.function_call_arguments.delta`, `response.completed`
-- **Gemini**: `streamGenerateContent?alt=sse` endpoint, parses chunked JSON candidates
+- **Anthropic**: `stream: true` on Messages; parses `content_block_delta`,
+  `content_block_start/stop`, `message_delta`.
+- **OpenAI**: `stream: true` on Responses; parses `response.output_text.delta`,
+  `response.function_call_arguments.delta`, `response.completed`.
+- **Gemini**: `streamGenerateContent?alt=sse`; parses chunked JSON candidates.
 
-Text deltas are forwarded to the TUI via `AppEvent::ModelResponseDelta` and accumulated in `App::streaming_buffer`, which is cleared when the full `ModelResponse` arrives.
+Text deltas forward to frontends via `AppEvent::ModelResponseDelta` and
+accumulate in a streaming buffer that clears when the full `ModelResponse`
+arrives.
 
 ## Rate-Limit Retry
 
-API requests use `send_with_retry()` with exponential backoff (1s x 2^attempt + jitter, up to 5 retries) for HTTP 429 and 5xx responses. Non-retryable errors (400, 401, etc.) fail immediately. API keys in error messages are masked via `mask_api_keys()`.
+API requests use `send_with_retry()` with exponential backoff
+(`1s × 2^attempt + jitter`, up to 5 retries) for HTTP 429 and 5xx. Non-retryable
+errors (400, 401, …) fail immediately. API keys in error messages are masked via
+`mask_api_keys()`.
 
 ## Prompt Caching
 
-- **Anthropic**: Uses `anthropic-beta: prompt-caching-2024-07-31` header with structured system content containing `cache_control: {"type": "ephemeral"}`
-- **OpenAI**: Automatic server-side caching for prompts >1024 tokens (no API changes needed)
-- **Gemini**: Implicit context caching (no API changes needed)
+- **Anthropic**: `anthropic-beta: prompt-caching-*` header with structured system
+  content carrying `cache_control: {"type": "ephemeral"}`.
+- **OpenAI**: automatic server-side caching for prompts over ~1024 tokens (no API
+  changes).
+- **Gemini**: implicit context caching (no API changes).
 
 ## Auto-Compaction
 
-When context usage reaches 90% (`usage_fraction() >= 0.90`), `conversation.auto_compact()` triggers:
-- Keeps: system message, first 2 context messages, last 4 messages
-- Summarizes: oldest half of remaining middle messages via `summarize_turns()`
-- Emits `ContextManagement` event to TUI/MCP
+When context usage reaches 90% (`usage_fraction() >= 0.90`),
+`conversation.auto_compact()` triggers:
+
+- **Keeps**: the system message, the first 2 context messages (working directory
+  + ack), and the last 4 messages.
+- **Summarizes**: the oldest half of the remaining middle messages via
+  `summarize_turns()`.
+- Emits a `ContextManagement` event to the frontends.
+
+Sub-agents and orchestrators additionally checkpoint structured state to the
+knowledge store so essential context survives the compaction boundary (see
+[Multi-Agent Orchestration](./multi-agent.md)).
+
+## Project Status and Direction
+
+The original eight-step arc (CLI → TUI → web → voice → desktop/computer-use →
+WebRTC display → phone → persistent daemon) is complete through step 8, with one
+explicit gap: the persistent daemon exists but **scheduled / recurring tasks do
+not** (only one-shot controller restarts). The dominant current direction is the
+multi-session, multi-backend orchestration hub described in this chapter —
+parallel local and external-agent sessions, a session graph, and rewindable
+history. Windows is a first-class target (see
+[Windows Support](./windows-support.md)); peer federation (A2A) is in progress.
 
 ## Environment
 
-- **OS:** macOS or Linux (Debian 12+). Windows (`x86_64-pc-windows-msvc`) is
-  supported as an in-progress port — see [Windows Support](./windows-support.md)
-- **Runtime:** Tokio async (full features)
-- **Permissions:** Runs as unprivileged user with passwordless sudo (Linux)
-- **Display:** Auto-managed Xvfb (Linux), native display (macOS), GDI/DXGI
-  desktop capture (Windows). See [Display Pipeline](./display-pipeline.md) and
-  [Windows Support](./windows-support.md)
-- **X11 auth:** At startup the runtime discovers active X displays and merges their xauth cookies into a session-scoped `session.Xauthority` file, passed as `XAUTHORITY` to all spawned commands
+- **OS:** macOS, Linux (Debian 12+), or Windows (`x86_64-pc-windows-msvc`). See
+  [Windows Support](./windows-support.md).
+- **Runtime:** Tokio async (full features).
+- **Permissions:** unprivileged user with passwordless sudo (Linux).
+- **Display:** auto-managed Xvfb (Linux), native display (macOS), GDI/DXGI
+  capture (Windows). See [Display Pipeline](./display-pipeline.md).
+- **X11 auth:** at startup the runtime discovers active X displays and merges
+  their xauth cookies into a session-scoped `session.Xauthority`, passed as
+  `XAUTHORITY` to spawned commands.
+
+## Where to Go Next
+
+- [Control Plane & Persistent Daemon](./control-plane-and-daemon.md) — the
+  single-writer control plane, session supervisor, file-watcher rewind, headless
+  daemon, and cost accounting.
+- [Session Logging](./session-logging.md) — the on-disk session layout, JSONL
+  event format, replay/rehydration, and cross-backend naming.
+- [Multi-Agent Orchestration](./multi-agent.md) — User mode, sub-agents,
+  worktrees, and external-agent supervision.
+- [Presence Layer](./presence.md), [Web Dashboard](./web-dashboard.md),
+  [MCP Server](./mcp-server.md), [Display Pipeline](./display-pipeline.md),
+  [Computer Use & Live Audio](./computer-use-and-audio.md).
