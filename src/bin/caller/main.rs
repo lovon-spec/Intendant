@@ -535,6 +535,15 @@ fn is_codex_injected_user_text_for_main(text: &str) -> bool {
     trimmed.starts_with("# AGENTS.md instructions for ")
         || trimmed.starts_with("<turn_aborted>")
         || trimmed.starts_with("<subagent_notification>")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<task-notification>")
+        || trimmed.starts_with("<command-name>")
+        || trimmed.starts_with("<command-message>")
+        || trimmed.starts_with("<local-command-stdout>")
+        || trimmed.starts_with("<bash-input>")
+        || trimmed.starts_with("<bash-stdout>")
+        || trimmed.starts_with("<bash-stderr>")
+        || trimmed.starts_with("<user_shell_command>")
 }
 
 fn codex_user_turn_state_from_history(session_id: &str) -> Option<UserTurnRevisionState> {
@@ -5099,8 +5108,35 @@ mod tests {
         assert!(is_codex_injected_user_text_for_main(
             "<subagent_notification>\n{\"agent_path\":\"child\"}\n</subagent_notification>"
         ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<user_shell_command>\n<command>\nhtop\n</command>\n</user_shell_command>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<task-notification>\n<task-id>child</task-id>\n</task-notification>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<command-name>/context</command-name>\n<command-args></command-args>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<local-command-stdout>context usage</local-command-stdout>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<bash-input>cargo test</bash-input>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<bash-stdout>ok</bash-stdout>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<bash-stderr>warning</bash-stderr>"
+        ));
         assert!(!is_codex_injected_user_text_for_main(
             "please inspect subagent_notification handling"
+        ));
+        assert!(!is_codex_injected_user_text_for_main(
+            "please inspect <bash-input> handling"
         ));
     }
 

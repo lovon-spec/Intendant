@@ -2936,6 +2936,15 @@ fn is_codex_injected_user_text(text: &str) -> bool {
     trimmed.starts_with("# AGENTS.md instructions for ")
         || trimmed.starts_with("<turn_aborted>")
         || trimmed.starts_with("<subagent_notification>")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<task-notification>")
+        || trimmed.starts_with("<command-name>")
+        || trimmed.starts_with("<command-message>")
+        || trimmed.starts_with("<local-command-stdout>")
+        || trimmed.starts_with("<bash-input>")
+        || trimmed.starts_with("<bash-stdout>")
+        || trimmed.starts_with("<bash-stderr>")
+        || trimmed.starts_with("<user_shell_command>")
 }
 
 fn codex_thread_display_name(value: Option<String>) -> Option<String> {
@@ -16310,6 +16319,42 @@ mod tests {
                     }
                 }),
                 serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:56Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:57Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<user_shell_command>\n<command>\nhtop\n</command>\n</user_shell_command>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:58Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<task-notification>\n<task-id>child</task-id>\n</task-notification>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
                     "timestamp": "2026-05-17T16:49:00Z",
                     "type": "response_item",
                     "payload": {
@@ -16365,6 +16410,7 @@ mod tests {
 
         assert_eq!(contents, vec!["Visible prompt", "Visible answer"]);
         assert_eq!(entries[0]["source"], "user");
+        assert_eq!(entries[0]["user_turn_index"], 1);
         assert_eq!(entries[1]["source"], "codex");
     }
 
