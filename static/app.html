@@ -3192,6 +3192,65 @@ html, body {
   font-weight: 600;
   cursor: pointer;
 }
+.sessions-start-btn:disabled {
+  opacity: 0.65;
+  cursor: progress;
+}
+.sessions-start-btn.pending {
+  border-color: var(--blue);
+  background: var(--blue);
+}
+.sessions-spawn-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 1px solid rgba(137, 180, 250, 0.24);
+  border-left: 3px solid var(--blue);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--blue) 9%, var(--surface0));
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+  text-transform: none;
+  box-sizing: border-box;
+}
+.sessions-spawn-notice.ok {
+  border-color: rgba(166, 227, 161, 0.28);
+  border-left-color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, var(--surface0));
+}
+.sessions-spawn-notice.warn {
+  border-color: rgba(249, 226, 175, 0.28);
+  border-left-color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 9%, var(--surface0));
+}
+.sessions-spawn-notice.error {
+  border-color: rgba(243, 139, 168, 0.28);
+  border-left-color: var(--red);
+  background: color-mix(in srgb, var(--red) 8%, var(--surface0));
+}
+.sessions-spawn-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border: 2px solid var(--surface2);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: sessions-spawn-spin 850ms linear infinite;
+}
+.sessions-spawn-notice.ok .sessions-spawn-spinner,
+.sessions-spawn-notice.warn .sessions-spawn-spinner,
+.sessions-spawn-notice.error .sessions-spawn-spinner {
+  animation: none;
+}
+.sessions-spawn-notice.ok .sessions-spawn-spinner { border-color: var(--green); }
+.sessions-spawn-notice.warn .sessions-spawn-spinner { border-color: var(--yellow); }
+.sessions-spawn-notice.error .sessions-spawn-spinner { border-color: var(--red); }
+@keyframes sessions-spawn-spin {
+  to { transform: rotate(360deg); }
+}
 .sessions-refresh {
   flex: 0 0 auto;
   height: 28px;
@@ -4524,6 +4583,7 @@ html, body {
 }
 .control-toast.error { border-left-color: var(--red); }
 .control-toast.success { border-left-color: var(--green); }
+.control-toast.info { border-left-color: var(--blue); }
 .control-toast.global-command-toast {
   position: fixed;
   bottom: 16px;
@@ -6778,7 +6838,11 @@ html, body {
                     </div>
                   </div>
                 </div>
-                <button class="sessions-start-btn" onclick="startNewSession()">Start session</button>
+                <button class="sessions-start-btn" id="new-session-start-btn" onclick="startNewSession()">Start session</button>
+                <div class="sessions-spawn-notice hidden" id="new-session-spawn-notice" role="status" aria-live="polite">
+                  <span class="sessions-spawn-spinner" aria-hidden="true"></span>
+                  <span id="new-session-spawn-text"></span>
+                </div>
               </div>
             </div>
           </div>
@@ -8587,7 +8651,10 @@ function processCommands(cmds) {
         pendingStatusPhaseGuard = null;
       }
       switch (c.cmd) {
-      case 'add_log_entry': renderLogEntry(c); break;
+      case 'add_log_entry':
+        maybeFailNewSessionSpawnFromLog(c);
+        renderLogEntry(c);
+        break;
       case 'mark_activity_context_rewind':
         flushLogReplayAppendBatch();
         markActivityContextRewind(c.session_id, c.user_turn_index, c.turns_removed);
@@ -9264,6 +9331,11 @@ let newSessionAgentCommands = {
   'claude-code': 'claude',
   gemini: 'gemini',
 };
+let newSessionSpawnPending = false;
+let newSessionSpawnTask = '';
+let newSessionSpawnTimeout = null;
+let newSessionSpawnClearTimeout = null;
+const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
 
 async function refreshControlPane() {
   try {
@@ -9619,7 +9691,8 @@ function showControlToast(kind, text) {
   const existing = host.querySelector('.control-toast');
   if (existing) existing.remove();
   const toast = document.createElement('div');
-  toast.className = 'control-toast ' + (kind === 'error' ? 'error' : 'success');
+  const toastKind = kind === 'error' ? 'error' : (kind === 'success' ? 'success' : 'info');
+  toast.className = 'control-toast ' + toastKind;
   if (host === document.body) toast.classList.add('global-command-toast');
   toast.textContent = text;
   host.appendChild(toast);
@@ -23644,6 +23717,7 @@ function renderDiskUsage(sessions) {
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
   const sid = String(sessionId || '').trim();
+  finishNewSessionSpawnNotice(sid, task);
   const alias = externalBackendAliasForSession(sid);
   const visibleSessionId = alias?.backendSessionId || sid;
   currentSessionFullId = visibleSessionId || '';
@@ -24554,6 +24628,89 @@ function renderNewSessionAgentControls(options = {}) {
   }
 }
 
+function setNewSessionStartButtonPending(pending) {
+  const btn = document.getElementById('new-session-start-btn');
+  if (!btn) return;
+  btn.disabled = !!pending;
+  btn.classList.toggle('pending', !!pending);
+  btn.textContent = pending ? 'Spawning...' : 'Start session';
+}
+
+function setNewSessionSpawnNotice(kind, text) {
+  const notice = document.getElementById('new-session-spawn-notice');
+  const textEl = document.getElementById('new-session-spawn-text');
+  if (!notice || !textEl) return;
+  const hasText = !!String(text || '').trim();
+  const noticeKind = ['ok', 'warn', 'error'].includes(kind) ? kind : 'pending';
+  notice.className = `sessions-spawn-notice ${noticeKind}` + (hasText ? '' : ' hidden');
+  textEl.textContent = text || '';
+  notice.title = text || '';
+}
+
+function clearNewSessionSpawnTimers() {
+  if (newSessionSpawnTimeout) clearTimeout(newSessionSpawnTimeout);
+  if (newSessionSpawnClearTimeout) clearTimeout(newSessionSpawnClearTimeout);
+  newSessionSpawnTimeout = null;
+  newSessionSpawnClearTimeout = null;
+}
+
+function beginNewSessionSpawnNotice(task, text) {
+  clearNewSessionSpawnTimers();
+  newSessionSpawnPending = true;
+  newSessionSpawnTask = String(task || '').trim();
+  setNewSessionStartButtonPending(true);
+  setNewSessionSpawnNotice('pending', text || 'Spawning new session...');
+  newSessionSpawnTimeout = setTimeout(() => {
+    if (!newSessionSpawnPending) return;
+    newSessionSpawnPending = false;
+    newSessionSpawnTask = '';
+    setNewSessionStartButtonPending(false);
+    setNewSessionSpawnNotice('warn', 'No start confirmation yet. Check the Activity log before retrying.');
+    showControlToast('info', 'No new-session start confirmation yet.');
+  }, NEW_SESSION_SPAWN_TIMEOUT_MS);
+}
+
+function updateNewSessionSpawnNotice(kind, text) {
+  if (!newSessionSpawnPending) return;
+  setNewSessionSpawnNotice(kind, text);
+}
+
+function failNewSessionSpawnNotice(text) {
+  clearNewSessionSpawnTimers();
+  newSessionSpawnPending = false;
+  newSessionSpawnTask = '';
+  setNewSessionStartButtonPending(false);
+  setNewSessionSpawnNotice('error', text || 'New session did not start.');
+  showControlToast('error', text || 'New session did not start.');
+}
+
+function finishNewSessionSpawnNotice(sessionId, task) {
+  if (!newSessionSpawnPending) return;
+  const expectedTask = newSessionSpawnTask;
+  const actualTask = String(task || '').trim();
+  if (expectedTask && actualTask && expectedTask !== actualTask) return;
+  clearNewSessionSpawnTimers();
+  newSessionSpawnPending = false;
+  newSessionSpawnTask = '';
+  setNewSessionStartButtonPending(false);
+  const shortId = sessionId ? ` (${shortSessionId(sessionId)})` : '';
+  setNewSessionSpawnNotice('ok', `Session started${shortId}. Opening Activity...`);
+  showControlToast('success', `Session started${shortId}`);
+  newSessionSpawnClearTimeout = setTimeout(() => {
+    setNewSessionSpawnNotice('', '');
+    newSessionSpawnClearTimeout = null;
+  }, 2500);
+}
+
+function maybeFailNewSessionSpawnFromLog(c) {
+  if (!newSessionSpawnPending || !c) return;
+  const level = String(c.level || '').toLowerCase();
+  if (level !== 'error') return;
+  const content = String(c.content || '').trim();
+  if (!/^(Session create failed|Project load failed):/.test(content)) return;
+  failNewSessionSpawnNotice(content);
+}
+
 async function loadNewSessionProjectRoot() {
   try {
     const resp = await fetch('/api/project-root');
@@ -24569,36 +24726,67 @@ async function startNewSession() {
   if (!input) return;
   const task = input.value.trim();
   if (!task) return;
-  if (app) {
-    const nameInput = document.getElementById('new-session-name');
-    const sessionName = nameInput?.value.trim() || '';
-    const direct = document.getElementById('direct-mode-toggle')?.checked || false;
-    const attachments = pendingAttachments.map(a => a.frameId);
-    const attachmentReceipt = pendingAttachments.slice();
-    const requestedProjectRoot = document.getElementById('new-session-project-root')?.value.trim() || '';
-    const projectRoot = await ensureNewSessionProjectDirectory(requestedProjectRoot);
-    if (requestedProjectRoot && !projectRoot) return;
-    const msg = { action: 'create_session', task: task };
-    if (sessionName) msg.name = sessionName;
-    if (projectRoot) msg.project_root = projectRoot;
-    const agentValue = document.getElementById('new-session-agent')?.value || '';
-    const selectedAgent = normalizeAgentId(agentValue);
-    if (agentValue === 'internal') {
-      msg.agent = 'internal';
-    } else if (selectedAgent) {
-      msg.agent = selectedAgent;
-      const agentCommand = document.getElementById('new-session-agent-command')?.value.trim() || '';
-      if (agentCommand) msg.agent_command = agentCommand;
-    }
-    if (direct) msg.direct = true;
-    if (attachments.length > 0) msg.attachments = attachments;
-    clearTaskTextarea(input);
-    if (nameInput) nameInput.value = '';
+  if (newSessionSpawnPending) {
+    showControlToast('info', 'A new session is already spawning.');
+    return;
+  }
+  if (!app) {
+    failNewSessionSpawnNotice('Dashboard is not connected to the server.');
+    return;
+  }
+
+  const nameInput = document.getElementById('new-session-name');
+  const sessionName = nameInput?.value.trim() || '';
+  const direct = document.getElementById('direct-mode-toggle')?.checked || false;
+  const attachments = pendingAttachments.map(a => a.frameId);
+  const attachmentReceipt = pendingAttachments.slice();
+  const requestedProjectRoot = document.getElementById('new-session-project-root')?.value.trim() || '';
+  beginNewSessionSpawnNotice(
+    task,
+    requestedProjectRoot ? 'Checking project directory...' : 'Spawning new session...'
+  );
+
+  let projectRoot = '';
+  try {
+    projectRoot = await ensureNewSessionProjectDirectory(requestedProjectRoot);
+  } catch (e) {
+    failNewSessionSpawnNotice(e?.message || 'Project directory check failed.');
+    return;
+  }
+  if (requestedProjectRoot && !projectRoot) {
+    failNewSessionSpawnNotice('Project directory needs attention before the session can start.');
+    return;
+  }
+
+  const msg = { action: 'create_session', task: task };
+  if (sessionName) msg.name = sessionName;
+  if (projectRoot) msg.project_root = projectRoot;
+  const agentValue = document.getElementById('new-session-agent')?.value || '';
+  const selectedAgent = normalizeAgentId(agentValue);
+  if (agentValue === 'internal') {
+    msg.agent = 'internal';
+  } else if (selectedAgent) {
+    msg.agent = selectedAgent;
+    const agentCommand = document.getElementById('new-session-agent-command')?.value.trim() || '';
+    if (agentCommand) msg.agent_command = agentCommand;
+  }
+  if (direct) msg.direct = true;
+  if (attachments.length > 0) msg.attachments = attachments;
+
+  try {
     app.send_server_action(msg);
-    if (attachments.length > 0) {
-      renderAttachmentReceipt(task, attachmentReceipt, 'Sent');
-      clearPendingAttachments();
-    }
+  } catch (e) {
+    failNewSessionSpawnNotice(e?.message || 'Failed to send new-session request.');
+    return;
+  }
+
+  updateNewSessionSpawnNotice('pending', 'Spawning new session...');
+  showControlToast('info', 'Spawning new session...');
+  clearTaskTextarea(input);
+  if (nameInput) nameInput.value = '';
+  if (attachments.length > 0) {
+    renderAttachmentReceipt(task, attachmentReceipt, 'Sent');
+    clearPendingAttachments();
   }
 }
 window.startNewSession = startNewSession;
