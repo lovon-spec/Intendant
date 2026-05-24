@@ -9723,8 +9723,62 @@ function applyCodexConfigChanged(evt) {
 // Track in-flight action dispatches so the UI can grey buttons out until a
 // matching CodexThreadActionResult arrives (or a short timeout elapses).
 const controlPendingActions = new Map(); // op -> { timeoutHandle, btnEl }
+const pendingDetachedCodexThreadActions = new Map(); // session id -> [{ op, params, timeoutHandle }]
 
-function dispatchCodexThreadAction(op, params, sessionId = '') {
+function sessionIdsForPendingDetachedActions(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const ids = new Set();
+  if (sid) ids.add(sid);
+  for (const [id, meta] of sessionMetadataById) {
+    if (!id || !meta) continue;
+    if (
+      meta.backendSessionId === sid ||
+      meta.intendantSessionId === sid
+    ) {
+      ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function queueDetachedCodexThreadAction(sessionId, op, params = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  const resume = detachedSessionResumeMessage(sid, '', true, []);
+  if (!resume || normalizeAgentId(resume.source) !== 'codex') {
+    showControlToast('error', `/${op} failed: Codex session is not attached`);
+    return false;
+  }
+  const timeoutHandle = setTimeout(() => {
+    const queue = pendingDetachedCodexThreadActions.get(sid) || [];
+    const next = queue.filter(item => item.timeoutHandle !== timeoutHandle);
+    if (next.length > 0) pendingDetachedCodexThreadActions.set(sid, next);
+    else pendingDetachedCodexThreadActions.delete(sid);
+    showControlToast('error', `/${op} failed: Codex session did not attach`);
+  }, 15000);
+  const queue = pendingDetachedCodexThreadActions.get(sid) || [];
+  const shouldRequestAttach = queue.length === 0;
+  queue.push({ op, params: params || {}, timeoutHandle });
+  pendingDetachedCodexThreadActions.set(sid, queue);
+  if (shouldRequestAttach) dispatchControlMsg(resume);
+  showControlToast('info', `Attaching Codex session before /${op}`);
+  return true;
+}
+
+function flushPendingDetachedCodexThreadActions(sessionId) {
+  const ids = sessionIdsForPendingDetachedActions(sessionId);
+  for (const sid of ids) {
+    const queue = pendingDetachedCodexThreadActions.get(sid);
+    if (!queue || queue.length === 0) continue;
+    pendingDetachedCodexThreadActions.delete(sid);
+    for (const item of queue) {
+      clearTimeout(item.timeoutHandle);
+      dispatchCodexThreadAction(item.op, item.params, sid, { skipDetachedAttach: true });
+    }
+  }
+}
+
+function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
   if (sid && sessionWindowIsSide(sid) && !codexThreadActionAllowedForSide(op)) {
     showControlToast('error', `/${op} is not available in a /side window; use the parent thread`);
@@ -9743,6 +9797,9 @@ function dispatchCodexThreadAction(op, params, sessionId = '') {
   ) {
     showControlToast('error', '/undo is available after the /side turn finishes or is stopped');
     return false;
+  }
+  if (sid && !options.skipDetachedAttach && sessionWindowIsDetached(sid)) {
+    return queueDetachedCodexThreadAction(sid, op, params || {});
   }
   const payload = { action: 'codex_thread_action', op, params: params || {} };
   if (sid) payload.session_id = sid;
@@ -24111,6 +24168,7 @@ function onSessionStarted(sessionId, task) {
       ...(alias?.source ? { source: alias.source, backendSource: alias.source } : {}),
     });
     focusSessionWindowFromLifecycle(visibleSessionId);
+    flushPendingDetachedCodexThreadActions(visibleSessionId);
   } else {
     updateTaskTargetChip();
   }
@@ -24139,6 +24197,7 @@ function onSessionAttached(sessionId, source) {
     const phase = existingPhase && existingPhase !== 'done' ? existingPhase : 'idle';
     ensureSessionWindow(sessionId, { source: source || 'session', phase, ended: false });
     focusSessionWindowFromLifecycle(sessionId);
+    flushPendingDetachedCodexThreadActions(sessionId);
   } else {
     updateTaskTargetChip();
   }
