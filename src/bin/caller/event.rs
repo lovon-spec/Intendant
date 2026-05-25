@@ -1127,6 +1127,16 @@ pub enum ControlMsg {
     EditUserMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        /// Optional source/resume context for a replayed external-agent
+        /// session that may not be attached to this daemon yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct: Option<bool>,
         user_turn_index: u32,
         /// Revision of the active user turn the frontend rendered. This lets
         /// the backend reject stale edit requests after a message has already
@@ -2925,6 +2935,36 @@ mod tests {
                 assert_eq!(name, "UI polish");
             }
             _ => panic!("expected RenameSession"),
+        }
+    }
+
+    #[test]
+    fn control_msg_edit_user_message_deserializes_resume_context() {
+        let json = r#"{"action":"edit_user_message","session_id":"019e5c7a","source":"codex","resume_id":"019e5c7a","project_root":"/repo","direct":true,"user_turn_index":2,"user_turn_revision":1,"text":"replacement"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::EditUserMessage {
+                session_id,
+                source,
+                resume_id,
+                project_root,
+                direct,
+                user_turn_index,
+                user_turn_revision,
+                text,
+                attachments,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("019e5c7a"));
+                assert_eq!(source.as_deref(), Some("codex"));
+                assert_eq!(resume_id.as_deref(), Some("019e5c7a"));
+                assert_eq!(project_root.as_deref(), Some("/repo"));
+                assert_eq!(direct, Some(true));
+                assert_eq!(user_turn_index, 2);
+                assert_eq!(user_turn_revision, Some(1));
+                assert_eq!(text, "replacement");
+                assert!(attachments.is_empty());
+            }
+            _ => panic!("expected EditUserMessage"),
         }
     }
 

@@ -68,6 +68,23 @@ struct ManagedSession {
     approval_registry: event::ApprovalRegistry,
 }
 
+#[derive(Clone)]
+struct EditRouteTarget {
+    managed_id: String,
+    source: String,
+    project_root: PathBuf,
+    session_dir: PathBuf,
+    follow_up_tx: mpsc::Sender<FollowUpMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditAttachRequest {
+    source: String,
+    resume_id: Option<String>,
+    project_root: Option<String>,
+    direct: Option<bool>,
+}
+
 impl SupervisorState {
     fn resolve_session_id(&self, session_id: &str) -> Option<String> {
         if self.sessions.contains_key(session_id) {
@@ -363,6 +380,10 @@ impl SessionSupervisor {
             }
             event::ControlMsg::EditUserMessage {
                 session_id,
+                source,
+                resume_id,
+                project_root,
+                direct,
                 user_turn_index,
                 user_turn_revision,
                 text,
@@ -370,6 +391,10 @@ impl SessionSupervisor {
             } => {
                 self.route_edit_user_message(
                     session_id,
+                    source,
+                    resume_id,
+                    project_root,
+                    direct,
                     user_turn_index,
                     user_turn_revision,
                     text,
@@ -430,6 +455,7 @@ impl SessionSupervisor {
             event::ControlMsg::CreateSession { .. } => true,
             event::ControlMsg::ResumeSession { .. } => true,
             event::ControlMsg::RenameSession { .. } => true,
+            msg if control_msg_can_attach_unmanaged_session(msg) => true,
             _ => {
                 if let Some(session_id) = control_target_session_id(msg) {
                     self.session_is_managed(session_id).await
@@ -1190,12 +1216,16 @@ impl SessionSupervisor {
     async fn route_edit_user_message(
         &self,
         session_id: Option<String>,
+        source: Option<String>,
+        resume_id: Option<String>,
+        project_root: Option<String>,
+        direct: Option<bool>,
         user_turn_index: u32,
         user_turn_revision: Option<u32>,
         text: String,
         attachments: Vec<String>,
     ) {
-        let (target_id, entry) = {
+        let requested_id = {
             let state = self.state.lock().await;
             let requested_id = session_id.or_else(|| state.active_session_id.clone());
             let Some(requested_id) = requested_id else {
@@ -1203,33 +1233,46 @@ impl SessionSupervisor {
                 self.warn("Edit dropped: no active managed session");
                 return;
             };
-            let target_id = state
-                .resolve_session_id(&requested_id)
-                .unwrap_or_else(|| requested_id.clone());
-            let entry = state.sessions.get(&target_id).map(|s| {
-                (
-                    s.session_id.clone(),
-                    s.source.clone(),
-                    s.project_root.clone(),
-                    s.session_dir.clone(),
-                    s.follow_up_tx.clone(),
-                )
-            });
-            (target_id, entry)
+            requested_id
         };
 
-        let Some((managed_id, source, project_root, session_dir, tx)) = entry else {
+        let (mut target_id, mut entry) = self.lookup_edit_route_target(&requested_id).await;
+        if entry.is_none() {
+            if let Some(attach) = edit_attach_request(source, resume_id, project_root, direct) {
+                let lookup_id = attach
+                    .resume_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or(&requested_id)
+                    .to_string();
+                self.resume_session(
+                    attach.source,
+                    requested_id.clone(),
+                    Some(lookup_id.clone()),
+                    attach.project_root,
+                    None,
+                    Some(attach.direct.unwrap_or(true)),
+                )
+                .await;
+                (target_id, entry) = self.lookup_edit_route_target(&lookup_id).await;
+                if entry.is_none() && lookup_id != requested_id {
+                    (target_id, entry) = self.lookup_edit_route_target(&requested_id).await;
+                }
+            }
+        }
+
+        let Some(target) = entry else {
             self.warn(&format!(
                 "Edit dropped: session {} is not managed by this daemon",
                 short_session(&target_id)
             ));
             return;
         };
-        let Some(backend) = external_agent::AgentBackend::from_str_loose(&source) else {
+        let Some(backend) = external_agent::AgentBackend::from_str_loose(&target.source) else {
             self.warn(&format!(
                 "Edit dropped: unknown external-agent source {} for session {}",
-                source,
-                short_session(&managed_id)
+                target.source,
+                short_session(&target.managed_id)
             ));
             return;
         };
@@ -1237,7 +1280,7 @@ impl SessionSupervisor {
             self.warn(&format!(
                 "Edit dropped: {} session {} does not support user-message rewind yet",
                 backend,
-                short_session(&managed_id)
+                short_session(&target.managed_id)
             ));
             return;
         }
@@ -1245,7 +1288,7 @@ impl SessionSupervisor {
             self.warn(&format!(
                 "Edit dropped: invalid user turn index 0 for {} session {}",
                 backend,
-                short_session(&managed_id)
+                short_session(&target.managed_id)
             ));
             return;
         }
@@ -1253,7 +1296,7 @@ impl SessionSupervisor {
             self.warn(&format!(
                 "Edit dropped: missing active-message revision for {} session {} user turn {}",
                 backend,
-                short_session(&managed_id),
+                short_session(&target.managed_id),
                 user_turn_index
             ));
             return;
@@ -1265,8 +1308,8 @@ impl SessionSupervisor {
             resolve_attachments(
                 &attachments,
                 &self.config.frame_registry,
-                &session_dir,
-                &project_root,
+                &target.session_dir,
+                &target.project_root,
             )
             .await
         };
@@ -1276,7 +1319,7 @@ impl SessionSupervisor {
                 resolved_attachments.len(),
                 attachments.len(),
                 backend,
-                short_session(&managed_id)
+                short_session(&target.managed_id)
             ));
         }
         let msg = FollowUpMessage::edit_user_message(
@@ -1285,14 +1328,32 @@ impl SessionSupervisor {
             user_turn_index,
             user_turn_revision,
         );
-        if tx.send(msg).await.is_err() {
+        if target.follow_up_tx.send(msg).await.is_err() {
             self.warn(&format!(
                 "Edit dropped: {} session {} in {} is not accepting input",
                 backend,
-                short_session(&managed_id),
-                project_root.display()
+                short_session(&target.managed_id),
+                target.project_root.display()
             ));
         }
+    }
+
+    async fn lookup_edit_route_target(
+        &self,
+        requested_id: &str,
+    ) -> (String, Option<EditRouteTarget>) {
+        let state = self.state.lock().await;
+        let target_id = state
+            .resolve_session_id(requested_id)
+            .unwrap_or_else(|| requested_id.to_string());
+        let entry = state.sessions.get(&target_id).map(|s| EditRouteTarget {
+            managed_id: s.session_id.clone(),
+            source: s.source.clone(),
+            project_root: s.project_root.clone(),
+            session_dir: s.session_dir.clone(),
+            follow_up_tx: s.follow_up_tx.clone(),
+        });
+        (target_id, entry)
     }
 
     async fn route_interrupt(&self, session_id: Option<String>) {
@@ -2222,6 +2283,42 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
     }
 }
 
+fn edit_attach_request(
+    source: Option<String>,
+    resume_id: Option<String>,
+    project_root: Option<String>,
+    direct: Option<bool>,
+) -> Option<EditAttachRequest> {
+    let backend = source
+        .as_deref()
+        .and_then(external_agent::AgentBackend::from_str_loose)?;
+    if !backend.supports_user_message_rewind() {
+        return None;
+    }
+
+    Some(EditAttachRequest {
+        source: backend.as_short_str().to_string(),
+        resume_id: resume_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty()),
+        project_root: project_root
+            .map(|root| root.trim().to_string())
+            .filter(|root| !root.is_empty()),
+        direct,
+    })
+}
+
+fn control_msg_can_attach_unmanaged_session(msg: &event::ControlMsg) -> bool {
+    match msg {
+        event::ControlMsg::EditUserMessage {
+            source: Some(source),
+            ..
+        } => external_agent::AgentBackend::from_str_loose(source)
+            .is_some_and(|backend| backend.supports_user_message_rewind()),
+        _ => false,
+    }
+}
+
 fn short_session(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
@@ -2456,6 +2553,45 @@ mod tests {
     #[test]
     fn ignores_non_codex_slash_commands() {
         assert!(parse_codex_slash_command("/help").is_none());
+    }
+
+    #[test]
+    fn edit_attach_request_accepts_only_rewind_capable_external_sources() {
+        let attach = edit_attach_request(
+            Some("Codex".to_string()),
+            Some(" 019e5c7a ".to_string()),
+            Some(" /tmp/project ".to_string()),
+            None,
+        )
+        .expect("codex edit should be attachable");
+        assert_eq!(attach.source, "codex");
+        assert_eq!(attach.resume_id.as_deref(), Some("019e5c7a"));
+        assert_eq!(attach.project_root.as_deref(), Some("/tmp/project"));
+
+        assert!(edit_attach_request(
+            Some("gemini".to_string()),
+            Some("gemini-session".to_string()),
+            None,
+            None,
+        )
+        .is_none());
+        assert!(edit_attach_request(None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn external_codex_edit_control_can_be_handled_before_attach() {
+        let msg = event::ControlMsg::EditUserMessage {
+            session_id: Some("019e5c7a".to_string()),
+            source: Some("codex".to_string()),
+            resume_id: Some("019e5c7a".to_string()),
+            project_root: Some("/tmp/project".to_string()),
+            direct: Some(true),
+            user_turn_index: 1,
+            user_turn_revision: Some(1),
+            text: "replacement".to_string(),
+            attachments: Vec::new(),
+        };
+        assert!(control_msg_can_attach_unmanaged_session(&msg));
     }
 
     #[test]

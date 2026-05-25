@@ -15240,6 +15240,7 @@ function clearPendingApproval() {
 }
 
 function showApproval(id, command, category, sessionId) {
+  if (processingLogReplay) return;
   hideAllPanels();
   pendingApprovalId = id;
   pendingApprovalSessionId =
@@ -24834,11 +24835,29 @@ function beginEditUserMessage({ sessionId, userTurnIndex, userTurnRevision, text
   updateSubmitButtonLabel(currentPhase);
 }
 
+function editUserMessageResumeContext(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const meta = sessionMetadataById.get(sid) || {};
+  const source = externalSourceForSessionWindow(sid, sessionWindows.get(sid) || null)
+    || normalizeAgentId(meta.source || meta.sourceLabel || '');
+  if (!source || source === 'intendant') return null;
+  const resumeId = String(meta.backendSessionId || sid).trim() || sid;
+  const ctx = {
+    source,
+    resume_id: resumeId,
+    direct: true,
+  };
+  if (meta.projectRoot) ctx.project_root = meta.projectRoot;
+  return ctx;
+}
+
 function submitEditedUserMessage(input, text) {
   if (!editMessageDraft || !app) return false;
   const attachments = pendingAttachments.map(a => a.frameId);
   const attachmentReceipt = pendingAttachments.slice();
   const targetSessionId = editMessageDraft.sessionId;
+  const resumeContext = editUserMessageResumeContext(targetSessionId);
   const msg = {
     action: 'edit_user_message',
     session_id: targetSessionId,
@@ -24846,6 +24865,7 @@ function submitEditedUserMessage(input, text) {
     user_turn_revision: editMessageDraft.userTurnRevision,
     text,
   };
+  if (resumeContext) Object.assign(msg, resumeContext);
   if (attachments.length > 0) msg.attachments = attachments;
   app.send_server_action(msg);
   markSessionWindowPendingActive(targetSessionId);
@@ -24985,6 +25005,7 @@ window.submitActivityOrSteer = function() {
   const targetSessionId = resolvePromptTargetSessionId();
   if (
     targetSessionId &&
+    !sessionWindowIsDetached(targetSessionId) &&
     isSessionWindowSteerActive(targetSessionId) &&
     sessionSupportsSteer(targetSessionId)
   ) {
@@ -27964,6 +27985,13 @@ document.addEventListener('keydown', (e) => {
 // ── Approval / Input / Follow-up actions (from HTML onclick) ──
 window.sendApproval = function(action) {
   if (!app || pendingApprovalId === null) return;
+  if (pendingApprovalSessionId && sessionWindowIsDetached(pendingApprovalSessionId)) {
+    showControlToast('error', 'Approval is no longer live; attach the session and retry if needed');
+    approvalSessionIds.delete(String(pendingApprovalId));
+    clearPendingApproval();
+    hidePanel('approval-panel');
+    return;
+  }
   const msg = { action, id: pendingApprovalId };
   if (pendingApprovalSessionId) msg.session_id = pendingApprovalSessionId;
   app.send_server_action(msg);
@@ -27985,13 +28013,18 @@ window.sendHumanResponse = function() {
 // — updateStopButtonVisibility resets the label when it hides/re-enables.
 window.sendInterrupt = function() {
   if (!app) return;
+  const targetSessionId = resolvePromptTargetSessionId();
+  if (targetSessionId && sessionWindowIsDetached(targetSessionId)) {
+    showControlToast('error', 'Attach the session before interrupting it');
+    updateStopButtonVisibility(currentPhase);
+    return;
+  }
   const btn = document.getElementById('stop-btn');
   if (btn) {
     btn.disabled = true;
     btn.innerHTML = '\u23F9 Interrupting...';
   }
   const msg = { action: 'interrupt' };
-  const targetSessionId = resolvePromptTargetSessionId();
   if (targetSessionId) msg.session_id = targetSessionId;
   app.send_server_action(msg);
 };
