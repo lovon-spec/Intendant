@@ -6859,9 +6859,38 @@ pub struct SettingsPayload {
     pub gemini_include_directories: Vec<String>,
     #[serde(default)]
     pub gemini_debug: bool,
+    // Per-category approval rules (persisted to `[approval]`). Exposed here
+    // for the dashboard's "Approval rules" controls to populate the selects.
+    // Live edits flow through the `set_approval_rule` ControlMsg, not through
+    // `apply_settings_payload`, so these are display/read-only in the payload.
+    // Values: "auto" | "ask" | "deny".
+    #[serde(default = "default_settings_approval_auto")]
+    pub approval_file_read: String,
+    #[serde(default = "default_settings_approval_ask")]
+    pub approval_file_write: String,
+    #[serde(default = "default_settings_approval_ask")]
+    pub approval_file_delete: String,
+    #[serde(default = "default_settings_approval_auto")]
+    pub approval_command_exec: String,
+    #[serde(default = "default_settings_approval_auto")]
+    pub approval_network: String,
+    #[serde(default = "default_settings_approval_ask")]
+    pub approval_destructive: String,
+    #[serde(default = "default_settings_approval_ask")]
+    pub approval_display_control: String,
+    #[serde(default = "default_settings_approval_auto")]
+    pub approval_tool_call: String,
     // Env var overrides (read-only, shown in UI)
     #[serde(default)]
     pub env_overrides: std::collections::HashMap<String, String>,
+}
+
+fn default_settings_approval_auto() -> String {
+    crate::autonomy::ApprovalRule::Auto.as_str().to_string()
+}
+
+fn default_settings_approval_ask() -> String {
+    crate::autonomy::ApprovalRule::Ask.as_str().to_string()
 }
 
 fn default_settings_codex_sandbox() -> String {
@@ -6946,6 +6975,14 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         gemini_allowed_mcp_servers: config.agent.gemini_cli.allowed_mcp_servers.clone(),
         gemini_include_directories: config.agent.gemini_cli.include_directories.clone(),
         gemini_debug: config.agent.gemini_cli.debug,
+        approval_file_read: config.approval.file_read.as_str().to_string(),
+        approval_file_write: config.approval.file_write.as_str().to_string(),
+        approval_file_delete: config.approval.file_delete.as_str().to_string(),
+        approval_command_exec: config.approval.command_exec.as_str().to_string(),
+        approval_network: config.approval.network.as_str().to_string(),
+        approval_destructive: config.approval.destructive.as_str().to_string(),
+        approval_display_control: config.approval.display_control.as_str().to_string(),
+        approval_tool_call: config.approval.tool_call.as_str().to_string(),
         env_overrides,
     }
 }

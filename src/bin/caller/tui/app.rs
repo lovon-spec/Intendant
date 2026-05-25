@@ -1183,6 +1183,17 @@ impl App {
             ControlMsg::SetAutonomy { level } => {
                 self.set_autonomy_level(&level);
             }
+            ControlMsg::SetApprovalRule {
+                ref category,
+                ref rule,
+            } => {
+                // Live shared-state update + intendant.toml persistence are
+                // handled by the control plane; the TUI just surfaces it.
+                self.log(
+                    LogLevel::Info,
+                    format!("Approval rule {} → {}", category, rule),
+                );
+            }
             ControlMsg::SetExternalAgent { agent } => {
                 let label = agent.as_deref().unwrap_or("none");
                 self.log(

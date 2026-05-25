@@ -6246,6 +6246,76 @@ html, body {
               <span class="control-backend-badge" id="control-backend-badge">none</span>
               <span class="control-applies-note" id="control-applies-note">changes apply on next task</span>
             </div>
+            <fieldset class="control-group" id="control-approval-rules">
+              <legend>Approval rules</legend>
+              <div class="control-row">
+                <label for="control-approval-file_read">File read</label>
+                <select id="control-approval-file_read" data-approval-category="file_read">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-file_write">File write</label>
+                <select id="control-approval-file_write" data-approval-category="file_write">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-file_delete">File delete</label>
+                <select id="control-approval-file_delete" data-approval-category="file_delete">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-command_exec">Command exec</label>
+                <select id="control-approval-command_exec" data-approval-category="command_exec">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-network">Network</label>
+                <select id="control-approval-network" data-approval-category="network">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-destructive">Destructive</label>
+                <select id="control-approval-destructive" data-approval-category="destructive">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-display_control">Display control</label>
+                <select id="control-approval-display_control" data-approval-category="display_control">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-row">
+                <label for="control-approval-tool_call">Tool calls (MCP / computer-use)</label>
+                <select id="control-approval-tool_call" data-approval-category="tool_call">
+                  <option value="auto">Auto</option>
+                  <option value="ask">Ask</option>
+                  <option value="deny">Deny</option>
+                </select>
+              </div>
+              <div class="control-hint">
+                Per-category gates for the internal agent. <strong>Auto</strong>: run without asking. <strong>Ask</strong>: prompt for approval. <strong>Deny</strong>: block outright. Applied live and saved to <code>intendant.toml [approval]</code>.
+              </div>
+            </fieldset>
             <div id="control-codex-section">
               <fieldset class="control-group">
                 <legend>Thread actions</legend>
@@ -9398,6 +9468,13 @@ let controlGeminiConfig = {
   include_directories: [],
   debug: false,
 };
+// Per-category approval rules (internal-agent autonomy gates). Mirrored from
+// /api/settings; live edits dispatch the `set_approval_rule` ControlMsg.
+const CONTROL_APPROVAL_CATEGORIES = [
+  'file_read', 'file_write', 'file_delete', 'command_exec',
+  'network', 'destructive', 'display_control', 'tool_call',
+];
+let controlApprovalRules = {};
 let controlCurrentBackend = null;
 let controlBackendActive = false;
 const controlAppliesBaseText = 'changes apply on next task';
@@ -9442,6 +9519,11 @@ async function refreshControlPane() {
         : [],
       debug: !!d.gemini_debug,
     };
+    controlApprovalRules = {};
+    for (const cat of CONTROL_APPROVAL_CATEGORIES) {
+      const v = d['approval_' + cat];
+      controlApprovalRules[cat] = (v === 'auto' || v === 'ask' || v === 'deny') ? v : 'ask';
+    }
     renderControlPane();
   } catch (e) {
     console.warn('Failed to load control-pane config:', e);
@@ -9509,6 +9591,12 @@ function renderControlPane() {
     if (debugCb) debugCb.checked = !!controlGeminiConfig.debug;
     if (debugStatus) debugStatus.textContent = controlGeminiConfig.debug ? 'on' : 'off';
   }
+  // Approval rules apply to the internal agent regardless of external backend,
+  // so they're rendered unconditionally.
+  for (const cat of CONTROL_APPROVAL_CATEGORIES) {
+    const sel = $('control-approval-' + cat);
+    if (sel && controlApprovalRules[cat]) sel.value = controlApprovalRules[cat];
+  }
   updateControlAppliesNote();
 }
 
@@ -9544,6 +9632,15 @@ function onControlApprovalChange(ev) {
   if (policy === controlCodexConfig.approval_policy) return;
   controlCodexConfig.approval_policy = policy;
   dispatchControlMsg({ action: 'set_codex_approval_policy', policy });
+}
+
+function onControlApprovalRuleChange(ev) {
+  const category = ev.target.dataset.approvalCategory;
+  const rule = ev.target.value;
+  if (!category) return;
+  if (rule === controlApprovalRules[category]) return;
+  controlApprovalRules[category] = rule;
+  dispatchControlMsg({ action: 'set_approval_rule', category, rule });
 }
 
 function onControlModelCommit(ev) {
@@ -10234,6 +10331,11 @@ function wireControlPaneListeners() {
   wireTextarea(geminiIncludeDirsTA, onControlGeminiIncludeDirsCommit);
   document.querySelectorAll('.control-action-btn[data-gemini-action]').forEach(btn => {
     btn.addEventListener('click', onControlGeminiActionBtnClick);
+  });
+
+  // ── Approval-rule listeners (internal-agent autonomy gates) ──
+  document.querySelectorAll('select[data-approval-category]').forEach(sel => {
+    sel.addEventListener('change', onControlApprovalRuleChange);
   });
 }
 

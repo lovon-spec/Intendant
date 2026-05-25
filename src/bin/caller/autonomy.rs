@@ -154,6 +154,29 @@ impl Default for ApprovalRule {
     }
 }
 
+impl ApprovalRule {
+    /// Canonical lowercase string form, matching the TOML / serde
+    /// representation (`auto` / `ask` / `deny`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// Parse a user-supplied rule string. Case-insensitive; returns `None`
+    /// for anything that isn't `auto` / `ask` / `deny`.
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "ask" => Some(Self::Ask),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
 /// Category-level approval rules parsed from intendant.toml [approval] section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalConfig {
@@ -198,6 +221,26 @@ impl Default for ApprovalConfig {
 }
 
 impl ApprovalConfig {
+    /// Set the rule for a category by its snake-case name (the
+    /// `ApprovalConfig` field name / `ActionCategory` Display form).
+    /// Categories that are always "ask" (`human_input`, `live_audio_spawn`)
+    /// have no backing field and are ignored. Returns `true` if a field was
+    /// updated.
+    pub fn set_rule_by_name(&mut self, category: &str, rule: ApprovalRule) -> bool {
+        match category {
+            "file_read" => self.file_read = rule,
+            "file_write" => self.file_write = rule,
+            "file_delete" => self.file_delete = rule,
+            "command_exec" => self.command_exec = rule,
+            "network" => self.network = rule,
+            "destructive" => self.destructive = rule,
+            "display_control" => self.display_control = rule,
+            "tool_call" => self.tool_call = rule,
+            _ => return false,
+        }
+        true
+    }
+
     pub fn rule_for(&self, category: ActionCategory) -> ApprovalRule {
         match category {
             ActionCategory::FileRead => self.file_read,

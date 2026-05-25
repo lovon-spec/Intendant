@@ -808,6 +808,15 @@ pub enum ControlMsg {
     SetAutonomy {
         level: String,
     },
+    /// Set a per-category approval rule. Applies LIVE to the shared autonomy
+    /// state and is persisted to `intendant.toml [approval]`. `category` is an
+    /// `ApprovalConfig` field name (`file_read`, `file_write`, `file_delete`,
+    /// `command_exec`, `network`, `destructive`, `display_control`,
+    /// `tool_call`); `rule` is `auto`, `ask`, or `deny`.
+    SetApprovalRule {
+        category: String,
+        rule: String,
+    },
     SetExternalAgent {
         #[serde(default)]
         agent: Option<String>,
@@ -2491,6 +2500,19 @@ mod tests {
         match msg {
             ControlMsg::SetAutonomy { level } => assert_eq!(level, "high"),
             _ => panic!("expected SetAutonomy"),
+        }
+    }
+
+    #[test]
+    fn control_msg_set_approval_rule_deserialize() {
+        let json = r#"{"action":"set_approval_rule","category":"tool_call","rule":"auto"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::SetApprovalRule { category, rule } => {
+                assert_eq!(category, "tool_call");
+                assert_eq!(rule, "auto");
+            }
+            _ => panic!("expected SetApprovalRule"),
         }
     }
 

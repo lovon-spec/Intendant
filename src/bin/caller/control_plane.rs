@@ -95,6 +95,37 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 autonomy: new_level.to_string(),
             });
         }
+        ControlMsg::SetApprovalRule { category, rule } => {
+            use crate::autonomy::ApprovalRule;
+            let Some(parsed) = ApprovalRule::from_str_loose(rule) else {
+                eprintln!(
+                    "[control_plane] ignoring SetApprovalRule with invalid rule {rule:?} (expected auto/ask/deny)"
+                );
+                return;
+            };
+            // Update the LIVE shared autonomy state so the change takes
+            // effect immediately for the running agent loop.
+            let updated = {
+                let mut guard = state.autonomy.write().await;
+                guard.rules.set_rule_by_name(category, parsed)
+            };
+            if !updated {
+                eprintln!(
+                    "[control_plane] ignoring SetApprovalRule with unknown category {category:?}"
+                );
+                return;
+            }
+            // Persist to intendant.toml [approval] so the rule survives
+            // daemon restarts. Mirrors the Codex persistence helpers:
+            // re-read, mutate, save (avoids racing concurrent writers).
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_approval_rule(root, category, parsed) {
+                    eprintln!(
+                        "[control_plane] failed to persist approval.{category} to intendant.toml: {e}"
+                    );
+                }
+            }
+        }
         ControlMsg::SetExternalAgent { agent } => {
             let parsed = agent
                 .as_deref()
@@ -664,6 +695,19 @@ fn persist_external_agent(
     proj.save_config()
 }
 
+/// Re-read intendant.toml, set one `[approval]` category rule, and save it
+/// back. Re-reading (rather than mutating a cached config) avoids racing
+/// concurrent writers to the TOML. Mirrors `persist_external_agent`.
+fn persist_approval_rule(
+    project_root: &std::path::Path,
+    category: &str,
+    rule: crate::autonomy::ApprovalRule,
+) -> Result<(), crate::error::CallerError> {
+    let mut proj = crate::project::Project::from_root(project_root.to_path_buf())?;
+    proj.config.approval.set_rule_by_name(category, rule);
+    proj.save_config()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +781,40 @@ mod tests {
             }
         }
         assert!(saw_autonomy_changed);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_approval_rule_updates_shared_state() {
+        use crate::autonomy::ApprovalRule;
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy: autonomy.clone(),
+                external_agent: external_agent.clone(),
+                codex_config: test_codex_config(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        // tool_call defaults to Auto.
+        assert_eq!(autonomy.read().await.rules.tool_call, ApprovalRule::Auto);
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetApprovalRule {
+            category: "tool_call".to_string(),
+            rule: "deny".to_string(),
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(autonomy.read().await.rules.tool_call, ApprovalRule::Deny);
 
         handle.abort();
     }

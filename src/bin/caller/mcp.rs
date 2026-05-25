@@ -1072,6 +1072,18 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetApprovalRule { category, rule } => {
+            // Live shared-state update + intendant.toml persistence are
+            // handled by the control plane; MCP only surfaces the ack.
+            emit_control_result(
+                control_tx,
+                "set_approval_rule",
+                true,
+                format!("Approval rule {} set to {}", category, rule),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetExternalAgent { agent } => {
             let parsed = agent
                 .as_deref()
