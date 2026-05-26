@@ -11511,7 +11511,11 @@ function applyPromptTargetLogSessionBadgeState(entry, target = resolvePromptTarg
 function resolvePromptTargetSessionId() {
   const sid = foregroundSessionFullId || currentSessionFullId || '';
   const win = sid ? sessionWindows.get(sid) : null;
-  return win && win.ended ? '' : sid;
+  if (sid && (!win || !win.ended)) return sid;
+  const candidates = Array.from(sessionWindows.entries())
+    .filter(([id, win]) => id !== daemonSessionFullId && win && !win.ended)
+    .map(([id]) => id);
+  return candidates.length === 1 ? candidates[0] : '';
 }
 
 function compactSessionText(value) {
@@ -24398,20 +24402,26 @@ function onSessionAttached(sessionId, source) {
 function onSessionEnded(sessionId, reason) {
   const sid = String(sessionId || '').trim();
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  const win = sid ? sessionWindows.get(sid) : null;
+  const externalSource = sid ? externalSourceForSessionWindow(sid, win) : '';
   const shouldRemoveSideWindow = sid && (
     meta.relationshipKind === 'side' ||
     String(reason || '').toLowerCase().includes('side conversation closed')
   );
+  const keepExternalDetached = sid && !!externalSource && !shouldRemoveSideWindow;
   if (shouldRemoveSideWindow) {
     removeSessionRelationshipsForSession(sid);
     removeSessionWindow(sid);
+  } else if (keepExternalDetached) {
+    updateSessionWindow(sid, { phase: 'idle', ended: false });
+    setSessionWindowDetached(sid, true, reason || 'session ended');
   } else if (sid) {
     updateSessionWindow(sid, { phase: 'done', ended: true });
   }
-  if (!sessionId || sessionId === currentSessionFullId) {
+  if (!keepExternalDetached && (!sessionId || sessionId === currentSessionFullId)) {
     currentSessionFullId = '';
   }
-  if (!sessionId || sessionId === foregroundSessionFullId) {
+  if (!keepExternalDetached && (!sessionId || sessionId === foregroundSessionFullId)) {
     foregroundSessionFullId = '';
     const next = Array.from(sessionWindows.entries())
       .find(([id, win]) => id !== sessionId && win.phase !== 'done')?.[0] || '';
@@ -24421,6 +24431,8 @@ function onSessionEnded(sessionId, reason) {
       setPhase('idle');
       updateTaskTargetChip();
     }
+  } else if (keepExternalDetached) {
+    updateTaskTargetChip();
   }
   scheduleSessionRelationshipRender();
   // Refresh sessions list if already loaded
@@ -24577,7 +24589,10 @@ window.submitActivityTask = function(options = {}) {
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   const targetSessionId = resolvePromptTargetSessionId();
-  const msg = targetSessionId && sessionWindowIsDetached(targetSessionId)
+  const shouldResumeExternalTarget = targetSessionId
+    && !!externalSourceForSessionWindow(targetSessionId)
+    && !isSessionWindowEffectivelyActive(targetSessionId);
+  const msg = targetSessionId && (sessionWindowIsDetached(targetSessionId) || shouldResumeExternalTarget)
     ? detachedSessionResumeMessage(targetSessionId, text, direct, attachments)
     : (targetSessionId
       ? { action: 'start_task', task: text, session_id: targetSessionId }
