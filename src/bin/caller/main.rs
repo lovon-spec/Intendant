@@ -132,6 +132,30 @@ fn event_targets_external_session_or_side(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalSteerTargetKind {
+    Primary,
+    Side,
+}
+
+fn resolve_external_steer_target_session(
+    target: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    side_threads: Option<&HashMap<String, String>>,
+) -> Option<(Option<String>, ExternalSteerTargetKind)> {
+    match target.as_deref() {
+        Some(target) if side_threads.is_some_and(|threads| threads.contains_key(target)) => {
+            Some((Some(target.to_string()), ExternalSteerTargetKind::Side))
+        }
+        Some(_) if event_targets_session_or_alias(target, session_id, alias_session_id) => {
+            Some((session_id.clone(), ExternalSteerTargetKind::Primary))
+        }
+        Some(_) => None,
+        None => Some((session_id.clone(), ExternalSteerTargetKind::Primary)),
+    }
+}
+
 /// Build the [`peer::AuthRequirements`] this daemon advertises in
 /// its own Agent Card from the project's `[server.auth]` config and
 /// the LAN cert dir.
@@ -1400,6 +1424,15 @@ impl<'a> ExternalSideSessionState<'a> {
         self.side_rounds.remove(child_thread_id);
         self.side_turn_revisions.remove(child_thread_id);
     }
+}
+
+fn claim_active_side_turn_completion(
+    active_side_turns: &mut HashSet<String>,
+    session_id: Option<&str>,
+) -> bool {
+    session_id
+        .map(|session_id| active_side_turns.remove(session_id))
+        .unwrap_or(true)
 }
 
 fn scoped_event_targets_config(
@@ -2816,11 +2849,20 @@ async fn drain_external_agent_events(
                         session_id,
                         text,
                         id,
-                    }) if event_targets_session_or_alias(
-                        &session_id,
-                        &local_session_id,
-                        &alias_session_id,
-                    ) => {
+                    }) => {
+                        let Some((target_session_id, target_kind)) =
+                            resolve_external_steer_target_session(
+                                &session_id,
+                                &local_session_id,
+                                &alias_session_id,
+                                side_sessions
+                                    .as_ref()
+                                    .map(|state| &*state.open_side_threads),
+                            )
+                        else {
+                            continue;
+                        };
+                        let target_is_side = target_kind == ExternalSteerTargetKind::Side;
                         // Try native mid-turn steering first. On success the
                         // backend/runtime has accepted the steer for the
                         // active turn, but it may only surface to the model at
@@ -2831,10 +2873,38 @@ async fn drain_external_agent_events(
                         // `run_external_agent_mode` / `run_with_presence`
                         // will flush it as a follow-up prefix on the next
                         // user message and emit SteerDelivered at that point.
+                        let activation_error = if target_is_side {
+                            match target_session_id.as_deref() {
+                                Some(target) => agent.activate_thread(target).await.err(),
+                                None => Some(CallerError::ExternalAgent(
+                                    "missing side thread target for steer".to_string(),
+                                )),
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(e) = activation_error {
+                            let reason =
+                                format!("{} couldn't target side conversation ({})", agent.name(), e);
+                            if let Ok(mut q) = config.context_injection.lock() {
+                                q.push(event::ContextInjection::text_with_steer_id_for_target(
+                                    text.clone(),
+                                    id.clone(),
+                                    target_session_id.clone(),
+                                ));
+                            }
+                            slog(config.session_log, |l| l.info(&reason));
+                            config.bus.send(AppEvent::SteerQueued {
+                                session_id: target_session_id,
+                                id,
+                                reason,
+                            });
+                            continue;
+                        }
                         match agent.steer_turn(&text).await {
                             Ok(()) => {
                                 pending_runtime_steers.push_back(PendingRuntimeSteer {
-                                    session_id: local_session_id.clone(),
+                                    session_id: target_session_id.clone(),
                                     id: id.clone(),
                                     text: text.clone(),
                                 });
@@ -2846,7 +2916,7 @@ async fn drain_external_agent_events(
                                     l.info(&format!("Steer accepted by {}", agent.name()))
                                 });
                                 config.bus.send(AppEvent::SteerAccepted {
-                                    session_id: local_session_id.clone(),
+                                    session_id: target_session_id,
                                     id,
                                     reason,
                                 });
@@ -2860,12 +2930,12 @@ async fn drain_external_agent_events(
                                     q.push(event::ContextInjection::text_with_steer_id_for_target(
                                         text.clone(),
                                         id.clone(),
-                                        local_session_id.clone(),
+                                        target_session_id.clone(),
                                     ));
                                 }
                                 slog(config.session_log, |l| l.info(&reason));
                                 config.bus.send(AppEvent::SteerQueued {
-                                    session_id: local_session_id.clone(),
+                                    session_id: target_session_id,
                                     id,
                                     reason,
                                 });
@@ -3762,10 +3832,13 @@ async fn drain_external_agent_events(
             }
             external_agent::AgentEvent::TurnCompleted { message } => {
                 if event_is_side || event_is_codex_subagent {
-                    if let Some(session_id) = config.session_id.as_deref() {
-                        if event_is_side {
-                            active_side_turns.remove(session_id);
-                        }
+                    if event_is_side
+                        && !claim_active_side_turn_completion(
+                            &mut active_side_turns,
+                            config.session_id.as_deref(),
+                        )
+                    {
+                        continue;
                     }
                     let conversation_kind = if event_is_side { "side" } else { "subagent" };
                     emit_child_turn_complete(config, conversation_kind, message);
@@ -7078,6 +7151,90 @@ Also: {"source": "bare"}"#;
     // (needs a backend + event channel); we unit-test the smaller helpers
     // that encapsulate the fallback policy. The end-to-end flow is covered
     // indirectly by the dispatcher / Codex tests.
+
+    #[test]
+    fn resolve_external_steer_target_prefers_side_thread_id() {
+        let mut side_threads = std::collections::HashMap::new();
+        side_threads.insert("side-thread".to_string(), "parent-thread".to_string());
+
+        let resolved = resolve_external_steer_target_session(
+            &Some("side-thread".to_string()),
+            &Some("parent-thread".to_string()),
+            &Some("alias-thread".to_string()),
+            Some(&side_threads),
+        );
+
+        assert_eq!(
+            resolved,
+            Some((
+                Some("side-thread".to_string()),
+                ExternalSteerTargetKind::Side
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_external_steer_target_maps_parent_alias_to_primary_session() {
+        let side_threads = std::collections::HashMap::new();
+
+        let alias = resolve_external_steer_target_session(
+            &Some("alias-thread".to_string()),
+            &Some("parent-thread".to_string()),
+            &Some("alias-thread".to_string()),
+            Some(&side_threads),
+        );
+        assert_eq!(
+            alias,
+            Some((
+                Some("parent-thread".to_string()),
+                ExternalSteerTargetKind::Primary
+            ))
+        );
+
+        let untargeted = resolve_external_steer_target_session(
+            &None,
+            &Some("parent-thread".to_string()),
+            &Some("alias-thread".to_string()),
+            Some(&side_threads),
+        );
+        assert_eq!(
+            untargeted,
+            Some((
+                Some("parent-thread".to_string()),
+                ExternalSteerTargetKind::Primary
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_external_steer_target_rejects_unrelated_session() {
+        let mut side_threads = std::collections::HashMap::new();
+        side_threads.insert("side-thread".to_string(), "parent-thread".to_string());
+
+        assert_eq!(
+            resolve_external_steer_target_session(
+                &Some("other-thread".to_string()),
+                &Some("parent-thread".to_string()),
+                &Some("alias-thread".to_string()),
+                Some(&side_threads),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn claim_active_side_turn_completion_is_idempotent() {
+        let mut active_side_turns = std::collections::HashSet::from(["side-thread".to_string()]);
+
+        assert!(claim_active_side_turn_completion(
+            &mut active_side_turns,
+            Some("side-thread")
+        ));
+        assert!(!claim_active_side_turn_completion(
+            &mut active_side_turns,
+            Some("side-thread")
+        ));
+    }
 
     #[tokio::test]
     async fn drain_steer_queue_as_followup_prefixes_single_queued_item() {
