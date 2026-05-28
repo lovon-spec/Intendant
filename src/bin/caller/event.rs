@@ -3489,6 +3489,7 @@ mod tests {
                 interrupt: false,
                 codex_thread_actions: vec!["undo".to_string()],
                 codex_managed_context: Some("managed".to_string()),
+                codex_command: Some("/opt/codex/bin/codex".to_string()),
             },
         };
         let outbound = app_event_to_outbound(&event).unwrap();
@@ -3499,6 +3500,7 @@ mod tests {
         assert!(json.contains("\"steer\":false"));
         assert!(json.contains("\"codex_thread_actions\":[\"undo\"]"));
         assert!(json.contains("\"codex_managed_context\":\"managed\""));
+        assert!(json.contains("\"codex_command\":\"/opt/codex/bin/codex\""));
     }
 
     #[test]

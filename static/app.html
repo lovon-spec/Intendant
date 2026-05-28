@@ -11213,7 +11213,7 @@ function renderManagedContextAlerts() {
     alert.textContent = pressure.last_rewind_insufficient.message;
     host.appendChild(alert);
   }
-  const command = controlCodexConfig.command || '';
+  const command = meta.capabilities?.codexCommand || controlCodexConfig.command || '';
   if (mode === 'managed' && /(^|\/)codex$/.test(command) && !/target\/(debug|release)\/codex/.test(command)) {
     const alert = document.createElement('div');
     alert.className = 'managed-context-alert';
@@ -13932,6 +13932,7 @@ function normalizeSessionCapabilities(raw = null) {
       ? actions.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
       : null,
     codexManagedContext: raw.codex_managed_context ?? raw.codexManagedContext ?? null,
+    codexCommand: raw.codex_command ?? raw.codexCommand ?? null,
   };
 }
 

@@ -119,6 +119,8 @@ pub struct SessionCapabilities {
     pub codex_thread_actions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_managed_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_command: Option<String>,
 }
 
 /// Per-session Codex `/goal` state shown by the dashboard.

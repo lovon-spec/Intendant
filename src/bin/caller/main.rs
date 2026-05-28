@@ -2775,6 +2775,7 @@ fn emit_codex_subagent_started(
             interrupt: false,
             codex_thread_actions: Vec::new(),
             codex_managed_context: None,
+            codex_command: None,
         },
     });
     config.bus.send(AppEvent::SessionStarted {
@@ -12557,6 +12558,7 @@ async fn run_external_agent_mode(
                         "memory-reset".to_string(),
                     ],
                     codex_managed_context: Some(mode),
+                    codex_command: Some(project.config.agent.codex.command.clone()),
                 },
             });
         }

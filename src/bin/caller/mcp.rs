@@ -6979,6 +6979,7 @@ mod tests {
                     interrupt: true,
                     codex_thread_actions: vec!["undo".to_string()],
                     codex_managed_context: Some("managed".to_string()),
+                    codex_command: Some("/opt/codex/bin/codex".to_string()),
                 },
             },
         );

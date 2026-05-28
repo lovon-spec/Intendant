@@ -4465,6 +4465,7 @@ mod tests {
                 interrupt: false,
                 codex_thread_actions: vec![],
                 codex_managed_context: Some("managed".to_string()),
+                codex_command: Some("/opt/codex/bin/codex".to_string()),
             },
         );
         log.session_goal(
@@ -4532,6 +4533,10 @@ mod tests {
                 assert_eq!(
                     capabilities.codex_managed_context.as_deref(),
                     Some("managed")
+                );
+                assert_eq!(
+                    capabilities.codex_command.as_deref(),
+                    Some("/opt/codex/bin/codex")
                 );
             }
             other => panic!("expected SessionCapabilities, got {:?}", other),
