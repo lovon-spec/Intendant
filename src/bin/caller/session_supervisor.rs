@@ -270,6 +270,7 @@ impl SessionSupervisor {
                 project_root,
                 agent,
                 agent_command,
+                codex_managed_context,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -281,6 +282,7 @@ impl SessionSupervisor {
                         || display_target.is_some()
                         || agent.is_some()
                         || agent_command.is_some()
+                        || codex_managed_context.is_some()
                         || name.is_some()
                     {
                         self.warn(
@@ -297,6 +299,7 @@ impl SessionSupervisor {
                     project_root,
                     agent,
                     agent_command,
+                    codex_managed_context,
                     orchestrate,
                     direct,
                     reference_frame_ids,
@@ -346,6 +349,7 @@ impl SessionSupervisor {
                 }
                 self.start_new_session(
                     task,
+                    None,
                     None,
                     None,
                     None,
@@ -473,6 +477,7 @@ impl SessionSupervisor {
         project_root: Option<String>,
         agent: Option<String>,
         agent_command: Option<String>,
+        codex_managed_context: Option<String>,
         orchestrate: Option<bool>,
         direct: Option<bool>,
         reference_frame_ids: Vec<String>,
@@ -581,6 +586,20 @@ impl SessionSupervisor {
                 return;
             };
             apply_session_agent_command(&mut project, backend, command);
+        }
+        if let Some(mode) =
+            normalize_session_codex_managed_context(codex_managed_context.as_deref())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: codex_managed_context requires Codex".to_string(),
+                );
+                return;
+            };
+            if let Err(e) = apply_session_codex_managed_context(&mut project, backend, mode) {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
         }
         let session_dir = session_log
             .lock()
@@ -2090,6 +2109,10 @@ fn normalize_session_agent_command(command: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn normalize_session_codex_managed_context(mode: Option<&str>) -> Option<String> {
+    mode.map(crate::project::normalize_codex_managed_context)
+}
+
 fn normalize_session_name_option(name: Option<&str>) -> Result<Option<String>, String> {
     match name.map(str::trim).filter(|name| !name.is_empty()) {
         Some(name) => crate::session_names::normalize_session_name(name).map(Some),
@@ -2112,6 +2135,21 @@ fn apply_session_agent_command(
         external_agent::AgentBackend::GeminiCli => {
             project.config.agent.gemini_cli.command = command;
         }
+    }
+}
+
+fn apply_session_codex_managed_context(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    mode: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Codex => {
+            project.config.agent.codex.managed_context =
+                crate::project::normalize_codex_managed_context(&mode);
+            Ok(())
+        }
+        _ => Err("codex_managed_context requires Codex".to_string()),
     }
 }
 
@@ -2814,6 +2852,29 @@ mod tests {
             project.config.agent.claude_code.command,
             "/opt/claude/bin/claude"
         );
+    }
+
+    #[test]
+    fn applies_session_codex_managed_context_to_codex_only() {
+        let mut project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        apply_session_codex_managed_context(
+            &mut project,
+            &external_agent::AgentBackend::Codex,
+            "on".to_string(),
+        )
+        .unwrap();
+        assert_eq!(project.config.agent.codex.managed_context, "managed");
+
+        let err = apply_session_codex_managed_context(
+            &mut project,
+            &external_agent::AgentBackend::GeminiCli,
+            "managed".to_string(),
+        )
+        .unwrap_err();
+        assert!(err.contains("requires Codex"));
     }
 
     #[test]

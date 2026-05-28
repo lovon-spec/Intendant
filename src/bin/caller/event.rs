@@ -1070,6 +1070,11 @@ pub enum ControlMsg {
         /// external agent. Empty/missing falls back to the configured command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_command: Option<String>,
+        /// Optional one-shot Codex managed-context mode for this session.
+        /// Accepted values normalize to "vanilla" or "managed". Only applies
+        /// when the resolved agent is Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_managed_context: Option<String>,
         #[serde(default)]
         orchestrate: Option<bool>,
         /// Bypass presence/orchestration, matching StartTask.direct.
@@ -2730,6 +2735,7 @@ mod tests {
                 project_root: None,
                 agent: Some("codex".to_string()),
                 agent_command: Some("/opt/codex/bin/codex".to_string()),
+                codex_managed_context: Some("managed".to_string()),
                 orchestrate: Some(false),
                 direct: Some(true),
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
@@ -2930,7 +2936,7 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_managed_context":"managed","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
@@ -2939,6 +2945,7 @@ mod tests {
                 project_root,
                 agent,
                 agent_command,
+                codex_managed_context,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -2950,6 +2957,7 @@ mod tests {
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));
                 assert_eq!(agent_command.as_deref(), Some("/opt/codex/bin/codex"));
+                assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert!(orchestrate.is_none());
                 assert_eq!(direct, Some(true));
                 assert!(reference_frame_ids.is_empty());

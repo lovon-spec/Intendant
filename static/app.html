@@ -3213,7 +3213,7 @@ html, body {
 }
 .sessions-new-agent-row {
   display: grid;
-  grid-template-columns: minmax(180px, 0.45fr) minmax(220px, 1fr);
+  grid-template-columns: minmax(150px, 0.4fr) minmax(220px, 1fr) minmax(140px, 0.4fr);
   gap: 10px;
   align-items: end;
 }
@@ -3292,6 +3292,7 @@ html, body {
 .sessions-project-input:focus { outline: none; border-color: var(--blue); }
 .sessions-project-input::placeholder { color: var(--overlay0); }
 .sessions-agent-select,
+.sessions-agent-managed-context-select,
 .sessions-agent-command-input {
   width: 100%;
   min-width: 0;
@@ -3306,10 +3307,12 @@ html, body {
   box-sizing: border-box;
 }
 .sessions-agent-select:focus,
+.sessions-agent-managed-context-select:focus,
 .sessions-agent-command-input:focus {
   outline: none;
   border-color: var(--blue);
 }
+.sessions-agent-managed-context-select:disabled,
 .sessions-agent-command-input:disabled {
   color: var(--overlay0);
   cursor: not-allowed;
@@ -7101,6 +7104,13 @@ html, body {
                       <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                     </div>
                   </div>
+                  <label class="sessions-new-session-field" for="new-session-codex-managed-context">
+                    Managed context
+                    <select id="new-session-codex-managed-context" class="sessions-agent-managed-context-select" disabled>
+                      <option value="vanilla">vanilla</option>
+                      <option value="managed">managed</option>
+                    </select>
+                  </label>
                 </div>
                 <button class="sessions-start-btn" id="new-session-start-btn" onclick="startNewSession()">Start session</button>
                 <div class="sessions-spawn-notice hidden" id="new-session-spawn-notice" role="status" aria-live="polite">
@@ -9615,6 +9625,7 @@ let newSessionAgentCommands = {
   'claude-code': 'claude',
   gemini: 'gemini',
 };
+let newSessionCodexManagedContext = 'vanilla';
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnTimeout = null;
@@ -9963,7 +9974,11 @@ function applyCodexConfigChanged(evt) {
   if (typeof evt.web_search === 'boolean') controlCodexConfig.web_search = evt.web_search;
   if (typeof evt.network_access === 'boolean') controlCodexConfig.network_access = evt.network_access;
   if (Array.isArray(evt.writable_roots)) controlCodexConfig.writable_roots = evt.writable_roots;
-  if (evt.managed_context) controlCodexConfig.managed_context = evt.managed_context;
+  if (evt.managed_context) {
+    controlCodexConfig.managed_context = evt.managed_context;
+    newSessionCodexManagedContext = evt.managed_context === 'managed' ? 'managed' : 'vanilla';
+    renderNewSessionAgentControls();
+  }
   // Sandbox change may flip the network-access row's enabled state — full
   // re-render is the simplest way to keep disabled-styling in sync.
   renderControlPane();
@@ -25792,6 +25807,8 @@ function setNewSessionAgentDefaults(settings) {
     'claude-code': settings.claude_command || 'claude',
     gemini: settings.gemini_command || 'gemini',
   };
+  newSessionCodexManagedContext =
+    settings.codex_managed_context === 'managed' ? 'managed' : 'vanilla';
   renderNewSessionAgentControls();
 }
 
@@ -25803,10 +25820,18 @@ function commandDefaultForNewSessionAgent(agentId) {
   }[agentId] || '');
 }
 
+function effectiveNewSessionAgentId() {
+  const select = document.getElementById('new-session-agent');
+  const raw = select?.value || '';
+  if (raw === 'internal') return 'internal';
+  return normalizeAgentId(raw) || newSessionConfiguredAgent || '';
+}
+
 function renderNewSessionAgentControls(options = {}) {
   const select = document.getElementById('new-session-agent');
   const commandInput = document.getElementById('new-session-agent-command');
   const browseBtn = document.getElementById('new-session-agent-command-browse');
+  const managedContextSel = document.getElementById('new-session-codex-managed-context');
   if (!select || !commandInput) return;
 
   const currentOption = select.querySelector('option[value=""]');
@@ -25817,6 +25842,7 @@ function renderNewSessionAgentControls(options = {}) {
   }
 
   const selectedAgent = normalizeAgentId(select.value);
+  const effectiveAgent = effectiveNewSessionAgentId();
   const hasExternalAgent = !!selectedAgent;
   commandInput.disabled = !hasExternalAgent;
   if (browseBtn) browseBtn.disabled = !hasExternalAgent;
@@ -25825,6 +25851,11 @@ function renderNewSessionAgentControls(options = {}) {
     : 'Select an external agent';
   if (!hasExternalAgent || options.replaceCommand) {
     commandInput.value = '';
+  }
+  if (managedContextSel) {
+    const appliesToCodex = effectiveAgent === 'codex';
+    managedContextSel.disabled = !appliesToCodex;
+    managedContextSel.value = newSessionCodexManagedContext;
   }
 }
 
@@ -25969,6 +26000,12 @@ async function startNewSession() {
     msg.agent = selectedAgent;
     const agentCommand = document.getElementById('new-session-agent-command')?.value.trim() || '';
     if (agentCommand) msg.agent_command = agentCommand;
+  }
+  if (effectiveNewSessionAgentId() === 'codex') {
+    const mode = document.getElementById('new-session-codex-managed-context')?.value === 'managed'
+      ? 'managed'
+      : 'vanilla';
+    msg.codex_managed_context = mode;
   }
   if (direct) msg.direct = true;
   if (attachments.length > 0) msg.attachments = attachments;
