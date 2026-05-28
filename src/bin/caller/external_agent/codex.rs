@@ -1392,6 +1392,14 @@ async fn read_latest_codex_request_payload(
     read_latest_codex_context_payload(root, None).await
 }
 
+fn codex_context_snapshot_not_ready(err: &CallerError) -> bool {
+    matches!(
+        err,
+        CallerError::ExternalAgent(message)
+            if message.starts_with("no Codex inference request payload found in ")
+    )
+}
+
 async fn read_latest_codex_context_payload(
     root: &Path,
     thread_id: Option<&str>,
@@ -3555,7 +3563,11 @@ impl ExternalAgent for CodexAgent {
     }
 
     async fn context_snapshot(&mut self) -> Result<Option<AgentContextSnapshot>, CallerError> {
-        self.read_context_snapshot().await.map(Some)
+        match self.read_context_snapshot().await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(err) if codex_context_snapshot_not_ready(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     async fn resolve_approval(
@@ -3877,6 +3889,17 @@ impl Drop for CodexAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_snapshot_not_ready_suppresses_empty_trace_poll() {
+        let err = CallerError::ExternalAgent(
+            "no Codex inference request payload found in /tmp/traces".to_string(),
+        );
+        assert!(codex_context_snapshot_not_ready(&err));
+
+        let other = CallerError::ExternalAgent("read Codex request trace entry: boom".to_string());
+        assert!(!codex_context_snapshot_not_ready(&other));
+    }
 
     #[test]
     fn json_rpc_request_serialization() {

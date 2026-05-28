@@ -11034,16 +11034,22 @@ async function ensureManagedContextSessionsLoaded() {
   return managedContextSessionsLoadInFlight;
 }
 
-function managedContextModeFromStatus() {
-  return managedContextStatus?.context_pressure?.managed_context || 'unknown';
-}
-
 function managedContextConfiguredMode(meta = {}) {
   return String(
     meta.capabilities?.codexManagedContext ||
     meta.capabilities?.codex_managed_context ||
     ''
   ).trim();
+}
+
+function managedContextEffectiveMode(sessionId = managedContextCurrentSessionId(), meta = null) {
+  const sessionMeta = meta || managedContextSessionMeta(sessionId);
+  const configuredMode = managedContextConfiguredMode(sessionMeta);
+  const live = managedContextSessionIsLive(sessionId, sessionMeta);
+  const pressure = managedContextStatus?.context_pressure || {};
+  return live
+    ? (pressure.managed_context || configuredMode || 'unknown')
+    : (configuredMode || 'unknown');
 }
 
 function managedContextCurrentSessionId() {
@@ -11303,7 +11309,12 @@ function syncManagedContextActiveSession() {
   const sessionId = managedContextCurrentSessionId();
   if (sessionId === managedContextActiveSessionId) return;
   managedContextActiveSessionId = sessionId;
+  managedContextStatus = null;
+  managedContextRecords = [];
   managedContextAnchors = [];
+  managedContextRecordsLoading = false;
+  managedContextAnchorsLoading = false;
+  managedContextLastError = '';
   resetManagedContextSessionDraft();
 }
 
@@ -11342,11 +11353,8 @@ function renderManagedContextStats() {
   const meta = managedContextSessionMeta(sessionId);
   const live = managedContextSessionIsLive(sessionId, meta);
   const pressure = managedContextStatus?.context_pressure || {};
-  const configuredMode = managedContextConfiguredMode(meta);
   const status = live ? (pressure.status || 'unknown') : (sessionId ? 'historical' : 'unknown');
-  const mode = live
-    ? (pressure.managed_context || configuredMode || 'unknown')
-    : (configuredMode || 'unknown');
+  const mode = managedContextEffectiveMode(sessionId, meta);
   const used = live ? pressure.used_tokens : null;
   const windowSize = live ? pressure.context_window : null;
   const pct = managedContextPercent(used, windowSize);
@@ -11378,9 +11386,9 @@ function renderManagedContextAlerts() {
     return;
   }
   const pressure = managedContextStatus?.context_pressure || {};
-  const mode = pressure.managed_context || 'unknown';
   const sessionId = managedContextCurrentSessionId();
   const meta = managedContextSessionMeta(sessionId);
+  const mode = managedContextEffectiveMode(sessionId, meta);
   const live = managedContextSessionIsLive(sessionId, meta);
   if (sessionId && !managedContextIsCodexLike(meta)) {
     const alert = document.createElement('div');
@@ -11388,15 +11396,16 @@ function renderManagedContextAlerts() {
     alert.textContent = 'Selected session is not reported as Codex.';
     host.appendChild(alert);
   }
+  if (sessionId && mode !== 'managed') {
+    const alert = document.createElement('div');
+    alert.className = 'managed-context-alert';
+    alert.textContent = 'Managed context actions are disabled for this session.';
+    host.appendChild(alert);
+  }
   if (sessionId && !live) {
     const alert = document.createElement('div');
     alert.className = 'managed-context-alert';
     alert.textContent = 'Historical session: records are available, live managed actions require a running Codex session.';
-    host.appendChild(alert);
-  } else if (mode !== 'managed') {
-    const alert = document.createElement('div');
-    alert.className = 'managed-context-alert';
-    alert.textContent = 'Managed actions are disabled for this session.';
     host.appendChild(alert);
   }
   if (pressure.last_rewind_insufficient?.message) {
@@ -11536,6 +11545,17 @@ async function fetchManagedContextAnchors() {
   return Array.isArray(payload.anchors) ? payload.anchors : [];
 }
 
+function settleManagedContextPromise(promise) {
+  return promise.then(
+    value => ({ status: 'fulfilled', value }),
+    reason => ({ status: 'rejected', reason }),
+  );
+}
+
+function managedContextDelay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function scheduleManagedContextRefresh(delay = 500) {
   if (activeActivitySubtab !== 'managed') return;
   if (managedContextRefreshTimer) clearTimeout(managedContextRefreshTimer);
@@ -11567,10 +11587,10 @@ async function refreshManagedContextPane(options = {}) {
   managedContextRecordsLoading = true;
   managedContextAnchorsLoading = true;
   renderManagedContextPane();
-  const [statusResult, recordsResult, anchorsResult] = await Promise.allSettled([
-    live ? fetchManagedContextStatus() : Promise.resolve(null),
-    fetchManagedContextRecords(),
-    fetchManagedContextAnchors(),
+  const statusPromise = settleManagedContextPromise(live ? fetchManagedContextStatus() : Promise.resolve(null));
+  const [recordsResult, anchorsResult] = await Promise.all([
+    settleManagedContextPromise(fetchManagedContextRecords()),
+    settleManagedContextPromise(fetchManagedContextAnchors()),
   ]);
   if (managedContextCurrentSessionId() !== sessionId) {
     return;
@@ -11578,14 +11598,6 @@ async function refreshManagedContextPane(options = {}) {
   managedContextRecordsLoading = false;
   managedContextAnchorsLoading = false;
   const errors = [];
-  if (statusResult.status === 'fulfilled') {
-    managedContextStatus = statusResult.value;
-  } else {
-    managedContextStatus = null;
-    const message = statusResult.reason?.message || String(statusResult.reason || 'unknown error');
-    errors.push(`Live status unavailable: ${message}`);
-    if (options.force) console.warn('Managed context status refresh failed:', statusResult.reason);
-  }
   if (recordsResult.status === 'fulfilled') {
     managedContextRecords = recordsResult.value;
   } else {
@@ -11603,6 +11615,28 @@ async function refreshManagedContextPane(options = {}) {
     if (options.force) console.warn('Managed context anchors refresh failed:', anchorsResult.reason);
   }
   managedContextLastError = errors.join(' ');
+  renderManagedContextPane();
+
+  const statusResult = await Promise.race([
+    statusPromise,
+    managedContextDelay(8000).then(() => ({
+      status: 'rejected',
+      reason: new Error('timed out waiting for live status'),
+    })),
+  ]);
+  if (managedContextCurrentSessionId() !== sessionId) {
+    return;
+  }
+  if (statusResult.status === 'fulfilled') {
+    managedContextStatus = statusResult.value;
+  } else {
+    managedContextStatus = null;
+    const message = statusResult.reason?.message || String(statusResult.reason || 'unknown error');
+    managedContextLastError = [managedContextLastError, `Live status unavailable: ${message}`]
+      .filter(Boolean)
+      .join(' ');
+    if (options.force) console.warn('Managed context status refresh failed:', statusResult.reason);
+  }
   renderManagedContextPane();
 }
 
@@ -11695,7 +11729,7 @@ function renderManagedContextPane() {
   const meta = managedContextSessionMeta(sessionId);
   const managed =
     managedContextSessionIsLive(sessionId, meta) &&
-    managedContextModeFromStatus() === 'managed';
+    managedContextEffectiveMode(sessionId, meta) === 'managed';
   ['managed-context-submit-rewind', 'managed-context-submit-backout'].forEach(id => {
     const btn = managedContextEl(id);
     if (btn) btn.disabled = !managed || !sessionId;
