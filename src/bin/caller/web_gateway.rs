@@ -19739,6 +19739,7 @@ mod tests {
             "intendant.conversation.messages.v1",
             None,
             Some(200_000),
+            Some(200_000),
             Some(1),
             &serde_json::json!([{"role": "user", "content": "hi"}]),
         );

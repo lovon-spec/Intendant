@@ -1264,12 +1264,14 @@ impl CodexAgent {
         let usage = self.latest_token_usage.lock().await.clone();
         let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
         let context_window = usage.as_ref().and_then(codex_usage_context_window);
+        let hard_context_window = usage.as_ref().and_then(codex_usage_hard_context_window);
         Ok(AgentContextSnapshot {
             source: "codex".to_string(),
             label: trace.label,
             format: trace.format,
             token_count,
             context_window,
+            hard_context_window,
             item_count: codex_request_item_count(&trace.payload),
             raw: trace.payload,
         })
@@ -1821,6 +1823,22 @@ fn codex_usage_context_window(value: &serde_json::Value) -> Option<u64> {
     )
 }
 
+fn codex_usage_hard_context_window(value: &serde_json::Value) -> Option<u64> {
+    first_u64_at(
+        value,
+        &[
+            "/modelHardContextWindow",
+            "/model_hard_context_window",
+            "/hardContextWindow",
+            "/hard_context_window",
+            "/info/modelHardContextWindow",
+            "/info/model_hard_context_window",
+            "/info/hardContextWindow",
+            "/info/hard_context_window",
+        ],
+    )
+}
+
 fn codex_usage_input_tokens(value: &serde_json::Value) -> Option<u64> {
     first_u64_at(value, &["/inputTokens", "/input_tokens"])
 }
@@ -1854,6 +1872,7 @@ fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentU
         .and_then(|u| first_u64_at(u, &["/totalTokens", "/total_tokens"]))
         .unwrap_or(total_tokens);
     let context_window = codex_usage_context_window(value).unwrap_or(0);
+    let hard_context_window = codex_usage_hard_context_window(value);
     let usage_pct = if context_window > 0 {
         tokens_used as f64 / context_window as f64 * 100.0
     } else {
@@ -1865,6 +1884,7 @@ fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentU
         model: model.to_string(),
         tokens_used,
         context_window,
+        hard_context_window,
         usage_pct,
         prompt_tokens,
         completion_tokens,
@@ -4249,15 +4269,18 @@ mod tests {
                 "totalTokens": 1200
             },
             "last": {"inputTokens": 100, "outputTokens": 25, "totalTokens": 125},
-            "modelContextWindow": 128000
+            "modelContextWindow": 128000,
+            "modelHardContextWindow": 272000
         });
         assert_eq!(codex_usage_total_tokens(&usage), Some(125));
         assert_eq!(codex_usage_context_window(&usage), Some(128000));
+        assert_eq!(codex_usage_hard_context_window(&usage), Some(272000));
         let snapshot = codex_usage_snapshot(&usage, "gpt-5.4").unwrap();
         assert_eq!(snapshot.provider, "openai");
         assert_eq!(snapshot.model, "gpt-5.4");
         assert_eq!(snapshot.tokens_used, 125);
         assert_eq!(snapshot.context_window, 128000);
+        assert_eq!(snapshot.hard_context_window, Some(272000));
         assert_eq!(snapshot.prompt_tokens, 1000);
         assert_eq!(snapshot.completion_tokens, 200);
         assert_eq!(snapshot.cached_tokens, 300);
@@ -5016,6 +5039,7 @@ mod tests {
                 model: "gpt-5.2-codex".to_string(),
                 tokens_used: 91_000,
                 context_window: 100_000,
+                hard_context_window: Some(120_000),
                 usage_pct: 91.0,
                 prompt_tokens: 88_000,
                 completion_tokens: 3_000,
@@ -5070,6 +5094,7 @@ mod tests {
                 model: "gpt-5.2-codex".to_string(),
                 tokens_used: 20_000,
                 context_window: 100_000,
+                hard_context_window: Some(120_000),
                 usage_pct: 20.0,
                 prompt_tokens: 18_000,
                 completion_tokens: 2_000,

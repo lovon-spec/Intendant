@@ -80,6 +80,7 @@ pub struct McpAppState {
     pub session_completion_tokens: u64,
     pub session_cached_tokens: u64,
     pub context_window: u64,
+    pub hard_context_window: Option<u64>,
     pub session_id: String,
     pub task_description: String,
     pub log_entries: std::collections::VecDeque<LogEntrySnapshot>,
@@ -176,6 +177,7 @@ impl McpAppState {
             session_completion_tokens: 0,
             session_cached_tokens: 0,
             context_window: 0,
+            hard_context_window: None,
             session_id: String::new(),
             task_description: String::new(),
             log_entries: std::collections::VecDeque::new(),
@@ -257,6 +259,7 @@ impl McpAppState {
                 model: self.model_name.clone(),
                 tokens_used: self.session_tokens,
                 context_window: self.context_window,
+                hard_context_window: self.hard_context_window,
                 usage_pct: self.budget_pct,
                 prompt_tokens: self.session_prompt_tokens,
                 completion_tokens: self.session_completion_tokens,
@@ -268,6 +271,7 @@ impl McpAppState {
                     model: self.presence_model_name.clone().unwrap_or_default(),
                     tokens_used: self.presence_tokens,
                     context_window: self.presence_context_window,
+                    hard_context_window: Some(self.presence_context_window),
                     usage_pct: self.presence_usage_pct,
                     prompt_tokens: 0,
                     completion_tokens: 0,
@@ -296,6 +300,7 @@ impl McpAppState {
         }
         self.session_tokens = usage.tokens_used;
         self.context_window = usage.context_window;
+        self.hard_context_window = usage.hard_context_window;
         self.budget_pct = usage.usage_pct;
         self.session_prompt_tokens = usage.prompt_tokens;
         self.session_completion_tokens = usage.completion_tokens;
@@ -384,13 +389,21 @@ impl McpAppState {
         }
     }
 
-    fn session_usage_values(&self, session_id: Option<&str>) -> (u64, u64) {
+    fn session_usage_values(&self, session_id: Option<&str>) -> (u64, u64, Option<u64>) {
         if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
             if let Some(usage) = self.session_usage.get(id) {
-                return (usage.tokens_used, usage.context_window);
+                return (
+                    usage.tokens_used,
+                    usage.context_window,
+                    usage.hard_context_window,
+                );
             }
         }
-        (self.session_tokens, self.context_window)
+        (
+            self.session_tokens,
+            self.context_window,
+            self.hard_context_window,
+        )
     }
 
     fn context_pressure_snapshot_for(
@@ -398,7 +411,8 @@ impl McpAppState {
         session_id: Option<&str>,
         managed_context_override: Option<bool>,
     ) -> serde_json::Value {
-        let (used_tokens, context_window) = self.session_usage_values(session_id);
+        let (used_tokens, context_window, hard_context_window) =
+            self.session_usage_values(session_id);
         let managed_context =
             self.exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
         if context_window == 0 {
@@ -407,9 +421,12 @@ impl McpAppState {
                 "status": "unknown",
                 "used_tokens": used_tokens,
                 "context_window": null,
+                "effective_context_window": null,
                 "remaining_tokens": null,
+                "remaining_hard_tokens": null,
                 "remaining_percent": null,
                 "recommended_rewind_limit": null,
+                "rewind_only_limit": null,
                 "hard_limit": null,
                 "rewind_only": false,
                 "managed_context": Self::managed_context_mode(managed_context),
@@ -419,12 +436,17 @@ impl McpAppState {
 
         let recommended_rewind_limit =
             (context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor() as u64;
+        let rewind_only_limit = context_window;
         let remaining_tokens = context_window.saturating_sub(used_tokens);
         let remaining_percent = (remaining_tokens as f64 / context_window as f64 * 100.0).max(0.0);
-        let status = if used_tokens >= context_window {
+        let remaining_hard_tokens =
+            hard_context_window.map(|hard| hard.saturating_sub(used_tokens));
+        let status = if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
             "critical"
-        } else if used_tokens >= recommended_rewind_limit {
+        } else if used_tokens >= rewind_only_limit {
             "high"
+        } else if used_tokens >= recommended_rewind_limit {
+            "pressure"
         } else {
             "ok"
         };
@@ -434,10 +456,13 @@ impl McpAppState {
             "status": status,
             "used_tokens": used_tokens,
             "context_window": context_window,
+            "effective_context_window": context_window,
             "remaining_tokens": remaining_tokens,
+            "remaining_hard_tokens": remaining_hard_tokens,
             "remaining_percent": remaining_percent,
             "recommended_rewind_limit": recommended_rewind_limit,
-            "hard_limit": context_window,
+            "rewind_only_limit": rewind_only_limit,
+            "hard_limit": hard_context_window,
             "rewind_only": managed_context && (status == "high" || status == "critical"),
             "managed_context": Self::managed_context_mode(managed_context),
             "last_rewind_insufficient": self.insufficient_rewind_notice_for(session_id).map(|notice| {
@@ -510,20 +535,20 @@ impl McpAppState {
         &self,
         session_id: Option<&str>,
     ) -> Option<(u64, u64, &'static str)> {
-        let (used_tokens, context_window) = self.session_usage_values(session_id);
+        let (used_tokens, context_window, hard_context_window) =
+            self.session_usage_values(session_id);
         if context_window == 0 {
             return None;
         }
-        let recommended_rewind_limit =
-            (context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor() as u64;
-        let status = if used_tokens >= context_window {
+        let rewind_only_limit = context_window;
+        let status = if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
             "critical"
-        } else if used_tokens >= recommended_rewind_limit {
+        } else if used_tokens >= rewind_only_limit {
             "high"
         } else {
             return None;
         };
-        Some((used_tokens, recommended_rewind_limit, status))
+        Some((used_tokens, rewind_only_limit, status))
     }
 
     fn rewind_only_gate_message(&self, tool_name: &str) -> Option<String> {
@@ -6320,6 +6345,7 @@ mod tests {
                 model: "gpt-5.2-codex".to_string(),
                 tokens_used: 86_000,
                 context_window: 100_000,
+                hard_context_window: Some(120_000),
                 usage_pct: 86.0,
                 prompt_tokens: 80_000,
                 completion_tokens: 6_000,
@@ -6333,10 +6359,13 @@ mod tests {
 
             let pressure = s.context_pressure_snapshot();
             assert_eq!(pressure["source"], "backend_reported");
-            assert_eq!(pressure["status"], "high");
+            assert_eq!(pressure["status"], "pressure");
             assert_eq!(pressure["used_tokens"], 86_000);
             assert_eq!(pressure["context_window"], 100_000);
+            assert_eq!(pressure["effective_context_window"], 100_000);
+            assert_eq!(pressure["hard_limit"], 120_000);
             assert_eq!(pressure["recommended_rewind_limit"], 85_000);
+            assert_eq!(pressure["rewind_only_limit"], 100_000);
             assert_eq!(pressure["rewind_only"], false);
             assert_eq!(pressure["managed_context"], "vanilla");
         });
@@ -6356,11 +6385,12 @@ mod tests {
             s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
                 provider: "openai".to_string(),
                 model: "gpt-5.2-codex".to_string(),
-                tokens_used: 86_000,
+                tokens_used: 100_000,
                 context_window: 100_000,
-                usage_pct: 86.0,
+                hard_context_window: Some(120_000),
+                usage_pct: 100.0,
                 prompt_tokens: 80_000,
-                completion_tokens: 6_000,
+                completion_tokens: 20_000,
                 cached_tokens: 10_000,
             });
             let pressure = s.context_pressure_snapshot();
@@ -6383,11 +6413,12 @@ mod tests {
             s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
                 provider: "openai".to_string(),
                 model: "gpt-5.2-codex".to_string(),
-                tokens_used: 86_000,
+                tokens_used: 100_000,
                 context_window: 100_000,
-                usage_pct: 86.0,
+                hard_context_window: Some(120_000),
+                usage_pct: 100.0,
                 prompt_tokens: 80_000,
-                completion_tokens: 6_000,
+                completion_tokens: 20_000,
                 cached_tokens: 0,
             });
 
@@ -6416,6 +6447,7 @@ mod tests {
                 model: "gpt-5.2".to_string(),
                 tokens_used: 95_000,
                 context_window: 100_000,
+                hard_context_window: Some(120_000),
                 usage_pct: 95.0,
                 prompt_tokens: 90_000,
                 completion_tokens: 5_000,
@@ -6441,6 +6473,7 @@ mod tests {
                 model: "gpt-5.2-codex".to_string(),
                 tokens_used: 95_000,
                 context_window: 100_000,
+                hard_context_window: Some(120_000),
                 usage_pct: 95.0,
                 prompt_tokens: 90_000,
                 completion_tokens: 5_000,
@@ -6700,10 +6733,11 @@ mod tests {
                 main: frontend::ModelUsageSnapshot {
                     provider: "openai".to_string(),
                     model: "gpt-5.2-codex".to_string(),
-                    tokens_used: 91_000,
+                    tokens_used: 101_000,
                     context_window: 100_000,
-                    usage_pct: 91.0,
-                    prompt_tokens: 86_000,
+                    hard_context_window: Some(120_000),
+                    usage_pct: 101.0,
+                    prompt_tokens: 96_000,
                     completion_tokens: 5_000,
                     cached_tokens: 0,
                 },
@@ -6716,8 +6750,8 @@ mod tests {
             .get("codex-thread")
             .expect("high pressure after rewind should be remembered");
         assert_eq!(notice.record_id, "rewind-high");
-        assert_eq!(notice.used_tokens, 91_000);
-        assert_eq!(notice.rewind_only_limit, 85_000);
+        assert_eq!(notice.used_tokens, 101_000);
+        assert_eq!(notice.rewind_only_limit, 100_000);
         assert!(s
             .pending_rewind_pressure_checks
             .get("codex-thread")
@@ -6755,7 +6789,7 @@ mod tests {
             InsufficientRewindNotice {
                 record_id: "rewind-old".to_string(),
                 used_tokens: 95_000,
-                rewind_only_limit: 85_000,
+                rewind_only_limit: 100_000,
                 context_window: 100_000,
             },
         );
@@ -6778,6 +6812,7 @@ mod tests {
                     model: "gpt-5.2-codex".to_string(),
                     tokens_used: 70_000,
                     context_window: 100_000,
+                    hard_context_window: Some(120_000),
                     usage_pct: 70.0,
                     prompt_tokens: 68_000,
                     completion_tokens: 2_000,
@@ -6818,10 +6853,11 @@ mod tests {
             frontend::ModelUsageSnapshot {
                 provider: "openai".to_string(),
                 model: "gpt-5.2-codex".to_string(),
-                tokens_used: 90_000,
+                tokens_used: 101_000,
                 context_window: 100_000,
-                usage_pct: 90.0,
-                prompt_tokens: 86_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 101.0,
+                prompt_tokens: 97_000,
                 completion_tokens: 4_000,
                 cached_tokens: 0,
             },
@@ -6881,10 +6917,11 @@ mod tests {
                 main: frontend::ModelUsageSnapshot {
                     provider: "openai".to_string(),
                     model: "gpt-5.2-codex".to_string(),
-                    tokens_used: 88_000,
+                    tokens_used: 101_000,
                     context_window: 100_000,
-                    usage_pct: 88.0,
-                    prompt_tokens: 83_000,
+                    hard_context_window: Some(120_000),
+                    usage_pct: 101.0,
+                    prompt_tokens: 96_000,
                     completion_tokens: 5_000,
                     cached_tokens: 0,
                 },
@@ -6945,10 +6982,11 @@ mod tests {
                 main: frontend::ModelUsageSnapshot {
                     provider: "openai".to_string(),
                     model: "gpt-5.2-codex".to_string(),
-                    tokens_used: 90_000,
+                    tokens_used: 100_000,
                     context_window: 100_000,
-                    usage_pct: 90.0,
-                    prompt_tokens: 85_000,
+                    hard_context_window: Some(120_000),
+                    usage_pct: 100.0,
+                    prompt_tokens: 95_000,
                     completion_tokens: 5_000,
                     cached_tokens: 0,
                 },
@@ -7032,6 +7070,7 @@ mod tests {
                     model: "gpt-5.2-codex".to_string(),
                     tokens_used: 125,
                     context_window: 1_000,
+                    hard_context_window: Some(1_200),
                     usage_pct: 12.5,
                     prompt_tokens: 100,
                     completion_tokens: 25,
@@ -7075,10 +7114,11 @@ mod tests {
                     frontend::ModelUsageSnapshot {
                         provider: "openai".to_string(),
                         model: "gpt-5.2-codex".to_string(),
-                        tokens_used: 900,
+                        tokens_used: 1_000,
                         context_window: 1_000,
-                        usage_pct: 90.0,
-                        prompt_tokens: 800,
+                        hard_context_window: Some(1_200),
+                        usage_pct: 100.0,
+                        prompt_tokens: 900,
                         completion_tokens: 100,
                         cached_tokens: 250,
                     },
@@ -7095,8 +7135,8 @@ mod tests {
                 value.pointer("/session_id"),
                 Some(&"managed-session".into())
             );
-            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&900.into()));
-            assert_eq!(value.pointer("/session_tokens"), Some(&900.into()));
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&1000.into()));
+            assert_eq!(value.pointer("/session_tokens"), Some(&1000.into()));
             assert_eq!(
                 value.pointer("/context_pressure/status"),
                 Some(&"high".into())
@@ -7132,6 +7172,7 @@ mod tests {
                             model: "gpt-5.2-codex".to_string(),
                             tokens_used: 850,
                             context_window: 1_000,
+                            hard_context_window: Some(1_200),
                             usage_pct: 85.0,
                             prompt_tokens: 800,
                             completion_tokens: 50,

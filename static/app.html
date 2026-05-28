@@ -11356,11 +11356,15 @@ function renderManagedContextStats() {
   const status = live ? (pressure.status || 'unknown') : (sessionId ? 'historical' : 'unknown');
   const mode = managedContextEffectiveMode(sessionId, meta);
   const used = live ? pressure.used_tokens : null;
-  const windowSize = live ? pressure.context_window : null;
-  const pct = managedContextPercent(used, windowSize);
+  const effectiveWindow = live ? (pressure.effective_context_window || pressure.context_window) : null;
+  const hardWindow = live ? (pressure.hard_limit || pressure.hard_context_window || null) : null;
+  const rewindOnlyLimit = live ? pressure.rewind_only_limit : null;
+  const pct = managedContextPercent(used, effectiveWindow);
   host.appendChild(managedContextStat('Mode', mode, mode === 'managed' ? 'ok' : 'vanilla'));
   host.appendChild(managedContextStat('Pressure', status, status));
-  host.appendChild(managedContextStat('Tokens', `${managedContextFormatNumber(used)} / ${managedContextFormatNumber(windowSize)}`, status));
+  host.appendChild(managedContextStat('Effective', `${managedContextFormatNumber(used)} / ${managedContextFormatNumber(effectiveWindow)}`, status));
+  host.appendChild(managedContextStat('Hard', `${managedContextFormatNumber(used)} / ${managedContextFormatNumber(hardWindow)}`, status));
+  host.appendChild(managedContextStat('Rewind at', managedContextFormatNumber(rewindOnlyLimit), status));
   host.appendChild(managedContextStat('Rewind-only', pressure.rewind_only ? 'on' : 'off', pressure.rewind_only ? 'critical' : 'ok'));
   if (fill) {
     fill.style.width = pct === null ? '0%' : Math.min(pct, 100).toFixed(1) + '%';
@@ -16878,12 +16882,18 @@ function renderUsageCard(label, data) {
   const completion = data.completion_tokens || 0;
   const cached = data.cached_tokens || 0;
   const uncachedInput = prompt - cached;
+  const effectiveWindow = data.context_window || 0;
+  const hardWindow = data.hard_context_window || data.hardContextWindow || null;
+  const remainingEffective = Math.max(0, effectiveWindow - data.tokens_used);
+  const hardLine = hardWindow && hardWindow !== effectiveWindow
+    ? `<span class="label">Hard limit</span><span class="value">${hardWindow.toLocaleString()}</span>`
+    : '';
   card.innerHTML = `
     <div class="card-title">${label}</div>
     <div class="card-model"><span class="provider">${data.provider}</span> / <span class="model-name">${data.model}</span></div>
     <div class="token-bar">
       <div class="bar-label">
-        <span class="tokens">${data.tokens_used.toLocaleString()} / ${data.context_window.toLocaleString()}</span>
+        <span class="tokens">${data.tokens_used.toLocaleString()} / ${effectiveWindow.toLocaleString()} effective</span>
         <span class="pct" style="color:${color}">${data.usage_pct.toFixed(1)}%</span>
       </div>
       <div class="bar-track"><div class="bar-fill" style="width:${Math.min(data.usage_pct, 100)}%;background:${color}"></div></div>
@@ -16894,8 +16904,9 @@ function renderUsageCard(label, data) {
       <span class="value" style="color:var(--green)">${cached.toLocaleString()}${prompt > 0 ? ' (' + (cached / prompt * 100).toFixed(0) + '%)' : ''}</span>
       <span class="label" style="padding-left:12px">Uncached</span><span class="value">${uncachedInput.toLocaleString()}</span>
       <span class="label">Output tokens</span><span class="value">${completion.toLocaleString()}</span>
-      <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Remaining</span>
-      <span class="value" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${(data.context_window - data.tokens_used).toLocaleString()}</span>
+      ${hardLine}
+      <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Effective remaining</span>
+      <span class="value" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${remainingEffective.toLocaleString()}</span>
     </div>`;
   return card;
 }
@@ -21103,8 +21114,10 @@ function renderContextPane() {
   set('context-source', d.label || d.source || 'model');
   set('context-turn', d.turn);
   set('context-items', d.item_count);
-  const tokens = d.token_count && d.context_window
-    ? `${Number(d.token_count).toLocaleString()} / ${Number(d.context_window).toLocaleString()}`
+  const effectiveWindow = d.effective_context_window || d.context_window;
+  const hardWindow = d.hard_context_window || d.hardContextWindow || null;
+  const tokens = d.token_count && effectiveWindow
+    ? `${Number(d.token_count).toLocaleString()} / ${Number(effectiveWindow).toLocaleString()} effective${hardWindow && hardWindow !== effectiveWindow ? ` (${Number(hardWindow).toLocaleString()} hard)` : ''}`
     : d.token_count;
   set('context-tokens', tokens);
   set('context-format', d.format || '--');

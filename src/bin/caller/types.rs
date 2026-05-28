@@ -391,6 +391,8 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         context_window: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        hard_context_window: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         item_count: Option<usize>,
         raw: serde_json::Value,
     },

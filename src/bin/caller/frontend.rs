@@ -69,7 +69,11 @@ pub struct ModelUsageSnapshot {
     pub provider: String,
     pub model: String,
     pub tokens_used: u64,
+    /// Effective context window used for density/soft-limit pressure.
     pub context_window: u64,
+    /// Raw model/backend context window. This is the hard request limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_context_window: Option<u64>,
     pub usage_pct: f64,
     /// Cumulative prompt (input) tokens across the session.
     #[serde(default)]

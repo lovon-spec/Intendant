@@ -555,6 +555,7 @@ pub enum AppEvent {
         format: String,
         token_count: Option<u64>,
         context_window: Option<u64>,
+        hard_context_window: Option<u64>,
         item_count: Option<usize>,
         raw: serde_json::Value,
     },
@@ -1739,6 +1740,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             format,
             token_count,
             context_window,
+            hard_context_window,
             item_count,
             raw,
         } => Some(OutboundEvent::ContextSnapshot {
@@ -1749,6 +1751,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             format: format.clone(),
             token_count: *token_count,
             context_window: *context_window,
+            hard_context_window: *hard_context_window,
             item_count: *item_count,
             raw: raw.clone(),
         }),
@@ -2291,6 +2294,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             format,
             token_count,
             context_window,
+            hard_context_window,
             item_count,
             raw,
         } => {
@@ -2302,6 +2306,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 format,
                 *token_count,
                 *context_window,
+                *hard_context_window,
                 *item_count,
                 raw,
             );
@@ -3608,6 +3613,7 @@ mod tests {
             format: "codex.thread.read.v2".to_string(),
             token_count: Some(1200),
             context_window: Some(128000),
+            hard_context_window: Some(128000),
             item_count: Some(2),
             raw: serde_json::json!({"thread": {"turns": []}}),
         };

@@ -1977,6 +1977,7 @@ fn external_context_snapshot_key(snapshot: &external_agent::AgentContextSnapshot
     snapshot.format.hash(&mut h);
     snapshot.token_count.hash(&mut h);
     snapshot.context_window.hash(&mut h);
+    snapshot.hard_context_window.hash(&mut h);
     snapshot.item_count.hash(&mut h);
     match serde_json::to_vec(&snapshot.raw) {
         Ok(bytes) => bytes.hash(&mut h),
@@ -2023,6 +2024,7 @@ fn external_context_snapshot_usage(
         model: model.to_string(),
         tokens_used,
         context_window,
+        hard_context_window: snapshot.hard_context_window,
         usage_pct: tokens_used as f64 / context_window as f64 * 100.0,
         prompt_tokens: tokens_used,
         completion_tokens: 0,
@@ -2054,6 +2056,7 @@ async fn emit_external_context_snapshot_if_changed(
                 format: snapshot.format,
                 token_count: snapshot.token_count,
                 context_window: snapshot.context_window,
+                hard_context_window: snapshot.hard_context_window,
                 item_count: snapshot.item_count,
                 raw: snapshot.raw,
             });
@@ -3528,6 +3531,7 @@ fn handle_idle_codex_subagent_event(
                     model: usage.model,
                     tokens_used: usage.tokens_used,
                     context_window: usage.context_window,
+                    hard_context_window: usage.hard_context_window,
                     usage_pct: usage.usage_pct,
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
@@ -4229,6 +4233,7 @@ async fn drain_external_agent_events(
                         model: usage.model,
                         tokens_used: usage.tokens_used,
                         context_window: usage.context_window,
+                        hard_context_window: usage.hard_context_window,
                         usage_pct: usage.usage_pct,
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
@@ -6548,6 +6553,7 @@ mod tests {
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(71_876),
             context_window: Some(258_400),
+            hard_context_window: Some(272_000),
             item_count: Some(51),
             raw: serde_json::json!({
                 "model": "gpt-5.5",
@@ -6560,6 +6566,7 @@ mod tests {
         assert_eq!(usage.model, "gpt-5.5");
         assert_eq!(usage.tokens_used, 71_876);
         assert_eq!(usage.context_window, 258_400);
+        assert_eq!(usage.hard_context_window, Some(272_000));
         assert_eq!(usage.prompt_tokens, 71_876);
         assert_eq!(usage.completion_tokens, 0);
         assert!((usage.usage_pct - (71_876.0 / 258_400.0 * 100.0)).abs() < 1e-12);
@@ -8873,6 +8880,7 @@ async fn run_agent_loop(
                     format: context_format,
                     token_count: conversation.last_usage().map(|u| u.total_tokens),
                     context_window: Some(conversation.context_window()),
+                    hard_context_window: Some(conversation.context_window()),
                     item_count: provider_request_item_count(&raw_context),
                     raw: raw_context,
                 });
@@ -15526,6 +15534,7 @@ async fn main() -> Result<(), CallerError> {
             project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
         mcp_app_state.configured_codex_managed_context = mcp_app_state.codex_managed_context;
         mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
+        mcp_app_state.hard_context_window = provider.as_ref().map(|p| p.context_window());
         mcp_app_state.session_id = session_log
             .lock()
             .map(|l| l.session_id().to_string())

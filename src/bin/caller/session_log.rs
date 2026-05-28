@@ -1965,6 +1965,7 @@ impl SessionLog {
         format: &str,
         token_count: Option<u64>,
         context_window: Option<u64>,
+        hard_context_window: Option<u64>,
         item_count: Option<usize>,
         raw: &serde_json::Value,
     ) {
@@ -1976,6 +1977,7 @@ impl SessionLog {
             format,
             token_count,
             context_window,
+            hard_context_window,
             item_count,
             raw,
         );
@@ -1990,6 +1992,7 @@ impl SessionLog {
         format: &str,
         token_count: Option<u64>,
         context_window: Option<u64>,
+        hard_context_window: Option<u64>,
         item_count: Option<usize>,
         raw: &serde_json::Value,
     ) {
@@ -2028,6 +2031,7 @@ impl SessionLog {
                     "format": format,
                     "token_count": token_count,
                     "context_window": context_window,
+                    "hard_context_window": hard_context_window,
                     "item_count": item_count,
                 });
                 if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2647,6 +2651,9 @@ pub fn session_log_entry_to_app_event(
             let context_window = data
                 .and_then(|d| d.get("context_window"))
                 .and_then(|v| v.as_u64());
+            let hard_context_window = data
+                .and_then(|d| d.get("hard_context_window"))
+                .and_then(|v| v.as_u64());
             let item_count = data
                 .and_then(|d| d.get("item_count"))
                 .and_then(|v| v.as_u64())
@@ -2663,6 +2670,7 @@ pub fn session_log_entry_to_app_event(
                 format,
                 token_count,
                 context_window,
+                hard_context_window,
                 item_count,
                 raw,
             })
@@ -3886,6 +3894,7 @@ mod tests {
             "codex.thread.read.v2",
             Some(42),
             Some(128_000),
+            Some(128_000),
             Some(1),
             &serde_json::json!({"thread": {"turns": [{"items": [{"type": "userMessage"}]}]}}),
         );
@@ -3909,6 +3918,7 @@ mod tests {
                 format,
                 token_count,
                 context_window,
+                hard_context_window,
                 item_count,
                 raw,
             } => {
@@ -3919,6 +3929,7 @@ mod tests {
                 assert_eq!(format, "codex.thread.read.v2");
                 assert_eq!(token_count, Some(42));
                 assert_eq!(context_window, Some(128_000));
+                assert_eq!(hard_context_window, Some(128_000));
                 assert_eq!(item_count, Some(1));
                 assert_eq!(
                     raw.pointer("/thread/turns/0/items/0/type")

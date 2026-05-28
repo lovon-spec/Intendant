@@ -347,7 +347,10 @@ pub struct AgentUsageSnapshot {
     pub provider: String,
     pub model: String,
     pub tokens_used: u64,
+    /// Effective context window reported by the backend.
     pub context_window: u64,
+    /// Raw model/backend context window, when the backend distinguishes it.
+    pub hard_context_window: Option<u64>,
     pub usage_pct: f64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -454,6 +457,7 @@ pub struct AgentContextSnapshot {
     pub format: String,
     pub token_count: Option<u64>,
     pub context_window: Option<u64>,
+    pub hard_context_window: Option<u64>,
     pub item_count: Option<usize>,
     pub raw: serde_json::Value,
 }
