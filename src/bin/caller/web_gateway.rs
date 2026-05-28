@@ -6658,6 +6658,150 @@ fn request_query_param(request_line: &str, key: &str) -> Option<String> {
     None
 }
 
+fn managed_context_query_session_id(request_line: &str) -> Option<String> {
+    request_query_param(request_line, "backend_session_id")
+        .or_else(|| request_query_param(request_line, "session_id"))
+        .or_else(|| request_query_param(request_line, "session"))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn managed_context_query_wrapper_session_id(request_line: &str) -> Option<String> {
+    request_query_param(request_line, "intendant_session_id")
+        .or_else(|| request_query_param(request_line, "wrapper_session_id"))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn managed_context_safe_log_dir_id(id: &str) -> Option<String> {
+    let id = id.trim();
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn managed_context_named_log_dir(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let session_id = managed_context_safe_log_dir_id(session_id)?;
+    let path = home.join(".intendant").join("logs").join(session_id);
+    path.is_dir().then_some(path)
+}
+
+fn managed_context_line_mentions_session(line: &str, session_id: &str) -> bool {
+    if !line.contains(session_id) {
+        return false;
+    }
+    if line.contains("\"session_identity\"")
+        || line.contains("External agent thread:")
+        || line.contains("Mode: external agent")
+        || line.contains("\"backend_session_id\"")
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .map(|value| {
+            value.pointer("/data/session_id").and_then(|v| v.as_str()) == Some(session_id)
+                || value
+                    .pointer("/data/backend_session_id")
+                    .and_then(|v| v.as_str())
+                    == Some(session_id)
+                || value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .and_then(external_agent_thread_id_from_message)
+                    .as_deref()
+                    == Some(session_id)
+        })
+        .unwrap_or(false)
+}
+
+fn managed_context_trace_dirs_mention_session(log_dir: &Path, session_id: &str) -> bool {
+    let trace_root = log_dir.join("model-request-traces");
+    let Ok(entries) = std::fs::read_dir(trace_root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .map(|name| name.contains(session_id))
+            .unwrap_or(false)
+    })
+}
+
+fn managed_context_log_dir_mentions_session(log_dir: &Path, session_id: &str) -> bool {
+    if log_dir.file_name().and_then(|name| name.to_str()) == Some(session_id) {
+        return true;
+    }
+    if managed_context_trace_dirs_mention_session(log_dir, session_id) {
+        return true;
+    }
+    let session_path = log_dir.join("session.jsonl");
+    let Ok(file) = std::fs::File::open(session_path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| managed_context_line_mentions_session(&line, session_id))
+}
+
+fn managed_context_candidate_log_dirs(
+    home: &Path,
+    active_log_dir: Option<&Path>,
+    session_id: Option<&str>,
+    wrapper_session_id: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen_dirs = HashSet::new();
+    let mut push_dir = |path: PathBuf| {
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string();
+        if seen_dirs.insert(key) {
+            dirs.push(path);
+        }
+    };
+
+    if let Some(log_dir) = active_log_dir {
+        push_dir(log_dir.to_path_buf());
+    }
+    if let Some(wrapper_session_id) = wrapper_session_id {
+        if let Some(path) = managed_context_named_log_dir(home, wrapper_session_id) {
+            push_dir(path);
+            return dirs;
+        }
+    }
+    if let Some(session_id) = session_id {
+        if let Some(path) = managed_context_named_log_dir(home, session_id) {
+            push_dir(path);
+            return dirs;
+        }
+        let logs_dir = home.join(".intendant").join("logs");
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                let log_dir = entry.path();
+                if log_dir.is_dir()
+                    && (managed_context_log_dir_mentions_session(&log_dir, session_id)
+                        || crate::context_rewind::records_dir(&log_dir).is_dir())
+                {
+                    push_dir(log_dir);
+                }
+            }
+        }
+    }
+    dirs
+}
+
 fn managed_context_record_matches_session(
     record: &crate::context_rewind::ContextRewindRecord,
     session_id: &str,
@@ -6844,52 +6988,55 @@ fn managed_context_anchors_response_from_home(
     active_log_dir: Option<&Path>,
     home: &Path,
 ) -> String {
-    let session_id = request_query_param(request_line, "session_id")
-        .or_else(|| request_query_param(request_line, "session"))
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty());
+    let session_id = managed_context_query_session_id(request_line);
+    let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
+    let filter_session_id = session_id.as_deref().or(wrapper_session_id.as_deref());
     let mut anchors = Vec::new();
     let mut seen_dirs = HashSet::new();
 
-    if let Some(log_dir) = active_log_dir {
+    let dirs = managed_context_candidate_log_dirs(
+        home,
+        active_log_dir,
+        session_id.as_deref(),
+        wrapper_session_id.as_deref(),
+    );
+    if !dirs.is_empty() {
+        for log_dir in dirs {
+            if let Err(err) = append_managed_context_anchors_from_dir(
+                &mut anchors,
+                &mut seen_dirs,
+                &log_dir,
+                filter_session_id,
+            ) {
+                return json_error(
+                    "500 Internal Server Error",
+                    format!("failed to read managed-context anchors: {err}"),
+                );
+            }
+        }
+    } else if active_log_dir.is_some() {
+        // Active log was present but unreadable or raced with session teardown.
+        return json_ok(serde_json::json!({ "anchors": [] }));
+    } else if session_id.is_none() && wrapper_session_id.is_none() {
+        return json_error(
+            "404 Not Found",
+            "managed-context anchors need an active session log",
+        );
+    } else {
+        let Some(log_dir) = active_log_dir else {
+            anchors.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            return json_ok(serde_json::json!({ "anchors": anchors }));
+        };
         if let Err(err) = append_managed_context_anchors_from_dir(
             &mut anchors,
             &mut seen_dirs,
             log_dir,
-            session_id.as_deref(),
+            filter_session_id,
         ) {
             return json_error(
                 "500 Internal Server Error",
                 format!("failed to read managed-context anchors: {err}"),
             );
-        }
-    } else if session_id.is_none() {
-        return json_error(
-            "404 Not Found",
-            "managed-context anchors need an active session log",
-        );
-    }
-
-    if session_id.is_some() {
-        let logs_dir = home.join(".intendant").join("logs");
-        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
-            for entry in entries.flatten() {
-                let log_dir = entry.path();
-                if !log_dir.is_dir() {
-                    continue;
-                }
-                if let Err(err) = append_managed_context_anchors_from_dir(
-                    &mut anchors,
-                    &mut seen_dirs,
-                    &log_dir,
-                    session_id.as_deref(),
-                ) {
-                    return json_error(
-                        "500 Internal Server Error",
-                        format!("failed to read managed-context anchors: {err}"),
-                    );
-                }
-            }
         }
     }
 
@@ -6914,52 +7061,54 @@ fn managed_context_records_response_from_home(
     active_log_dir: Option<&Path>,
     home: &Path,
 ) -> String {
-    let session_id = request_query_param(request_line, "session_id")
-        .or_else(|| request_query_param(request_line, "session"))
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty());
+    let session_id = managed_context_query_session_id(request_line);
+    let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
+    let filter_session_id = session_id.as_deref().or(wrapper_session_id.as_deref());
     let mut records = Vec::new();
     let mut seen_dirs = std::collections::HashSet::new();
 
-    if let Some(log_dir) = active_log_dir {
+    let dirs = managed_context_candidate_log_dirs(
+        home,
+        active_log_dir,
+        session_id.as_deref(),
+        wrapper_session_id.as_deref(),
+    );
+    if !dirs.is_empty() {
+        for log_dir in dirs {
+            if let Err(err) = append_managed_context_records_from_dir(
+                &mut records,
+                &mut seen_dirs,
+                &log_dir,
+                filter_session_id,
+            ) {
+                return json_error(
+                    "500 Internal Server Error",
+                    format!("failed to read managed-context records: {err}"),
+                );
+            }
+        }
+    } else if active_log_dir.is_some() {
+        return json_ok(serde_json::json!({ "records": [] }));
+    } else if session_id.is_none() && wrapper_session_id.is_none() {
+        return json_error(
+            "404 Not Found",
+            "managed-context records need an active session log",
+        );
+    } else {
+        let Some(log_dir) = active_log_dir else {
+            records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            return json_ok(serde_json::json!({ "records": records }));
+        };
         if let Err(err) = append_managed_context_records_from_dir(
             &mut records,
             &mut seen_dirs,
             log_dir,
-            session_id.as_deref(),
+            filter_session_id,
         ) {
             return json_error(
                 "500 Internal Server Error",
                 format!("failed to read managed-context records: {err}"),
             );
-        }
-    } else if session_id.is_none() {
-        return json_error(
-            "404 Not Found",
-            "managed-context records need an active session log",
-        );
-    }
-
-    if session_id.is_some() {
-        let logs_dir = home.join(".intendant").join("logs");
-        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
-            for entry in entries.flatten() {
-                let log_dir = entry.path();
-                if !log_dir.is_dir() {
-                    continue;
-                }
-                if let Err(err) = append_managed_context_records_from_dir(
-                    &mut records,
-                    &mut seen_dirs,
-                    &log_dir,
-                    session_id.as_deref(),
-                ) {
-                    return json_error(
-                        "500 Internal Server Error",
-                        format!("failed to read managed-context records: {err}"),
-                    );
-                }
-            }
         }
     }
 

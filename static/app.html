@@ -8427,6 +8427,19 @@ function showVoiceStatus(msg, isError) {
   el.className = 'voice-status' + (isError ? ' error' : '');
   el.classList.remove('hidden');
 }
+function shouldSuppressServerWebSocketError(msg) {
+  if (msg !== 'Server WebSocket error') return false;
+  const conn = document.getElementById('sb-conn');
+  const connected = conn?.classList.contains('ok') === true;
+  if (connected) clearServerWebSocketErrorStatus();
+  return connected;
+}
+function clearServerWebSocketErrorStatus() {
+  const el = document.getElementById('voiceStatus');
+  if (!el || el.textContent !== 'Server WebSocket error') return;
+  el.textContent = '';
+  el.className = 'voice-status hidden';
+}
 function hideVoiceStatus() {
   document.getElementById('voiceStatus').classList.add('hidden');
 }
@@ -8914,6 +8927,7 @@ async function main() {
   app.set_on_server_state((connected) => {
     document.getElementById('sb-conn').className = connected ? 'conn-dot ok' : 'conn-dot err';
     if (connected) {
+      clearServerWebSocketErrorStatus();
       // Fresh WS sessions start unsubscribed on the server. Reassert
       // our local subscription state so reloads / reconnects restore
       // frame flow to a Terminal-tab view without requiring the user
@@ -8986,6 +9000,7 @@ async function main() {
   });
 
   app.set_on_error((msg) => {
+    if (shouldSuppressServerWebSocketError(msg)) return;
     if (!msg.startsWith('Server')) {
       if (modelConnected) voiceHadPriorSession = true;
       modelConnected = false;
@@ -9397,6 +9412,7 @@ function processCommands(cmds) {
       case 'term_data': handleTermData(c.base64); break;
       case 'set_connected':
         document.getElementById('sb-conn').className = c.connected ? 'conn-dot ok' : 'conn-dot err';
+        if (c.connected) clearServerWebSocketErrorStatus();
         break;
       case 'file_changed':
         onFileChanged(c.path, c.kind, c.lines_added, c.lines_removed);
@@ -11057,6 +11073,19 @@ function managedContextCurrentSessionId() {
   return String(sel?.value || '').trim();
 }
 
+function managedContextHistoryQueryString() {
+  const sessionId = managedContextCurrentSessionId();
+  if (!sessionId) return '';
+  const meta = managedContextSessionMeta(sessionId);
+  const params = new URLSearchParams();
+  params.set('session_id', sessionId);
+  const backendSessionId = managedContextBackendSessionId(meta);
+  const intendantSessionId = managedContextIntendantSessionId(meta);
+  if (backendSessionId) params.set('backend_session_id', backendSessionId);
+  if (intendantSessionId) params.set('intendant_session_id', intendantSessionId);
+  return params.toString();
+}
+
 function managedContextBackendSessionId(meta = {}) {
   return String(meta.backend_session_id || meta.backendSessionId || '').trim();
 }
@@ -11319,8 +11348,15 @@ function syncManagedContextActiveSession() {
 }
 
 function managedContextNumber(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+function managedContextPositiveNumber(value) {
+  const n = managedContextNumber(value);
+  return n !== null && n > 0 ? n : null;
 }
 
 function managedContextFormatNumber(value) {
@@ -11356,9 +11392,13 @@ function renderManagedContextStats() {
   const status = live ? (pressure.status || 'unknown') : (sessionId ? 'historical' : 'unknown');
   const mode = managedContextEffectiveMode(sessionId, meta);
   const used = live ? pressure.used_tokens : null;
-  const effectiveWindow = live ? (pressure.effective_context_window || pressure.context_window) : null;
-  const hardWindow = live ? (pressure.hard_limit || pressure.hard_context_window || null) : null;
-  const rewindOnlyLimit = live ? pressure.rewind_only_limit : null;
+  const effectiveWindow = live
+    ? managedContextPositiveNumber(pressure.effective_context_window || pressure.context_window)
+    : null;
+  const hardWindow = live
+    ? managedContextPositiveNumber(pressure.hard_limit || pressure.hard_context_window)
+    : null;
+  const rewindOnlyLimit = live ? managedContextPositiveNumber(pressure.rewind_only_limit) : null;
   const pct = managedContextPercent(used, effectiveWindow);
   host.appendChild(managedContextStat('Mode', mode, mode === 'managed' ? 'ok' : 'vanilla'));
   host.appendChild(managedContextStat('Pressure', status, status));
@@ -11532,18 +11572,18 @@ async function fetchManagedContextStatus() {
 }
 
 async function fetchManagedContextRecords() {
-  const sessionId = managedContextCurrentSessionId();
-  if (!sessionId) return [];
-  const resp = await authedFetch(`/api/managed-context/records?session_id=${encodeURIComponent(sessionId)}`);
+  const query = managedContextHistoryQueryString();
+  if (!query) return [];
+  const resp = await authedFetch(`/api/managed-context/records?${query}`);
   const payload = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(payload.error || `records HTTP ${resp.status}`);
   return Array.isArray(payload.records) ? payload.records : [];
 }
 
 async function fetchManagedContextAnchors() {
-  const sessionId = managedContextCurrentSessionId();
-  if (!sessionId) return [];
-  const resp = await authedFetch(`/api/managed-context/anchors?session_id=${encodeURIComponent(sessionId)}`);
+  const query = managedContextHistoryQueryString();
+  if (!query) return [];
+  const resp = await authedFetch(`/api/managed-context/anchors?${query}`);
   const payload = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(payload.error || `anchors HTTP ${resp.status}`);
   return Array.isArray(payload.anchors) ? payload.anchors : [];
@@ -11592,9 +11632,31 @@ async function refreshManagedContextPane(options = {}) {
   managedContextAnchorsLoading = true;
   renderManagedContextPane();
   const statusPromise = settleManagedContextPromise(live ? fetchManagedContextStatus() : Promise.resolve(null));
+  const recordsPromise = settleManagedContextPromise(fetchManagedContextRecords());
+  const anchorsPromise = settleManagedContextPromise(fetchManagedContextAnchors());
+  const statusResult = await Promise.race([
+    statusPromise,
+    managedContextDelay(8000).then(() => ({
+      status: 'rejected',
+      reason: new Error('timed out waiting for live status'),
+    })),
+  ]);
+  if (managedContextCurrentSessionId() !== sessionId) {
+    return;
+  }
+  if (statusResult.status === 'fulfilled') {
+    managedContextStatus = statusResult.value;
+  } else {
+    managedContextStatus = null;
+    const message = statusResult.reason?.message || String(statusResult.reason || 'unknown error');
+    managedContextLastError = `Live status unavailable: ${message}`;
+    if (options.force) console.warn('Managed context status refresh failed:', statusResult.reason);
+  }
+  renderManagedContextPane();
+
   const [recordsResult, anchorsResult] = await Promise.all([
-    settleManagedContextPromise(fetchManagedContextRecords()),
-    settleManagedContextPromise(fetchManagedContextAnchors()),
+    recordsPromise,
+    anchorsPromise,
   ]);
   if (managedContextCurrentSessionId() !== sessionId) {
     return;
@@ -11618,29 +11680,7 @@ async function refreshManagedContextPane(options = {}) {
     errors.push(`Anchors unavailable: ${message}`);
     if (options.force) console.warn('Managed context anchors refresh failed:', anchorsResult.reason);
   }
-  managedContextLastError = errors.join(' ');
-  renderManagedContextPane();
-
-  const statusResult = await Promise.race([
-    statusPromise,
-    managedContextDelay(8000).then(() => ({
-      status: 'rejected',
-      reason: new Error('timed out waiting for live status'),
-    })),
-  ]);
-  if (managedContextCurrentSessionId() !== sessionId) {
-    return;
-  }
-  if (statusResult.status === 'fulfilled') {
-    managedContextStatus = statusResult.value;
-  } else {
-    managedContextStatus = null;
-    const message = statusResult.reason?.message || String(statusResult.reason || 'unknown error');
-    managedContextLastError = [managedContextLastError, `Live status unavailable: ${message}`]
-      .filter(Boolean)
-      .join(' ');
-    if (options.force) console.warn('Managed context status refresh failed:', statusResult.reason);
-  }
+  managedContextLastError = [managedContextLastError, ...errors].filter(Boolean).join(' ');
   renderManagedContextPane();
 }
 

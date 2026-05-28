@@ -1472,7 +1472,7 @@ impl CodexThreadActionDedupe {
 }
 
 impl ExternalContextRewindRequest {
-    fn rendered_primer(&self) -> Option<String> {
+    fn rendered_primer(&self, record_id: Option<&str>) -> Option<String> {
         let primer = self.primer.as_deref()?.trim();
         if primer.is_empty() {
             return None;
@@ -1485,6 +1485,9 @@ impl ExternalContextRewindRequest {
             "Reason",
             self.reason.as_deref().unwrap_or("context rewind"),
         );
+        if let Some(record_id) = record_id.map(str::trim).filter(|id| !id.is_empty()) {
+            push_context_rewind_text_section(&mut out, "Record id", record_id);
+        }
         push_context_rewind_text_section(&mut out, "Primer", primer);
         push_context_rewind_list_section(&mut out, "Preserve", &self.preserve);
         push_context_rewind_list_section(&mut out, "Discard", &self.discard);
@@ -1785,7 +1788,7 @@ async fn apply_external_context_rewind(
             )
         })?;
 
-    if let Some(primer) = request.rendered_primer() {
+    if let Some(primer) = request.rendered_primer(Some(record_id.as_str())) {
         agent
             .inject_thread_developer_message(thread_id, &primer)
             .await
@@ -6741,9 +6744,12 @@ mod tests {
         );
         assert!(request.auto_resume);
 
-        let primer = request.rendered_primer().expect("primer");
+        let primer = request
+            .rendered_primer(Some("rewind-test-record"))
+            .expect("primer");
         assert!(primer.contains("<model_context_rewind_primer>"));
         assert!(primer.contains("Earlier history before the target is still present"));
+        assert!(primer.contains("Record id:\nrewind-test-record"));
         assert!(primer.contains("Keep the useful result."));
         assert!(primer.contains("- fact A"));
         assert!(primer.contains("- bad assumption"));
