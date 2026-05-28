@@ -11006,6 +11006,9 @@ let sessionsLoaded = false;
 let _cachedSessions = [];
 let managedContextStatus = null;
 let managedContextRecords = [];
+let managedContextAnchors = [];
+let managedContextRecordsLoading = false;
+let managedContextAnchorsLoading = false;
 let managedContextLastError = '';
 let managedContextRefreshTimer = null;
 let managedContextRpcSeq = 1;
@@ -11300,6 +11303,7 @@ function syncManagedContextActiveSession() {
   const sessionId = managedContextCurrentSessionId();
   if (sessionId === managedContextActiveSessionId) return;
   managedContextActiveSessionId = sessionId;
+  managedContextAnchors = [];
   resetManagedContextSessionDraft();
 }
 
@@ -11401,7 +11405,7 @@ function renderManagedContextAlerts() {
     alert.textContent = pressure.last_rewind_insufficient.message;
     host.appendChild(alert);
   }
-  const command = meta.capabilities?.codexCommand || controlCodexConfig.command || '';
+  const command = meta.capabilities?.codexCommand || meta.capabilities?.codex_command || controlCodexConfig.command || '';
   if (mode === 'managed' && /(^|\/)codex$/.test(command) && !/target\/(debug|release)\/codex/.test(command)) {
     const alert = document.createElement('div');
     alert.className = 'managed-context-alert';
@@ -11415,18 +11419,37 @@ function renderManagedContextAnchors() {
   if (!host) return;
   const sid = managedContextCurrentSessionId();
   const seen = new Set();
-  const entries = Array.from(document.querySelectorAll('.log-entry[data-item-id]'))
+  const rows = [];
+  Array.from(document.querySelectorAll('.log-entry[data-item-id]'))
     .filter(entry => !sid || entry.dataset.sessionId === sid || sessionWindowTargetForLogSession(entry.dataset.sessionId || '') === sid)
     .reverse()
-    .slice(0, 18);
+    .forEach(entry => {
+      rows.push({
+        itemId: entry.dataset.itemId,
+        sessionId: entry.dataset.sessionId || sid,
+        content: compactSessionText(entry.querySelector('.log-content')?.textContent || entry.textContent || ''),
+      });
+    });
+  for (const anchor of managedContextAnchors || []) {
+    rows.push({
+      itemId: anchor.item_id || anchor.itemId,
+      sessionId: anchor.session_id || anchor.sessionId || anchor.intendant_session_id || anchor.intendantSessionId || sid,
+      content: compactSessionText([
+        anchor.tool_name || anchor.toolName || 'tool',
+        anchor.status ? `(${anchor.status})` : '',
+        anchor.preview || '',
+      ].filter(Boolean).join(' ')),
+    });
+  }
   host.innerHTML = '';
-  for (const entry of entries) {
-    const itemId = entry.dataset.itemId;
+  for (const rowInfo of rows) {
+    if (host.childElementCount >= 18) break;
+    const itemId = rowInfo.itemId;
     if (!itemId || seen.has(itemId)) continue;
     seen.add(itemId);
     const row = document.createElement('div');
     row.className = 'managed-context-anchor-item';
-    const content = compactSessionText(entry.querySelector('.log-content')?.textContent || entry.textContent || '');
+    const content = rowInfo.content || '';
     row.innerHTML =
       `<div><div class="managed-context-anchor-id">${escapeHtml(itemId)}</div>` +
       `<div class="managed-context-muted">${escapeHtml(content || 'tool call')}</div></div>`;
@@ -11434,12 +11457,14 @@ function renderManagedContextAnchors() {
     btn.type = 'button';
     btn.className = 'managed-context-btn';
     btn.textContent = 'Use';
-    btn.addEventListener('click', () => fillManagedContextAnchor(itemId, entry.dataset.sessionId || sid));
+    btn.addEventListener('click', () => fillManagedContextAnchor(itemId, rowInfo.sessionId || sid));
     row.appendChild(btn);
     host.appendChild(row);
   }
   if (!host.childElementCount) {
-    host.innerHTML = '<div class="managed-context-muted">No item anchors in the visible log yet.</div>';
+    host.innerHTML = managedContextAnchorsLoading
+      ? '<div class="managed-context-muted">Loading recent anchors...</div>'
+      : '<div class="managed-context-muted">No item anchors found for this session yet.</div>';
   }
 }
 
@@ -11502,6 +11527,15 @@ async function fetchManagedContextRecords() {
   return Array.isArray(payload.records) ? payload.records : [];
 }
 
+async function fetchManagedContextAnchors() {
+  const sessionId = managedContextCurrentSessionId();
+  if (!sessionId) return [];
+  const resp = await authedFetch(`/api/managed-context/anchors?session_id=${encodeURIComponent(sessionId)}`);
+  const payload = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(payload.error || `anchors HTTP ${resp.status}`);
+  return Array.isArray(payload.anchors) ? payload.anchors : [];
+}
+
 function scheduleManagedContextRefresh(delay = 500) {
   if (activeActivitySubtab !== 'managed') return;
   if (managedContextRefreshTimer) clearTimeout(managedContextRefreshTimer);
@@ -11522,15 +11556,27 @@ async function refreshManagedContextPane(options = {}) {
   if (!sessionId) {
     managedContextStatus = null;
     managedContextRecords = [];
+    managedContextAnchors = [];
+    managedContextRecordsLoading = false;
+    managedContextAnchorsLoading = false;
     managedContextLastError = '';
     renderManagedContextPane();
     return;
   }
   managedContextLastError = '';
-  const [statusResult, recordsResult] = await Promise.allSettled([
+  managedContextRecordsLoading = true;
+  managedContextAnchorsLoading = true;
+  renderManagedContextPane();
+  const [statusResult, recordsResult, anchorsResult] = await Promise.allSettled([
     live ? fetchManagedContextStatus() : Promise.resolve(null),
     fetchManagedContextRecords(),
+    fetchManagedContextAnchors(),
   ]);
+  if (managedContextCurrentSessionId() !== sessionId) {
+    return;
+  }
+  managedContextRecordsLoading = false;
+  managedContextAnchorsLoading = false;
   const errors = [];
   if (statusResult.status === 'fulfilled') {
     managedContextStatus = statusResult.value;
@@ -11547,6 +11593,14 @@ async function refreshManagedContextPane(options = {}) {
     const message = recordsResult.reason?.message || String(recordsResult.reason || 'unknown error');
     errors.push(`Records unavailable: ${message}`);
     if (options.force) console.warn('Managed context records refresh failed:', recordsResult.reason);
+  }
+  if (anchorsResult.status === 'fulfilled') {
+    managedContextAnchors = anchorsResult.value;
+  } else {
+    managedContextAnchors = [];
+    const message = anchorsResult.reason?.message || String(anchorsResult.reason || 'unknown error');
+    errors.push(`Anchors unavailable: ${message}`);
+    if (options.force) console.warn('Managed context anchors refresh failed:', anchorsResult.reason);
   }
   managedContextLastError = errors.join(' ');
   renderManagedContextPane();
@@ -11565,7 +11619,9 @@ function renderManagedContextRecords() {
     if (result) result.textContent = 'No action yet';
   }
   if (!managedContextRecords.length) {
-    host.innerHTML = '<div class="managed-context-muted">No rewind records for this session.</div>';
+    host.innerHTML = managedContextRecordsLoading
+      ? '<div class="managed-context-muted">Loading rewind records...</div>'
+      : '<div class="managed-context-muted">No rewind records for this session.</div>';
     return;
   }
   for (const record of managedContextRecords) {

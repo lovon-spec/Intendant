@@ -94,6 +94,8 @@ const SESSION_LOG_SEARCH_READ_LIMIT: u64 = 2 * 1024 * 1024;
 const SESSION_LOG_SEARCH_FIELD_CHARS: usize = 8 * 1024;
 const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
 const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
+const MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT: usize = 64;
+const MANAGED_CONTEXT_ANCHOR_LIMIT: usize = 40;
 const FS_LIST_LIMIT: usize = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6684,6 +6686,229 @@ fn append_managed_context_records_from_dir(
     Ok(())
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ManagedContextAnchor {
+    item_id: String,
+    session_id: Option<String>,
+    intendant_session_id: Option<String>,
+    tool_name: String,
+    preview: String,
+    status: Option<String>,
+    created_at: Option<String>,
+    trace_path: String,
+}
+
+fn managed_context_anchor_timestamp(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("wall_time_unix_ms")
+        .and_then(|v| v.as_i64())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|dt| dt.to_rfc3339())
+}
+
+fn managed_context_anchor_tool_name(payload: &serde_json::Value) -> String {
+    payload
+        .pointer("/summary/label")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.pointer("/kind/type").and_then(|v| v.as_str()))
+        .unwrap_or("tool")
+        .to_string()
+}
+
+fn managed_context_anchor_preview(payload: &serde_json::Value) -> String {
+    payload
+        .pointer("/summary/input_preview")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            payload
+                .pointer("/summary/output_preview")
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| compact_text(s, 240))
+        .unwrap_or_default()
+}
+
+fn managed_context_anchor_session_id(value: &serde_json::Value) -> Option<String> {
+    value_str(value, "thread_id")
+        .or_else(|| {
+            value
+                .pointer("/payload/thread_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| value_str(value, "rollout_id"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn managed_context_anchor_matches_session(anchor: &ManagedContextAnchor, session_id: &str) -> bool {
+    anchor.session_id.as_deref() == Some(session_id)
+        || anchor.intendant_session_id.as_deref() == Some(session_id)
+}
+
+fn append_managed_context_anchors_from_trace_file(
+    anchors: &mut Vec<ManagedContextAnchor>,
+    trace_path: &Path,
+    intendant_session_id: Option<&str>,
+    session_id: Option<&str>,
+) -> std::io::Result<()> {
+    let file = std::fs::File::open(trace_path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut indexes: HashMap<String, usize> = HashMap::new();
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        match payload.get("type").and_then(|v| v.as_str()) {
+            Some("tool_call_started") => {
+                let Some(item_id) = value_str(payload, "tool_call_id")
+                    .or_else(|| value_str(payload, "model_visible_call_id"))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let anchor = ManagedContextAnchor {
+                    item_id: item_id.clone(),
+                    session_id: managed_context_anchor_session_id(&value),
+                    intendant_session_id: intendant_session_id.map(str::to_string),
+                    tool_name: managed_context_anchor_tool_name(payload),
+                    preview: managed_context_anchor_preview(payload),
+                    status: None,
+                    created_at: managed_context_anchor_timestamp(&value),
+                    trace_path: trace_path.to_string_lossy().to_string(),
+                };
+                if let Some(session_id) = session_id {
+                    if !managed_context_anchor_matches_session(&anchor, session_id) {
+                        continue;
+                    }
+                }
+                indexes.insert(item_id, anchors.len());
+                anchors.push(anchor);
+            }
+            Some("tool_call_ended" | "tool_call_runtime_ended") => {
+                let Some(item_id) = value_str(payload, "tool_call_id") else {
+                    continue;
+                };
+                let Some(index) = indexes.get(item_id.trim()).copied() else {
+                    continue;
+                };
+                if anchors[index].status.is_none() {
+                    anchors[index].status = value_str(payload, "status");
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn append_managed_context_anchors_from_dir(
+    anchors: &mut Vec<ManagedContextAnchor>,
+    seen_dirs: &mut HashSet<String>,
+    log_dir: &Path,
+    session_id: Option<&str>,
+) -> std::io::Result<()> {
+    let key = std::fs::canonicalize(log_dir)
+        .unwrap_or_else(|_| log_dir.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if !seen_dirs.insert(key) {
+        return Ok(());
+    }
+    let intendant_session_id = log_dir.file_name().and_then(|name| name.to_str());
+    let trace_root = log_dir.join("model-request-traces");
+    for trace_path in collect_recent_files(
+        &trace_root,
+        "trace.jsonl",
+        MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT,
+    ) {
+        append_managed_context_anchors_from_trace_file(
+            anchors,
+            &trace_path,
+            intendant_session_id,
+            session_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn managed_context_anchors_response_from_home(
+    request_line: &str,
+    active_log_dir: Option<&Path>,
+    home: &Path,
+) -> String {
+    let session_id = request_query_param(request_line, "session_id")
+        .or_else(|| request_query_param(request_line, "session"))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    let mut anchors = Vec::new();
+    let mut seen_dirs = HashSet::new();
+
+    if let Some(log_dir) = active_log_dir {
+        if let Err(err) = append_managed_context_anchors_from_dir(
+            &mut anchors,
+            &mut seen_dirs,
+            log_dir,
+            session_id.as_deref(),
+        ) {
+            return json_error(
+                "500 Internal Server Error",
+                format!("failed to read managed-context anchors: {err}"),
+            );
+        }
+    } else if session_id.is_none() {
+        return json_error(
+            "404 Not Found",
+            "managed-context anchors need an active session log",
+        );
+    }
+
+    if session_id.is_some() {
+        let logs_dir = home.join(".intendant").join("logs");
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                let log_dir = entry.path();
+                if !log_dir.is_dir() {
+                    continue;
+                }
+                if let Err(err) = append_managed_context_anchors_from_dir(
+                    &mut anchors,
+                    &mut seen_dirs,
+                    &log_dir,
+                    session_id.as_deref(),
+                ) {
+                    return json_error(
+                        "500 Internal Server Error",
+                        format!("failed to read managed-context anchors: {err}"),
+                    );
+                }
+            }
+        }
+    }
+
+    anchors.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let mut seen_items = HashSet::new();
+    anchors.retain(|anchor| seen_items.insert(anchor.item_id.clone()));
+    anchors.truncate(MANAGED_CONTEXT_ANCHOR_LIMIT);
+    json_ok(serde_json::json!({ "anchors": anchors }))
+}
+
+#[cfg(test)]
+fn managed_context_anchors_response(request_line: &str, log_dir: &Path) -> String {
+    managed_context_anchors_response_from_home(
+        request_line,
+        Some(log_dir),
+        &crate::platform::home_dir(),
+    )
+}
+
 fn managed_context_records_response_from_home(
     request_line: &str,
     active_log_dir: Option<&Path>,
@@ -12143,6 +12368,32 @@ pub fn spawn_web_gateway(
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/managed-context/anchors")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = match session_log.as_ref() {
+                            Some(log) => match log.lock() {
+                                Ok(log) => {
+                                    let active_log_dir = log.dir().to_path_buf();
+                                    managed_context_anchors_response_from_home(
+                                        &request_line,
+                                        Some(active_log_dir.as_path()),
+                                        &crate::platform::home_dir(),
+                                    )
+                                }
+                                Err(_) => json_error(
+                                    "500 Internal Server Error",
+                                    "session log lock poisoned",
+                                ),
+                            },
+                            None => managed_context_anchors_response_from_home(
+                                &request_line,
+                                None,
+                                &crate::platform::home_dir(),
+                            ),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
                         && request_line.contains(" /api/managed-context/records")
                     {
                         use tokio::io::AsyncWriteExt;
@@ -15153,7 +15404,11 @@ mod tests {
     fn managed_context_records_response_scans_historical_logs_for_session_id() {
         let home = tempfile::tempdir().unwrap();
         let active = tempfile::tempdir().unwrap();
-        let old_log = home.path().join(".intendant").join("logs").join("wrapper-a");
+        let old_log = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-a");
         crate::context_rewind::persist_record(
             &old_log,
             &managed_context_test_record(
@@ -15188,6 +15443,114 @@ mod tests {
             .map(|record| record["record_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["historical"]);
+    }
+
+    #[test]
+    fn managed_context_anchors_response_reads_trace_anchors_by_backend_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace_dir = dir.path().join("model-request-traces").join("trace-a");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        let trace_path = trace_dir.join("trace.jsonl");
+        let lines = [
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944111933i64,
+                "rollout_id": "codex-thread-a",
+                "thread_id": "codex-thread-a",
+                "payload": {
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-visible",
+                    "kind": { "type": "exec_command" },
+                    "summary": {
+                        "label": "exec_command",
+                        "input_preview": "{\"cmd\":\"pwd\"}"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944112003i64,
+                "rollout_id": "codex-thread-a",
+                "thread_id": "codex-thread-a",
+                "payload": {
+                    "type": "tool_call_ended",
+                    "tool_call_id": "call-visible",
+                    "status": "completed"
+                }
+            }),
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944113000i64,
+                "rollout_id": "other-thread",
+                "thread_id": "other-thread",
+                "payload": {
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-hidden",
+                    "kind": { "type": "exec_command" }
+                }
+            }),
+        ];
+        std::fs::write(
+            trace_path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let response = managed_context_anchors_response(
+            "GET /api/managed-context/anchors?session_id=codex-thread-a HTTP/1.1",
+            dir.path(),
+        );
+        let body = response_json_body(&response);
+        let anchors = body["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0]["item_id"], "call-visible");
+        assert_eq!(anchors[0]["session_id"], "codex-thread-a");
+        assert_eq!(anchors[0]["tool_name"], "exec_command");
+        assert_eq!(anchors[0]["status"], "completed");
+        assert!(anchors[0]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("\"cmd\":\"pwd\""));
+    }
+
+    #[test]
+    fn managed_context_anchors_response_accepts_wrapper_session_alias() {
+        let home = tempfile::tempdir().unwrap();
+        let active = tempfile::tempdir().unwrap();
+        let old_log = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-a");
+        let trace_dir = old_log.join("model-request-traces").join("trace-a");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        std::fs::write(
+            trace_dir.join("trace.jsonl"),
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944111933i64,
+                "rollout_id": "codex-thread-a",
+                "thread_id": "codex-thread-a",
+                "payload": {
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-wrapper",
+                    "kind": { "type": "exec_command" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response = managed_context_anchors_response_from_home(
+            "GET /api/managed-context/anchors?session_id=wrapper-a HTTP/1.1",
+            Some(active.path()),
+            home.path(),
+        );
+        let body = response_json_body(&response);
+        let anchors = body["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0]["item_id"], "call-wrapper");
+        assert_eq!(anchors[0]["intendant_session_id"], "wrapper-a");
     }
 
     #[test]
