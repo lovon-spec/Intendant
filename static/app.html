@@ -11011,6 +11011,7 @@ let managedContextRefreshTimer = null;
 let managedContextRpcSeq = 1;
 let managedContextSessionManuallySelected = false;
 let managedContextSessionsLoadInFlight = null;
+let managedContextActiveSessionId = '';
 
 function managedContextEl(id) {
   return document.getElementById(id);
@@ -11274,6 +11275,34 @@ function renderManagedContextSessionSelect() {
   }
 }
 
+function resetManagedContextSessionDraft() {
+  [
+    'managed-context-anchor',
+    'managed-context-reason',
+    'managed-context-primer',
+    'managed-context-preserve',
+    'managed-context-discard',
+    'managed-context-artifacts',
+    'managed-context-next-steps',
+    'managed-context-record-id',
+    'managed-context-backout-name',
+  ].forEach(id => {
+    const el = managedContextEl(id);
+    if (el) el.value = '';
+  });
+  const allowCacheReset = managedContextEl('managed-context-allow-cache-reset');
+  if (allowCacheReset) allowCacheReset.checked = false;
+  const result = managedContextEl('managed-context-action-result');
+  if (result) result.textContent = 'No action yet';
+}
+
+function syncManagedContextActiveSession() {
+  const sessionId = managedContextCurrentSessionId();
+  if (sessionId === managedContextActiveSessionId) return;
+  managedContextActiveSessionId = sessionId;
+  resetManagedContextSessionDraft();
+}
+
 function managedContextNumber(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
@@ -11415,14 +11444,15 @@ function renderManagedContextAnchors() {
 }
 
 function fillManagedContextAnchor(itemId, sessionId = '') {
-  const anchor = managedContextEl('managed-context-anchor');
-  if (anchor) anchor.value = itemId || '';
   const sid = String(sessionId || '').trim();
   if (sid) {
     renderManagedContextSessionSelect();
     const sel = managedContextEl('managed-context-session');
     if (sel && Array.from(sel.options).some(o => o.value === sid)) sel.value = sid;
+    syncManagedContextActiveSession();
   }
+  const anchor = managedContextEl('managed-context-anchor');
+  if (anchor) anchor.value = itemId || '';
   showControlToast('info', 'Managed context anchor selected');
 }
 window.fillManagedContextAnchor = fillManagedContextAnchor;
@@ -11484,6 +11514,7 @@ function scheduleManagedContextRefresh(delay = 500) {
 async function refreshManagedContextPane(options = {}) {
   await ensureManagedContextSessionsLoaded();
   renderManagedContextSessionSelect();
+  syncManagedContextActiveSession();
   renderManagedContextAnchors();
   const sessionId = managedContextCurrentSessionId();
   const meta = managedContextSessionMeta(sessionId);
@@ -11526,6 +11557,13 @@ function renderManagedContextRecords() {
   if (!host) return;
   host.innerHTML = '';
   const selected = String(managedContextEl('managed-context-record-id')?.value || '').trim();
+  const selectedExists = selected && managedContextRecords.some(record => record.record_id === selected);
+  if (selected && !selectedExists) {
+    const input = managedContextEl('managed-context-record-id');
+    if (input) input.value = '';
+    const result = managedContextEl('managed-context-action-result');
+    if (result) result.textContent = 'No action yet';
+  }
   if (!managedContextRecords.length) {
     host.innerHTML = '<div class="managed-context-muted">No rewind records for this session.</div>';
     return;
