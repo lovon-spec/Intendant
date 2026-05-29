@@ -14833,6 +14833,10 @@ function sessionConfigSource(meta = {}) {
   return normalizeAgentId(
     meta.backendSource ||
     meta.backend_source ||
+    meta.configuredSource ||
+    meta.configured_source ||
+    meta.backendSourceLabel ||
+    meta.backend_source_label ||
     meta.source ||
     meta.source_label ||
     meta.sourceLabel ||
@@ -29710,9 +29714,35 @@ function renderSessionsList(sessions, el, options = {}) {
   const fragment = document.createDocumentFragment();
 
   for (const s of sorted) {
-    const source = s.source || 'intendant';
+    const configMeta = sessionConfigMetadata(s);
+    const configSource = sessionConfigSource(configMeta);
+    const rawSource = normalizeAgentId(s.source || '') || 'intendant';
+    const backendSource = normalizeAgentId(
+      s.backend_source ||
+      s.backendSource ||
+      s.configured_source ||
+      s.configuredSource ||
+      configMeta.backend_source ||
+      configMeta.backendSource ||
+      configMeta.configured_source ||
+      configMeta.configuredSource ||
+      ''
+    );
+    const hasExternalBackend = !!(
+      backendSource && backendSource !== 'intendant' ||
+      configSource && configSource !== 'intendant' ||
+      s.backend_session_id ||
+      s.backendSessionId ||
+      configMeta.backendSessionId ||
+      configMeta.backend_session_id
+    );
+    const source = hasExternalBackend
+      ? (backendSource && backendSource !== 'intendant'
+        ? backendSource
+        : (configSource && configSource !== 'intendant' ? configSource : 'external'))
+      : rawSource;
     const shortId = (s.session_id || '').substring(0, 8);
-    const isExternal = source !== 'intendant';
+    const isExternal = hasExternalBackend || source !== 'intendant';
     const isCurrent = currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
 
     // Override status for current session — never show as abandoned/idle
@@ -29776,7 +29806,15 @@ function renderSessionsList(sessions, el, options = {}) {
 
     const sourceEl = document.createElement('span');
     sourceEl.className = 'sc-source' + (isExternal ? '' : ' local');
-    sourceEl.textContent = s.source_label || (isExternal ? prettyAgentName(source) : 'Intendant') || source;
+    sourceEl.textContent = isExternal
+      ? (
+        s.backend_source_label ||
+        s.backendSourceLabel ||
+        (rawSource !== 'intendant' ? (s.source_label || s.sourceLabel) : '') ||
+        prettyAgentName(source) ||
+        source
+      )
+      : (s.source_label || s.sourceLabel || 'Intendant');
     top.appendChild(sourceEl);
 
     if (s.role) {
@@ -29992,7 +30030,6 @@ function renderSessionsList(sessions, el, options = {}) {
         actions.appendChild(renameBtn);
       }
 
-      const configSource = sessionConfigSource(sessionConfigMetadata(s));
       if (sessionId && configSource && configSource !== 'intendant') {
         const configBtn = document.createElement('button');
         configBtn.className = 'sc-rename-btn';
