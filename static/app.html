@@ -398,6 +398,7 @@ html, body {
 .settings-row input[type="number"],
 .settings-row select {
   flex: 1;
+  min-width: 0;
   padding: 6px 10px;
   border: 1px solid var(--surface1);
   border-radius: 4px;
@@ -6426,6 +6427,31 @@ html, body {
   }
   .status-bar .session { display: inline-block; flex-shrink: 1; }
   .tab-btn { padding: 8px 12px; min-height: 40px; font-size: 12px; }
+  .settings-pane-body {
+    padding: 12px;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+  }
+  .settings-group {
+    min-width: 0;
+    padding: 10px 12px;
+  }
+  .settings-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .settings-row label {
+    min-width: 0;
+  }
+  .settings-row input[type="text"],
+  .settings-row input[type="number"],
+  .settings-row input[type="password"],
+  .settings-row select {
+    width: 100%;
+    box-sizing: border-box;
+  }
   .subtabs {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
