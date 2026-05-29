@@ -9966,9 +9966,48 @@ async function parseChangesResponse(resp) {
   return data;
 }
 
+function normalizeChangesRootPath(value) {
+  return String(value || '').trim().replace(/[\\/]+$/, '');
+}
+
+function currentChangesTargetMismatchReason() {
+  const sid = String(currentSessionFullId || foregroundSessionFullId || '').trim();
+  if (!sid) return '';
+  const meta = sessionMetadataById.get(sid) || {};
+  const win = sessionWindows.get(sid) || null;
+  const source = externalSourceForSessionWindow(sid, win)
+    || normalizeAgentId(meta.source || meta.backendSource || '');
+  if (!source || source === 'intendant') return '';
+
+  const trackedRoot = normalizeChangesRootPath(dashboardProjectRoot);
+  const targetRoot = normalizeChangesRootPath(meta.projectRoot || meta.cwd);
+  if (!trackedRoot || !targetRoot || trackedRoot === targetRoot) return '';
+
+  const sourceLabel = meta.sourceLabel || meta.backendSource || source;
+  return `Change tracking is attached to ${compactPathLabel(trackedRoot, true)}, but the selected ${sourceLabel} session is in ${compactPathLabel(targetRoot, true)}.`;
+}
+
+function showChangesTargetMismatch(message) {
+  activeChangesFile = null;
+  changedFiles.clear();
+  renderChangesFileList(message || 'Change tracking unavailable for selected target');
+  const header = document.getElementById('changes-diff-header');
+  if (header) header.textContent = 'Change tracking unavailable';
+  const content = document.getElementById('changes-diff-content');
+  if (content) {
+    content.innerHTML = `<span class="changes-empty">${escapeHtml(message || 'Change tracking unavailable for selected target')}</span>`;
+  }
+  updateChangesBadge();
+}
+
 async function refreshChangesList(options = {}) {
   const { selectFirst = false, refreshActive = false, quiet = false } = options;
   const seq = ++changesRefreshSeq;
+  const targetMismatch = currentChangesTargetMismatchReason();
+  if (targetMismatch) {
+    showChangesTargetMismatch(targetMismatch);
+    return;
+  }
   try {
     const resp = await fetch('/api/session/current/changes');
     const data = await parseChangesResponse(resp);
@@ -10080,6 +10119,12 @@ window.selectChangesFile = selectChangesFile;
 let historyCache = null;
 
 async function refreshHistory() {
+  if (currentChangesTargetMismatchReason()) {
+    historyCache = null;
+    const wrap = document.getElementById('changes-timeline');
+    if (wrap) wrap.style.display = 'none';
+    return;
+  }
   try {
     const r = await fetch('/api/session/current/history');
     if (!r.ok) {
