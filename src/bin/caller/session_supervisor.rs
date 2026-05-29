@@ -754,8 +754,10 @@ impl SessionSupervisor {
                 .find_managed_session_id(&source_norm, &session_id, &resume_token)
                 .await
             {
-                let mut state = self.state.lock().await;
-                state.active_session_id = Some(existing_id);
+                {
+                    let mut state = self.state.lock().await;
+                    state.active_session_id = Some(existing_id);
+                }
                 self.emit_attached_status(&resume_token, &source_norm).await;
             } else if external_backend.is_none() {
                 match session_log::SessionLog::find_session_by_id(&session_id) {
@@ -2891,6 +2893,72 @@ mod tests {
 
         let state = supervisor.state.lock().await;
         assert!(state.session_is_managed("parent-thread"));
+    }
+
+    #[tokio::test]
+    async fn resume_managed_external_session_without_task_attaches_without_deadlock() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (tx, _rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                ManagedSession {
+                    session_id: "parent-thread".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                },
+            );
+        }
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            supervisor.resume_session(
+                "codex".to_string(),
+                "parent-thread".to_string(),
+                Some("parent-thread".to_string()),
+                Some("/tmp/project".to_string()),
+                None,
+                Some(true),
+                Vec::new(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("attach-only resume should not deadlock");
+
+        {
+            let state = supervisor.state.lock().await;
+            assert_eq!(state.active_session_id.as_deref(), Some("parent-thread"));
+        }
+
+        let mut saw_status = false;
+        let mut saw_attach = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            match event {
+                AppEvent::StatusUpdate {
+                    session_id, phase, ..
+                } if session_id == "parent-thread" && phase == "idle" => {
+                    saw_status = true;
+                }
+                AppEvent::SessionAttached { session_id, source }
+                    if session_id == "parent-thread" && source == "codex" =>
+                {
+                    saw_attach = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_status, "attach-only resume should emit current status");
+        assert!(saw_attach, "attach-only resume should emit SessionAttached");
     }
 
     #[tokio::test]
