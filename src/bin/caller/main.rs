@@ -3934,8 +3934,18 @@ async fn drain_external_agent_events(
                         }
                         match agent.steer_turn(&text).await {
                             Ok(()) => {
+                                let accepted_session_id = target_session_id.clone();
+                                emit_user_message_log(
+                                    config.bus,
+                                    config.session_log,
+                                    accepted_session_id.as_deref(),
+                                    None,
+                                    None,
+                                    None,
+                                    &text,
+                                );
                                 pending_runtime_steers.push_back(PendingRuntimeSteer {
-                                    session_id: target_session_id.clone(),
+                                    session_id: accepted_session_id.clone(),
                                     id: id.clone(),
                                     text: text.clone(),
                                 });
@@ -3947,7 +3957,7 @@ async fn drain_external_agent_events(
                                     l.info(&format!("Steer accepted by {}", agent.name()))
                                 });
                                 config.bus.send(AppEvent::SteerAccepted {
-                                    session_id: target_session_id,
+                                    session_id: accepted_session_id,
                                     id,
                                     reason,
                                 });

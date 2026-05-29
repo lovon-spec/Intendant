@@ -6576,6 +6576,16 @@ html, body {
     flex: 0 0 auto;
     min-height: 36px;
   }
+  #activity-subtabs {
+    flex-wrap: wrap;
+    overflow-x: hidden;
+    row-gap: 2px;
+  }
+  #activity-subtabs .subtab-btn {
+    flex: 1 1 auto;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
   .activity-toolbar {
     flex-wrap: wrap;
     align-items: center;
@@ -15827,9 +15837,14 @@ function renderSessionRelationships() {
   if (!grid) return;
   const svg = ensureSessionRelationshipOverlay(grid);
   svg.replaceChildren();
-  svg.setAttribute('width', Math.max(grid.scrollWidth, grid.clientWidth));
-  svg.setAttribute('height', Math.max(grid.scrollHeight, grid.clientHeight));
-  svg.setAttribute('viewBox', `0 0 ${Math.max(grid.scrollWidth, grid.clientWidth)} ${Math.max(grid.scrollHeight, grid.clientHeight)}`);
+  const previousDisplay = svg.style.display || '';
+  svg.style.display = 'none';
+  const overlayWidth = Math.max(grid.scrollWidth, grid.clientWidth);
+  const overlayHeight = Math.max(grid.scrollHeight, grid.clientHeight);
+  svg.style.display = previousDisplay;
+  svg.setAttribute('width', overlayWidth);
+  svg.setAttribute('height', overlayHeight);
+  svg.setAttribute('viewBox', `0 0 ${overlayWidth} ${overlayHeight}`);
 
   for (const [sid, win] of sessionWindows) {
     win.el.classList.remove('relationship-parent-highlight', 'relationship-child-highlight');
