@@ -2093,6 +2093,7 @@ html, body {
   flex: 1;
   min-width: 0;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
 }
 .log-state-badges {
@@ -3655,11 +3656,13 @@ html, body {
 }
 .session-detail { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .session-detail-header {
-  display: flex; align-items: center; gap: 12px;
+  display: flex; align-items: flex-start; gap: 12px;
   position: sticky; top: 0; z-index: 20;
   padding: 8px 0; border-bottom: 1px solid var(--surface0); margin-bottom: 8px;
   background: var(--base);
   flex-shrink: 0;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .session-back-btn {
   background: var(--surface0); border: 1px solid var(--surface1);
@@ -3668,7 +3671,7 @@ html, body {
 }
 .session-back-btn:hover { background: var(--surface1); }
 .session-detail-title {
-  flex: 1 1 auto;
+  flex: 1 1 360px;
   min-width: 0;
   color: var(--text);
   font-size: 13px;
@@ -3682,6 +3685,7 @@ html, body {
   align-items: baseline;
   gap: 6px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 .session-detail-title .sd-title-subline {
   color: var(--overlay1);
@@ -3708,22 +3712,23 @@ html, body {
 }
 .session-detail-title .sd-title-text {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
 }
 .session-detail-title .sd-title-id {
   flex: 0 1 auto;
-  min-width: 12ch;
+  min-width: 0;
   color: var(--overlay1);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   user-select: text;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
 }
 .session-detail-action-btn {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  max-width: 100%;
   background: var(--surface0);
   border: 1px solid var(--surface1);
   border-radius: 4px;
@@ -3887,9 +3892,9 @@ html, body {
   color: var(--text);
   font-weight: 600;
   line-height: 1.3;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
 }
 .session-card .sc-id {
   font-size: 11px;
@@ -4018,9 +4023,17 @@ html, body {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
 }
 .session-card .sc-meta .label { color: var(--overlay0); }
-.session-card .sc-meta .value { color: var(--subtext0); }
+.session-card .sc-meta .value {
+  color: var(--subtext0);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .session-card .sc-meta .provider-val { color: var(--blue); }
 .session-card .sc-meta .model-val { color: var(--green); }
 .session-card .sc-meta.sc-media {
