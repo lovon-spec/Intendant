@@ -22312,6 +22312,7 @@ function focusNewSessionInput() {
 
 function switchSessionsSubtab(name) {
   const next = VALID_SESSIONS_SUBTABS.includes(name) ? name : 'recent';
+  if (currentSessionDetail) closeSessionDetail();
   activeSessionsSubtab = next;
   document.querySelectorAll('#sessions-subtabs .subtab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.sessionsTab === next);
