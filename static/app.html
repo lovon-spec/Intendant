@@ -30341,14 +30341,31 @@ function renderWorktreesList(scan, el) {
 
 function resumeSession(s) {
   if (!app || !s || !s.session_id) return;
+  const sid = String(s.session_id || '').trim();
+  if (!sid) return;
   const source = normalizeAgentId(s.backend_source || s.source || '') || 'intendant';
+  const resumeId = String(s.backend_session_id || s.resume_id || sid).trim() || sid;
+  const projectRoot = s.project_root || s.projectRoot || null;
+  const meta = {
+    ...sessionWindowMetaFromSession(s),
+    source,
+    source_label: prettyAgentName(source) || source,
+    backend_source: source,
+    backend_session_id: resumeId,
+    project_root: projectRoot,
+    phase: 'idle',
+    ended: false,
+  };
+  ensureSessionWindow(sid, meta);
+  if (source !== 'intendant') setSessionWindowDetached(sid, true, 'resume requested');
+  focusSessionWindow(sid);
   const overrides = sessionLaunchOverridesForSession(s);
   app.send_server_action({
     action: 'resume_session',
     source,
-    session_id: s.session_id,
-    resume_id: s.backend_session_id || s.resume_id || s.session_id,
-    project_root: s.project_root || null,
+    session_id: sid,
+    resume_id: resumeId,
+    project_root: projectRoot,
     direct: true,
     ...overrides,
   });
