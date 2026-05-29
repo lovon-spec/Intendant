@@ -11116,6 +11116,21 @@ function queueDetachedCodexThreadAction(sessionId, op, params = {}) {
   return true;
 }
 
+function canAttachSessionWindow(sessionId, win = null) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  if (sessionWindowIsSide(sid) || sessionWindowIsSubagent(sid)) return false;
+  const source = externalSourceForSessionWindow(sid, win);
+  return !!source && source !== 'intendant' && sessionWindowIsDetached(sid);
+}
+
+function canQueueDetachedCodexThreadAction(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionWindowIsCodex(sid) || !canAttachSessionWindow(sid)) return false;
+  const resume = detachedSessionResumeMessage(sid, '', true, []);
+  return !!resume && normalizeAgentId(resume.source) === 'codex';
+}
+
 function flushPendingDetachedCodexThreadActions(sessionId) {
   const ids = sessionIdsForPendingDetachedActions(sessionId);
   for (const sid of ids) {
@@ -15134,6 +15149,7 @@ const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
   { op: 'rename-session', label: 'Rename session...', title: 'Rename this session' },
   { op: 'configure-launch', label: 'Launch config...', title: 'Configure the binary and managed-context mode used on next attach/resume' },
+  { op: 'attach-session', label: 'Attach session', title: 'Attach this backend without sending a prompt' },
   { op: 'restart-session', label: 'Restart with saved config', title: 'Stop this backend and resume it with saved launch config' },
   { op: 'stop-session', label: 'Stop session...', title: 'Stop the live backend and remove it from active dashboards', danger: true },
 ];
@@ -15412,6 +15428,9 @@ function codexThreadActionStateForSession(sessionId, op) {
     return { allowed: false, reason: 'Unsupported for Codex subagent threads' };
   }
   if (!isSessionWindowEffectivelyActive(sessionId)) {
+    if (canQueueDetachedCodexThreadAction(sessionId)) {
+      return { allowed: true, reason: 'Attach session to run this action' };
+    }
     return { allowed: false, reason: 'Start a task in this Codex session first' };
   }
   return { allowed: true, reason: '' };
@@ -15469,6 +15488,17 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   win.actionMenuButton.disabled = false;
   win.actionMenuButton.title = 'Session actions';
   win.actionMenuButton.setAttribute('aria-label', win.actionMenuButton.title);
+  win.actionMenu?.querySelectorAll('[data-session-window-generic-action]').forEach(item => {
+    const op = item.dataset.sessionWindowAction || '';
+    if (op !== 'attach-session') return;
+    const visible = canAttachSessionWindow(sid, win);
+    item.classList.toggle('hidden', !visible);
+    item.disabled = !visible;
+    item.title = visible
+      ? 'Attach this backend without sending a prompt'
+      : 'Session is already attached';
+    item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
+  });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
     const op = item.dataset.sessionWindowAction || '';
     const spec = sessionWindowCodexActionByOp(op);
@@ -15975,6 +16005,20 @@ function restartSessionWindowAction(sessionId) {
   showControlToast('info', `Restarting session ${shortSessionId(sid)} with saved config`);
 }
 
+function attachSessionWindowAction(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!canAttachSessionWindow(sid)) {
+    showControlToast('info', `Session ${shortSessionId(sid)} is already attached`);
+    return;
+  }
+  const msg = sessionWindowExternalActionContext(sid);
+  if (!msg) return;
+  delete msg.task;
+  delete msg.attachments;
+  dispatchControlMsg(msg);
+  showControlToast('info', `Attaching session ${shortSessionId(sid)}`);
+}
+
 function runSessionWindowAction(sessionId, op) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -16001,6 +16045,10 @@ function runSessionWindowAction(sessionId, op) {
   }
   if (op === 'restart-session') {
     restartSessionWindowAction(sid);
+    return;
+  }
+  if (op === 'attach-session') {
+    attachSessionWindowAction(sid);
     return;
   }
   if (op === 'stop-session') {
@@ -16062,6 +16110,7 @@ function appendSessionWindowActionMenuItem(parent, action, codex = false) {
   item.dataset.sessionWindowAction = action.op;
   if (action.danger) item.classList.add('danger');
   if (codex) item.dataset.sessionWindowCodexAction = '1';
+  else item.dataset.sessionWindowGenericAction = '1';
   item.setAttribute('role', 'menuitem');
   parent.appendChild(item);
   return item;
