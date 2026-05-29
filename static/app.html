@@ -4529,8 +4529,12 @@ html, body {
   border: 1px solid var(--surface1);
   border-radius: 8px;
   padding: 24px;
-  min-width: 420px;
+  box-sizing: border-box;
+  width: min(560px, calc(100vw - 32px));
+  min-width: min(420px, calc(100vw - 32px));
   max-width: 560px;
+  max-height: calc(100vh - 32px);
+  overflow: auto;
   box-shadow: 0 8px 32px rgba(0,0,0,0.4);
 }
 .modal-dialog h3 {
@@ -4559,6 +4563,16 @@ html, body {
   font-size: 12px;
   border-radius: 2px;
 }
+.dashboard-confirm-message {
+  color: var(--subtext0);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.dashboard-confirm-dialog .modal-warning {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .modal-actions {
   display: flex;
   justify-content: flex-end;
@@ -4573,7 +4587,8 @@ html, body {
   font-weight: 600;
 }
 .modal-cancel { background: var(--surface1); color: var(--text); }
-.modal-confirm { background: var(--red); color: var(--base); }
+.modal-confirm { background: var(--blue); color: var(--base); }
+.modal-confirm.danger { background: var(--red); color: var(--base); }
 .modal-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
 .fs-picker-dialog {
   width: min(720px, calc(100vw - 32px));
@@ -8158,7 +8173,7 @@ html, body {
     <div class="modal-warning" id="rollback-warning" style="display:none"></div>
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeRollbackModal()">Cancel</button>
-      <button class="modal-confirm" id="rollback-confirm-btn" onclick="confirmRollback()">Roll back</button>
+      <button class="modal-confirm danger" id="rollback-confirm-btn" onclick="confirmRollback()">Roll back</button>
     </div>
   </div>
 </div>
@@ -8247,6 +8262,18 @@ html, body {
     <div class="modal-actions">
       <button class="modal-cancel" type="button" onclick="closeSessionDeleteModal()">Cancel</button>
       <button class="modal-confirm danger" type="button" id="session-delete-confirm" onclick="confirmSessionDeleteModal()">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div id="dashboard-confirm-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog dashboard-confirm-dialog">
+    <h3 id="dashboard-confirm-title">Confirm action</h3>
+    <p class="dashboard-confirm-message" id="dashboard-confirm-message"></p>
+    <div class="modal-warning" id="dashboard-confirm-warning" style="display:none"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" id="dashboard-confirm-cancel">Cancel</button>
+      <button class="modal-confirm danger" type="button" id="dashboard-confirm-accept">Continue</button>
     </div>
   </div>
 </div>
@@ -10307,6 +10334,51 @@ window.updateRollbackWarning = updateRollbackWarning;
   if (convEl) convEl.addEventListener('change', updateRollbackWarning);
 }
 
+let dashboardConfirmPending = null;
+
+function closeDashboardConfirmModal(result = false) {
+  const pending = dashboardConfirmPending;
+  dashboardConfirmPending = null;
+  const modal = document.getElementById('dashboard-confirm-modal');
+  if (modal) modal.style.display = 'none';
+  if (pending && typeof pending.resolve === 'function') pending.resolve(!!result);
+}
+window.closeDashboardConfirmModal = closeDashboardConfirmModal;
+
+function showDashboardConfirm(opts = {}) {
+  return new Promise(resolve => {
+    if (dashboardConfirmPending) closeDashboardConfirmModal(false);
+    dashboardConfirmPending = { resolve };
+
+    const title = document.getElementById('dashboard-confirm-title');
+    const message = document.getElementById('dashboard-confirm-message');
+    const warning = document.getElementById('dashboard-confirm-warning');
+    const accept = document.getElementById('dashboard-confirm-accept');
+    const cancel = document.getElementById('dashboard-confirm-cancel');
+    const modal = document.getElementById('dashboard-confirm-modal');
+
+    if (title) title.textContent = opts.title || 'Confirm action';
+    if (message) message.textContent = opts.message || '';
+    if (warning) {
+      const warningText = opts.warning || '';
+      warning.textContent = warningText;
+      warning.style.display = warningText ? '' : 'none';
+    }
+    if (accept) {
+      accept.textContent = opts.confirmLabel || 'Continue';
+      accept.className = 'modal-confirm' + (opts.danger === false ? '' : ' danger');
+    }
+    if (cancel) cancel.textContent = opts.cancelLabel || 'Cancel';
+    if (modal) {
+      modal.style.display = 'flex';
+      setTimeout(() => accept?.focus(), 0);
+    } else {
+      closeDashboardConfirmModal(false);
+    }
+  });
+}
+window.showDashboardConfirm = showDashboardConfirm;
+
 async function confirmRollback() {
   if (pendingRollbackRoundId === null || pendingRollbackRoundId === undefined) return;
   const roundId = pendingRollbackRoundId;
@@ -10334,12 +10406,12 @@ async function confirmRollback() {
         const t = await resp.text().catch(() => '');
         if (t) errMsg = t;
       }
-      alert(`Rollback failed: ${errMsg}`);
+      showControlToast('error', `Rollback failed: ${errMsg}`);
     }
     // Success: backend emits `rolled_back` / `conversation_rolled_back`
     // events, the WASM layer raises HistoryChanged, and the UI refreshes.
   } catch (e) {
-    alert(`Rollback failed: ${e.message || e}`);
+    showControlToast('error', `Rollback failed: ${e.message || e}`);
   }
 }
 window.confirmRollback = confirmRollback;
@@ -10349,21 +10421,27 @@ async function doRedo() {
     const r = await fetch('/api/session/current/redo', { method: 'POST' });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
-      alert(`Redo failed: ${err.error || r.statusText}`);
+      showControlToast('error', `Redo failed: ${err.error || r.statusText}`);
     }
   } catch (e) {
-    alert(`Redo error: ${e.message || e}`);
+    showControlToast('error', `Redo error: ${e.message || e}`);
   }
 }
 window.doRedo = doRedo;
 
 async function doPrune() {
-  if (!confirm('Prune all abandoned branches?\n\nThis frees disk space but cannot be undone.')) return;
+  const ok = await showDashboardConfirm({
+    title: 'Prune abandoned branches',
+    message: 'Prune all abandoned branches?',
+    warning: 'This frees disk space but cannot be undone.',
+    confirmLabel: 'Prune',
+  });
+  if (!ok) return;
   try {
     const r = await fetch('/api/session/current/prune', { method: 'POST' });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
-      alert(`Prune failed: ${err.error || r.statusText}`);
+      showControlToast('error', `Prune failed: ${err.error || r.statusText}`);
       return;
     }
     // History event will redraw; the console line is a belt-and-suspenders
@@ -10374,7 +10452,7 @@ async function doPrune() {
       console.log(`Pruned ${data.branches_removed || 0} branches, ${mb} MB freed`);
     }
   } catch (e) {
-    alert(`Prune error: ${e.message || e}`);
+    showControlToast('error', `Prune error: ${e.message || e}`);
   }
 }
 window.doPrune = doPrune;
@@ -11225,7 +11303,7 @@ function handleSessionRenameResult(evt) {
   );
 }
 
-function promptCodexThreadActionParams(opts = {}) {
+async function promptCodexThreadActionParams(opts = {}) {
   let params = {};
   if (opts.promptName) {
     const name = window.prompt('Fork name (leave empty for auto):', '');
@@ -11280,16 +11358,23 @@ function promptCodexThreadActionParams(opts = {}) {
     const n = parseInt(opts.turns, 10);
     if (!isNaN(n) && n > 0) params.turns = n;
   }
-  if (opts.confirm && !window.confirm(opts.confirm)) return null;
+  if (opts.confirm) {
+    const ok = await showDashboardConfirm({
+      title: opts.confirmTitle || 'Confirm Codex action',
+      message: opts.confirm,
+      confirmLabel: opts.confirmLabel || 'Continue',
+    });
+    if (!ok) return null;
+  }
   return params;
 }
 
-function onControlActionBtnClick(ev) {
+async function onControlActionBtnClick(ev) {
   const btn = ev.currentTarget;
   if (btn.classList.contains('pending') || btn.disabled) return;
   const op = btn.dataset.codexAction;
   if (!op) return;
-  const params = promptCodexThreadActionParams({
+  const params = await promptCodexThreadActionParams({
     promptName: btn.dataset.promptName,
     promptSide: btn.dataset.promptSide,
     promptReview: btn.dataset.promptReview,
@@ -11297,6 +11382,8 @@ function onControlActionBtnClick(ev) {
     promptGoal: btn.dataset.promptGoal,
     turns: btn.dataset.turns,
     confirm: btn.dataset.confirm,
+    confirmTitle: btn.dataset.confirmTitle,
+    confirmLabel: btn.dataset.confirmLabel,
   });
   if (params === null) return;
   // Init is a task dispatch, not an RPC: send as a regular task instead so
@@ -15584,7 +15671,7 @@ function runSessionWindowAction(sessionId, op) {
   runSessionWindowCodexAction(sid, op);
 }
 
-function runSessionWindowCodexAction(sessionId, op) {
+async function runSessionWindowCodexAction(sessionId, op) {
   const sid = String(sessionId || '').trim();
   const spec = sessionWindowCodexActionByOp(op);
   if (!sid || !spec) return;
@@ -15597,7 +15684,7 @@ function runSessionWindowCodexAction(sessionId, op) {
     showControlToast('error', `/${op} is not available here: ${actionState.reason}`);
     return;
   }
-  const params = promptCodexThreadActionParams(spec);
+  const params = await promptCodexThreadActionParams(spec);
   if (params === null) return;
   if (dispatchCodexThreadAction(op, params, sid)) {
     markActionPending(op);
@@ -18894,14 +18981,19 @@ class DisplaySlot {
       this.deleteRecBtn.style.display = 'none';
     }
   }
-  deleteRecording() {
+  async deleteRecording() {
     if (!app) return;
     const stream = this.recordingStreamName || ('display_' + this.displayId);
-    if (confirm('Delete recording for ' + stream + '?')) {
-      app.send_server_action({ action: 'delete_recording', stream_name: stream });
-      this.deleteRecBtn.style.display = 'none';
-      this.recordingStreamName = null;
-    }
+    const ok = await showDashboardConfirm({
+      title: 'Delete recording',
+      message: `Delete recording for ${stream}?`,
+      warning: 'Recording files will be removed from this session.',
+      confirmLabel: 'Delete',
+    });
+    if (!ok) return;
+    app.send_server_action({ action: 'delete_recording', stream_name: stream });
+    this.deleteRecBtn.style.display = 'none';
+    this.recordingStreamName = null;
   }
   // Phase 5c: teardown.  `userInitiated` separates the user-close path
   // (display toggled off, `removeDisplaySlot`, etc.) from transient
@@ -21489,7 +21581,14 @@ async function submitClip(action) {
   const timestamps = computeClipTimestamps(clipInSecs, clipOutSecs, fps, clipKeyframes);
 
   if (timestamps.length > 200) {
-    if (!confirm(`This clip has ${timestamps.length} frames. Max recommended is 200. Continue?`)) return;
+    const ok = await showDashboardConfirm({
+      title: 'Create large clip',
+      message: `This clip has ${timestamps.length} frames. Max recommended is 200.`,
+      warning: 'Large clips can take longer to generate and attach.',
+      confirmLabel: 'Continue',
+      danger: false,
+    });
+    if (!ok) return;
   }
 
   clipAbort = false;
@@ -29821,15 +29920,19 @@ function recomputeWorktreeSummary(scan) {
   scan.summary = summary;
 }
 
-function removeWorktree(wt, button) {
+async function removeWorktree(wt, button) {
   const branch = wt.branch || wt.head_short || '(unknown ref)';
-  const ok = window.confirm(
-    `Remove worktree ${branch}?\n\n` +
-    `Path: ${wt.path}\n` +
-    `Repo: ${wt.repo_root}\n\n` +
-    `${wt.safety || 'This worktree was marked as safe to remove.'}\n\n` +
-    'Before removing, Intendant will re-check that this is not the main worktree, has no active sessions, is not locked, is clean, is merged or prunable, and still points at the same HEAD.'
-  );
+  const ok = await showDashboardConfirm({
+    title: 'Remove worktree',
+    message:
+      `Remove worktree ${branch}?\n\n` +
+      `Path: ${wt.path}\n` +
+      `Repo: ${wt.repo_root}`,
+    warning:
+      `${wt.safety || 'This worktree was marked as safe to remove.'}\n\n` +
+      'Before removing, Intendant will re-check that this is not the main worktree, has no active sessions, is not locked, is clean, is merged or prunable, and still points at the same HEAD.',
+    confirmLabel: 'Remove',
+  });
   if (!ok) return;
 
   if (button) button.disabled = true;
@@ -30979,6 +31082,11 @@ document.addEventListener('keydown', (e) => {
   const sessionDeleteModal = document.getElementById('session-delete-modal');
   if (sessionDeleteModal && sessionDeleteModal.style.display !== 'none') {
     closeSessionDeleteModal();
+    return;
+  }
+  const dashboardConfirmModal = document.getElementById('dashboard-confirm-modal');
+  if (dashboardConfirmModal && dashboardConfirmModal.style.display !== 'none') {
+    closeDashboardConfirmModal(false);
   }
 });
 document.getElementById('rollback-modal')?.addEventListener('click', (e) => {
@@ -31002,6 +31110,11 @@ document.getElementById('session-config-modal')?.addEventListener('click', (e) =
 document.getElementById('session-delete-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'session-delete-modal') closeSessionDeleteModal();
 });
+document.getElementById('dashboard-confirm-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'dashboard-confirm-modal') closeDashboardConfirmModal(false);
+});
+document.getElementById('dashboard-confirm-cancel')?.addEventListener('click', () => closeDashboardConfirmModal(false));
+document.getElementById('dashboard-confirm-accept')?.addEventListener('click', () => closeDashboardConfirmModal(true));
 
 // Enter to submit
 document.querySelector('#human-input')?.addEventListener('keydown', (e) => {
