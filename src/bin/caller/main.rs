@@ -3783,6 +3783,7 @@ async fn drain_external_agent_events(
             loop {
                 match watcher_rx.recv().await {
                     Ok(AppEvent::InterruptRequested { session_id })
+                    | Ok(AppEvent::SessionStopRequested { session_id, .. })
                         if event_targets_session_or_alias(
                             &session_id,
                             &watcher_session_id,
@@ -3834,6 +3835,23 @@ async fn drain_external_agent_events(
             biased;
             bus_event = bus_rx.recv() => {
                 match bus_event {
+                    Ok(AppEvent::SessionStopRequested { session_id, reason })
+                        if event_targets_session_or_alias(
+                            &session_id,
+                            &local_session_id,
+                            &alias_session_id,
+                        ) =>
+                    {
+                        if let Err(e) = agent.interrupt_turn().await {
+                            slog(config.session_log, |l| {
+                                l.warn(&format!("Stop interrupt failed for {}: {}", agent.name(), e))
+                            });
+                        }
+                        return DrainOutcome::Terminated {
+                            reason,
+                            exit_code: None,
+                        };
+                    }
                     Ok(AppEvent::InterruptRequested { session_id })
                         if event_targets_session_or_alias(
                             &session_id,
@@ -13023,6 +13041,19 @@ async fn run_external_agent_mode(
                     }
                     bus_event = external_control_rx.recv() => {
                         match bus_event {
+                            Ok(AppEvent::SessionStopRequested { session_id, reason })
+                                if event_targets_external_session_or_side(
+                                    &session_id,
+                                    &live_session_id,
+                                    &drain_config.alias_session_id,
+                                    &open_side_threads,
+                                ) =>
+                            {
+                                slog(&session_log, |l| {
+                                    l.info(&format!("Stop requested while idle: {}", reason))
+                                });
+                                break 'outer;
+                            }
                             Ok(AppEvent::SteerRequested {
                                 session_id,
                                 text,

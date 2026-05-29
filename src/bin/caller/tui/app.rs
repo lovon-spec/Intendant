@@ -1472,6 +1472,29 @@ impl App {
                     ),
                 );
             }
+            ControlMsg::StopSession { ref session_id } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Stop session requested for {}",
+                        truncate_str(session_id, 12)
+                    ),
+                );
+            }
+            ControlMsg::RestartSession {
+                ref source,
+                ref session_id,
+                ..
+            } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Restart {} session requested for {}",
+                        source,
+                        truncate_str(session_id, 12)
+                    ),
+                );
+            }
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
             | ControlMsg::GetRestartStatus
@@ -2540,6 +2563,9 @@ impl App {
                     LogSource::System,
                     None,
                 );
+            }
+            AppEvent::SessionStopRequested { .. } => {
+                // Internal lifecycle signal consumed by agent loops.
             }
             AppEvent::SessionEnded {
                 ref session_id,

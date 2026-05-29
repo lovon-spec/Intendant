@@ -543,7 +543,9 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 params: params.clone(),
             });
         }
-        ControlMsg::ResumeSession { .. } => {
+        ControlMsg::ResumeSession { .. }
+        | ControlMsg::RestartSession { .. }
+        | ControlMsg::StopSession { .. } => {
             // Routed by the daemon loop; there is no persistent config state
             // to update here.
         }

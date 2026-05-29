@@ -2275,6 +2275,28 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::StopSession { session_id } => {
+            emit_control_result(
+                control_tx,
+                "stop_session",
+                true,
+                format!("Stop session requested: {}", session_id),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::RestartSession {
+            source, session_id, ..
+        } => {
+            emit_control_result(
+                control_tx,
+                "restart_session",
+                true,
+                format!("Restart session requested: {} {}", source, session_id),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::FollowUp {
             text, direct: _, ..
         } => {
@@ -2682,6 +2704,7 @@ pub fn spawn_event_listener(
                     | AppEvent::AutonomyChanged { .. }
                     | AppEvent::CodexThreadActionRequested { .. }
                     | AppEvent::ExternalFollowUpRequested { .. }
+                    | AppEvent::SessionStopRequested { .. }
                     | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionRenameResult { .. }

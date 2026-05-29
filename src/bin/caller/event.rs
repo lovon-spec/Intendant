@@ -198,6 +198,12 @@ pub enum AppEvent {
     InterruptRequested {
         session_id: Option<String>,
     },
+    /// User requested that a managed session stop completely. External-agent
+    /// loops listen for this and shut down their backend process.
+    SessionStopRequested {
+        session_id: Option<String>,
+        reason: String,
+    },
     /// The agent turn was interrupted. Emitted by the loop once cancellation completes.
     Interrupted {
         session_id: Option<String>,
@@ -968,6 +974,32 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_managed_context: Option<String>,
     },
+    /// Stop a live managed session. Unlike hiding a dashboard card, this
+    /// removes the live session from daemon state and asks the backend process
+    /// to shut down.
+    StopSession {
+        session_id: String,
+    },
+    /// Stop a live external-agent session and immediately resume it using the
+    /// persisted launch config for that session.
+    RestartSession {
+        source: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct: Option<bool>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_managed_context: Option<String>,
+    },
     /// Set the Gemini model override. `None`/missing lets Gemini pick.
     /// Applies to the NEXT task because Gemini latches `--model` at
     /// process spawn.
@@ -1496,6 +1528,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::InterruptRequested { session_id } => Some(OutboundEvent::InterruptRequested {
             session_id: session_id.clone(),
         }),
+        AppEvent::SessionStopRequested { .. } => None,
         AppEvent::Interrupted { session_id, reason } => Some(OutboundEvent::Interrupted {
             session_id: session_id.clone(),
             reason: reason.clone(),
@@ -3105,6 +3138,48 @@ mod tests {
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
             }
             _ => panic!("expected ResumeSession"),
+        }
+    }
+
+    #[test]
+    fn control_msg_stop_session_deserializes() {
+        let json = r#"{"action":"stop_session","session_id":"thread-1"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::StopSession { session_id } => {
+                assert_eq!(session_id, "thread-1");
+            }
+            _ => panic!("expected StopSession"),
+        }
+    }
+
+    #[test]
+    fn control_msg_restart_session_deserializes_launch_overrides() {
+        let json = r#"{"action":"restart_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","direct":true,"agent_command":"/tmp/codex","codex_managed_context":"managed"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::RestartSession {
+                source,
+                session_id,
+                resume_id,
+                project_root,
+                task,
+                direct,
+                attachments,
+                agent_command,
+                codex_managed_context,
+            } => {
+                assert_eq!(source, "codex");
+                assert_eq!(session_id, "thread-1");
+                assert_eq!(resume_id.as_deref(), Some("thread-1"));
+                assert_eq!(project_root.as_deref(), Some("/repo"));
+                assert!(task.is_none());
+                assert_eq!(direct, Some(true));
+                assert!(attachments.is_empty());
+                assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
+                assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+            }
+            _ => panic!("expected RestartSession"),
         }
     }
 

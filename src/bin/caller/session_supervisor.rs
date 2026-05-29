@@ -35,6 +35,8 @@ pub struct SessionSupervisor {
 }
 
 const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const SESSION_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Default)]
 struct SupervisorState {
@@ -42,6 +44,8 @@ struct SupervisorState {
     session_aliases: HashMap<String, String>,
     related_sessions: HashMap<String, RelatedSession>,
     active_session_id: Option<String>,
+    next_session_instance: u64,
+    restart_dedupe: HashMap<String, std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +70,14 @@ struct ManagedSession {
     session_dir: PathBuf,
     follow_up_tx: mpsc::Sender<FollowUpMessage>,
     approval_registry: event::ApprovalRegistry,
+    instance_id: u64,
+    finished_rx: Option<oneshot::Receiver<()>>,
+}
+
+struct StoppedManagedSession {
+    session_id: String,
+    source: String,
+    finished_rx: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Clone)]
@@ -154,6 +166,35 @@ impl SupervisorState {
             self.active_session_id = self.sessions.keys().next().cloned();
         }
         Some((canonical, removed))
+    }
+
+    fn remove_session_instance(
+        &mut self,
+        session_id: &str,
+        instance_id: u64,
+    ) -> Option<(String, ManagedSession)> {
+        let canonical = self.resolve_session_id(session_id)?;
+        if self
+            .sessions
+            .get(&canonical)
+            .map(|session| session.instance_id != instance_id)
+            .unwrap_or(true)
+        {
+            return None;
+        }
+        self.remove_session(&canonical)
+    }
+
+    fn mark_restart_requested(&mut self, key: &str) -> bool {
+        let now = std::time::Instant::now();
+        self.restart_dedupe
+            .retain(|_, expires_at| *expires_at > now);
+        if self.restart_dedupe.contains_key(key) {
+            return false;
+        }
+        self.restart_dedupe
+            .insert(key.to_string(), now + SESSION_RESTART_DEDUPE_WINDOW);
+        true
     }
 }
 
@@ -410,6 +451,35 @@ impl SessionSupervisor {
                     attachments,
                     agent_command,
                     codex_managed_context,
+                    false,
+                )
+                .await;
+            }
+            event::ControlMsg::StopSession { session_id } => {
+                self.stop_managed_session(Some(session_id), "stopped by user")
+                    .await;
+            }
+            event::ControlMsg::RestartSession {
+                source,
+                session_id,
+                resume_id,
+                project_root,
+                task,
+                direct,
+                attachments,
+                agent_command,
+                codex_managed_context,
+            } => {
+                self.restart_session(
+                    source,
+                    session_id,
+                    resume_id,
+                    project_root,
+                    task,
+                    direct,
+                    attachments,
+                    agent_command,
+                    codex_managed_context,
                 )
                 .await;
             }
@@ -516,6 +586,8 @@ impl SessionSupervisor {
         match msg {
             event::ControlMsg::CreateSession { .. } => true,
             event::ControlMsg::ResumeSession { .. } => true,
+            event::ControlMsg::RestartSession { .. } => true,
+            event::ControlMsg::StopSession { .. } => true,
             event::ControlMsg::RenameSession { .. } => true,
             event::ControlMsg::ConfigureSessionAgent { .. } => true,
             msg if control_msg_can_attach_unmanaged_session(msg) => true,
@@ -729,6 +801,7 @@ impl SessionSupervisor {
         attachments: Vec<String>,
         agent_command: Option<String>,
         codex_managed_context: Option<String>,
+        force_new: bool,
     ) {
         let source_norm = source.trim().to_lowercase();
         let resume_task = task.and_then(|task| {
@@ -776,6 +849,7 @@ impl SessionSupervisor {
             if let Some(existing_id) = self
                 .find_managed_session_id(&source_norm, &session_id, &resume_token)
                 .await
+                .filter(|_| !force_new)
             {
                 {
                     let mut state = self.state.lock().await;
@@ -863,7 +937,7 @@ impl SessionSupervisor {
         }
         let resume_task = resume_task.expect("checked above");
 
-        if external_backend.is_some() {
+        if external_backend.is_some() && !force_new {
             if self
                 .find_managed_session_id(&source_norm, &session_id, &resume_token)
                 .await
@@ -1012,23 +1086,26 @@ impl SessionSupervisor {
         ready_for_thread_actions: Option<oneshot::Sender<()>>,
     ) {
         let (follow_up_tx, follow_up_rx) = mpsc::channel::<FollowUpMessage>(16);
+        let (finished_tx, finished_rx) = oneshot::channel();
         let approval_registry = event::ApprovalRegistry::default();
         let context_injection = event::ContextInjectionQueue::default();
-        self.register_session(
-            session_id.clone(),
-            source.clone(),
-            if task.trim().is_empty() {
-                "idle".to_string()
-            } else {
-                "thinking".to_string()
-            },
-            project.root.clone(),
-            log_dir.clone(),
-            follow_up_tx,
-            approval_registry.clone(),
-            session_name,
-        )
-        .await;
+        let session_instance_id = self
+            .register_session(
+                session_id.clone(),
+                source.clone(),
+                if task.trim().is_empty() {
+                    "idle".to_string()
+                } else {
+                    "thinking".to_string()
+                },
+                project.root.clone(),
+                log_dir.clone(),
+                follow_up_tx,
+                approval_registry.clone(),
+                session_name,
+                Some(finished_rx),
+            )
+            .await;
 
         let supervisor = self.clone();
         let bus = self.config.bus.clone();
@@ -1061,9 +1138,17 @@ impl SessionSupervisor {
                 let provider = match provider::select_provider() {
                     Ok(provider) => provider,
                     Err(e) => {
-                        return supervisor
-                            .finish_session(session_id, session_log, task, Err(e))
+                        supervisor
+                            .finish_session(
+                                session_id,
+                                session_instance_id,
+                                session_log,
+                                task,
+                                Err(e),
+                            )
                             .await;
+                        let _ = finished_tx.send(());
+                        return;
                     }
                 };
                 if use_direct {
@@ -1098,8 +1183,9 @@ impl SessionSupervisor {
             };
 
             supervisor
-                .finish_session(session_id, session_log, task, result)
+                .finish_session(session_id, session_instance_id, session_log, task, result)
                 .await;
+            let _ = finished_tx.send(());
         });
     }
 
@@ -1217,7 +1303,7 @@ impl SessionSupervisor {
                 }
             };
             supervisor
-                .finish_session(session_id, session_log, task, summary)
+                .finish_session(session_id, 0, session_log, task, summary)
                 .await;
         });
         true
@@ -1444,6 +1530,7 @@ impl SessionSupervisor {
                     Vec::new(),
                     None,
                     None,
+                    false,
                 )
                 .await;
                 (target_id, entry) = self.lookup_edit_route_target(&lookup_id).await;
@@ -1571,6 +1658,144 @@ impl SessionSupervisor {
         self.config.bus.send(AppEvent::InterruptRequested {
             session_id: requested_id.or(Some(target_id)),
         });
+    }
+
+    async fn stop_managed_session(
+        &self,
+        session_id: Option<String>,
+        reason: &str,
+    ) -> Option<StoppedManagedSession> {
+        let reason = reason.trim();
+        let reason = if reason.is_empty() {
+            "stopped by user"
+        } else {
+            reason
+        };
+        let removed = {
+            let mut state = self.state.lock().await;
+            let requested_id = session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .or_else(|| state.active_session_id.clone());
+            let Some(requested_id) = requested_id else {
+                drop(state);
+                self.warn("Stop session dropped: no active managed session");
+                return None;
+            };
+            if state.related_sessions.contains_key(&requested_id) {
+                drop(state);
+                self.warn(&format!(
+                    "Stop session dropped: {} is a related Codex thread; stop the parent session instead",
+                    short_session(&requested_id)
+                ));
+                return None;
+            }
+            let Some(target_id) = state.resolve_session_id(&requested_id) else {
+                drop(state);
+                self.warn(&format!(
+                    "Stop session dropped: session {} is not managed by this daemon",
+                    short_session(&requested_id)
+                ));
+                return None;
+            };
+            state.remove_session(&target_id)
+        };
+
+        let Some((canonical, session)) = removed else {
+            self.warn("Stop session dropped: no matching managed session");
+            return None;
+        };
+        self.config.bus.send(AppEvent::SessionStopRequested {
+            session_id: Some(canonical.clone()),
+            reason: reason.to_string(),
+        });
+        self.config.bus.send(AppEvent::SessionEnded {
+            session_id: canonical.clone(),
+            reason: reason.to_string(),
+        });
+        Some(StoppedManagedSession {
+            session_id: canonical,
+            source: session.source,
+            finished_rx: session.finished_rx,
+        })
+    }
+
+    async fn wait_for_stopped_session(&self, mut stopped: StoppedManagedSession) {
+        let Some(finished_rx) = stopped.finished_rx.take() else {
+            return;
+        };
+        match tokio::time::timeout(SESSION_STOP_WAIT_TIMEOUT, finished_rx).await {
+            Ok(Ok(())) | Ok(Err(_)) => {}
+            Err(_) => {
+                self.warn(&format!(
+                    "Restarting {} session {} before the previous backend confirmed shutdown",
+                    stopped.source,
+                    short_session(&stopped.session_id)
+                ));
+            }
+        }
+    }
+
+    async fn restart_session(
+        &self,
+        source: String,
+        session_id: String,
+        resume_id: Option<String>,
+        project_root: Option<String>,
+        task: Option<String>,
+        direct: Option<bool>,
+        attachments: Vec<String>,
+        agent_command: Option<String>,
+        codex_managed_context: Option<String>,
+    ) {
+        let source_norm = source.trim().to_lowercase();
+        if source_norm == "intendant" {
+            self.warn("Restart with saved config is only available for external-agent sessions");
+            return;
+        }
+        if external_agent::AgentBackend::from_str_loose(&source_norm).is_none() {
+            self.loop_error(format!("Unsupported session source: {}", source));
+            return;
+        }
+        let resume_token = resume_id.clone().unwrap_or_else(|| session_id.clone());
+        let restart_key = format!("{}:{}", source_norm, resume_token);
+        {
+            let mut state = self.state.lock().await;
+            if !state.mark_restart_requested(&restart_key) {
+                drop(state);
+                self.warn(&format!(
+                    "Restart session ignored: {} was already restarted recently",
+                    short_session(&resume_token)
+                ));
+                return;
+            }
+        }
+        if let Some(existing_id) = self
+            .find_managed_session_id(&source_norm, &session_id, &resume_token)
+            .await
+        {
+            if let Some(stopped) = self
+                .stop_managed_session(Some(existing_id), "restarting session")
+                .await
+            {
+                self.wait_for_stopped_session(stopped).await;
+            }
+        }
+        self.resume_session(
+            source_norm,
+            session_id,
+            resume_id,
+            project_root,
+            task,
+            direct,
+            attachments,
+            agent_command,
+            codex_managed_context,
+            true,
+        )
+        .await;
     }
 
     async fn route_steer(
@@ -2076,9 +2301,12 @@ impl SessionSupervisor {
         follow_up_tx: mpsc::Sender<FollowUpMessage>,
         approval_registry: event::ApprovalRegistry,
         name: Option<String>,
-    ) {
+        finished_rx: Option<oneshot::Receiver<()>>,
+    ) -> u64 {
         let rehydrated_related = load_related_sessions_from_log(&session_dir);
         let mut state = self.state.lock().await;
+        state.next_session_instance = state.next_session_instance.saturating_add(1);
+        let instance_id = state.next_session_instance;
         state.active_session_id = Some(session_id.clone());
         state.session_aliases.remove(&session_id);
         state.sessions.insert(
@@ -2092,6 +2320,8 @@ impl SessionSupervisor {
                 session_dir,
                 follow_up_tx,
                 approval_registry,
+                instance_id,
+                finished_rx,
             },
         );
         for rel in rehydrated_related {
@@ -2101,11 +2331,13 @@ impl SessionSupervisor {
                 &rel.relationship,
             );
         }
+        instance_id
     }
 
     async fn finish_session(
         &self,
         session_id: String,
+        session_instance_id: u64,
         session_log: SharedSessionLog,
         task: String,
         result: Result<LoopStats, CallerError>,
@@ -2132,16 +2364,26 @@ impl SessionSupervisor {
 
         let ended_session_id = {
             let mut state = self.state.lock().await;
-            state
-                .remove_session(&session_id)
-                .map(|(canonical, _)| canonical)
-                .unwrap_or_else(|| session_id.clone())
+            if session_instance_id == 0 {
+                Some(
+                    state
+                        .remove_session(&session_id)
+                        .map(|(canonical, _)| canonical)
+                        .unwrap_or_else(|| session_id.clone()),
+                )
+            } else {
+                state
+                    .remove_session_instance(&session_id, session_instance_id)
+                    .map(|(canonical, _)| canonical)
+            }
         };
 
-        self.config.bus.send(AppEvent::SessionEnded {
-            session_id: ended_session_id.clone(),
-            reason,
-        });
+        if let Some(ended_session_id) = ended_session_id.clone() {
+            self.config.bus.send(AppEvent::SessionEnded {
+                session_id: ended_session_id.clone(),
+                reason,
+            });
+        }
 
         if let Some(ref shared_session) = self.config.shared_session {
             let mut state = shared_session.write().await;
@@ -2152,7 +2394,9 @@ impl SessionSupervisor {
                     let log_session_id = log.lock().ok().map(|log| log.session_id().to_string());
                     Arc::ptr_eq(log, &session_log)
                         || log_session_id.as_deref() == Some(&session_id)
-                        || log_session_id.as_deref() == Some(&ended_session_id)
+                        || ended_session_id
+                            .as_deref()
+                            .is_some_and(|id| log_session_id.as_deref() == Some(id))
                 })
                 .unwrap_or(false);
             if matches_current {
@@ -2598,7 +2842,8 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
         | event::ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
         event::ControlMsg::RenameSession { session_id, .. } => Some(session_id.as_str()),
         event::ControlMsg::ConfigureSessionAgent { session_id, .. } => Some(session_id.as_str()),
-        event::ControlMsg::ResumeSession { .. } => None,
+        event::ControlMsg::StopSession { session_id } => Some(session_id.as_str()),
+        event::ControlMsg::ResumeSession { .. } | event::ControlMsg::RestartSession { .. } => None,
         _ => None,
     }
 }
@@ -2728,6 +2973,8 @@ mod tests {
             session_dir: PathBuf::from("/tmp/session"),
             follow_up_tx: tx,
             approval_registry: event::ApprovalRegistry::default(),
+            instance_id: 0,
+            finished_rx: None,
         }
     }
 
@@ -2844,6 +3091,74 @@ mod tests {
         assert!(!state.related_sessions.contains_key("sub-child"));
     }
 
+    #[test]
+    fn supervisor_state_does_not_remove_newer_session_instance() {
+        let mut state = SupervisorState::default();
+        let mut session = managed_session("thread", "codex");
+        session.instance_id = 1;
+        state.sessions.insert("thread".to_string(), session);
+
+        assert!(state.remove_session_instance("thread", 2).is_none());
+        assert!(state.session_is_managed("thread"));
+        assert!(state.remove_session_instance("thread", 1).is_some());
+        assert!(!state.session_is_managed("thread"));
+    }
+
+    #[test]
+    fn supervisor_state_dedupes_concurrent_restart_requests() {
+        let mut state = SupervisorState::default();
+
+        assert!(state.mark_restart_requested("codex:thread"));
+        assert!(!state.mark_restart_requested("codex:thread"));
+        assert!(state.mark_restart_requested("codex:other-thread"));
+    }
+
+    #[tokio::test]
+    async fn stop_managed_session_broadcasts_stop_and_removes_live_session() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                managed_session("parent-thread", "codex"),
+            );
+        }
+
+        let stopped = supervisor
+            .stop_managed_session(Some("parent-thread".to_string()), "stopped by user")
+            .await
+            .expect("managed session should stop");
+        assert_eq!(stopped.session_id, "parent-thread");
+
+        {
+            let state = supervisor.state.lock().await;
+            assert!(!state.session_is_managed("parent-thread"));
+        }
+
+        let mut saw_stop_request = false;
+        let mut saw_session_ended = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            match event {
+                AppEvent::SessionStopRequested { session_id, reason }
+                    if session_id.as_deref() == Some("parent-thread")
+                        && reason == "stopped by user" =>
+                {
+                    saw_stop_request = true;
+                }
+                AppEvent::SessionEnded { session_id, reason }
+                    if session_id == "parent-thread" && reason == "stopped by user" =>
+                {
+                    saw_session_ended = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_stop_request, "expected SessionStopRequested");
+        assert!(saw_session_ended, "expected SessionEnded");
+    }
+
     #[tokio::test]
     async fn resume_managed_external_session_with_task_routes_follow_up() {
         let bus = EventBus::new();
@@ -2862,6 +3177,8 @@ mod tests {
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
                     approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
                 },
             );
         }
@@ -2877,6 +3194,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                false,
             )
             .await;
 
@@ -2909,6 +3227,8 @@ mod tests {
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
                     approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
                 },
             );
         }
@@ -2925,6 +3245,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                false,
             ),
         )
         .await
@@ -2982,6 +3303,8 @@ mod tests {
                     session_dir: session_dir.clone(),
                     follow_up_tx: tx,
                     approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
                 },
             );
         }
@@ -3012,6 +3335,7 @@ mod tests {
                 vec![format!("upload:{}", upload.id)],
                 None,
                 None,
+                false,
             )
             .await;
 
@@ -3050,6 +3374,8 @@ mod tests {
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
                     approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
                 },
             );
             assert!(state.apply_related_session("parent-thread", "side-thread", "side"));
