@@ -97,6 +97,7 @@ const SESSION_LOG_SEARCH_READ_LIMIT: u64 = 2 * 1024 * 1024;
 const SESSION_LOG_SEARCH_FIELD_CHARS: usize = 8 * 1024;
 const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
 const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
+const DELETED_EXTERNAL_SESSIONS_FILE: &str = "deleted_external_sessions.json";
 const MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT: usize = 64;
 const MANAGED_CONTEXT_ANCHOR_LIMIT: usize = 40;
 const FS_LIST_LIMIT: usize = 500;
@@ -2282,6 +2283,122 @@ fn resolve_session_dir_from_listed_external_row(home: &Path, session_id: &str) -
 
 fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
     resolve_session_dir_from_home(&crate::platform::home_dir(), session_id)
+}
+
+fn deleted_external_sessions_path(home: &Path) -> PathBuf {
+    home.join(".intendant").join(DELETED_EXTERNAL_SESSIONS_FILE)
+}
+
+fn read_deleted_external_sessions(home: &Path) -> HashSet<(String, String)> {
+    let path = deleted_external_sessions_path(home);
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    let Ok(serde_json::Value::Object(root)) = serde_json::from_str::<serde_json::Value>(&contents)
+    else {
+        return HashSet::new();
+    };
+
+    let mut deleted = HashSet::new();
+    for (source, ids) in root {
+        let source = crate::session_names::normalize_source(&source);
+        let Some(ids) = ids.as_array() else {
+            continue;
+        };
+        for id in ids.iter().filter_map(|id| id.as_str()) {
+            let id = id.trim();
+            if !source.is_empty() && !id.is_empty() {
+                deleted.insert((source.clone(), id.to_string()));
+            }
+        }
+    }
+    deleted
+}
+
+fn write_deleted_external_sessions(
+    home: &Path,
+    deleted: &HashSet<(String, String)>,
+) -> Result<(), String> {
+    let mut by_source: HashMap<String, Vec<String>> = HashMap::new();
+    for (source, id) in deleted {
+        by_source
+            .entry(source.clone())
+            .or_default()
+            .push(id.clone());
+    }
+    let mut root = serde_json::Map::new();
+    for (source, mut ids) in by_source {
+        ids.sort();
+        ids.dedup();
+        root.insert(source, serde_json::json!(ids));
+    }
+
+    let path = deleted_external_sessions_path(home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create tombstone dir: {e}"))?;
+    }
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .map_err(|e| format!("serialize tombstones: {e}"))?;
+    std::fs::write(path, body).map_err(|e| format!("write tombstones: {e}"))
+}
+
+fn mark_external_session_deleted(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let source = crate::session_names::normalize_source(source);
+    let session_id = session_id.trim();
+    if source.is_empty() || session_id.is_empty() {
+        return Ok(());
+    }
+    let mut deleted = read_deleted_external_sessions(home);
+    if !deleted.insert((source, session_id.to_string())) {
+        return Ok(());
+    }
+    write_deleted_external_sessions(home, &deleted)
+}
+
+fn session_matches_deleted_external(
+    session: &serde_json::Value,
+    deleted: &HashSet<(String, String)>,
+) -> bool {
+    if deleted.is_empty() {
+        return false;
+    }
+    let sources: Vec<String> = ["source", "backend_source"]
+        .into_iter()
+        .filter_map(|key| value_str(session, key))
+        .map(|source| crate::session_names::normalize_source(&source))
+        .filter(|source| !source.is_empty())
+        .collect();
+    let ids: Vec<String> = ["session_id", "resume_id", "backend_session_id"]
+        .into_iter()
+        .filter_map(|key| value_str(session, key))
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    sources.iter().any(|source| {
+        ids.iter()
+            .any(|id| deleted.contains(&(source.clone(), id.clone())))
+    })
+}
+
+fn external_delete_target_for_intendant_session_dir(dir: &Path) -> Option<(String, String)> {
+    let session_id = dir.file_name()?.to_string_lossy().to_string();
+    let row = intendant_session_list_row_from_dir(dir, &session_id)?;
+    let source = value_str(&row, "backend_source")?;
+    let external_id = value_str(&row, "backend_session_id")?;
+    if !crate::external_agent::source_session_id_is_canonical(&source, &external_id) {
+        return None;
+    }
+    Some((source, external_id))
+}
+
+fn invalidate_session_list_response_cache() {
+    if let Some(cache) = SESSION_LIST_RESPONSE_CACHE.get() {
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// List recording streams from a recordings directory on disk.
@@ -6223,6 +6340,12 @@ fn list_sessions_from_home(home_path: &Path) -> String {
     external_sessions.extend(list_codex_sessions(home_path));
     external_sessions.extend(list_claude_sessions(home_path));
     external_sessions.extend(list_gemini_sessions(home_path));
+    let deleted_external_sessions = read_deleted_external_sessions(home_path);
+    if !deleted_external_sessions.is_empty() {
+        external_sessions.retain(|session| {
+            !session_matches_deleted_external(session, &deleted_external_sessions)
+        });
+    }
     crate::session_names::apply_session_name_overlays(home_path, &mut external_sessions);
     crate::session_config::apply_overlays_to_sessions(home_path, &mut external_sessions);
     if !logs_dir.is_dir() {
@@ -8536,10 +8659,28 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
     match target {
         "session" => {
             let bytes = dir_byte_size(&dir);
+            let external_delete_target = external_delete_target_for_intendant_session_dir(&dir);
             match std::fs::remove_dir_all(&dir) {
                 Ok(_) => {
-                    serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes})
-                        .to_string()
+                    let mut body =
+                        serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes});
+                    if let Some((source, external_id)) = external_delete_target {
+                        match mark_external_session_deleted(
+                            &crate::platform::home_dir(),
+                            &source,
+                            &external_id,
+                        ) {
+                            Ok(()) => {
+                                body["external_session_hidden"] = serde_json::json!(true);
+                            }
+                            Err(e) => {
+                                body["external_session_hidden"] = serde_json::json!(false);
+                                body["external_session_hide_error"] = serde_json::json!(e);
+                            }
+                        }
+                    }
+                    invalidate_session_list_response_cache();
+                    body.to_string()
                 }
                 Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
             }
@@ -17769,6 +17910,77 @@ mod tests {
         assert_eq!(
             session.get("task").and_then(|v| v.as_str()),
             Some("Fix naming")
+        );
+    }
+
+    #[test]
+    fn list_sessions_filters_deleted_external_session_tombstones() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-deleted-external";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": id,
+                "updated_at": "2026-05-17T20:44:33Z"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/Users/vm/projects/intendant"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Delete me"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id)),
+            "codex session should be listed before tombstone"
+        );
+
+        mark_external_session_deleted(home.path(), "codex", id).unwrap();
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        assert!(
+            !sessions
+                .iter()
+                .any(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id)),
+            "tombstoned codex session should be hidden"
         );
     }
 
