@@ -146,6 +146,15 @@ const TABLE: &[(&str, Pricing)] = &[
         },
     ),
     (
+        "claude-opus-4-8",
+        Pricing {
+            input: 5.0e-6,
+            cache_write: 6.25e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
+        },
+    ),
+    (
         "claude-opus-4-6",
         Pricing {
             input: 5.0e-6,
@@ -470,4 +479,23 @@ pub fn estimate_live_usage_cost(model: &str, usage: LiveUsageTokens) -> Option<f
         usage.cached_tokens,
         0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opus_4_8_session_cost_uses_anthropic_pricing() {
+        let cost = estimate_session_cost("claude-opus-4-8", 1_000, 500, 200, 100).unwrap();
+        let expected = 700.0 * 5.0e-6 + 100.0 * 6.25e-6 + 200.0 * 0.5e-6 + 500.0 * 25.0e-6;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn opus_4_8_pricing_matches_version_suffixes() {
+        let cost =
+            estimate_session_cost("claude-opus-4-8-20260528", 1_000_000, 1_000_000, 0, 0).unwrap();
+        assert!((cost - 30.0).abs() < 1e-12);
+    }
 }

@@ -503,6 +503,14 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ),
     // Anthropic
     (
+        "claude-opus-4-8",
+        ModelPricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
+        },
+    ),
+    (
         "claude-opus-4-6",
         ModelPricing {
             input: 5.0e-6,
@@ -3222,8 +3230,9 @@ mod tests {
 
     #[test]
     fn pricing_exact_match() {
-        let p = find_pricing("claude-opus-4-6").unwrap();
+        let p = find_pricing("claude-opus-4-8").unwrap();
         assert!((p.input - 5.0e-6).abs() < 1e-12);
+        assert!((p.cached - 0.5e-6).abs() < 1e-12);
         assert!((p.output - 25.0e-6).abs() < 1e-12);
     }
 
