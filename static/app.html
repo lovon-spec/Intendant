@@ -8210,6 +8210,25 @@ html, body {
   </div>
 </div>
 
+<div id="session-rename-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog session-rename-dialog">
+    <h3>Rename session</h3>
+    <div class="session-config-row">
+      <label>Session</label>
+      <input id="session-rename-session" type="text" readonly>
+    </div>
+    <div class="session-config-row">
+      <label for="session-rename-name">Name</label>
+      <input id="session-rename-name" type="text" maxlength="180" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="session-config-status" id="session-rename-status"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" type="button" onclick="closeSessionRenameModal()">Cancel</button>
+      <button class="modal-confirm" type="button" id="session-rename-save" onclick="saveSessionRenameModal()">Save name</button>
+    </div>
+  </div>
+</div>
+
 <!-- Voice Overlay -->
 <div class="voice-overlay" id="voiceOverlay" draggable="false">
   <div class="voice-drag-handle" id="voiceDragHandle"></div>
@@ -10341,6 +10360,7 @@ let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnTimeout = null;
 let newSessionSpawnClearTimeout = null;
+let sessionRenameEditing = null;
 let sessionConfigEditing = null;
 const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
 
@@ -11104,6 +11124,10 @@ function handleCodexThreadActionResult(evt) {
       successText = `Renamed session to ${name}`;
     }
     refreshSessionWindowMetadata(600);
+    scheduleSessionsMetadataRefresh(200);
+    closeSessionRenameModalIfMatches(sid);
+  } else if (!evt.success && evt.action === 'rename') {
+    showSessionRenameStatus(`Rename session failed: ${evt.message}`, 'error', evt.session_id);
   }
   showControlToast(
     evt.success ? 'success' : 'error',
@@ -11119,6 +11143,10 @@ function handleSessionRenameResult(evt) {
     const name = compactSessionText(evt.name);
     if (sid && name) applySessionRenameToUi(sid, evt.source || '', name);
     refreshSessionWindowMetadata(600);
+    scheduleSessionsMetadataRefresh(200);
+    closeSessionRenameModalIfMatches(sid);
+  } else {
+    showSessionRenameStatus(`Rename session failed: ${evt.message}`, 'error', sid);
   }
   showControlToast(
     evt.success ? 'success' : 'error',
@@ -14348,6 +14376,38 @@ function applySessionRenameToUi(sessionId, source, name) {
   if (sessionsLoaded) _refilterSessions();
 }
 
+function sessionRenameIds() {
+  if (!sessionRenameEditing) return [];
+  return [
+    sessionRenameEditing.sessionId,
+    sessionRenameEditing.backendSessionId,
+  ].map(id => String(id || '').trim()).filter(Boolean);
+}
+
+function closeSessionRenameModalIfMatches(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionRenameIds().includes(sid)) return;
+  closeSessionRenameModal();
+}
+
+function showSessionRenameStatus(message, kind = '', sessionId = '') {
+  if (sessionId) {
+    const sid = String(sessionId || '').trim();
+    if (sid && !sessionRenameIds().includes(sid)) return;
+  }
+  const status = document.getElementById('session-rename-status');
+  if (!status) return;
+  status.className = 'session-config-status' + (kind ? ` ${kind}` : '');
+  status.textContent = message || '';
+}
+
+function closeSessionRenameModal() {
+  const modal = document.getElementById('session-rename-modal');
+  if (modal) modal.style.display = 'none';
+  sessionRenameEditing = null;
+  showSessionRenameStatus('');
+}
+
 function requestSessionRename(sessionOrId, sourceArg = '') {
   const session = typeof sessionOrId === 'object'
     ? sessionOrId
@@ -14373,20 +14433,48 @@ function requestSessionRename(sessionOrId, sourceArg = '') {
   ).trim();
   const effectiveSource = backendSource || source;
   const currentName = compactSessionText(session.name || cached.name);
-  const name = window.prompt('Session name:', currentName);
-  if (name === null) return false;
-  if (!name.trim()) {
-    showControlToast('error', 'Rename session failed: session name is required');
-    return false;
+  sessionRenameEditing = {
+    sessionId: sid,
+    source: effectiveSource,
+    backendSessionId,
+  };
+  const sessionInput = document.getElementById('session-rename-session');
+  if (sessionInput) {
+    sessionInput.value = sid;
+    sessionInput.title = sid;
   }
+  const nameInput = document.getElementById('session-rename-name');
+  if (nameInput) {
+    nameInput.value = currentName;
+    nameInput.title = currentName;
+  }
+  showSessionRenameStatus('');
+  const modal = document.getElementById('session-rename-modal');
+  if (modal) modal.style.display = 'flex';
+  setTimeout(() => {
+    const input = document.getElementById('session-rename-name');
+    if (!input) return;
+    input.focus();
+    input.select();
+  }, 0);
+  return true;
+}
+
+function saveSessionRenameModal() {
+  if (!sessionRenameEditing || !app) return;
+  const name = document.getElementById('session-rename-name')?.value.trim() || '';
+  if (!name) {
+    showSessionRenameStatus('Session name is required.', 'error');
+    return;
+  }
+  showSessionRenameStatus('Saving...');
   dispatchControlMsg({
     action: 'rename_session',
-    session_id: sid,
-    source: effectiveSource,
-    ...(backendSessionId ? { backend_session_id: backendSessionId } : {}),
-    name: name.trim(),
+    session_id: sessionRenameEditing.sessionId,
+    source: sessionRenameEditing.source,
+    ...(sessionRenameEditing.backendSessionId ? { backend_session_id: sessionRenameEditing.backendSessionId } : {}),
+    name,
   });
-  return true;
 }
 
 function findCachedSessionByAnyId(sessionId) {
@@ -14599,6 +14687,8 @@ function saveSessionConfigModal() {
 }
 
 window.openSessionConfigModal = openSessionConfigModal;
+window.closeSessionRenameModal = closeSessionRenameModal;
+window.saveSessionRenameModal = saveSessionRenameModal;
 window.closeSessionConfigModal = closeSessionConfigModal;
 window.saveSessionConfigModal = saveSessionConfigModal;
 
@@ -30687,6 +30777,11 @@ document.addEventListener('keydown', (e) => {
     closeFsPicker();
     return;
   }
+  const sessionRenameModal = document.getElementById('session-rename-modal');
+  if (sessionRenameModal && sessionRenameModal.style.display !== 'none') {
+    closeSessionRenameModal();
+    return;
+  }
   const sessionConfigModal = document.getElementById('session-config-modal');
   if (sessionConfigModal && sessionConfigModal.style.display !== 'none') {
     closeSessionConfigModal();
@@ -30697,6 +30792,15 @@ document.getElementById('rollback-modal')?.addEventListener('click', (e) => {
 });
 document.getElementById('fs-picker-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'fs-picker-modal') closeFsPicker();
+});
+document.getElementById('session-rename-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'session-rename-modal') closeSessionRenameModal();
+});
+document.getElementById('session-rename-name')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    saveSessionRenameModal();
+  }
 });
 document.getElementById('session-config-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'session-config-modal') closeSessionConfigModal();

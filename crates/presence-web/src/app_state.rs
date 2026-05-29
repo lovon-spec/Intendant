@@ -256,7 +256,19 @@ pub enum UiCommand {
     /// /memory-reset, /new) finished. `success` + `message` drive a
     /// dashboard toast and the Activity log entry.
     CodexThreadActionResult {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         action: String,
+        success: bool,
+        message: String,
+    },
+    /// A generic session rename finished after being persisted by the daemon.
+    SessionRenameResult {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         success: bool,
         message: String,
     },
@@ -1841,6 +1853,10 @@ impl AppState {
             }
 
             "codex_thread_action_result" => {
+                let session_id = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let action = msg
                     .get("action")
                     .and_then(|v| v.as_str())
@@ -1856,6 +1872,7 @@ impl AppState {
                     .unwrap_or("")
                     .to_string();
                 cmds.push(UiCommand::CodexThreadActionResult {
+                    session_id,
                     action: action.clone(),
                     success,
                     message: message.clone(),
@@ -1869,6 +1886,32 @@ impl AppState {
                     format!("Codex /{}: FAILED — {}", action, message)
                 };
                 cmds.extend(self.add_log(level, &line, None, "server"));
+            }
+
+            "session_rename_result" => {
+                let session_id = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let source = msg.get("source").and_then(|v| v.as_str()).map(String::from);
+                let name = msg.get("name").and_then(|v| v.as_str()).map(String::from);
+                let success = msg
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let message = msg
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                cmds.push(UiCommand::SessionRenameResult {
+                    session_id,
+                    source,
+                    name,
+                    success,
+                    message,
+                });
             }
 
             "codex_config_changed" => {
@@ -3588,6 +3631,7 @@ mod tests {
                     action,
                     success: true,
                     message,
+                    ..
                 } => {
                     assert_eq!(action, "compact");
                     assert!(message.contains("compaction"));
@@ -3624,6 +3668,7 @@ mod tests {
                     action,
                     success: false,
                     message,
+                    ..
                 } => {
                     assert_eq!(action, "fork");
                     assert!(message.contains("no active"));
@@ -3640,6 +3685,33 @@ mod tests {
         }
         assert!(saw_result, "expected CodexThreadActionResult (failure)");
         assert!(saw_log, "expected warn Activity log entry");
+    }
+
+    #[test]
+    fn handle_session_rename_result_emits_command() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "session_rename_result",
+            "session_id": "codex-session-1",
+            "source": "codex",
+            "name": "Renamed session",
+            "success": true,
+            "message": "Renamed session to Renamed session"
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SessionRenameResult {
+                session_id,
+                source: Some(source),
+                name: Some(name),
+                success: true,
+                message,
+            } if session_id == "codex-session-1"
+                && source == "codex"
+                && name == "Renamed session"
+                && message.contains("Renamed session")
+        )));
     }
 
     #[test]
