@@ -27938,10 +27938,11 @@ function setNewSessionProjectRoot(root) {
   if (input && dashboardProjectRoot && !input.value.trim()) input.value = dashboardProjectRoot;
   updateNewSessionProjectPrefills();
   if (input) input.title = input.value.trim() || dashboardProjectRoot;
-  scheduleNewSessionProjectStatusRefresh();
+  scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
 }
 
 let newSessionProjectStatusTimer = null;
+let newSessionProjectObservedValue = null;
 let fsPickerCurrentPath = '';
 let fsPickerSelectedPath = '';
 let fsPickerMode = 'directory';
@@ -27973,7 +27974,8 @@ async function fetchProjectPathStatus(path) {
   return data;
 }
 
-function renderNewSessionProjectStatus(status) {
+function renderNewSessionProjectStatus(status, statusPath = newSessionProjectInputValue()) {
+  newSessionProjectObservedValue = String(statusPath || '');
   if (!status) {
     setNewSessionProjectStatus('', '');
     setNewSessionCreateVisible(false);
@@ -27994,19 +27996,24 @@ function renderNewSessionProjectStatus(status) {
   }
 }
 
-async function refreshNewSessionProjectStatus() {
+async function refreshNewSessionProjectStatus(options = {}) {
+  const hideWhileChecking = !!options.hideWhileChecking;
   const path = newSessionProjectInputValue();
   if (!path) {
-    renderNewSessionProjectStatus(null);
+    renderNewSessionProjectStatus(null, path);
     return null;
   }
+  newSessionProjectObservedValue = path;
+  setNewSessionProjectStatus('warn', 'Checking directory on this host...');
+  if (hideWhileChecking) setNewSessionCreateVisible(false);
   try {
     const status = await fetchProjectPathStatus(path);
     if (newSessionProjectInputValue() !== path) return null;
-    renderNewSessionProjectStatus(status);
+    renderNewSessionProjectStatus(status, path);
     return status;
   } catch (e) {
     if (newSessionProjectInputValue() === path) {
+      newSessionProjectObservedValue = path;
       setNewSessionProjectStatus('error', e.message || 'Path check failed');
       setNewSessionCreateVisible(false);
     }
@@ -28014,9 +28021,24 @@ async function refreshNewSessionProjectStatus() {
   }
 }
 
-function scheduleNewSessionProjectStatusRefresh() {
+function scheduleNewSessionProjectStatusRefresh(options = {}) {
+  const hideWhileChecking = !!options.hideWhileChecking;
   if (newSessionProjectStatusTimer) clearTimeout(newSessionProjectStatusTimer);
-  newSessionProjectStatusTimer = setTimeout(refreshNewSessionProjectStatus, 180);
+  if (hideWhileChecking && newSessionProjectInputValue()) {
+    setNewSessionProjectStatus('warn', 'Checking directory on this host...');
+    setNewSessionCreateVisible(false);
+  }
+  newSessionProjectStatusTimer = setTimeout(
+    () => refreshNewSessionProjectStatus({ hideWhileChecking }),
+    180,
+  );
+}
+
+function refreshNewSessionProjectStatusOnValueDrift() {
+  if (activeTab !== 'sessions' || activeSessionsSubtab !== 'new') return;
+  const current = newSessionProjectInputValue();
+  if (current === newSessionProjectObservedValue) return;
+  scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
 }
 
 async function ensureNewSessionProjectDirectory(projectRoot) {
@@ -28098,7 +28120,7 @@ function updateNewSessionProjectPrefills(sessions = _cachedSessions) {
   if (input) {
     if (!input.value.trim() && options.length > 0) input.value = options[0].path;
     input.title = input.value.trim() || '';
-    scheduleNewSessionProjectStatusRefresh();
+    scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
   }
 }
 
@@ -29146,8 +29168,9 @@ document.getElementById('worktrees-refresh-btn')?.addEventListener('click', () =
 document.getElementById('worktrees-scan-btn')?.addEventListener('click', () => loadWorktrees({ forceScan: true }));
 document.getElementById('new-session-project-root')?.addEventListener('input', (ev) => {
   ev.currentTarget.title = ev.currentTarget.value.trim();
-  scheduleNewSessionProjectStatusRefresh();
+  scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
 });
+window.setInterval(refreshNewSessionProjectStatusOnValueDrift, 500);
 document.getElementById('new-session-create-project-dir')?.addEventListener('change', refreshNewSessionProjectStatus);
 document.getElementById('new-session-agent')?.addEventListener('change', () => {
   renderNewSessionAgentControls({ replaceCommand: true });

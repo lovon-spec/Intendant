@@ -14104,7 +14104,13 @@ pub fn spawn_web_gateway(
                         // multi-host Stats tab can fetch sibling
                         // daemons' session lists to populate its "All
                         // Sessions" and "Disk Usage" cards per host.
-                        let body = list_sessions();
+                        let body = match tokio::task::spawn_blocking(list_sessions).await {
+                            Ok(body) => body,
+                            Err(e) => serde_json::json!({
+                                "error": format!("session list task failed: {e}")
+                            })
+                            .to_string(),
+                        };
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
