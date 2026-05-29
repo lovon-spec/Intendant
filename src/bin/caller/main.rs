@@ -2441,6 +2441,7 @@ async fn apply_context_rewind_backout_action(
             project_root: Some(config.project_root.to_string_lossy().to_string()),
             task: None,
             direct: Some(true),
+            attachments: Vec::new(),
             agent_command: crate::session_config::read_log_dir_config(config.log_dir)
                 .and_then(|cfg| cfg.agent_command),
             codex_managed_context: crate::session_config::read_log_dir_config(config.log_dir)
@@ -2512,6 +2513,7 @@ async fn handle_external_thread_action(
                     project_root: Some(config.project_root.to_string_lossy().to_string()),
                     task: None,
                     direct: Some(true),
+                    attachments: Vec::new(),
                     agent_command: crate::session_config::read_log_dir_config(config.log_dir)
                         .and_then(|cfg| cfg.agent_command),
                     codex_managed_context: crate::session_config::read_log_dir_config(
@@ -11182,6 +11184,7 @@ async fn run_with_presence(
                             project_root: Some(project_root.to_string_lossy().to_string()),
                             task: None,
                             direct: Some(true),
+                            attachments: Vec::new(),
                             agent_command: Some(project.config.agent.codex.command.clone()),
                             codex_managed_context: Some(
                                 crate::project::normalize_codex_managed_context(

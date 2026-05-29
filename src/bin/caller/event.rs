@@ -1163,6 +1163,9 @@ pub enum ControlMsg {
         /// Bypass presence/orchestration, matching StartTask.direct.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direct: Option<bool>,
+        /// Frame/upload IDs attached to the first turn sent after resume.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
         /// Per-session executable override. When omitted, the supervisor
         /// rehydrates the persisted session value before falling back to the
         /// global Settings value.
@@ -3076,7 +3079,7 @@ mod tests {
 
     #[test]
     fn control_msg_resume_session_deserializes_launch_overrides() {
-        let json = r#"{"action":"resume_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","direct":true,"agent_command":"/tmp/codex","codex_managed_context":"managed"}"#;
+        let json = r#"{"action":"resume_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","task":"continue","direct":true,"attachments":["upload:u1"],"agent_command":"/tmp/codex","codex_managed_context":"managed"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::ResumeSession {
@@ -3084,7 +3087,9 @@ mod tests {
                 session_id,
                 resume_id,
                 project_root,
+                task,
                 direct,
+                attachments,
                 agent_command,
                 codex_managed_context,
                 ..
@@ -3093,7 +3098,9 @@ mod tests {
                 assert_eq!(session_id, "thread-1");
                 assert_eq!(resume_id.as_deref(), Some("thread-1"));
                 assert_eq!(project_root.as_deref(), Some("/repo"));
+                assert_eq!(task.as_deref(), Some("continue"));
                 assert_eq!(direct, Some(true));
+                assert_eq!(attachments, vec!["upload:u1"]);
                 assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
             }

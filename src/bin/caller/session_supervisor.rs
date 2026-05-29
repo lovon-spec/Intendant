@@ -369,6 +369,7 @@ impl SessionSupervisor {
                 project_root,
                 task,
                 direct,
+                attachments,
                 agent_command,
                 codex_managed_context,
             } => {
@@ -379,6 +380,7 @@ impl SessionSupervisor {
                     project_root,
                     task,
                     direct,
+                    attachments,
                     agent_command,
                     codex_managed_context,
                 )
@@ -701,6 +703,7 @@ impl SessionSupervisor {
         project_root: Option<String>,
         task: Option<String>,
         direct: Option<bool>,
+        attachments: Vec<String>,
         agent_command: Option<String>,
         codex_managed_context: Option<String>,
     ) {
@@ -841,7 +844,7 @@ impl SessionSupervisor {
                 .await
                 .is_some()
             {
-                self.route_follow_up(Some(session_id), resume_task, direct, Vec::new(), None)
+                self.route_follow_up(Some(session_id), resume_task, direct, attachments, None)
                     .await;
                 return;
             }
@@ -900,7 +903,41 @@ impl SessionSupervisor {
             task: Some(resume_task.clone()),
         });
 
-        emit_task_dispatched_log(&self.config.bus, &session_log, &resume_task, 0);
+        let session_dir = session_log
+            .lock()
+            .map(|log| log.dir().to_path_buf())
+            .unwrap_or_else(|_| log_dir.clone());
+        let resolved_attachments = if attachments.is_empty() {
+            Vec::new()
+        } else {
+            resolve_attachments(
+                &attachments,
+                &self.config.frame_registry,
+                &session_dir,
+                &project.root,
+            )
+            .await
+        };
+        if resolved_attachments.len() < attachments.len() {
+            self.warn(&format!(
+                "Only resolved {} of {} requested attachment(s) while resuming {} session {}",
+                resolved_attachments.len(),
+                attachments.len(),
+                if external_backend.is_some() {
+                    source_norm.as_str()
+                } else {
+                    "intendant"
+                },
+                short_session(&live_session_id)
+            ));
+        }
+
+        emit_task_dispatched_log(
+            &self.config.bus,
+            &session_log,
+            &resume_task,
+            attachments.len(),
+        );
         self.spawn_agent_session(
             live_session_id,
             source_norm,
@@ -910,7 +947,7 @@ impl SessionSupervisor {
             log_dir,
             external_backend,
             direct.unwrap_or(true),
-            UserAttachments::default(),
+            UserAttachments::from_items(resolved_attachments),
             None,
             Some(resume_token),
             false,
@@ -1395,6 +1432,7 @@ impl SessionSupervisor {
                     attach.project_root,
                     None,
                     Some(attach.direct.unwrap_or(true)),
+                    Vec::new(),
                     None,
                     None,
                 )
@@ -2839,6 +2877,7 @@ mod tests {
                 Some("/tmp/project".to_string()),
                 Some("continue parent".to_string()),
                 Some(true),
+                Vec::new(),
                 None,
                 None,
             )
@@ -2852,6 +2891,81 @@ mod tests {
 
         let state = supervisor.state.lock().await;
         assert!(state.session_is_managed("parent-thread"));
+    }
+
+    #[tokio::test]
+    async fn resume_managed_external_session_with_task_preserves_attachments() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(project_root.clone(), bus);
+        let (tx, mut rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                ManagedSession {
+                    session_id: "parent-thread".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: project_root.clone(),
+                    session_dir: session_dir.clone(),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                },
+            );
+        }
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"needle").unwrap();
+        file.flush().unwrap();
+        let upload = crate::upload_store::commit_upload(
+            file,
+            "note.txt",
+            "text/plain",
+            6,
+            crate::upload_store::UploadDestination::Task,
+            &session_dir,
+            "parent-thread",
+            &project_root,
+        )
+        .unwrap();
+
+        supervisor
+            .resume_session(
+                "codex".to_string(),
+                "parent-thread".to_string(),
+                Some("parent-thread".to_string()),
+                Some(project_root.to_string_lossy().to_string()),
+                Some("read attachment".to_string()),
+                Some(true),
+                vec![format!("upload:{}", upload.id)],
+                None,
+                None,
+            )
+            .await;
+
+        let msg = rx
+            .try_recv()
+            .expect("resume task should route to existing runner");
+        assert_eq!(msg.text, "read attachment");
+        assert_eq!(msg.attachments.len(), 1);
+        match &msg.attachments.items[0] {
+            external_agent::AgentAttachment::File(file) => {
+                assert_eq!(file.name, "note.txt");
+                assert_eq!(file.mime_type, "text/plain");
+                assert_eq!(file.size, 6);
+                assert_eq!(file.local_path, upload.path);
+            }
+            other => panic!("expected file attachment, got {other:?}"),
+        }
     }
 
     #[tokio::test]
