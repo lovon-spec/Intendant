@@ -2954,10 +2954,28 @@ fn codex_line_may_affect_replay(line: &str) -> bool {
         .and_then(|payload| payload.kind.as_deref());
     match (kind.kind.as_deref(), payload_kind) {
         (_, Some("thread_rolled_back" | "user_message" | "agent_message" | "message")) => true,
-        (Some("event_msg" | "response_item"), None) => true,
+        // All response items must reach the parser so item-anchor rewinds can locate
+        // their anchor — including non-message items (function_call, reasoning) that
+        // render no transcript entry but are the usual targets of a noise-trim rewind.
+        (Some("response_item"), _) => true,
+        (Some("event_msg"), None) => true,
         (None, _) => true,
         _ => false,
     }
+}
+
+/// Item id carried by a `response_item` rollout line (the id an item-anchor rewind
+/// targets), or `None` for other line kinds / items without an id.
+fn codex_response_item_id(obj: &serde_json::Value) -> Option<String> {
+    if obj.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+        return None;
+    }
+    obj.get("payload")
+        .and_then(|payload| payload.get("id"))
+        .or_else(|| obj.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn codex_line_may_affect_session_list(line: &str) -> bool {
@@ -3107,6 +3125,55 @@ fn external_transcript_entry_role(entry: &serde_json::Value) -> Option<&'static 
     } else {
         None
     }
+}
+
+/// Mark every transcript entry at or after `start_index` superseded (skipping
+/// rollback markers and already-superseded entries). Used for item-anchor rewinds,
+/// which discard the tail after the anchored item. Returns the user-turn indices
+/// that were superseded so caller can keep revision bookkeeping consistent.
+fn mark_external_entries_superseded_from(
+    entries: &mut [serde_json::Value],
+    start_index: usize,
+    rollback_ts: &str,
+) -> Vec<u32> {
+    let mut superseded_user_turns = Vec::new();
+    for idx in start_index..entries.len() {
+        let entry = &entries[idx];
+        if entry
+            .get("superseded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if entry.get("kind").and_then(|v| v.as_str()) == Some("rollback_marker") {
+            continue;
+        }
+        let Some(role) = external_transcript_entry_role(entry) else {
+            continue;
+        };
+        let user_turn_index = entry
+            .get("user_turn_index")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        if let Some(obj) = entries[idx].as_object_mut() {
+            obj.insert("superseded".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "superseded_at".to_string(),
+                serde_json::Value::String(rollback_ts.to_string()),
+            );
+            obj.insert(
+                "superseded_reason".to_string(),
+                serde_json::Value::String("thread_rollback".to_string()),
+            );
+        }
+        if role == "user" {
+            if let Some(turn) = user_turn_index {
+                superseded_user_turns.push(turn);
+            }
+        }
+    }
+    superseded_user_turns
 }
 
 fn mark_latest_external_turn_superseded(
@@ -4588,6 +4655,10 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
     let mut entries: Vec<serde_json::Value> = Vec::new();
     let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
     let mut pending_replacement_for_user_turn: Option<u32> = None;
+    // (count_before, count_after) entry-count boundaries for each rollout item id,
+    // so an item-anchor rewind can supersede exactly the entries after the anchor.
+    let mut item_entry_boundaries: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -4621,6 +4692,27 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                                 user_turn_revisions.rewind_from_turn(turn);
                             }
                             None => break,
+                        }
+                    }
+                    // Item-anchor rewinds (often num_turns == 0) discard the tail after
+                    // the anchored item. If the anchor item was seen in this rollout,
+                    // supersede every entry past its boundary so the transcript stops
+                    // showing discarded entries as live.
+                    if let Some((anchor_item_id, anchor_position)) = anchor.as_ref() {
+                        if let Some(&(before, after)) =
+                            item_entry_boundaries.get(anchor_item_id.as_str())
+                        {
+                            let start = if anchor_position == "before" {
+                                before
+                            } else {
+                                after
+                            };
+                            for turn in
+                                mark_external_entries_superseded_from(&mut entries, start, &ts)
+                            {
+                                user_turn_revisions.rewind_from_turn(turn);
+                                superseded_user_turns.push(turn);
+                            }
                         }
                     }
                     if let Some(replacement_turn) = superseded_user_turns.iter().copied().min() {
@@ -4668,6 +4760,8 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
             }
         }
         let ts = value_str(&obj, "timestamp").unwrap_or_default();
+        let response_item_id = codex_response_item_id(&obj);
+        let entries_before = entries.len();
         if let Some(payload) = obj.get("payload") {
             if let Some((role, text)) = codex_event_message_text(payload) {
                 push_codex_transcript_message(
@@ -4689,6 +4783,11 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     text,
                 );
             }
+        }
+        // Record where this item sits in the entry stream so a later item-anchor
+        // rewind targeting it can supersede entries before/after it precisely.
+        if let Some(item_id) = response_item_id {
+            item_entry_boundaries.insert(item_id, (entries_before, entries.len()));
         }
     }
 
@@ -18364,6 +18463,87 @@ mod tests {
         assert!(marker["content"]
             .as_str()
             .is_some_and(|content| content.contains("Rewound to after item call-keep")));
+    }
+
+    #[test]
+    fn external_activity_replay_supersedes_entries_after_item_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-item-anchor-dimming";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg-prompt",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg-keep",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Kept answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg-noise",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Discarded noise" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 0,
+                        "anchor": { "itemId": "msg-keep", "position": "after" }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        let entry_for = |needle: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["content"].as_str() == Some(needle))
+                .unwrap_or_else(|| panic!("missing entry {needle}"))
+                .clone()
+        };
+        // Everything up to and including the "after" anchor stays live; the tail is dimmed.
+        assert_ne!(entry_for("Prompt")["superseded"], true);
+        assert_ne!(entry_for("Kept answer")["superseded"], true);
+        assert_eq!(entry_for("Discarded noise")["superseded"], true);
     }
 
     #[test]

@@ -158,40 +158,114 @@ pub fn write_external_overlay(
         return Ok(());
     }
 
-    let path = overlay_path(home);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create overlay dir: {e}"))?;
-    }
-    let mut root = match std::fs::read_to_string(&path) {
-        Ok(raw) => {
-            serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
+    // Serialize the read-modify-write across intendant processes that share this
+    // single global overlay file, so concurrent writers don't lose each other's
+    // entries (atomic_write alone prevents torn files, not lost updates).
+    with_overlay_lock(home, || {
+        let path = overlay_path(home);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create overlay dir: {e}"))?;
         }
-        Err(_) => Value::Object(Map::new()),
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
+        let mut root = match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(value) => value,
+                Err(err) => {
+                    // Don't silently reset a corrupt overlay — that would discard
+                    // every other session's config. Preserve it for forensics and warn.
+                    let backup = path.with_extension("corrupt");
+                    let _ = std::fs::rename(&path, &backup);
+                    eprintln!(
+                        "[session_config] agent-config overlay {} was corrupt ({err}); moved to {} and started fresh",
+                        path.display(),
+                        backup.display()
+                    );
+                    Value::Object(Map::new())
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
+            Err(err) => return Err(format!("read overlay: {err}")),
+        };
+        if !root.is_object() {
+            root = Value::Object(Map::new());
+        }
+        let root_obj = root.as_object_mut().expect("root is object");
+        let source_value = root_obj
+            .entry(source.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !source_value.is_object() {
+            *source_value = Value::Object(Map::new());
+        }
+        source_value
+            .as_object_mut()
+            .expect("source is object")
+            .insert(
+                session_id.to_string(),
+                serde_json::to_value(config).map_err(|e| format!("serialize config: {e}"))?,
+            );
+        let json =
+            serde_json::to_string_pretty(&root).map_err(|e| format!("serialize overlay: {e}"))?;
+        // Atomic write so a concurrent reader never sees a torn file and collapses
+        // every other session's managed-context flag to the default.
+        crate::file_watcher::atomic_write(&path, json.as_bytes())
+            .map_err(|e| format!("write overlay: {e}"))
+    })
+}
+
+/// Run `write` while holding a best-effort cross-process advisory lock on the
+/// shared overlay file, so concurrent intendant processes serialize their
+/// read-modify-write. The lock is a pure-safe `O_CREAT|O_EXCL` lock file with a
+/// stale-lock timeout (so a crashed holder can't wedge other writers); if it
+/// can't be acquired within the bound, the write proceeds unlocked rather than
+/// blocking forever.
+fn with_overlay_lock<T>(
+    home: &Path,
+    write: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    use std::time::{Duration, Instant};
+    const STALE_AFTER: Duration = Duration::from_secs(5);
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(15);
+    const POLL: Duration = Duration::from_millis(25);
+
+    let lock_path = overlay_path(home).with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-    let root_obj = root.as_object_mut().expect("root is object");
-    let source_value = root_obj
-        .entry(source)
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !source_value.is_object() {
-        *source_value = Value::Object(Map::new());
+    let start = Instant::now();
+    let mut acquired = false;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => {
+                acquired = true;
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&lock_path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .map(|age| age > STALE_AFTER)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                if start.elapsed() > GIVE_UP_AFTER {
+                    break; // proceed unlocked rather than block forever
+                }
+                std::thread::sleep(POLL);
+            }
+            Err(_) => break, // cannot create a lock file (perms, etc.) — proceed unlocked
+        }
     }
-    source_value
-        .as_object_mut()
-        .expect("source is object")
-        .insert(
-            session_id.to_string(),
-            serde_json::to_value(config).map_err(|e| format!("serialize config: {e}"))?,
-        );
-    let json =
-        serde_json::to_string_pretty(&root).map_err(|e| format!("serialize overlay: {e}"))?;
-    // The overlay is a single global file shared across sessions (and processes);
-    // an atomic write keeps a concurrent reader from ever seeing a torn file and
-    // collapsing every other session's managed-context flag to the default.
-    crate::file_watcher::atomic_write(&path, json.as_bytes())
-        .map_err(|e| format!("write overlay: {e}"))
+    let result = write();
+    if acquired {
+        let _ = std::fs::remove_file(&lock_path);
+    }
+    result
 }
 
 pub fn lookup_external_overlay(
@@ -299,13 +373,35 @@ fn overlay_path(home: &Path) -> PathBuf {
 
 fn read_overlay_map(home: &Path) -> HashMap<String, HashMap<String, SessionAgentConfig>> {
     let path = overlay_path(home);
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return HashMap::new();
+    // Distinguish "absent" (normal — no overlay yet) from "present but unreadable/
+    // corrupt". The latter must not be silently collapsed to empty, since that would
+    // revert every external session's managed-context flag to the default with no signal.
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => {
+            eprintln!(
+                "[session_config] could not read agent-config overlay {}: {err}; sessions keep default managed-context",
+                path.display()
+            );
+            return HashMap::new();
+        }
     };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return HashMap::new();
+    let value = match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "[session_config] agent-config overlay {} is not valid JSON ({err}); ignoring it",
+                path.display()
+            );
+            return HashMap::new();
+        }
     };
     let Some(obj) = value.as_object() else {
+        eprintln!(
+            "[session_config] agent-config overlay {} is not a JSON object; ignoring it",
+            path.display()
+        );
         return HashMap::new();
     };
     let mut out = HashMap::new();
@@ -412,5 +508,26 @@ mod tests {
         write_external_overlay(home.path(), "codex", "thread-1", &cfg).unwrap();
         let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
         assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn corrupt_overlay_is_preserved_and_overwritten_fresh() {
+        let home = tempfile::tempdir().unwrap();
+        let path = overlay_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+
+        // Writing must not panic or silently wipe the file; it preserves the corrupt
+        // copy and starts fresh so the new entry is still readable.
+        let cfg = from_wire(Some("codex"), Some("/tmp/codex"), Some("managed"));
+        write_external_overlay(home.path(), "codex", "thread-1", &cfg).unwrap();
+
+        assert!(path.with_extension("corrupt").exists());
+        assert_eq!(
+            lookup_external_overlay(home.path(), "codex", "thread-1").unwrap(),
+            cfg
+        );
+        // The lock file is released after the write.
+        assert!(!path.with_extension("lock").exists());
     }
 }
