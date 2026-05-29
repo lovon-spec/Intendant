@@ -13539,6 +13539,15 @@ function isSessionWindowEffectivelyActive(sessionId) {
   return isAgentActivePhase(phase);
 }
 
+function hasActiveSessionWindowExcept(sessionId) {
+  const exceptSid = String(sessionId || '').trim();
+  for (const [sid, win] of sessionWindows) {
+    if (!win || sid === exceptSid || win.ended) continue;
+    if (hasPendingActiveSessionWindow(sid) || isAgentActivePhase(win.phase)) return true;
+  }
+  return false;
+}
+
 function isSteerPhase(phase) {
   const p = phaseKey(phase);
   return isAgentActivePhase(p) && p !== 'interrupting';
@@ -27396,6 +27405,13 @@ function onSessionEnded(sessionId, reason) {
     }
   } else if (keepExternalDetached) {
     updateTaskTargetChip();
+    if (
+      sid === currentSessionFullId ||
+      sid === foregroundSessionFullId ||
+      (!hasActiveSessionWindowExcept(sid) && isAgentActivePhase(currentPhase))
+    ) {
+      setPhase('idle');
+    }
   }
   scheduleSessionRelationshipRender();
   // Refresh sessions list if already loaded
