@@ -2166,6 +2166,27 @@ fn persist_codex_thread_rename_overlay(
     crate::session_names::rename_session(home, "codex", session_id, &name).map(Some)
 }
 
+fn codex_thread_action_capabilities() -> Vec<String> {
+    [
+        "compact",
+        "fork",
+        "side",
+        "undo",
+        "review",
+        "rename",
+        "goal",
+        "goal-set",
+        "goal-get",
+        "goal-clear",
+        "goal-pause",
+        "goal-resume",
+        "memory-reset",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 fn side_session_prompt_from_params(params: &serde_json::Value) -> Option<String> {
     ["prompt", "message", "text", "task"]
         .iter()
@@ -6564,6 +6585,24 @@ mod tests {
             ),
             Some("Param name".to_string())
         );
+    }
+
+    #[test]
+    fn codex_thread_action_capabilities_cover_dashboard_goal_buttons() {
+        let actions = codex_thread_action_capabilities();
+        for action in [
+            "goal",
+            "goal-get",
+            "goal-clear",
+            "goal-pause",
+            "goal-resume",
+        ] {
+            assert!(
+                actions.iter().any(|candidate| candidate == action),
+                "missing dashboard Codex action capability: {}",
+                action
+            );
+        }
     }
 
     #[test]
@@ -12690,20 +12729,7 @@ async fn run_external_agent_mode(
                     follow_up: true,
                     steer: true,
                     interrupt: true,
-                    codex_thread_actions: vec![
-                        "compact".to_string(),
-                        "fork".to_string(),
-                        "side".to_string(),
-                        "undo".to_string(),
-                        "review".to_string(),
-                        "rename".to_string(),
-                        "goal".to_string(),
-                        "goal-set".to_string(),
-                        "goal-clear".to_string(),
-                        "goal-pause".to_string(),
-                        "goal-resume".to_string(),
-                        "memory-reset".to_string(),
-                    ],
+                    codex_thread_actions: codex_thread_action_capabilities(),
                     codex_managed_context: Some(mode),
                     codex_command: Some(project.config.agent.codex.command.clone()),
                 },
