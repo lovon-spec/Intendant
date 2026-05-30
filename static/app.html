@@ -1001,6 +1001,9 @@ html, body {
   gap: 6px;
   margin-left: auto;
 }
+.context-focus-only {
+  display: none;
+}
 .context-mode-btn,
 .context-focus-btn,
 .context-hotspot-btn {
@@ -1014,6 +1017,11 @@ html, body {
   line-height: 1.2;
   padding: 5px 8px;
   cursor: pointer;
+}
+.context-focus-btn[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--mauve) 24%, var(--surface0));
+  border-color: var(--mauve);
+  color: var(--text);
 }
 .context-mode-btn:hover,
 .context-focus-btn:hover,
@@ -1057,6 +1065,7 @@ html, body {
   position: relative;
   min-height: 260px;
   overflow: hidden;
+  touch-action: none;
   background:
     radial-gradient(circle at 18% 20%, rgba(137, 180, 250, 0.18), transparent 30%),
     radial-gradient(circle at 84% 78%, rgba(166, 227, 161, 0.12), transparent 28%),
@@ -1067,6 +1076,9 @@ html, body {
   width: 100%;
   height: 100%;
   cursor: grab;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 #context-scene.dragging { cursor: grabbing; }
 .context-scene-empty {
@@ -1230,6 +1242,88 @@ html, body {
 .json-null { color: var(--overlay1); font-style: italic; }
 .json-punctuation { color: var(--overlay1); }
 .json-error { color: var(--red); }
+
+body.context-focus-active {
+  overflow: hidden;
+}
+.context-pane.context-focus {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  width: 100vw;
+  height: 100dvh;
+  min-height: 100dvh;
+  background: var(--base);
+  color: var(--text);
+}
+.context-pane.context-focus .context-toolbar {
+  padding-top: max(8px, env(safe-area-inset-top));
+  box-shadow: 0 10px 30px rgba(0,0,0,0.28);
+  overflow: visible;
+}
+.context-pane.context-focus .context-focus-only {
+  display: inline-flex;
+}
+.context-pane.context-focus #context-open-focus-btn {
+  display: none;
+}
+.context-pane.context-focus .context-body {
+  position: relative;
+  display: block;
+  flex: 1 1 auto;
+  min-height: 0;
+  border-bottom: none;
+  overflow: hidden;
+}
+.context-pane.context-focus .context-scene-wrap {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+  height: auto;
+}
+.context-pane.context-focus .context-scene-overlay {
+  z-index: 2;
+}
+.context-pane.context-focus .context-inspector {
+  position: absolute;
+  z-index: 4;
+  left: 12px;
+  right: 12px;
+  bottom: calc(12px + env(safe-area-inset-bottom));
+  width: auto;
+  max-height: min(34dvh, 300px);
+  min-height: 0;
+  border: 1px solid rgba(108, 112, 134, 0.65);
+  border-radius: 6px;
+  background: rgba(17, 17, 26, 0.9);
+  box-shadow: 0 16px 45px rgba(0,0,0,0.42);
+  backdrop-filter: blur(14px);
+}
+.context-pane.context-focus .context-detail-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.context-pane.context-focus .context-detail-preview {
+  max-height: 92px;
+}
+.context-pane.context-focus .context-raw {
+  display: none;
+  position: absolute;
+  z-index: 8;
+  left: 12px;
+  right: 12px;
+  top: calc(112px + env(safe-area-inset-top));
+  bottom: calc(12px + env(safe-area-inset-bottom));
+  flex: none;
+  max-height: none;
+  min-height: 0;
+  border: 1px solid rgba(108, 112, 134, 0.72);
+  border-radius: 6px;
+  background: rgba(17, 17, 26, 0.96);
+  box-shadow: 0 18px 55px rgba(0,0,0,0.48);
+}
+.context-pane.context-focus.context-raw-open .context-raw {
+  display: block;
+}
 
 /* Stop button — interrupt the current agent turn. Lives in the Activity
    toolbar and is shown only while a turn is in flight. */
@@ -6835,6 +6929,10 @@ html, body {
     white-space: normal;
     overflow-wrap: anywhere;
   }
+  .context-meta-source,
+  .context-meta-format {
+    display: none;
+  }
   .context-controls {
     width: 100%;
     margin-left: 0;
@@ -6849,11 +6947,11 @@ html, body {
   }
   .context-body {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(200px, 38vh) minmax(200px, auto);
+    grid-template-rows: minmax(280px, 46vh);
     overflow: auto;
   }
   .context-scene-wrap {
-    min-height: 200px;
+    min-height: 280px;
   }
   .context-scene-overlay {
     flex-direction: column;
@@ -6862,13 +6960,106 @@ html, body {
     justify-content: flex-start;
   }
   .context-inspector {
-    border-left: none;
-    border-top: 1px solid var(--surface0);
+    display: none;
   }
   .context-raw {
-    flex-basis: 20%;
-    max-height: none;
-    min-height: 104px;
+    display: none;
+  }
+  .context-pane.context-focus .context-toolbar {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    padding: max(7px, env(safe-area-inset-top)) 8px 6px;
+    gap: 6px;
+  }
+  .context-pane.context-focus .context-toolbar-main {
+    flex: 1 1 auto;
+    width: auto;
+    gap: 5px;
+  }
+  .context-pane.context-focus .context-title {
+    flex: 0 0 auto;
+  }
+  .context-pane.context-focus .context-meta-source,
+  .context-pane.context-focus .context-meta-items,
+  .context-pane.context-focus .context-meta-format {
+    display: none;
+  }
+  .context-pane.context-focus .context-meta {
+    font-size: 10px;
+    padding: 2px 5px;
+  }
+  .context-pane.context-focus .context-controls {
+    width: 100%;
+    flex: 1 1 100%;
+    flex-wrap: nowrap;
+    gap: 4px;
+  }
+  .context-pane.context-focus .context-mode-btn,
+  .context-pane.context-focus .context-focus-btn {
+    min-height: 30px;
+    padding: 5px 6px;
+    font-size: 10px;
+  }
+  .context-pane.context-focus .context-replay-strip {
+    flex-wrap: wrap;
+    gap: 5px;
+    padding: 6px 8px;
+  }
+  .context-pane.context-focus .context-replay-label {
+    flex: 1 1 100%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .context-pane.context-focus .context-body {
+    grid-template-rows: none;
+    overflow: hidden;
+  }
+  .context-pane.context-focus .context-scene-wrap {
+    min-height: 0;
+  }
+  .context-pane.context-focus .context-scene-overlay {
+    left: 8px;
+    right: 8px;
+    top: 8px;
+  }
+  .context-pane.context-focus .context-scene-caption {
+    display: none;
+  }
+  .context-pane.context-focus .context-legend {
+    justify-content: flex-start;
+    max-height: 76px;
+    overflow: auto;
+    padding-right: 4px;
+  }
+  .context-pane.context-focus .context-inspector {
+    display: flex;
+    left: 8px;
+    right: 8px;
+    bottom: calc(8px + env(safe-area-inset-bottom));
+    max-height: min(32dvh, 230px);
+  }
+  .context-pane.context-focus .context-inspector-header {
+    padding: 8px 9px 6px;
+  }
+  .context-pane.context-focus .context-detail-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px;
+    padding: 7px 8px;
+  }
+  .context-pane.context-focus .context-detail-preview {
+    max-height: 64px;
+    padding: 8px;
+  }
+  .context-pane.context-focus .context-hotspots {
+    display: none;
+  }
+  .context-pane.context-focus .context-raw {
+    left: 8px;
+    right: 8px;
+    top: calc(118px + env(safe-area-inset-top));
+    bottom: calc(8px + env(safe-area-inset-bottom));
+    font-size: 11px;
   }
   .verbosity-select { margin-left: 0; }
   .log-entry { padding: 1px 8px; }
@@ -7232,16 +7423,19 @@ html, body {
             <div class="context-toolbar">
               <div class="context-toolbar-main">
                 <span class="context-title" id="context-title">Context</span>
-                <span class="context-meta"><strong>Source</strong><span id="context-source">--</span></span>
-                <span class="context-meta"><strong>Turn</strong><span id="context-turn">--</span></span>
-                <span class="context-meta"><strong>Items</strong><span id="context-items">--</span></span>
-                <span class="context-meta"><strong>Tokens</strong><span id="context-tokens">--</span></span>
-                <span class="context-meta"><strong>Format</strong><span id="context-format">--</span></span>
+                <span class="context-meta context-meta-source"><strong>Source</strong><span id="context-source">--</span></span>
+                <span class="context-meta context-meta-turn"><strong>Turn</strong><span id="context-turn">--</span></span>
+                <span class="context-meta context-meta-items"><strong>Items</strong><span id="context-items">--</span></span>
+                <span class="context-meta context-meta-tokens"><strong>Tokens</strong><span id="context-tokens">--</span></span>
+                <span class="context-meta context-meta-format"><strong>Format</strong><span id="context-format">--</span></span>
               </div>
               <div class="context-controls">
                 <button class="context-mode-btn active" id="context-live-btn" type="button">Live</button>
                 <button class="context-mode-btn" id="context-replay-btn" type="button">Replay</button>
                 <button class="context-focus-btn" id="context-reset-view-btn" type="button">Reset view</button>
+                <button class="context-focus-btn" id="context-open-focus-btn" type="button" title="Open context focus view" aria-label="Open context focus view">&#x26F6; Focus</button>
+                <button class="context-focus-btn context-focus-only" id="context-raw-toggle-btn" type="button" title="Show raw context snapshot" aria-pressed="false">Raw</button>
+                <button class="context-focus-btn context-focus-only" id="context-close-focus-btn" type="button" title="Close context focus view">Close</button>
               </div>
             </div>
             <div class="context-replay-strip">
@@ -22967,6 +23161,8 @@ let contextSelectedPartId = null;
 let contextSnapshotSeq = 1;
 let contextLastAnalysis = null;
 let contextListenersWired = false;
+let contextFocusMode = false;
+let contextRawOpen = false;
 
 const CONTEXT_GLOBAL_SESSION = '__global__';
 const CONTEXT_CATEGORY_ORDER = [
@@ -23009,6 +23205,10 @@ const contextViz = {
   dragMoved: false,
   dragX: 0,
   dragY: 0,
+  activePointers: new Map(),
+  primaryPointerId: null,
+  pinchDistance: 0,
+  pinchZoom: 38,
   rotationX: -0.22,
   rotationY: -0.48,
   zoom: 38,
@@ -23493,6 +23693,46 @@ function updateContextReplayControls(snapshot) {
   }
 }
 
+function updateContextFocusControls() {
+  const pane = document.querySelector('.context-pane');
+  if (pane) {
+    pane.classList.toggle('context-focus', contextFocusMode);
+    pane.classList.toggle('context-raw-open', contextFocusMode && contextRawOpen);
+  }
+  document.body.classList.toggle('context-focus-active', contextFocusMode);
+  const rawBtn = document.getElementById('context-raw-toggle-btn');
+  if (rawBtn) {
+    rawBtn.setAttribute('aria-pressed', contextRawOpen ? 'true' : 'false');
+    rawBtn.textContent = contextRawOpen ? 'Hide raw' : 'Raw';
+  }
+}
+
+function setContextFocusMode(open, opts = {}) {
+  const next = Boolean(open);
+  if (contextFocusMode === next && !opts.force) return;
+  contextFocusMode = next;
+  if (!contextFocusMode) contextRawOpen = false;
+  updateContextFocusControls();
+  if (contextFocusMode) {
+    const pane = document.querySelector('.context-pane');
+    if (opts.requestFullscreen && pane?.requestFullscreen) {
+      pane.requestFullscreen().catch(() => {});
+    }
+    contextStartThreeAnimation();
+    requestAnimationFrame(() => contextRenderThree());
+  } else {
+    if (document.fullscreenElement?.classList?.contains('context-pane')) {
+      document.exitFullscreen().catch(() => {});
+    }
+    contextRenderThree();
+  }
+}
+
+function setContextRawOpen(open) {
+  contextRawOpen = Boolean(open);
+  updateContextFocusControls();
+}
+
 function wireContextPaneListeners() {
   if (contextListenersWired) return;
   contextListenersWired = true;
@@ -23522,6 +23762,23 @@ function wireContextPaneListeners() {
     contextViz.zoom = 38;
     contextRenderThree();
   });
+  document.getElementById('context-open-focus-btn')?.addEventListener('click', () => {
+    setContextFocusMode(true, { requestFullscreen: true });
+  });
+  document.getElementById('context-close-focus-btn')?.addEventListener('click', () => {
+    setContextFocusMode(false);
+  });
+  document.getElementById('context-raw-toggle-btn')?.addEventListener('click', () => {
+    setContextRawOpen(!contextRawOpen);
+  });
+  document.addEventListener('keydown', ev => {
+    if (!contextFocusMode || ev.key !== 'Escape') return;
+    if (contextRawOpen) {
+      setContextRawOpen(false);
+    } else {
+      setContextFocusMode(false);
+    }
+  });
 }
 
 function focusContextPart(partId) {
@@ -23544,6 +23801,26 @@ function contextDisposeObject(object) {
       }
     }
   });
+}
+
+function contextClampZoom(value) {
+  return Math.max(12, Math.min(82, value));
+}
+
+function contextPointerDistance(points) {
+  if (points.length < 2) return 0;
+  const dx = points[0].x - points[1].x;
+  const dy = points[0].y - points[1].y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function contextResetPointerState() {
+  contextViz.dragging = false;
+  contextViz.dragMoved = false;
+  contextViz.primaryPointerId = null;
+  contextViz.pinchDistance = 0;
+  contextViz.activePointers.clear();
+  contextViz.canvas?.classList.remove('dragging');
 }
 
 function contextInitThree() {
@@ -23570,15 +23847,43 @@ function contextInitThree() {
   contextViz.resizeObserver = new ResizeObserver(() => contextRenderThree());
   contextViz.resizeObserver.observe(canvas.parentElement || canvas);
   canvas.addEventListener('pointerdown', ev => {
+    ev.preventDefault();
+    canvas.setPointerCapture?.(ev.pointerId);
+    contextViz.activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY, type: ev.pointerType });
+    if (contextViz.activePointers.size === 2) {
+      const points = [...contextViz.activePointers.values()];
+      contextViz.pinchDistance = contextPointerDistance(points);
+      contextViz.pinchZoom = contextViz.zoom;
+      contextViz.dragging = false;
+      contextViz.dragMoved = true;
+      canvas.classList.remove('dragging');
+      return;
+    }
+    if (contextViz.activePointers.size > 1) return;
     contextViz.dragging = true;
     contextViz.dragMoved = false;
+    contextViz.primaryPointerId = ev.pointerId;
     contextViz.dragX = ev.clientX;
     contextViz.dragY = ev.clientY;
     canvas.classList.add('dragging');
-    canvas.setPointerCapture?.(ev.pointerId);
   });
   canvas.addEventListener('pointermove', ev => {
+    if (contextViz.activePointers.has(ev.pointerId)) {
+      contextViz.activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY, type: ev.pointerType });
+    }
+    if (contextViz.activePointers.size >= 2) {
+      ev.preventDefault();
+      const distance = contextPointerDistance([...contextViz.activePointers.values()]);
+      if (distance > 4 && contextViz.pinchDistance > 4) {
+        contextViz.zoom = contextClampZoom(contextViz.pinchZoom * (contextViz.pinchDistance / distance));
+        contextViz.dragMoved = true;
+        contextRenderThree();
+      }
+      return;
+    }
     if (!contextViz.dragging) return;
+    ev.preventDefault();
+    if (contextViz.primaryPointerId !== null && ev.pointerId !== contextViz.primaryPointerId) return;
     const dx = ev.clientX - contextViz.dragX;
     const dy = ev.clientY - contextViz.dragY;
     if (Math.abs(dx) + Math.abs(dy) > 2) contextViz.dragMoved = true;
@@ -23589,19 +23894,33 @@ function contextInitThree() {
     contextRenderThree();
   });
   canvas.addEventListener('pointerup', ev => {
+    ev.preventDefault();
     canvas.classList.remove('dragging');
     canvas.releasePointerCapture?.(ev.pointerId);
-    const shouldPick = !contextViz.dragMoved;
-    contextViz.dragging = false;
+    contextViz.activePointers.delete(ev.pointerId);
+    const shouldPick = !contextViz.dragMoved && contextViz.primaryPointerId === ev.pointerId;
+    if (contextViz.activePointers.size === 1) {
+      const [nextId, point] = contextViz.activePointers.entries().next().value;
+      contextViz.primaryPointerId = nextId;
+      contextViz.dragX = point.x;
+      contextViz.dragY = point.y;
+      contextViz.dragging = true;
+      return;
+    }
+    if (contextViz.activePointers.size === 0) {
+      contextViz.dragging = false;
+      contextViz.primaryPointerId = null;
+      contextViz.pinchDistance = 0;
+    }
     if (shouldPick) contextPickThreePart(ev);
   });
-  canvas.addEventListener('pointercancel', () => {
-    contextViz.dragging = false;
-    canvas.classList.remove('dragging');
+  canvas.addEventListener('pointercancel', ev => {
+    canvas.releasePointerCapture?.(ev.pointerId);
+    contextResetPointerState();
   });
   canvas.addEventListener('wheel', ev => {
     ev.preventDefault();
-    contextViz.zoom = Math.max(16, Math.min(70, contextViz.zoom + ev.deltaY * 0.035));
+    contextViz.zoom = contextClampZoom(contextViz.zoom + ev.deltaY * 0.035);
     contextRenderThree();
   }, { passive: false });
   return true;
@@ -23860,6 +24179,7 @@ function renderContextPane() {
   const rawEl = document.getElementById('context-raw');
   if (!rawEl) return;
   wireContextPaneListeners();
+  updateContextFocusControls();
   const set = (id, value) => {
     const el = document.getElementById(id);
     if (el) el.textContent = contextValueText(value);
@@ -23922,6 +24242,7 @@ function switchActivitySubtab(name) {
     renderContextPane();
     contextStartThreeAnimation();
   } else {
+    setContextFocusMode(false);
     contextStopThreeAnimation();
   }
   if (name === 'managed') {
