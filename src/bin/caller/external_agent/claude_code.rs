@@ -15,8 +15,6 @@ use super::{
     ToolCompletionStatus,
 };
 
-use super::codex::DISPLAY_TOOLS_PROMPT;
-
 // ---------------------------------------------------------------------------
 // Claude Code JSONL protocol types (stdin/stdout)
 // ---------------------------------------------------------------------------
@@ -113,7 +111,6 @@ pub struct ClaudeCodeAgent {
     permission_mode: String,
     allowed_tools: Vec<String>,
     web_port: Option<u16>,
-    prompt_sent: bool,
     working_dir: Option<std::path::PathBuf>,
     child: Option<Child>,
     writer: Option<SharedWriter>,
@@ -138,7 +135,6 @@ impl ClaudeCodeAgent {
             permission_mode,
             allowed_tools,
             web_port,
-            prompt_sent: false,
             working_dir: None,
             child: None,
             writer: None,
@@ -516,20 +512,13 @@ impl ExternalAgent for ClaudeCodeAgent {
         _thread: &AgentThread,
         message: &str,
     ) -> Result<(), CallerError> {
-        let augmented = if self.web_port.is_some() && !self.prompt_sent {
-            self.prompt_sent = true;
-            format!("{}{}", message, DISPLAY_TOOLS_PROMPT)
-        } else {
-            message.to_string()
-        };
-
         let user_msg = CcUserMessage {
             msg_type: "user".into(),
             message: CcMessageContent {
                 role: "user".into(),
                 content: vec![CcContentBlock {
                     block_type: "text".into(),
-                    text: augmented,
+                    text: message.to_string(),
                 }],
             },
             session_id: self.session_id.clone(),
@@ -654,7 +643,6 @@ mod tests {
         assert_eq!(agent.permission_mode, "auto");
         assert!(agent.allowed_tools.is_empty());
         assert!(agent.web_port.is_none());
-        assert!(!agent.prompt_sent);
     }
 
     #[tokio::test]

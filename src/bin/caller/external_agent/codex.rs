@@ -896,113 +896,6 @@ fn format_duration_short(seconds: u64) -> String {
     }
 }
 
-/// Guidance about the sandbox Codex is running under, appended to the first
-/// user message alongside the Intendant MCP tool prompt. The string is dynamic so
-/// the model sees the actual sandbox for this session, not a baked-in default.
-///
-/// Steered by a concrete failure mode: under `workspace-write`, Codex tried
-/// to drive LibreOffice via a UNO socket, then via a named pipe — both are
-/// listener binds the sandbox blocks. A line up front about "pure-Python
-/// libraries before daemon processes" would have short-circuited that.
-pub(super) fn sandbox_hint(sandbox_mode: &str) -> String {
-    let body = match sandbox_mode {
-        "read-only" => {
-            "\
-You are running under Codex's `read-only` sandbox. You CANNOT modify any \
-file on disk. Use read/search tools only and return findings to the user — \
-do not attempt edits, shell side-effects, or spawning daemons."
-        }
-        "danger-full-access" => {
-            "\
-You are running under Codex's `danger-full-access` sandbox. No filesystem \
-or network restrictions apply — the user has explicitly opted in. Still \
-prefer the least-invasive approach that gets the task done."
-        }
-        // Default: treat anything else as workspace-write (Intendant's
-        // project config uses that as the default).
-        _ => {
-            "\
-You are running under Codex's `workspace-write` sandbox. Writes are allowed \
-inside the project root and `/tmp`; outbound network is blocked unless \
-`sandbox_workspace_write.network_access = true` in the config; inbound \
-listener binds (sockets AND named pipes) are blocked regardless. \
-\n\n\
-Implication: when a task needs a document, data file, or archive, prefer a \
-pure-Python library that writes the file directly (e.g. `python-pptx` or \
-`odfpy` for presentations, `openpyxl` for spreadsheets, `zipfile`/`tarfile` \
-for archives, or hand-rolled XML+zip packaging) over automating a desktop \
-application through UNO / D-Bus / AppleScript — those need a listener the \
-sandbox blocks. If the user explicitly asked for live automation, say the \
-sandbox prevents it and ask whether to switch to `danger-full-access` \
-before retrying."
-        }
-    };
-    format!("\n\n## Environment\n\n{}\n", body)
-}
-
-const MANAGED_CONTEXT_TOOLS_PROMPT: &str = "\n\
-### Managed Context (managed Codex only)\n\
-- **rewind_context(anchor, reason, primer, preserve?, discard?, artifacts?, next_steps?)**: Rewrite the active Codex thread to a denser continuation at an exact item/tool-call anchor. Use this proactively after noisy tool output, failed exploration, or a long research branch once the durable facts can be crystallized into the primer. Also use it when context pressure is high.\n\
-- **rewind_backout(record_id, mode?, allow_cache_reset?)**: Inspect or restore a prior managed-context record. Use `mode=\"restore\"` for same-thread recovery; `fork`/`backout` require `allow_cache_reset=true` because they create a new cache key.\n\
-\n";
-
-pub(super) const DISPLAY_TOOLS_PROMPT: &str = "\n\n\
-## Intendant MCP Tools\n\
-\n\
-You have access to these tools through the `intendant` MCP server.\n\
-\n\
-### Session Status (always available)\n\
-- **get_status()**: Report current Intendant state, including backend-reported Codex context density/pressure.\n\
-\n\
-**GUI interaction rule:** For all GUI tasks, use take_screenshot and execute_cu_actions. Look at screenshots and click what you see. Do NOT use osascript, accessibility queries, shell commands, or app binary inspection for GUI interaction.\n\
-\n\
-### Computer Use (always available)\n\
-Direct capture and interaction with displays.\n\
-- **take_screenshot(display_target?)**: On-demand capture. Returns an MCP image.\n\
-- **execute_cu_actions(actions, display_target?)**: Execute actions AND return a post-action MCP image.\n\
-  A screenshot is automatically taken after the last action.\n\
-  Actions is a JSON array. Action types:\n\
-  - `{\"type\": \"click\", \"x\": 100, \"y\": 200, \"button\": \"left\"}` — button: left/right/middle\n\
-  - `{\"type\": \"double_click\", \"x\": 100, \"y\": 200}`\n\
-  - `{\"type\": \"type\", \"text\": \"hello\"}` — types text literally\n\
-  - `{\"type\": \"key\", \"key\": \"cmd+space\"}` — key combos: cmd, ctrl, alt, shift + key. Examples: cmd+tab, cmd+space, cmd+w, enter, escape, tab, up, down\n\
-  - `{\"type\": \"scroll\", \"x\": 400, \"y\": 300, \"direction\": \"down\", \"amount\": 3}`\n\
-  - `{\"type\": \"move_mouse\", \"x\": 100, \"y\": 200}`\n\
-  - `{\"type\": \"drag\", \"start_x\": 100, \"start_y\": 200, \"end_x\": 300, \"end_y\": 400}`\n\
-  - `{\"type\": \"wait\", \"ms\": 1000}`\n\
-  Coordinates are in logical display points.\n\
-- **list_displays()**: Enumerate available displays with IDs and resolutions.\n\
-\n\
-### Display Streaming & Frames (requires active web dashboard)\n\
-These access the frame registry populated by the web dashboard's WebRTC\n\
-display stream. Returns empty if no dashboard is streaming.\n\
-- **list_frames(stream?, count?)**: List captured frames with metadata.\n\
-- **read_frame(frame_id, stream?)**: Read a frame image (base64 JPEG). Use frame_id=\"latest\" for most recent.\n\
-- **take_display(display_id)**: Signal you are using a display. Notifies the dashboard UI.\n\
-- **release_display(display_id, note?)**: Signal you are done with a display.\n\
-\n\
-### Voice / Live Audio\n\
-- **spawn_live_audio(id, provider, playbook, response_schema, timeout_secs?, voice?, model?, initial_message?)**: Spawn a voice conversation via OpenAI Realtime or Gemini Live. Routes audio through Vortex Audio. The voice model follows the playbook and returns structured data matching response_schema. Blocks until complete.\n\
-\n\
-### Task Delegation\n\
-- **start_task(task, display_target?)**: Delegate a task to Intendant's internal agent.\n\
-\n\
-Display targets: \"user_session\" (user's display), \":99\" (virtual display 99).\n\
-";
-
-fn intendant_mcp_tools_prompt(managed_context: bool) -> String {
-    if !managed_context {
-        return DISPLAY_TOOLS_PROMPT.to_string();
-    }
-    let mut out = DISPLAY_TOOLS_PROMPT.to_string();
-    if let Some(insert_at) = out.find("**GUI interaction rule:**") {
-        out.insert_str(insert_at, MANAGED_CONTEXT_TOOLS_PROMPT);
-    } else {
-        out.push_str(MANAGED_CONTEXT_TOOLS_PROMPT);
-    }
-    out
-}
-
 fn encode_mcp_query_value(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -1107,7 +1000,6 @@ pub struct CodexAgent {
     web_port: Option<u16>,
     mcp_session_id: Option<String>,
     resume_session: Option<String>,
-    prompt_sent: bool,
     /// Working directory used to resolve Codex project config for config/read.
     working_dir: Option<PathBuf>,
     /// Working directory where .codex/config.toml was written (for cleanup).
@@ -1219,7 +1111,6 @@ impl CodexAgent {
             web_port,
             mcp_session_id: None,
             resume_session: None,
-            prompt_sent: false,
             working_dir: None,
             config_working_dir: None,
             request_trace_root: None,
@@ -3639,31 +3530,11 @@ impl ExternalAgent for CodexAgent {
         message: &str,
         images: &[AgentImageAttachment],
     ) -> Result<(), CallerError> {
-        let augmented = if !self.prompt_sent {
-            self.prompt_sent = true;
-            // Sandbox hint is cheap (~400 chars) and steers the model away
-            // from approaches that the current sandbox will silently reject
-            // (e.g. listener binds under workspace-write). Attach on every
-            // new thread, whether or not the MCP display tools are wired.
-            let sandbox = sandbox_hint(&self.sandbox);
-            if self.web_port.is_some() {
-                format!(
-                    "{}{}{}",
-                    message,
-                    sandbox,
-                    intendant_mcp_tools_prompt(self.managed_context)
-                )
-            } else {
-                format!("{}{}", message, sandbox)
-            }
-        } else {
-            message.to_string()
-        };
         // Codex v2 `UserInput` enum (camelCase): { type: "text" | "localImage" | "image" }.
         // Prefer `localImage` (file path) when we have one — keeps base64 out of the
         // JSON-RPC stream. Fall back to `image` with a data URL only if we don't.
         let mut input: Vec<serde_json::Value> = Vec::with_capacity(images.len() + 1);
-        input.push(serde_json::json!({"type": "text", "text": augmented}));
+        input.push(serde_json::json!({"type": "text", "text": message}));
         for img in images {
             if let Some(ref path) = img.local_path {
                 input.push(serde_json::json!({
@@ -4997,49 +4868,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_hint_mentions_mode_and_steers_writeable() {
-        let ws = sandbox_hint("workspace-write");
-        assert!(ws.contains("workspace-write"), "missing mode: {}", ws);
-        assert!(
-            ws.contains("python-pptx") || ws.contains("pure-Python"),
-            "workspace-write hint should steer toward library-first path, got: {}",
-            ws,
-        );
-        assert!(
-            ws.contains("listener"),
-            "should warn about listener binds: {}",
-            ws
-        );
-
-        let ro = sandbox_hint("read-only");
-        assert!(ro.contains("read-only"), "missing mode: {}", ro);
-        assert!(
-            ro.contains("CANNOT modify"),
-            "read-only hint should be explicit: {}",
-            ro
-        );
-
-        let danger = sandbox_hint("danger-full-access");
-        assert!(
-            danger.contains("danger-full-access"),
-            "missing mode: {}",
-            danger
-        );
-    }
-
-    #[test]
-    fn sandbox_hint_unknown_mode_falls_back_to_workspace_write() {
-        // Defensive: if a new sandbox mode is added upstream and we haven't
-        // updated here, we don't lie to the model about what's possible.
-        let hint = sandbox_hint("some-new-mode");
-        assert!(
-            hint.contains("workspace-write"),
-            "unknown mode must fall back to the safest real policy: {}",
-            hint
-        );
-    }
-
-    #[test]
     fn translate_item_completed_cancelled() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
@@ -6318,21 +6146,6 @@ mod tests {
         });
         assert_eq!(init_params["clientInfo"]["name"], "intendant");
         assert_eq!(init_params["capabilities"]["experimentalApi"], true);
-    }
-
-    #[test]
-    fn intendant_mcp_prompt_advertises_rewind_tools_only_for_managed_codex() {
-        let vanilla = intendant_mcp_tools_prompt(false);
-        assert!(vanilla.contains("take_screenshot"));
-        assert!(vanilla.contains("get_status"));
-        assert!(!vanilla.contains("rewind_context"));
-        assert!(!vanilla.contains("rewind_backout"));
-
-        let managed = intendant_mcp_tools_prompt(true);
-        assert!(managed.contains("take_screenshot"));
-        assert!(managed.contains("get_status"));
-        assert!(managed.contains("rewind_context"));
-        assert!(managed.contains("rewind_backout"));
     }
 
     #[test]

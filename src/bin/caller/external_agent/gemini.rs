@@ -20,9 +20,6 @@ use super::{
     ExternalAgent, ToolCompletionStatus,
 };
 
-// Re-use the same display tools prompt as Codex — the MCP tools are identical.
-use super::codex::DISPLAY_TOOLS_PROMPT;
-
 /// Gemini CU uses a 0-1000 normalized coordinate grid. Tell the model to pass
 /// coordinate_space so we denormalize before executing clicks.
 const GEMINI_CU_ADDENDUM: &str = "\n\n\
@@ -1049,7 +1046,7 @@ impl ExternalAgent for GeminiAgent {
     ) -> Result<(), CallerError> {
         let augmented = if self.web_port.is_some() && !self.prompt_sent {
             self.prompt_sent = true;
-            format!("{}{}{}", message, DISPLAY_TOOLS_PROMPT, GEMINI_CU_ADDENDUM)
+            format!("{}{}", message, GEMINI_CU_ADDENDUM)
         } else {
             message.to_string()
         };
