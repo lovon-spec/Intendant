@@ -17091,9 +17091,48 @@ function isCommandOutputLog(c) {
   return level === 'agent';
 }
 
+function padTimestampPart(value, width = 2) {
+  return String(Math.trunc(Math.abs(Number(value) || 0))).padStart(width, '0');
+}
+
+function parseTimestampWithExplicitZone(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?)(Z|[+-]\d{2}:?\d{2})$/);
+  if (!match) return null;
+  const zone = match[3] === 'Z'
+    ? 'Z'
+    : match[3].replace(/^([+-]\d{2})(\d{2})$/, '$1:$2');
+  const date = new Date(`${match[1]}T${match[2]}${zone}`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function localTimestampOffsetLabel(date) {
+  const offset = -date.getTimezoneOffset();
+  const sign = offset >= 0 ? '+' : '-';
+  const abs = Math.abs(offset);
+  return `UTC${sign}${padTimestampPart(Math.floor(abs / 60))}:${padTimestampPart(abs % 60)}`;
+}
+
+function formatLocalTimestamp(date, options = {}) {
+  const datePart = options.includeYear
+    ? `${date.getFullYear()}-${padTimestampPart(date.getMonth() + 1)}-${padTimestampPart(date.getDate())}`
+    : `${padTimestampPart(date.getMonth() + 1)}-${padTimestampPart(date.getDate())}`;
+  let timePart = `${padTimestampPart(date.getHours())}:${padTimestampPart(date.getMinutes())}`;
+  if (options.includeSeconds) {
+    timePart += `:${padTimestampPart(date.getSeconds())}`;
+    if (options.includeMillis && date.getMilliseconds()) {
+      timePart += `.${padTimestampPart(date.getMilliseconds(), 3)}`;
+    }
+  }
+  return `${datePart} ${timePart}`;
+}
+
 function formatLogTimestampLabel(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
+  const zoned = parseTimestampWithExplicitZone(raw);
+  if (zoned) return formatLocalTimestamp(zoned);
   const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})/);
   if (match) return `${match[2]}-${match[3]} ${match[4]}:${match[5]}`;
   const time = raw.match(/^(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/);
@@ -17104,6 +17143,10 @@ function formatLogTimestampLabel(value) {
 
 function formatLogTimestampTitle(value) {
   const raw = String(value || '').trim();
+  const zoned = parseTimestampWithExplicitZone(raw);
+  if (zoned) {
+    return `${formatLocalTimestamp(zoned, { includeYear: true, includeSeconds: true, includeMillis: true })} ${localTimestampOffsetLabel(zoned)} (${raw})`;
+  }
   return raw;
 }
 
@@ -20934,6 +20977,8 @@ function currentLogTime() {
 function formatSessionDetailTimestamp(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
+  const zoned = parseTimestampWithExplicitZone(raw);
+  if (zoned) return formatLocalTimestamp(zoned, { includeYear: true, includeSeconds: true });
   const iso = raw.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/);
   if (iso) return `${iso[1]} ${iso[2]}`;
   return raw;
@@ -31463,7 +31508,8 @@ function renderSessionDetailEntries(entries, el) {
     const ts = document.createElement('span');
     ts.className = 'log-ts';
     ts.textContent = formatSessionDetailTimestamp(e.ts);
-    if (e.ts && ts.textContent !== String(e.ts)) ts.title = String(e.ts);
+    const tsTitle = formatLogTimestampTitle(e.ts);
+    if (tsTitle && ts.textContent !== tsTitle) ts.title = tsTitle;
 
     const lvl = document.createElement('span');
     lvl.className = 'log-level';
