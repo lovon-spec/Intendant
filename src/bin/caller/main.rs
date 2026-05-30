@@ -12992,6 +12992,8 @@ async fn run_external_agent_mode(
             Ok(result) => {
                 if let Some(goal) = result.goal {
                     emit_external_session_goal(&drain_config, live_session_id.clone(), Some(goal));
+                } else if result.goal_absent {
+                    emit_external_session_goal(&drain_config, live_session_id.clone(), None);
                 }
                 if result.paused {
                     let message =
@@ -13627,6 +13629,12 @@ async fn run_external_agent_mode(
                                     &drain_config,
                                     live_session_id.clone(),
                                     Some(goal),
+                                );
+                            } else if result.goal_absent {
+                                emit_external_session_goal(
+                                    &drain_config,
+                                    live_session_id.clone(),
+                                    None,
                                 );
                             }
                         }

@@ -638,11 +638,20 @@ impl CodexAgent {
             .send_request("thread/goal/get", Some(params))
             .await
             .map_err(|e| CallerError::ExternalAgent(format!("thread/goal/get: {e}")))?;
-        let current_goal = response.get("goal").and_then(session_goal_from_value);
-        if !codex_goal_status(&response).is_some_and(|status| status.eq_ignore_ascii_case("active"))
+        let Some(current_goal) = response.get("goal").and_then(session_goal_from_value) else {
+            return Ok(AutonomousGoalPauseResult {
+                goal_absent: true,
+                ..Default::default()
+            });
+        };
+        if !current_goal
+            .status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("active"))
         {
             return Ok(AutonomousGoalPauseResult {
-                goal: current_goal,
+                goal: Some(current_goal),
+                goal_absent: false,
                 paused: false,
             });
         }
@@ -659,12 +668,15 @@ impl CodexAgent {
             .get("goal")
             .and_then(session_goal_from_value)
             .or_else(|| {
-                current_goal.map(|mut goal| {
-                    goal.status = Some("paused".to_string());
-                    goal
-                })
+                let mut goal = current_goal;
+                goal.status = Some("paused".to_string());
+                Some(goal)
             });
-        Ok(AutonomousGoalPauseResult { goal, paused: true })
+        Ok(AutonomousGoalPauseResult {
+            goal,
+            goal_absent: false,
+            paused: true,
+        })
     }
 }
 
@@ -749,15 +761,6 @@ fn rollback_anchor_position(
     })
 }
 
-fn codex_goal_status(response: &serde_json::Value) -> Option<&str> {
-    response
-        .pointer("/goal/status")
-        .and_then(|v| v.as_str())
-        .or_else(|| response.get("status").and_then(|v| v.as_str()))
-        .map(str::trim)
-        .filter(|status| !status.is_empty())
-}
-
 fn side_prompt_from_params(params: &serde_json::Value) -> Result<String, CallerError> {
     let prompt = ["prompt", "message", "text", "task"]
         .iter()
@@ -814,15 +817,21 @@ fn extract_thread_path(value: &serde_json::Value) -> Option<PathBuf> {
 fn format_goal_response(prefix: &str, response: &serde_json::Value) -> String {
     match response.get("goal") {
         Some(serde_json::Value::Null) | None => "no goal set".to_string(),
-        Some(goal) => format!("{}: {}", prefix, format_goal(goal)),
+        Some(goal) => format_goal(goal)
+            .map(|goal| format!("{}: {}", prefix, goal))
+            .unwrap_or_else(|| "no goal set".to_string()),
     }
 }
 
-fn format_goal(goal: &serde_json::Value) -> String {
-    let objective = goal
-        .get("objective")
+fn goal_objective(goal: &serde_json::Value) -> Option<&str> {
+    goal.get("objective")
         .and_then(|v| v.as_str())
-        .unwrap_or("<unknown objective>");
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn format_goal(goal: &serde_json::Value) -> Option<String> {
+    let objective = goal_objective(goal)?;
     let status = goal
         .get("status")
         .and_then(|v| v.as_str())
@@ -844,17 +853,11 @@ fn format_goal(goal: &serde_json::Value) -> String {
         details.push(format!("elapsed {}", format_duration_short(seconds)));
     }
 
-    format!("{} ({})", objective, details.join(", "))
+    Some(format!("{} ({})", objective, details.join(", ")))
 }
 
 fn session_goal_from_value(goal: &serde_json::Value) -> Option<crate::types::SessionGoal> {
-    let objective = goal
-        .get("objective")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<unknown objective>")
-        .to_string();
+    let objective = goal_objective(goal)?.to_string();
 
     Some(crate::types::SessionGoal {
         objective,
@@ -3042,11 +3045,11 @@ fn translate_notification_with_scope(
                 state.goal_known_active = false;
                 return;
             }
-            state.goal_known_active = true;
             // Codex refreshes active goal metadata frequently. Keep those
             // updates structured-only so normal activity logs do not fill with
             // status churn.
             if let Some(goal) = session_goal_from_value(goal) {
+                state.goal_known_active = true;
                 send_scoped_agent_event(
                     event_tx,
                     thread_id,
@@ -6433,16 +6436,56 @@ mod tests {
     }
 
     #[test]
-    fn goal_status_parser_accepts_nested_and_flat_shapes() {
+    fn malformed_goal_payloads_are_treated_as_no_goal() {
+        let response = serde_json::json!({
+            "goal": {
+                "threadId": "thread-abc",
+                "status": "active",
+                "tokensUsed": 10,
+                "timeUsedSeconds": 2
+            }
+        });
+
         assert_eq!(
-            codex_goal_status(&serde_json::json!({"goal": {"status": "active"}})),
-            Some("active")
+            format_goal_response("current goal", &response),
+            "no goal set"
         );
-        assert_eq!(
-            codex_goal_status(&serde_json::json!({"status": " paused "})),
-            Some("paused")
+        assert!(session_goal_from_value(&response["goal"]).is_none());
+        assert!(session_goal_from_value(&serde_json::json!({
+            "objective": "   ",
+            "status": "active"
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn malformed_goal_notifications_do_not_emit_badges_or_clear_noise() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        let update = serde_json::json!({
+            "threadId": "thread-abc",
+            "goal": {
+                "threadId": "thread-abc",
+                "status": "active"
+            }
+        });
+
+        translate_notification_with_state("thread/goal/updated", &update, &tx, &mut state);
+        assert!(
+            rx.try_recv().is_err(),
+            "malformed goal updates should not create visible goal state"
         );
-        assert_eq!(codex_goal_status(&serde_json::json!({})), None);
+
+        translate_notification_with_state(
+            "thread/goal/cleared",
+            &serde_json::json!({ "threadId": "thread-abc" }),
+            &tx,
+            &mut state,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "ignored malformed updates should not make later startup clears noisy"
+        );
     }
 
     #[test]

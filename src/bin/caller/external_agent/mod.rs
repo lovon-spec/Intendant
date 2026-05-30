@@ -503,6 +503,8 @@ pub struct AgentContextSnapshot {
 pub struct AutonomousGoalPauseResult {
     /// The latest visible goal state, if the backend has one.
     pub goal: Option<crate::types::SessionGoal>,
+    /// True when the backend successfully reported that no visible goal exists.
+    pub goal_absent: bool,
     /// True when this call changed an active goal into a passive state.
     pub paused: bool,
 }
