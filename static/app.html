@@ -1894,7 +1894,7 @@ body.context-focus-active {
   min-height: 130px;
 }
 .session-window:not(.header-collapsed):not(.minimized) {
-  max-height: 320px;
+  max-height: none;
 }
 .session-window.header-collapsed .session-window-task {
   display: none;
@@ -1927,6 +1927,7 @@ body.context-focus-active {
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-header {
   align-items: flex-start;
+  flex-wrap: wrap;
   cursor: pointer;
 }
 .session-window.header-collapsed .session-window-header {
@@ -1942,6 +1943,10 @@ body.context-focus-active {
 .session-window.header-collapsed .session-window-title {
   flex: 0 1 min(520px, 46%);
   max-width: min(520px, 46%);
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-title {
+  flex: 1 1 100%;
+  order: 1;
 }
 .session-window-meta {
   min-width: 0;
@@ -1969,6 +1974,14 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-window:not(.header-collapsed):not(.minimized) .session-window-id {
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  flex-wrap: wrap;
+}
 .session-window-relation-strip {
   flex-shrink: 0;
   display: inline-flex;
@@ -1977,6 +1990,10 @@ body.context-focus-active {
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-relation-strip {
+  flex-wrap: wrap;
+  overflow: visible;
 }
 .session-window-relation-chip {
   flex-shrink: 0;
@@ -2009,6 +2026,23 @@ body.context-focus-active {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-identity-name,
+.session-window:not(.header-collapsed):not(.minimized) .session-identity-short,
+.session-window:not(.header-collapsed):not(.minimized) .session-identity-full {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.session-identity-full {
+  display: none;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-identity-short-collapsed {
+  display: none;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-identity-full {
+  display: inline;
 }
 .session-identity-short,
 .session-identity-separator {
@@ -2105,6 +2139,12 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-window:not(.header-collapsed):not(.minimized) .session-window-tier,
+.session-window:not(.header-collapsed):not(.minimized) .session-window-status,
+.session-window:not(.header-collapsed):not(.minimized) .session-window-menu-cluster,
+.session-window:not(.header-collapsed):not(.minimized) .session-window-state-cluster {
+  order: 3;
+}
 .session-window-goal {
   flex: 0 2 230px;
   min-width: 0;
@@ -2127,6 +2167,14 @@ body.context-focus-active {
   flex: 1 1 220px;
   max-width: min(460px, 38%);
 }
+.session-window:not(.header-collapsed):not(.minimized) .session-window-goal {
+  flex: 1 1 100%;
+  order: 2;
+  max-width: none;
+  align-items: flex-start;
+  white-space: normal;
+  overflow: visible;
+}
 .session-window-goal::before {
   content: "/goal";
   flex-shrink: 0;
@@ -2139,6 +2187,12 @@ body.context-focus-active {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-goal-text {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .session-window-goal.paused {
   border-color: rgba(250, 179, 135, 0.30);
@@ -2178,6 +2232,9 @@ body.context-focus-active {
 .session-window-menu-cluster {
   position: relative;
   margin-left: 2px;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-menu-cluster {
+  margin-left: auto;
 }
 .session-window.header-collapsed .session-window-menu-cluster {
   margin-left: auto;
@@ -2292,6 +2349,9 @@ body.context-focus-active {
   min-height: 0;
   overflow-y: auto;
   padding: 3px 0;
+}
+.session-window:not(.header-collapsed):not(.minimized) .session-window-log {
+  max-height: 220px;
 }
 .session-window-jump-bottom {
   position: absolute;
@@ -14797,12 +14857,20 @@ function renderSessionIdentity(el, sessionId, options = {}) {
   const prefix = compactSessionText(options.prefix);
   if (prefix) appendSessionIdentityPart(el, 'session-identity-prefix', prefix);
 
+  const shortClass = options.includeFullId
+    ? 'session-identity-short session-identity-short-collapsed'
+    : 'session-identity-short';
+  const appendId = () => {
+    appendSessionIdentityPart(el, shortClass, shortId);
+    if (options.includeFullId) appendSessionIdentityPart(el, 'session-identity-full', sid);
+  };
+
   if (options.order === 'name-id' && showName) {
     appendSessionIdentityPart(el, 'session-identity-name', name);
     appendSessionIdentityPart(el, 'session-identity-separator', '\u00b7');
-    appendSessionIdentityPart(el, 'session-identity-short', shortId);
+    appendId();
   } else {
-    appendSessionIdentityPart(el, 'session-identity-short', shortId);
+    appendId();
     if (showName) {
       appendSessionIdentityPart(el, 'session-identity-separator', '\u00b7');
       appendSessionIdentityPart(el, 'session-identity-name', name);
@@ -17569,7 +17637,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   title.className = 'session-window-title';
   const id = document.createElement('div');
   id.className = 'session-window-id';
-  renderSessionIdentity(id, sid, { order: 'id-name', showName: false });
+  renderSessionIdentity(id, sid, { order: 'id-name', showName: false, includeFullId: true });
   applySessionBadgeStyle(id, sid);
   const relationStrip = document.createElement('div');
   relationStrip.className = 'session-window-relation-strip hidden';
@@ -17798,8 +17866,7 @@ function updateSessionWindow(sessionId, meta = {}) {
     return;
   }
   win.metadataSignature = signature;
-  const displayName = compactSessionText(meta.name);
-  renderSessionIdentity(win.id, sid, { order: 'id-name' });
+  renderSessionIdentity(win.id, sid, { order: 'id-name', includeFullId: true });
   if (meta.projectRoot) {
     win.project.textContent = meta.projectLabel || compactPathLabel(meta.projectRoot, true);
     win.project.title = meta.projectRoot;
@@ -17818,7 +17885,6 @@ function updateSessionWindow(sessionId, meta = {}) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
   }
-  win.task.classList.toggle('hidden', !!displayName);
   if (meta.source) {
     win.source = meta.source;
   }
