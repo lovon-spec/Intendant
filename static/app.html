@@ -5046,6 +5046,7 @@ body.context-focus-active {
 .modal-cancel { background: var(--surface1); color: var(--text); }
 .modal-confirm { background: var(--blue); color: var(--base); }
 .modal-confirm.danger { background: var(--red); color: var(--base); }
+.modal-confirm.hidden { display: none; }
 .modal-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
 .fs-picker-dialog {
   width: min(720px, calc(100vw - 32px));
@@ -9198,6 +9199,7 @@ body.display-fullscreen-open {
     <div class="modal-actions">
       <button class="modal-cancel" type="button" id="dashboard-confirm-cancel">Cancel</button>
       <button class="modal-confirm danger" type="button" id="dashboard-confirm-accept">Continue</button>
+      <button class="modal-confirm danger hidden" type="button" id="dashboard-confirm-alternate">Stop session</button>
     </div>
   </div>
 </div>
@@ -11337,19 +11339,24 @@ function closeDashboardConfirmModal(result = false) {
   dashboardConfirmPending = null;
   const modal = document.getElementById('dashboard-confirm-modal');
   if (modal) modal.style.display = 'none';
-  if (pending && typeof pending.resolve === 'function') pending.resolve(!!result);
+  if (pending && typeof pending.resolve === 'function') pending.resolve(result);
 }
 window.closeDashboardConfirmModal = closeDashboardConfirmModal;
 
 function showDashboardConfirm(opts = {}) {
   return new Promise(resolve => {
     if (dashboardConfirmPending) closeDashboardConfirmModal(false);
-    dashboardConfirmPending = { resolve };
+    dashboardConfirmPending = {
+      resolve,
+      confirmValue: opts.confirmValue === undefined ? true : opts.confirmValue,
+      alternateValue: opts.alternateValue === undefined ? 'alternate' : opts.alternateValue,
+    };
 
     const title = document.getElementById('dashboard-confirm-title');
     const message = document.getElementById('dashboard-confirm-message');
     const warning = document.getElementById('dashboard-confirm-warning');
     const accept = document.getElementById('dashboard-confirm-accept');
+    const alternate = document.getElementById('dashboard-confirm-alternate');
     const cancel = document.getElementById('dashboard-confirm-cancel');
     const modal = document.getElementById('dashboard-confirm-modal');
 
@@ -11363,6 +11370,15 @@ function showDashboardConfirm(opts = {}) {
     if (accept) {
       accept.textContent = opts.confirmLabel || 'Continue';
       accept.className = 'modal-confirm' + (opts.danger === false ? '' : ' danger');
+      accept.title = opts.confirmTitleAttr || '';
+    }
+    if (alternate) {
+      const alternateLabel = opts.alternateLabel || '';
+      alternate.textContent = alternateLabel || 'Alternate';
+      alternate.className = 'modal-confirm'
+        + (opts.alternateDanger === false ? '' : ' danger')
+        + (alternateLabel ? '' : ' hidden');
+      alternate.title = opts.alternateTitle || '';
     }
     if (cancel) cancel.textContent = opts.cancelLabel || 'Cancel';
     if (modal) {
@@ -17221,36 +17237,120 @@ function renderSessionRelationships() {
 
 function sessionWindowExternalActionContext(sessionId) {
   const sid = String(sessionId || '').trim();
-  if (!sid) return null;
-  if (sessionWindowIsSide(sid) || sessionWindowIsSubagent(sid)) {
-    showControlToast('error', 'Stop the parent session instead');
+  const availability = sessionWindowStopAvailability(sid);
+  if (!availability.ok) {
+    if (availability.toast) showControlToast('error', availability.toast);
     return null;
+  }
+  return availability.msg;
+}
+
+function sessionWindowStopAvailability(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return { ok: false, reason: 'No session selected.', toast: '' };
+  if (sessionWindowIsSide(sid) || sessionWindowIsSubagent(sid)) {
+    return {
+      ok: false,
+      reason: 'This is a related session. Stop the parent session instead.',
+      toast: 'Stop the parent session instead',
+    };
   }
   const source = externalSourceForSessionWindow(sid);
   if (!source || source === 'intendant') {
-    showControlToast('error', 'This action is only available for external-agent sessions');
-    return null;
+    return {
+      ok: false,
+      reason: 'Stop session is only available for external-agent sessions.',
+      toast: 'This action is only available for external-agent sessions',
+    };
   }
   const msg = detachedSessionResumeMessage(sid, null, true, []);
   if (!msg || msg.source === 'intendant') {
-    showControlToast('error', 'Could not resolve the external session launch context');
-    return null;
+    return {
+      ok: false,
+      reason: 'Could not resolve the external session launch context.',
+      toast: 'Could not resolve the external session launch context',
+    };
   }
-  return msg;
+  return { ok: true, reason: '', toast: '', msg };
 }
 
-async function stopSessionWindowAction(sessionId) {
+async function stopSessionWindowAction(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid || !sessionWindowExternalActionContext(sid)) return;
-  const ok = await showDashboardConfirm({
-    title: 'Stop session',
-    message: 'Stop this live backend? Its history remains available in Sessions, but this card will not be restored after refresh or in other browsers until you resume it.',
-    confirmLabel: 'Stop session',
-  });
-  if (!ok) return;
+  if (!options.skipConfirm) {
+    const ok = await showDashboardConfirm({
+      title: 'Stop session',
+      message: 'Stop this live backend? Its history remains available in Sessions, but this card will not be restored after refresh or in other browsers until you resume it.',
+      confirmLabel: 'Stop session',
+    });
+    if (!ok) return;
+  }
   dispatchControlMsg({ action: 'stop_session', session_id: sid });
   clearPendingFollowUpsForSession(sid, 'session stopped');
   showControlToast('info', `Stopping session ${shortSessionId(sid)}`);
+}
+
+function hideSessionWindowAction(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  if ((sessionMetadataById.get(sid) || {}).relationshipKind === 'side') {
+    removeSessionRelationshipsForSession(sid);
+  }
+  removeSessionWindow(sid);
+}
+
+function closeSideSessionWindowAction(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  maybeDispatchSideClose(sid);
+  removeSessionRelationshipsForSession(sid);
+  removeSessionWindow(sid);
+}
+
+async function chooseSessionWindowCloseAction(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const stopAvailability = sessionWindowStopAvailability(sid);
+  const canCloseSide = !stopAvailability.ok && !!sideCloseParamsForSession(sid);
+  const alternateLabel = stopAvailability.ok
+    ? 'Stop session'
+    : canCloseSide
+      ? 'Close side'
+      : '';
+  const result = await showDashboardConfirm({
+    title: stopAvailability.ok
+      ? 'Hide or stop session?'
+      : canCloseSide
+        ? 'Hide or close side?'
+        : 'Hide session card?',
+    message: stopAvailability.ok
+      ? 'Hide card only removes this card from this dashboard. Stop session ends the live backend and removes it from active dashboards.'
+      : canCloseSide
+      ? 'Hide card only removes this card from this dashboard. Close side ends the side conversation in the parent Codex thread.'
+      : 'Hide card only removes this card from this dashboard.',
+    warning: stopAvailability.ok
+      ? 'Session history remains available either way.'
+      : canCloseSide
+      ? 'The parent session remains available either way.'
+      : stopAvailability.reason,
+    confirmLabel: 'Hide card',
+    confirmValue: 'hide',
+    confirmTitleAttr: 'Remove this card from this dashboard only',
+    cancelLabel: 'Cancel',
+    danger: false,
+    ...(alternateLabel ? {
+      alternateLabel,
+      alternateValue: stopAvailability.ok ? 'stop' : 'close-side',
+      alternateTitle: stopAvailability.ok ? 'Stop the live backend' : 'Close the side conversation',
+    } : {}),
+  });
+  if (result === 'hide') {
+    hideSessionWindowAction(sid);
+  } else if (result === 'stop') {
+    await stopSessionWindowAction(sid, { skipConfirm: true });
+  } else if (result === 'close-side') {
+    closeSideSessionWindowAction(sid);
+  }
 }
 
 function restartSessionWindowAction(sessionId) {
@@ -17481,7 +17581,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const close = document.createElement('button');
   close.className = 'session-window-action session-window-close';
   close.type = 'button';
-  close.title = 'Hide card';
+  close.title = 'Hide or stop session';
   close.setAttribute('aria-label', close.title);
   close.textContent = '\u00d7';
   menuControls.appendChild(actions);
@@ -17572,11 +17672,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   close.addEventListener('click', (e) => {
     e.stopPropagation();
     setSessionWindowMenuOpen(sid, false);
-    maybeDispatchSideClose(sid);
-    if ((sessionMetadataById.get(sid) || {}).relationshipKind === 'side') {
-      removeSessionRelationshipsForSession(sid);
-    }
-    removeSessionWindow(sid);
+    chooseSessionWindowCloseAction(sid);
   });
 
   grid.appendChild(el);
@@ -34873,7 +34969,12 @@ document.getElementById('dashboard-confirm-modal')?.addEventListener('click', (e
   if (e.target && e.target.id === 'dashboard-confirm-modal') closeDashboardConfirmModal(false);
 });
 document.getElementById('dashboard-confirm-cancel')?.addEventListener('click', () => closeDashboardConfirmModal(false));
-document.getElementById('dashboard-confirm-accept')?.addEventListener('click', () => closeDashboardConfirmModal(true));
+document.getElementById('dashboard-confirm-accept')?.addEventListener('click', () => {
+  closeDashboardConfirmModal(dashboardConfirmPending?.confirmValue ?? true);
+});
+document.getElementById('dashboard-confirm-alternate')?.addEventListener('click', () => {
+  closeDashboardConfirmModal(dashboardConfirmPending?.alternateValue ?? 'alternate');
+});
 document.getElementById('dashboard-prompt-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'dashboard-prompt-modal') closeDashboardPromptModal(null);
 });
