@@ -3822,6 +3822,11 @@ body.context-focus-active {
   background: var(--surface1);
   color: var(--text);
 }
+.sessions-refresh:disabled,
+.sessions-refresh.pending {
+  opacity: 0.65;
+  cursor: progress;
+}
 .sessions-aggregate {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -3866,9 +3871,20 @@ body.context-focus-active {
 .worktrees-header .sessions-search {
   max-width: none;
 }
+.sessions-search-status.worktrees-scan-note {
+  margin-top: 0;
+  color: var(--subtext0);
+}
+.worktrees-list.is-busy {
+  opacity: 0.82;
+}
 .session-card.worktree-card {
   cursor: default;
   padding: 9px 12px;
+}
+.session-card.worktree-card.removing {
+  border-color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 8%, var(--surface0));
 }
 .session-card.worktree-card .sc-actions {
   position: static;
@@ -4386,6 +4402,17 @@ body.context-focus-active {
 .sc-delete-btn:hover {
   border-color: var(--red);
   color: var(--red);
+}
+.sc-delete-btn:disabled,
+.sc-delete-btn.pending,
+.sc-resume-btn:disabled {
+  opacity: 0.65;
+  cursor: progress;
+}
+.sc-delete-btn.pending {
+  border-color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 12%, transparent);
+  color: var(--blue);
 }
 .sc-rename-btn {
   border-color: color-mix(in srgb, var(--mauve) 55%, var(--surface1));
@@ -8327,7 +8354,12 @@ body.context-focus-active {
                 </label>
               </div>
             </div>
+            <div class="sessions-search-status worktrees-scan-note">Worktree scans can take a while on large repositories.</div>
             <div class="sessions-search-status" id="worktrees-status"></div>
+            <div class="sessions-spawn-notice hidden" id="worktrees-activity-notice" role="status" aria-live="polite">
+              <span class="sessions-spawn-spinner" aria-hidden="true"></span>
+              <span id="worktrees-activity-text"></span>
+            </div>
             <div class="sessions-aggregate" id="worktrees-aggregate"></div>
             <div class="worktrees-list" id="worktrees-list">
               <div class="empty-state">No worktree scan yet</div>
@@ -24418,7 +24450,15 @@ function switchSessionsSubtab(name) {
     updateNewSessionProjectPrefills();
     requestAnimationFrame(focusNewSessionInput);
   } else if (next === 'worktrees') {
-    loadWorktrees({ forceScan: !worktreesLoaded });
+    if (worktreeHasScannedData(_cachedWorktreeScan)) {
+      renderWorktrees(_cachedWorktreeScan);
+      if (worktreesLoadInFlight === 'scan') {
+        setWorktreesStatus('Scanning known project, session, and common worktree roots. This can take a while.');
+        setWorktreesActivityNotice('pending', 'Scanning worktrees. This can take a while on large repositories.');
+      }
+    } else {
+      loadWorktrees({ forceScan: !worktreesLoaded });
+    }
   } else if (!sessionsLoaded) {
     loadSessions();
   } else {
@@ -30806,6 +30846,10 @@ function onDebugScreenTornDown() {
 // ── Sessions Tab ──
 let worktreesLoaded = false;
 let _cachedWorktreeScan = null;
+let worktreesLoadInFlight = '';
+let worktreesRequestSerial = 0;
+let worktreesActivityClearTimeout = null;
+const pendingWorktreeRemovals = new Set();
 let _sessionsLoadToken = 0;
 let _sessionDeepSearchToken = 0;
 let _sessionDeepSearchAbort = null;
@@ -32173,6 +32217,10 @@ function _refilterWorktrees() {
   }
 }
 
+function worktreeHasScannedData(scan) {
+  return !!(scan && scan.scanned_at);
+}
+
 function setWorktreesStatus(message, kind = '') {
   const el = document.getElementById('worktrees-status');
   if (!el) return;
@@ -32180,27 +32228,105 @@ function setWorktreesStatus(message, kind = '') {
   el.textContent = message || '';
 }
 
+function setWorktreesActivityNotice(kind, text, autoHideMs = 0) {
+  const notice = document.getElementById('worktrees-activity-notice');
+  const textEl = document.getElementById('worktrees-activity-text');
+  if (!notice || !textEl) return;
+  if (worktreesActivityClearTimeout) {
+    clearTimeout(worktreesActivityClearTimeout);
+    worktreesActivityClearTimeout = null;
+  }
+  const hasText = !!String(text || '').trim();
+  const noticeKind = ['ok', 'warn', 'error'].includes(kind) ? kind : 'pending';
+  notice.className = `sessions-spawn-notice ${noticeKind}` + (hasText ? '' : ' hidden');
+  textEl.textContent = text || '';
+  notice.title = text || '';
+  if (hasText && autoHideMs > 0) {
+    worktreesActivityClearTimeout = setTimeout(() => {
+      setWorktreesActivityNotice('', '');
+      worktreesActivityClearTimeout = null;
+    }, autoHideMs);
+  }
+}
+
+function setWorktreesLoadPending(pending, mode = '') {
+  const listEl = document.getElementById('worktrees-list');
+  const scanBtn = document.getElementById('worktrees-scan-btn');
+  const cachedBtn = document.getElementById('worktrees-refresh-btn');
+  if (listEl) listEl.classList.toggle('is-busy', !!pending);
+  if (scanBtn) {
+    scanBtn.disabled = !!pending;
+    scanBtn.classList.toggle('pending', !!pending && mode === 'scan');
+    scanBtn.textContent = pending && mode === 'scan' ? 'Scanning...' : 'Scan';
+  }
+  if (cachedBtn) {
+    cachedBtn.disabled = !!pending;
+    cachedBtn.classList.toggle('pending', !!pending && mode === 'cache');
+    cachedBtn.textContent = pending && mode === 'cache' ? 'Loading...' : 'Cached';
+  }
+}
+
 function loadWorktrees(options = {}) {
   const forceScan = !!options.forceScan;
   const listEl = document.getElementById('worktrees-list');
   if (!listEl) return;
+  if (worktreesLoadInFlight === 'scan' && forceScan) {
+    setWorktreesStatus('A worktree scan is already running. This can take a while on large repositories.');
+    setWorktreesActivityNotice('pending', 'Scanning worktrees. This can take a while on large repositories.');
+    return;
+  }
+  const browserCachedScan = worktreeHasScannedData(_cachedWorktreeScan) ? _cachedWorktreeScan : null;
+  const requestSerial = ++worktreesRequestSerial;
+  worktreesLoadInFlight = forceScan ? 'scan' : 'cache';
+  setWorktreesLoadPending(true, worktreesLoadInFlight);
   if (forceScan) {
-    listEl.innerHTML = '<div class="empty-state">Scanning worktrees...</div>';
-    setWorktreesStatus('Scanning known project, session, and common worktree roots...');
+    if (!browserCachedScan) {
+      listEl.innerHTML = '<div class="empty-state">Scanning worktrees...</div>';
+    }
+    setWorktreesStatus('Scanning known project, session, and common worktree roots. This can take a while.');
+    setWorktreesActivityNotice('pending', 'Scanning worktrees. This can take a while on large repositories.');
   } else {
-    setWorktreesStatus('Loading cached worktree scan...');
+    if (browserCachedScan) {
+      renderWorktrees(browserCachedScan);
+      setWorktreesStatus('Showing the last scan while checking the cached inventory...');
+    } else {
+      setWorktreesStatus('Loading cached worktree scan...');
+    }
   }
   const url = forceScan ? '/api/worktrees/scan' : '/api/worktrees';
   authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
     .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
     .then(scan => {
+      if (requestSerial !== worktreesRequestSerial) return;
       worktreesLoaded = true;
+      if (!forceScan && !worktreeHasScannedData(scan) && browserCachedScan) {
+        renderWorktrees(browserCachedScan);
+        setWorktreesStatus('Showing the last browser scan; no server-cached scan is available. Click Scan to refresh from disk.');
+        return;
+      }
       _cachedWorktreeScan = scan;
       renderWorktrees(scan);
+      if (forceScan && worktreeHasScannedData(scan)) {
+        const count = Number(scan?.summary?.worktrees || scan?.worktrees?.length || 0).toLocaleString();
+        setWorktreesActivityNotice('ok', `Scan complete. Found ${count} worktree${count === '1' ? '' : 's'}.`, 2500);
+      }
     })
     .catch(err => {
-      setWorktreesStatus(err.message || 'Failed to load worktrees', 'error');
-      listEl.innerHTML = '<div class="empty-state">Failed to load worktrees</div>';
+      if (requestSerial !== worktreesRequestSerial) return;
+      const message = err.message || 'Failed to load worktrees';
+      if (browserCachedScan) {
+        renderWorktrees(browserCachedScan);
+        setWorktreesStatus(`${message}. Showing the last browser scan.`, 'error');
+      } else {
+        setWorktreesStatus(message, 'error');
+        listEl.innerHTML = '<div class="empty-state">Failed to load worktrees</div>';
+      }
+      setWorktreesActivityNotice('error', message);
+    })
+    .finally(() => {
+      if (requestSerial !== worktreesRequestSerial) return;
+      worktreesLoadInFlight = '';
+      setWorktreesLoadPending(false);
     });
 }
 
@@ -32209,7 +32335,7 @@ function renderWorktrees(scan) {
   renderWorktreesList(scan, document.getElementById('worktrees-list'));
   const scannedAt = scan && scan.scanned_at;
   if (!scannedAt) {
-    setWorktreesStatus('No worktree scan yet. Click Scan to inventory known roots.');
+    setWorktreesStatus('No worktree scan yet. Scans can take a while on large repositories.');
     return;
   }
   const scanned = worktreeDate(scannedAt);
@@ -32343,6 +32469,13 @@ function recomputeWorktreeSummary(scan) {
   scan.summary = summary;
 }
 
+function setWorktreeRemoveButtonPending(button, pending) {
+  if (!button) return;
+  button.disabled = !!pending;
+  button.classList.toggle('pending', !!pending);
+  button.textContent = pending ? 'Removing...' : 'Remove worktree...';
+}
+
 async function removeWorktree(wt, button) {
   const branch = wt.branch || wt.head_short || '(unknown ref)';
   const ok = await showDashboardConfirm({
@@ -32358,42 +32491,55 @@ async function removeWorktree(wt, button) {
   });
   if (!ok) return;
 
-  if (button) button.disabled = true;
+  const pathKey = String(wt.path || '');
+  if (pendingWorktreeRemovals.has(pathKey)) {
+    setWorktreesStatus(`Already removing ${wt.path}...`);
+    return;
+  }
+  pendingWorktreeRemovals.add(pathKey);
+  setWorktreeRemoveButtonPending(button, true);
+  button?.closest('.worktree-card')?.classList.add('removing');
   setWorktreesStatus(`Removing ${wt.path}...`);
-  authedFetch('/api/worktrees/remove', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      repo_root: wt.repo_root,
-      path: wt.path,
-      expected_head: wt.head || null,
-    }),
-  })
-    .then(async r => {
-      const text = await r.text();
-      let result = {};
-      try { result = text ? JSON.parse(text) : {}; } catch (_) {}
-      if (!r.ok || result.ok === false) {
-        throw new Error(result.error || `worktree removal returned ${r.status}`);
-      }
-      return result;
-    })
-    .then(result => {
-      const freed = Number(result.size_bytes || wt.size_bytes || 0);
-      if (_cachedWorktreeScan && Array.isArray(_cachedWorktreeScan.worktrees)) {
-        _cachedWorktreeScan.worktrees = _cachedWorktreeScan.worktrees
-          .filter(entry => entry.path !== wt.path);
-        recomputeWorktreeSummary(_cachedWorktreeScan);
-        renderWorktrees(_cachedWorktreeScan);
-      }
-      setWorktreesStatus(`Removed ${wt.path}. Freed about ${_fmtBytes(freed)}. Click Scan to refresh from disk.`);
-    })
-    .catch(err => {
-      setWorktreesStatus(err.message || 'Worktree removal failed', 'error');
-    })
-    .finally(() => {
-      if (button) button.disabled = false;
+  setWorktreesActivityNotice('pending', `Removing ${wt.path}...`);
+
+  try {
+    const r = await authedFetch('/api/worktrees/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        repo_root: wt.repo_root,
+        path: wt.path,
+        expected_head: wt.head || null,
+      }),
     });
+    const text = await r.text();
+    let result = {};
+    try { result = text ? JSON.parse(text) : {}; } catch (_) {}
+    if (!r.ok || result.ok === false) {
+      throw new Error(result.error || `worktree removal returned ${r.status}`);
+    }
+
+    const freed = Number(result.size_bytes || wt.size_bytes || 0);
+    pendingWorktreeRemovals.delete(pathKey);
+    if (_cachedWorktreeScan && Array.isArray(_cachedWorktreeScan.worktrees)) {
+      _cachedWorktreeScan.worktrees = _cachedWorktreeScan.worktrees
+        .filter(entry => entry.path !== wt.path);
+      recomputeWorktreeSummary(_cachedWorktreeScan);
+      renderWorktrees(_cachedWorktreeScan);
+    }
+    const message = `Removed ${wt.path}. Freed about ${_fmtBytes(freed)}. Click Scan to refresh from disk.`;
+    setWorktreesStatus(message);
+    setWorktreesActivityNotice('ok', message, 3500);
+    showControlToast('success', 'Worktree removed.');
+  } catch (err) {
+    pendingWorktreeRemovals.delete(pathKey);
+    if (_cachedWorktreeScan) renderWorktrees(_cachedWorktreeScan);
+    const message = err.message || 'Worktree removal failed';
+    setWorktreesStatus(message, 'error');
+    setWorktreesActivityNotice('error', message);
+  } finally {
+    setWorktreeRemoveButtonPending(button, false);
+  }
 }
 
 function renderWorktreesList(scan, el) {
@@ -32448,8 +32594,11 @@ function renderWorktreesList(scan, el) {
   }
 
   for (const wt of rows) {
+    const pathKey = String(wt.path || '');
+    const removing = pendingWorktreeRemovals.has(pathKey);
     const card = document.createElement('div');
     card.className = 'session-card worktree-card';
+    if (removing) card.classList.add('removing');
     if (wt.safe_to_remove) card.classList.add('safe');
     else if (wt.dirty || wt.merge_status === 'unmerged' || (wt.active_sessions || 0) > 0 || wt.conflicted > 0) card.classList.add('danger');
     else card.classList.add('warning');
@@ -32479,8 +32628,8 @@ function renderWorktreesList(scan, el) {
     top.appendChild(titleBlock);
 
     const statusEl = document.createElement('span');
-    statusEl.className = 'sc-status ' + (wt.safe_to_remove ? 'completed' : (wt.dirty || wt.merge_status === 'unmerged' ? 'interrupted' : 'idle'));
-    statusEl.textContent = wt.safe_to_remove ? 'candidate' : wt.recommended_action || 'review';
+    statusEl.className = 'sc-status ' + (removing ? 'in_progress' : (wt.safe_to_remove ? 'completed' : (wt.dirty || wt.merge_status === 'unmerged' ? 'interrupted' : 'idle')));
+    statusEl.textContent = removing ? 'removing' : (wt.safe_to_remove ? 'candidate' : wt.recommended_action || 'review');
     top.appendChild(statusEl);
     card.appendChild(top);
 
@@ -32552,8 +32701,10 @@ function renderWorktreesList(scan, el) {
       const command = worktreeRemoveCommand(wt);
       const removeBtn = document.createElement('button');
       removeBtn.className = 'sc-delete-btn';
-      removeBtn.textContent = 'Remove worktree...';
+      removeBtn.textContent = removing ? 'Removing...' : 'Remove worktree...';
       removeBtn.title = 'Re-check safety and remove this worktree';
+      removeBtn.disabled = removing;
+      removeBtn.classList.toggle('pending', removing);
       removeBtn.addEventListener('click', (ev) => {
         ev.stopPropagation();
         removeWorktree(wt, removeBtn);
@@ -32563,6 +32714,7 @@ function renderWorktreesList(scan, el) {
       const copyCmd = document.createElement('button');
       copyCmd.className = 'sc-resume-btn';
       copyCmd.textContent = 'Copy remove command';
+      copyCmd.disabled = removing;
       copyCmd.addEventListener('click', (ev) => {
         ev.stopPropagation();
         copyTextToClipboard(command).then(
