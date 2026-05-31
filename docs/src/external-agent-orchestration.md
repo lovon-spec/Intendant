@@ -107,7 +107,7 @@ loop.
 | Native thread id | Yes | No (`claude-code-session` placeholder until a real id appears) | Yes |
 | Mid-turn steer | Yes (`turn/steer`) | No → queue + next-turn fallback | No → queue + next-turn fallback |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset | No → session reset |
-| Fork / side threads / review / goals / compact / memory-reset | Yes (`thread_action`) | No | No |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | No | No |
 
 All three spawn through `crate::platform::spawn_command(&cfg.command)` with the
 working dir set to the project root, stdin/stdout piped, and stderr inherited.
@@ -148,7 +148,7 @@ features they lack.
   happen after noisy tool output, failed exploration, or a long research branch
   whose useful result can be crystallized into a compact primer.
 
-- **Rich `thread_action` ops** (`codex.rs`): `compact`, `fork`,
+- **Rich `thread_action` ops** (`codex.rs`): `compact`, `fast`, `fork`,
   `side`/`btw` (open a side conversation) and `side-close`, `review`,
   `goal`/`goal-set`/`goal-clear`/`goal-pause`/`goal-resume`/`goal-complete`, and
   `memory-reset`. Side threads can be steered and rolled back independently of the

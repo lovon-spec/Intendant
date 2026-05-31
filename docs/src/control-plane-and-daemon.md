@@ -77,7 +77,7 @@ persistent agent so the next launch picks them up. Each `ControlMsg::SetCodex*`
 / `SetGemini*` variant documents this in its doc comment.
 
 Two exceptions apply *immediately* rather than next-task, because the backend
-accepts them as live RPCs: `CodexThreadAction` (the `/new`, `/compact`, `/fork`,
+accepts them as live RPCs: `CodexThreadAction` (the `/new`, `/compact`, `/fast`, `/fork`,
 `/undo`, `/review`, … slash-command surface) and `GeminiThreadAction` (`/new`).
 The control plane does not own the persistent agent, so it merely *re-broadcasts*
 these as `CodexThreadActionRequested` / `GeminiThreadActionRequested` for the

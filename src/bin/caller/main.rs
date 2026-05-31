@@ -2336,6 +2336,7 @@ fn persist_codex_thread_rename_overlay(
 fn codex_thread_action_capabilities() -> Vec<String> {
     [
         "compact",
+        "fast",
         "fork",
         "side",
         "undo",
@@ -2785,6 +2786,70 @@ async fn handle_external_thread_action(
     }
 
     ExternalThreadActionEffect::None
+}
+
+fn parse_codex_fast_slash_command(
+    text: &str,
+) -> Option<Result<(&'static str, serde_json::Value), String>> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let mut split = rest.splitn(2, char::is_whitespace);
+    let name = split.next()?.trim().to_ascii_lowercase();
+    if name != "fast" {
+        return None;
+    }
+    let args = split.next().unwrap_or("").trim();
+    if !args.is_empty() {
+        return Some(Err("/fast does not accept arguments".to_string()));
+    }
+    Some(Ok(("fast", serde_json::json!({}))))
+}
+
+async fn maybe_handle_codex_fast_slash_steer(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    text: &str,
+    target_session_id: Option<String>,
+    steer_id: String,
+    config: &DrainConfig<'_>,
+) -> bool {
+    if agent.name() != "codex" {
+        return false;
+    }
+    // Codex app-server `turn/steer` is text-only; service-tier changes must
+    // be routed as thread actions and applied to future supported requests.
+    let Some(parsed) = parse_codex_fast_slash_command(text) else {
+        return false;
+    };
+    match parsed {
+        Ok((op, params)) => {
+            handle_external_thread_action(
+                agent,
+                op.to_string(),
+                params,
+                target_session_id.clone(),
+                config,
+            )
+            .await;
+        }
+        Err(message) => {
+            config.bus.send(AppEvent::CodexThreadActionResult {
+                session_id: target_session_id
+                    .clone()
+                    .or_else(|| config.session_id.clone()),
+                action: "fast".to_string(),
+                success: false,
+                message,
+            });
+        }
+    }
+    if !steer_id.trim().is_empty() {
+        config.bus.send(AppEvent::SteerDelivered {
+            session_id: target_session_id,
+            id: steer_id,
+            mid_turn: false,
+        });
+    }
+    true
 }
 
 fn undo_turns_from_params(params: &serde_json::Value) -> u32 {
@@ -4061,6 +4126,17 @@ async fn drain_external_agent_events(
                             continue;
                         };
                         let target_is_side = target_kind == ExternalSteerTargetKind::Side;
+                        if maybe_handle_codex_fast_slash_steer(
+                            agent,
+                            &text,
+                            target_session_id.clone(),
+                            id.clone(),
+                            config,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         // Try native mid-turn steering first. On success the
                         // backend/runtime has accepted the steer for the
                         // active turn, but it may only surface to the model at
@@ -6791,6 +6867,7 @@ mod tests {
     fn codex_thread_action_capabilities_cover_dashboard_goal_buttons() {
         let actions = codex_thread_action_capabilities();
         for action in [
+            "fast",
             "goal",
             "goal-get",
             "goal-clear",
@@ -6803,6 +6880,21 @@ mod tests {
                 action
             );
         }
+    }
+
+    #[test]
+    fn codex_fast_slash_command_parses_for_steer_intercept() {
+        let parsed = parse_codex_fast_slash_command(" /fast ")
+            .expect("recognized slash command")
+            .expect("valid slash command");
+        assert_eq!(parsed.0, "fast");
+        assert_eq!(parsed.1, serde_json::json!({}));
+        assert!(parse_codex_fast_slash_command("/fork").is_none());
+
+        let err = parse_codex_fast_slash_command("/fast now")
+            .expect("recognized slash command")
+            .unwrap_err();
+        assert!(err.contains("does not accept arguments"), "got: {err}");
     }
 
     #[test]
@@ -13385,6 +13477,17 @@ async fn run_external_agent_mode(
                                 &drain_config.alias_session_id,
                                 &open_side_threads,
                             ) => {
+                                if maybe_handle_codex_fast_slash_steer(
+                                    &mut agent,
+                                    &text,
+                                    session_id.clone(),
+                                    id.clone(),
+                                    &drain_config,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
                                 break FollowUpMessage::steer(
                                     text,
                                     UserAttachments::default(),

@@ -51,6 +51,7 @@ Do not modify files, source, git state, permissions, configuration, or any other
 const GENERATION_STARVATION_NEAR_LIMIT_PCT: f64 = 85.0;
 const GENERATION_STARVATION_HINT: &str = "The previous Codex response appears to have been cut off near the backend context limit. Avoid regenerating the same long output; rewind context first or produce a much shorter recovery response.";
 const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
+const CODEX_FAST_SERVICE_TIER: &str = "priority";
 
 /// Codex-specific thread-action helpers. Each wraps one of Codex's app-server
 /// JSON-RPC methods (`thread/compact/start`, `thread/fork`, `thread/inject_items`,
@@ -157,6 +158,7 @@ impl CodexAgent {
                 self.update_goal_status(params, "budgetLimited").await
             }
             "memory-reset" | "memory_reset" => self.reset_memory().await,
+            "fast" => Ok(self.toggle_fast_service_tier()),
             other => Err(CallerError::ExternalAgent(format!(
                 "unsupported Codex thread action: /{}",
                 other
@@ -188,6 +190,7 @@ impl CodexAgent {
                 serde_json::Value::String(n.trim().to_string()),
             );
         }
+        self.insert_service_tier_override(&mut obj);
         let response = self
             .send_request("thread/fork", Some(serde_json::Value::Object(obj)))
             .await
@@ -239,10 +242,17 @@ impl CodexAgent {
             )));
         }
 
-        let turn_params = serde_json::json!({
-            "threadId": child_thread_id.clone(),
-            "input": [{"type": "text", "text": prompt}],
-        });
+        let mut turn_obj = serde_json::Map::new();
+        turn_obj.insert(
+            "threadId".into(),
+            serde_json::Value::String(child_thread_id.clone()),
+        );
+        turn_obj.insert(
+            "input".into(),
+            serde_json::Value::Array(vec![serde_json::json!({"type": "text", "text": prompt})]),
+        );
+        self.insert_service_tier_override_consuming_clear(&mut turn_obj);
+        let turn_params = serde_json::Value::Object(turn_obj);
         self.capture_turn_descendant_baseline();
         match self.send_request("turn/start", Some(turn_params)).await {
             Ok(response) => {
@@ -385,6 +395,7 @@ impl CodexAgent {
                 serde_json::Value::String(self.sandbox.clone()),
             );
         }
+        self.insert_service_tier_override(&mut obj);
         serde_json::Value::Object(obj)
     }
 
@@ -1028,6 +1039,12 @@ pub struct CodexAgent {
     sandbox: String,
     /// Reasoning effort override (Responses API). `None` = Codex default.
     reasoning_effort: Option<String>,
+    /// Codex service-tier override. `Some("priority")` is Codex `/fast`.
+    service_tier: Option<String>,
+    /// Set when `/fast` is toggled off so the next supported app-server
+    /// request carries `serviceTier: null` and clears Codex's persisted
+    /// session override.
+    service_tier_clear_pending: bool,
     /// Enable Responses API `web_search` tool. Maps to `codex --search`.
     web_search: bool,
     /// Enable outbound network inside the `workspace-write` sandbox. Ignored
@@ -1097,6 +1114,53 @@ pub struct CodexAgentOptions {
 impl CodexAgent {
     fn context_archive_exact(&self) -> bool {
         crate::project::codex_context_archive_exact(&self.context_archive)
+    }
+
+    fn toggle_fast_service_tier(&mut self) -> String {
+        if self.service_tier.as_deref() == Some(CODEX_FAST_SERVICE_TIER) {
+            self.service_tier = None;
+            self.service_tier_clear_pending = true;
+            "fast mode disabled for future Codex turns; active turns continue unchanged".to_string()
+        } else {
+            self.service_tier = Some(CODEX_FAST_SERVICE_TIER.to_string());
+            self.service_tier_clear_pending = false;
+            "fast mode enabled for future Codex turns; active turns continue unchanged".to_string()
+        }
+    }
+
+    fn service_tier_override_value(&self) -> Option<serde_json::Value> {
+        if let Some(service_tier) = self
+            .service_tier
+            .as_deref()
+            .map(str::trim)
+            .filter(|service_tier| !service_tier.is_empty())
+        {
+            return Some(serde_json::Value::String(service_tier.to_string()));
+        }
+        if self.service_tier_clear_pending {
+            return Some(serde_json::Value::Null);
+        }
+        None
+    }
+
+    fn insert_service_tier_override(
+        &self,
+        params: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        if let Some(value) = self.service_tier_override_value() {
+            params.insert("serviceTier".into(), value);
+        }
+    }
+
+    fn insert_service_tier_override_consuming_clear(
+        &mut self,
+        params: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        let consumed_clear = self.service_tier.is_none() && self.service_tier_clear_pending;
+        self.insert_service_tier_override(params);
+        if consumed_clear {
+            self.service_tier_clear_pending = false;
+        }
     }
 
     fn cleanup_temporary_request_trace_root(&mut self) {
@@ -1182,6 +1246,8 @@ impl CodexAgent {
             approval_policy,
             sandbox,
             reasoning_effort: opts.reasoning_effort,
+            service_tier: None,
+            service_tier_clear_pending: false,
             web_search: opts.web_search,
             network_access: opts.network_access,
             writable_roots: opts.writable_roots,
@@ -1381,6 +1447,7 @@ impl CodexAgent {
         if let Some(ref model) = self.model {
             params.insert("model".into(), serde_json::Value::String(model.clone()));
         }
+        self.insert_service_tier_override_consuming_clear(&mut params);
 
         let response = self
             .send_request("thread/resume", Some(serde_json::Value::Object(params)))
@@ -4278,6 +4345,7 @@ impl ExternalAgent for CodexAgent {
             "sandbox".into(),
             serde_json::Value::String(self.sandbox.clone()),
         );
+        self.insert_service_tier_override_consuming_clear(&mut params);
 
         let method = if let Some(ref thread_id) = self.resume_session {
             params.insert(
@@ -4380,10 +4448,14 @@ impl ExternalAgent for CodexAgent {
                 }));
             }
         }
-        let params = serde_json::json!({
-            "threadId": thread.thread_id,
-            "input": input,
-        });
+        let mut params_obj = serde_json::Map::new();
+        params_obj.insert(
+            "threadId".into(),
+            serde_json::Value::String(thread.thread_id.clone()),
+        );
+        params_obj.insert("input".into(), serde_json::Value::Array(input));
+        self.insert_service_tier_override_consuming_clear(&mut params_obj);
+        let params = serde_json::Value::Object(params_obj);
         self.turn_descendant_baseline =
             self.child.as_ref().and_then(|child| child.id()).map(|pid| {
                 crate::platform::process_descendants(pid)
@@ -4658,10 +4730,14 @@ impl ExternalAgent for CodexAgent {
                 "rollout-path fork requires a path".into(),
             ));
         }
-        let params = serde_json::json!({
-            "threadId": "",
-            "path": path.as_ref(),
-        });
+        let mut params_obj = serde_json::Map::new();
+        params_obj.insert("threadId".into(), serde_json::Value::String(String::new()));
+        params_obj.insert(
+            "path".into(),
+            serde_json::Value::String(path.as_ref().to_string()),
+        );
+        self.insert_service_tier_override(&mut params_obj);
+        let params = serde_json::Value::Object(params_obj);
         let response = self
             .send_request("thread/fork", Some(params))
             .await
@@ -6955,6 +7031,50 @@ mod tests {
                 (_, other) => panic!("op /{}: expected ExternalAgent error, got {:?}", op, other),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn thread_action_fast_toggles_priority_service_tier_without_thread() {
+        let mut agent = test_agent();
+
+        let enabled = agent
+            .thread_action("fast", &serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert!(enabled.contains("enabled"), "got: {enabled}");
+        assert_eq!(agent.service_tier.as_deref(), Some(CODEX_FAST_SERVICE_TIER));
+        assert!(!agent.service_tier_clear_pending);
+
+        let disabled = agent
+            .thread_action("fast", &serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert!(disabled.contains("disabled"), "got: {disabled}");
+        assert_eq!(agent.service_tier, None);
+        assert!(agent.service_tier_clear_pending);
+    }
+
+    #[test]
+    fn service_tier_override_serializes_fast_and_standard_clear() {
+        let mut agent = test_agent();
+
+        agent.toggle_fast_service_tier();
+        let mut fast_params = serde_json::Map::new();
+        agent.insert_service_tier_override_consuming_clear(&mut fast_params);
+        assert_eq!(fast_params["serviceTier"], CODEX_FAST_SERVICE_TIER);
+        assert_eq!(agent.service_tier.as_deref(), Some(CODEX_FAST_SERVICE_TIER));
+        assert!(!agent.service_tier_clear_pending);
+
+        agent.toggle_fast_service_tier();
+        let mut standard_params = serde_json::Map::new();
+        agent.insert_service_tier_override_consuming_clear(&mut standard_params);
+        assert!(standard_params["serviceTier"].is_null());
+        assert_eq!(agent.service_tier, None);
+        assert!(!agent.service_tier_clear_pending);
+
+        let mut later_params = serde_json::Map::new();
+        agent.insert_service_tier_override_consuming_clear(&mut later_params);
+        assert!(later_params.get("serviceTier").is_none());
     }
 
     #[tokio::test]

@@ -934,7 +934,7 @@ pub enum ControlMsg {
     },
     /// Invoke one of Codex's thread-level actions against the persistent
     /// agent. Mirrors the raw-codex slash-command surface: `/new`, `/compact`,
-    /// `/fork`, `/side`, `/undo`, `/review`, `/rename`, `/goal`, `/init`,
+    /// `/fast`, `/fork`, `/side`, `/undo`, `/review`, `/rename`, `/goal`, `/init`,
     /// `/memory-reset`. Applies immediately (not "next task") because Codex's
     /// app-server accepts these as mid-session RPCs.
     ///

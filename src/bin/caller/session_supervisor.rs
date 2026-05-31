@@ -1932,6 +1932,56 @@ impl SessionSupervisor {
 
         let steer_id = id.unwrap_or_default();
         let event_session_id = requested_id.clone().or(Some(managed_id.clone()));
+        if let Some(parsed) = parse_codex_slash_command(&text) {
+            match parsed {
+                Ok(command) => {
+                    if source == "codex" {
+                        if relation
+                            .as_ref()
+                            .is_some_and(|rel| rel.relationship == "side")
+                        {
+                            self.warn(&format!(
+                                "Slash command /{} is not supported for Codex side session {}; use the parent thread instead",
+                                command.op,
+                                short_session(requested_id.as_deref().unwrap_or(&managed_id))
+                            ));
+                            return;
+                        }
+                        if !attachments.is_empty() {
+                            self.warn(&format!(
+                                "Slash command /{} for Codex session {} ignored {} steer attachment(s)",
+                                command.op,
+                                short_session(&managed_id),
+                                attachments.len()
+                            ));
+                        }
+                        self.config.bus.send(AppEvent::ControlCommand(
+                            event::ControlMsg::CodexThreadAction {
+                                session_id: Some(managed_id),
+                                op: command.op,
+                                params: command.params,
+                            },
+                        ));
+                        if !steer_id.trim().is_empty() {
+                            self.config.bus.send(AppEvent::SteerDelivered {
+                                session_id: event_session_id,
+                                id: steer_id,
+                                mid_turn: false,
+                            });
+                        }
+                    } else {
+                        self.warn(&format!(
+                            "Slash command /{} is only supported for Codex sessions; target {} session {}",
+                            command.op,
+                            source,
+                            short_session(&managed_id)
+                        ));
+                    }
+                }
+                Err(message) => self.warn(&message),
+            }
+            return;
+        }
         if attachments.is_empty() {
             self.config.bus.send(AppEvent::SteerRequested {
                 session_id: event_session_id,
@@ -2804,6 +2854,15 @@ fn parse_codex_slash_command(text: &str) -> Option<Result<CodexSlashCommand, Str
                 params: serde_json::Value::Object(params),
             }))
         }
+        "fast" => {
+            if !args.is_empty() {
+                return Some(Err("/fast does not accept arguments".to_string()));
+            }
+            Some(Ok(CodexSlashCommand {
+                op: "fast".to_string(),
+                params: serde_json::json!({}),
+            }))
+        }
         "goal" => Some(parse_goal_slash_command(args)),
         _ => None,
     }
@@ -3630,6 +3689,18 @@ mod tests {
         assert_eq!(slash("/goal pause").op, "goal-pause");
         assert_eq!(slash("/goal resume").op, "goal-resume");
         assert_eq!(slash("/goal done").op, "goal-complete");
+    }
+
+    #[test]
+    fn parses_fast_slash_command() {
+        let command = slash("/fast");
+        assert_eq!(command.op, "fast");
+        assert_eq!(command.params, serde_json::json!({}));
+
+        let err = parse_codex_slash_command("/fast now")
+            .expect("recognized slash command")
+            .unwrap_err();
+        assert!(err.contains("does not accept arguments"), "got: {err}");
     }
 
     #[test]

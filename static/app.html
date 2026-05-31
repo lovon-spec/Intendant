@@ -7743,6 +7743,7 @@ body.context-focus-active {
                 <legend>Thread actions</legend>
                 <div class="control-actions-row">
                   <button class="control-action-btn" data-codex-action="new" title="Tear down the Codex thread so the next task starts fresh (/new)">New thread</button>
+                  <button class="control-action-btn" data-codex-action="fast" title="Toggle Codex Fast service tier for future turns (/fast)">Fast</button>
                   <button class="control-action-btn" data-codex-action="compact" title="Compact conversation history to free context (/compact)">Compact</button>
                   <button class="control-action-btn" data-codex-action="undo" data-turns="1" title="Roll back the last turn (/undo)">Undo</button>
                   <button class="control-action-btn" data-codex-action="fork" data-prompt-name="1" title="Fork the current thread into a new branch (/fork)">Fork…</button>
@@ -11944,6 +11945,10 @@ function parseCodexSlashCommand(text) {
     if (prompt) params.prompt = prompt;
     return { op: 'side', params };
   }
+  if (name === 'fast') {
+    if (rest) return { error: '/fast does not accept arguments' };
+    return { op: 'fast', params: {} };
+  }
   if (
     name === 'rewind-anchor' ||
     name === 'rewind-to-item' ||
@@ -15827,6 +15832,7 @@ const SESSION_WINDOW_GENERIC_ACTIONS = [
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', promptName: true },
   { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', promptSide: true },
+  { op: 'fast', label: 'Fast', title: 'Toggle Codex Fast service tier for future turns' },
   {
     label: 'Configure goal...',
     title: 'Configure this thread goal',
