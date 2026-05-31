@@ -537,6 +537,13 @@ pub trait ExternalAgent: Send + Sync {
     /// Create a new conversation thread.
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError>;
 
+    /// Return the current service-tier override for this external session.
+    /// Codex uses this for its app-server `serviceTier` field; other backends
+    /// currently do not expose tiered routing.
+    fn service_tier(&self) -> Option<&str> {
+        None
+    }
+
     /// Send a user message into an existing thread (starts a turn).
     async fn send_message(
         &mut self,

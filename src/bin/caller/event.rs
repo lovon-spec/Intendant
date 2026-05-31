@@ -3746,6 +3746,8 @@ mod tests {
                 codex_managed_context: Some("managed".to_string()),
                 codex_context_archive: Some("summary".to_string()),
                 codex_command: Some("/opt/codex/bin/codex".to_string()),
+                codex_fast_mode: Some(true),
+                codex_service_tier: Some("priority".to_string()),
             },
         };
         let outbound = app_event_to_outbound(&event).unwrap();
@@ -3758,6 +3760,8 @@ mod tests {
         assert!(json.contains("\"codex_managed_context\":\"managed\""));
         assert!(json.contains("\"codex_context_archive\":\"summary\""));
         assert!(json.contains("\"codex_command\":\"/opt/codex/bin/codex\""));
+        assert!(json.contains("\"codex_fast_mode\":true"));
+        assert!(json.contains("\"codex_service_tier\":\"priority\""));
     }
 
     #[test]

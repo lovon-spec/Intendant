@@ -7386,6 +7386,8 @@ mod tests {
                     codex_managed_context: Some("managed".to_string()),
                     codex_context_archive: None,
                     codex_command: Some("/opt/codex/bin/codex".to_string()),
+                    codex_fast_mode: Some(true),
+                    codex_service_tier: Some("priority".to_string()),
                 },
             },
         );

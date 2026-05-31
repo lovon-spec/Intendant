@@ -4642,6 +4642,8 @@ mod tests {
                 codex_managed_context: Some("managed".to_string()),
                 codex_context_archive: Some("summary".to_string()),
                 codex_command: Some("/opt/codex/bin/codex".to_string()),
+                codex_fast_mode: Some(false),
+                codex_service_tier: None,
             },
         );
         log.session_goal(
@@ -4718,6 +4720,8 @@ mod tests {
                     capabilities.codex_command.as_deref(),
                     Some("/opt/codex/bin/codex")
                 );
+                assert_eq!(capabilities.codex_fast_mode, Some(false));
+                assert_eq!(capabilities.codex_service_tier, None);
             }
             other => panic!("expected SessionCapabilities, got {:?}", other),
         }

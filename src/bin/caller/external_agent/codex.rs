@@ -1163,6 +1163,18 @@ impl CodexAgent {
         }
     }
 
+    fn update_service_tier_from_thread_response(&mut self, response: &serde_json::Value) {
+        let Some(value) = response.get("serviceTier") else {
+            return;
+        };
+        self.service_tier = value
+            .as_str()
+            .map(str::trim)
+            .filter(|tier| !tier.is_empty())
+            .map(str::to_string);
+        self.service_tier_clear_pending = false;
+    }
+
     fn cleanup_temporary_request_trace_root(&mut self) {
         if !self.request_trace_temporary {
             return;
@@ -4116,6 +4128,10 @@ impl ExternalAgent for CodexAgent {
         "codex"
     }
 
+    fn service_tier(&self) -> Option<&str> {
+        self.service_tier.as_deref()
+    }
+
     async fn initialize(
         &mut self,
         config: AgentConfig,
@@ -4362,6 +4378,7 @@ impl ExternalAgent for CodexAgent {
         let result = self
             .send_request(method, Some(serde_json::Value::Object(params)))
             .await?;
+        self.update_service_tier_from_thread_response(&result);
 
         let thread_id = result
             .pointer("/thread/id")
@@ -7077,6 +7094,27 @@ mod tests {
         let mut later_params = serde_json::Map::new();
         agent.insert_service_tier_override_consuming_clear(&mut later_params);
         assert!(later_params.get("serviceTier").is_none());
+    }
+
+    #[test]
+    fn thread_start_response_updates_effective_service_tier() {
+        let mut agent = test_agent();
+        agent.service_tier = Some("fast".to_string());
+        agent.service_tier_clear_pending = true;
+
+        agent.update_service_tier_from_thread_response(&serde_json::json!({
+            "thread": { "id": "thread-1" },
+            "serviceTier": CODEX_FAST_SERVICE_TIER,
+        }));
+        assert_eq!(agent.service_tier.as_deref(), Some(CODEX_FAST_SERVICE_TIER));
+        assert!(!agent.service_tier_clear_pending);
+
+        agent.update_service_tier_from_thread_response(&serde_json::json!({
+            "thread": { "id": "thread-1" },
+            "serviceTier": null,
+        }));
+        assert_eq!(agent.service_tier, None);
+        assert!(!agent.service_tier_clear_pending);
     }
 
     #[tokio::test]

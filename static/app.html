@@ -2079,6 +2079,26 @@ body.context-focus-active {
 .session-window-status.active { color: var(--teal); }
 .session-window-status.waiting { color: var(--yellow); }
 .session-window-status.done { color: var(--green); }
+.session-window-tier {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: var(--session-window-chip-bg);
+  color: var(--overlay1);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.session-window-tier.fast {
+  border-color: rgba(166, 227, 161, 0.38);
+  background: rgba(166, 227, 161, 0.12);
+  color: var(--green);
+}
+.session-window-tier.normal {
+  border-color: rgba(137, 180, 250, 0.26);
+  color: var(--blue);
+}
 .session-window-goal {
   flex: 0 2 230px;
   min-width: 0;
@@ -2199,6 +2219,10 @@ body.context-focus-active {
 }
 .session-window-menu button:hover {
   background: var(--surface0);
+}
+.session-window-menu button.active {
+  background: rgba(166, 227, 161, 0.10);
+  color: var(--green);
 }
 .session-window-menu button.danger {
   color: var(--red);
@@ -5174,6 +5198,25 @@ body.context-focus-active {
   font-size: 12px;
   color: var(--text);
 }
+.control-fast-status {
+  padding: 2px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: var(--surface0);
+  color: var(--overlay1);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.control-fast-status.fast {
+  border-color: rgba(166, 227, 161, 0.38);
+  background: rgba(166, 227, 161, 0.12);
+  color: var(--green);
+}
+.control-fast-status.normal {
+  border-color: rgba(137, 180, 250, 0.26);
+  color: var(--blue);
+}
 .control-applies-note {
   flex: 1;
   min-width: 0;
@@ -5285,6 +5328,11 @@ body.context-focus-active {
 .control-action-btn:hover:not(:disabled) {
   background: var(--surface1);
   border-color: var(--blue);
+}
+.control-action-btn.active {
+  border-color: rgba(166, 227, 161, 0.48);
+  background: rgba(166, 227, 161, 0.12);
+  color: var(--green);
 }
 .control-action-btn:disabled {
   opacity: 0.5;
@@ -7804,6 +7852,7 @@ body.display-fullscreen-open {
             <div class="control-header">
               <span>Backend:</span>
               <span class="control-backend-badge" id="control-backend-badge">none</span>
+              <span class="control-fast-status hidden" id="control-fast-status"></span>
               <span class="control-applies-note" id="control-applies-note">changes apply on next task</span>
             </div>
             <fieldset class="control-group" id="control-approval-rules">
@@ -14510,6 +14559,7 @@ function markSessionWindowPendingActive(sessionId) {
 function updateTaskTargetChip() {
   updatePromptTargetSessionHighlight();
   updatePromptTargetLogSessionBadges();
+  updateControlFastButtonState();
   const chip = document.getElementById('task-target-chip');
   if (!chip) return;
   const sid = resolvePromptTargetSessionId();
@@ -14806,6 +14856,10 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.codexManagedContext || '',
     meta.capabilities?.codexCommand || '',
     meta.capabilities?.codexManagedContext || '',
+    meta.capabilities?.codexFastMode === undefined || meta.capabilities?.codexFastMode === null
+      ? ''
+      : (meta.capabilities.codexFastMode ? 'fast' : 'normal'),
+    meta.capabilities?.codexServiceTier || '',
     sessionGoalSignature(meta.goal),
     meta.parentId || '',
     meta.relationshipKind || '',
@@ -14872,6 +14926,27 @@ function renderSessionWindowGoal(win, goal) {
     : (goal.tokenBudget ? `\nBudget: ${goal.tokenBudget.toLocaleString()} tokens` : '');
   win.goal.title = `Goal: ${goal.objective}\nStatus: ${status}\nElapsed: ${elapsed}${tokenText}`;
   return status === 'active';
+}
+
+function renderSessionWindowTier(win) {
+  if (!win?.tier) return;
+  const sid = win.sessionId || '';
+  if (!sid || !sessionWindowIsCodex(sid, win)) {
+    win.tier.className = 'session-window-tier hidden';
+    win.tier.textContent = '';
+    win.tier.title = '';
+    return;
+  }
+  const fastMode = sessionCodexFastMode(sid);
+  if (fastMode === null) {
+    win.tier.className = 'session-window-tier hidden';
+    win.tier.textContent = '';
+    win.tier.title = '';
+    return;
+  }
+  win.tier.className = `session-window-tier ${fastMode ? 'fast' : 'normal'}`;
+  win.tier.textContent = fastMode ? 'Fast' : 'Normal';
+  win.tier.title = sessionCodexServiceTierTitle(sid);
 }
 
 function refreshSessionGoalTicker() {
@@ -16049,7 +16124,12 @@ function sessionWindowIsCodex(sessionId, win = null) {
   const sid = String(sessionId || '').trim();
   const current = win || (sid ? sessionWindows.get(sid) : null);
   const meta = sid ? (sessionMetadataById.get(sid) || {}) : {};
-  return normalizeAgentId(meta.backendSource || current?.source || meta.source || meta.sourceLabel || '') === 'codex';
+  if (normalizeAgentId(meta.backendSource || current?.source || meta.source || meta.sourceLabel || '') === 'codex') {
+    return true;
+  }
+  const capabilities = meta.capabilities || {};
+  if (typeof capabilities.codexFastMode === 'boolean') return true;
+  return Array.isArray(capabilities.codexThreadActions) && capabilities.codexThreadActions.length > 0;
 }
 
 function sessionWindowIsSide(sessionId) {
@@ -16351,6 +16431,19 @@ function codexThreadActionAllowedForSide(op) {
 function normalizeSessionCapabilities(raw = null) {
   if (!raw || typeof raw !== 'object') return null;
   const actions = raw.codex_thread_actions || raw.codexThreadActions;
+  const rawFastMode = raw.codex_fast_mode ?? raw.codexFastMode;
+  let codexFastMode = null;
+  if (typeof rawFastMode === 'boolean') {
+    codexFastMode = rawFastMode;
+  } else if (typeof rawFastMode === 'string') {
+    const normalized = rawFastMode.trim().toLowerCase();
+    if (normalized === 'true') codexFastMode = true;
+    if (normalized === 'false') codexFastMode = false;
+  }
+  const rawServiceTier = raw.codex_service_tier ?? raw.codexServiceTier;
+  const codexServiceTier = rawServiceTier === null || rawServiceTier === undefined
+    ? null
+    : String(rawServiceTier).trim() || null;
   return {
     followUp: raw.follow_up ?? raw.followUp ?? true,
     steer: raw.steer ?? false,
@@ -16361,7 +16454,21 @@ function normalizeSessionCapabilities(raw = null) {
     codexManagedContext: raw.codex_managed_context ?? raw.codexManagedContext ?? null,
     codexContextArchive: raw.codex_context_archive ?? raw.codexContextArchive ?? null,
     codexCommand: raw.codex_command ?? raw.codexCommand ?? null,
+    codexFastMode,
+    codexServiceTier,
   };
+}
+
+function mergeSessionCapabilities(existing = null, incoming = null) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const merged = { ...existing, ...incoming };
+  for (const key of ['codexThreadActions', 'codexManagedContext', 'codexContextArchive', 'codexCommand', 'codexFastMode', 'codexServiceTier']) {
+    if (incoming[key] === null || incoming[key] === undefined) {
+      merged[key] = existing[key] ?? null;
+    }
+  }
+  return merged;
 }
 
 function applySessionCapabilities(evt = {}) {
@@ -16380,14 +16487,16 @@ function applySessionCapabilities(evt = {}) {
   }
   for (const id of related) {
     const existing = sessionMetadataById.get(id) || {};
-    sessionMetadataById.set(id, { ...existing, capabilities });
+    const mergedCapabilities = mergeSessionCapabilities(existing.capabilities, capabilities);
+    sessionMetadataById.set(id, { ...existing, capabilities: mergedCapabilities });
     if (sessionWindows.has(id)) {
-      updateSessionWindow(id, { capabilities });
+      updateSessionWindow(id, { capabilities: mergedCapabilities });
     }
   }
   updateSessionWindowActionMenuVisibility(sid);
   updateStopButtonVisibility(currentPhase);
   updateSubmitButtonLabel(currentPhase);
+  updateControlFastButtonState();
 }
 
 function getSessionCapabilities(sessionId) {
@@ -16399,6 +16508,54 @@ function getSessionCapabilities(sessionId) {
     return { followUp: true, steer: false, interrupt: false, codexThreadActions: [] };
   }
   return null;
+}
+
+function sessionCodexFastMode(sessionId) {
+  const capabilities = getSessionCapabilities(sessionId);
+  if (!capabilities) return null;
+  if (typeof capabilities.codexFastMode === 'boolean') return capabilities.codexFastMode;
+  const tier = String(capabilities.codexServiceTier || '').trim().toLowerCase();
+  if (!tier) return null;
+  return tier === 'priority' || tier === 'fast';
+}
+
+function sessionCodexServiceTierTitle(sessionId) {
+  const fastMode = sessionCodexFastMode(sessionId);
+  if (fastMode === null) return 'Codex service tier has not been reported for this session yet';
+  const capabilities = getSessionCapabilities(sessionId) || {};
+  const rawTier = String(capabilities.codexServiceTier || '').trim();
+  const suffix = rawTier ? ` (${rawTier})` : '';
+  return fastMode
+    ? `Codex Fast is enabled for future turns${suffix}; active turns continue unchanged`
+    : `Codex is using the normal service tier${suffix}`;
+}
+
+function updateControlFastButtonState() {
+  const btn = document.querySelector('.control-action-btn[data-codex-action="fast"]');
+  const status = document.getElementById('control-fast-status');
+  const sid = resolvePromptTargetSessionId();
+  const fastMode = sid ? sessionCodexFastMode(sid) : null;
+  if (btn) {
+    btn.classList.toggle('active', fastMode === true);
+    if (fastMode === null) {
+      btn.removeAttribute('aria-pressed');
+      btn.title = 'Toggle Codex Fast service tier for future turns (/fast)';
+    } else {
+      btn.setAttribute('aria-pressed', fastMode ? 'true' : 'false');
+      btn.title = `${sessionCodexServiceTierTitle(sid)}. Click to toggle (/fast).`;
+    }
+  }
+  if (status) {
+    if (fastMode === null) {
+      status.className = 'control-fast-status hidden';
+      status.textContent = '';
+      status.title = '';
+    } else {
+      status.className = `control-fast-status ${fastMode ? 'fast' : 'normal'}`;
+      status.textContent = fastMode ? 'Fast' : 'Normal';
+      status.title = sessionCodexServiceTierTitle(sid);
+    }
+  }
 }
 
 function sessionSupportsSteer(sessionId) {
@@ -16507,7 +16664,17 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
     const state = codexThreadActionStateForSession(sid, op);
     item.classList.toggle('hidden', !isCodex || isSide);
     item.disabled = isCodex && !isSide ? !state.allowed : false;
-    item.title = state.allowed ? (spec?.title || '') : state.reason;
+    if (op === 'fast' && state.allowed) {
+      const fastMode = sessionCodexFastMode(sid);
+      item.classList.toggle('active', fastMode === true);
+      if (fastMode === null) item.removeAttribute('aria-pressed');
+      else item.setAttribute('aria-pressed', fastMode ? 'true' : 'false');
+      item.title = `${sessionCodexServiceTierTitle(sid)}. Click to toggle.`;
+    } else {
+      item.classList.remove('active');
+      item.removeAttribute('aria-pressed');
+      item.title = state.allowed ? (spec?.title || '') : state.reason;
+    }
     item.setAttribute('aria-disabled', item.disabled ? 'true' : 'false');
   });
   win.actionMenu?.querySelectorAll('[data-session-window-codex-submenu]').forEach(submenu => {
@@ -17177,6 +17344,8 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const goalText = document.createElement('span');
   goalText.className = 'session-window-goal-text';
   goal.appendChild(goalText);
+  const tier = document.createElement('span');
+  tier.className = 'session-window-tier hidden';
   header.title = 'Click header to collapse or expand';
   const menuControls = document.createElement('div');
   menuControls.className = 'session-window-action-cluster session-window-menu-cluster';
@@ -17231,6 +17400,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   windowControls.appendChild(close);
   header.appendChild(title);
   header.appendChild(goal);
+  header.appendChild(tier);
   header.appendChild(status);
   header.appendChild(menuControls);
   header.appendChild(windowControls);
@@ -17332,6 +17502,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     status,
     goal,
     goalText,
+    tier,
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
@@ -17413,8 +17584,10 @@ function updateSessionWindow(sessionId, meta = {}) {
     if (cls) win.status.classList.add(cls);
   }
   renderSessionWindowGoal(win, meta.goal || null);
+  renderSessionWindowTier(win);
   refreshSessionGoalTicker();
   updateSessionWindowActionMenuVisibility(sid);
+  updateControlFastButtonState();
   updateSessionRelationshipBadges(sid);
   if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
   scheduleSessionRelationshipRender();

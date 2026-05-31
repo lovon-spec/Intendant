@@ -123,6 +123,13 @@ pub struct SessionCapabilities {
     pub codex_context_archive: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_command: Option<String>,
+    /// Session-scoped Codex service-tier state. `Some(false)` is serialized so
+    /// frontends can distinguish a known normal tier from unknown old replay
+    /// data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_fast_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_service_tier: Option<String>,
 }
 
 /// Per-session Codex `/goal` state shown by the dashboard.

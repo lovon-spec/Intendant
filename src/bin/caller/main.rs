@@ -2359,6 +2359,95 @@ fn codex_thread_action_capabilities() -> Vec<String> {
     .collect()
 }
 
+fn codex_service_tier_is_fast(service_tier: Option<&str>) -> bool {
+    service_tier
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .is_some_and(|tier| {
+            tier.eq_ignore_ascii_case(external_agent::codex::CODEX_FAST_SERVICE_TIER)
+                || tier.eq_ignore_ascii_case("fast")
+        })
+}
+
+fn codex_service_tier_value(service_tier: Option<&str>) -> Option<String> {
+    service_tier
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_external_session_capabilities(
+    project: &Project,
+    service_tier: Option<&str>,
+) -> types::SessionCapabilities {
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        codex_thread_actions: codex_thread_action_capabilities(),
+        codex_managed_context: Some(project::normalize_codex_managed_context(
+            &project.config.agent.codex.managed_context,
+        )),
+        codex_context_archive: Some(project::normalize_codex_context_archive(
+            &project.config.agent.codex.context_archive,
+        )),
+        codex_command: Some(project.config.agent.codex.command.clone()),
+        codex_fast_mode: Some(codex_service_tier_is_fast(service_tier)),
+        codex_service_tier: codex_service_tier_value(service_tier),
+    }
+}
+
+fn emit_codex_session_capabilities_for_project(
+    bus: &EventBus,
+    session_id: Option<&str>,
+    project: &Project,
+    service_tier: Option<&str>,
+) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: codex_external_session_capabilities(project, service_tier),
+    });
+}
+
+fn codex_drain_session_capabilities(
+    config: &DrainConfig<'_>,
+    service_tier: Option<&str>,
+) -> types::SessionCapabilities {
+    let launch = crate::session_config::read_log_dir_config(config.log_dir);
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        codex_thread_actions: codex_thread_action_capabilities(),
+        codex_managed_context: launch
+            .as_ref()
+            .and_then(|cfg| cfg.codex_managed_context.clone()),
+        codex_context_archive: launch
+            .as_ref()
+            .and_then(|cfg| cfg.codex_context_archive.clone()),
+        codex_command: launch.as_ref().and_then(|cfg| cfg.agent_command.clone()),
+        codex_fast_mode: Some(codex_service_tier_is_fast(service_tier)),
+        codex_service_tier: codex_service_tier_value(service_tier),
+    }
+}
+
+fn emit_codex_session_capabilities_for_drain(
+    config: &DrainConfig<'_>,
+    session_id: Option<&str>,
+    service_tier: Option<&str>,
+) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    config.bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: codex_drain_session_capabilities(config, service_tier),
+    });
+}
+
 fn side_session_prompt_from_params(params: &serde_json::Value) -> Option<String> {
     ["prompt", "message", "text", "task"]
         .iter()
@@ -2731,6 +2820,15 @@ async fn handle_external_thread_action(
         success,
         message: message.clone(),
     });
+
+    if success && op == "fast" {
+        let service_tier = agent.service_tier().map(str::to_string);
+        emit_codex_session_capabilities_for_drain(
+            config,
+            result_session_id.as_deref(),
+            service_tier.as_deref(),
+        );
+    }
 
     if success && op == "fork" {
         if let Some(child_id) = forked_thread_id_from_message(&message) {
@@ -3132,6 +3230,8 @@ fn emit_codex_subagent_started(
             codex_managed_context: None,
             codex_context_archive: None,
             codex_command: None,
+            codex_fast_mode: None,
+            codex_service_tier: None,
         },
     });
     config.bus.send(AppEvent::SessionStarted {
@@ -6914,6 +7014,15 @@ mod tests {
                 action
             );
         }
+    }
+
+    #[test]
+    fn codex_service_tier_fast_mode_accepts_canonical_and_legacy_values() {
+        assert!(codex_service_tier_is_fast(Some("priority")));
+        assert!(codex_service_tier_is_fast(Some(" FAST ")));
+        assert!(!codex_service_tier_is_fast(None));
+        assert!(!codex_service_tier_is_fast(Some("")));
+        assert!(!codex_service_tier_is_fast(Some("standard")));
     }
 
     #[test]
@@ -11789,6 +11898,17 @@ async fn run_with_presence(
                     success,
                     message: message.clone(),
                 });
+                if success && op == "fast" {
+                    let service_tier = persistent_agent
+                        .as_ref()
+                        .and_then(|agent| agent.service_tier().map(str::to_string));
+                    emit_codex_session_capabilities_for_project(
+                        &bus,
+                        result_session_id.as_deref(),
+                        &project,
+                        service_tier.as_deref(),
+                    );
+                }
                 if success && op == "fork" {
                     if let Some(child_id) = forked_thread_id_from_message(&message) {
                         emit_codex_fork_session_name(&bus, &child_id, &action_params);
@@ -13234,25 +13354,12 @@ async fn run_external_agent_mode(
     let persist_model_responses_inline = control_session_id.is_some();
     let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
     if backend == external_agent::AgentBackend::Codex {
-        if let Some(session_id) = intendant_session_id.as_deref() {
-            let mode = project::normalize_codex_managed_context(
-                &project.config.agent.codex.managed_context,
-            );
-            bus.send(AppEvent::SessionCapabilities {
-                session_id: session_id.to_string(),
-                capabilities: types::SessionCapabilities {
-                    follow_up: true,
-                    steer: true,
-                    interrupt: true,
-                    codex_thread_actions: codex_thread_action_capabilities(),
-                    codex_managed_context: Some(mode),
-                    codex_context_archive: Some(project::normalize_codex_context_archive(
-                        &project.config.agent.codex.context_archive,
-                    )),
-                    codex_command: Some(project.config.agent.codex.command.clone()),
-                },
-            });
-        }
+        emit_codex_session_capabilities_for_project(
+            &bus,
+            intendant_session_id.as_deref(),
+            &project,
+            codex_service_tier.as_deref(),
+        );
     }
     let (mut agent, thread, mut event_rx) = match create_external_agent(
         &backend,
@@ -13312,6 +13419,23 @@ async fn run_external_agent_mode(
             source: backend.as_short_str().to_string(),
             backend_session_id: backend_session_id.clone(),
         });
+    }
+    if backend == external_agent::AgentBackend::Codex {
+        let service_tier = agent.service_tier().map(str::to_string);
+        emit_codex_session_capabilities_for_project(
+            &bus,
+            intendant_session_id.as_deref(),
+            &project,
+            service_tier.as_deref(),
+        );
+        if live_session_id != intendant_session_id {
+            emit_codex_session_capabilities_for_project(
+                &bus,
+                live_session_id.as_deref(),
+                &project,
+                service_tier.as_deref(),
+            );
+        }
     }
     if emit_session_started_after_identity {
         if let Some(session_id) = live_session_id.clone() {
