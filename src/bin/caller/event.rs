@@ -392,6 +392,21 @@ pub enum AppEvent {
         display_id: u32,
         backend: &'static str,
     },
+    /// Agent-requested visual collaboration state for the dashboard.
+    ///
+    /// This is intentionally presentation-level: it does not grant input
+    /// authority or mutate display sessions. Browsers use it to foreground a
+    /// display, render a focus box, and expose a user-clickable input button
+    /// when an agent asks for cooperation.
+    SharedView {
+        session_id: Option<String>,
+        action: String,
+        display_target: Option<String>,
+        display_id: Option<u32>,
+        reason: Option<String>,
+        region: Option<crate::types::SharedViewRegion>,
+        note: Option<String>,
+    },
 
     // User session display grant/revoke
     UserDisplayGranted {
@@ -2039,6 +2054,23 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             display_id: *display_id,
             backend: backend.to_string(),
         }),
+        AppEvent::SharedView {
+            session_id,
+            action,
+            display_target,
+            display_id,
+            reason,
+            region,
+            note,
+        } => Some(OutboundEvent::SharedView {
+            session_id: session_id.clone(),
+            action: action.clone(),
+            display_target: display_target.clone(),
+            display_id: *display_id,
+            reason: reason.clone(),
+            region: region.clone(),
+            note: note.clone(),
+        }),
         AppEvent::UploadReady { descriptor } => Some(OutboundEvent::UploadReady {
             descriptor: descriptor.clone(),
         }),
@@ -2310,6 +2342,26 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 "Display :{} waiting for OS approval ({backend} portal)",
                 display_id
             ));
+        }
+        AppEvent::SharedView {
+            action,
+            display_id,
+            display_target,
+            reason,
+            note,
+            ..
+        } => {
+            let target = display_id
+                .map(|id| format!(":{}", id))
+                .or_else(|| display_target.clone())
+                .unwrap_or_else(|| "default display".to_string());
+            let detail = reason
+                .as_deref()
+                .or(note.as_deref())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!(": {}", s))
+                .unwrap_or_default();
+            log.info(&format!("Shared view {} on {}{}", action, target, detail));
         }
         AppEvent::UserDisplayGranted { display_id } => {
             log.info(&format!(
