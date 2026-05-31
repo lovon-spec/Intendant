@@ -170,6 +170,13 @@ pub struct CodexConfig {
     /// the Intendant-aware Codex fork.
     #[serde(default = "default_codex_managed_context", alias = "context_recovery")]
     pub managed_context: String,
+    /// Context snapshot archive mode for the Activity -> Context tab.
+    /// `summary` records compact per-request visualization data and uses
+    /// temporary provider traces while the session is live. `exact` persists
+    /// full provider request payloads for exact raw replay. `off` disables
+    /// context snapshot capture.
+    #[serde(default = "default_codex_context_archive")]
+    pub context_archive: String,
 }
 
 fn default_codex_command() -> String {
@@ -186,6 +193,10 @@ fn default_codex_sandbox() -> String {
 
 fn default_codex_managed_context() -> String {
     "vanilla".to_string()
+}
+
+fn default_codex_context_archive() -> String {
+    "summary".to_string()
 }
 
 /// Valid Codex sandbox modes, in the order we present them in the UI.
@@ -258,6 +269,18 @@ pub fn codex_managed_context_enabled(mode: &str) -> bool {
     normalize_codex_managed_context(mode) == "managed"
 }
 
+pub fn normalize_codex_context_archive(input: &str) -> String {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "exact" | "full" | "raw" | "on" | "true" | "1" => "exact".to_string(),
+        "off" | "none" | "disabled" | "false" | "0" => "off".to_string(),
+        _ => "summary".to_string(),
+    }
+}
+
+pub fn codex_context_archive_exact(mode: &str) -> bool {
+    normalize_codex_context_archive(mode) == "exact"
+}
+
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
@@ -270,6 +293,7 @@ impl Default for CodexConfig {
             network_access: false,
             writable_roots: Vec::new(),
             managed_context: default_codex_managed_context(),
+            context_archive: default_codex_context_archive(),
         }
     }
 }
@@ -1434,6 +1458,7 @@ default_backend = "codex"
         assert!(config.agent.codex.model.is_none());
         assert_eq!(config.agent.codex.approval_policy, "on-request");
         assert_eq!(config.agent.codex.sandbox, "workspace-write");
+        assert_eq!(config.agent.codex.context_archive, "summary");
         assert_eq!(config.agent.claude_code.command, "claude");
         assert!(config.agent.claude_code.model.is_none());
         assert_eq!(config.agent.claude_code.permission_mode, "auto");
@@ -1447,5 +1472,8 @@ default_backend = "codex"
         assert!(config.model.is_none());
         assert_eq!(config.approval_policy, "on-request");
         assert_eq!(config.sandbox, "workspace-write");
+        assert_eq!(config.context_archive, "summary");
+        assert_eq!(normalize_codex_context_archive("raw"), "exact");
+        assert_eq!(normalize_codex_context_archive("disabled"), "off");
     }
 }

@@ -1048,6 +1048,9 @@ pub struct CodexAgent {
     /// Root directory where Codex rollout traces exact provider request
     /// payloads for the dashboard Context tab.
     request_trace_root: Option<PathBuf>,
+    request_trace_temporary: bool,
+    context_archive: String,
+    context_seen_request_ids: HashSet<String>,
     child: Option<Child>,
     writer: Option<BufWriter<ChildStdin>>,
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
@@ -1092,6 +1095,20 @@ pub struct CodexAgentOptions {
 }
 
 impl CodexAgent {
+    fn context_archive_exact(&self) -> bool {
+        crate::project::codex_context_archive_exact(&self.context_archive)
+    }
+
+    fn cleanup_temporary_request_trace_root(&mut self) {
+        if !self.request_trace_temporary {
+            return;
+        }
+        if let Some(root) = self.request_trace_root.take() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+        self.request_trace_temporary = false;
+    }
+
     fn intendant_mcp_url(&self, port: u16) -> String {
         let mode = if self.managed_context {
             "managed"
@@ -1155,6 +1172,9 @@ impl CodexAgent {
             working_dir: None,
             config_working_dir: None,
             request_trace_root: None,
+            request_trace_temporary: false,
+            context_archive: "summary".to_string(),
+            context_seen_request_ids: HashSet::new(),
             child: None,
             writer: None,
             event_tx: None,
@@ -1272,15 +1292,25 @@ impl CodexAgent {
         let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
         let context_window = usage.as_ref().and_then(codex_usage_context_window);
         let hard_context_window = usage.as_ref().and_then(codex_usage_hard_context_window);
+        let item_count = codex_request_item_count(&trace.payload);
+        let raw = codex_context_archive_payload(
+            trace.payload,
+            &trace.request_id,
+            trace.request_index,
+            &trace.format,
+            self.context_archive_exact(),
+        );
         Ok(AgentContextSnapshot {
             source: "codex".to_string(),
             label: trace.label,
+            request_id: Some(trace.request_id),
+            request_index: Some(trace.request_index),
             format: trace.format,
             token_count,
             context_window,
             hard_context_window,
-            item_count: codex_request_item_count(&trace.payload),
-            raw: trace.payload,
+            item_count,
+            raw,
         })
     }
 
@@ -1367,6 +1397,8 @@ fn codex_turn_start_thread_not_found(err: &CallerError) -> bool {
 
 struct CodexRequestPayloadSnapshot {
     label: String,
+    request_id: String,
+    request_index: u64,
     format: String,
     payload: serde_json::Value,
 }
@@ -1413,25 +1445,58 @@ async fn read_latest_codex_context_payload(
     root: &Path,
     thread_id: Option<&str>,
 ) -> Result<CodexRequestPayloadSnapshot, CallerError> {
-    let index = read_codex_trace_index(root, thread_id).await?;
-    let latest = index
-        .requests
-        .iter()
-        .max_by_key(|candidate| candidate.order)
-        .cloned()
-        .ok_or_else(|| {
-            CallerError::ExternalAgent(format!(
-                "no Codex inference request payload found in {}",
-                root.display()
-            ))
-        })?;
+    let snapshots = read_codex_context_payloads(root, thread_id).await?;
+    snapshots.into_iter().last().ok_or_else(|| {
+        CallerError::ExternalAgent(format!(
+            "no Codex inference request payload found in {}",
+            root.display()
+        ))
+    })
+}
 
-    let payload = read_codex_json_payload(&latest.bundle_dir, &latest.relative_path).await?;
-    let format = codex_request_format(latest.provider_name.as_deref());
+async fn read_codex_context_payloads(
+    root: &Path,
+    thread_id: Option<&str>,
+) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
+    read_codex_context_payloads_excluding(root, thread_id, &HashSet::new()).await
+}
+
+async fn read_codex_context_payloads_excluding(
+    root: &Path,
+    thread_id: Option<&str>,
+    seen_request_ids: &HashSet<String>,
+) -> Result<Vec<CodexRequestPayloadSnapshot>, CallerError> {
+    let index = read_codex_trace_index(root, thread_id).await?;
+    let mut requests = index.requests.clone();
+    requests.sort_by(|a, b| codex_request_sort_key(a).cmp(&codex_request_sort_key(b)));
+
+    let mut snapshots = Vec::with_capacity(requests.len());
+    for (idx, request_ref) in requests.iter().enumerate() {
+        if seen_request_ids.contains(&codex_request_id(request_ref)) {
+            continue;
+        }
+        snapshots.push(codex_context_payload_snapshot(&index, request_ref, idx as u64 + 1).await?);
+    }
+    Ok(snapshots)
+}
+
+async fn codex_context_payload_snapshot(
+    index: &CodexTraceIndex,
+    request_ref: &CodexRequestPayloadRef,
+    request_index: u64,
+) -> Result<CodexRequestPayloadSnapshot, CallerError> {
+    let payload =
+        read_codex_json_payload(&request_ref.bundle_dir, &request_ref.relative_path).await?;
+    let format = codex_request_format(request_ref.provider_name.as_deref());
+    let request_id = codex_request_id(request_ref);
     if format == "openai.responses.request.v1" {
-        let resolved = resolve_openai_responses_context_payload(&index, &latest, payload).await?;
+        let resolved =
+            resolve_openai_responses_context_payload(index, request_ref, request_index, payload)
+                .await?;
         return Ok(CodexRequestPayloadSnapshot {
             label: "Codex resolved request payload".to_string(),
+            request_id,
+            request_index,
             format: "openai.responses.resolved_request.v1".to_string(),
             payload: resolved,
         });
@@ -1439,8 +1504,399 @@ async fn read_latest_codex_context_payload(
 
     Ok(CodexRequestPayloadSnapshot {
         label: "Codex request payload".to_string(),
+        request_id,
+        request_index,
         format,
         payload,
+    })
+}
+
+fn codex_request_sort_key(request: &CodexRequestPayloadRef) -> (i64, u64, String, String, String) {
+    (
+        request.order.0,
+        request.order.1,
+        request.bundle_dir.to_string_lossy().to_string(),
+        request.relative_path.clone(),
+        request.inference_call_id.clone(),
+    )
+}
+
+fn codex_request_id(request: &CodexRequestPayloadRef) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    fn feed(hash: &mut u64, part: &str) {
+        for byte in part.as_bytes() {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        *hash ^= 0xff;
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    let bundle_dir = request.bundle_dir.to_string_lossy();
+    let thread_id = request.thread_id.as_deref().unwrap_or_default();
+    let mut hash = FNV_OFFSET;
+    feed(&mut hash, &bundle_dir);
+    feed(&mut hash, &request.relative_path);
+    feed(&mut hash, &request.inference_call_id);
+    feed(&mut hash, thread_id);
+    format!("codex-request-{hash:016x}")
+}
+
+fn stable_context_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn compact_context_text(text: &str, limit: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= limit {
+        return text;
+    }
+    let mut out = text
+        .chars()
+        .take(limit.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn context_json_len(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|_| value.to_string().len())
+}
+
+fn context_estimated_tokens(value: &serde_json::Value) -> u64 {
+    let chars = context_json_len(value);
+    std::cmp::max(1, chars.div_ceil(4) as u64)
+}
+
+fn context_first_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(context_first_text)
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_default(),
+        serde_json::Value::Object(map) => {
+            for key in [
+                "text",
+                "input_text",
+                "output_text",
+                "summary",
+                "content",
+                "output",
+                "arguments",
+            ] {
+                if let Some(serde_json::Value::String(text)) = map.get(key) {
+                    if !text.trim().is_empty() {
+                        return text.clone();
+                    }
+                }
+            }
+            for key in ["parts", "content"] {
+                if let Some(value) = map.get(key) {
+                    let found = context_first_text(value);
+                    if !found.trim().is_empty() {
+                        return found;
+                    }
+                }
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn context_has_media(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(context_has_media),
+        serde_json::Value::Object(map) => {
+            let type_text = map
+                .get("type")
+                .or_else(|| map.get("mime_type"))
+                .or_else(|| map.get("mimeType"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if ["image", "audio", "video", "file"]
+                .iter()
+                .any(|needle| type_text.contains(needle))
+            {
+                return true;
+            }
+            if [
+                "image_url",
+                "input_image",
+                "inline_data",
+                "inlineData",
+                "media",
+            ]
+            .iter()
+            .any(|key| map.contains_key(*key))
+            {
+                return true;
+            }
+            map.values().any(context_has_media)
+        }
+        _ => false,
+    }
+}
+
+fn context_message_category(item: &serde_json::Value) -> &'static str {
+    let role = item
+        .get("role")
+        .or_else(|| item.get("speaker"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let item_type = item
+        .get("type")
+        .or_else(|| item.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if item_type.contains("reasoning") || item_type.contains("thinking") {
+        return "reasoning";
+    }
+    if item_type.contains("function_call_output")
+        || item_type == "tool_result"
+        || item_type == "functionresponse"
+    {
+        return "tool_output";
+    }
+    if item_type.contains("function_call") || item_type == "tool_use" || item_type == "functioncall"
+    {
+        return "tool_call";
+    }
+    match role.as_str() {
+        "system" | "developer" => "instructions",
+        "user" | "human" => {
+            if context_has_media(item) {
+                "media"
+            } else {
+                "user"
+            }
+        }
+        "assistant" | "model" => {
+            if context_has_media(item) {
+                "media"
+            } else {
+                "assistant"
+            }
+        }
+        "tool" => "tool_output",
+        _ if context_has_media(item) => "media",
+        _ => "other",
+    }
+}
+
+fn context_message_title(item: &serde_json::Value, index: usize) -> String {
+    if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+        return name.to_string();
+    }
+    if let Some(name) = item
+        .pointer("/function/name")
+        .and_then(|v| v.as_str())
+        .or_else(|| item.pointer("/tool/name").and_then(|v| v.as_str()))
+    {
+        return name.to_string();
+    }
+    let role = item
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let item_type = item
+        .get("type")
+        .or_else(|| item.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    match (role.is_empty(), item_type.is_empty()) {
+        (false, false) => format!("{role} {item_type}"),
+        (false, true) => format!("{role} message"),
+        (true, false) => item_type.replace('_', " "),
+        (true, true) => format!("item {}", index + 1),
+    }
+}
+
+fn context_tool_name(tool: &serde_json::Value, fallback_index: usize) -> String {
+    tool.pointer("/function/name")
+        .and_then(|v| v.as_str())
+        .or_else(|| tool.get("name").and_then(|v| v.as_str()))
+        .or_else(|| tool.pointer("/tool/name").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tool {}", fallback_index + 1))
+}
+
+fn push_context_summary_part(
+    parts: &mut Vec<serde_json::Value>,
+    category: &str,
+    title: impl Into<String>,
+    value: &serde_json::Value,
+    path: impl Into<String>,
+) {
+    let first_text = context_first_text(value);
+    let preview = if first_text.trim().is_empty() {
+        compact_context_text(&value.to_string(), 360)
+    } else {
+        compact_context_text(&first_text, 360)
+    };
+    parts.push(serde_json::json!({
+        "category": category,
+        "title": title.into(),
+        "subtitle": compact_context_text(&first_text, 180),
+        "path": path.into(),
+        "preview": preview,
+        "estimated_tokens": context_estimated_tokens(value),
+        "chars": context_json_len(value),
+    }));
+}
+
+fn codex_context_summary_parts(payload: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut parts = Vec::new();
+    let mut consumed = HashSet::new();
+    if let Some(map) = payload.as_object() {
+        for key in [
+            "instructions",
+            "system",
+            "system_instruction",
+            "developer",
+            "developer_message",
+        ] {
+            if let Some(value) = map.get(key) {
+                consumed.insert(key);
+                push_context_summary_part(
+                    &mut parts,
+                    "instructions",
+                    key.replace('_', " "),
+                    value,
+                    format!("$.{key}"),
+                );
+            }
+        }
+        if let Some(tools) = map.get("tools").and_then(|v| v.as_array()) {
+            consumed.insert("tools");
+            for (index, tool) in tools.iter().enumerate() {
+                push_context_summary_part(
+                    &mut parts,
+                    "schema",
+                    format!("tool schema: {}", context_tool_name(tool, index)),
+                    tool,
+                    format!("$.tools[{index}]"),
+                );
+            }
+        }
+        for key in ["input", "messages", "contents", "history", "output_items"] {
+            if let Some(items) = map.get(key).and_then(|v| v.as_array()) {
+                consumed.insert(key);
+                for (index, item) in items.iter().enumerate() {
+                    push_context_summary_part(
+                        &mut parts,
+                        context_message_category(item),
+                        context_message_title(item, index),
+                        item,
+                        format!("$.{key}[{index}]"),
+                    );
+                }
+            }
+        }
+        let mut config = serde_json::Map::new();
+        for (key, value) in map {
+            if consumed.contains(key.as_str()) || value.is_null() {
+                continue;
+            }
+            if value.is_string() || value.is_number() || value.is_boolean() {
+                config.insert(key.clone(), value.clone());
+            } else if matches!(
+                key.as_str(),
+                "reasoning" | "metadata" | "include" | "tool_choice"
+            ) {
+                config.insert(key.clone(), value.clone());
+            }
+        }
+        if !config.is_empty() {
+            push_context_summary_part(
+                &mut parts,
+                "config",
+                "request configuration",
+                &serde_json::Value::Object(config),
+                "$.config",
+            );
+        }
+    } else if let Some(items) = payload.as_array() {
+        for (index, item) in items.iter().enumerate() {
+            push_context_summary_part(
+                &mut parts,
+                context_message_category(item),
+                context_message_title(item, index),
+                item,
+                format!("$[{index}]"),
+            );
+        }
+    }
+    if parts.is_empty() {
+        push_context_summary_part(&mut parts, "other", "raw context payload", payload, "$");
+    }
+    parts
+}
+
+fn codex_context_archive_payload(
+    payload: serde_json::Value,
+    request_id: &str,
+    request_index: u64,
+    format: &str,
+    exact: bool,
+) -> serde_json::Value {
+    let raw_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| payload.to_string().into());
+    let raw_len = raw_bytes.len();
+    let raw_hash = format!("{:016x}", stable_context_hash(&raw_bytes));
+    if exact {
+        let mut payload = payload;
+        if let serde_json::Value::Object(map) = &mut payload {
+            let context = map
+                .entry("_intendant_context".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let serde_json::Value::Object(context_map) = context {
+                context_map.insert("archive_mode".to_string(), serde_json::json!("exact"));
+                context_map.insert("raw_archived".to_string(), serde_json::json!(true));
+                context_map.insert("raw_bytes".to_string(), serde_json::json!(raw_len));
+                context_map.insert("raw_hash".to_string(), serde_json::json!(raw_hash));
+                context_map.insert("request_id".to_string(), serde_json::json!(request_id));
+                context_map.insert(
+                    "request_index".to_string(),
+                    serde_json::json!(request_index),
+                );
+            }
+        }
+        return payload;
+    }
+    let summary_parts = codex_context_summary_parts(&payload);
+    serde_json::json!({
+        "_intendant_context": {
+            "archive_mode": "summary",
+            "raw_archived": false,
+            "raw_bytes": raw_len,
+            "raw_hash": raw_hash,
+            "request_id": request_id,
+            "request_index": request_index,
+            "format": format,
+        },
+        "summary": {
+            "kind": "compact_context_snapshot",
+            "raw_bytes": raw_len,
+            "part_count": summary_parts.len(),
+            "exact_replay_available": false,
+        },
+        "summary_parts": summary_parts,
     })
 }
 
@@ -1590,6 +2046,7 @@ async fn read_codex_json_payload(
 async fn resolve_openai_responses_context_payload(
     index: &CodexTraceIndex,
     latest_ref: &CodexRequestPayloadRef,
+    request_index: u64,
     latest_payload: serde_json::Value,
 ) -> Result<serde_json::Value, CallerError> {
     let mut previous_pairs = Vec::new();
@@ -1645,6 +2102,9 @@ async fn resolve_openai_responses_context_payload(
             serde_json::json!({
                 "source": "codex_rollout_trace_payloads",
                 "thread_id": latest_ref.thread_id.clone(),
+                "request_id": codex_request_id(latest_ref),
+                "request_index": request_index,
+                "inference_call_id": latest_ref.inference_call_id.clone(),
                 "latest_request_input_count": latest_request_input_count,
                 "resolved_input_count": resolved_input.len(),
                 "unresolved_previous_response_id": unresolved_previous_response_id,
@@ -3315,6 +3775,10 @@ impl ExternalAgent for CodexAgent {
         self.writable_roots = config.writable_roots;
         self.managed_context = config.codex_managed_context;
         self.request_trace_root = config.request_trace_dir;
+        self.request_trace_temporary = config.request_trace_temporary;
+        self.context_archive =
+            crate::project::normalize_codex_context_archive(&config.context_archive);
+        self.context_seen_request_ids.clear();
         self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
         self.working_dir = Some(config.working_dir.clone());
@@ -3665,6 +4129,64 @@ impl ExternalAgent for CodexAgent {
         }
     }
 
+    async fn context_snapshots(&mut self) -> Result<Vec<AgentContextSnapshot>, CallerError> {
+        let Some(root) = self.request_trace_root.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let thread_id = self.active_thread_id.lock().await.clone();
+        let traces = match read_codex_context_payloads_excluding(
+            root,
+            thread_id.as_deref(),
+            &self.context_seen_request_ids,
+        )
+        .await
+        {
+            Ok(traces) => traces,
+            Err(err) if codex_context_snapshot_not_ready(&err) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let usage = self.latest_token_usage.lock().await.clone();
+        let latest_request_id = traces.last().map(|trace| trace.request_id.clone());
+        let exact_archive = self.context_archive_exact();
+        Ok(traces
+            .into_iter()
+            .map(|trace| {
+                let is_latest = latest_request_id.as_deref() == Some(trace.request_id.as_str());
+                let item_count = codex_request_item_count(&trace.payload);
+                let raw = codex_context_archive_payload(
+                    trace.payload,
+                    &trace.request_id,
+                    trace.request_index,
+                    &trace.format,
+                    exact_archive,
+                );
+                AgentContextSnapshot {
+                    source: "codex".to_string(),
+                    label: trace.label,
+                    request_id: Some(trace.request_id),
+                    request_index: Some(trace.request_index),
+                    format: trace.format,
+                    token_count: is_latest
+                        .then(|| usage.as_ref().and_then(codex_usage_total_tokens))
+                        .flatten(),
+                    context_window: is_latest
+                        .then(|| usage.as_ref().and_then(codex_usage_context_window))
+                        .flatten(),
+                    hard_context_window: is_latest
+                        .then(|| usage.as_ref().and_then(codex_usage_hard_context_window))
+                        .flatten(),
+                    item_count,
+                    raw,
+                }
+            })
+            .inspect(|snapshot| {
+                if let Some(request_id) = snapshot.request_id.as_ref() {
+                    self.context_seen_request_ids.insert(request_id.clone());
+                }
+            })
+            .collect())
+    }
+
     async fn resolve_approval(
         &mut self,
         request_id: &str,
@@ -3981,6 +4503,7 @@ impl ExternalAgent for CodexAgent {
         self.turn_descendant_baseline = None;
         self.active_turn_id.lock().await.take();
         self.active_thread_id.lock().await.take();
+        self.cleanup_temporary_request_trace_root();
 
         Ok(())
     }
@@ -4003,6 +4526,7 @@ impl Drop for CodexAgent {
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
         }
+        self.cleanup_temporary_request_trace_root();
     }
 }
 
@@ -4023,6 +4547,56 @@ mod tests {
 
         let other = CallerError::ExternalAgent("read Codex request trace entry: boom".to_string());
         assert!(!codex_context_snapshot_not_ready(&other));
+    }
+
+    #[test]
+    fn context_archive_summary_compacts_raw_payload_for_visualization() {
+        let large = "x".repeat(8_000);
+        let payload = serde_json::json!({
+            "instructions": large,
+            "input": [
+                {"type": "message", "role": "user", "content": "please inspect context use"}
+            ],
+            "model": "gpt-test",
+        });
+        let compact =
+            codex_context_archive_payload(payload.clone(), "req-1", 1, "openai.test", false);
+        let compact_json = serde_json::to_string(&compact).unwrap();
+        assert_eq!(
+            compact.pointer("/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert_eq!(
+            compact.pointer("/_intendant_context/raw_archived"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            compact.pointer("/_intendant_context/raw_bytes"),
+            Some(&serde_json::json!(context_json_len(&payload)))
+        );
+        assert!(compact_json.len() < context_json_len(&payload));
+        assert!(!compact_json.contains(&"x".repeat(1_000)));
+        assert!(compact
+            .get("summary_parts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parts| parts.len() >= 2));
+    }
+
+    #[test]
+    fn context_archive_exact_preserves_raw_payload() {
+        let payload = serde_json::json!({
+            "instructions": "keep me exact",
+            "input": [{"role": "user", "content": "hello"}],
+        });
+        let exact = codex_context_archive_payload(payload, "req-1", 1, "openai.test", true);
+        assert_eq!(
+            exact.pointer("/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("exact"))
+        );
+        assert_eq!(
+            exact.get("instructions").and_then(|v| v.as_str()),
+            Some("keep me exact")
+        );
     }
 
     #[test]
@@ -4243,6 +4817,8 @@ mod tests {
 
         let snapshot = read_latest_codex_request_payload(tmp.path()).await.unwrap();
         assert_eq!(snapshot.format, "openai.responses.resolved_request.v1");
+        assert_eq!(snapshot.request_index, 3);
+        assert!(snapshot.request_id.starts_with("codex-request-"));
         assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 3);
     }
 
@@ -4347,6 +4923,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snapshot.format, "openai.responses.resolved_request.v1");
+        assert_eq!(snapshot.request_index, 2);
         let input = snapshot.payload["input"].as_array().unwrap();
         assert_eq!(input.len(), 3);
         let rendered = serde_json::to_string(&snapshot.payload).unwrap();
@@ -4361,6 +4938,78 @@ mod tests {
             snapshot.payload["_intendant_context"]["resolved_input_count"],
             serde_json::json!(3)
         );
+        assert_eq!(
+            snapshot.payload["_intendant_context"]["request_index"],
+            serde_json::json!(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_request_trace_reads_all_context_payloads_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        std::fs::create_dir_all(trace.join("payloads")).unwrap();
+
+        for (idx, text) in [(1, "first"), (2, "second"), (3, "third")] {
+            std::fs::write(
+                trace.join(format!("payloads/request-{idx}.json")),
+                serde_json::json!({
+                    "type": "response.create",
+                    "input": [{"role": "user", "content": text}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        std::fs::write(
+            trace.join("trace.jsonl"),
+            [
+                (30, 3, "inference:3"),
+                (10, 1, "inference:1"),
+                (20, 2, "inference:2"),
+            ]
+            .into_iter()
+            .map(|(ts, idx, call_id)| {
+                serde_json::json!({
+                    "schema_version": 1,
+                    "wall_time_unix_ms": ts,
+                    "payload": {
+                        "type": "inference_started",
+                        "provider_name": "OpenAI",
+                        "thread_id": "thread-abc",
+                        "inference_call_id": call_id,
+                        "request_payload": {
+                            "kind": {"type": "inference_request"},
+                            "path": format!("payloads/request-{idx}.json")
+                        }
+                    }
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let snapshots = read_codex_context_payloads(tmp.path(), Some("thread-abc"))
+            .await
+            .unwrap();
+        let indexes: Vec<u64> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.request_index)
+            .collect();
+        assert_eq!(indexes, vec![1, 2, 3]);
+        let rendered: Vec<String> = snapshots
+            .iter()
+            .map(|snapshot| serde_json::to_string(&snapshot.payload).unwrap())
+            .collect();
+        assert!(rendered[0].contains("first"));
+        assert!(rendered[1].contains("second"));
+        assert!(rendered[2].contains("third"));
+        assert!(snapshots
+            .windows(2)
+            .all(|pair| pair[0].request_id != pair[1].request_id));
     }
 
     #[test]
@@ -6334,6 +6983,8 @@ mod tests {
             model: None,
             working_dir: tmp.path().to_path_buf(),
             request_trace_dir: Some(trace_dir),
+            request_trace_temporary: false,
+            context_archive: "summary".to_string(),
             approval_policy: "never".to_string(),
             sandbox: "danger-full-access".to_string(),
             reasoning_effort: None,

@@ -32,6 +32,7 @@ pub struct CodexRuntimeConfig {
     pub network_access: bool,
     pub writable_roots: Vec<String>,
     pub managed_context: String,
+    pub context_archive: String,
 }
 
 pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
@@ -374,6 +375,26 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
+        ControlMsg::SetCodexContextArchive { mode } => {
+            let normalized = crate::project::normalize_codex_context_archive(mode);
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.context_archive = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.context_archive = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.context_archive to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                context_archive: Some(normalized),
+                ..Default::default()
+            }));
+        }
         ControlMsg::SetGeminiModel { model } => {
             // Treat empty/whitespace as "clear the override", matching the
             // dashboard input semantics for the Codex-model field.
@@ -644,6 +665,7 @@ struct CodexConfigDelta {
     network_access: Option<bool>,
     writable_roots: Option<Vec<String>>,
     managed_context: Option<String>,
+    context_archive: Option<String>,
 }
 
 fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
@@ -659,6 +681,7 @@ fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
         network_access: delta.network_access,
         writable_roots: delta.writable_roots,
         managed_context: delta.managed_context,
+        context_archive: delta.context_archive,
     }
 }
 
@@ -769,6 +792,7 @@ mod tests {
             network_access: false,
             writable_roots: Vec::new(),
             managed_context: "vanilla".to_string(),
+            context_archive: "summary".to_string(),
         }))
     }
 
@@ -1370,6 +1394,44 @@ mod tests {
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(codex_config.read().await.managed_context, "vanilla");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_context_archive_normalizes_and_updates_shared_state() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexContextArchive {
+                mode: "raw".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.context_archive, "exact");
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexContextArchive {
+                mode: "disabled".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.context_archive, "off");
 
         handle.abort();
     }

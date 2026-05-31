@@ -368,6 +368,7 @@ impl SessionSupervisor {
                 agent,
                 agent_command,
                 codex_managed_context,
+                codex_context_archive,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -380,6 +381,7 @@ impl SessionSupervisor {
                         || agent.is_some()
                         || agent_command.is_some()
                         || codex_managed_context.is_some()
+                        || codex_context_archive.is_some()
                         || name.is_some()
                     {
                         self.warn(
@@ -397,6 +399,7 @@ impl SessionSupervisor {
                     agent,
                     agent_command,
                     codex_managed_context,
+                    codex_context_archive,
                     orchestrate,
                     direct,
                     reference_frame_ids,
@@ -451,6 +454,7 @@ impl SessionSupervisor {
                     None,
                     None,
                     None,
+                    None,
                     orchestrate,
                     direct,
                     reference_frame_ids,
@@ -469,6 +473,7 @@ impl SessionSupervisor {
                 attachments,
                 agent_command,
                 codex_managed_context,
+                codex_context_archive,
             } => {
                 self.resume_session(
                     source,
@@ -480,6 +485,7 @@ impl SessionSupervisor {
                     attachments,
                     agent_command,
                     codex_managed_context,
+                    codex_context_archive,
                     false,
                 )
                 .await;
@@ -498,6 +504,7 @@ impl SessionSupervisor {
                 attachments,
                 agent_command,
                 codex_managed_context,
+                codex_context_archive,
             } => {
                 self.restart_session(
                     source,
@@ -509,6 +516,7 @@ impl SessionSupervisor {
                     attachments,
                     agent_command,
                     codex_managed_context,
+                    codex_context_archive,
                 )
                 .await;
             }
@@ -596,6 +604,7 @@ impl SessionSupervisor {
                 intendant_session_id,
                 agent_command,
                 codex_managed_context,
+                codex_context_archive,
             } => {
                 self.configure_session_agent(
                     session_id,
@@ -604,6 +613,7 @@ impl SessionSupervisor {
                     intendant_session_id,
                     agent_command,
                     codex_managed_context,
+                    codex_context_archive,
                 )
                 .await;
             }
@@ -638,6 +648,7 @@ impl SessionSupervisor {
         agent: Option<String>,
         agent_command: Option<String>,
         codex_managed_context: Option<String>,
+        codex_context_archive: Option<String>,
         orchestrate: Option<bool>,
         direct: Option<bool>,
         reference_frame_ids: Vec<String>,
@@ -761,6 +772,20 @@ impl SessionSupervisor {
                 return;
             }
         }
+        if let Some(mode) =
+            normalize_session_codex_context_archive(codex_context_archive.as_deref())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: codex_context_archive requires Codex".to_string(),
+                );
+                return;
+            };
+            if let Err(e) = apply_session_codex_context_archive(&mut project, backend, mode) {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        }
         if let Some(backend) = backend.as_ref() {
             let config = crate::session_config::from_project(backend, &project);
             if let Err(e) = crate::session_config::write_log_dir_config(&log_dir, &config) {
@@ -830,6 +855,7 @@ impl SessionSupervisor {
         attachments: Vec<String>,
         agent_command: Option<String>,
         codex_managed_context: Option<String>,
+        codex_context_archive: Option<String>,
         force_new: bool,
     ) {
         let source_norm = source.trim().to_lowercase();
@@ -867,6 +893,7 @@ impl SessionSupervisor {
                 Some(backend.as_short_str()),
                 agent_command.as_deref(),
                 codex_managed_context.as_deref(),
+                codex_context_archive.as_deref(),
             );
             if let Some(persisted) = crate::session_config::load_for_resume(
                 &crate::platform::home_dir(),
@@ -1582,6 +1609,7 @@ impl SessionSupervisor {
                     Vec::new(),
                     None,
                     None,
+                    None,
                     false,
                 )
                 .await;
@@ -1801,6 +1829,7 @@ impl SessionSupervisor {
         attachments: Vec<String>,
         agent_command: Option<String>,
         codex_managed_context: Option<String>,
+        codex_context_archive: Option<String>,
     ) {
         let source_norm = source.trim().to_lowercase();
         if source_norm == "intendant" {
@@ -1845,6 +1874,7 @@ impl SessionSupervisor {
             attachments,
             agent_command,
             codex_managed_context,
+            codex_context_archive,
             true,
         )
         .await;
@@ -2074,6 +2104,7 @@ impl SessionSupervisor {
         intendant_session_id: Option<String>,
         agent_command: Option<String>,
         codex_managed_context: Option<String>,
+        codex_context_archive: Option<String>,
     ) {
         let managed = {
             let state = self.state.lock().await;
@@ -2103,6 +2134,7 @@ impl SessionSupervisor {
             Some(backend.as_short_str()),
             agent_command.as_deref(),
             codex_managed_context.as_deref(),
+            codex_context_archive.as_deref(),
         );
         if config.is_empty() {
             self.loop_error("Session config failed: no launch settings supplied".to_string());
@@ -2647,6 +2679,10 @@ fn normalize_session_codex_managed_context(mode: Option<&str>) -> Option<String>
     mode.map(crate::project::normalize_codex_managed_context)
 }
 
+fn normalize_session_codex_context_archive(mode: Option<&str>) -> Option<String> {
+    mode.map(crate::project::normalize_codex_context_archive)
+}
+
 fn normalize_session_name_option(name: Option<&str>) -> Result<Option<String>, String> {
     match name.map(str::trim).filter(|name| !name.is_empty()) {
         Some(name) => crate::session_names::normalize_session_name(name).map(Some),
@@ -2684,6 +2720,21 @@ fn apply_session_codex_managed_context(
             Ok(())
         }
         _ => Err("codex_managed_context requires Codex".to_string()),
+    }
+}
+
+fn apply_session_codex_context_archive(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    mode: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Codex => {
+            project.config.agent.codex.context_archive =
+                crate::project::normalize_codex_context_archive(&mode);
+            Ok(())
+        }
+        _ => Err("codex_context_archive requires Codex".to_string()),
     }
 }
 
@@ -3071,6 +3122,7 @@ mod tests {
                     network_access: false,
                     writable_roots: Vec::new(),
                     managed_context: "vanilla".to_string(),
+                    context_archive: "summary".to_string(),
                 },
             )),
             shared_gemini_config: Arc::new(tokio::sync::RwLock::new(
@@ -3294,6 +3346,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None,
                 false,
             )
             .await;
@@ -3343,6 +3396,7 @@ mod tests {
                 None,
                 Some(true),
                 Vec::new(),
+                None,
                 None,
                 None,
                 false,
@@ -3433,6 +3487,7 @@ mod tests {
                 Some("read attachment".to_string()),
                 Some(true),
                 vec![format!("upload:{}", upload.id)],
+                None,
                 None,
                 None,
                 false,
@@ -3673,6 +3728,29 @@ mod tests {
             &mut project,
             &external_agent::AgentBackend::GeminiCli,
             "managed".to_string(),
+        )
+        .unwrap_err();
+        assert!(err.contains("requires Codex"));
+    }
+
+    #[test]
+    fn applies_session_codex_context_archive_to_codex_only() {
+        let mut project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        apply_session_codex_context_archive(
+            &mut project,
+            &external_agent::AgentBackend::Codex,
+            "raw".to_string(),
+        )
+        .unwrap();
+        assert_eq!(project.config.agent.codex.context_archive, "exact");
+
+        let err = apply_session_codex_context_archive(
+            &mut project,
+            &external_agent::AgentBackend::GeminiCli,
+            "summary".to_string(),
         )
         .unwrap_err();
         assert!(err.contains("requires Codex"));

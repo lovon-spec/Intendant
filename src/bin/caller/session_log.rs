@@ -2081,6 +2081,8 @@ impl SessionLog {
             None,
             source,
             label,
+            None,
+            None,
             turn,
             format,
             token_count,
@@ -2096,6 +2098,8 @@ impl SessionLog {
         session_id: Option<&str>,
         source: &str,
         label: &str,
+        request_id: Option<&str>,
+        request_index: Option<u64>,
         turn: Option<usize>,
         format: &str,
         token_count: Option<u64>,
@@ -2136,6 +2140,8 @@ impl SessionLog {
                 let mut data = serde_json::json!({
                     "source": source,
                     "label": label,
+                    "request_id": request_id,
+                    "request_index": request_index,
                     "format": format,
                     "token_count": token_count,
                     "context_window": context_window,
@@ -2732,6 +2738,13 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
+            let request_id = data
+                .and_then(|d| d.get("request_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let request_index = data
+                .and_then(|d| d.get("request_index"))
+                .and_then(|v| v.as_u64());
             let token_count = data
                 .and_then(|d| d.get("token_count"))
                 .and_then(|v| v.as_u64());
@@ -2753,6 +2766,8 @@ pub fn session_log_entry_to_app_event(
                 session_id,
                 source,
                 label,
+                request_id,
+                request_index,
                 turn,
                 format,
                 token_count,
@@ -3984,6 +3999,8 @@ mod tests {
             Some("session-1"),
             "codex",
             "Codex thread",
+            Some("req-42"),
+            Some(42),
             Some(2),
             "codex.thread.read.v2",
             Some(42),
@@ -4008,6 +4025,8 @@ mod tests {
                 session_id,
                 source,
                 label,
+                request_id,
+                request_index,
                 turn,
                 format,
                 token_count,
@@ -4019,6 +4038,8 @@ mod tests {
                 assert_eq!(session_id.as_deref(), Some("session-1"));
                 assert_eq!(source, "codex");
                 assert_eq!(label, "Codex thread");
+                assert_eq!(request_id.as_deref(), Some("req-42"));
+                assert_eq!(request_index, Some(42));
                 assert_eq!(turn, Some(2));
                 assert_eq!(format, "codex.thread.read.v2");
                 assert_eq!(token_count, Some(42));
@@ -4619,6 +4640,7 @@ mod tests {
                 interrupt: false,
                 codex_thread_actions: vec![],
                 codex_managed_context: Some("managed".to_string()),
+                codex_context_archive: Some("summary".to_string()),
                 codex_command: Some("/opt/codex/bin/codex".to_string()),
             },
         );
@@ -4687,6 +4709,10 @@ mod tests {
                 assert_eq!(
                     capabilities.codex_managed_context.as_deref(),
                     Some("managed")
+                );
+                assert_eq!(
+                    capabilities.codex_context_archive.as_deref(),
+                    Some("summary")
                 );
                 assert_eq!(
                     capabilities.codex_command.as_deref(),

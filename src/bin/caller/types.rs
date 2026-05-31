@@ -120,6 +120,8 @@ pub struct SessionCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_managed_context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_context_archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_command: Option<String>,
 }
 
@@ -334,6 +336,8 @@ pub enum OutboundEvent {
         writable_roots: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none", alias = "context_recovery")]
         managed_context: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_archive: Option<String>,
     },
     /// Mirror of `CodexConfigChanged` for the Gemini CLI backend. Fields
     /// omitted (or `Option::None`) mean "no change since the last emission".
@@ -383,6 +387,10 @@ pub enum OutboundEvent {
         session_id: Option<String>,
         source: String,
         label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_index: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         turn: Option<usize>,
         format: String,

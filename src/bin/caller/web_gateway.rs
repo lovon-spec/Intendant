@@ -5291,6 +5291,7 @@ fn external_session_activity_replay_from_home_with_attach(
                 .and_then(|v| v.as_str()),
         }));
     }
+    append_external_context_snapshot_replay_entries(home, &source, session_id, &mut entries);
 
     Some(
         serde_json::json!({
@@ -5300,6 +5301,60 @@ fn external_session_activity_replay_from_home_with_attach(
         })
         .to_string(),
     )
+}
+
+fn append_external_context_snapshot_replay_entries(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    entries: &mut Vec<serde_json::Value>,
+) {
+    if crate::session_names::normalize_source(source) != "codex" {
+        return;
+    }
+    let mut seen = HashSet::new();
+    for dir in managed_context_candidate_log_dirs(home, None, Some(session_id), None) {
+        let Ok(contents) = std::fs::read_to_string(dir.join("session.jsonl")) else {
+            continue;
+        };
+        for entry in replay_jsonl_to_outbound_entries(&contents, &dir) {
+            if entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+                continue;
+            }
+            if !context_snapshot_replay_entry_matches_session(&entry, session_id) {
+                continue;
+            }
+            let key = context_snapshot_replay_entry_key(&entry);
+            if seen.insert(key) {
+                entries.push(entry);
+            }
+        }
+    }
+}
+
+fn context_snapshot_replay_entry_matches_session(
+    entry: &serde_json::Value,
+    session_id: &str,
+) -> bool {
+    entry.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
+        || entry
+            .pointer("/raw/_intendant_context/thread_id")
+            .and_then(|v| v.as_str())
+            == Some(session_id)
+}
+
+fn context_snapshot_replay_entry_key(entry: &serde_json::Value) -> String {
+    if let Some(request_id) = entry.get("request_id").and_then(|v| v.as_str()) {
+        return format!("request:{request_id}");
+    }
+    if let Some(request_index) = entry.get("request_index").and_then(|v| v.as_u64()) {
+        let session_id = entry
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        return format!("index:{session_id}:{request_index}");
+    }
+    serde_json::to_string(entry).unwrap_or_else(|_| format!("{entry:?}"))
 }
 
 fn external_attached_session_from_wire(line: &str) -> Option<(String, String)> {
@@ -6175,8 +6230,13 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                             .as_ref()
                             .and_then(|caps| caps.get("codex_managed_context"))
                             .and_then(|v| v.as_str());
-                        session_agent_config =
-                            Some(crate::session_config::from_wire(source, command, mode));
+                        let archive = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_context_archive"))
+                            .and_then(|v| v.as_str());
+                        session_agent_config = Some(crate::session_config::from_wire(
+                            source, command, mode, archive,
+                        ));
                     }
                 }
                 "round_complete" => {
@@ -8895,6 +8955,8 @@ pub struct SettingsPayload {
     pub codex_writable_roots: Vec<String>,
     #[serde(default, alias = "codex_context_recovery")]
     pub codex_managed_context: Option<String>,
+    #[serde(default)]
+    pub codex_context_archive: Option<String>,
     // Other external-agent executable commands. The Settings pane does not
     // edit these today, but the New Session pane uses them as per-launch
     // command/path defaults.
@@ -9026,6 +9088,9 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         codex_managed_context: Some(crate::project::normalize_codex_managed_context(
             &config.agent.codex.managed_context,
         )),
+        codex_context_archive: Some(crate::project::normalize_codex_context_archive(
+            &config.agent.codex.context_archive,
+        )),
         claude_command: Some(config.agent.claude_code.command.clone()),
         gemini_command: Some(config.agent.gemini_cli.command.clone()),
         gemini_model: config.agent.gemini_cli.model.clone(),
@@ -9100,6 +9165,9 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     }
     if let Some(mode) = payload.codex_managed_context.as_deref() {
         config.agent.codex.managed_context = crate::project::normalize_codex_managed_context(mode);
+    }
+    if let Some(mode) = payload.codex_context_archive.as_deref() {
+        config.agent.codex.context_archive = crate::project::normalize_codex_context_archive(mode);
     }
     if payload.claude_command.is_some() {
         config.agent.claude_code.command =
@@ -21972,6 +22040,84 @@ mod tests {
         assert_eq!(
             context.pointer("/raw/0/role").and_then(|v| v.as_str()),
             Some("user")
+        );
+    }
+
+    #[test]
+    fn external_activity_replay_includes_persisted_context_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-context-replay";
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "show context" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let wrapper_log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-session");
+        let mut log = crate::session_log::SessionLog::open(wrapper_log_dir).unwrap();
+        log.context_snapshot_for_session(
+            Some(session_id),
+            "codex",
+            "Codex resolved request payload",
+            Some("req-context-1"),
+            Some(1),
+            Some(4),
+            "openai.responses.resolved_request.v1",
+            Some(1200),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "_intendant_context": {
+                    "thread_id": session_id,
+                    "request_id": "req-context-1",
+                    "request_index": 1
+                },
+                "input": [{"role": "user", "content": "show context"}]
+            }),
+        );
+        drop(log);
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+        let context = entries
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("persisted context snapshot should replay with external transcript");
+        assert_eq!(context["session_id"], session_id);
+        assert_eq!(context["request_id"], "req-context-1");
+        assert_eq!(context["request_index"], 1);
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/thread_id"),
+            Some(&serde_json::json!(session_id))
         );
     }
 

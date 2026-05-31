@@ -1640,6 +1640,20 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetCodexContextArchive { mode } => {
+            let normalized = crate::project::normalize_codex_context_archive(&mode);
+            emit_control_result(
+                control_tx,
+                "set_codex_context_archive",
+                true,
+                format!(
+                    "Codex context replay set to {} (applies on next task)",
+                    normalized
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::CodexThreadAction { op, .. } => {
             // The actual RPC round-trip happens on the daemon-side action
             // watcher. Acknowledge dispatch here; the result will surface
@@ -6699,6 +6713,7 @@ mod tests {
                 network_access: None,
                 writable_roots: None,
                 managed_context: Some("managed".to_string()),
+                context_archive: None,
             },
         ));
         assert!(s.codex_managed_context);
@@ -6728,6 +6743,7 @@ mod tests {
                 network_access: None,
                 writable_roots: None,
                 managed_context: Some("managed".to_string()),
+                context_archive: None,
             },
         ));
         assert!(s.configured_codex_managed_context);
@@ -7065,6 +7081,7 @@ mod tests {
                     interrupt: true,
                     codex_thread_actions: vec!["undo".to_string()],
                     codex_managed_context: Some("managed".to_string()),
+                    codex_context_archive: None,
                     codex_command: Some("/opt/codex/bin/codex".to_string()),
                 },
             },

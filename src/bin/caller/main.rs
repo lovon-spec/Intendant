@@ -728,6 +728,7 @@ fn codex_runtime_config_equal(
         && a.network_access == b.network_access
         && a.writable_roots == b.writable_roots
         && a.managed_context == b.managed_context
+        && a.context_archive == b.context_archive
 }
 
 /// Structural equality for `GeminiRuntimeConfig`. Every field here is a
@@ -1042,6 +1043,30 @@ async fn resolve_agent_backend(
     resolve_agent_backend_from_config(shared.read().await.clone(), project)
 }
 
+fn codex_context_trace_dir(
+    session_log: &SharedSessionLog,
+    context_archive: &str,
+) -> (Option<PathBuf>, bool) {
+    match project::normalize_codex_context_archive(context_archive).as_str() {
+        "off" => (None, false),
+        "exact" => (
+            session_log
+                .lock()
+                .ok()
+                .map(|log| log.dir().join("model-request-traces")),
+            false,
+        ),
+        _ => {
+            let session = session_log_id(session_log)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+            let dir = std::env::temp_dir()
+                .join("intendant-context-traces")
+                .join(format!("{session}-{}", uuid::Uuid::new_v4().simple()));
+            (Some(dir), true)
+        }
+    }
+}
+
 /// Construct, initialize, and start a thread for an external agent backend.
 ///
 /// Returns the agent, thread handle, and event receiver. The caller owns the
@@ -1063,10 +1088,6 @@ async fn create_external_agent(
 > {
     use external_agent::{AgentBackend, AgentConfig};
 
-    let request_trace_dir = session_log
-        .lock()
-        .ok()
-        .map(|log| log.dir().join("model-request-traces"));
     let mcp_session_id = mcp_session_id.or_else(|| session_log_id(session_log));
 
     let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
@@ -1077,6 +1098,9 @@ async fn create_external_agent(
                 project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref());
             let codex_managed_context =
                 project::codex_managed_context_enabled(&cfg.managed_context);
+            let context_archive = project::normalize_codex_context_archive(&cfg.context_archive);
+            let (request_trace_dir, request_trace_temporary) =
+                codex_context_trace_dir(session_log, &context_archive);
             let opts = external_agent::codex::CodexAgentOptions {
                 reasoning_effort: reasoning_effort.clone(),
                 web_search: cfg.web_search,
@@ -1095,7 +1119,9 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
-                request_trace_dir: request_trace_dir.clone(),
+                request_trace_dir,
+                request_trace_temporary,
+                context_archive,
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: sandbox_mode,
                 reasoning_effort,
@@ -1129,7 +1155,9 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
-                request_trace_dir: request_trace_dir.clone(),
+                request_trace_dir: None,
+                request_trace_temporary: false,
+                context_archive: "off".to_string(),
                 // `AgentConfig.approval_policy` is Codex's `-a` flag; for
                 // Gemini we reuse the field as the ACP approval hint so the
                 // sandbox/prompt layer can adjust if needed. Storing the
@@ -1160,7 +1188,9 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
-                request_trace_dir: request_trace_dir.clone(),
+                request_trace_dir: None,
+                request_trace_temporary: false,
+                context_archive: "off".to_string(),
                 approval_policy: cfg.permission_mode.clone(),
                 sandbox: String::new(),
                 reasoning_effort: None,
@@ -1327,7 +1357,7 @@ const EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT: usize = 64 * 1024;
 
 #[derive(Default)]
 struct ExternalContextSnapshotState {
-    last_key: Option<u64>,
+    emitted_keys: std::collections::HashSet<u64>,
     last_error: Option<String>,
 }
 
@@ -2057,6 +2087,12 @@ fn external_context_snapshot_key(snapshot: &external_agent::AgentContextSnapshot
     use std::hash::{Hash, Hasher};
 
     let mut h = DefaultHasher::new();
+    if snapshot.request_id.is_some() {
+        snapshot.source.hash(&mut h);
+        snapshot.request_id.hash(&mut h);
+        snapshot.request_index.hash(&mut h);
+        return h.finish();
+    }
     snapshot.source.hash(&mut h);
     snapshot.label.hash(&mut h);
     snapshot.format.hash(&mut h);
@@ -2178,38 +2214,42 @@ async fn emit_external_context_snapshot_if_changed(
     turn: Option<usize>,
     state: &mut ExternalContextSnapshotState,
 ) {
-    match agent.context_snapshot().await {
-        Ok(Some(snapshot)) => {
-            let key = external_context_snapshot_key(&snapshot);
-            if state.last_key == Some(key) {
+    match agent.context_snapshots().await {
+        Ok(snapshots) => {
+            let mut emitted = false;
+            for snapshot in snapshots {
+                let key = external_context_snapshot_key(&snapshot);
+                if !state.emitted_keys.insert(key) {
+                    continue;
+                }
+                emitted = true;
                 state.last_error = None;
-                return;
-            }
-            state.last_key = Some(key);
-            state.last_error = None;
-            let usage = external_context_snapshot_usage(&snapshot);
-            config.bus.send(AppEvent::ContextSnapshot {
-                session_id: config.session_id.clone(),
-                source: snapshot.source,
-                label: snapshot.label,
-                turn,
-                format: snapshot.format,
-                token_count: snapshot.token_count,
-                context_window: snapshot.context_window,
-                hard_context_window: snapshot.hard_context_window,
-                item_count: snapshot.item_count,
-                raw: snapshot.raw,
-            });
-            if let Some(main) = usage {
-                config.bus.send(AppEvent::UsageSnapshot {
+                let usage = external_context_snapshot_usage(&snapshot);
+                config.bus.send(AppEvent::ContextSnapshot {
                     session_id: config.session_id.clone(),
-                    main,
-                    presence: None,
+                    source: snapshot.source,
+                    label: snapshot.label,
+                    request_id: snapshot.request_id,
+                    request_index: snapshot.request_index,
+                    turn,
+                    format: snapshot.format,
+                    token_count: snapshot.token_count,
+                    context_window: snapshot.context_window,
+                    hard_context_window: snapshot.hard_context_window,
+                    item_count: snapshot.item_count,
+                    raw: snapshot.raw,
                 });
+                if let Some(main) = usage {
+                    config.bus.send(AppEvent::UsageSnapshot {
+                        session_id: config.session_id.clone(),
+                        main,
+                        presence: None,
+                    });
+                }
             }
-        }
-        Ok(None) => {
-            state.last_error = None;
+            if !emitted {
+                state.last_error = None;
+            }
         }
         Err(e) => {
             let message = format!(
@@ -2622,6 +2662,8 @@ async fn apply_context_rewind_backout_action(
                 .and_then(|cfg| cfg.agent_command),
             codex_managed_context: crate::session_config::read_log_dir_config(config.log_dir)
                 .and_then(|cfg| cfg.codex_managed_context),
+            codex_context_archive: crate::session_config::read_log_dir_config(config.log_dir)
+                .and_then(|cfg| cfg.codex_context_archive),
         }));
 
     Ok(format!(
@@ -2714,6 +2756,10 @@ async fn handle_external_thread_action(
                         config.log_dir,
                     )
                     .and_then(|cfg| cfg.codex_managed_context),
+                    codex_context_archive: crate::session_config::read_log_dir_config(
+                        config.log_dir,
+                    )
+                    .and_then(|cfg| cfg.codex_context_archive),
                 }));
         }
     }
@@ -3015,6 +3061,7 @@ fn emit_codex_subagent_started(
             interrupt: false,
             codex_thread_actions: Vec::new(),
             codex_managed_context: None,
+            codex_context_archive: None,
             codex_command: None,
         },
     });
@@ -6883,6 +6930,8 @@ mod tests {
         let snapshot = external_agent::AgentContextSnapshot {
             source: "codex".to_string(),
             label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(71_876),
             context_window: Some(258_400),
@@ -6910,6 +6959,8 @@ mod tests {
         let below_soft = external_agent::AgentContextSnapshot {
             source: "codex".to_string(),
             label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
             format: "openai.responses.resolved_request.v1".to_string(),
             token_count: Some(258_399),
             context_window: Some(258_400),
@@ -9366,6 +9417,8 @@ async fn run_agent_loop(
                     session_id: local_session_id.clone(),
                     source: "native".to_string(),
                     label: "Internal agent request payload".to_string(),
+                    request_id: Some(format!("native-turn-{turn}")),
+                    request_index: Some(turn as u64),
                     turn: Some(turn),
                     format: context_format,
                     token_count: conversation.last_usage().map(|u| u.total_tokens),
@@ -11634,6 +11687,11 @@ async fn run_with_presence(
                                     &project.config.agent.codex.managed_context,
                                 ),
                             ),
+                            codex_context_archive: Some(
+                                crate::project::normalize_codex_context_archive(
+                                    &project.config.agent.codex.context_archive,
+                                ),
+                            ),
                         }));
                     }
                 }
@@ -12045,6 +12103,7 @@ async fn run_with_presence(
                     cx.network_access = current_codex_config.network_access;
                     cx.writable_roots = current_codex_config.writable_roots.clone();
                     cx.managed_context = current_codex_config.managed_context.clone();
+                    cx.context_archive = current_codex_config.context_archive.clone();
                 }
                 if matches!(backend, external_agent::AgentBackend::GeminiCli) {
                     let gm = &mut proj.config.agent.gemini_cli;
@@ -13050,6 +13109,9 @@ async fn run_external_agent_mode(
                     interrupt: true,
                     codex_thread_actions: codex_thread_action_capabilities(),
                     codex_managed_context: Some(mode),
+                    codex_context_archive: Some(project::normalize_codex_context_archive(
+                        &project.config.agent.codex.context_archive,
+                    )),
                     codex_command: Some(project.config.agent.codex.command.clone()),
                 },
             });
@@ -16339,6 +16401,7 @@ async fn main() -> Result<(), CallerError> {
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
                     managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+                    context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
                 },
             ))
         };
@@ -17215,6 +17278,7 @@ async fn main() -> Result<(), CallerError> {
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
                     managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+                    context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
                 },
             ))
         };
@@ -17814,6 +17878,7 @@ async fn main() -> Result<(), CallerError> {
                     network_access: cfg.network_access,
                     writable_roots: cfg.writable_roots.clone(),
                     managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+                    context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
                 },
             ))
         };

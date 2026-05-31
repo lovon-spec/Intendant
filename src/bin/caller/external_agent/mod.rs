@@ -422,6 +422,11 @@ pub struct AgentConfig {
     /// Directory where a backend can write exact model request payload traces.
     /// Backends that cannot capture provider-bound request bodies ignore it.
     pub request_trace_dir: Option<PathBuf>,
+    /// True when `request_trace_dir` is a temporary summary-mode trace root
+    /// that should be deleted when the backend shuts down.
+    pub request_trace_temporary: bool,
+    /// Context snapshot archive mode: `summary`, `exact`, or `off`.
+    pub context_archive: String,
     pub approval_policy: String,
     /// Sandbox mode for Codex: `"read-only"`, `"workspace-write"`, or
     /// `"danger-full-access"`. Ignored by backends that don't model a
@@ -490,6 +495,8 @@ impl RollbackAnchorPosition {
 pub struct AgentContextSnapshot {
     pub source: String,
     pub label: String,
+    pub request_id: Option<String>,
+    pub request_index: Option<u64>,
     pub format: String,
     pub token_count: Option<u64>,
     pub context_window: Option<u64>,
@@ -552,6 +559,14 @@ pub trait ExternalAgent: Send + Sync {
     /// not synthesize transcript-shaped replacements.
     async fn context_snapshot(&mut self) -> Result<Option<AgentContextSnapshot>, CallerError> {
         Ok(None)
+    }
+
+    /// Return all exact model request payloads currently visible at the
+    /// provider boundary. Backends with durable request traces should override
+    /// this so Intendant can import every request even when several happen
+    /// between dashboard polls.
+    async fn context_snapshots(&mut self) -> Result<Vec<AgentContextSnapshot>, CallerError> {
+        Ok(self.context_snapshot().await?.into_iter().collect())
     }
 
     /// Send a user message with a heterogeneous list of attachments

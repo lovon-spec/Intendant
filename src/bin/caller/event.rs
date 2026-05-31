@@ -557,6 +557,8 @@ pub enum AppEvent {
         session_id: Option<String>,
         source: String,
         label: String,
+        request_id: Option<String>,
+        request_index: Option<u64>,
         turn: Option<usize>,
         format: String,
         token_count: Option<u64>,
@@ -639,6 +641,7 @@ pub enum AppEvent {
         network_access: Option<bool>,
         writable_roots: Option<Vec<String>>,
         managed_context: Option<String>,
+        context_archive: Option<String>,
     },
 
     /// Emitted when one or more Gemini CLI runtime fields change. Mirror of
@@ -922,6 +925,13 @@ pub enum ControlMsg {
     SetCodexManagedContext {
         mode: String,
     },
+    /// Set Codex context snapshot archive mode. `summary` keeps compact
+    /// per-request visualization data, `exact` persists full provider
+    /// payloads for raw replay, and `off` disables context capture. Applies
+    /// to the NEXT task.
+    SetCodexContextArchive {
+        mode: String,
+    },
     /// Invoke one of Codex's thread-level actions against the persistent
     /// agent. Mirrors the raw-codex slash-command surface: `/new`, `/compact`,
     /// `/fork`, `/side`, `/undo`, `/review`, `/rename`, `/goal`, `/init`,
@@ -973,6 +983,8 @@ pub enum ControlMsg {
         agent_command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_managed_context: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_context_archive: Option<String>,
     },
     /// Stop a live managed session. Unlike hiding a dashboard card, this
     /// removes the live session from daemon state and asks the backend process
@@ -999,6 +1011,8 @@ pub enum ControlMsg {
         agent_command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_managed_context: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_context_archive: Option<String>,
     },
     /// Set the Gemini model override. `None`/missing lets Gemini pick.
     /// Applies to the NEXT task because Gemini latches `--model` at
@@ -1124,6 +1138,11 @@ pub enum ControlMsg {
         /// when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_managed_context: Option<String>,
+        /// Optional one-shot Codex context replay/archive mode for this
+        /// session. Accepted values normalize to "summary", "exact", or
+        /// "off". Only applies when the resolved agent is Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_context_archive: Option<String>,
         #[serde(default)]
         orchestrate: Option<bool>,
         /// Bypass presence/orchestration, matching StartTask.direct.
@@ -1207,6 +1226,10 @@ pub enum ControlMsg {
         /// `source` resolves to Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_managed_context: Option<String>,
+        /// Per-session Codex context replay/archive override. Only applies
+        /// when `source` resolves to Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_context_archive: Option<String>,
     },
     FollowUp {
         /// Optional target session. Omitted means "current active session"
@@ -1796,6 +1819,8 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id,
             source,
             label,
+            request_id,
+            request_index,
             turn,
             format,
             token_count,
@@ -1807,6 +1832,8 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             source: source.clone(),
             label: label.clone(),
+            request_id: request_id.clone(),
+            request_index: *request_index,
             turn: *turn,
             format: format.clone(),
             token_count: *token_count,
@@ -1875,6 +1902,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             network_access,
             writable_roots,
             managed_context,
+            context_archive,
         } => Some(OutboundEvent::CodexConfigChanged {
             command: command.clone(),
             sandbox: sandbox.clone(),
@@ -1887,6 +1915,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             network_access: *network_access,
             writable_roots: writable_roots.clone(),
             managed_context: managed_context.clone(),
+            context_archive: context_archive.clone(),
         }),
         AppEvent::GeminiConfigChanged {
             model,
@@ -2350,6 +2379,8 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             session_id,
             source,
             label,
+            request_id,
+            request_index,
             turn,
             format,
             token_count,
@@ -2362,6 +2393,8 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 session_id.as_deref(),
                 source,
                 label,
+                request_id.as_deref(),
+                *request_index,
                 *turn,
                 format,
                 *token_count,
@@ -2834,6 +2867,7 @@ mod tests {
                 agent: Some("codex".to_string()),
                 agent_command: Some("/opt/codex/bin/codex".to_string()),
                 codex_managed_context: Some("managed".to_string()),
+                codex_context_archive: Some("summary".to_string()),
                 orchestrate: Some(false),
                 direct: Some(true),
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
@@ -3034,7 +3068,7 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_managed_context":"managed","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_managed_context":"managed","codex_context_archive":"exact","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
@@ -3044,6 +3078,7 @@ mod tests {
                 agent,
                 agent_command,
                 codex_managed_context,
+                codex_context_archive,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -3056,6 +3091,7 @@ mod tests {
                 assert_eq!(agent.as_deref(), Some("codex"));
                 assert_eq!(agent_command.as_deref(), Some("/opt/codex/bin/codex"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+                assert_eq!(codex_context_archive.as_deref(), Some("exact"));
                 assert!(orchestrate.is_none());
                 assert_eq!(direct, Some(true));
                 assert!(reference_frame_ids.is_empty());
@@ -3088,7 +3124,7 @@ mod tests {
 
     #[test]
     fn control_msg_configure_session_agent_deserializes() {
-        let json = r#"{"action":"configure_session_agent","session_id":"abc123","source":"codex","backend_session_id":"thread-1","intendant_session_id":"wrap-1","agent_command":"/tmp/codex","codex_managed_context":"managed"}"#;
+        let json = r#"{"action":"configure_session_agent","session_id":"abc123","source":"codex","backend_session_id":"thread-1","intendant_session_id":"wrap-1","agent_command":"/tmp/codex","codex_managed_context":"managed","codex_context_archive":"off"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::ConfigureSessionAgent {
@@ -3098,6 +3134,7 @@ mod tests {
                 intendant_session_id,
                 agent_command,
                 codex_managed_context,
+                codex_context_archive,
             } => {
                 assert_eq!(session_id, "abc123");
                 assert_eq!(source.as_deref(), Some("codex"));
@@ -3105,6 +3142,7 @@ mod tests {
                 assert_eq!(intendant_session_id.as_deref(), Some("wrap-1"));
                 assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+                assert_eq!(codex_context_archive.as_deref(), Some("off"));
             }
             _ => panic!("expected ConfigureSessionAgent"),
         }
@@ -3112,7 +3150,7 @@ mod tests {
 
     #[test]
     fn control_msg_resume_session_deserializes_launch_overrides() {
-        let json = r#"{"action":"resume_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","task":"continue","direct":true,"attachments":["upload:u1"],"agent_command":"/tmp/codex","codex_managed_context":"managed"}"#;
+        let json = r#"{"action":"resume_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","task":"continue","direct":true,"attachments":["upload:u1"],"agent_command":"/tmp/codex","codex_managed_context":"managed","codex_context_archive":"summary"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::ResumeSession {
@@ -3125,7 +3163,7 @@ mod tests {
                 attachments,
                 agent_command,
                 codex_managed_context,
-                ..
+                codex_context_archive,
             } => {
                 assert_eq!(source, "codex");
                 assert_eq!(session_id, "thread-1");
@@ -3136,6 +3174,7 @@ mod tests {
                 assert_eq!(attachments, vec!["upload:u1"]);
                 assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+                assert_eq!(codex_context_archive.as_deref(), Some("summary"));
             }
             _ => panic!("expected ResumeSession"),
         }
@@ -3155,7 +3194,7 @@ mod tests {
 
     #[test]
     fn control_msg_restart_session_deserializes_launch_overrides() {
-        let json = r#"{"action":"restart_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","direct":true,"agent_command":"/tmp/codex","codex_managed_context":"managed"}"#;
+        let json = r#"{"action":"restart_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","direct":true,"agent_command":"/tmp/codex","codex_managed_context":"managed","codex_context_archive":"exact"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::RestartSession {
@@ -3168,6 +3207,7 @@ mod tests {
                 attachments,
                 agent_command,
                 codex_managed_context,
+                codex_context_archive,
             } => {
                 assert_eq!(source, "codex");
                 assert_eq!(session_id, "thread-1");
@@ -3178,6 +3218,7 @@ mod tests {
                 assert!(attachments.is_empty());
                 assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+                assert_eq!(codex_context_archive.as_deref(), Some("exact"));
             }
             _ => panic!("expected RestartSession"),
         }
@@ -3651,6 +3692,7 @@ mod tests {
                 interrupt: false,
                 codex_thread_actions: vec!["undo".to_string()],
                 codex_managed_context: Some("managed".to_string()),
+                codex_context_archive: Some("summary".to_string()),
                 codex_command: Some("/opt/codex/bin/codex".to_string()),
             },
         };
@@ -3662,6 +3704,7 @@ mod tests {
         assert!(json.contains("\"steer\":false"));
         assert!(json.contains("\"codex_thread_actions\":[\"undo\"]"));
         assert!(json.contains("\"codex_managed_context\":\"managed\""));
+        assert!(json.contains("\"codex_context_archive\":\"summary\""));
         assert!(json.contains("\"codex_command\":\"/opt/codex/bin/codex\""));
     }
 
@@ -3766,6 +3809,8 @@ mod tests {
             session_id: Some("sess-ctx".to_string()),
             source: "codex".to_string(),
             label: "Codex thread".to_string(),
+            request_id: Some("req-ctx".to_string()),
+            request_index: Some(7),
             turn: Some(3),
             format: "codex.thread.read.v2".to_string(),
             token_count: Some(1200),
@@ -3779,6 +3824,7 @@ mod tests {
         assert!(json.contains("\"event\":\"context_snapshot\""));
         assert!(json.contains("\"session_id\":\"sess-ctx\""));
         assert!(json.contains("\"source\":\"codex\""));
+        assert!(json.contains("\"request_index\":7"));
         assert!(json.contains("\"raw\""));
     }
 

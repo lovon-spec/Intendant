@@ -3576,7 +3576,7 @@ body.context-focus-active {
 }
 .sessions-new-agent-row {
   display: grid;
-  grid-template-columns: minmax(150px, 0.4fr) minmax(220px, 1fr) minmax(140px, 0.4fr);
+  grid-template-columns: minmax(140px, 0.35fr) minmax(220px, 1fr) minmax(130px, 0.35fr) minmax(130px, 0.35fr);
   gap: 10px;
   align-items: end;
 }
@@ -7424,7 +7424,7 @@ body.context-focus-active {
               <div class="context-toolbar-main">
                 <span class="context-title" id="context-title">Context</span>
                 <span class="context-meta context-meta-source"><strong>Source</strong><span id="context-source">--</span></span>
-                <span class="context-meta context-meta-turn"><strong>Turn</strong><span id="context-turn">--</span></span>
+                <span class="context-meta context-meta-turn"><strong>Request</strong><span id="context-turn">--</span></span>
                 <span class="context-meta context-meta-items"><strong>Items</strong><span id="context-items">--</span></span>
                 <span class="context-meta context-meta-tokens"><strong>Tokens</strong><span id="context-tokens">--</span></span>
                 <span class="context-meta context-meta-format"><strong>Format</strong><span id="context-format">--</span></span>
@@ -7791,6 +7791,17 @@ body.context-focus-active {
                 </div>
                 <div class="control-hint">
                   <strong>vanilla</strong> keeps upstream/fork Codex behavior. <strong>managed</strong> enables proactive Intendant context densification, rewind/backout tools, and suppressed Codex auto-compaction for managed long tasks.
+                </div>
+                <div class="control-row">
+                  <label for="control-codex-context-archive">Context replay</label>
+                  <select id="control-codex-context-archive">
+                    <option value="summary" selected>summary</option>
+                    <option value="exact">exact</option>
+                    <option value="off">off</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>summary</strong> keeps compact visualization snapshots. <strong>exact</strong> persists full raw provider payloads. <strong>off</strong> disables Context snapshots.
                 </div>
               </fieldset>
               <fieldset class="control-group">
@@ -8173,7 +8184,7 @@ body.context-focus-active {
                 <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
                 <span class="session-detail-title" id="session-detail-title"></span>
                 <button class="session-detail-action-btn session-resume-btn" id="session-detail-resume" type="button" title="Resume this session in Activity">Resume session</button>
-                <button class="session-detail-action-btn session-config-btn" id="session-detail-config" type="button" title="Configure binary and managed context for this session">Configure</button>
+                <button class="session-detail-action-btn session-config-btn" id="session-detail-config" type="button" title="Configure launch settings for this session">Configure</button>
                 <button class="session-detail-action-btn session-rename-btn" id="session-detail-rename" type="button" title="Rename this session">Rename</button>
               </div>
               <div class="session-detail-body" id="session-detail-body">
@@ -8379,6 +8390,14 @@ body.context-focus-active {
                     <select id="new-session-codex-managed-context" class="sessions-agent-managed-context-select" disabled>
                       <option value="vanilla">vanilla</option>
                       <option value="managed">managed</option>
+                    </select>
+                  </label>
+                  <label class="sessions-new-session-field" for="new-session-codex-context-archive">
+                    Context replay
+                    <select id="new-session-codex-context-archive" class="sessions-agent-context-archive-select" disabled>
+                      <option value="summary">summary</option>
+                      <option value="exact">exact</option>
+                      <option value="off">off</option>
                     </select>
                   </label>
                 </div>
@@ -8835,6 +8854,14 @@ body.context-focus-active {
       <select id="session-config-managed-context">
         <option value="vanilla">vanilla</option>
         <option value="managed">managed</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-archive-row">
+      <label for="session-config-context-archive">Context replay</label>
+      <select id="session-config-context-archive">
+        <option value="summary">summary</option>
+        <option value="exact">exact</option>
+        <option value="off">off</option>
       </select>
     </div>
     <div class="session-config-status" id="session-config-status"></div>
@@ -11175,6 +11202,7 @@ let controlCodexConfig = {
   network_access: false,
   writable_roots: [],
   managed_context: 'vanilla',
+  context_archive: 'summary',
 };
 let controlGeminiConfig = {
   model: '',
@@ -11202,6 +11230,7 @@ let newSessionAgentCommands = {
   gemini: 'gemini',
 };
 let newSessionCodexManagedContext = 'vanilla';
+let newSessionCodexContextArchive = 'summary';
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnTimeout = null;
@@ -11230,6 +11259,7 @@ async function refreshControlPane() {
       network_access: !!d.codex_network_access,
       writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
       managed_context: d.codex_managed_context || 'vanilla',
+      context_archive: d.codex_context_archive || 'summary',
     };
     controlGeminiConfig = {
       model: d.gemini_model || '',
@@ -11275,6 +11305,7 @@ function renderControlPane() {
     const webSearch = $('control-codex-web-search');
     const webSearchStatus = $('control-codex-web-search-status');
     const managedContextSel = $('control-codex-managed-context');
+    const contextArchiveSel = $('control-codex-context-archive');
     const networkCb = $('control-codex-network');
     const networkStatus = $('control-codex-network-status');
     const networkRow = $('control-codex-network-row');
@@ -11287,6 +11318,7 @@ function renderControlPane() {
     if (webSearch) webSearch.checked = !!controlCodexConfig.web_search;
     if (webSearchStatus) webSearchStatus.textContent = controlCodexConfig.web_search ? 'on' : 'off';
     if (managedContextSel) managedContextSel.value = controlCodexConfig.managed_context || 'vanilla';
+    if (contextArchiveSel) contextArchiveSel.value = controlCodexConfig.context_archive || 'summary';
     if (networkCb) networkCb.checked = !!controlCodexConfig.network_access;
     if (networkStatus) networkStatus.textContent = controlCodexConfig.network_access ? 'on' : 'off';
     // Network access only matters inside workspace-write. Grey out + annotate
@@ -11398,6 +11430,13 @@ function onControlManagedContextChange(ev) {
   if (mode === (controlCodexConfig.managed_context || 'vanilla')) return;
   controlCodexConfig.managed_context = mode;
   dispatchControlMsg({ action: 'set_codex_managed_context', mode });
+}
+
+function onControlContextArchiveChange(ev) {
+  const mode = ['summary', 'exact', 'off'].includes(ev.target.value) ? ev.target.value : 'summary';
+  if (mode === (controlCodexConfig.context_archive || 'summary')) return;
+  controlCodexConfig.context_archive = mode;
+  dispatchControlMsg({ action: 'set_codex_context_archive', mode });
 }
 
 function onControlNetworkChange(ev) {
@@ -11559,6 +11598,11 @@ function applyCodexConfigChanged(evt) {
   if (evt.managed_context) {
     controlCodexConfig.managed_context = evt.managed_context;
     newSessionCodexManagedContext = evt.managed_context === 'managed' ? 'managed' : 'vanilla';
+    renderNewSessionAgentControls();
+  }
+  if (evt.context_archive) {
+    controlCodexConfig.context_archive = evt.context_archive;
+    newSessionCodexContextArchive = normalizeContextArchiveMode(evt.context_archive);
     renderNewSessionAgentControls();
   }
   // Sandbox change may flip the network-access row's enabled state — full
@@ -12157,6 +12201,7 @@ function wireControlPaneListeners() {
   const reasoningSel = $('control-codex-reasoning');
   const webSearch = $('control-codex-web-search');
   const managedContextSel = $('control-codex-managed-context');
+  const contextArchiveSel = $('control-codex-context-archive');
   const networkCb = $('control-codex-network');
   const rootsTA = $('control-codex-writable-roots');
   if (sandboxSel) sandboxSel.addEventListener('change', onControlSandboxChange);
@@ -12164,6 +12209,7 @@ function wireControlPaneListeners() {
   if (reasoningSel) reasoningSel.addEventListener('change', onControlReasoningChange);
   if (webSearch) webSearch.addEventListener('change', onControlWebSearchChange);
   if (managedContextSel) managedContextSel.addEventListener('change', onControlManagedContextChange);
+  if (contextArchiveSel) contextArchiveSel.addEventListener('change', onControlContextArchiveChange);
   if (networkCb) networkCb.addEventListener('change', onControlNetworkChange);
   // Commit text inputs on blur or Enter so every keystroke doesn't ping the server.
   if (modelInp) {
@@ -14463,6 +14509,8 @@ function normalizeSessionWindowMeta(meta = {}) {
   if (agentCommand) out.agentCommand = agentCommand;
   const managedMode = String(meta.codex_managed_context || meta.codexManagedContext || '').trim();
   if (managedMode === 'managed' || managedMode === 'vanilla') out.codexManagedContext = managedMode;
+  const archiveMode = String(meta.codex_context_archive || meta.codexContextArchive || '').trim();
+  if (['summary', 'exact', 'off'].includes(archiveMode)) out.codexContextArchive = archiveMode;
   if (meta.capabilities) out.capabilities = normalizeSessionCapabilities(meta.capabilities);
   if (
     Object.prototype.hasOwnProperty.call(meta, 'goal') ||
@@ -14647,6 +14695,7 @@ function sessionWindowMetaFromSession(session) {
     intendant_session_id: session.intendant_session_id,
     agent_command: session.agent_command || session.codex_command,
     codex_managed_context: session.codex_managed_context,
+    codex_context_archive: session.codex_context_archive,
     capabilities: session.capabilities,
   };
   if (
@@ -14766,6 +14815,7 @@ function persistedSessionWindowRecord(sessionId, win = null) {
   if (meta.intendantSessionId) record.intendant_session_id = meta.intendantSessionId;
   if (meta.agentCommand) record.agent_command = meta.agentCommand;
   if (meta.codexManagedContext) record.codex_managed_context = meta.codexManagedContext;
+  if (meta.codexContextArchive) record.codex_context_archive = meta.codexContextArchive;
   if (meta.projectRoot) record.project_root = meta.projectRoot;
   if (meta.cwd) record.cwd = meta.cwd;
   if (meta.parentId && meta.relationshipKind) {
@@ -15497,6 +15547,16 @@ function sessionConfigManagedMode(meta = {}) {
   return mode === 'managed' ? 'managed' : 'vanilla';
 }
 
+function sessionConfigArchiveMode(meta = {}) {
+  return normalizeContextArchiveMode(String(
+    meta.codexContextArchive ||
+    meta.codex_context_archive ||
+    meta.capabilities?.codexContextArchive ||
+    meta.capabilities?.codex_context_archive ||
+    ''
+  ).trim() || controlCodexConfig.context_archive || 'summary');
+}
+
 function sessionConfigMetadata(sessionOrId) {
   const raw = typeof sessionOrId === 'object'
     ? sessionOrId
@@ -15526,7 +15586,10 @@ function sessionLaunchOverridesForSession(sessionOrId) {
   const overrides = {};
   const command = sessionConfigCommand(meta);
   if (command) overrides.agent_command = command;
-  if (source === 'codex') overrides.codex_managed_context = sessionConfigManagedMode(meta);
+  if (source === 'codex') {
+    overrides.codex_managed_context = sessionConfigManagedMode(meta);
+    overrides.codex_context_archive = sessionConfigArchiveMode(meta);
+  }
   return overrides;
 }
 
@@ -15562,8 +15625,12 @@ function openSessionConfigModal(sessionOrId) {
   }
   const managedRow = document.getElementById('session-config-managed-row');
   const managedSel = document.getElementById('session-config-managed-context');
+  const archiveRow = document.getElementById('session-config-archive-row');
+  const archiveSel = document.getElementById('session-config-context-archive');
   if (managedRow) managedRow.style.display = source === 'codex' ? '' : 'none';
   if (managedSel) managedSel.value = sessionConfigManagedMode(meta);
+  if (archiveRow) archiveRow.style.display = source === 'codex' ? '' : 'none';
+  if (archiveSel) archiveSel.value = sessionConfigArchiveMode(meta);
   const status = document.getElementById('session-config-status');
   if (status) {
     status.className = 'session-config-status';
@@ -15582,7 +15649,7 @@ function closeSessionConfigModal() {
   sessionConfigEditing = null;
 }
 
-function applySessionConfigLocal(meta, command, mode) {
+function applySessionConfigLocal(meta, command, mode, archiveMode) {
   const ids = Array.from(new Set([
     meta.sessionId,
     meta.backendSessionId,
@@ -15597,7 +15664,10 @@ function applySessionConfigLocal(meta, command, mode) {
       ...(meta.backendSessionId ? { backendSessionId: meta.backendSessionId } : {}),
       ...(meta.intendantSessionId ? { intendantSessionId: meta.intendantSessionId } : {}),
       ...(command ? { agentCommand: command } : {}),
-      ...(meta.source === 'codex' ? { codexManagedContext: mode } : {}),
+      ...(meta.source === 'codex' ? {
+        codexManagedContext: mode,
+        codexContextArchive: archiveMode,
+      } : {}),
     };
     sessionMetadataById.set(id, next);
     if (sessionWindows.has(id)) updateSessionWindow(id, next);
@@ -15618,7 +15688,10 @@ function applySessionConfigLocal(meta, command, mode) {
       delete session.agent_command;
       delete session.codex_command;
     }
-    if (meta.source === 'codex') session.codex_managed_context = mode;
+    if (meta.source === 'codex') {
+      session.codex_managed_context = mode;
+      session.codex_context_archive = archiveMode;
+    }
   }
   persistSessionWindowState();
 }
@@ -15629,6 +15702,9 @@ function saveSessionConfigModal() {
   const mode = document.getElementById('session-config-managed-context')?.value === 'managed'
     ? 'managed'
     : 'vanilla';
+  const archiveMode = normalizeContextArchiveMode(
+    document.getElementById('session-config-context-archive')?.value || controlCodexConfig.context_archive
+  );
   const payload = {
     action: 'configure_session_agent',
     session_id: sessionConfigEditing.sessionId,
@@ -15636,11 +15712,14 @@ function saveSessionConfigModal() {
     ...(sessionConfigEditing.backendSessionId ? { backend_session_id: sessionConfigEditing.backendSessionId } : {}),
     ...(sessionConfigEditing.intendantSessionId ? { intendant_session_id: sessionConfigEditing.intendantSessionId } : {}),
     agent_command: command,
-    ...(sessionConfigEditing.source === 'codex' ? { codex_managed_context: mode } : {}),
+    ...(sessionConfigEditing.source === 'codex' ? {
+      codex_managed_context: mode,
+      codex_context_archive: archiveMode,
+    } : {}),
   };
   try {
     dispatchControlMsg(payload);
-    applySessionConfigLocal(sessionConfigEditing, command, mode);
+    applySessionConfigLocal(sessionConfigEditing, command, mode, archiveMode);
     scheduleSessionsMetadataRefresh(200);
     const status = document.getElementById('session-config-status');
     if (status) {
@@ -16019,6 +16098,7 @@ function normalizeSessionCapabilities(raw = null) {
       ? actions.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
       : null,
     codexManagedContext: raw.codex_managed_context ?? raw.codexManagedContext ?? null,
+    codexContextArchive: raw.codex_context_archive ?? raw.codexContextArchive ?? null,
     codexCommand: raw.codex_command ?? raw.codexCommand ?? null,
   };
 }
@@ -23272,6 +23352,8 @@ function contextSnapshotFingerprint(snapshot) {
   return [
     contextSessionKey(snapshot),
     snapshot?.ts || '',
+    snapshot?.request_index ?? '',
+    snapshot?.request_id || '',
     snapshot?.turn ?? '',
     snapshot?.label || '',
     snapshot?.format || '',
@@ -23279,6 +23361,22 @@ function contextSnapshotFingerprint(snapshot) {
     snapshot?.item_count ?? '',
     rawSize,
   ].join('|');
+}
+
+function contextSnapshotRequestLabel(snapshot) {
+  if (!snapshot) return 'request --';
+  const idx = snapshot.request_index ?? snapshot.raw?._intendant_context?.request_index;
+  if (idx !== undefined && idx !== null) return `request ${idx}`;
+  if (snapshot.turn !== undefined && snapshot.turn !== null) return `turn ${snapshot.turn}`;
+  return 'request --';
+}
+
+function contextSnapshotSortValue(snapshot) {
+  const idx = snapshot?.request_index ?? snapshot?.raw?._intendant_context?.request_index;
+  if (Number.isFinite(Number(idx))) return Number(idx);
+  const ts = Date.parse(snapshot?.ts || '');
+  if (Number.isFinite(ts)) return ts / 1000;
+  return snapshot?.__context_seq || 0;
 }
 
 function normalizeContextSnapshot(snapshot) {
@@ -23322,7 +23420,13 @@ function storeContextSnapshot(snapshot) {
 
 function handleContextReplaySnapshots(snapshots) {
   resetContextSnapshotState();
-  for (const snapshot of snapshots || []) storeContextSnapshot(snapshot);
+  const sorted = [...(snapshots || [])].sort((a, b) => {
+    const sa = contextSnapshotSortValue(a);
+    const sb = contextSnapshotSortValue(b);
+    if (sa !== sb) return sa - sb;
+    return String(a?.request_id || '').localeCompare(String(b?.request_id || ''));
+  });
+  for (const snapshot of sorted) storeContextSnapshot(snapshot);
   renderContextPane();
 }
 
@@ -23504,11 +23608,37 @@ function contextAddRequestConfig(parts, raw, consumedKeys) {
   }
 }
 
+function contextAddSummaryParts(parts, summaryParts) {
+  for (const item of summaryParts || []) {
+    const category = contextNormalizeCategory(item?.category || 'other');
+    const estimatedTokens = Number(item?.estimated_tokens ?? item?.estimatedTokens ?? item?.tokens ?? 1);
+    const chars = Number(item?.chars ?? 0);
+    parts.push({
+      id: `part-${parts.length}`,
+      index: parts.length,
+      category,
+      title: String(item?.title || CONTEXT_CATEGORY_DEFS[category].label || 'Context item').trim(),
+      subtitle: String(item?.subtitle || '').trim(),
+      path: item?.path || '$',
+      value: item,
+      preview: String(item?.preview || item?.subtitle || '').trim(),
+      estimatedTokens: Number.isFinite(estimatedTokens) ? Math.max(1, estimatedTokens) : 1,
+      chars: Number.isFinite(chars) ? chars : 0,
+      meta: item?.meta || {},
+    });
+  }
+}
+
 function analyzeContextSnapshot(snapshot) {
   const raw = contextRawValue(snapshot);
   const parts = [];
   const consumedKeys = new Set();
-  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+  const summaryParts = Array.isArray(snapshot?.summary_parts)
+    ? snapshot.summary_parts
+    : (Array.isArray(raw?.summary_parts) ? raw.summary_parts : null);
+  if (summaryParts) {
+    contextAddSummaryParts(parts, summaryParts);
+  } else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     for (const key of ['instructions', 'system', 'system_instruction', 'developer', 'developer_message']) {
       if (raw[key]) {
         consumedKeys.add(key);
@@ -23687,8 +23817,7 @@ function updateContextReplayControls(snapshot) {
       label.textContent = 'No snapshots';
     } else {
       const modeLabel = contextReplayMode === 'replay' ? 'Replay' : 'Live';
-      const turn = snapshot?.turn !== undefined && snapshot?.turn !== null ? `turn ${snapshot.turn}` : 'turn --';
-      label.textContent = `${modeLabel} snapshot ${idx + 1} / ${timeline.length} - ${turn} - ${formatContextTimestamp(snapshot?.ts)}`;
+      label.textContent = `${modeLabel} snapshot ${idx + 1} / ${timeline.length} - ${contextSnapshotRequestLabel(snapshot)} - ${formatContextTimestamp(snapshot?.ts)}`;
     }
   }
 }
@@ -24202,7 +24331,7 @@ function renderContextPane() {
   }
   const d = snapshot;
   set('context-source', d.label || d.source || 'model');
-  set('context-turn', d.turn);
+  set('context-turn', contextSnapshotRequestLabel(d).replace(/^request /, '#'));
   set('context-items', d.item_count);
   const effectiveWindow = d.effective_context_window || d.context_window;
   const hardWindow = d.hard_context_window || d.hardContextWindow || null;
@@ -28561,6 +28690,7 @@ async function loadSettings() {
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
     controlCodexConfig.command = d.codex_command || 'codex';
     controlCodexConfig.managed_context = d.codex_managed_context || 'vanilla';
+    controlCodexConfig.context_archive = d.codex_context_archive || 'summary';
     setNewSessionAgentDefaults(d);
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync the Settings dropdown and status bar
@@ -28634,6 +28764,7 @@ async function saveSettings() {
       ? controlCodexConfig.writable_roots
       : [],
     codex_managed_context: controlCodexConfig.managed_context || 'vanilla',
+    codex_context_archive: controlCodexConfig.context_archive || 'summary',
     gemini_model: controlGeminiConfig.model || null,
     gemini_approval_mode: controlGeminiConfig.approval_mode || 'default',
     gemini_sandbox: !!controlGeminiConfig.sandbox,
@@ -28677,6 +28808,10 @@ async function saveSettings() {
     app.send_server_action({
       action: 'set_codex_command',
       command: (g('set-codex-command').value || '').trim() || null,
+    });
+    app.send_server_action({
+      action: 'set_codex_context_archive',
+      mode: controlCodexConfig.context_archive || 'summary',
     });
   }
 }
@@ -30318,6 +30453,10 @@ window.openAgentBinaryPicker = openAgentBinaryPicker;
 window.openSessionConfigBinaryPicker = openSessionConfigBinaryPicker;
 window.createPickerDirectory = createPickerDirectory;
 
+function normalizeContextArchiveMode(mode) {
+  return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';
+}
+
 function setNewSessionAgentDefaults(settings) {
   newSessionAgentCommands = {
     codex: settings.codex_command || 'codex',
@@ -30326,6 +30465,7 @@ function setNewSessionAgentDefaults(settings) {
   };
   newSessionCodexManagedContext =
     settings.codex_managed_context === 'managed' ? 'managed' : 'vanilla';
+  newSessionCodexContextArchive = normalizeContextArchiveMode(settings.codex_context_archive || 'summary');
   renderNewSessionAgentControls();
 }
 
@@ -30349,6 +30489,7 @@ function renderNewSessionAgentControls(options = {}) {
   const commandInput = document.getElementById('new-session-agent-command');
   const browseBtn = document.getElementById('new-session-agent-command-browse');
   const managedContextSel = document.getElementById('new-session-codex-managed-context');
+  const contextArchiveSel = document.getElementById('new-session-codex-context-archive');
   const managedContextNote = document.getElementById('new-session-managed-context-note');
   if (!select || !commandInput) return;
 
@@ -30374,6 +30515,11 @@ function renderNewSessionAgentControls(options = {}) {
     const appliesToCodex = effectiveAgent === 'codex';
     managedContextSel.disabled = !appliesToCodex;
     managedContextSel.value = newSessionCodexManagedContext;
+  }
+  if (contextArchiveSel) {
+    const appliesToCodex = effectiveAgent === 'codex';
+    contextArchiveSel.disabled = !appliesToCodex;
+    contextArchiveSel.value = normalizeContextArchiveMode(newSessionCodexContextArchive);
   }
   if (managedContextNote) {
     const mode = managedContextSel?.value || newSessionCodexManagedContext;
@@ -30588,6 +30734,10 @@ async function startNewSession() {
       ? 'managed'
       : 'vanilla';
     msg.codex_managed_context = mode;
+    const archiveMode = normalizeContextArchiveMode(
+      document.getElementById('new-session-codex-context-archive')?.value || newSessionCodexContextArchive
+    );
+    msg.codex_context_archive = archiveMode;
   }
   if (direct) msg.direct = true;
   if (attachments.length > 0) msg.attachments = attachments;
@@ -31085,6 +31235,10 @@ document.getElementById('new-session-agent')?.addEventListener('change', () => {
 });
 document.getElementById('new-session-codex-managed-context')?.addEventListener('change', (ev) => {
   newSessionCodexManagedContext = ev.currentTarget.value === 'managed' ? 'managed' : 'vanilla';
+  renderNewSessionAgentControls();
+});
+document.getElementById('new-session-codex-context-archive')?.addEventListener('change', (ev) => {
+  newSessionCodexContextArchive = normalizeContextArchiveMode(ev.currentTarget.value);
   renderNewSessionAgentControls();
 });
 document.getElementById('fs-picker-path')?.addEventListener('keydown', (ev) => {

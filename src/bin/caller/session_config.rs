@@ -22,6 +22,8 @@ pub struct SessionAgentConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub codex_managed_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_context_archive: Option<String>,
 }
 
 impl SessionAgentConfig {
@@ -29,6 +31,7 @@ impl SessionAgentConfig {
         self.source.is_none()
             && self.agent_command.is_none()
             && self.codex_managed_context.is_none()
+            && self.codex_context_archive.is_none()
     }
 
     pub fn merge_missing_from(&mut self, fallback: SessionAgentConfig) {
@@ -40,6 +43,9 @@ impl SessionAgentConfig {
         }
         if self.codex_managed_context.is_none() {
             self.codex_managed_context = fallback.codex_managed_context;
+        }
+        if self.codex_context_archive.is_none() {
+            self.codex_context_archive = fallback.codex_context_archive;
         }
     }
 }
@@ -55,6 +61,7 @@ pub fn from_wire(
     source: Option<&str>,
     agent_command: Option<&str>,
     codex_managed_context: Option<&str>,
+    codex_context_archive: Option<&str>,
 ) -> SessionAgentConfig {
     let source = source
         .map(crate::session_names::normalize_source)
@@ -63,10 +70,15 @@ pub fn from_wire(
         Some("codex") => codex_managed_context.map(crate::project::normalize_codex_managed_context),
         _ => None,
     };
+    let codex_context_archive = match source.as_deref() {
+        Some("codex") => codex_context_archive.map(crate::project::normalize_codex_context_archive),
+        _ => None,
+    };
     SessionAgentConfig {
         source,
         agent_command: normalize_agent_command(agent_command),
         codex_managed_context,
+        codex_context_archive,
     }
 }
 
@@ -78,16 +90,21 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             codex_managed_context: Some(crate::project::normalize_codex_managed_context(
                 &project.config.agent.codex.managed_context,
             )),
+            codex_context_archive: Some(crate::project::normalize_codex_context_archive(
+                &project.config.agent.codex.context_archive,
+            )),
         },
         AgentBackend::ClaudeCode => SessionAgentConfig {
             source: Some("claude-code".to_string()),
             agent_command: Some(project.config.agent.claude_code.command.clone()),
             codex_managed_context: None,
+            codex_context_archive: None,
         },
         AgentBackend::GeminiCli => SessionAgentConfig {
             source: Some("gemini".to_string()),
             agent_command: Some(project.config.agent.gemini_cli.command.clone()),
             codex_managed_context: None,
+            codex_context_archive: None,
         },
     }
 }
@@ -105,6 +122,10 @@ pub fn apply_to_project(
             if let Some(mode) = config.codex_managed_context.clone() {
                 project.config.agent.codex.managed_context =
                     crate::project::normalize_codex_managed_context(&mode);
+            }
+            if let Some(mode) = config.codex_context_archive.clone() {
+                project.config.agent.codex.context_archive =
+                    crate::project::normalize_codex_context_archive(&mode);
             }
         }
         AgentBackend::ClaudeCode => {
@@ -142,6 +163,9 @@ pub fn read_log_dir_config(log_dir: &Path) -> Option<SessionAgentConfig> {
     }
     if let Some(mode) = config.codex_managed_context.take() {
         config.codex_managed_context = Some(crate::project::normalize_codex_managed_context(&mode));
+    }
+    if let Some(mode) = config.codex_context_archive.take() {
+        config.codex_context_archive = Some(crate::project::normalize_codex_context_archive(&mode));
     }
     (!config.is_empty()).then_some(config)
 }
@@ -335,6 +359,12 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
             Value::String(crate::project::normalize_codex_managed_context(mode)),
         );
     }
+    if let Some(mode) = config.codex_context_archive.as_deref() {
+        obj.insert(
+            "codex_context_archive".to_string(),
+            Value::String(crate::project::normalize_codex_context_archive(mode)),
+        );
+    }
 }
 
 pub fn apply_overlays_to_sessions(home: &Path, sessions: &mut [Value]) {
@@ -428,6 +458,10 @@ fn read_overlay_map(home: &Path) -> HashMap<String, HashMap<String, SessionAgent
                 config.codex_managed_context =
                     Some(crate::project::normalize_codex_managed_context(&mode));
             }
+            if let Some(mode) = config.codex_context_archive.take() {
+                config.codex_context_archive =
+                    Some(crate::project::normalize_codex_context_archive(&mode));
+            }
             if !config.is_empty() {
                 by_id.insert(session_id.clone(), config);
             }
@@ -495,16 +529,27 @@ mod tests {
 
     #[test]
     fn normalizes_codex_wire_config() {
-        let cfg = from_wire(Some("Codex"), Some("  /tmp/codex  "), Some("true"));
+        let cfg = from_wire(
+            Some("Codex"),
+            Some("  /tmp/codex  "),
+            Some("true"),
+            Some("raw"),
+        );
         assert_eq!(cfg.source.as_deref(), Some("codex"));
         assert_eq!(cfg.agent_command.as_deref(), Some("/tmp/codex"));
         assert_eq!(cfg.codex_managed_context.as_deref(), Some("managed"));
+        assert_eq!(cfg.codex_context_archive.as_deref(), Some("exact"));
     }
 
     #[test]
     fn overlay_round_trips_external_config() {
         let home = tempfile::tempdir().unwrap();
-        let cfg = from_wire(Some("codex"), Some("/tmp/codex"), Some("managed"));
+        let cfg = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("managed"),
+            Some("summary"),
+        );
         write_external_overlay(home.path(), "codex", "thread-1", &cfg).unwrap();
         let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
         assert_eq!(loaded, cfg);
@@ -519,7 +564,12 @@ mod tests {
 
         // Writing must not panic or silently wipe the file; it preserves the corrupt
         // copy and starts fresh so the new entry is still readable.
-        let cfg = from_wire(Some("codex"), Some("/tmp/codex"), Some("managed"));
+        let cfg = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("managed"),
+            Some("off"),
+        );
         write_external_overlay(home.path(), "codex", "thread-1", &cfg).unwrap();
 
         assert!(path.with_extension("corrupt").exists());
