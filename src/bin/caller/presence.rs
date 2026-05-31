@@ -983,6 +983,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::DisplayResize { .. }
         | AppEvent::UserDisplayGranted { .. }
         | AppEvent::UserDisplayRevoked { .. }
+        | AppEvent::SharedView { .. }
 
         // Pull-only events — not pushed to presence
         | AppEvent::AgentOutput { .. }

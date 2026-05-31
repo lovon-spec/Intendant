@@ -139,6 +139,19 @@ pub struct SessionGoal {
     pub token_budget: Option<u64>,
 }
 
+/// Normalized region in a shared display view.
+///
+/// Coordinates are fractions of the visible display frame, where `(0, 0)` is
+/// the top-left and `(1, 1)` is the bottom-right. The dashboard renders this as
+/// a focus box over the video stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedViewRegion {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// Events sent to connected control socket clients, web gateway, and MCP.
 ///
 /// Also deserialized by `crate::peer::upcast::OutboundEventUpcaster`
@@ -261,6 +274,21 @@ pub enum OutboundEvent {
     DisplayApprovalPending {
         display_id: u32,
         backend: String,
+    },
+    SharedView {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<SharedViewRegion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     RecordingStarted {
         stream_name: String,

@@ -5717,6 +5717,66 @@ body.context-focus-active {
   font-size: 12px;
   color: var(--subtext0);
 }
+.shared-view-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--blue) 14%, var(--mantle));
+  border-bottom: 1px solid color-mix(in srgb, var(--blue) 42%, var(--surface0));
+  color: var(--text);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.shared-view-banner.hidden { display: none; }
+.shared-view-kicker {
+  color: var(--blue);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.shared-view-message {
+  min-width: 0;
+  flex: 1;
+  color: var(--subtext1);
+  overflow-wrap: anywhere;
+}
+.shared-view-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.shared-view-action,
+.shared-view-close {
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  min-height: 28px;
+  padding: 3px 9px;
+}
+.shared-view-action {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+.shared-view-action:hover {
+  background: var(--blue);
+  color: var(--base);
+}
+.shared-view-close {
+  width: 28px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+.shared-view-close:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
 .displays-container {
   flex: 1;
   min-height: 120px;
@@ -5748,6 +5808,19 @@ body.context-focus-active {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+.display-slot.shared-view-active {
+  outline: 2px solid color-mix(in srgb, var(--blue) 74%, transparent);
+  outline-offset: -2px;
+}
+.display-slot.display-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 260;
+  background: var(--base);
+}
+body.display-fullscreen-open {
+  overflow: hidden;
 }
 .display-toolbar {
   display: flex;
@@ -5803,6 +5876,7 @@ body.context-focus-active {
 .display-toolbar .take-control-btn,
 .display-toolbar .release-control-btn,
 .display-toolbar .stream-btn,
+.display-toolbar .display-fullscreen-btn,
 .peer-display-controls .take-control-btn,
 .peer-display-controls .release-control-btn {
   padding: 3px 10px;
@@ -5860,6 +5934,11 @@ body.context-focus-active {
   background: var(--red);
   border-color: var(--red);
 }
+.display-toolbar .display-fullscreen-btn:hover {
+  background: var(--mauve);
+  color: var(--base);
+  border-color: var(--mauve);
+}
 .display-toolbar .release-note {
   padding: 2px 8px;
   border: 1px solid var(--surface1);
@@ -5878,6 +5957,41 @@ body.context-focus-active {
 .display-canvas video {
   max-width: 100%;
   max-height: 100%;
+}
+.display-slot.display-fullscreen .display-canvas video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.shared-view-focus-box {
+  position: absolute;
+  border: 2px solid var(--yellow);
+  border-radius: 4px;
+  box-shadow:
+    0 0 0 9999px rgba(0, 0, 0, 0.26),
+    0 0 18px rgba(249, 226, 175, 0.55);
+  pointer-events: none;
+  z-index: 3;
+}
+.shared-view-focus-box::after {
+  content: attr(data-note);
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  max-width: min(360px, 70vw);
+  padding: 4px 7px;
+  border-radius: 4px;
+  background: rgba(17, 17, 26, 0.9);
+  border: 1px solid rgba(249, 226, 175, 0.5);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: none;
+}
+.shared-view-focus-box[data-note]:not([data-note=""])::after {
+  display: block;
 }
 
 /* ── Activity Display Strip ── */
@@ -6947,6 +7061,21 @@ body.context-focus-active {
   .activity-toolbar {
     flex-wrap: wrap;
     align-items: center;
+  }
+  .shared-view-banner {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .shared-view-message {
+    flex-basis: calc(100% - 96px);
+  }
+  .display-toolbar {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .display-toolbar .take-control-btn {
+    margin-left: 0;
   }
   .context-toolbar {
     flex-wrap: wrap;
@@ -8039,6 +8168,14 @@ body.context-focus-active {
           <div class="title">Screen sharing approval needed</div>
           <div class="subtitle">A dialog should be visible on the guest desktop — approve it to start the video stream.</div>
         </div>
+      </div>
+      <div class="shared-view-banner hidden" id="shared-view-banner">
+        <span class="shared-view-kicker">Shared view</span>
+        <span class="shared-view-message" id="shared-view-message"></span>
+        <span class="shared-view-actions">
+          <button class="shared-view-action" id="shared-view-take-input" type="button" style="display:none" title="Take input authority for the focused display">Take input</button>
+          <button class="shared-view-close" type="button" id="shared-view-close" title="Hide shared view">&times;</button>
+        </span>
       </div>
       <div class="displays-container" id="displays-container">
         <div class="displays-placeholder" id="displays-placeholder">
@@ -9385,6 +9522,15 @@ const SHELL_KEY_SEQS = {
 
 // Displays
 const displaySlots = new Map();
+const sharedViewState = {
+  visible: false,
+  displayId: null,
+  displayTarget: '',
+  action: '',
+  reason: '',
+  note: '',
+  region: null,
+};
 // Phase 5c: buffer for `display_input_authority_state` frames that
 // arrive before the corresponding DisplaySlot exists (race between the
 // `display_ready` and `display_input_authority_state` channels in the
@@ -9776,6 +9922,10 @@ async function main() {
         const contextSid = sessionWindowTargetForLogSession(d.session_id);
         if (contextSid) markSessionWindowPendingActive(contextSid);
         handleContextSnapshot(d);
+        return;
+      }
+      if (d.event === 'shared_view') {
+        handleSharedViewEvent(d);
         return;
       }
       if (d.t === 'log_replay' && Array.isArray(d.entries)) {
@@ -19422,6 +19572,21 @@ function wireShellKeybar() {
 // has ever opened the Terminal tab.
 document.addEventListener('DOMContentLoaded', wireShellKeybar);
 document.addEventListener('DOMContentLoaded', syncTerminalPaneAccessibility);
+document.addEventListener('DOMContentLoaded', () => {
+  const close = document.getElementById('shared-view-close');
+  if (close) close.addEventListener('click', hideSharedView);
+  const takeInput = document.getElementById('shared-view-take-input');
+  if (takeInput) takeInput.addEventListener('click', takeSharedViewInput);
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  for (const slot of displaySlots.values()) {
+    if (slot.el.classList.contains('display-fullscreen')) {
+      slot.toggleFullscreen(false);
+      return;
+    }
+  }
+});
 
 // ── Displays (WebRTC — video track + data channels for input) ──
 
@@ -19479,6 +19644,7 @@ class DisplaySlot {
         <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">&#x1F441; Stream</button>
         <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">&#x1F4CE; Attach</button>
         <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">&#x23FA; Record</button>
+        <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" title="Full screen">&#x26F6;</button>
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
         <button class="release-control-btn" id="ds-release-${displayId}" style="display:none" title="Release control and return display to view-only mode">Release</button>
         <button class="delete-recording-btn" id="ds-delete-rec-${displayId}" style="display:none" title="Delete recording files for this display">&#x1F5D1; Delete</button>
@@ -19494,6 +19660,7 @@ class DisplaySlot {
     this.frameIdEl = this.el.querySelector(`#ds-frame-${displayId}`);
     this.canvasEl = this.el.querySelector(`#display-canvas-${displayId}`);
     this.recordBtn = this.el.querySelector(`#ds-record-${displayId}`);
+    this.fullscreenBtn = this.el.querySelector(`#ds-fullscreen-${displayId}`);
     this.deleteRecBtn = this.el.querySelector(`#ds-delete-rec-${displayId}`);
     this.attachBtn = this.el.querySelector(`#ds-attach-${displayId}`);
     this.recording = false;
@@ -19511,8 +19678,34 @@ class DisplaySlot {
     this.releaseBtn.addEventListener('click', () => this.releaseControl());
     this.streamBtn.addEventListener('click', () => this.toggleStreaming());
     this.recordBtn.addEventListener('click', () => this.toggleRecording());
+    this.fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
     this.deleteRecBtn.addEventListener('click', () => this.deleteRecording());
     this.attachBtn.addEventListener('click', () => this.attachCurrentFrame());
+  }
+
+  toggleFullscreen(force) {
+    const want = force === undefined
+      ? !this.el.classList.contains('display-fullscreen')
+      : !!force;
+    if (want) {
+      for (const slot of displaySlots.values()) {
+        if (slot === this) continue;
+        slot.el.classList.remove('display-fullscreen');
+        if (slot.fullscreenBtn) {
+          slot.fullscreenBtn.innerHTML = '&#x26F6;';
+          slot.fullscreenBtn.title = 'Full screen';
+        }
+      }
+    }
+    this.el.classList.toggle('display-fullscreen', want);
+    const anyFullscreen = want || Array.from(displaySlots.values()).some(slot =>
+      slot !== this && slot.el.classList.contains('display-fullscreen')
+    );
+    document.body.classList.toggle('display-fullscreen-open', anyFullscreen);
+    if (this.fullscreenBtn) {
+      this.fullscreenBtn.innerHTML = want ? '&times;' : '&#x26F6;';
+      this.fullscreenBtn.title = want ? 'Exit full screen' : 'Full screen';
+    }
   }
 
   /// Capture the currently-rendered video frame and queue it as a pending
@@ -20303,9 +20496,13 @@ function removeDisplaySlot(displayId) {
   // `oniceconnectionstatechange` handler; display_capture_lost) which
   // call `disconnect()` with the `userInitiated: false` default and
   // therefore preserve authority for a possible re-grant.
+  slot.toggleFullscreen(false);
   slot.disconnect({ userInitiated: true });
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
+  if (sharedViewState.displayId === displayId) {
+    clearSharedViewDecorations();
+  }
   removeDisplayThumb(displayId);
   if (displaySlots.size === 0) {
     const placeholder = document.getElementById('displays-placeholder');
@@ -20313,6 +20510,131 @@ function removeDisplaySlot(displayId) {
     if (placeholder) placeholder.style.display = '';
     if (container) container.classList.remove('has-displays');
   }
+}
+
+function normalizeSharedViewDisplayId(evt) {
+  if (evt.display_id !== undefined && evt.display_id !== null) {
+    const n = Number(evt.display_id);
+    if (Number.isFinite(n)) return n;
+  }
+  const target = String(evt.display_target || '').trim();
+  if (!target) return null;
+  if (target === 'user_session' || target === 'primary') return 0;
+  const stripped = target.startsWith(':') ? target.slice(1)
+    : target.startsWith('display_') ? target.slice('display_'.length)
+    : target;
+  const n = Number(stripped);
+  return Number.isFinite(n) ? n : null;
+}
+
+function clearSharedViewDecorations() {
+  for (const slot of displaySlots.values()) {
+    slot.el.classList.remove('shared-view-active');
+    const focus = slot.canvasEl && slot.canvasEl.querySelector('.shared-view-focus-box');
+    if (focus) focus.remove();
+  }
+}
+
+function renderSharedViewFocus(slot, region, note) {
+  if (!slot || !slot.canvasEl) return;
+  let focus = slot.canvasEl.querySelector('.shared-view-focus-box');
+  if (!region) {
+    if (focus) focus.remove();
+    return;
+  }
+  if (!focus) {
+    focus = document.createElement('div');
+    focus.className = 'shared-view-focus-box';
+    slot.canvasEl.appendChild(focus);
+  }
+  const x = Math.max(0, Math.min(1, Number(region.x) || 0));
+  const y = Math.max(0, Math.min(1, Number(region.y) || 0));
+  const w = Math.max(0.01, Math.min(1 - x, Number(region.width) || 0.01));
+  const h = Math.max(0.01, Math.min(1 - y, Number(region.height) || 0.01));
+  focus.style.left = (x * 100).toFixed(3) + '%';
+  focus.style.top = (y * 100).toFixed(3) + '%';
+  focus.style.width = (w * 100).toFixed(3) + '%';
+  focus.style.height = (h * 100).toFixed(3) + '%';
+  focus.dataset.note = note || '';
+}
+
+function updateSharedViewBanner() {
+  const banner = document.getElementById('shared-view-banner');
+  const message = document.getElementById('shared-view-message');
+  const takeInput = document.getElementById('shared-view-take-input');
+  if (!banner || !message) return;
+  banner.classList.toggle('hidden', !sharedViewState.visible);
+  if (!sharedViewState.visible) return;
+  const target = sharedViewState.displayId !== null
+    ? ':' + sharedViewState.displayId
+    : (sharedViewState.displayTarget || 'display');
+  const detail = sharedViewState.reason || sharedViewState.note || '';
+  const action = sharedViewState.action === 'input_request'
+    ? 'Input requested'
+    : sharedViewState.action === 'focus'
+      ? 'Focus'
+      : sharedViewState.action === 'capture'
+        ? 'Captured'
+        : 'Viewing';
+  message.textContent = detail ? `${action} ${target}: ${detail}` : `${action} ${target}`;
+  if (takeInput) {
+    const canTake = sharedViewState.action === 'input_request'
+      && sharedViewState.displayId !== null
+      && displaySlots.has(sharedViewState.displayId);
+    takeInput.style.display = canTake ? '' : 'none';
+  }
+}
+
+function applySharedViewToSlot(slot) {
+  if (!sharedViewState.visible || !slot) return;
+  if (sharedViewState.displayId !== null && Number(slot.displayId) !== sharedViewState.displayId) {
+    return;
+  }
+  updateSharedViewBanner();
+  slot.el.classList.add('shared-view-active');
+  renderSharedViewFocus(slot, sharedViewState.region, sharedViewState.note || sharedViewState.reason);
+  if (activeTab === 'displays') {
+    requestAnimationFrame(() => {
+      try { slot.el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
+    });
+  }
+}
+
+function hideSharedView() {
+  sharedViewState.visible = false;
+  sharedViewState.action = 'hide';
+  sharedViewState.region = null;
+  updateSharedViewBanner();
+  clearSharedViewDecorations();
+}
+
+function takeSharedViewInput() {
+  if (sharedViewState.displayId === null) return;
+  const slot = displaySlots.get(sharedViewState.displayId);
+  if (slot) slot.takeControl();
+}
+
+function handleSharedViewEvent(evt) {
+  const action = String(evt.action || 'show');
+  if (action === 'hide') {
+    hideSharedView();
+    return;
+  }
+  sharedViewState.visible = true;
+  sharedViewState.action = action;
+  sharedViewState.displayId = normalizeSharedViewDisplayId(evt);
+  sharedViewState.displayTarget = String(evt.display_target || '');
+  sharedViewState.reason = String(evt.reason || '');
+  sharedViewState.note = String(evt.note || '');
+  sharedViewState.region = evt.region || null;
+
+  clearSharedViewDecorations();
+  updateSharedViewBanner();
+  routeTo('displays');
+  const slot = sharedViewState.displayId !== null
+    ? displaySlots.get(sharedViewState.displayId)
+    : displaySlots.values().next().value;
+  if (slot) applySharedViewToSlot(slot);
 }
 
 function addDisplaySlot(displayId, width, height) {
@@ -20361,6 +20683,7 @@ function addDisplaySlot(displayId, width, height) {
   container.appendChild(slot.el);
   slot.connect();
   addDisplayThumb(displayId);
+  applySharedViewToSlot(slot);
 }
 
 // ── Activity Display Strip ──

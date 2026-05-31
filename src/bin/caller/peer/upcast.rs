@@ -282,6 +282,7 @@ impl AppEventUpcaster {
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::SessionGoal { .. }
             | AppEvent::FollowUpStatus { .. }
+            | AppEvent::SharedView { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::FileChanged { .. }
             | AppEvent::UploadReady { .. }
@@ -1370,6 +1371,7 @@ impl WireEventUpcaster {
             | OutboundEvent::SessionCapabilities { .. }
             | OutboundEvent::SessionGoal { .. }
             | OutboundEvent::FollowUpStatus { .. }
+            | OutboundEvent::SharedView { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }

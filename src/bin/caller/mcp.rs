@@ -2724,7 +2724,8 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::GeminiConfigChanged { .. }
                     | AppEvent::GeminiThreadActionRequested { .. }
-                    | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
+                    | AppEvent::GeminiThreadActionResult { .. }
+                    | AppEvent::SharedView { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..
                     } => {
@@ -3948,6 +3949,82 @@ pub struct ReadFrameParams {
     pub stream: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct SharedViewRegionParams {
+    /// Normalized left coordinate, from 0.0 to 1.0.
+    pub x: f64,
+    /// Normalized top coordinate, from 0.0 to 1.0.
+    pub y: f64,
+    /// Normalized width, from 0.0 to 1.0.
+    pub width: f64,
+    /// Normalized height, from 0.0 to 1.0.
+    pub height: f64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ShowSharedViewParams {
+    /// Display target to foreground, such as "user_session" or ":99".
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// Numeric display id. Prefer this when known.
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Why the agent wants the user to watch or collaborate.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Optional normalized region to highlight after the view opens.
+    #[serde(default)]
+    pub focus_region: Option<SharedViewRegionParams>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HideSharedViewParams {
+    /// Optional reason for dismissing the collaboration view.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FocusSharedViewParams {
+    /// Display target to focus, such as "user_session" or ":99".
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// Numeric display id. Prefer this when known.
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Normalized region to highlight.
+    pub region: SharedViewRegionParams,
+    /// Short label for what the user should look at.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestSharedViewInputParams {
+    /// Display target where user input is useful, such as "user_session" or ":99".
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// Numeric display id. Prefer this when known.
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Why the agent wants input authority or human interaction.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CaptureSharedViewFrameParams {
+    /// Display target to capture, such as "user_session" or ":99". Auto-detects if omitted.
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// Numeric display id. Prefer this when known.
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Optional note that appears in the dashboard shared-view banner.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScheduleControllerRestartParams {
     /// Identifier for the controlling agent/client (e.g. "codex", "claude_code").
@@ -4293,6 +4370,37 @@ impl IntendantServer {
                 let params = parse_params::<ReleaseDisplayParams>(args)?;
                 Ok(text_tool_result(self.release_display(params).await))
             }
+            "show_shared_view" => {
+                let Parameters(params) = parse_params::<ShowSharedViewParams>(args)?;
+                Ok(text_tool_result(
+                    self.show_shared_view_for_session(params, session_id).await,
+                ))
+            }
+            "hide_shared_view" => {
+                let Parameters(params) = parse_params::<HideSharedViewParams>(args)?;
+                Ok(text_tool_result(
+                    self.hide_shared_view_for_session(params, session_id).await,
+                ))
+            }
+            "focus_shared_view" => {
+                let Parameters(params) = parse_params::<FocusSharedViewParams>(args)?;
+                Ok(text_tool_result(
+                    self.focus_shared_view_for_session(params, session_id).await,
+                ))
+            }
+            "request_shared_view_input" => {
+                let Parameters(params) = parse_params::<RequestSharedViewInputParams>(args)?;
+                Ok(text_tool_result(
+                    self.request_shared_view_input_for_session(params, session_id)
+                        .await,
+                ))
+            }
+            "capture_shared_view_frame" => {
+                let Parameters(params) = parse_params::<CaptureSharedViewFrameParams>(args)?;
+                self.capture_shared_view_frame_for_session(params, session_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
             "take_screenshot" => {
                 let params = parse_params::<TakeScreenshotParams>(args)?;
                 self.take_screenshot(params)
@@ -4461,6 +4569,60 @@ fn image_tool_result(text: impl Into<String>, base64_png: impl Into<String>) -> 
         Content::text(text.into()),
         Content::image(base64_png.into(), "image/png"),
     ])
+}
+
+fn clamp_shared_view_unit(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn normalize_shared_view_region(region: SharedViewRegionParams) -> crate::types::SharedViewRegion {
+    let x = clamp_shared_view_unit(region.x);
+    let y = clamp_shared_view_unit(region.y);
+    let width = clamp_shared_view_unit(region.width).min(1.0 - x);
+    let height = clamp_shared_view_unit(region.height).min(1.0 - y);
+    crate::types::SharedViewRegion {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn shared_view_display_target(
+    display_target: Option<String>,
+    display_id: Option<u32>,
+) -> Option<String> {
+    display_target
+        .map(|target| target.trim().to_string())
+        .filter(|target| !target.is_empty())
+        .or_else(|| display_id.map(|id| format!(":{}", id)))
+}
+
+fn shared_view_display_id(display_target: Option<&str>, display_id: Option<u32>) -> Option<u32> {
+    if display_id.is_some() {
+        return display_id;
+    }
+    let target = display_target?.trim();
+    if target.eq_ignore_ascii_case("user_session") || target.eq_ignore_ascii_case("primary") {
+        return Some(0);
+    }
+    target
+        .strip_prefix(':')
+        .or_else(|| target.strip_prefix("display_"))
+        .unwrap_or(target)
+        .parse::<u32>()
+        .ok()
+}
+
+fn shared_view_target_label(display_id: Option<u32>, display_target: Option<&str>) -> String {
+    display_id
+        .map(|id| format!(":{}", id))
+        .or_else(|| display_target.map(str::to_string))
+        .unwrap_or_else(|| "default display".to_string())
 }
 
 #[tool_router]
@@ -5318,6 +5480,175 @@ impl IntendantServer {
             note: params.note.clone(),
         });
         format!("Released control of :{}", params.display_id)
+    }
+
+    async fn emit_shared_view(
+        &self,
+        session_id: Option<&str>,
+        action: &str,
+        display_target: Option<String>,
+        display_id: Option<u32>,
+        reason: Option<String>,
+        region: Option<crate::types::SharedViewRegion>,
+        note: Option<String>,
+    ) -> String {
+        self.bus.send(AppEvent::SharedView {
+            session_id: session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            action: action.to_string(),
+            display_target: display_target.clone(),
+            display_id,
+            reason: reason.clone(),
+            region,
+            note: note.clone(),
+        });
+        let target = shared_view_target_label(display_id, display_target.as_deref());
+        let detail = reason
+            .or(note)
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!(" ({})", s))
+            .unwrap_or_default();
+        format!("shared view {} requested for {}{}", action, target, detail)
+    }
+
+    async fn show_shared_view_for_session(
+        &self,
+        params: ShowSharedViewParams,
+        session_id: Option<&str>,
+    ) -> String {
+        let display_target = shared_view_display_target(params.display_target, params.display_id);
+        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        let region = params.focus_region.map(normalize_shared_view_region);
+        self.emit_shared_view(
+            session_id,
+            "show",
+            display_target,
+            display_id,
+            params.reason,
+            region,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Open or foreground the dashboard shared display view for agent-human collaboration. This does not grant input authority; it asks connected dashboards to show the relevant display and optional focus region."
+    )]
+    async fn show_shared_view(
+        &self,
+        Parameters(params): Parameters<ShowSharedViewParams>,
+    ) -> String {
+        self.show_shared_view_for_session(params, None).await
+    }
+
+    async fn hide_shared_view_for_session(
+        &self,
+        params: HideSharedViewParams,
+        session_id: Option<&str>,
+    ) -> String {
+        self.emit_shared_view(session_id, "hide", None, None, params.reason, None, None)
+            .await
+    }
+
+    #[tool(description = "Dismiss the dashboard shared display view banner and focus overlay.")]
+    async fn hide_shared_view(
+        &self,
+        Parameters(params): Parameters<HideSharedViewParams>,
+    ) -> String {
+        self.hide_shared_view_for_session(params, None).await
+    }
+
+    async fn focus_shared_view_for_session(
+        &self,
+        params: FocusSharedViewParams,
+        session_id: Option<&str>,
+    ) -> String {
+        let display_target = shared_view_display_target(params.display_target, params.display_id);
+        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.emit_shared_view(
+            session_id,
+            "focus",
+            display_target,
+            display_id,
+            None,
+            Some(normalize_shared_view_region(params.region)),
+            params.note,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Highlight a normalized region in the dashboard shared display view. Use this to point the user at a specific UI element or area."
+    )]
+    async fn focus_shared_view(
+        &self,
+        Parameters(params): Parameters<FocusSharedViewParams>,
+    ) -> String {
+        self.focus_shared_view_for_session(params, None).await
+    }
+
+    async fn request_shared_view_input_for_session(
+        &self,
+        params: RequestSharedViewInputParams,
+        session_id: Option<&str>,
+    ) -> String {
+        let display_target = shared_view_display_target(params.display_target, params.display_id);
+        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.emit_shared_view(
+            session_id,
+            "input_request",
+            display_target,
+            display_id,
+            params.reason,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Ask the dashboard user to take input authority for the shared display. This is advisory: the user must click the dashboard control before keyboard/mouse input is granted."
+    )]
+    async fn request_shared_view_input(
+        &self,
+        Parameters(params): Parameters<RequestSharedViewInputParams>,
+    ) -> String {
+        self.request_shared_view_input_for_session(params, None)
+            .await
+    }
+
+    async fn capture_shared_view_frame_for_session(
+        &self,
+        params: CaptureSharedViewFrameParams,
+        session_id: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        let display_target = shared_view_display_target(params.display_target, params.display_id);
+        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.emit_shared_view(
+            session_id,
+            "capture",
+            display_target.clone(),
+            display_id,
+            params.reason,
+            None,
+            None,
+        )
+        .await;
+        self.take_screenshot(Parameters(TakeScreenshotParams { display_target }))
+            .await
+    }
+
+    #[tool(
+        description = "Capture the currently shared display as an MCP image. Also foregrounds the dashboard shared view so the user can see what was captured."
+    )]
+    async fn capture_shared_view_frame(
+        &self,
+        Parameters(params): Parameters<CaptureSharedViewFrameParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.capture_shared_view_frame_for_session(params, None)
+            .await
     }
 
     #[tool(description = "Take a screenshot of a display. Returns an MCP image content block.")]
@@ -6390,6 +6721,57 @@ mod tests {
             assert_eq!(snap.budget_pct, 42.0);
             assert_eq!(snap.phase, "thinking");
             assert_eq!(snap.session_tokens, 1234);
+        });
+    }
+
+    #[test]
+    fn shared_view_tool_emits_dashboard_event() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(test_state(), bus.clone());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "show_shared_view",
+                    serde_json::json!({
+                        "display_target": ":99",
+                        "reason": "show the failing login screen",
+                        "focus_region": { "x": 0.9, "y": 0.9, "width": 0.4, "height": 0.4 }
+                    }),
+                    Some("session-a"),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch");
+            assert!(!result.is_error.unwrap_or(false));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::SharedView {
+                    session_id,
+                    action,
+                    display_target,
+                    display_id,
+                    reason,
+                    region: Some(region),
+                    ..
+                })) => {
+                    assert_eq!(session_id.as_deref(), Some("session-a"));
+                    assert_eq!(action, "show");
+                    assert_eq!(display_target.as_deref(), Some(":99"));
+                    assert_eq!(display_id, Some(99));
+                    assert_eq!(reason.as_deref(), Some("show the failing login screen"));
+                    assert_eq!(region.x, 0.9);
+                    assert_eq!(region.y, 0.9);
+                    assert!((region.width - 0.1).abs() < f64::EPSILON);
+                    assert!((region.height - 0.1).abs() < f64::EPSILON);
+                }
+                other => panic!("expected SharedView event, got {other:?}"),
+            }
         });
     }
 
