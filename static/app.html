@@ -5966,6 +5966,7 @@ body.display-fullscreen-open {
 .display-toolbar .take-control-btn,
 .display-toolbar .release-control-btn,
 .display-toolbar .stream-btn,
+.display-toolbar .annotate-btn,
 .display-toolbar .display-fullscreen-btn,
 .peer-display-controls .take-control-btn,
 .peer-display-controls .release-control-btn {
@@ -5989,6 +5990,12 @@ body.display-fullscreen-open {
   background: var(--green);
   color: var(--base);
   border-color: var(--green);
+}
+.display-toolbar .annotate-btn:hover,
+.display-toolbar .annotate-btn.active {
+  background: var(--blue);
+  color: var(--base);
+  border-color: var(--blue);
 }
 .display-toolbar .record-btn {
   border-color: var(--red);
@@ -6047,6 +6054,18 @@ body.display-fullscreen-open {
 .display-canvas video {
   max-width: 100%;
   max-height: 100%;
+}
+.display-canvas .live-annotation-source,
+.display-canvas .live-annotation-overlay {
+  position: absolute;
+  pointer-events: none;
+}
+.display-canvas .live-annotation-source {
+  z-index: 4;
+  background: #000;
+}
+.display-canvas .live-annotation-overlay {
+  z-index: 5;
 }
 .display-slot.display-fullscreen .display-canvas video {
   width: 100%;
@@ -6646,7 +6665,8 @@ body.display-fullscreen-open {
   padding: 0;
 }
 .ann-close:hover { background: var(--red); color: var(--base); border-color: var(--red); }
-.recording-overlay.annotation-active {
+.recording-overlay.annotation-active,
+.live-annotation-overlay.annotation-active {
   pointer-events: auto;
   touch-action: none;
   cursor: crosshair;
@@ -20033,6 +20053,7 @@ class DisplaySlot {
         <input class="release-note" id="ds-note-${displayId}" placeholder="Note (optional)" style="display:none">
         <button class="stream-btn" id="ds-stream-${displayId}" title="Continuously send screenshots of this display to the live presence (voice) model. Main agents are not affected.">&#x1F441; Stream</button>
         <button class="ann-attach-btn" id="ds-attach-${displayId}" title="Capture current frame and attach to next task">&#x1F4CE; Attach</button>
+        <button class="annotate-btn" id="ds-annotate-${displayId}" title="Freeze current frame and annotate it">&#9998; Annotate</button>
         <button class="record-btn" id="ds-record-${displayId}" title="Record this display (ffmpeg)">&#x23FA; Record</button>
         <button class="display-fullscreen-btn" id="ds-fullscreen-${displayId}" title="Full screen">&#x26F6;</button>
         <button class="take-control-btn" id="ds-take-${displayId}" title="Take interactive control of this display (keyboard and mouse)">Take Control</button>
@@ -20053,6 +20074,7 @@ class DisplaySlot {
     this.fullscreenBtn = this.el.querySelector(`#ds-fullscreen-${displayId}`);
     this.deleteRecBtn = this.el.querySelector(`#ds-delete-rec-${displayId}`);
     this.attachBtn = this.el.querySelector(`#ds-attach-${displayId}`);
+    this.annotateBtn = this.el.querySelector(`#ds-annotate-${displayId}`);
     this.recording = false;
 
     // Video element for WebRTC media track
@@ -20083,6 +20105,7 @@ class DisplaySlot {
     this.fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
     this.deleteRecBtn.addEventListener('click', () => this.deleteRecording());
     this.attachBtn.addEventListener('click', () => this.attachCurrentFrame());
+    this.annotateBtn.addEventListener('click', () => this.annotateCurrentFrame());
   }
 
   toggleFullscreen(force) {
@@ -20110,18 +20133,12 @@ class DisplaySlot {
     }
   }
 
-  /// Capture the currently-rendered video frame and queue it as a pending
-  /// attachment. Works whether or not the display is currently streaming —
-  /// just rasterizes whatever the <video> element is showing right now.
-  attachCurrentFrame() {
+  captureCurrentFrame(quality = 0.85) {
     if (!this.connected || !this.videoEl || !this.videoEl.videoWidth) {
-      this.attachBtn.title = 'No frame available yet';
-      setTimeout(() => { this.attachBtn.title = 'Capture current frame and attach to next task'; }, 2000);
-      return;
+      return null;
     }
     const sw = this.videoEl.videoWidth;
     const sh = this.videoEl.videoHeight;
-    // Logical resolution (HQ archive size)
     const dpr = window.devicePixelRatio || 1;
     const w = Math.round(sw / dpr);
     const h = Math.round(sh / dpr);
@@ -20129,7 +20146,22 @@ class DisplaySlot {
     c.width = w;
     c.height = h;
     c.getContext('2d').drawImage(this.videoEl, 0, 0, w, h);
-    const dataUrl = c.toDataURL('image/jpeg', 0.85);
+    const dataUrl = c.toDataURL('image/jpeg', quality);
+    const b64 = dataUrl.split(',')[1];
+    return { canvas: c, dataUrl, b64, width: w, height: h };
+  }
+
+  /// Capture the currently-rendered video frame and queue it as a pending
+  /// attachment. Works whether or not the display is currently streaming —
+  /// just rasterizes whatever the <video> element is showing right now.
+  attachCurrentFrame() {
+    const frame = this.captureCurrentFrame(0.85);
+    if (!frame) {
+      this.attachBtn.title = 'No frame available yet';
+      setTimeout(() => { this.attachBtn.title = 'Capture current frame and attach to next task'; }, 2000);
+      return;
+    }
+    const dataUrl = frame.dataUrl;
     const b64 = dataUrl.split(',')[1];
     // Use a deterministic frame_id scheme so attachments are distinguishable
     // from streamed frames in the registry.
@@ -20157,6 +20189,16 @@ class DisplaySlot {
     const orig = this.attachBtn.innerHTML;
     this.attachBtn.innerHTML = '&#x2713; Attached';
     setTimeout(() => { this.attachBtn.innerHTML = orig; }, 1500);
+  }
+
+  annotateCurrentFrame() {
+    const frame = this.captureCurrentFrame(0.92);
+    if (!frame) {
+      this.annotateBtn.title = 'No frame available yet';
+      setTimeout(() => { this.annotateBtn.title = 'Freeze current frame and annotate it'; }, 2000);
+      return;
+    }
+    enterLiveAnnotationMode(this, frame);
   }
 
   connect() {
@@ -20494,6 +20536,10 @@ class DisplaySlot {
     // injection (xdotool key / CGEvent keycode). Using `key` for character-based text
     // input (e.g. xdotool type, CGEvent character input) is a follow-up.
     this._boundHandlers.keydown = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       if (['ShiftLeft','ShiftRight','ControlLeft','ControlRight','AltLeft','AltRight','MetaLeft','MetaRight'].includes(e.code)) {
         this._heldModifiers.add(e.code);
@@ -20501,11 +20547,19 @@ class DisplaySlot {
       sendControl({ t: 'kd', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.keyup = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       this._heldModifiers.delete(e.code);
       sendControl({ t: 'ku', code: e.code, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
     };
     this._boundHandlers.pointerdown = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       vid.focus();
       vid.setPointerCapture(e.pointerId);
@@ -20513,16 +20567,28 @@ class DisplaySlot {
       sendControl({ t: 'md', x, y, b: e.button });
     };
     this._boundHandlers.pointerup = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       vid.releasePointerCapture(e.pointerId);
       const { x, y } = normalize(e);
       sendControl({ t: 'mu', x, y, b: e.button });
     };
     this._boundHandlers.pointermove = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       const { x, y } = normalize(e);
       sendPointer({ t: 'mm', x, y, buttons: e.buttons });
     };
     this._boundHandlers.wheel = (e) => {
+      if (shouldSuppressDisplayInputForAnnotation(this)) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       const { x, y } = normalize(e);
       // Normalize pixel deltas to discrete scroll notches.
@@ -20889,6 +20955,14 @@ function removeDisplaySlot(displayId) {
   displayId = Number(displayId);
   const slot = displaySlots.get(displayId);
   if (!slot) return;
+  if (
+    annotationMode &&
+    annotationContext &&
+    annotationContext.kind === 'live' &&
+    annotationContext.slot === slot
+  ) {
+    exitAnnotationMode();
+  }
   // Mark as user-intent-closed BEFORE disconnect so any in-flight
   // reconnect timer short-circuits and any subsequent `failed` event
   // skips the retry path. See DisplaySlot._closedByUser.
@@ -21209,6 +21283,14 @@ function moveCanvasToSlot(slot) {
 }
 
 function relocateDisplays(tabId) {
+  if (
+    tabId !== 'displays' &&
+    annotationMode &&
+    annotationContext &&
+    annotationContext.kind === 'live'
+  ) {
+    exitAnnotationMode();
+  }
   for (const slot of displaySlots.values()) {
     if (tabId === 'activity') moveCanvasToThumb(slot);
     else if (tabId === 'displays') moveCanvasToSlot(slot);
@@ -22156,6 +22238,9 @@ class AnnotationCanvas {
     this.canvas.addEventListener('pointerup', this._onUp);
     this.active = true;
     this.render();
+    this._prevTabIndex = this.canvas.getAttribute('tabindex');
+    this.canvas.tabIndex = 0;
+    try { this.canvas.focus({ preventScroll: true }); } catch (_) { this.canvas.focus(); }
   }
 
   deactivate() {
@@ -22171,6 +22256,9 @@ class AnnotationCanvas {
     this.canvas.style.top = '';
     this.canvas.style.width = '';
     this.canvas.style.height = '';
+    if (this._prevTabIndex === null) this.canvas.removeAttribute('tabindex');
+    else if (this._prevTabIndex !== undefined) this.canvas.setAttribute('tabindex', this._prevTabIndex);
+    this._prevTabIndex = undefined;
   }
 
   _alignToSource() {
@@ -22308,6 +22396,58 @@ class AnnotationCanvas {
 let annotationCanvas = null;
 let annotationMode = false;
 let annotationCounter = 0;
+let annotationContext = null;
+const annotationToolbarHome = (() => {
+  const toolbar = document.getElementById('annotation-toolbar');
+  return toolbar ? { parent: toolbar.parentNode, nextSibling: toolbar.nextSibling } : null;
+})();
+
+function moveAnnotationToolbar(parent, beforeNode = null) {
+  const toolbar = document.getElementById('annotation-toolbar');
+  if (!toolbar || !parent) return;
+  if (toolbar.parentNode !== parent || toolbar.nextSibling !== beforeNode) {
+    parent.insertBefore(toolbar, beforeNode);
+  }
+}
+
+function restoreAnnotationToolbar() {
+  if (!annotationToolbarHome) return;
+  moveAnnotationToolbar(annotationToolbarHome.parent, annotationToolbarHome.nextSibling);
+}
+
+function setLiveAnnotationButton(slot, active) {
+  if (!slot || !slot.annotateBtn) return;
+  slot.annotateBtn.classList.toggle('active', !!active);
+  slot.annotateBtn.innerHTML = active ? '&#x2715; Annotating' : '&#9998; Annotate';
+  slot.annotateBtn.title = active ? 'Exit live annotation' : 'Freeze current frame and annotate it';
+}
+
+function alignLiveAnnotationSource(slot, source) {
+  if (!slot || !source || !slot.canvasEl || !slot.videoEl) return;
+  const wrapRect = slot.canvasEl.getBoundingClientRect();
+  const videoRect = slot.videoEl.getBoundingClientRect();
+  const videoWidth = Number(slot.videoEl.videoWidth) || source.width || videoRect.width;
+  const videoHeight = Number(slot.videoEl.videoHeight) || source.height || videoRect.height;
+  if (wrapRect.width <= 0 || wrapRect.height <= 0 || videoRect.width <= 0 || videoRect.height <= 0) return;
+  const scale = Math.min(videoRect.width / videoWidth, videoRect.height / videoHeight);
+  const frameW = videoWidth * scale;
+  const frameH = videoHeight * scale;
+  const frameX = videoRect.left - wrapRect.left + ((videoRect.width - frameW) / 2);
+  const frameY = videoRect.top - wrapRect.top + ((videoRect.height - frameH) / 2);
+  source.style.left = frameX + 'px';
+  source.style.top = frameY + 'px';
+  source.style.width = frameW + 'px';
+  source.style.height = frameH + 'px';
+}
+
+function shouldSuppressDisplayInputForAnnotation(slot) {
+  return !!(
+    annotationMode &&
+    annotationContext &&
+    annotationContext.kind === 'live' &&
+    annotationContext.slot === slot
+  );
+}
 
 function enterAnnotationMode() {
   if (annotationMode) return;
@@ -22321,9 +22461,14 @@ function enterAnnotationMode() {
   // Wait for video to have dimensions
   if (!video.videoWidth) return;
 
+  moveAnnotationToolbar(
+    document.getElementById('recording-section'),
+    document.getElementById('recording-timeline')
+  );
   annotationCanvas = new AnnotationCanvas(overlay, video);
   annotationCanvas.activate();
   annotationMode = true;
+  annotationContext = { kind: 'recording', stream: activeRecordingStream || 'annotation' };
   document.getElementById('annotation-toolbar').classList.remove('hidden');
   if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
 
@@ -22335,15 +22480,72 @@ function enterAnnotationMode() {
   window._annResizeObserver.observe(document.getElementById('recording-player-wrap'));
 }
 
+function enterLiveAnnotationMode(slot, frame) {
+  if (!slot || !frame || !slot.canvasEl) return;
+  if (annotationMode) {
+    if (annotationContext && annotationContext.kind === 'live' && annotationContext.slot === slot) {
+      exitAnnotationMode();
+      return;
+    }
+    exitAnnotationMode();
+  }
+
+  const source = frame.canvas;
+  source.className = 'live-annotation-source';
+  source.setAttribute('aria-hidden', 'true');
+
+  const overlay = document.createElement('canvas');
+  overlay.className = 'live-annotation-overlay';
+  overlay.width = frame.width;
+  overlay.height = frame.height;
+
+  slot.canvasEl.appendChild(source);
+  slot.canvasEl.appendChild(overlay);
+  alignLiveAnnotationSource(slot, source);
+
+  annotationCanvas = new AnnotationCanvas(overlay, source);
+  annotationCanvas.activate();
+  annotationMode = true;
+  annotationContext = {
+    kind: 'live',
+    slot,
+    stream: `display_${slot.displayId}_annotation`,
+    source,
+    overlay,
+  };
+  setLiveAnnotationButton(slot, true);
+  moveAnnotationToolbar(slot.el, null);
+  document.getElementById('annotation-toolbar').classList.remove('hidden');
+  if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
+
+  if (window._annResizeObserver) window._annResizeObserver.disconnect();
+  window._annResizeObserver = new ResizeObserver(() => {
+    if (annotationCanvas && annotationMode) {
+      alignLiveAnnotationSource(slot, source);
+      annotationCanvas._alignToSource();
+    }
+  });
+  window._annResizeObserver.observe(slot.canvasEl);
+  window._annResizeObserver.observe(source);
+}
+
 function exitAnnotationMode() {
   if (!annotationMode) return;
   if (window._annResizeObserver) { window._annResizeObserver.disconnect(); window._annResizeObserver = null; }
+  const context = annotationContext;
   if (annotationCanvas) {
     annotationCanvas.deactivate();
     annotationCanvas = null;
   }
+  if (context && context.kind === 'live') {
+    if (context.source && context.source.parentNode) context.source.parentNode.removeChild(context.source);
+    if (context.overlay && context.overlay.parentNode) context.overlay.parentNode.removeChild(context.overlay);
+    setLiveAnnotationButton(context.slot, false);
+  }
   annotationMode = false;
+  annotationContext = null;
   document.getElementById('annotation-toolbar').classList.add('hidden');
+  restoreAnnotationToolbar();
 }
 
 // ── Pending attachments (frame IDs queued for the next task) ──
@@ -22821,8 +23023,13 @@ async function submitAnnotation(action) {
   });
 
   annotationCounter++;
-  const frameId = `ann-${activeRecordingStream || 'recording'}-${annotationCounter}`;
-  const stream = activeRecordingStream || 'annotation';
+  const stream = annotationContext && annotationContext.stream
+    ? annotationContext.stream
+    : (activeRecordingStream || 'annotation');
+  const framePrefix = annotationContext && annotationContext.kind === 'live'
+    ? `ann-display_${annotationContext.slot.displayId}`
+    : `ann-${activeRecordingStream || 'recording'}`;
+  const frameId = `${framePrefix}-${annotationCounter}`;
 
   if (action === 'attach') {
     // Attach: register the frame on the server, queue the ID locally.
