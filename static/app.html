@@ -2038,11 +2038,8 @@ body.context-focus-active {
 .session-identity-full {
   display: none;
 }
-.session-window:not(.header-collapsed):not(.minimized) .session-identity-short-collapsed {
-  display: none;
-}
 .session-window:not(.header-collapsed):not(.minimized) .session-identity-full {
-  display: inline;
+  display: none;
 }
 .session-identity-short,
 .session-identity-separator {
@@ -2352,6 +2349,9 @@ body.context-focus-active {
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-log {
   max-height: 220px;
+}
+.session-window-grid.maximized .session-window.maximized .session-window-log {
+  max-height: none;
 }
 .session-window-jump-bottom {
   position: absolute;
@@ -14891,6 +14891,31 @@ function renderSessionIdentity(el, sessionId, options = {}) {
   el.setAttribute('aria-label', title);
 }
 
+function setSessionWindowPathElement(el, fullValue, compactValue, fallback, titleFallback) {
+  if (!el) return;
+  const full = compactSessionText(fullValue);
+  const compact = compactSessionText(compactValue) || full || fallback;
+  el.dataset.fullText = full || '';
+  el.dataset.compactText = compact || fallback;
+  el.dataset.fallbackText = fallback;
+  el.title = full || titleFallback;
+}
+
+function refreshSessionWindowPathElement(el, expanded) {
+  if (!el) return;
+  const full = el.dataset.fullText || '';
+  const compact = el.dataset.compactText || '';
+  const fallback = el.dataset.fallbackText || 'unknown';
+  el.textContent = expanded && full ? full : (compact || full || fallback);
+}
+
+function refreshSessionWindowPathLabels(win) {
+  if (!win) return;
+  const expanded = !win.headerCollapsed && !win.minimized;
+  refreshSessionWindowPathElement(win.project, expanded);
+  refreshSessionWindowPathElement(win.cwd, expanded);
+}
+
 function refreshSessionIdentityLabels(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -17728,18 +17753,28 @@ function ensureSessionWindow(sessionId, meta = {}) {
   title.className = 'session-window-title';
   const id = document.createElement('div');
   id.className = 'session-window-id';
-  renderSessionIdentity(id, sid, { order: 'id-name', showName: false, includeFullId: true });
+  renderSessionIdentity(id, sid, { order: 'id-name' });
   applySessionBadgeStyle(id, sid);
   const relationStrip = document.createElement('div');
   relationStrip.className = 'session-window-relation-strip hidden';
   const project = document.createElement('div');
   project.className = 'session-window-project';
-  project.textContent = meta.projectLabel || meta.projectRoot || 'unknown';
-  project.title = meta.projectRoot || 'Project directory not known yet';
+  setSessionWindowPathElement(
+    project,
+    meta.projectRoot,
+    meta.projectLabel,
+    'unknown',
+    'Project directory not known yet'
+  );
   const cwd = document.createElement('div');
   cwd.className = 'session-window-cwd';
-  cwd.textContent = meta.cwdLabel || meta.cwd || 'unknown';
-  cwd.title = meta.cwd || 'Working directory not known yet';
+  setSessionWindowPathElement(
+    cwd,
+    meta.cwd,
+    meta.cwdLabel,
+    'unknown',
+    'Working directory not known yet'
+  );
   const metaRow = document.createElement('div');
   metaRow.className = 'session-window-meta';
   metaRow.appendChild(id);
@@ -17957,21 +17992,42 @@ function updateSessionWindow(sessionId, meta = {}) {
     return;
   }
   win.metadataSignature = signature;
-  renderSessionIdentity(win.id, sid, { order: 'id-name', includeFullId: true });
+  renderSessionIdentity(win.id, sid, { order: 'id-name' });
   if (meta.projectRoot) {
-    win.project.textContent = meta.projectLabel || compactPathLabel(meta.projectRoot, true);
-    win.project.title = meta.projectRoot;
+    setSessionWindowPathElement(
+      win.project,
+      meta.projectRoot,
+      meta.projectLabel || compactPathLabel(meta.projectRoot, true),
+      'unknown',
+      'Project directory not known yet'
+    );
   } else {
-    win.project.textContent = 'unknown';
-    win.project.title = 'Project directory not known yet';
+    setSessionWindowPathElement(
+      win.project,
+      '',
+      '',
+      'unknown',
+      'Project directory not known yet'
+    );
   }
   if (meta.cwd) {
-    win.cwd.textContent = meta.cwdLabel || compactPathLabel(meta.cwd, true);
-    win.cwd.title = meta.cwd;
+    setSessionWindowPathElement(
+      win.cwd,
+      meta.cwd,
+      meta.cwdLabel || compactPathLabel(meta.cwd, true),
+      'unknown',
+      'Working directory not known yet'
+    );
   } else {
-    win.cwd.textContent = 'unknown';
-    win.cwd.title = 'Working directory not known yet';
+    setSessionWindowPathElement(
+      win.cwd,
+      '',
+      '',
+      'unknown',
+      'Working directory not known yet'
+    );
   }
+  refreshSessionWindowPathLabels(win);
   if (meta.task) {
     win.task.textContent = meta.task;
     win.task.title = meta.task;
@@ -18028,6 +18084,7 @@ function updateSessionWindowHeaderCollapseState(sessionId) {
   if (win.header) {
     win.header.title = collapsed ? 'Click header to expand' : 'Click header to collapse';
   }
+  refreshSessionWindowPathLabels(win);
 }
 
 function setSessionWindowHeaderCollapsed(sessionId, collapsed) {
@@ -18056,6 +18113,7 @@ function setSessionWindowMinimized(sessionId, minimized) {
     updateSessionWindowMaximizeState();
   }
   updateSessionWindowMinimizeState(sid);
+  refreshSessionWindowPathLabels(win);
   applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
 }
