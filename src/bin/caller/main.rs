@@ -2344,6 +2344,7 @@ fn codex_thread_action_capabilities() -> Vec<String> {
         "fast",
         "fork",
         "side",
+        "side-close",
         "undo",
         "review",
         "rename",
@@ -7051,10 +7052,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_thread_action_capabilities_cover_dashboard_goal_buttons() {
+    fn codex_thread_action_capabilities_cover_dashboard_actions() {
         let actions = codex_thread_action_capabilities();
         for action in [
             "fast",
+            "side-close",
             "goal",
             "goal-get",
             "goal-clear",

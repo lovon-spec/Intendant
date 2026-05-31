@@ -659,7 +659,7 @@ pub trait ExternalAgent: Send + Sync {
     }
 
     /// Dispatch a backend-specific thread action (Codex: compact, fork, side,
-    /// rollback, review, memory-reset; other backends currently reject).
+    /// side-close, rollback, review, memory-reset; other backends currently reject).
     /// Returns a short human-readable status message on success.
     async fn thread_action(
         &mut self,

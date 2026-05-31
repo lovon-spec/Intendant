@@ -12066,6 +12066,7 @@ function flushPendingDetachedCodexThreadActions(sessionId) {
 
 function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
+  const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-');
   if (!sid) {
     showControlToast('error', `/${op} needs a target Codex session`);
     return false;
@@ -12074,7 +12075,9 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
     showControlToast('error', `/${op} is not available in a /side window; use the parent thread`);
     return false;
   }
-  const actionState = sid ? codexThreadActionStateForSession(sid, op) : { allowed: true, reason: '' };
+  const actionState = options.internalSideClose && normalizedOp === 'side-close'
+    ? { allowed: true, reason: '' }
+    : (sid ? codexThreadActionStateForSession(sid, op) : { allowed: true, reason: '' });
   if (sid && !actionState.allowed) {
     showControlToast('error', `/${op} is not available here: ${actionState.reason}`);
     return false;
@@ -12082,7 +12085,7 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   if (
     sid &&
     sessionWindowIsSide(sid) &&
-    String(op || '').trim().toLowerCase().replace(/_/g, '-') === 'undo' &&
+    normalizedOp === 'undo' &&
     isSessionWindowEffectivelyActive(sid, currentPhase)
   ) {
     showControlToast('error', '/undo is available after the /side turn finishes or is stopped');
@@ -17093,10 +17096,12 @@ function sideCloseParamsForSession(sessionId) {
 function maybeDispatchSideClose(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
-  if (!sid || win?.ended) return;
+  if (!sid || win?.ended) return false;
   const close = sideCloseParamsForSession(sid);
-  if (!close) return;
-  dispatchCodexThreadAction('side-close', close.params, close.parentSessionId);
+  if (!close) return false;
+  return dispatchCodexThreadAction('side-close', close.params, close.parentSessionId, {
+    internalSideClose: true,
+  });
 }
 
 function removeSessionWindow(sessionId) {
@@ -17363,9 +17368,9 @@ function hideSessionWindowAction(sessionId) {
 function closeSideSessionWindowAction(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
-  maybeDispatchSideClose(sid);
-  removeSessionRelationshipsForSession(sid);
-  removeSessionWindow(sid);
+  if (maybeDispatchSideClose(sid)) {
+    showControlToast('info', `Closing side ${shortSessionId(sid)}`);
+  }
 }
 
 async function chooseSessionWindowCloseAction(sessionId) {

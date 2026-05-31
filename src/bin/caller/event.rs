@@ -955,6 +955,7 @@ pub enum ControlMsg {
     ///
     /// `params` is a free-form JSON object whose shape depends on `op`:
     /// `/fork` accepts `{"name": "..."}`, `/side` accepts `{"prompt": "..."}`,
+    /// `/side-close` accepts `{"threadId": "...", "parentThreadId": "..."}`,
     /// `/undo` accepts `{"turns": N}`, `/review` accepts `{"prompt": "..."}`, `/rename` accepts
     /// `{"name": "..."}`, `/goal` accepts `{"objective": "...",
     /// "tokenBudget": N, "status": "active|paused|budgetLimited|complete"}`,
