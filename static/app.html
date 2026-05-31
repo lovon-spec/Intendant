@@ -2395,6 +2395,12 @@ html, body {
   border-color: rgba(250, 179, 135, 0.45);
   background: rgba(250, 179, 135, 0.1);
 }
+@media (hover: none), (pointer: coarse) {
+  .log-entry.editable-user-message .log-edit-message {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
 .log-entry .log-content.log-markdown,
 .session-detail-logs .log-content.log-markdown {
   white-space: normal;
@@ -14662,13 +14668,19 @@ async function restorePersistedSessionWindow(record) {
     });
     if (!win) return;
     setSessionWindowDetached(sid, true, 'restored from browser state');
-    const params = new URLSearchParams({ source });
-    const resp = await authedFetch(`/api/session/${encodeURIComponent(sid)}?${params.toString()}`);
+    const detailSessionId = source !== 'intendant' && record.meta?.intendantSessionId
+      ? record.meta.intendantSessionId
+      : sid;
+    const detailSource = detailSessionId !== sid ? 'intendant' : source;
+    const params = new URLSearchParams({ source: detailSource });
+    const resp = await authedFetch(`/api/session/${encodeURIComponent(detailSessionId)}?${params.toString()}`);
     const data = await resp.json();
     if (!resp.ok || data?.error) return;
     applySessionRelationshipsFromSession(data);
     const entries = Array.isArray(data.entries) ? data.entries : [];
     if (!entries.length) return;
+    applySessionIdentitiesFromReplayEntries(entries);
+    applySessionGoalsFromReplayEntries(entries);
 
     resetSessionWindowLog(win);
     appendSessionWindowHistoryBatch(
@@ -32363,7 +32375,11 @@ function openSessionDetail(sessionOrId, taskArg) {
   document.getElementById('sd-frames').style.display = 'none';
   document.getElementById('session-detail-frames').innerHTML = '';
 
-  fetch('/api/session/' + encodeURIComponent(sessionId) + '?source=' + encodeURIComponent(source))
+  const detailSessionId = source !== 'intendant' && (session.intendant_session_id || session.intendantSessionId)
+    ? (session.intendant_session_id || session.intendantSessionId)
+    : sessionId;
+  const detailSource = detailSessionId !== sessionId ? 'intendant' : source;
+  fetch('/api/session/' + encodeURIComponent(detailSessionId) + '?source=' + encodeURIComponent(detailSource))
     .then(r => r.json())
     .then(data => {
       if (data.error) {
@@ -32371,6 +32387,8 @@ function openSessionDetail(sessionOrId, taskArg) {
         return;
       }
       const entries = data.entries || [];
+      applySessionIdentitiesFromReplayEntries(entries);
+      applySessionGoalsFromReplayEntries(entries);
       renderSessionDetailLogs(entries, logsEl);
       document.getElementById('sd-logs-badge').textContent = entries.length + ' entries';
 
@@ -32644,6 +32662,15 @@ function renderSessionDetailEntries(entries, el) {
   for (const e of entries) {
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
+    const source = e.source || '';
+    const displaySource = sourceLabels[source] || source || '\u2139';
+    const detailRecord = {
+      ...e,
+      level,
+      source,
+      session_id: e.session_id || currentSessionDetail?.backend_session_id || currentSessionDetail?.resume_id || currentSessionDetail?.session_id || '',
+      content: e.content || '',
+    };
 
     if (e.turn && e.turn !== lastTurn) {
       lastTurn = e.turn;
@@ -32655,8 +32682,19 @@ function renderSessionDetailEntries(entries, el) {
 
     const entry = document.createElement('div');
     entry.className = 'log-entry level-' + level;
-    const sourceClass = String(e.source || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    const sourceClass = String(source).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
     if (sourceClass) entry.classList.add('source-' + sourceClass);
+    if (detailRecord.session_id) entry.dataset.sessionId = detailRecord.session_id;
+    if (e.user_turn_index !== undefined && e.user_turn_index !== null) {
+      entry.dataset.userTurnIndex = String(e.user_turn_index);
+    }
+    if (e.user_turn_revision !== undefined && e.user_turn_revision !== null) {
+      entry.dataset.userTurnRevision = String(e.user_turn_revision);
+    }
+    if (e.superseded) {
+      entry.classList.add('superseded');
+      entry.dataset.superseded = 'true';
+    }
 
     const ts = document.createElement('span');
     ts.className = 'log-ts';
@@ -32666,12 +32704,12 @@ function renderSessionDetailEntries(entries, el) {
 
     const lvl = document.createElement('span');
     lvl.className = 'log-level';
-    lvl.textContent = sourceLabels[e.source] || e.source || '\u2139';
+    lvl.textContent = displaySource;
     lvl.style.color = levelColors[level] || 'var(--text)';
 
-    if (isDiffLog({ level, source: e.source || '', content: e.content || '' })) {
+    if (isDiffLog({ level, source, content: detailRecord.content })) {
       entry.classList.add('diff-log-entry');
-      const parsed = parseUnifiedDiff(diffLogContent({ source: e.source || '', content: e.content || '' }));
+      const parsed = parseUnifiedDiff(diffLogContent({ source, content: detailRecord.content }));
       const wrap = document.createElement('span');
       wrap.className = 'log-content diff-log-wrap';
       const summary = document.createElement('span');
@@ -32698,17 +32736,19 @@ function renderSessionDetailEntries(entries, el) {
     cnt.className = 'log-content';
     renderLogContentElement(cnt, {
       level,
-      source: sourceLabels[e.source] || e.source || '\u2139',
-      content: e.content || ''
+      source: displaySource,
+      content: detailRecord.content
     });
+    appendLogStateBadges(cnt, detailRecord);
     if (levelColors[level]) cnt.style.color = levelColors[level];
 
     entry.appendChild(ts);
     entry.appendChild(lvl);
     entry.appendChild(cnt);
+    appendEditUserMessageButton(entry, detailRecord);
 
     // Collapsible for long entries
-    const content = e.content || '';
+    const content = detailRecord.content;
     if (content.split('\n').length > 3 || content.length > 300) {
       cnt.style.maxHeight = '1.5em';
       cnt.style.overflow = 'hidden';
@@ -32718,7 +32758,8 @@ function renderSessionDetailEntries(entries, el) {
       toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up" style="display:none">\u25BE less</span>';
       toggle.style.cssText = 'color:var(--blue);font-size:11px;flex-shrink:0;padding:2px 6px;cursor:pointer;';
       entry.appendChild(toggle);
-      entry.addEventListener('click', () => {
+      entry.addEventListener('click', (event) => {
+        if (event.target?.closest?.('.log-edit-message')) return;
         const expanded = cnt.style.maxHeight === 'none';
         cnt.style.maxHeight = expanded ? '1.5em' : 'none';
         cnt.style.overflow = expanded ? 'hidden' : 'visible';

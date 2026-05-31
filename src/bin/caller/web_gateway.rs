@@ -1540,7 +1540,9 @@ fn replay_jsonl_to_outbound_entries(
     entries
 }
 
-fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {
+fn external_backend_session_from_replay(contents: &str) -> Option<(String, String)> {
+    let mut found_source: Option<String> = None;
+    let mut found_id: Option<String> = None;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -1562,10 +1564,37 @@ fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {
                     .and_then(|v| v.as_str())
                     .and_then(clean_external_thread_id)
                 {
-                    return Some(id);
+                    return Some((source, id));
                 }
             }
         }
+        if let Some(message) = entry_json.get("message").and_then(|v| v.as_str()) {
+            if found_source.is_none() {
+                found_source = external_agent_source_from_message(message);
+            }
+            if found_id.is_none() {
+                found_id = external_agent_thread_id_from_message(message);
+            }
+            if let (Some(source), Some(id)) = (found_source.as_ref(), found_id.as_ref()) {
+                return Some((source.clone(), id.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {
+    if let Some((_, id)) = external_backend_session_from_replay(contents) {
+        return Some(id);
+    }
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if let Some(message) = entry_json.get("message").and_then(|v| v.as_str()) {
             if let Some(id) = external_agent_thread_id_from_message(message) {
                 return Some(id);
@@ -1573,6 +1602,139 @@ fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn home_from_intendant_log_dir(log_dir: &std::path::Path) -> Option<PathBuf> {
+    let logs_dir = log_dir.parent()?;
+    if logs_dir.file_name().and_then(|name| name.to_str()) != Some("logs") {
+        return None;
+    }
+    let intendant_dir = logs_dir.parent()?;
+    if intendant_dir.file_name().and_then(|name| name.to_str()) != Some(".intendant") {
+        return None;
+    }
+    intendant_dir.parent().map(Path::to_path_buf)
+}
+
+fn annotate_replay_user_turns_from_external_transcript(
+    entries: &mut [serde_json::Value],
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) {
+    let Some(transcript) = external_session_entries_from_home(home, source, session_id) else {
+        return;
+    };
+    let user_turns: Vec<serde_json::Value> = transcript
+        .into_iter()
+        .filter(|entry| entry.get("source").and_then(|v| v.as_str()) == Some("user"))
+        .filter(|entry| {
+            entry
+                .get("user_turn_index")
+                .and_then(|v| v.as_u64())
+                .is_some()
+                && entry
+                    .get("user_turn_revision")
+                    .and_then(|v| v.as_u64())
+                    .is_some()
+        })
+        .collect();
+    if user_turns.is_empty() {
+        return;
+    }
+
+    let mut next_user_turn = 0usize;
+    for entry in entries {
+        if entry.get("event").and_then(|v| v.as_str()) != Some("log_entry") {
+            continue;
+        }
+        if entry.get("session_id").and_then(|v| v.as_str()) != Some(session_id) {
+            continue;
+        }
+        let source = entry
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if source != "user" {
+            continue;
+        }
+        let content = entry
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        let Some((matched_offset, turn)) =
+            user_turns[next_user_turn..]
+                .iter()
+                .enumerate()
+                .find(|(_, turn)| {
+                    turn.get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|candidate| candidate.trim() == content)
+                        .unwrap_or(false)
+                })
+        else {
+            continue;
+        };
+        next_user_turn += matched_offset + 1;
+
+        if let Some(obj) = entry.as_object_mut() {
+            for key in [
+                "user_turn_index",
+                "user_turn_revision",
+                "replacement_for_user_turn_index",
+                "superseded",
+                "superseded_reason",
+            ] {
+                if let Some(value) = turn.get(key) {
+                    obj.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
+}
+
+fn session_log_replay_entries_from_dir(
+    log_dir: &std::path::Path,
+) -> Option<(Vec<serde_json::Value>, Option<String>)> {
+    let session_jsonl = log_dir.join("session.jsonl");
+    let contents = std::fs::read_to_string(&session_jsonl).ok()?;
+    let external_session = external_backend_session_from_replay(&contents);
+    let external_session_id = external_session
+        .as_ref()
+        .map(|(_, id)| id.clone())
+        .or_else(|| external_backend_session_id_from_replay(&contents));
+    let mut entries = replay_jsonl_to_outbound_entries(&contents, log_dir);
+    if let Some((source, session_id)) = external_session.as_ref() {
+        let home = home_from_intendant_log_dir(log_dir).unwrap_or_else(crate::platform::home_dir);
+        annotate_replay_user_turns_from_external_transcript(
+            &mut entries,
+            &home,
+            source,
+            session_id,
+        );
+    }
+    Some((entries, external_session_id))
+}
+
+fn session_log_replay_payload_from_dir(
+    log_dir: &std::path::Path,
+) -> Option<(String, Option<String>)> {
+    let (entries, external_session_id) = session_log_replay_entries_from_dir(log_dir)?;
+    Some((
+        serde_json::json!({
+            "t": "log_replay",
+            "entries": entries,
+        })
+        .to_string(),
+        external_session_id,
+    ))
 }
 
 fn replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
@@ -1598,15 +1760,7 @@ fn session_log_id(session_log: &Arc<Mutex<crate::session_log::SessionLog>>) -> O
 }
 
 fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
-    let session_jsonl = log_dir.join("session.jsonl");
-    let contents = std::fs::read_to_string(&session_jsonl).ok()?;
-    Some(
-        serde_json::json!({
-            "t": "log_replay",
-            "entries": replay_jsonl_to_outbound_entries(&contents, log_dir),
-        })
-        .to_string(),
-    )
+    session_log_replay_payload_from_dir(log_dir).map(|(payload, _)| payload)
 }
 
 fn agent_output_chunks_with_fallback(
@@ -2017,6 +2171,13 @@ fn resume_session_activity_replay_from_home(
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .unwrap_or(session_id);
+    if let Some(log_dir) = intendant_session_dir_from_home(home, session_id) {
+        if let Some((payload, external_id)) = session_log_replay_payload_from_dir(&log_dir) {
+            if external_id.as_deref() == Some(replay_id) {
+                return Some(payload);
+            }
+        }
+    }
     external_session_activity_replay_from_home_with_attach(
         home,
         &source_norm,
@@ -2505,12 +2666,9 @@ fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
 
-    let jsonl_path = session_dir.join("session.jsonl");
-    let entries = if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
-        replay_jsonl_to_outbound_entries(&contents, &session_dir)
-    } else {
-        Vec::new()
-    };
+    let entries = session_log_replay_entries_from_dir(&session_dir)
+        .map(|(entries, _)| entries)
+        .unwrap_or_default();
 
     // Check for screenshot frames
     let frames_dir = session_dir.join("frames");
@@ -10417,8 +10575,14 @@ pub fn spawn_web_gateway(
                                     sl.lock().ok().map(|log| log.dir().to_path_buf())
                                 })
                             });
+                    let mut replayed_external_session_ids: HashSet<String> = HashSet::new();
                     if let Some(ref log_dir) = replay_log_dir {
-                        if let Some(replay) = session_log_replay_from_dir(log_dir) {
+                        if let Some((replay, external_session_id)) =
+                            session_log_replay_payload_from_dir(log_dir)
+                        {
+                            if let Some(external_session_id) = external_session_id {
+                                replayed_external_session_ids.insert(external_session_id);
+                            }
                             let _ = direct_tx.send(replay);
                         }
                     }
@@ -10438,6 +10602,9 @@ pub fn spawn_web_gateway(
                             .unwrap_or_default();
                     active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
                     for (session_id, source) in active_external_sessions {
+                        if replayed_external_session_ids.contains(&session_id) {
+                            continue;
+                        }
                         if let Some(replay) = external_session_activity_replay(
                             &source,
                             &session_id,
@@ -21826,6 +21993,99 @@ mod tests {
             user_row.get("session_id").and_then(|v| v.as_str()),
             Some(backend_id)
         );
+    }
+
+    #[test]
+    fn resume_external_wrapper_replays_full_log_with_editable_user_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let log_dir = home.join(".intendant").join("logs").join("wrapper-session");
+        let backend_id = "019e598b-editable-wrapper-replay";
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.session_started("wrapper-session", Some("external task"));
+        log.session_identity("wrapper-session", "codex", backend_id);
+        log.info("Mode: external agent (Codex)");
+        log.info("[user] first prompt");
+        log.info("full wrapper-only event");
+        log.info("[user] second prompt");
+        drop(log);
+
+        let codex_dir = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join(format!("rollout-2026-05-17T16-48-52-{backend_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": backend_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "first prompt" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:50:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "assistant reply" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:51:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "second prompt" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay = resume_session_activity_replay_from_home(
+            home,
+            "codex",
+            "wrapper-session",
+            Some(backend_id),
+            None,
+            EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+        )
+        .expect("wrapper session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry" && entry["content"] == "full wrapper-only event"
+        }));
+        let first_prompt = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "first prompt")
+            .expect("first prompt should replay from wrapper log");
+        assert_eq!(first_prompt["session_id"], backend_id);
+        assert_eq!(first_prompt["user_turn_index"], 1);
+        assert_eq!(first_prompt["user_turn_revision"], 1);
+        let second_prompt = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "second prompt")
+            .expect("second prompt should replay from wrapper log");
+        assert_eq!(second_prompt["user_turn_index"], 2);
+        assert_eq!(second_prompt["user_turn_revision"], 1);
+
+        let detail: serde_json::Value =
+            serde_json::from_str(&get_session_detail_from_home(home, "wrapper-session")).unwrap();
+        let detail_entries = detail["entries"].as_array().unwrap();
+        let detail_prompt = detail_entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "first prompt")
+            .expect("session detail should expose editable wrapper prompt");
+        assert_eq!(detail_prompt["session_id"], backend_id);
+        assert_eq!(detail_prompt["user_turn_index"], 1);
+        assert_eq!(detail_prompt["user_turn_revision"], 1);
     }
 
     #[test]
