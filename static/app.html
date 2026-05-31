@@ -5725,6 +5725,11 @@ body.context-focus-active {
   flex-shrink: 0;
 }
 .shared-view-banner.hidden { display: none; }
+.shared-view-banner-compact {
+  border-top: 1px solid color-mix(in srgb, var(--blue) 30%, var(--surface0));
+  border-bottom-color: var(--surface0);
+  padding: 6px 12px;
+}
 .shared-view-kicker {
   color: var(--blue);
   font-weight: 700;
@@ -7521,6 +7526,14 @@ body.display-fullscreen-open {
               <span>Displays (<span id="strip-count">0</span>)</span>
               <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
             </div>
+            <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner" data-shared-view-banner>
+              <span class="shared-view-kicker">Shared view</span>
+              <span class="shared-view-message" data-shared-view-message></span>
+              <span class="shared-view-actions">
+                <button class="shared-view-action" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
+                <button class="shared-view-close" type="button" data-shared-view-close title="Hide shared view">&times;</button>
+              </span>
+            </div>
             <div class="activity-display-row" id="activity-display-row"></div>
           </div>
           <div class="activity-split-handle hidden" id="activity-split-handle"></div>
@@ -8165,12 +8178,12 @@ body.display-fullscreen-open {
           <div class="subtitle">A dialog should be visible on the guest desktop — approve it to start the video stream.</div>
         </div>
       </div>
-      <div class="shared-view-banner hidden" id="shared-view-banner">
+      <div class="shared-view-banner hidden" id="shared-view-banner" data-shared-view-banner>
         <span class="shared-view-kicker">Shared view</span>
-        <span class="shared-view-message" id="shared-view-message"></span>
+        <span class="shared-view-message" id="shared-view-message" data-shared-view-message></span>
         <span class="shared-view-actions">
-          <button class="shared-view-action" id="shared-view-take-input" type="button" style="display:none" title="Take input authority for the focused display">Take input</button>
-          <button class="shared-view-close" type="button" id="shared-view-close" title="Hide shared view">&times;</button>
+          <button class="shared-view-action" id="shared-view-take-input" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
+          <button class="shared-view-close" type="button" id="shared-view-close" data-shared-view-close title="Hide shared view">&times;</button>
         </span>
       </div>
       <div class="displays-container" id="displays-container">
@@ -19568,10 +19581,12 @@ function wireShellKeybar() {
 document.addEventListener('DOMContentLoaded', wireShellKeybar);
 document.addEventListener('DOMContentLoaded', syncTerminalPaneAccessibility);
 document.addEventListener('DOMContentLoaded', () => {
-  const close = document.getElementById('shared-view-close');
-  if (close) close.addEventListener('click', hideSharedView);
-  const takeInput = document.getElementById('shared-view-take-input');
-  if (takeInput) takeInput.addEventListener('click', takeSharedViewInput);
+  document.querySelectorAll('[data-shared-view-close]').forEach(btn => {
+    btn.addEventListener('click', hideSharedView);
+  });
+  document.querySelectorAll('[data-shared-view-take-input]').forEach(btn => {
+    btn.addEventListener('click', takeSharedViewInput);
+  });
 });
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
@@ -20554,12 +20569,17 @@ function renderSharedViewFocus(slot, region, note) {
 }
 
 function updateSharedViewBanner() {
-  const banner = document.getElementById('shared-view-banner');
-  const message = document.getElementById('shared-view-message');
-  const takeInput = document.getElementById('shared-view-take-input');
-  if (!banner || !message) return;
-  banner.classList.toggle('hidden', !sharedViewState.visible);
-  if (!sharedViewState.visible) return;
+  const banners = Array.from(document.querySelectorAll('[data-shared-view-banner]'));
+  if (!banners.length) return;
+  for (const banner of banners) {
+    banner.classList.toggle('hidden', !sharedViewState.visible);
+  }
+  if (!sharedViewState.visible) {
+    document.querySelectorAll('[data-shared-view-take-input]').forEach(btn => {
+      btn.style.display = 'none';
+    });
+    return;
+  }
   const target = sharedViewState.displayId !== null
     ? ':' + sharedViewState.displayId
     : (sharedViewState.displayTarget || 'display');
@@ -20571,13 +20591,16 @@ function updateSharedViewBanner() {
       : sharedViewState.action === 'capture'
         ? 'Captured'
         : 'Viewing';
-  message.textContent = detail ? `${action} ${target}: ${detail}` : `${action} ${target}`;
-  if (takeInput) {
+  const text = detail ? `${action} ${target}: ${detail}` : `${action} ${target}`;
+  document.querySelectorAll('[data-shared-view-message]').forEach(message => {
+    message.textContent = text;
+  });
+  document.querySelectorAll('[data-shared-view-take-input]').forEach(takeInput => {
     const canTake = sharedViewState.action === 'input_request'
       && sharedViewState.displayId !== null
       && displaySlots.has(sharedViewState.displayId);
     takeInput.style.display = canTake ? '' : 'none';
-  }
+  });
 }
 
 function applySharedViewToSlot(slot) {
@@ -20592,6 +20615,12 @@ function applySharedViewToSlot(slot) {
     requestAnimationFrame(() => {
       try { slot.el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
     });
+  } else if (activeTab === 'activity' && activeActivitySubtab === 'log') {
+    setDisplayStripExpanded(true);
+    requestAnimationFrame(() => {
+      const strip = document.getElementById('activity-display-strip');
+      try { if (strip) strip.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
+    });
   }
 }
 
@@ -20601,6 +20630,10 @@ function hideSharedView() {
   sharedViewState.region = null;
   updateSharedViewBanner();
   clearSharedViewDecorations();
+  if (displayThumbs.size === 0) {
+    const strip = document.getElementById('activity-display-strip');
+    if (strip) strip.classList.add('hidden');
+  }
 }
 
 function takeSharedViewInput() {
@@ -20625,7 +20658,13 @@ function handleSharedViewEvent(evt) {
 
   clearSharedViewDecorations();
   updateSharedViewBanner();
-  routeTo('displays');
+  if (activeTab !== 'displays' && (activeTab !== 'activity' || activeActivitySubtab !== 'log')) {
+    routeTo('activity', 'log');
+  }
+  const activityStrip = document.getElementById('activity-display-strip');
+  if (activeTab === 'activity' && activeActivitySubtab === 'log' && activityStrip) {
+    activityStrip.classList.remove('hidden');
+  }
   const slot = sharedViewState.displayId !== null
     ? displaySlots.get(sharedViewState.displayId)
     : displaySlots.values().next().value;
@@ -20739,10 +20778,14 @@ function relocateDisplays(tabId) {
 }
 
 function toggleDisplayStrip() {
+  setDisplayStripExpanded(!stripExpanded);
+}
+
+function setDisplayStripExpanded(wantExpanded) {
   const strip = document.getElementById('activity-display-strip');
   const handle = document.getElementById('activity-split-handle');
   const toggle = document.getElementById('strip-toggle');
-  stripExpanded = !stripExpanded;
+  stripExpanded = !!wantExpanded;
 
   if (stripExpanded) {
     strip.classList.add('expanded');
@@ -20757,7 +20800,6 @@ function toggleDisplayStrip() {
     toggle.innerHTML = '&#x25BE;';
     toggle.title = 'Expand displays';
   }
-
 }
 
 // ── Activity display strip split-drag ──

@@ -4625,6 +4625,32 @@ fn shared_view_target_label(display_id: Option<u32>, display_target: Option<&str
         .unwrap_or_else(|| "default display".to_string())
 }
 
+fn shared_view_user_display_id(
+    display_target: Option<&str>,
+    display_id: Option<u32>,
+    explicit_display_id: bool,
+) -> Option<u32> {
+    if explicit_display_id {
+        return display_id;
+    }
+    let Some(target) = display_target
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return Some(0);
+    };
+    if target.eq_ignore_ascii_case("user_session")
+        || target.eq_ignore_ascii_case("user")
+        || target.eq_ignore_ascii_case("primary")
+        || target == ":0"
+        || target == "0"
+        || target.eq_ignore_ascii_case("display_0")
+    {
+        return Some(0);
+    }
+    None
+}
+
 #[tool_router]
 impl IntendantServer {
     #[tool(
@@ -5513,14 +5539,51 @@ impl IntendantServer {
         format!("shared view {} requested for {}{}", action, target, detail)
     }
 
+    async fn ensure_shared_view_display_active(
+        &self,
+        display_target: Option<&str>,
+        display_id: Option<u32>,
+        explicit_display_id: bool,
+    ) {
+        let Some(display_id) =
+            shared_view_user_display_id(display_target, display_id, explicit_display_id)
+        else {
+            return;
+        };
+
+        let (autonomy, session_registry) = {
+            let state = self.state.read().await;
+            (state.autonomy.clone(), state.session_registry.clone())
+        };
+        if let Some(registry) = session_registry {
+            if registry.read().await.get(display_id).is_some() {
+                return;
+            }
+        }
+
+        {
+            let mut guard = autonomy.write().await;
+            guard.user_display_granted = true;
+        }
+        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+        self.bus.send(AppEvent::UserDisplayGranted { display_id });
+    }
+
     async fn show_shared_view_for_session(
         &self,
         params: ShowSharedViewParams,
         session_id: Option<&str>,
     ) -> String {
+        let explicit_display_id = params.display_id.is_some();
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
         let region = params.focus_region.map(normalize_shared_view_region);
+        self.ensure_shared_view_display_active(
+            display_target.as_deref(),
+            display_id,
+            explicit_display_id,
+        )
+        .await;
         self.emit_shared_view(
             session_id,
             "show",
@@ -5534,7 +5597,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Open or foreground the dashboard shared display view for agent-human collaboration. This does not grant input authority; it asks connected dashboards to show the relevant display and optional focus region."
+        description = "Open the dashboard shared display view for agent-human collaboration. For user_session/:0 targets, this also requests display-stream activation. This does not grant input authority; it asks connected dashboards to show the relevant display and optional focus region."
     )]
     async fn show_shared_view(
         &self,
@@ -5565,8 +5628,15 @@ impl IntendantServer {
         params: FocusSharedViewParams,
         session_id: Option<&str>,
     ) -> String {
+        let explicit_display_id = params.display_id.is_some();
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.ensure_shared_view_display_active(
+            display_target.as_deref(),
+            display_id,
+            explicit_display_id,
+        )
+        .await;
         self.emit_shared_view(
             session_id,
             "focus",
@@ -5580,7 +5650,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Highlight a normalized region in the dashboard shared display view. Use this to point the user at a specific UI element or area."
+        description = "Highlight a normalized region in the dashboard shared display view. For user_session/:0 targets, this also requests display-stream activation. Use this to point the user at a specific UI element or area."
     )]
     async fn focus_shared_view(
         &self,
@@ -5594,8 +5664,15 @@ impl IntendantServer {
         params: RequestSharedViewInputParams,
         session_id: Option<&str>,
     ) -> String {
+        let explicit_display_id = params.display_id.is_some();
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.ensure_shared_view_display_active(
+            display_target.as_deref(),
+            display_id,
+            explicit_display_id,
+        )
+        .await;
         self.emit_shared_view(
             session_id,
             "input_request",
@@ -5609,7 +5686,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Ask the dashboard user to take input authority for the shared display. This is advisory: the user must click the dashboard control before keyboard/mouse input is granted."
+        description = "Ask the dashboard user to take input authority for the shared display. For user_session/:0 targets, this also requests display-stream activation. This is advisory: the user must click the dashboard control before keyboard/mouse input is granted."
     )]
     async fn request_shared_view_input(
         &self,
@@ -5624,8 +5701,15 @@ impl IntendantServer {
         params: CaptureSharedViewFrameParams,
         session_id: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
+        let explicit_display_id = params.display_id.is_some();
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.ensure_shared_view_display_active(
+            display_target.as_deref(),
+            display_id,
+            explicit_display_id,
+        )
+        .await;
         self.emit_shared_view(
             session_id,
             "capture",
@@ -6772,6 +6856,61 @@ mod tests {
                 }
                 other => panic!("expected SharedView event, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn shared_view_user_session_requests_display_activation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(test_state(), bus.clone());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "show_shared_view",
+                    serde_json::json!({
+                        "display_target": "user_session",
+                        "reason": "show the user's screen"
+                    }),
+                    Some("session-a"),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch");
+            assert!(!result.is_error.unwrap_or(false));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                    assert_eq!(display_id, 0);
+                }
+                other => panic!("expected UserDisplayGranted event, got {other:?}"),
+            }
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::SharedView {
+                    session_id,
+                    action,
+                    display_target,
+                    display_id,
+                    ..
+                })) => {
+                    assert_eq!(session_id.as_deref(), Some("session-a"));
+                    assert_eq!(action, "show");
+                    assert_eq!(display_target.as_deref(), Some("user_session"));
+                    assert_eq!(display_id, Some(0));
+                }
+                other => panic!("expected SharedView event, got {other:?}"),
+            }
+            assert_eq!(
+                std::env::var("INTENDANT_USER_DISPLAY_GRANTED").as_deref(),
+                Ok("1")
+            );
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
 

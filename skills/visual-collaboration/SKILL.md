@@ -9,7 +9,7 @@ Use this skill when work benefits from a shared visual surface with the user: UI
 
 ## Core Tools
 
-- `show_shared_view`: foregrounds the dashboard Video tab and marks the relevant display as the shared view.
+- `show_shared_view`: opens the shared display surface and marks the relevant display as the shared view. For `user_session` / `:0`, this also requests display-stream activation.
 - `focus_shared_view`: highlights a normalized region `{x, y, width, height}` on the shared display. Coordinates are fractions from 0.0 to 1.0.
 - `capture_shared_view_frame`: captures the current display as an MCP image and foregrounds the same dashboard view.
 - `request_shared_view_input`: asks the user to take input authority. The user must click the dashboard control; the tool does not grant control by itself.
@@ -17,7 +17,7 @@ Use this skill when work benefits from a shared visual surface with the user: UI
 
 ## Workflow
 
-1. Call `show_shared_view` before work the user should watch or participate in.
+1. Call `show_shared_view` before work the user should watch or participate in. Prefer `display_target: "user_session"` when you mean the user's host screen.
 2. Use `focus_shared_view` whenever you reference a specific UI area. Keep notes short and concrete.
 3. Use `capture_shared_view_frame` when you need to reason about the current pixels.
 4. Use `request_shared_view_input` only when the user needs to type, approve auth, choose from an account picker, or otherwise act directly.
