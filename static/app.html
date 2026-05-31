@@ -922,15 +922,14 @@ html, body {
   color: var(--green);
 }
 
-/* ── Activity Toolbar ── */
-.activity-toolbar {
+/* ── Activity Log Controls ── */
+.activity-subtab-controls {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  background: var(--mantle);
-  border-bottom: 1px solid var(--surface0);
-  flex-shrink: 0;
+  gap: 6px;
+  margin-left: auto;
+  min-width: max-content;
+  padding: 0 4px 4px 8px;
 }
 .verbosity-select,
 .host-filter-select {
@@ -943,8 +942,8 @@ html, body {
   font-size: 11px;
   cursor: pointer;
 }
-.verbosity-select { margin-left: auto; }
-.host-filter-select { margin-left: 6px; }
+.verbosity-select,
+.host-filter-select { margin-left: 0; }
 .verbosity-select:focus,
 .host-filter-select:focus { outline: none; border-color: var(--blue); }
 
@@ -6107,16 +6106,20 @@ body.display-fullscreen-open {
 .activity-display-header:hover {
   background: var(--surface0);
 }
+.strip-minimize-btn,
 .strip-toggle-btn {
-  margin-left: auto;
   background: none;
   border: none;
   color: var(--overlay1);
   cursor: pointer;
   font-size: 12px;
+  min-width: 26px;
   padding: 2px 8px;
   border-radius: 3px;
 }
+.strip-minimize-btn { margin-left: auto; }
+.strip-toggle-btn { margin-left: 2px; }
+.strip-minimize-btn:hover,
 .strip-toggle-btn:hover { color: var(--text); background: var(--surface0); }
 .activity-display-row {
   display: flex;
@@ -6131,6 +6134,13 @@ body.display-fullscreen-open {
   height: auto;
   padding-bottom: 0;
   min-height: 0;
+}
+.activity-display-strip.minimized .shared-view-banner,
+.activity-display-strip.minimized .activity-display-row {
+  display: none;
+}
+.activity-display-strip.minimized .strip-toggle-btn {
+  display: none;
 }
 .activity-display-thumb {
   flex: 1;
@@ -7150,9 +7160,11 @@ body.display-fullscreen-open {
     padding-left: 8px;
     padding-right: 8px;
   }
-  .activity-toolbar {
-    flex-wrap: wrap;
-    align-items: center;
+  .activity-subtab-controls {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+    margin-left: 0;
+    padding: 0 4px 4px;
   }
   .shared-view-banner {
     align-items: flex-start;
@@ -7589,20 +7601,19 @@ body.display-fullscreen-open {
           Changes <span class="badge" id="badge-changes" style="display:none"></span>
         </button>
         <button class="subtab-btn" data-activity-tab="control">Control</button>
+        <div class="activity-subtab-controls" id="activity-log-controls">
+          <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
+            <option value="normal" selected>Normal</option>
+            <option value="verbose">Verbose</option>
+            <option value="debug">Debug</option>
+          </select>
+          <select class="host-filter-select" id="host-filter-select" title="Filter activity by source host" style="display:none">
+            <option value="">All hosts</option>
+          </select>
+        </div>
       </div>
       <div class="subtab-panes">
         <div class="subtab-pane active" id="activity-log-pane">
-          <div class="activity-toolbar">
-            <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
-              <option value="normal" selected>Normal</option>
-              <option value="verbose">Verbose</option>
-              <option value="debug">Debug</option>
-            </select>
-            <select class="host-filter-select" id="host-filter-select" title="Filter activity by source host" style="display:none">
-              <option value="">All hosts</option>
-            </select>
-          </div>
-
           <!-- Pending attachments bar (frames the user has Attached but not yet sent) -->
           <div class="pending-attachments-bar hidden" id="pending-attachments-bar">
             <span class="pending-attachments-label">Attachments</span>
@@ -7615,6 +7626,7 @@ body.display-fullscreen-open {
           <div class="activity-display-strip hidden" id="activity-display-strip">
             <div class="activity-display-header">
               <span>Displays (<span id="strip-count">0</span>)</span>
+              <button class="strip-minimize-btn" id="strip-minimize" type="button" title="Minimize displays" aria-label="Minimize displays" aria-pressed="false">&minus;</button>
               <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
             </div>
             <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner" data-shared-view-banner>
@@ -9652,6 +9664,7 @@ const pendingAuthorityStates = new Map();
 // Activity display strip
 const displayThumbs = new Map();
 let stripExpanded = false;
+let stripMinimized = false;
 let stripHeight = 280;
 
 // Recording replay
@@ -21173,6 +21186,9 @@ function removeDisplayThumb(displayId) {
   displayThumbs.delete(displayId);
   document.getElementById('strip-count').textContent = displayThumbs.size;
   if (displayThumbs.size === 0) {
+    stripExpanded = false;
+    stripMinimized = false;
+    applyDisplayStripState();
     document.getElementById('activity-display-strip').classList.add('hidden');
   }
 }
@@ -21200,27 +21216,58 @@ function relocateDisplays(tabId) {
 }
 
 function toggleDisplayStrip() {
+  if (stripMinimized) {
+    setDisplayStripMinimized(false);
+    return;
+  }
   setDisplayStripExpanded(!stripExpanded);
 }
 
 function setDisplayStripExpanded(wantExpanded) {
+  stripExpanded = !!wantExpanded;
+  stripMinimized = false;
+  applyDisplayStripState();
+}
+
+function setDisplayStripMinimized(wantMinimized) {
+  stripMinimized = !!wantMinimized;
+  applyDisplayStripState();
+}
+
+function applyDisplayStripState() {
   const strip = document.getElementById('activity-display-strip');
   const handle = document.getElementById('activity-split-handle');
   const toggle = document.getElementById('strip-toggle');
-  stripExpanded = !!wantExpanded;
+  const minimize = document.getElementById('strip-minimize');
+  if (!strip || !handle || !toggle) return;
 
-  if (stripExpanded) {
-    strip.classList.add('expanded');
+  strip.classList.toggle('minimized', stripMinimized);
+  strip.classList.toggle('expanded', stripExpanded && !stripMinimized);
+
+  if (stripMinimized) {
+    strip.style.height = '';
+    handle.classList.add('hidden');
+  } else if (stripExpanded) {
     strip.style.height = stripHeight + 'px';
     handle.classList.remove('hidden');
+  } else {
+    strip.style.height = '';
+    handle.classList.add('hidden');
+  }
+
+  if (stripExpanded) {
     toggle.innerHTML = '&#x25B4;';
     toggle.title = 'Collapse displays';
   } else {
-    strip.classList.remove('expanded');
-    strip.style.height = '';
-    handle.classList.add('hidden');
     toggle.innerHTML = '&#x25BE;';
     toggle.title = 'Expand displays';
+  }
+
+  if (minimize) {
+    minimize.innerHTML = stripMinimized ? '+' : '&minus;';
+    minimize.title = stripMinimized ? 'Restore displays' : 'Minimize displays';
+    minimize.setAttribute('aria-label', minimize.title);
+    minimize.setAttribute('aria-pressed', stripMinimized ? 'true' : 'false');
   }
 }
 
@@ -21232,7 +21279,7 @@ function setDisplayStripExpanded(wantExpanded) {
   let dragging = false;
 
   handle.addEventListener('mousedown', (e) => {
-    if (!stripExpanded) return;
+    if (!stripExpanded || stripMinimized) return;
     dragging = true;
     handle.classList.add('dragging');
     document.body.style.cursor = 'row-resize';
@@ -25588,6 +25635,7 @@ function switchActivitySubtab(name) {
   document.getElementById('activity-managed-pane').classList.toggle('active', name === 'managed');
   document.getElementById('activity-changes-pane').classList.toggle('active', name === 'changes');
   document.getElementById('activity-control-pane').classList.toggle('active', name === 'control');
+  document.getElementById('activity-log-controls')?.classList.toggle('hidden', name !== 'log');
   syncSessionWindowGridControls();
   if (name === 'context') {
     renderContextPane();
@@ -35048,6 +35096,10 @@ document.getElementById('sb-hosts-group').addEventListener('click', () => {
 // Toggle display strip — header click or button click
 document.getElementById('activity-display-strip').querySelector('.activity-display-header')
   .addEventListener('click', toggleDisplayStrip);
+document.getElementById('strip-minimize')?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setDisplayStripMinimized(!stripMinimized);
+});
 
 // Drag handle for display strip resize
 (function() {
@@ -35058,7 +35110,7 @@ document.getElementById('activity-display-strip').querySelector('.activity-displ
   let startH = 0;
 
   handle.addEventListener('mousedown', (e) => {
-    if (!stripExpanded) return;
+    if (!stripExpanded || stripMinimized) return;
     dragging = true;
     startY = e.clientY;
     startH = strip.offsetHeight;
