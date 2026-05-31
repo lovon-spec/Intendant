@@ -16424,7 +16424,7 @@ function sessionWindowIsSubagent(sessionId) {
 }
 
 function sessionWindowShouldStartHeaderCollapsed(meta = {}) {
-  return String(meta.relationshipKind || '').trim().toLowerCase() === 'subagent';
+  return true;
 }
 
 const SESSION_WINDOW_BOTTOM_THRESHOLD_PX = 28;
