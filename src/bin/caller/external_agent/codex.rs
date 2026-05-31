@@ -2030,7 +2030,7 @@ fn codex_context_summary_parts(payload: &serde_json::Value) -> Vec<serde_json::V
     parts
 }
 
-fn codex_context_archive_payload(
+pub(crate) fn codex_context_archive_payload(
     payload: serde_json::Value,
     request_id: &str,
     request_index: u64,

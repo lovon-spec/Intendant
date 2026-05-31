@@ -23669,6 +23669,8 @@ let contextFocusMode = false;
 let contextRawOpen = false;
 let contextRawRenderedKey = null;
 let contextRenderScheduled = false;
+const contextSnapshotExactFetches = new Map();
+const contextSnapshotExactFailures = new Set();
 
 const CONTEXT_GLOBAL_SESSION = '__global__';
 const CONTEXT_CATEGORY_ORDER = [
@@ -23824,6 +23826,8 @@ function resetContextSnapshotState() {
   contextSnapshotsBySession.clear();
   contextSnapshotTimelinesBySession.clear();
   contextReplayIndexBySession.clear();
+  contextSnapshotExactFetches.clear();
+  contextSnapshotExactFailures.clear();
   contextSelectedPartId = null;
   contextLastAnalysis = null;
   contextRawRenderedKey = null;
@@ -23895,6 +23899,145 @@ function formatContextTimestamp(ts) {
 
 function contextRawValue(snapshot) {
   return snapshot && Object.prototype.hasOwnProperty.call(snapshot, 'raw') ? snapshot.raw : snapshot;
+}
+
+function contextSnapshotRawMeta(snapshot) {
+  const raw = contextRawValue(snapshot);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return raw._intendant_context || raw.context || {};
+}
+
+function contextSnapshotRawSummary(snapshot) {
+  const raw = contextRawValue(snapshot);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return raw.summary || {};
+}
+
+function contextSnapshotFile(snapshot) {
+  const meta = contextSnapshotRawMeta(snapshot);
+  return String(snapshot?.snapshot_file || snapshot?.snapshotFile || meta.snapshot_file || '').trim();
+}
+
+function contextSnapshotExactReplayAvailable(snapshot) {
+  const meta = contextSnapshotRawMeta(snapshot);
+  const summary = contextSnapshotRawSummary(snapshot);
+  return Boolean(
+    snapshot?.exact_replay_available ||
+    snapshot?.exactReplayAvailable ||
+    meta.exact_replay_available ||
+    meta.exactReplayAvailable ||
+    summary.exact_replay_available ||
+    summary.exactReplayAvailable
+  );
+}
+
+function contextSnapshotHasExactRaw(snapshot) {
+  if (!snapshot) return false;
+  const raw = contextRawValue(snapshot);
+  const meta = contextSnapshotRawMeta(snapshot);
+  const summary = contextSnapshotRawSummary(snapshot);
+  if (meta.raw_omitted || summary.raw_omitted) return false;
+  if (meta.archive_mode === 'summary' || summary.kind === 'compact_context_snapshot') return false;
+  if (Array.isArray(raw?.summary_parts)) return false;
+  return raw !== undefined;
+}
+
+function contextSnapshotNeedsExact(snapshot) {
+  if (!snapshot || snapshot.__exact_loaded || contextSnapshotHasExactRaw(snapshot)) return false;
+  return Boolean(contextSnapshotFile(snapshot) && contextSnapshotExactReplayAvailable(snapshot));
+}
+
+function contextSnapshotLazySessionId(snapshot) {
+  const sid = contextSessionKey(snapshot);
+  if (sid && sid !== CONTEXT_GLOBAL_SESSION) return sid;
+  return resolvePromptTargetSessionId() || daemonSessionFullId || '';
+}
+
+function contextSnapshotLazySource(snapshot) {
+  const source = String(snapshot?.source || '').trim();
+  return source || 'intendant';
+}
+
+function contextSnapshotExactFetchKey(snapshot) {
+  return `${contextSnapshotLazySessionId(snapshot)}|${contextSnapshotFile(snapshot)}|${snapshot?.request_id || ''}|${snapshot?.request_index ?? ''}|${snapshot?.ts || ''}`;
+}
+
+function contextSnapshotExactFetchFailed(snapshot) {
+  const key = contextSnapshotExactFetchKey(snapshot);
+  return Boolean(key && contextSnapshotExactFailures.has(key));
+}
+
+function replaceStoredContextSnapshot(previous, exact) {
+  if (!previous || !exact) return previous;
+  const key = previous.__context_key || contextSnapshotFingerprint(previous);
+  const sid = contextSessionKey(previous);
+  const next = {
+    ...previous,
+    ...exact,
+    raw: Object.prototype.hasOwnProperty.call(exact, 'raw') ? exact.raw : previous.raw,
+    snapshot_file: contextSnapshotFile(exact) || contextSnapshotFile(previous),
+    exact_replay_available: true,
+    __exact_loaded: true,
+    __context_key: key,
+    __context_seq: previous.__context_seq,
+  };
+  const timeline = contextSnapshotTimelinesBySession.get(sid);
+  if (timeline) {
+    const idx = timeline.findIndex(item => item.__context_key === key);
+    if (idx >= 0) timeline[idx] = next;
+  }
+  if (contextSnapshotsBySession.get(sid)?.__context_key === key) {
+    contextSnapshotsBySession.set(sid, next);
+  }
+  if (latestContextSnapshot?.__context_key === key) {
+    latestContextSnapshot = next;
+  }
+  return next;
+}
+
+function ensureExactContextSnapshot(snapshot) {
+  if (!contextSnapshotNeedsExact(snapshot)) return null;
+  const key = contextSnapshotExactFetchKey(snapshot);
+  if (!key || contextSnapshotExactFailures.has(key)) return null;
+  if (contextSnapshotExactFetches.has(key)) return contextSnapshotExactFetches.get(key);
+  const sessionId = contextSnapshotLazySessionId(snapshot);
+  const file = contextSnapshotFile(snapshot);
+  if (!sessionId || !file) return null;
+  const params = new URLSearchParams();
+  params.set('file', file);
+  params.set('source', contextSnapshotLazySource(snapshot));
+  if (snapshot.request_id) params.set('request_id', snapshot.request_id);
+  if (snapshot.request_index !== undefined && snapshot.request_index !== null) {
+    params.set('request_index', String(snapshot.request_index));
+  }
+  if (snapshot.ts) params.set('ts', snapshot.ts);
+  const url = `/api/session/${encodeURIComponent(sessionId)}/context-snapshot?${params.toString()}`;
+  const promise = authedFetch(url)
+    .then(async resp => {
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data?.error) {
+        throw new Error(data?.error || `context snapshot fetch returned ${resp.status}`);
+      }
+      const exact = data.snapshot || data;
+      if (!Object.prototype.hasOwnProperty.call(exact || {}, 'raw')) {
+        throw new Error('context snapshot response did not include raw payload');
+      }
+      contextSnapshotExactFailures.delete(key);
+      const replaced = replaceStoredContextSnapshot(snapshot, exact);
+      contextRawRenderedKey = null;
+      if (contextPaneVisible()) renderContextPane();
+      return replaced;
+    })
+    .catch(err => {
+      contextSnapshotExactFailures.add(key);
+      console.warn('Failed to load exact context snapshot', err);
+      return null;
+    })
+    .finally(() => {
+      contextSnapshotExactFetches.delete(key);
+    });
+  contextSnapshotExactFetches.set(key, promise);
+  return promise;
 }
 
 function contextFullText(value) {
@@ -24412,6 +24555,7 @@ function wireContextPaneListeners() {
 
 function focusContextPart(partId) {
   contextSelectedPartId = partId;
+  ensureExactContextSnapshot(contextSnapshotForForegroundSession());
   const part = selectedContextPart(contextLastAnalysis);
   renderContextDetail(contextLastAnalysis, part);
   contextUpdateMeshSelection();
@@ -24903,6 +25047,23 @@ function renderContextRaw(snapshot) {
     contextRawRenderedKey = 'collapsed';
     return;
   }
+  if (contextSnapshotNeedsExact(snapshot)) {
+    ensureExactContextSnapshot(snapshot);
+    const loadingKey = `loading:${contextRawRenderKey(snapshot)}`;
+    if (contextSnapshotExactFetchFailed(snapshot)) {
+      const failedKey = `failed:${contextRawRenderKey(snapshot)}`;
+      if (contextRawRenderedKey !== failedKey) {
+        rawEl.textContent = 'Exact context snapshot failed to load. Showing compact replay payload.\n\n' + contextFullText(contextRawValue(snapshot));
+      }
+      contextRawRenderedKey = failedKey;
+      return;
+    }
+    if (contextRawRenderedKey !== loadingKey) {
+      rawEl.textContent = 'Loading exact context snapshot...';
+    }
+    contextRawRenderedKey = loadingKey;
+    return;
+  }
   const renderKey = `raw:${contextRawRenderKey(snapshot)}`;
   if (contextRawRenderedKey === renderKey) return;
   rawEl.textContent = contextFullText(contextRawValue(snapshot));
@@ -24935,6 +25096,7 @@ function renderContextPane() {
     return;
   }
   const d = snapshot;
+  ensureExactContextSnapshot(snapshot);
   set('context-source', d.label || d.source || 'model');
   set('context-turn', contextSnapshotRequestLabel(d).replace(/^request /, '#'));
   set('context-items', d.item_count);
@@ -31428,6 +31590,7 @@ let worktreesLoadInFlight = '';
 let worktreesRequestSerial = 0;
 let worktreesActivityClearTimeout = null;
 const pendingWorktreeRemovals = new Set();
+const SESSION_CARD_RENDER_LIMIT = 300;
 let _sessionsLoadToken = 0;
 let _sessionDeepSearchToken = 0;
 let _sessionDeepSearchAbort = null;
@@ -32373,7 +32536,8 @@ function renderSessionsList(sessions, el, options = {}) {
   const statusFilter = options.statusFilter || [];
   const hasProjectFilter = Array.isArray(projectFilter) ? projectFilter.length > 0 : !!projectFilter;
   const deepSearchActive = deepSearchOnly && _sessionDeepSearch.active;
-  let visibleCount = 0;
+  let matchedCount = 0;
+  let renderedCount = 0;
   const fragment = document.createDocumentFragment();
 
   for (const s of sorted) {
@@ -32423,7 +32587,9 @@ function renderSessionsList(sessions, el, options = {}) {
     const logHit = deepSearchOnly ? sessionDeepSearchHit(s, source) : null;
     if (deepSearchActive && !logHit) continue;
 
-    visibleCount += 1;
+    matchedCount += 1;
+    if (renderedCount >= SESSION_CARD_RENDER_LIMIT) continue;
+    renderedCount += 1;
 
     const card = document.createElement('div');
     card.className = 'session-card';
@@ -32771,7 +32937,7 @@ function renderSessionsList(sessions, el, options = {}) {
     fragment.appendChild(card);
   }
 
-  if (visibleCount === 0) {
+  if (matchedCount === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
     empty.textContent = deepSearchActive && sessionDeepSearchHasMissingMetadata()
@@ -32786,6 +32952,12 @@ function renderSessionsList(sessions, el, options = {}) {
     el.appendChild(empty);
   } else {
     el.appendChild(fragment);
+    if (matchedCount > renderedCount) {
+      const limitNotice = document.createElement('div');
+      limitNotice.className = 'empty-state';
+      limitNotice.textContent = `Showing ${renderedCount.toLocaleString()} of ${matchedCount.toLocaleString()} matching sessions. Refine filters to narrow results.`;
+      el.appendChild(limitNotice);
+    }
   }
 }
 

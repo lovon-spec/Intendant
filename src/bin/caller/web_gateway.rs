@@ -1470,12 +1470,32 @@ fn replay_jsonl_to_outbound_entries(
     contents: &str,
     log_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
+    replay_jsonl_to_outbound_entries_inner(contents, log_dir, false)
+}
+
+fn replay_jsonl_to_browser_entries(
+    contents: &str,
+    log_dir: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    replay_jsonl_to_outbound_entries_inner(contents, log_dir, true)
+}
+
+fn replay_jsonl_to_outbound_entries_inner(
+    contents: &str,
+    log_dir: &std::path::Path,
+    compact_historical_context: bool,
+) -> Vec<serde_json::Value> {
     let (provider, model, autonomy) = scan_replay_status(contents);
     let external_replay_session_id = external_backend_session_id_from_replay(contents);
     let wrapper_replay_session_id = replay_session_id_from_dir(log_dir);
     let replay_session_id = external_replay_session_id
         .clone()
         .or_else(|| wrapper_replay_session_id.clone());
+    let context_files_to_load = if compact_historical_context {
+        latest_context_snapshot_files_by_session(contents, replay_session_id.as_deref())
+    } else {
+        HashSet::new()
+    };
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
     entries.push(serde_json::json!({
@@ -1493,6 +1513,29 @@ fn replay_jsonl_to_outbound_entries(
         let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if compact_historical_context
+            && entry_json.get("event").and_then(|v| v.as_str()) == Some("context_snapshot")
+        {
+            let file = entry_json.get("file").and_then(|v| v.as_str());
+            if !file.is_some_and(|file| context_files_to_load.contains(file)) {
+                let Some(mut value) = context_snapshot_replay_entry_without_raw(
+                    &entry_json,
+                    replay_session_id.as_deref(),
+                ) else {
+                    continue;
+                };
+                inject_replay_entry_metadata(
+                    &mut value,
+                    &entry_json,
+                    replay_session_id.as_deref(),
+                    external_replay_session_id.as_deref(),
+                    wrapper_replay_session_id.as_deref(),
+                );
+                entries.push(value);
+                continue;
+            }
+        }
+
         let Some(app_event) =
             crate::session_log::session_log_entry_to_app_event(&entry_json, log_dir)
         else {
@@ -1504,40 +1547,204 @@ fn replay_jsonl_to_outbound_entries(
         let Ok(mut value) = serde_json::to_value(&outbound) else {
             continue;
         };
-        // Inject the historical timestamp so WASM's handle_event uses it
-        // instead of wallclock when rendering log entries.
-        if let Some(obj) = value.as_object_mut() {
-            let ts = entry_json
-                .get("ts")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            obj.insert("ts".to_string(), serde_json::Value::String(ts));
-            if !obj.contains_key("session_id") {
-                if let Some(session_id) = replay_session_id.as_deref() {
-                    obj.insert(
-                        "session_id".to_string(),
-                        serde_json::Value::String(session_id.to_string()),
-                    );
-                }
-            } else if let (Some(external_id), Some(wrapper_id)) = (
-                external_replay_session_id.as_deref(),
-                wrapper_replay_session_id.as_deref(),
-            ) {
-                let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                let session_id = obj.get("session_id").and_then(|v| v.as_str());
-                if event != "session_identity" && session_id == Some(wrapper_id) {
-                    obj.insert(
-                        "session_id".to_string(),
-                        serde_json::Value::String(external_id.to_string()),
-                    );
-                }
-            }
+        if compact_historical_context {
+            compact_context_snapshot_raw_for_replay(&mut value);
         }
+        inject_replay_entry_metadata(
+            &mut value,
+            &entry_json,
+            replay_session_id.as_deref(),
+            external_replay_session_id.as_deref(),
+            wrapper_replay_session_id.as_deref(),
+        );
         entries.push(value);
     }
 
     entries
+}
+
+fn inject_replay_entry_metadata(
+    value: &mut serde_json::Value,
+    entry_json: &serde_json::Value,
+    replay_session_id: Option<&str>,
+    external_replay_session_id: Option<&str>,
+    wrapper_replay_session_id: Option<&str>,
+) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let ts = entry_json
+        .get("ts")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    obj.insert("ts".to_string(), serde_json::Value::String(ts));
+    if obj.get("event").and_then(|v| v.as_str()) == Some("context_snapshot") {
+        if let Some(file) = entry_json.get("file").and_then(|v| v.as_str()) {
+            obj.insert(
+                "snapshot_file".to_string(),
+                serde_json::Value::String(file.to_string()),
+            );
+            obj.insert(
+                "exact_replay_available".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            if let Some(raw) = obj.get_mut("raw") {
+                annotate_context_snapshot_raw_value_exact_replay(raw, file);
+            }
+        }
+    }
+    if !obj.contains_key("session_id") {
+        if let Some(session_id) = replay_session_id {
+            obj.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+    } else if let (Some(external_id), Some(wrapper_id)) =
+        (external_replay_session_id, wrapper_replay_session_id)
+    {
+        let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        let session_id = obj.get("session_id").and_then(|v| v.as_str());
+        if event != "session_identity" && session_id == Some(wrapper_id) {
+            obj.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(external_id.to_string()),
+            );
+        }
+    }
+}
+
+fn latest_context_snapshot_files_by_session(
+    contents: &str,
+    replay_session_id: Option<&str>,
+) -> HashSet<String> {
+    let mut latest_by_session = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry_json.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+            continue;
+        }
+        let Some(file) = entry_json.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let session_id = entry_json
+            .get("data")
+            .and_then(|data| data.get("session_id"))
+            .and_then(|v| v.as_str())
+            .or(replay_session_id)
+            .unwrap_or("__global__");
+        latest_by_session.insert(session_id.to_string(), file.to_string());
+    }
+    latest_by_session.into_values().collect()
+}
+
+fn context_snapshot_replay_entry_without_raw(
+    entry_json: &serde_json::Value,
+    replay_session_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    let data = entry_json.get("data");
+    let source = data
+        .and_then(|d| d.get("source"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("model")
+        .to_string();
+    let label = data
+        .and_then(|d| d.get("label"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Model context")
+        .to_string();
+    let format = data
+        .and_then(|d| d.get("format"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let request_id = data
+        .and_then(|d| d.get("request_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let request_index = data
+        .and_then(|d| d.get("request_index"))
+        .and_then(|v| v.as_u64());
+    let token_count = data
+        .and_then(|d| d.get("token_count"))
+        .and_then(|v| v.as_u64());
+    let context_window = data
+        .and_then(|d| d.get("context_window"))
+        .and_then(|v| v.as_u64());
+    let hard_context_window = data
+        .and_then(|d| d.get("hard_context_window"))
+        .and_then(|v| v.as_u64());
+    let item_count = data
+        .and_then(|d| d.get("item_count"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let session_id = data
+        .and_then(|d| d.get("session_id"))
+        .and_then(|v| v.as_str())
+        .or(replay_session_id)
+        .map(|s| s.to_string());
+    let turn = entry_json
+        .get("turn")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let raw = context_snapshot_omitted_raw(
+        request_id.as_deref(),
+        request_index,
+        format.as_str(),
+        item_count,
+        entry_json.get("file").and_then(|v| v.as_str()),
+    );
+    serde_json::to_value(crate::types::OutboundEvent::ContextSnapshot {
+        session_id,
+        source,
+        label,
+        request_id,
+        request_index,
+        turn,
+        format,
+        token_count,
+        context_window,
+        hard_context_window,
+        item_count,
+        raw,
+    })
+    .ok()
+}
+
+fn context_snapshot_omitted_raw(
+    request_id: Option<&str>,
+    request_index: Option<u64>,
+    format: &str,
+    item_count: Option<usize>,
+    snapshot_file: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "_intendant_context": {
+            "archive_mode": "summary",
+            "raw_archived": true,
+            "raw_omitted": true,
+            "exact_replay_available": snapshot_file.is_some(),
+            "snapshot_file": snapshot_file,
+            "request_id": request_id,
+            "request_index": request_index,
+            "format": format,
+        },
+        "summary": {
+            "kind": "compact_context_snapshot",
+            "raw_omitted": true,
+            "exact_replay_available": snapshot_file.is_some(),
+            "part_count": 0,
+            "item_count": item_count,
+        },
+        "summary_parts": [],
+    })
 }
 
 fn external_backend_session_from_replay(contents: &str) -> Option<(String, String)> {
@@ -1710,7 +1917,7 @@ fn session_log_replay_entries_from_dir(
         .as_ref()
         .map(|(_, id)| id.clone())
         .or_else(|| external_backend_session_id_from_replay(&contents));
-    let mut entries = replay_jsonl_to_outbound_entries(&contents, log_dir);
+    let mut entries = replay_jsonl_to_browser_entries(&contents, log_dir);
     if let Some((source, session_id)) = external_session.as_ref() {
         let home = home_from_intendant_log_dir(log_dir).unwrap_or_else(crate::platform::home_dir);
         annotate_replay_user_turns_from_external_transcript(
@@ -1723,10 +1930,105 @@ fn session_log_replay_entries_from_dir(
     Some((entries, external_session_id))
 }
 
+fn context_snapshot_raw_is_compact(raw: &serde_json::Value) -> bool {
+    raw.pointer("/_intendant_context/archive_mode")
+        .and_then(|v| v.as_str())
+        == Some("summary")
+        || raw.pointer("/summary/kind").and_then(|v| v.as_str()) == Some("compact_context_snapshot")
+        || raw.get("summary_parts").is_some()
+}
+
+fn compact_context_snapshot_raw_for_replay(entry: &mut serde_json::Value) {
+    if entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+        return;
+    }
+    let snapshot_file = entry
+        .get("snapshot_file")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let request_id = entry
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("replay")
+        .to_string();
+    let request_index = entry
+        .get("request_index")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let format = entry
+        .get("format")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let Some(raw) = entry.get_mut("raw") else {
+        return;
+    };
+    if raw.is_null() || context_snapshot_raw_is_compact(raw) {
+        return;
+    }
+
+    let raw_payload = std::mem::take(raw);
+    *raw = crate::external_agent::codex::codex_context_archive_payload(
+        raw_payload,
+        &request_id,
+        request_index,
+        &format,
+        false,
+    );
+    if let Some(snapshot_file) = snapshot_file.as_deref() {
+        annotate_context_snapshot_raw_exact_replay(entry, snapshot_file);
+    }
+}
+
+fn compact_context_snapshot_entries_for_replay(entries: &mut [serde_json::Value]) {
+    for entry in entries {
+        compact_context_snapshot_raw_for_replay(entry);
+    }
+}
+
+fn annotate_context_snapshot_raw_exact_replay(entry: &mut serde_json::Value, snapshot_file: &str) {
+    let Some(raw) = entry.get_mut("raw") else {
+        return;
+    };
+    annotate_context_snapshot_raw_value_exact_replay(raw, snapshot_file);
+}
+
+fn annotate_context_snapshot_raw_value_exact_replay(
+    raw: &mut serde_json::Value,
+    snapshot_file: &str,
+) {
+    if let Some(context) = raw
+        .get_mut("_intendant_context")
+        .and_then(|value| value.as_object_mut())
+    {
+        context.insert(
+            "snapshot_file".to_string(),
+            serde_json::Value::String(snapshot_file.to_string()),
+        );
+        context.insert(
+            "exact_replay_available".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if let Some(summary) = raw
+        .get_mut("summary")
+        .and_then(|value| value.as_object_mut())
+    {
+        summary.insert(
+            "exact_replay_available".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
+
 fn session_log_replay_payload_from_dir(
     log_dir: &std::path::Path,
 ) -> Option<(String, Option<String>)> {
-    let (entries, external_session_id) = session_log_replay_entries_from_dir(log_dir)?;
+    let (mut entries, external_session_id) = session_log_replay_entries_from_dir(log_dir)?;
+    compact_context_snapshot_entries_for_replay(&mut entries);
     Some((
         serde_json::json!({
             "t": "log_replay",
@@ -2666,9 +2968,10 @@ fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
 
-    let entries = session_log_replay_entries_from_dir(&session_dir)
+    let mut entries = session_log_replay_entries_from_dir(&session_dir)
         .map(|(entries, _)| entries)
         .unwrap_or_default();
+    compact_context_snapshot_entries_for_replay(&mut entries);
 
     // Check for screenshot frames
     let frames_dir = session_dir.join("frames");
@@ -2691,6 +2994,233 @@ fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
         "frames": frames,
         "relationships": session_relationships_from_log_dir(&session_dir),
     }).to_string()
+}
+
+#[derive(Default)]
+struct ContextSnapshotSelector {
+    file: Option<String>,
+    request_id: Option<String>,
+    request_index: Option<u64>,
+    ts: Option<String>,
+}
+
+impl ContextSnapshotSelector {
+    fn is_empty(&self) -> bool {
+        self.file.is_none()
+            && self.request_id.is_none()
+            && self.request_index.is_none()
+            && self.ts.is_none()
+    }
+}
+
+fn context_snapshot_file_selector_is_safe(file: &str) -> bool {
+    if file.is_empty() || file.len() > 512 || file.contains('\\') {
+        return false;
+    }
+    let path = Path::new(file);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn context_snapshot_selector_from_request(
+    request_line: &str,
+) -> Result<ContextSnapshotSelector, String> {
+    let file = query_param(request_line, "file").filter(|value| !value.trim().is_empty());
+    if file
+        .as_deref()
+        .is_some_and(|file| !context_snapshot_file_selector_is_safe(file))
+    {
+        return Err("invalid snapshot file".to_string());
+    }
+    let request_index =
+        match query_param(request_line, "request_index").filter(|value| !value.trim().is_empty()) {
+            Some(value) => Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid request_index".to_string())?,
+            ),
+            None => None,
+        };
+    let selector = ContextSnapshotSelector {
+        file,
+        request_id: query_param(request_line, "request_id")
+            .filter(|value| !value.trim().is_empty()),
+        request_index,
+        ts: query_param(request_line, "ts").filter(|value| !value.trim().is_empty()),
+    };
+    if selector.is_empty() {
+        return Err("missing snapshot selector".to_string());
+    }
+    Ok(selector)
+}
+
+fn context_snapshot_candidate_log_dirs(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let push = |dirs: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf| {
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string();
+        if seen.insert(key) {
+            dirs.push(path);
+        }
+    };
+
+    if let Some(dir) = resolve_session_dir_from_home(home, session_id) {
+        push(&mut dirs, &mut seen, dir);
+    }
+    let source = crate::session_names::normalize_source(source);
+    if source != "intendant" || dirs.is_empty() {
+        for dir in managed_context_candidate_log_dirs(home, None, Some(session_id), None) {
+            push(&mut dirs, &mut seen, dir);
+        }
+    }
+    dirs
+}
+
+fn context_snapshot_log_entry_matches_selector(
+    entry: &serde_json::Value,
+    selector: &ContextSnapshotSelector,
+) -> bool {
+    if entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+        return false;
+    }
+    if let Some(file) = selector.file.as_deref() {
+        if entry.get("file").and_then(|v| v.as_str()) != Some(file) {
+            return false;
+        }
+    }
+    if let Some(request_id) = selector.request_id.as_deref() {
+        if entry
+            .get("data")
+            .and_then(|data| data.get("request_id"))
+            .and_then(|v| v.as_str())
+            != Some(request_id)
+        {
+            return false;
+        }
+    }
+    if let Some(request_index) = selector.request_index {
+        if entry
+            .get("data")
+            .and_then(|data| data.get("request_index"))
+            .and_then(|v| v.as_u64())
+            != Some(request_index)
+        {
+            return false;
+        }
+    }
+    if let Some(ts) = selector.ts.as_deref() {
+        if entry.get("ts").and_then(|v| v.as_str()) != Some(ts) {
+            return false;
+        }
+    }
+    true
+}
+
+fn context_snapshot_log_entry_matches_session(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    session_id: &str,
+    source: &str,
+) -> bool {
+    let data_session = entry
+        .get("data")
+        .and_then(|data| data.get("session_id"))
+        .and_then(|v| v.as_str());
+    if data_session == Some(session_id) {
+        return true;
+    }
+    let source = crate::session_names::normalize_source(source);
+    if source == "intendant" {
+        return data_session.is_none()
+            || replay_session_id_from_dir(log_dir).as_deref() == Some(session_id);
+    }
+    data_session.is_none() && replay_session_id_from_dir(log_dir).as_deref() == Some(session_id)
+}
+
+fn exact_context_snapshot_from_log_entry(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    contents: &str,
+) -> Option<serde_json::Value> {
+    let app_event = crate::session_log::session_log_entry_to_app_event(entry, log_dir)?;
+    let outbound = crate::event::app_event_to_outbound(&app_event)?;
+    let mut value = serde_json::to_value(&outbound).ok()?;
+    let external_replay_session_id = external_backend_session_id_from_replay(contents);
+    let wrapper_replay_session_id = replay_session_id_from_dir(log_dir);
+    let replay_session_id = external_replay_session_id
+        .clone()
+        .or_else(|| wrapper_replay_session_id.clone());
+    inject_replay_entry_metadata(
+        &mut value,
+        entry,
+        replay_session_id.as_deref(),
+        external_replay_session_id.as_deref(),
+        wrapper_replay_session_id.as_deref(),
+    );
+    Some(value)
+}
+
+fn get_session_context_snapshot_from_home(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+    request_line: &str,
+) -> (&'static str, String) {
+    if !session_lookup_id_is_safe(session_id) {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"error": "invalid session id"}).to_string(),
+        );
+    }
+    let selector = match context_snapshot_selector_from_request(request_line) {
+        Ok(selector) => selector,
+        Err(error) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": error}).to_string(),
+            );
+        }
+    };
+    for log_dir in context_snapshot_candidate_log_dirs(home, session_id, source) {
+        let Ok(contents) = std::fs::read_to_string(log_dir.join("session.jsonl")) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if !context_snapshot_log_entry_matches_selector(&entry, &selector)
+                || !context_snapshot_log_entry_matches_session(&entry, &log_dir, session_id, source)
+            {
+                continue;
+            }
+            let Some(snapshot) = exact_context_snapshot_from_log_entry(&entry, &log_dir, &contents)
+            else {
+                continue;
+            };
+            return (
+                "200 OK",
+                serde_json::json!({
+                    "ok": true,
+                    "snapshot": snapshot,
+                })
+                .to_string(),
+            );
+        }
+    }
+    (
+        "404 Not Found",
+        serde_json::json!({"error": "context snapshot not found"}).to_string(),
+    )
 }
 
 fn session_log_search_from_request(request_line: &str) -> String {
@@ -5450,6 +5980,7 @@ fn external_session_activity_replay_from_home_with_attach(
         }));
     }
     append_external_context_snapshot_replay_entries(home, &source, session_id, &mut entries);
+    compact_context_snapshot_entries_for_replay(&mut entries);
 
     Some(
         serde_json::json!({
@@ -14125,7 +14656,39 @@ pub fn spawn_web_gateway(
                             .unwrap_or("");
                         let rest_parts: Vec<&str> = rest.split('/').collect();
 
-                        if rest_parts.len() >= 2 && rest_parts[1] == "recordings" {
+                        let route_name = rest_parts
+                            .get(1)
+                            .map(|part| part.split('?').next().unwrap_or(part))
+                            .unwrap_or("");
+
+                        if rest_parts.len() >= 2 && route_name == "context-snapshot" {
+                            // GET /api/session/{id}/context-snapshot?file=...
+                            // Replays exactly one archived context snapshot
+                            // on demand so historical session replay can stay
+                            // lightweight by default.
+                            let raw_id = rest_parts[0];
+                            let session_id = raw_id.split('?').next().unwrap_or(raw_id);
+                            let source = query_param(request_line, "source")
+                                .unwrap_or_else(|| "intendant".to_string());
+                            let (status, body) = get_session_context_snapshot_from_home(
+                                &crate::platform::home_dir(),
+                                session_id,
+                                &source,
+                                request_line,
+                            );
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\n\
+                                 Content-Type: application/json\r\n\
+                                 Content-Length: {}\r\n\
+                                 Cache-Control: no-cache\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        } else if rest_parts.len() >= 2 && route_name == "recordings" {
                             // Session recording sub-routes: /api/session/{id}/recordings[/...]
                             let session_id = rest_parts[0];
                             let rec_rest = &rest_parts[2..]; // parts after "recordings"
@@ -14270,7 +14833,7 @@ pub fn spawn_web_gateway(
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
-                        } else if rest_parts.len() >= 2 && rest_parts[1] == "report" {
+                        } else if rest_parts.len() >= 2 && route_name == "report" {
                             // GET /api/session/{id}/report — download a zip of
                             // the current session's text artifacts for sharing
                             // with the dev. Pass id="current" to target the
@@ -14342,7 +14905,7 @@ pub fn spawn_web_gateway(
                                     }
                                 }
                             }
-                        } else if rest_parts.len() >= 2 && rest_parts[1] == "frames" {
+                        } else if rest_parts.len() >= 2 && route_name == "frames" {
                             // Session frame sub-routes: /api/session/{id}/frames[/{filename}]
                             use tokio::io::AsyncWriteExt;
                             let session_id = rest_parts[0];
@@ -22256,6 +22819,202 @@ mod tests {
     }
 
     #[test]
+    fn session_log_replay_payload_compacts_context_snapshot_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let large = "x".repeat(8_000);
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(1_000),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "instructions": large,
+                "input": [{"role": "user", "content": "inspect dashboard lag"}]
+            }),
+        );
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(2),
+            "openai.responses.resolved_request.v1",
+            Some(1_100),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "input": [{"role": "user", "content": "latest context survives as compact summary"}]
+            }),
+        );
+        drop(log);
+
+        let replay = session_log_replay_from_dir(&log_dir).expect("session log should replay");
+        assert!(
+            !replay.contains(&"x".repeat(1_000)),
+            "replay should not include exact historical context payloads"
+        );
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let contexts: Vec<&serde_json::Value> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "context_snapshot")
+            .collect();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts
+                .iter()
+                .filter(|entry| entry.pointer("/raw/_intendant_context/raw_omitted")
+                    == Some(&serde_json::json!(true)))
+                .count(),
+            1
+        );
+        let context = contexts
+            .iter()
+            .find(|entry| {
+                entry
+                    .pointer("/raw/_intendant_context/raw_omitted")
+                    .and_then(|v| v.as_bool())
+                    != Some(true)
+            })
+            .expect("latest context snapshot should keep a compact summary");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert!(context
+            .get("snapshot_file")
+            .and_then(|v| v.as_str())
+            .is_some_and(|file| file.contains("_context_")));
+        assert_eq!(context["exact_replay_available"], true);
+        assert!(context
+            .pointer("/raw/summary_parts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parts| !parts.is_empty()));
+    }
+
+    #[test]
+    fn session_detail_compacts_context_snapshot_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("detail-session");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(1_000),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "instructions": "y".repeat(8_000),
+                "input": [{"role": "user", "content": "open session detail"}]
+            }),
+        );
+        drop(log);
+
+        let detail = get_session_detail_from_home(dir.path(), "detail-session");
+        assert!(
+            !detail.contains(&"y".repeat(1_000)),
+            "session detail should not include exact historical context payloads"
+        );
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let context = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("context snapshot should be present");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert!(context
+            .get("snapshot_file")
+            .and_then(|v| v.as_str())
+            .is_some_and(|file| file.contains("_context_")));
+    }
+
+    #[test]
+    fn session_context_snapshot_endpoint_loads_exact_raw_on_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("lazy-session");
+        let exact_text = "selected tool call payload survives lazy load";
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(1_000),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "input": [{
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": { "cmd": exact_text }
+                }]
+            }),
+        );
+        drop(log);
+
+        let detail = get_session_detail_from_home(dir.path(), "lazy-session");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let context = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("context snapshot should be present");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert!(
+            context.pointer("/raw/input").is_none(),
+            "session detail replay should not carry exact raw input"
+        );
+        let snapshot_file = context["snapshot_file"]
+            .as_str()
+            .expect("context snapshot should carry a lazy-load file pointer");
+        let encoded_file = snapshot_file.replace('/', "%2F");
+        let request = format!(
+            "GET /api/session/lazy-session/context-snapshot?source=intendant&file={encoded_file} HTTP/1.1"
+        );
+        let (status, body) = get_session_context_snapshot_from_home(
+            dir.path(),
+            "lazy-session",
+            "intendant",
+            &request,
+        );
+        assert_eq!(status, "200 OK");
+        let loaded: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let snapshot = &loaded["snapshot"];
+        assert_eq!(snapshot["snapshot_file"], snapshot_file);
+        assert_eq!(snapshot["exact_replay_available"], true);
+        assert_eq!(
+            snapshot.pointer("/raw/input/0/arguments/cmd"),
+            Some(&serde_json::json!(exact_text))
+        );
+    }
+
+    #[test]
     fn agent_output_chunks_falls_back_to_other_logs_by_output_id() {
         let dir = tempfile::tempdir().unwrap();
         let logs_dir = dir.path().join("logs");
@@ -22457,9 +23216,16 @@ mod tests {
         assert_eq!(context["request_id"], "req-context-1");
         assert_eq!(context["request_index"], 1);
         assert_eq!(
-            context.pointer("/raw/_intendant_context/thread_id"),
-            Some(&serde_json::json!(session_id))
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
         );
+        assert!(context
+            .pointer("/raw/summary_parts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parts| parts.iter().any(|part| part
+                .get("preview")
+                .and_then(|v| v.as_str())
+                .is_some_and(|preview| preview.contains("show context")))));
     }
 
     #[test]
@@ -22548,17 +23314,16 @@ mod tests {
             .as_str()
             .is_some_and(|request_id| request_id.starts_with("codex-request-")));
         assert_eq!(
-            context.pointer("/raw/_intendant_context/thread_id"),
-            Some(&serde_json::json!(session_id))
-        );
-        assert_eq!(
             context.pointer("/raw/_intendant_context/archive_mode"),
-            Some(&serde_json::json!("exact"))
+            Some(&serde_json::json!("summary"))
         );
-        assert_eq!(
-            context.pointer("/raw/input/0/content"),
-            Some(&serde_json::json!("from raw trace"))
-        );
+        assert!(context
+            .pointer("/raw/summary_parts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parts| parts.iter().any(|part| part
+                .get("preview")
+                .and_then(|v| v.as_str())
+                .is_some_and(|preview| preview.contains("from raw trace")))));
     }
 
     #[tokio::test]
