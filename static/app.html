@@ -29498,7 +29498,11 @@ function onSessionAttached(sessionId, source) {
 
 function isExplicitSessionStopReason(reason) {
   const text = String(reason || '').toLowerCase();
-  return text.includes('stopped by user') || text.includes('restarting session');
+  return text.includes('stopped by user');
+}
+
+function isRestartingSessionReason(reason) {
+  return String(reason || '').toLowerCase().includes('restarting session');
 }
 
 function onSessionEnded(sessionId, reason) {
@@ -29508,6 +29512,7 @@ function onSessionEnded(sessionId, reason) {
   const win = sid ? sessionWindows.get(sid) : null;
   const externalSource = sid ? externalSourceForSessionWindow(sid, win) : '';
   const explicitStop = sid && isExplicitSessionStopReason(reason);
+  const restarting = sid && isRestartingSessionReason(reason);
   const shouldRemoveSideWindow = sid && (
     meta.relationshipKind === 'side' ||
     String(reason || '').toLowerCase().includes('side conversation closed')
@@ -29521,6 +29526,10 @@ function onSessionEnded(sessionId, reason) {
     clearPendingFollowUpsForSession(sid, reason || 'session stopped');
     removeSessionRelationshipsForSession(sid);
     removeSessionWindow(sid);
+  } else if (restarting) {
+    clearPendingFollowUpsForSession(sid, reason || 'restarting session');
+    updateSessionWindow(sid, { phase: 'idle', ended: false });
+    setSessionWindowDetached(sid, true, reason || 'restarting session');
   } else if (keepExternalDetached) {
     updateSessionWindow(sid, { phase: 'idle', ended: false });
     setSessionWindowDetached(sid, true, reason || 'session ended');
