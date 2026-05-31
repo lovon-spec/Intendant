@@ -1903,6 +1903,9 @@ body.context-focus-active {
 .session-window.minimized .session-window-goal {
   display: none;
 }
+.session-window.minimized .session-window-tier {
+  display: none;
+}
 .session-window.header-collapsed .session-window-title {
   gap: 1px;
 }
@@ -2099,6 +2102,12 @@ body.context-focus-active {
   border-color: rgba(137, 180, 250, 0.26);
   color: var(--blue);
 }
+.session-window.header-collapsed .session-window-tier {
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .session-window-goal {
   flex: 0 2 230px;
   min-width: 0;
@@ -2146,6 +2155,9 @@ body.context-focus-active {
   color: var(--green);
 }
 @container (max-width: 560px) {
+  .session-window.header-collapsed .session-window-tier {
+    display: none;
+  }
   .session-window:not(.header-collapsed) .session-window-goal {
     display: none;
   }
