@@ -23329,11 +23329,17 @@ const contextViz = {
   dragMoved: false,
   dragX: 0,
   dragY: 0,
+  panMode: false,
+  targetX: 0,
+  targetY: 2.2,
+  targetZ: 0,
   activePointers: new Map(),
   primaryPointerId: null,
   pinchDistance: 0,
   pinchZoom: 38,
-  rotationX: -0.22,
+  pinchCenterX: 0,
+  pinchCenterY: 0,
+  rotationX: 0.34,
   rotationY: -0.48,
   zoom: 38,
 };
@@ -23866,6 +23872,31 @@ function updateContextReplayControls(snapshot) {
   }
 }
 
+function contextShouldHandleKeyboardEvent(ev) {
+  if (ev.defaultPrevented || ev.altKey || ev.ctrlKey || ev.metaKey) return false;
+  const target = ev.target;
+  const tag = String(target?.tagName || '').toLowerCase();
+  if (target?.isContentEditable || ['input', 'textarea', 'select'].includes(tag)) return false;
+  return contextFocusMode || (activeTab === 'activity' && activeActivitySubtab === 'context');
+}
+
+function stepContextReplaySnapshot(delta) {
+  const { key, timeline } = contextTimelineForForegroundSession();
+  if (!timeline.length) return false;
+  const currentSnapshot = contextSnapshotForForegroundSession();
+  let current = timeline.indexOf(currentSnapshot);
+  if (current < 0) current = contextReplayIndexBySession.get(key) ?? timeline.length - 1;
+  current = Math.max(0, Math.min(timeline.length - 1, Number(current) || 0));
+  const next = Math.max(0, Math.min(timeline.length - 1, current + delta));
+  if (next !== current || contextReplayMode !== 'replay') {
+    contextReplayMode = 'replay';
+    contextReplayIndexBySession.set(key, next);
+    contextSelectedPartId = null;
+    renderContextPane();
+  }
+  return true;
+}
+
 function updateContextFocusControls() {
   const pane = document.querySelector('.context-pane');
   if (pane) {
@@ -23930,10 +23961,7 @@ function wireContextPaneListeners() {
     renderContextPane();
   });
   document.getElementById('context-reset-view-btn')?.addEventListener('click', () => {
-    contextViz.rotationX = -0.22;
-    contextViz.rotationY = -0.48;
-    contextViz.zoom = 38;
-    contextRenderThree();
+    contextResetView();
   });
   document.getElementById('context-open-focus-btn')?.addEventListener('click', () => {
     setContextFocusMode(true, { requestFullscreen: true });
@@ -23945,6 +23973,18 @@ function wireContextPaneListeners() {
     setContextRawOpen(!contextRawOpen);
   });
   document.addEventListener('keydown', ev => {
+    if (contextShouldHandleKeyboardEvent(ev)) {
+      const delta = {
+        ArrowLeft: -1,
+        ArrowUp: -1,
+        ArrowRight: 1,
+        ArrowDown: 1,
+      }[ev.key];
+      if (delta && stepContextReplaySnapshot(delta)) {
+        ev.preventDefault();
+        return;
+      }
+    }
     if (!contextFocusMode || ev.key !== 'Escape') return;
     if (contextRawOpen) {
       setContextRawOpen(false);
@@ -23987,9 +24027,45 @@ function contextPointerDistance(points) {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
+function contextPointerCenter(points) {
+  if (!points.length) return { x: 0, y: 0 };
+  let x = 0;
+  let y = 0;
+  for (const point of points) {
+    x += point.x;
+    y += point.y;
+  }
+  return { x: x / points.length, y: y / points.length };
+}
+
+function contextResetView() {
+  contextViz.rotationX = 0.34;
+  contextViz.rotationY = -0.48;
+  contextViz.zoom = 38;
+  contextViz.targetX = 0;
+  contextViz.targetY = 2.2;
+  contextViz.targetZ = 0;
+  contextRenderThree();
+}
+
+function contextPanCamera(dx, dy) {
+  if (!contextViz.camera || !contextViz.canvas || typeof THREE === 'undefined') return;
+  const rect = contextViz.canvas.getBoundingClientRect();
+  const scale = contextViz.zoom / Math.max(240, rect.height) * 1.75;
+  contextViz.camera.updateMatrixWorld();
+  const right = new THREE.Vector3().setFromMatrixColumn(contextViz.camera.matrixWorld, 0);
+  const up = new THREE.Vector3().setFromMatrixColumn(contextViz.camera.matrixWorld, 1);
+  const x = -dx * scale;
+  const y = dy * scale;
+  contextViz.targetX += right.x * x + up.x * y;
+  contextViz.targetY += right.y * x + up.y * y;
+  contextViz.targetZ += right.z * x + up.z * y;
+}
+
 function contextResetPointerState() {
   contextViz.dragging = false;
   contextViz.dragMoved = false;
+  contextViz.panMode = false;
   contextViz.primaryPointerId = null;
   contextViz.pinchDistance = 0;
   contextViz.activePointers.clear();
@@ -24026,6 +24102,9 @@ function contextInitThree() {
     if (contextViz.activePointers.size === 2) {
       const points = [...contextViz.activePointers.values()];
       contextViz.pinchDistance = contextPointerDistance(points);
+      const center = contextPointerCenter(points);
+      contextViz.pinchCenterX = center.x;
+      contextViz.pinchCenterY = center.y;
       contextViz.pinchZoom = contextViz.zoom;
       contextViz.dragging = false;
       contextViz.dragMoved = true;
@@ -24035,6 +24114,7 @@ function contextInitThree() {
     if (contextViz.activePointers.size > 1) return;
     contextViz.dragging = true;
     contextViz.dragMoved = false;
+    contextViz.panMode = ev.button === 1 || ev.button === 2 || ev.shiftKey;
     contextViz.primaryPointerId = ev.pointerId;
     contextViz.dragX = ev.clientX;
     contextViz.dragY = ev.clientY;
@@ -24046,12 +24126,17 @@ function contextInitThree() {
     }
     if (contextViz.activePointers.size >= 2) {
       ev.preventDefault();
-      const distance = contextPointerDistance([...contextViz.activePointers.values()]);
+      const points = [...contextViz.activePointers.values()];
+      const distance = contextPointerDistance(points);
       if (distance > 4 && contextViz.pinchDistance > 4) {
         contextViz.zoom = contextClampZoom(contextViz.pinchZoom * (contextViz.pinchDistance / distance));
         contextViz.dragMoved = true;
-        contextRenderThree();
       }
+      const center = contextPointerCenter(points);
+      contextPanCamera(center.x - contextViz.pinchCenterX, center.y - contextViz.pinchCenterY);
+      contextViz.pinchCenterX = center.x;
+      contextViz.pinchCenterY = center.y;
+      contextRenderThree();
       return;
     }
     if (!contextViz.dragging) return;
@@ -24062,8 +24147,13 @@ function contextInitThree() {
     if (Math.abs(dx) + Math.abs(dy) > 2) contextViz.dragMoved = true;
     contextViz.dragX = ev.clientX;
     contextViz.dragY = ev.clientY;
-    contextViz.rotationY += dx * 0.008;
-    contextViz.rotationX = Math.max(-0.9, Math.min(0.35, contextViz.rotationX + dy * 0.006));
+    if (contextViz.panMode || ev.shiftKey) {
+      contextViz.panMode = true;
+      contextPanCamera(dx, dy);
+    } else {
+      contextViz.rotationY += dx * 0.008;
+      contextViz.rotationX = Math.max(-1.22, Math.min(1.22, contextViz.rotationX + dy * 0.006));
+    }
     contextRenderThree();
   });
   canvas.addEventListener('pointerup', ev => {
@@ -24071,17 +24161,19 @@ function contextInitThree() {
     canvas.classList.remove('dragging');
     canvas.releasePointerCapture?.(ev.pointerId);
     contextViz.activePointers.delete(ev.pointerId);
-    const shouldPick = !contextViz.dragMoved && contextViz.primaryPointerId === ev.pointerId;
+    const shouldPick = !contextViz.dragMoved && !contextViz.panMode && contextViz.primaryPointerId === ev.pointerId;
     if (contextViz.activePointers.size === 1) {
       const [nextId, point] = contextViz.activePointers.entries().next().value;
       contextViz.primaryPointerId = nextId;
       contextViz.dragX = point.x;
       contextViz.dragY = point.y;
       contextViz.dragging = true;
+      contextViz.panMode = false;
       return;
     }
     if (contextViz.activePointers.size === 0) {
       contextViz.dragging = false;
+      contextViz.panMode = false;
       contextViz.primaryPointerId = null;
       contextViz.pinchDistance = 0;
     }
@@ -24096,6 +24188,7 @@ function contextInitThree() {
     contextViz.zoom = contextClampZoom(contextViz.zoom + ev.deltaY * 0.035);
     contextRenderThree();
   }, { passive: false });
+  canvas.addEventListener('contextmenu', ev => ev.preventDefault());
   return true;
 }
 
@@ -24291,11 +24384,22 @@ function contextPickThreePart(ev) {
 function contextRenderThree(time = 0) {
   if (!contextViz.renderer || !contextViz.scene || !contextViz.camera) return;
   contextSetThreeSize();
-  contextViz.camera.position.set(0, 16, contextViz.zoom);
-  contextViz.camera.lookAt(0, 2.2, 0);
+  const radius = contextClampZoom(contextViz.zoom);
+  const pitch = Math.max(-1.22, Math.min(1.22, contextViz.rotationX));
+  const yaw = contextViz.rotationY;
+  const cosPitch = Math.cos(pitch);
+  const targetX = contextViz.targetX;
+  const targetY = contextViz.targetY;
+  const targetZ = contextViz.targetZ;
+  contextViz.camera.position.set(
+    targetX + Math.sin(yaw) * cosPitch * radius,
+    targetY + Math.sin(pitch) * radius,
+    targetZ + Math.cos(yaw) * cosPitch * radius
+  );
+  contextViz.camera.lookAt(targetX, targetY, targetZ);
+  contextViz.camera.updateMatrixWorld();
   if (contextViz.root) {
-    contextViz.root.rotation.x = contextViz.rotationX;
-    contextViz.root.rotation.y = contextViz.rotationY;
+    contextViz.root.rotation.set(0, 0, 0);
   }
   if (time && contextViz.meshes.length) {
     const t = time * 0.001;
