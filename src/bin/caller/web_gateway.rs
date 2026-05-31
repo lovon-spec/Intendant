@@ -1232,6 +1232,7 @@ const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
+const SOURCE_VIEWER_MAX_BYTES: u64 = 5 * 1024 * 1024;
 // 0 means replay every renderable entry from the external audit transcript.
 // External activity replay intentionally includes only user/assistant messages
 // and explicit context-rewind markers, not tool events or tool output.
@@ -9122,6 +9123,646 @@ fn url_path_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DashboardSourceRequest {
+    path: PathBuf,
+    line: Option<usize>,
+}
+
+fn dashboard_source_request_from_line(request_line: &str) -> Option<DashboardSourceRequest> {
+    if !request_line.starts_with("GET ") {
+        return None;
+    }
+    let path_token = request_line.split_whitespace().nth(1)?;
+    let path_part = path_token.split('?').next().unwrap_or(path_token);
+    if path_part.is_empty() || path_part == "/" {
+        return None;
+    }
+    let decoded = url_path_decode(path_part);
+    if decoded.contains('\0') {
+        return None;
+    }
+
+    let exact_path = dashboard_url_path_to_fs_path(&decoded);
+    if source_viewer_file_candidate(&exact_path) {
+        return Some(DashboardSourceRequest {
+            path: exact_path,
+            line: None,
+        });
+    }
+
+    let (without_line, line) = split_source_line_suffix(&decoded)?;
+    let source_path = dashboard_url_path_to_fs_path(without_line);
+    if source_viewer_file_candidate(&source_path) {
+        return Some(DashboardSourceRequest {
+            path: source_path,
+            line: Some(line),
+        });
+    }
+    None
+}
+
+fn dashboard_url_path_to_fs_path(decoded: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = decoded.strip_prefix('/') {
+            if looks_like_windows_drive_path(rest) {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    PathBuf::from(decoded)
+}
+
+#[cfg(windows)]
+fn looks_like_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+        && bytes[0].is_ascii_alphabetic()
+}
+
+fn source_viewer_file_candidate(path: &Path) -> bool {
+    path.is_absolute()
+        && std::fs::metadata(path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+}
+
+fn split_source_line_suffix(raw: &str) -> Option<(&str, usize)> {
+    let (path, line_raw) = raw.rsplit_once(':')?;
+    if path.is_empty() || line_raw.is_empty() || !line_raw.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let line = line_raw.parse::<usize>().ok()?;
+    if line == 0 {
+        return None;
+    }
+    Some((path, line))
+}
+
+fn dashboard_source_viewer_response(request_line: &str) -> Option<(&'static str, String)> {
+    let request = dashboard_source_request_from_line(request_line)?;
+    Some(render_dashboard_source_viewer_response(request))
+}
+
+fn render_dashboard_source_viewer_response(
+    request: DashboardSourceRequest,
+) -> (&'static str, String) {
+    let display_path = std::fs::canonicalize(&request.path).unwrap_or(request.path.clone());
+    let display_path_str = display_path.to_string_lossy().to_string();
+    let metadata = match std::fs::metadata(&display_path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return (
+                "404 Not Found",
+                render_dashboard_source_error_html(
+                    &display_path_str,
+                    "Not a file",
+                    "The requested path is not a regular file.",
+                ),
+            )
+        }
+        Err(err) => {
+            return (
+                "404 Not Found",
+                render_dashboard_source_error_html(
+                    &display_path_str,
+                    "File not found",
+                    &format!("Could not read file metadata: {err}"),
+                ),
+            )
+        }
+    };
+
+    if metadata.len() > SOURCE_VIEWER_MAX_BYTES {
+        return (
+            "413 Payload Too Large",
+            render_dashboard_source_error_html(
+                &display_path_str,
+                "File too large",
+                &format!(
+                    "Source viewer is limited to {} bytes; this file is {} bytes.",
+                    SOURCE_VIEWER_MAX_BYTES,
+                    metadata.len()
+                ),
+            ),
+        );
+    }
+
+    let bytes = match std::fs::read(&display_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (
+                "500 Internal Server Error",
+                render_dashboard_source_error_html(
+                    &display_path_str,
+                    "Read failed",
+                    &format!("Could not read the file: {err}"),
+                ),
+            )
+        }
+    };
+
+    if bytes.contains(&0) {
+        return (
+            "415 Unsupported Media Type",
+            render_dashboard_source_error_html(
+                &display_path_str,
+                "Binary file",
+                "The requested file appears to be binary and cannot be rendered as source.",
+            ),
+        );
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    let language = source_viewer_language(&display_path);
+    use base64::Engine as _;
+    let content_b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    (
+        "200 OK",
+        render_dashboard_source_viewer_html(
+            &display_path_str,
+            request.line,
+            language,
+            &content_b64,
+            bytes.len(),
+        ),
+    )
+}
+
+fn source_viewer_language(path: &Path) -> &'static str {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match file_name.as_str() {
+        "cargo.toml" => return "toml",
+        "makefile" | "dockerfile" => return "shell",
+        _ => {}
+    }
+
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => "rust",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "py" => "python",
+        "rb" => "ruby",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" => "cpp",
+        "cs" => "csharp",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "php" => "php",
+        "sh" | "bash" | "zsh" | "fish" | "ps1" => "shell",
+        "json" | "jsonl" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "md" | "markdown" => "markdown",
+        "css" | "scss" | "sass" => "css",
+        "html" | "htm" => "html",
+        "xml" => "xml",
+        "sql" => "sql",
+        _ => "",
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn render_dashboard_source_error_html(path: &str, title: &str, message: &str) -> String {
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>");
+    html.push_str(&html_escape(title));
+    html.push_str("</title><style>");
+    html.push_str(SOURCE_VIEWER_BASE_CSS);
+    html.push_str(
+        "</style></head><body><header><div class=\"source-kicker\">Intendant source</div><h1>",
+    );
+    html.push_str(&html_escape(title));
+    html.push_str("</h1><div class=\"source-path\">");
+    html.push_str(&html_escape(path));
+    html.push_str("</div></header><main class=\"source-error\"><p>");
+    html.push_str(&html_escape(message));
+    html.push_str("</p><a href=\"/\">Dashboard</a></main></body></html>");
+    html
+}
+
+fn render_dashboard_source_viewer_html(
+    path: &str,
+    line: Option<usize>,
+    language: &str,
+    content_b64: &str,
+    byte_len: usize,
+) -> String {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    let title = match line {
+        Some(line) => format!("{file_name}:{line}"),
+        None => file_name.to_string(),
+    };
+    let data_json = serde_json::json!({
+        "path": path,
+        "line": line,
+        "language": language,
+        "bytes": byte_len,
+        "content_b64": content_b64,
+    })
+    .to_string()
+    .replace("</", "<\\/");
+
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>");
+    html.push_str(&html_escape(&title));
+    html.push_str("</title><style>");
+    html.push_str(SOURCE_VIEWER_BASE_CSS);
+    html.push_str(SOURCE_VIEWER_CODE_CSS);
+    html.push_str("</style></head><body><header><div class=\"source-topline\"><div><div class=\"source-kicker\">Intendant source</div><h1 title=\"");
+    html.push_str(&html_escape(path));
+    html.push_str("\">");
+    html.push_str(&html_escape(&title));
+    html.push_str("</h1></div><a class=\"source-dashboard\" href=\"/\">Dashboard</a></div><div class=\"source-path\">");
+    html.push_str(&html_escape(path));
+    html.push_str("</div><div class=\"source-meta\"><span>");
+    if language.is_empty() {
+        html.push_str("text");
+    } else {
+        html.push_str(&html_escape(language));
+    }
+    html.push_str("</span><span id=\"source-line-count\">loading</span><span>");
+    html.push_str(&byte_len.to_string());
+    html.push_str(" bytes</span></div></header><main><pre id=\"source-code\" class=\"source-code\" aria-label=\"source file\"></pre></main><script>const SOURCE_DATA = ");
+    html.push_str(&data_json);
+    html.push_str(";</script><script>");
+    html.push_str(SOURCE_VIEWER_JS);
+    html.push_str("</script></body></html>");
+    html
+}
+
+const SOURCE_VIEWER_BASE_CSS: &str = r#"
+:root {
+  color-scheme: dark;
+  --base: #1e1e2e;
+  --mantle: #181825;
+  --crust: #11111b;
+  --surface0: #313244;
+  --surface1: #45475a;
+  --overlay0: #6c7086;
+  --subtext0: #a6adc8;
+  --text: #cdd6f4;
+  --blue: #89b4fa;
+  --sapphire: #74c7ec;
+  --green: #a6e3a1;
+  --yellow: #f9e2af;
+  --peach: #fab387;
+  --red: #f38ba8;
+  --mauve: #cba6f7;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  background: var(--base);
+  font-family: var(--font-sans);
+}
+header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 14px 18px 12px;
+  background: color-mix(in srgb, var(--mantle) 94%, transparent);
+  border-bottom: 1px solid var(--surface0);
+  backdrop-filter: blur(10px);
+}
+.source-topline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.source-kicker {
+  color: var(--subtext0);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+h1 {
+  margin: 2px 0 0;
+  font-size: 18px;
+  line-height: 1.25;
+  font-weight: 700;
+  word-break: break-word;
+}
+.source-dashboard {
+  flex: 0 0 auto;
+  color: var(--crust);
+  background: var(--blue);
+  border: 0;
+  border-radius: 5px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+}
+.source-path {
+  margin-top: 8px;
+  color: var(--subtext0);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.source-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+}
+.source-meta span {
+  color: var(--subtext0);
+  border: 1px solid var(--surface0);
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.source-error {
+  max-width: 860px;
+  margin: 48px auto;
+  padding: 0 18px;
+  color: var(--text);
+}
+.source-error p {
+  margin: 0 0 14px;
+  color: var(--subtext0);
+  line-height: 1.5;
+}
+.source-error a {
+  color: var(--sapphire);
+}
+"#;
+
+const SOURCE_VIEWER_CODE_CSS: &str = r#"
+main {
+  overflow-x: auto;
+}
+.source-code {
+  margin: 0;
+  min-width: max-content;
+  padding: 10px 0 28px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 2;
+}
+.source-line {
+  display: grid;
+  grid-template-columns: 72px minmax(max-content, 1fr);
+  min-height: 1.55em;
+  scroll-margin-top: 110px;
+}
+.source-line:hover {
+  background: rgba(69, 71, 90, 0.28);
+}
+.source-line.is-target {
+  background: rgba(250, 179, 135, 0.16);
+  box-shadow: inset 3px 0 0 var(--peach);
+}
+.line-no {
+  user-select: none;
+  padding: 0 12px 0 18px;
+  color: var(--overlay0);
+  text-align: right;
+  text-decoration: none;
+}
+.source-line:hover .line-no,
+.source-line.is-target .line-no {
+  color: var(--peach);
+}
+.line-code {
+  display: block;
+  padding-right: 24px;
+  color: var(--text);
+  white-space: pre;
+}
+.syntax-comment { color: var(--overlay0); }
+.syntax-string { color: var(--green); }
+.syntax-number { color: var(--peach); }
+.syntax-keyword { color: var(--mauve); font-weight: 600; }
+.syntax-type { color: var(--yellow); }
+.syntax-fn { color: var(--blue); }
+.syntax-punct { color: var(--subtext0); }
+.syntax-op { color: var(--red); }
+.syntax-var { color: var(--sapphire); }
+.syntax-tag { color: var(--blue); }
+.syntax-attr { color: var(--yellow); }
+.syntax-md-heading { color: var(--mauve); font-weight: 700; }
+.syntax-md-code { color: var(--peach); }
+"#;
+
+const SOURCE_VIEWER_JS: &str = r##"
+(function () {
+  const data = SOURCE_DATA || {};
+  const bytes = Uint8Array.from(atob(data.content_b64 || ''), ch => ch.charCodeAt(0));
+  const text = new TextDecoder('utf-8').decode(bytes).replace(/\r\n?/g, '\n');
+  const lines = text.length ? (text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n')) : [''];
+  const codeEl = document.getElementById('source-code');
+  const countEl = document.getElementById('source-line-count');
+  const language = String(data.language || '');
+  const keywords = new Set(('as async await break case catch class const continue default defer delete do dyn else enum export extends extern false finally fn for from func function if impl import in interface let loop match mod move mut new nil null package priv pub ref return self Self static struct super switch this throw trait true try type typeof undefined unsafe use var where while yield').split(/\s+/));
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, ch => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    })[ch]);
+  }
+
+  function span(cls, value) {
+    return '<span class="' + cls + '">' + escapeHtml(value) + '</span>';
+  }
+
+  function highlightMarkdown(src) {
+    let html = escapeHtml(src);
+    html = html.replace(/^(\s{0,3}#{1,6})(\s.*)?$/, '<span class="syntax-md-heading">$1</span>$2');
+    html = html.replace(/(`[^`]+`)/g, '<span class="syntax-md-code">$1</span>');
+    html = html.replace(/(\*\*[^*]+\*\*)/g, '<span class="syntax-keyword">$1</span>');
+    return html;
+  }
+
+  function highlightJsonLike(src) {
+    let html = escapeHtml(src);
+    html = html.replace(/(&quot;(?:\\.|[^&])*?&quot;)(\s*:)/g, '<span class="syntax-attr">$1</span>$2');
+    html = html.replace(/(:\s*)(&quot;(?:\\.|[^&])*?&quot;)/g, '$1<span class="syntax-string">$2</span>');
+    html = html.replace(/\b(true|false|null)\b/g, '<span class="syntax-keyword">$1</span>');
+    html = html.replace(/\b(-?\d+(?:\.\d+)?)\b/g, '<span class="syntax-number">$1</span>');
+    return html;
+  }
+
+  function highlightMarkup(src) {
+    let html = escapeHtml(src);
+    html = html.replace(/(&lt;\/?)([A-Za-z0-9:_-]+)/g, '$1<span class="syntax-tag">$2</span>');
+    html = html.replace(/\b([A-Za-z_:][-A-Za-z0-9_:.]*)(=)/g, '<span class="syntax-attr">$1</span>$2');
+    html = html.replace(/(&quot;.*?&quot;|&#39;.*?&#39;)/g, '<span class="syntax-string">$1</span>');
+    return html;
+  }
+
+  function highlightCss(src) {
+    let html = escapeHtml(src);
+    html = html.replace(/(\/\*.*?\*\/)/g, '<span class="syntax-comment">$1</span>');
+    html = html.replace(/([.#]?[A-Za-z_-][A-Za-z0-9_-]*)(\s*[:{])/g, '<span class="syntax-tag">$1</span>$2');
+    html = html.replace(/\b(-?\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)?)\b/g, '<span class="syntax-number">$1</span>');
+    return html;
+  }
+
+  function highlightCode(src) {
+    let html = '';
+    let i = 0;
+    const hashComment = ['python', 'ruby', 'shell', 'toml', 'yaml'].includes(language);
+    const sqlComment = language === 'sql';
+    while (i < src.length) {
+      const ch = src[i];
+      const next = src[i + 1] || '';
+      if (hashComment && ch === '#') {
+        html += span('syntax-comment', src.slice(i));
+        break;
+      }
+      if (sqlComment && ch === '-' && next === '-') {
+        html += span('syntax-comment', src.slice(i));
+        break;
+      }
+      if (ch === '/' && next === '/') {
+        html += span('syntax-comment', src.slice(i));
+        break;
+      }
+      if (ch === '/' && next === '*') {
+        const end = src.indexOf('*/', i + 2);
+        const stop = end === -1 ? src.length : end + 2;
+        html += span('syntax-comment', src.slice(i, stop));
+        i = stop;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        const quote = ch;
+        let j = i + 1;
+        while (j < src.length) {
+          if (src[j] === '\\') {
+            j += 2;
+            continue;
+          }
+          if (src[j] === quote) {
+            j++;
+            break;
+          }
+          j++;
+        }
+        html += span('syntax-string', src.slice(i, j));
+        i = j;
+        continue;
+      }
+      if (/[0-9]/.test(ch) && (i === 0 || !/[A-Za-z0-9_]/.test(src[i - 1] || ''))) {
+        let j = i + 1;
+        while (j < src.length && /[A-Za-z0-9_.]/.test(src[j])) j++;
+        html += span('syntax-number', src.slice(i, j));
+        i = j;
+        continue;
+      }
+      if (/[A-Za-z_$]/.test(ch)) {
+        let j = i + 1;
+        while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+        const token = src.slice(i, j);
+        const rest = src.slice(j).trimStart();
+        if (keywords.has(token)) {
+          html += span('syntax-keyword', token);
+        } else if (/^[A-Z][A-Za-z0-9_$]*$/.test(token)) {
+          html += span('syntax-type', token);
+        } else if (rest.startsWith('(')) {
+          html += span('syntax-fn', token);
+        } else {
+          html += escapeHtml(token);
+        }
+        i = j;
+        continue;
+      }
+      if ('{}[]().,;:'.includes(ch)) {
+        html += span('syntax-punct', ch);
+      } else if ('+-=*/!&|<>?%'.includes(ch)) {
+        html += span('syntax-op', ch);
+      } else {
+        html += escapeHtml(ch);
+      }
+      i++;
+    }
+    return html;
+  }
+
+  function highlightLine(src) {
+    if (language === 'markdown') return highlightMarkdown(src);
+    if (language === 'json') return highlightJsonLike(src);
+    if (language === 'html' || language === 'xml') return highlightMarkup(src);
+    if (language === 'css') return highlightCss(src);
+    return highlightCode(src);
+  }
+
+  function targetFromHash() {
+    const match = location.hash.match(/^#L?(\d+)$/i);
+    return match ? Number(match[1]) : 0;
+  }
+
+  function setTarget(line, scroll) {
+    document.querySelector('.source-line.is-target')?.classList.remove('is-target');
+    if (!line || !Number.isFinite(line)) return;
+    const el = document.getElementById('L' + line);
+    if (!el) return;
+    el.classList.add('is-target');
+    if (scroll) requestAnimationFrame(() => el.scrollIntoView({ block: 'center' }));
+  }
+
+  codeEl.innerHTML = lines.map((line, index) => {
+    const number = index + 1;
+    return '<div class="source-line" id="L' + number + '" data-line="' + number + '">' +
+      '<a class="line-no" href="#L' + number + '">' + number + '</a>' +
+      '<code class="line-code">' + (highlightLine(line) || ' ') + '</code>' +
+      '</div>';
+  }).join('');
+  countEl.textContent = lines.length + (lines.length === 1 ? ' line' : ' lines');
+  setTarget(Number(data.line || 0) || targetFromHash(), true);
+  window.addEventListener('hashchange', () => setTarget(targetFromHash(), true));
+})();
+"##;
+
 fn expand_dashboard_fs_path(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     let path = if trimmed.is_empty() || trimmed == "~" {
@@ -15532,6 +16173,22 @@ pub fn spawn_web_gateway(
                                     Content-Length: 0\r\n\
                                     \r\n";
                         let _ = stream.write_all(http.as_bytes()).await;
+                    } else if let Some((status, body)) =
+                        dashboard_source_viewer_response(request_line)
+                    {
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\n\
+                             Content-Type: text/html; charset=utf-8\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(),
+                            body
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else {
                         let (content_type, body, cache) =
                             if request_line.contains("/wasm-web/presence_web.js") {
@@ -17453,6 +18110,40 @@ mod tests {
     fn initial_body_bytes_rejects_incomplete_headers() {
         let request = b"POST /api/session/current/uploads HTTP/1.1\r\nContent-Length: 4\r\n";
         assert!(initial_body_bytes(request).is_err());
+    }
+
+    #[test]
+    fn source_viewer_request_strips_line_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let file = src_dir.join("file name.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let encoded_path = file.to_string_lossy().replace(' ', "%20");
+        let request_line = format!("GET {encoded_path}:42 HTTP/1.1");
+
+        let parsed = dashboard_source_request_from_line(&request_line).unwrap();
+        assert_eq!(parsed.path, file);
+        assert_eq!(parsed.line, Some(42));
+    }
+
+    #[test]
+    fn source_viewer_request_ignores_dashboard_routes() {
+        assert!(dashboard_source_request_from_line("GET /sessions HTTP/1.1").is_none());
+    }
+
+    #[test]
+    fn source_viewer_response_embeds_file_and_target_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        std::fs::write(&file, "fn one() {}\nfn two() {}\n").unwrap();
+        let request_line = format!("GET {}:2 HTTP/1.1", file.to_string_lossy());
+
+        let (status, body) = dashboard_source_viewer_response(&request_line).unwrap();
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("\"line\":2"), "{body}");
+        assert!(body.contains("\"language\":\"rust\""), "{body}");
+        assert!(body.contains("source-code"), "{body}");
     }
 
     #[test]
