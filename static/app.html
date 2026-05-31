@@ -20537,6 +20537,24 @@ function normalizeSharedViewDisplayId(evt) {
   return Number.isFinite(n) ? n : null;
 }
 
+function sharedViewDisplayLabel(displayId, displayTarget) {
+  if (displayId !== null && displayId !== undefined) {
+    const n = Number(displayId);
+    if (Number.isFinite(n)) return n === 0 ? 'primary display' : `display ${n}`;
+  }
+  const target = String(displayTarget || '').trim();
+  if (!target) return 'display';
+  if (target === 'user_session' || target === 'user' || target === 'primary') {
+    return 'primary display';
+  }
+  const stripped = target.startsWith(':') ? target.slice(1)
+    : target.startsWith('display_') ? target.slice('display_'.length)
+    : target;
+  const n = Number(stripped);
+  if (Number.isFinite(n)) return n === 0 ? 'primary display' : `display ${n}`;
+  return target;
+}
+
 function clearSharedViewDecorations() {
   for (const slot of displaySlots.values()) {
     slot.el.classList.remove('shared-view-active');
@@ -20580,9 +20598,7 @@ function updateSharedViewBanner() {
     });
     return;
   }
-  const target = sharedViewState.displayId !== null
-    ? ':' + sharedViewState.displayId
-    : (sharedViewState.displayTarget || 'display');
+  const target = sharedViewDisplayLabel(sharedViewState.displayId, sharedViewState.displayTarget);
   const detail = sharedViewState.reason || sharedViewState.note || '';
   const action = sharedViewState.action === 'input_request'
     ? 'Input requested'
@@ -21354,15 +21370,15 @@ function _streamGroup(name) {
 }
 
 function _streamLabel(name) {
-  // display_0 → :0 #1, display_0_2 → :0 #2
+  // display_0 -> Display 0 #1, display_0_2 -> Display 0 #2
   if (name.startsWith('display_')) {
     const rest = name.slice(8);
     const m = rest.match(/^(\d+)_(\d+)$/);
-    if (m) return ':' + m[1] + ' #' + m[2];
+    if (m) return 'Display ' + m[1] + ' #' + m[2];
     // First recording for this display — label as #1
     const m2 = rest.match(/^(\d+)$/);
-    if (m2) return ':' + m2[1] + ' #1';
-    return ':' + rest;
+    if (m2) return 'Display ' + m2[1] + ' #1';
+    return 'Display ' + rest;
   }
   return name;
 }

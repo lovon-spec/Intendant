@@ -9,7 +9,7 @@ Use this skill when work benefits from a shared visual surface with the user: UI
 
 ## Core Tools
 
-- `show_shared_view`: opens the shared display surface and marks the relevant display as the shared view. For `user_session` / `:0`, this also requests display-stream activation.
+- `show_shared_view`: opens the shared display surface and marks the relevant display as the shared view. For `user_session` / the primary display, this also requests display-stream activation.
 - `focus_shared_view`: highlights a normalized region `{x, y, width, height}` on the shared display. Coordinates are fractions from 0.0 to 1.0.
 - `capture_shared_view_frame`: captures the current display as an MCP image and foregrounds the same dashboard view.
 - `request_shared_view_input`: asks the user to take input authority. The user must click the dashboard control; the tool does not grant control by itself.
@@ -28,7 +28,7 @@ Use this skill when work benefits from a shared visual surface with the user: UI
 Prefer `display_id` when known. Use `display_target` otherwise:
 
 - `user_session` for the user's primary shared desktop.
-- `:99` or another X display number for a virtual display.
+- `display_99`, `99`, or legacy `:99` for a virtual display.
 - Omit both only when auto-detection is acceptable.
 
 The shared view is a dashboard coordination layer. For actual computer-use actions, continue using `take_screenshot` and `execute_cu_actions`; for archived stream frames, use `list_frames` and `read_frame`.

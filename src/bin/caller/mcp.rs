@@ -3726,7 +3726,7 @@ pub struct StartTaskParams {
     /// CU-capable model instead of the regular agent loop.
     #[serde(default)]
     pub reference_frame_ids: Vec<String>,
-    /// Explicit display target for CU tasks: "user_session", ":99", etc.
+    /// Explicit display target for CU tasks: "user_session", "display_99", etc.
     #[serde(default)]
     pub display_target: Option<String>,
 }
@@ -3795,7 +3795,7 @@ pub struct ClaimFissionCanonicalParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeDisplayParams {
-    /// Display ID to claim (e.g. 99 for virtual display :99).
+    /// Display ID to claim (e.g. 99 for virtual display 99).
     pub display_id: u32,
 }
 
@@ -3909,7 +3909,7 @@ fn default_timeout() -> u64 {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeScreenshotParams {
-    /// Display target: "user_session", ":99", etc. Auto-detects if omitted.
+    /// Display target: "user_session", "display_99", etc. Auto-detects if omitted.
     #[serde(default)]
     pub display_target: Option<String>,
 }
@@ -3963,7 +3963,7 @@ pub struct SharedViewRegionParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ShowSharedViewParams {
-    /// Display target to foreground, such as "user_session" or ":99".
+    /// Display target to foreground, such as "user_session" or "display_99".
     #[serde(default)]
     pub display_target: Option<String>,
     /// Numeric display id. Prefer this when known.
@@ -3986,7 +3986,7 @@ pub struct HideSharedViewParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FocusSharedViewParams {
-    /// Display target to focus, such as "user_session" or ":99".
+    /// Display target to focus, such as "user_session" or "display_99".
     #[serde(default)]
     pub display_target: Option<String>,
     /// Numeric display id. Prefer this when known.
@@ -4001,7 +4001,7 @@ pub struct FocusSharedViewParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestSharedViewInputParams {
-    /// Display target where user input is useful, such as "user_session" or ":99".
+    /// Display target where user input is useful, such as "user_session" or "display_99".
     #[serde(default)]
     pub display_target: Option<String>,
     /// Numeric display id. Prefer this when known.
@@ -4014,7 +4014,7 @@ pub struct RequestSharedViewInputParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CaptureSharedViewFrameParams {
-    /// Display target to capture, such as "user_session" or ":99". Auto-detects if omitted.
+    /// Display target to capture, such as "user_session" or "display_99". Auto-detects if omitted.
     #[serde(default)]
     pub display_target: Option<String>,
     /// Numeric display id. Prefer this when known.
@@ -4618,10 +4618,36 @@ fn shared_view_display_id(display_target: Option<&str>, display_id: Option<u32>)
 }
 
 fn shared_view_target_label(display_id: Option<u32>, display_target: Option<&str>) -> String {
-    display_id
-        .map(|id| format!(":{}", id))
-        .or_else(|| display_target.map(str::to_string))
-        .unwrap_or_else(|| "default display".to_string())
+    if let Some(id) = display_id {
+        return if id == 0 {
+            "primary display".to_string()
+        } else {
+            format!("display {}", id)
+        };
+    }
+    let Some(target) = display_target
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return "default display".to_string();
+    };
+    if target.eq_ignore_ascii_case("user_session")
+        || target.eq_ignore_ascii_case("user")
+        || target.eq_ignore_ascii_case("primary")
+    {
+        return "primary display".to_string();
+    }
+    let parsed = target
+        .strip_prefix(':')
+        .or_else(|| target.strip_prefix("display_"))
+        .unwrap_or(target)
+        .parse::<u32>()
+        .ok();
+    match parsed {
+        Some(0) => "primary display".to_string(),
+        Some(id) => format!("display {}", id),
+        None => target.to_string(),
+    }
 }
 
 fn shared_view_user_display_id(
@@ -5493,7 +5519,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Open the dashboard shared display view for agent-human collaboration. For user_session/:0 targets, this also requests display-stream activation. This does not grant input authority; it asks connected dashboards to show the relevant display and optional focus region."
+        description = "Open the dashboard shared display view for agent-human collaboration. For user_session / primary-display targets, this also requests display-stream activation. This does not grant input authority; it asks connected dashboards to show the relevant display and optional focus region."
     )]
     async fn show_shared_view(
         &self,
@@ -5546,7 +5572,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Highlight a normalized region in the dashboard shared display view. For user_session/:0 targets, this also requests display-stream activation. Use this to point the user at a specific UI element or area."
+        description = "Highlight a normalized region in the dashboard shared display view. For user_session / primary-display targets, this also requests display-stream activation. Use this to point the user at a specific UI element or area."
     )]
     async fn focus_shared_view(
         &self,
@@ -5582,7 +5608,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Ask the dashboard user to take input authority for the shared display. For user_session/:0 targets, this also requests display-stream activation. This is advisory: the user must click the dashboard control before keyboard/mouse input is granted."
+        description = "Ask the dashboard user to take input authority for the shared display. For user_session / primary-display targets, this also requests display-stream activation. This is advisory: the user must click the dashboard control before keyboard/mouse input is granted."
     )]
     async fn request_shared_view_input(
         &self,
@@ -5945,9 +5971,14 @@ impl IntendantServer {
 fn resolve_display_target(target: Option<&str>) -> crate::computer_use::DisplayTarget {
     use crate::computer_use::DisplayTarget;
     match target {
-        Some("user_session") | Some("user") | Some(":0") | Some("0") => DisplayTarget::UserSession,
+        Some("user_session") | Some("user") | Some("primary") | Some(":0") | Some("0")
+        | Some("display_0") => DisplayTarget::UserSession,
         Some(s) if s.starts_with(':') => {
             let id: u32 = s[1..].parse().unwrap_or(99);
+            DisplayTarget::Virtual { id }
+        }
+        Some(s) if s.starts_with("display_") => {
+            let id: u32 = s["display_".len()..].parse().unwrap_or(99);
             DisplayTarget::Virtual { id }
         }
         Some(s) => {
@@ -6643,6 +6674,26 @@ mod tests {
             );
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
+    }
+
+    #[test]
+    fn shared_view_labels_are_platform_neutral() {
+        assert_eq!(
+            shared_view_target_label(Some(0), Some(":0")),
+            "primary display"
+        );
+        assert_eq!(
+            shared_view_target_label(None, Some("user_session")),
+            "primary display"
+        );
+        assert_eq!(
+            shared_view_target_label(None, Some("display_99")),
+            "display 99"
+        );
+        assert_eq!(
+            shared_view_target_label(Some(99), Some(":99")),
+            "display 99"
+        );
     }
 
     #[test]

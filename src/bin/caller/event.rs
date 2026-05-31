@@ -1167,7 +1167,7 @@ pub enum ControlMsg {
         /// regular agent loop.
         #[serde(default)]
         reference_frame_ids: Vec<String>,
-        /// Explicit display target for CU actions (e.g. "user_session", ":99").
+        /// Explicit display target for CU actions (e.g. "user_session", "display_99").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_target: Option<String>,
         /// Frame/upload IDs attached via the dashboard.
@@ -1192,7 +1192,7 @@ pub enum ControlMsg {
         /// regular agent loop.
         #[serde(default)]
         reference_frame_ids: Vec<String>,
-        /// Explicit display target for CU actions (e.g. "user_session", ":99").
+        /// Explicit display target for CU actions (e.g. "user_session", "display_99").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_target: Option<String>,
         /// Frame IDs that the user attached to this task via the dashboard's
