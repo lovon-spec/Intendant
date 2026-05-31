@@ -375,7 +375,47 @@ impl SessionSupervisor {
                 display_target,
                 attachments,
             } => {
-                if parse_codex_slash_command(&task).is_some() {
+                if let Some(parsed) = parse_codex_slash_command(&task) {
+                    match parsed {
+                        Ok(command) if command.op == "fast" => {
+                            let agent = match codex_fast_new_session_agent(agent.as_deref()) {
+                                Ok(agent) => Some(agent),
+                                Err(message) => {
+                                    self.loop_error(message);
+                                    return;
+                                }
+                            };
+                            if !reference_frame_ids.is_empty()
+                                || display_target.is_some()
+                                || !attachments.is_empty()
+                            {
+                                self.warn(
+                                    "/fast creates an idle Codex session; attachments and display metadata were ignored",
+                                );
+                            }
+                            self.start_new_session(
+                                String::new(),
+                                name,
+                                project_root,
+                                agent,
+                                agent_command,
+                                codex_managed_context,
+                                codex_context_archive,
+                                orchestrate,
+                                direct,
+                                Vec::new(),
+                                None,
+                                Vec::new(),
+                                Some(
+                                    crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
+                                        .to_string(),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
                     if !reference_frame_ids.is_empty()
                         || display_target.is_some()
                         || agent.is_some()
@@ -405,6 +445,7 @@ impl SessionSupervisor {
                     reference_frame_ids,
                     display_target,
                     attachments,
+                    None,
                 )
                 .await;
             }
@@ -437,7 +478,40 @@ impl SessionSupervisor {
                 attachments,
                 follow_up_id: _,
             } => {
-                if parse_codex_slash_command(&task).is_some() {
+                if let Some(parsed) = parse_codex_slash_command(&task) {
+                    match parsed {
+                        Ok(command) if command.op == "fast" => {
+                            if !reference_frame_ids.is_empty()
+                                || display_target.is_some()
+                                || !attachments.is_empty()
+                            {
+                                self.warn(
+                                    "/fast creates an idle Codex session; attachments and display metadata were ignored",
+                                );
+                            }
+                            self.start_new_session(
+                                String::new(),
+                                None,
+                                None,
+                                Some("codex".to_string()),
+                                None,
+                                None,
+                                None,
+                                orchestrate,
+                                direct,
+                                Vec::new(),
+                                None,
+                                Vec::new(),
+                                Some(
+                                    crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
+                                        .to_string(),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
                     if !reference_frame_ids.is_empty() || display_target.is_some() {
                         self.warn(
                             "Slash command dropped reference frame/display metadata; routing to active Codex session",
@@ -460,6 +534,7 @@ impl SessionSupervisor {
                     reference_frame_ids,
                     display_target,
                     attachments,
+                    None,
                 )
                 .await;
             }
@@ -654,6 +729,7 @@ impl SessionSupervisor {
         reference_frame_ids: Vec<String>,
         display_target: Option<String>,
         attachments: Vec<String>,
+        codex_service_tier: Option<String>,
     ) {
         let session_name = match normalize_session_name_option(name.as_deref()) {
             Ok(name) => name,
@@ -691,10 +767,15 @@ impl SessionSupervisor {
             }
         };
 
+        let task_meta = if task.trim().is_empty() {
+            None
+        } else {
+            Some(task.as_str())
+        };
         write_session_meta(
             &session_log,
             &project.root,
-            Some(&task),
+            task_meta,
             session_name.as_deref(),
         );
         self.activate_shared_session(session_log.clone()).await;
@@ -825,7 +906,9 @@ impl SessionSupervisor {
             });
         }
 
-        emit_task_dispatched_log(&self.config.bus, &session_log, &task, attachments.len());
+        if !task.trim().is_empty() {
+            emit_task_dispatched_log(&self.config.bus, &session_log, &task, attachments.len());
+        }
         self.spawn_agent_session(
             session_id,
             source,
@@ -840,6 +923,7 @@ impl SessionSupervisor {
             None,
             emit_session_started_after_identity,
             None,
+            codex_service_tier,
         )
         .await;
     }
@@ -996,6 +1080,7 @@ impl SessionSupervisor {
                     Some(resume_token.clone()),
                     false,
                     Some(ready_tx),
+                    None,
                 )
                 .await;
                 self.clear_external_attach_request(&external_attach_keys)
@@ -1122,6 +1207,7 @@ impl SessionSupervisor {
             Some(resume_token),
             false,
             None,
+            None,
         )
         .await;
     }
@@ -1163,6 +1249,7 @@ impl SessionSupervisor {
         resume_token: Option<String>,
         emit_session_started_after_identity: bool,
         ready_for_thread_actions: Option<oneshot::Sender<()>>,
+        codex_service_tier: Option<String>,
     ) {
         let (follow_up_tx, follow_up_rx) = mpsc::channel::<FollowUpMessage>(16);
         let (finished_tx, finished_rx) = oneshot::channel();
@@ -1208,6 +1295,7 @@ impl SessionSupervisor {
                     web_port,
                     attachments,
                     resume_token,
+                    codex_service_tier,
                     Some(session_id.clone()),
                     emit_session_started_after_identity,
                     ready_for_thread_actions,
@@ -2718,6 +2806,21 @@ impl SessionAgentSelection {
     }
 }
 
+fn codex_fast_new_session_agent(agent: Option<&str>) -> Result<String, String> {
+    match SessionAgentSelection::from_wire(agent)? {
+        SessionAgentSelection::Configured => Ok("codex".to_string()),
+        SessionAgentSelection::External(external_agent::AgentBackend::Codex) => {
+            Ok("codex".to_string())
+        }
+        SessionAgentSelection::Internal => {
+            Err("/fast can only start a new Codex external-agent session".to_string())
+        }
+        SessionAgentSelection::External(other) => Err(format!(
+            "/fast can only start a new Codex external-agent session; selected {other}"
+        )),
+    }
+}
+
 fn normalize_session_agent_command(command: Option<&str>) -> Option<String> {
     command
         .map(str::trim)
@@ -3701,6 +3804,27 @@ mod tests {
             .expect("recognized slash command")
             .unwrap_err();
         assert!(err.contains("does not accept arguments"), "got: {err}");
+    }
+
+    #[test]
+    fn fast_new_session_forces_or_accepts_codex_agent() {
+        assert_eq!(
+            codex_fast_new_session_agent(None).unwrap(),
+            "codex".to_string()
+        );
+        assert_eq!(
+            codex_fast_new_session_agent(Some("configured")).unwrap(),
+            "codex".to_string()
+        );
+        assert_eq!(
+            codex_fast_new_session_agent(Some("codex")).unwrap(),
+            "codex".to_string()
+        );
+
+        let err = codex_fast_new_session_agent(Some("gemini")).unwrap_err();
+        assert!(err.contains("Codex"), "got: {err}");
+        let err = codex_fast_new_session_agent(Some("internal")).unwrap_err();
+        assert!(err.contains("Codex"), "got: {err}");
     }
 
     #[test]

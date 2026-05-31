@@ -7884,7 +7884,7 @@ body.display-fullscreen-open {
                   <button class="control-action-btn" data-codex-action="memory-reset" title="Reset Codex's thread memory (/memory reset)">Reset memory</button>
                 </div>
                 <div class="control-hint">
-                  Actions dispatch to the live Codex thread. <strong>New thread</strong> is the only one that takes effect without an active task — the rest require an already-running Codex session (start any task first). Goal actions use Codex's experimental persisted goal API. Errors surface as a toast + Activity log entry.
+                  Actions dispatch to the live Codex thread. <strong>New thread</strong> is the only button that takes effect without an active task; typing <strong>/fast</strong> with no target starts an idle fast Codex session. Goal actions use Codex's experimental persisted goal API. Errors surface as a toast + Activity log entry.
                 </div>
               </fieldset>
               <fieldset class="control-group">
@@ -12165,6 +12165,11 @@ function dispatchCodexSlashCommand(parsed) {
   }
   const sid = resolvePromptTargetSessionId();
   if (!sid) {
+    if (parsed.op === 'fast') {
+      dispatchControlMsg({ action: 'create_session', task: '/fast', agent: 'codex' });
+      showControlToast('info', 'Starting a fast Codex session');
+      return true;
+    }
     showControlToast('error', `/${parsed.op}: select a Codex session first`);
     return false;
   }

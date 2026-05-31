@@ -94,13 +94,13 @@ It subscribes to the bus and handles the session-lifecycle `ControlMsg`s:
 
 | ControlMsg | Behavior |
 |------------|----------|
-| `CreateSession` | Explicitly create a new managed session and submit its first task (the forward-compatible primitive for parallel sessions) |
-| `StartTask { session_id: None }` | Start a new managed session (legacy clients) |
+| `CreateSession` | Explicitly create a new managed session and submit its first task (the forward-compatible primitive for parallel sessions). A task of exactly `/fast` is special-cased into a new idle Codex session with the fast service tier enabled. |
+| `StartTask { session_id: None }` | Start a new managed session (legacy clients). A task of exactly `/fast` follows the same idle fast Codex bootstrap path as `CreateSession`. |
 | `StartTask { session_id: Some(id) }` | Route the text as a follow-up turn into the named session |
 | `ResumeSession` | Re-attach an existing session by source (`intendant`/`codex`/`claude-code`/`gemini`) + id, optionally with a prompt |
 | `FollowUp` | Route text to a session's follow-up channel (target id, or the active session) |
 | `EditUserMessage` | Rewind a session to a user turn and submit replacement text (rollback-capable backends only) |
-| `Interrupt` / `Steer` | Mid-turn control of a running session |
+| `Interrupt` / `Steer` | Mid-turn control of a running session. If a steer body is a supported Codex slash command, the supervisor converts it to a Codex thread action instead of injecting it as model text. |
 | `Approve`/`Deny`/`Skip`/`ApproveAll` | Resolve a pending approval against the right session's `ApprovalRegistry` |
 | `RenameSession` | Rename via the cross-backend naming abstraction (see [Session Logging](./session-logging.md)) |
 

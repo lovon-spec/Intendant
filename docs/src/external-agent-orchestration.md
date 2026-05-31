@@ -156,6 +156,13 @@ features they lack.
   **sub-agent** activity (`AgentEvent::SubAgentToolCall`) and per-fork token
   accounting.
 
+  `/fast` is also a session-bootstrap command: when a new-session request contains
+  exactly `/fast`, the supervisor starts a new idle Codex session and passes
+  `serviceTier: "priority"` on `thread/start`. Existing targeted `/fast` commands
+  remain live thread actions and toggle the service tier for future turns in that
+  Codex session; if typed while the prompt is in steer mode, the supervisor still
+  converts it to the thread action rather than sending `/fast` as model text.
+
 - **Diff handling.** Codex's `turn/diff/updated` sometimes carries paths only
   inside the diff body; `parse_diff_file_paths()` recovers them from the unified
   diff when the explicit `files_changed` list is empty.

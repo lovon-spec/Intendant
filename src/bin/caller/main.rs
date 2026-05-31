@@ -1078,6 +1078,7 @@ async fn create_external_agent(
     web_port: Option<u16>,
     resume_session: Option<String>,
     mcp_session_id: Option<String>,
+    codex_service_tier: Option<String>,
 ) -> Result<
     (
         Box<dyn external_agent::ExternalAgent>,
@@ -1125,6 +1126,7 @@ async fn create_external_agent(
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: sandbox_mode,
                 reasoning_effort,
+                service_tier: codex_service_tier,
                 web_search: cfg.web_search,
                 network_access: cfg.network_access,
                 writable_roots: cfg.writable_roots.clone(),
@@ -1166,6 +1168,7 @@ async fn create_external_agent(
                 approval_policy: approval_mode,
                 sandbox: String::new(),
                 reasoning_effort: None,
+                service_tier: None,
                 web_search: false,
                 network_access: false,
                 writable_roots: Vec::new(),
@@ -1194,6 +1197,7 @@ async fn create_external_agent(
                 approval_policy: cfg.permission_mode.clone(),
                 sandbox: String::new(),
                 reasoning_effort: None,
+                service_tier: None,
                 web_search: false,
                 network_access: false,
                 writable_roots: Vec::new(),
@@ -12244,6 +12248,7 @@ async fn run_with_presence(
                     web_port,
                     None,
                     session_log_id(&session_log),
+                    None,
                 )
                 .await
                 {
@@ -13206,6 +13211,7 @@ async fn run_external_agent_mode(
     web_port: Option<u16>,
     attachments: UserAttachments,
     resume_session: Option<String>,
+    codex_service_tier: Option<String>,
     control_session_id: Option<String>,
     emit_session_started_after_identity: bool,
     ready_for_thread_actions: Option<tokio::sync::oneshot::Sender<()>>,
@@ -13255,6 +13261,7 @@ async fn run_external_agent_mode(
         web_port,
         resume_session,
         intendant_session_id.clone(),
+        codex_service_tier,
     )
     .await
     {
@@ -16932,6 +16939,7 @@ async fn main() -> Result<(), CallerError> {
                             UserAttachments::default(),
                             None,
                             None,
+                            None,
                             false,
                             None,
                         )
@@ -17630,6 +17638,7 @@ async fn main() -> Result<(), CallerError> {
                         UserAttachments::default(),
                         None,
                         None,
+                        None,
                         false,
                         None,
                     )
@@ -18093,6 +18102,7 @@ async fn main() -> Result<(), CallerError> {
                 true, // headless mode
                 web_port_for_agent,
                 UserAttachments::default(),
+                None,
                 None,
                 None,
                 false,

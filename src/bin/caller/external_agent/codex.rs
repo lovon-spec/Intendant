@@ -51,7 +51,7 @@ Do not modify files, source, git state, permissions, configuration, or any other
 const GENERATION_STARVATION_NEAR_LIMIT_PCT: f64 = 85.0;
 const GENERATION_STARVATION_HINT: &str = "The previous Codex response appears to have been cut off near the backend context limit. Avoid regenerating the same long output; rewind context first or produce a much shorter recovery response.";
 const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
-const CODEX_FAST_SERVICE_TIER: &str = "priority";
+pub(crate) const CODEX_FAST_SERVICE_TIER: &str = "priority";
 
 /// Codex-specific thread-action helpers. Each wraps one of Codex's app-server
 /// JSON-RPC methods (`thread/compact/start`, `thread/fork`, `thread/inject_items`,
@@ -4124,6 +4124,8 @@ impl ExternalAgent for CodexAgent {
         self.approval_policy = config.approval_policy.clone();
         self.sandbox = config.sandbox;
         self.reasoning_effort = config.reasoning_effort;
+        self.service_tier = config.service_tier;
+        self.service_tier_clear_pending = false;
         self.web_search = config.web_search;
         self.network_access = config.network_access;
         self.writable_roots = config.writable_roots;
@@ -7474,6 +7476,7 @@ mod tests {
             approval_policy: "never".to_string(),
             sandbox: "danger-full-access".to_string(),
             reasoning_effort: None,
+            service_tier: None,
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
