@@ -33542,13 +33542,9 @@ function renderSessionsList(sessions, el, options = {}) {
       configMeta.backendSessionId ||
       configMeta.backend_session_id
     );
-    const source = hasExternalBackend
-      ? (backendSource && backendSource !== 'intendant'
-        ? backendSource
-        : (configSource && configSource !== 'intendant' ? configSource : 'external'))
-      : rawSource;
+    const source = rawSource;
     const shortId = (s.session_id || '').substring(0, 8);
-    const isExternal = hasExternalBackend || source !== 'intendant';
+    const isExternal = source !== 'intendant';
     const isCurrent = currentSessionId && s.session_id && s.session_id.startsWith(currentSessionId);
 
     // Override status for current session — never show as abandoned/idle
@@ -33616,13 +33612,17 @@ function renderSessionsList(sessions, el, options = {}) {
     sourceEl.className = 'sc-source' + (isExternal ? '' : ' local');
     sourceEl.textContent = isExternal
       ? (
+        s.source_label ||
+        s.sourceLabel ||
         s.backend_source_label ||
         s.backendSourceLabel ||
-        (rawSource !== 'intendant' ? (s.source_label || s.sourceLabel) : '') ||
         prettyAgentName(source) ||
         source
       )
       : (s.source_label || s.sourceLabel || 'Intendant');
+    if (!isExternal && hasExternalBackend && backendSource && backendSource !== 'intendant') {
+      sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
+    }
     top.appendChild(sourceEl);
 
     if (s.role) {
