@@ -5214,24 +5214,24 @@ impl IntendantServer {
             return "rewind_context anchor.position must be `before` or `after`".to_string();
         }
 
-        self.bus
-            .send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
-                session_id: params.session_id.clone(),
-                op: "rewind_context".to_string(),
-                params: serde_json::json!({
-                    "anchor": {
-                        "item_id": item_id,
-                        "position": position,
-                    },
-                    "reason": reason,
-                    "primer": primer,
-                    "preserve": params.preserve,
-                    "discard": params.discard,
-                    "artifacts": params.artifacts,
-                    "next_steps": params.next_steps,
-                }),
-            }));
-        "ok (managed-context rewind dispatched)".to_string()
+        self.dispatch_codex_thread_action_and_wait(
+            params.session_id.clone(),
+            "rewind_context".to_string(),
+            serde_json::json!({
+                "anchor": {
+                    "item_id": item_id,
+                    "position": position,
+                },
+                "reason": reason,
+                "primer": primer,
+                "preserve": params.preserve,
+                "discard": params.discard,
+                "artifacts": params.artifacts,
+                "next_steps": params.next_steps,
+            }),
+            "rewind_context dispatched but no validation result was observed".to_string(),
+        )
+        .await
     }
 
     #[tool(
@@ -7435,7 +7435,31 @@ mod tests {
             let state = test_state();
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
             let server = IntendantServer::new(state, bus.clone());
+
+            let event_task = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            params,
+                        })) if op == "rewind_context" => {
+                            let event = (session_id.clone(), op.clone(), params);
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: true,
+                                message: "context rewind scheduled".to_string(),
+                            });
+                            break event;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            });
 
             let result = server
                 .call_tool_by_name_for_session(
@@ -7451,26 +7475,84 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                result_json
+                    .pointer("/content/0/text")
+                    .and_then(|value| value.as_str()),
+                Some("context rewind scheduled")
+            );
 
-            let event = timeout(Duration::from_secs(1), async {
+            let event = timeout(Duration::from_secs(1), event_task)
+                .await
+                .expect("expected CodexThreadAction control command")
+                .unwrap();
+
+            assert_eq!(event.0.as_deref(), Some("backend-session-1"));
+            assert_eq!(event.1, "rewind_context");
+            assert_eq!(event.2["anchor"]["item_id"], "call-1");
+        });
+    }
+
+    #[test]
+    fn rewind_context_surfaces_validation_failure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
+            let server = IntendantServer::new(state, bus);
+
+            let result_task = tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
                         Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
                             session_id,
                             op,
-                            params,
-                        })) => break (session_id, op, params),
+                            ..
+                        })) if op == "rewind_context" => {
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: false,
+                                message:
+                                    "rollback anchor item_id `rewind_context-call_6` was not found; call list_rewind_anchors"
+                                        .to_string(),
+                            });
+                            break;
+                        }
                         Ok(_) => continue,
                         Err(e) => panic!("event bus closed: {e}"),
                     }
                 }
-            })
-            .await
-            .expect("expected CodexThreadAction control command");
+            });
 
-            assert_eq!(event.0.as_deref(), Some("backend-session-1"));
-            assert_eq!(event.1, "rewind_context");
-            assert_eq!(event.2["anchor"]["item_id"], "call-1");
+            let result = server
+                .call_tool_by_name_for_session(
+                    "rewind_context",
+                    serde_json::json!({
+                        "anchor": {"item_id": "rewind_context-call_6", "position": "after"},
+                        "reason": "recover pressure",
+                        "primer": "dense continuation"
+                    }),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+
+            let result_json = serde_json::to_value(&result).unwrap();
+            let text = result_json
+                .pointer("/content/0/text")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            assert!(text.contains("rewind_context failed"), "got: {text}");
+            assert!(text.contains("call list_rewind_anchors"), "got: {text}");
+            result_task.await.unwrap();
         });
     }
 

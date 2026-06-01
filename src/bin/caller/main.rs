@@ -1850,6 +1850,34 @@ fn resolve_context_rewind_anchor(
     ))
 }
 
+fn active_context_rewind_thread_id<'a>(config: &'a DrainConfig<'_>) -> Option<&'a str> {
+    config
+        .alias_session_id
+        .as_deref()
+        .or(config.session_id.as_deref())
+}
+
+async fn validate_context_rewind_request_before_schedule(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread_id: &str,
+    request: &ExternalContextRewindRequest,
+) -> Result<(), String> {
+    if !agent.supports_item_anchor_rewind() {
+        return Err(format!(
+            "{} does not support item-anchor rewind",
+            agent.name()
+        ));
+    }
+    let snapshot = agent
+        .read_thread_snapshot(thread_id)
+        .await
+        .map_err(|e| format!("failed to read thread metadata before rewind: {}", e))?;
+    let source_rollout_path = snapshot
+        .rollout_path
+        .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
+    resolve_context_rewind_anchor(&source_rollout_path, &request.item_id).map(|_| ())
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ContextRewindRolloutAnchorScan {
     requested_anchor_exists: bool,
@@ -4906,6 +4934,8 @@ async fn drain_external_agent_events(
                         &local_session_id,
                         &alias_session_id,
                     ) => {
+                        let result_session_id =
+                            session_id.clone().or_else(|| local_session_id.clone());
                         if !codex_thread_action_dedupe.mark_seen(&request_id) {
                             continue;
                         }
@@ -4914,7 +4944,7 @@ async fn drain_external_agent_events(
                                 "/undo is only available between turns for this session"
                                     .to_string();
                             config.bus.send(AppEvent::CodexThreadActionResult {
-                                session_id: local_session_id.clone(),
+                                session_id: result_session_id.clone(),
                                 action,
                                 success: false,
                                 message,
@@ -4932,7 +4962,7 @@ async fn drain_external_agent_events(
                                 Ok(request) => {
                                     if pending_context_rewind.is_some() {
                                         config.bus.send(AppEvent::CodexThreadActionResult {
-                                            session_id: local_session_id.clone(),
+                                            session_id: result_session_id.clone(),
                                             action,
                                             success: false,
                                             message:
@@ -4940,6 +4970,33 @@ async fn drain_external_agent_events(
                                                     .to_string(),
                                         });
                                     } else {
+                                        let Some(thread_id) =
+                                            active_context_rewind_thread_id(config)
+                                        else {
+                                            config.bus.send(AppEvent::CodexThreadActionResult {
+                                                session_id: result_session_id.clone(),
+                                                action,
+                                                success: false,
+                                                message:
+                                                    "cannot validate context rewind: active Codex thread id is unknown"
+                                                        .to_string(),
+                                            });
+                                            continue;
+                                        };
+                                        if let Err(message) =
+                                            validate_context_rewind_request_before_schedule(
+                                                agent, thread_id, &request,
+                                            )
+                                            .await
+                                        {
+                                            config.bus.send(AppEvent::CodexThreadActionResult {
+                                                session_id: result_session_id.clone(),
+                                                action,
+                                                success: false,
+                                                message,
+                                            });
+                                            continue;
+                                        }
                                         let target = request.target_label();
                                         let should_stop_turn = request.auto_resume;
                                         pending_context_rewind = Some(request);
@@ -4962,7 +5019,7 @@ async fn drain_external_agent_events(
                                         }
                                         slog(config.session_log, |l| l.info(&message));
                                         config.bus.send(AppEvent::CodexThreadActionResult {
-                                            session_id: local_session_id.clone(),
+                                            session_id: result_session_id.clone(),
                                             action,
                                             success: true,
                                             message,
@@ -4971,7 +5028,7 @@ async fn drain_external_agent_events(
                                 }
                                 Err(message) => {
                                     config.bus.send(AppEvent::CodexThreadActionResult {
-                                        session_id: local_session_id.clone(),
+                                        session_id: result_session_id.clone(),
                                         action,
                                         success: false,
                                         message,
