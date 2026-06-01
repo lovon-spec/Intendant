@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_AGENT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
+const OUTBOUND_CONTEXT_SNAPSHOT_RAW_INLINE_LIMIT: usize = 128 * 1024;
 
 pub fn next_agent_output_id() -> String {
     let seq = NEXT_AGENT_OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
@@ -836,6 +837,72 @@ pub enum AppEvent {
     Tick,
     #[allow(dead_code)]
     Quit,
+}
+
+fn context_snapshot_raw_is_compact(raw: &serde_json::Value) -> bool {
+    raw.pointer("/_intendant_context/archive_mode")
+        .and_then(|v| v.as_str())
+        == Some("summary")
+        || raw.pointer("/summary/kind").and_then(|v| v.as_str()) == Some("compact_context_snapshot")
+        || raw.get("summary_parts").is_some()
+}
+
+fn context_snapshot_raw_size(raw: &serde_json::Value) -> usize {
+    serde_json::to_vec(raw)
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|_| raw.to_string().len())
+}
+
+fn mark_context_snapshot_exact_available(raw: &mut serde_json::Value) {
+    if let Some(context) = raw
+        .get_mut("_intendant_context")
+        .and_then(|value| value.as_object_mut())
+    {
+        context.insert("raw_archived".to_string(), serde_json::Value::Bool(true));
+        context.insert("raw_omitted".to_string(), serde_json::Value::Bool(true));
+        context.insert(
+            "exact_replay_available".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if let Some(summary) = raw
+        .get_mut("summary")
+        .and_then(|value| value.as_object_mut())
+    {
+        summary.insert("raw_omitted".to_string(), serde_json::Value::Bool(true));
+        summary.insert(
+            "exact_replay_available".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
+
+fn compact_context_snapshot_raw_for_outbound(
+    raw: &serde_json::Value,
+    request_id: Option<&str>,
+    request_index: Option<u64>,
+    format: &str,
+) -> serde_json::Value {
+    if context_snapshot_raw_is_compact(raw)
+        || context_snapshot_raw_size(raw) <= OUTBOUND_CONTEXT_SNAPSHOT_RAW_INLINE_LIMIT
+    {
+        return raw.clone();
+    }
+
+    let request_id = request_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("live");
+    let request_index = request_index.unwrap_or(0);
+    let mut compact = crate::external_agent::codex::codex_context_archive_payload(
+        raw.clone(),
+        request_id,
+        request_index,
+        format,
+        false,
+    );
+    mark_context_snapshot_exact_available(&mut compact);
+    compact
 }
 
 /// Response from the approval system.
@@ -1921,7 +1988,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             context_window: *context_window,
             hard_context_window: *hard_context_window,
             item_count: *item_count,
-            raw: raw.clone(),
+            raw: compact_context_snapshot_raw_for_outbound(
+                raw,
+                request_id.as_deref(),
+                *request_index,
+                format,
+            ),
         }),
         AppEvent::StatusUpdate {
             turn,
@@ -3990,6 +4062,52 @@ mod tests {
         assert!(json.contains("\"source\":\"codex\""));
         assert!(json.contains("\"request_index\":7"));
         assert!(json.contains("\"raw\""));
+    }
+
+    #[test]
+    fn outbound_context_snapshot_compacts_large_raw() {
+        let large_text = "large-context ".repeat(20_000);
+        let event = AppEvent::ContextSnapshot {
+            session_id: Some("sess-ctx".to_string()),
+            source: "codex".to_string(),
+            label: "Codex thread".to_string(),
+            request_id: Some("req-large".to_string()),
+            request_index: Some(9),
+            turn: Some(4),
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(80_000),
+            context_window: Some(128000),
+            hard_context_window: Some(128000),
+            item_count: Some(1),
+            raw: serde_json::json!({
+                "input": [{"role": "user", "content": large_text}],
+                "model": "codex",
+            }),
+        };
+
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let crate::types::OutboundEvent::ContextSnapshot { raw, .. } = outbound else {
+            panic!("expected context snapshot outbound event");
+        };
+
+        assert_eq!(
+            raw.pointer("/summary/kind").and_then(|v| v.as_str()),
+            Some("compact_context_snapshot")
+        );
+        assert_eq!(
+            raw.pointer("/summary/exact_replay_available")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            raw.pointer("/_intendant_context/raw_omitted")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            serde_json::to_string(&raw).unwrap().len() < 20_000,
+            "outbound snapshot should stay compact"
+        );
     }
 
     #[test]

@@ -25034,7 +25034,13 @@ function contextSnapshotHasExactRaw(snapshot) {
 
 function contextSnapshotNeedsExact(snapshot) {
   if (!snapshot || snapshot.__exact_loaded || contextSnapshotHasExactRaw(snapshot)) return false;
-  return Boolean(contextSnapshotFile(snapshot) && contextSnapshotExactReplayAvailable(snapshot));
+  const hasSelector = Boolean(
+    contextSnapshotFile(snapshot) ||
+    snapshot.request_id ||
+    (snapshot.request_index !== undefined && snapshot.request_index !== null) ||
+    snapshot.ts
+  );
+  return Boolean(hasSelector && contextSnapshotExactReplayAvailable(snapshot));
 }
 
 function contextSnapshotLazySessionId(snapshot) {
@@ -25092,9 +25098,9 @@ function ensureExactContextSnapshot(snapshot) {
   if (contextSnapshotExactFetches.has(key)) return contextSnapshotExactFetches.get(key);
   const sessionId = contextSnapshotLazySessionId(snapshot);
   const file = contextSnapshotFile(snapshot);
-  if (!sessionId || !file) return null;
+  if (!sessionId) return null;
   const params = new URLSearchParams();
-  params.set('file', file);
+  if (file) params.set('file', file);
   params.set('source', contextSnapshotLazySource(snapshot));
   if (snapshot.request_id) params.set('request_id', snapshot.request_id);
   if (snapshot.request_index !== undefined && snapshot.request_index !== null) {
