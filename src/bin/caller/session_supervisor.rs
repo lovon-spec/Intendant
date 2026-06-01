@@ -38,6 +38,10 @@ const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::
 const SESSION_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 const EXTERNAL_ATTACH_DEDUPE_WINDOW: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
+#[cfg(not(test))]
+const TEXT_STEER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const TEXT_STEER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[derive(Default)]
 struct SupervisorState {
@@ -2106,11 +2110,22 @@ impl SessionSupervisor {
             return;
         }
         if attachments.is_empty() {
+            let ack_rx = self.config.bus.subscribe();
             self.config.bus.send(AppEvent::SteerRequested {
-                session_id: event_session_id,
-                text,
-                id: steer_id,
+                session_id: event_session_id.clone(),
+                text: text.clone(),
+                id: steer_id.clone(),
             });
+            if !steer_id.trim().is_empty() {
+                spawn_text_steer_fallback(
+                    self.config.bus.clone(),
+                    ack_rx,
+                    tx,
+                    text,
+                    steer_id,
+                    event_session_id,
+                );
+            }
             return;
         }
 
@@ -3223,6 +3238,70 @@ fn emit_follow_up_status(
     });
 }
 
+fn spawn_text_steer_fallback(
+    bus: EventBus,
+    mut ack_rx: tokio::sync::broadcast::Receiver<AppEvent>,
+    follow_up_tx: mpsc::Sender<FollowUpMessage>,
+    text: String,
+    steer_id: String,
+    target_session_id: Option<String>,
+) {
+    tokio::spawn(async move {
+        let timeout = tokio::time::sleep(TEXT_STEER_FALLBACK_TIMEOUT);
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                _ = &mut timeout => break,
+                event = ack_rx.recv() => {
+                    match event {
+                        Ok(AppEvent::SteerAccepted { session_id, id, .. })
+                        | Ok(AppEvent::SteerQueued { session_id, id, .. })
+                        | Ok(AppEvent::SteerDelivered { session_id, id, .. })
+                            if id == steer_id
+                                && steer_ack_targets_session(
+                                    &session_id,
+                                    &target_session_id,
+                                ) =>
+                        {
+                            return;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+
+        let msg = FollowUpMessage::steer(text, UserAttachments::default(), steer_id.clone())
+            .for_target(target_session_id.clone());
+        match follow_up_tx.send(msg).await {
+            Ok(()) => bus.send(AppEvent::SteerQueued {
+                session_id: target_session_id,
+                id: steer_id,
+                reason: "native steer was not acknowledged; queued as follow-up".to_string(),
+            }),
+            Err(_) => bus.send(AppEvent::LogEntry {
+                session_id: target_session_id,
+                level: "warn".to_string(),
+                source: "Intendant".to_string(),
+                content:
+                    "Steer dropped: target session stopped before native steer was acknowledged"
+                        .to_string(),
+                turn: None,
+            }),
+        }
+    });
+}
+
+fn steer_ack_targets_session(actual: &Option<String>, expected: &Option<String>) -> bool {
+    match (actual.as_deref(), expected.as_deref()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        (None, _) | (_, None) => true,
+    }
+}
+
 fn load_related_sessions_from_log(session_dir: &Path) -> Vec<RelatedSessionRecord> {
     let path = session_dir.join("session.jsonl");
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -3810,6 +3889,135 @@ mod tests {
         let state = supervisor.state.lock().await;
         assert!(state.session_is_managed("parent-thread"));
         assert!(state.session_is_managed("side-thread"));
+    }
+
+    #[tokio::test]
+    async fn text_steer_falls_back_to_follow_up_without_native_ack() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                ManagedSession {
+                    session_id: "parent-thread".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "thinking".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                },
+            );
+        }
+
+        supervisor
+            .route_steer(
+                Some("parent-thread".to_string()),
+                "Pause for a moment".to_string(),
+                Some("steer-1".to_string()),
+                Vec::new(),
+            )
+            .await;
+
+        match bus_rx.recv().await.expect("steer requested event") {
+            AppEvent::SteerRequested {
+                session_id,
+                text,
+                id,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("parent-thread"));
+                assert_eq!(text, "Pause for a moment");
+                assert_eq!(id, "steer-1");
+            }
+            other => panic!("expected steer requested event, got {other:?}"),
+        }
+
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("unacknowledged steer should be queued")
+            .expect("follow-up channel should stay open");
+        assert_eq!(msg.text, "Pause for a moment");
+        assert_eq!(msg.steer_id.as_deref(), Some("steer-1"));
+        assert_eq!(msg.target_session_id.as_deref(), Some("parent-thread"));
+
+        let mut saw_queued = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::SteerQueued {
+                session_id,
+                id,
+                reason,
+            } = event
+            {
+                assert_eq!(session_id.as_deref(), Some("parent-thread"));
+                assert_eq!(id, "steer-1");
+                assert!(reason.contains("not acknowledged"), "got: {reason}");
+                saw_queued = true;
+            }
+        }
+        assert!(saw_queued, "fallback should emit SteerQueued");
+    }
+
+    #[tokio::test]
+    async fn text_steer_native_ack_prevents_follow_up_fallback() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                ManagedSession {
+                    session_id: "parent-thread".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "thinking".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                },
+            );
+        }
+
+        supervisor
+            .route_steer(
+                Some("parent-thread".to_string()),
+                "pause for a moment".to_string(),
+                Some("steer-2".to_string()),
+                Vec::new(),
+            )
+            .await;
+
+        match bus_rx.recv().await.expect("steer requested event") {
+            AppEvent::SteerRequested { id, .. } => assert_eq!(id, "steer-2"),
+            other => panic!("expected steer requested event, got {other:?}"),
+        }
+        bus.send(AppEvent::SteerAccepted {
+            session_id: Some("parent-thread".to_string()),
+            id: "steer-2".to_string(),
+            reason: "Codex accepted the steer".to_string(),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "acknowledged steer should not also queue a follow-up"
+        );
+
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::SteerQueued { id, .. } = event {
+                assert_ne!(id, "steer-2", "acknowledged steer should not queue");
+            }
+        }
     }
 
     #[test]

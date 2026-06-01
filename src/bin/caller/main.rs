@@ -1267,6 +1267,19 @@ struct PendingRuntimeSteer {
     text: String,
 }
 
+fn steer_id_has_been_handled(
+    handled_steer_ids: &std::collections::HashSet<String>,
+    id: &str,
+) -> bool {
+    !id.trim().is_empty() && handled_steer_ids.contains(id)
+}
+
+fn mark_steer_id_handled(handled_steer_ids: &mut std::collections::HashSet<String>, id: &str) {
+    if !id.trim().is_empty() {
+        handled_steer_ids.insert(id.to_string());
+    }
+}
+
 fn pending_runtime_steer_targets_session(
     pending: &PendingRuntimeSteer,
     session_id: &Option<String>,
@@ -2510,6 +2523,7 @@ struct ExternalContextRewindResume<'a, 'b> {
     stats: &'a mut LoopStats,
     diff_tracker: &'a mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &'a mut std::collections::VecDeque<PendingRuntimeSteer>,
+    handled_steer_ids: &'a mut std::collections::HashSet<String>,
     codex_thread_action_dedupe: &'a mut CodexThreadActionDedupe,
     side_sessions: Option<&'a mut ExternalSideSessionState<'b>>,
 }
@@ -2532,6 +2546,7 @@ async fn send_external_context_rewind_resume_turn(
         resume.stats,
         resume.diff_tracker,
         resume.pending_runtime_steers,
+        resume.handled_steer_ids,
         resume.codex_thread_action_dedupe,
         resume.side_sessions,
     )
@@ -4300,6 +4315,7 @@ async fn drain_external_child_turn(
     stats: &mut LoopStats,
     diff_tracker: &mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    handled_steer_ids: &mut std::collections::HashSet<String>,
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     child_thread_id: String,
     conversation_kind: &str,
@@ -4338,6 +4354,7 @@ async fn drain_external_child_turn(
         stats,
         diff_tracker,
         pending_runtime_steers,
+        handled_steer_ids,
         codex_thread_action_dedupe,
         None,
     )
@@ -4716,6 +4733,7 @@ async fn drain_external_agent_events(
     stats: &mut LoopStats,
     diff_tracker: &mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    handled_steer_ids: &mut std::collections::HashSet<String>,
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
 ) -> DrainOutcome {
@@ -4900,6 +4918,16 @@ async fn drain_external_agent_events(
                         else {
                             continue;
                         };
+                        if steer_id_has_been_handled(handled_steer_ids, &id) {
+                            slog(config.session_log, |l| {
+                                l.debug(&format!(
+                                    "Ignoring duplicate steer {} already consumed by another delivery path",
+                                    id
+                                ))
+                            });
+                            continue;
+                        }
+                        mark_steer_id_handled(handled_steer_ids, &id);
                         let target_is_side = target_kind == ExternalSteerTargetKind::Side;
                         if maybe_handle_codex_fast_slash_steer(
                             agent,
@@ -12497,6 +12525,8 @@ async fn run_with_presence(
     let mut persistent_diff_tracker = ExternalDiffDeltaTracker::default();
     let mut persistent_pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
         std::collections::VecDeque::new();
+    let mut persistent_handled_steer_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut persistent_open_side_threads: HashMap<String, String> = HashMap::new();
     let mut persistent_side_rounds: HashMap<String, usize> = HashMap::new();
     let mut persistent_side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
@@ -12702,6 +12732,7 @@ async fn run_with_presence(
                                         diff_tracker: &mut persistent_diff_tracker,
                                         pending_runtime_steers:
                                             &mut persistent_pending_runtime_steers,
+                                        handled_steer_ids: &mut persistent_handled_steer_ids,
                                         codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
                                         side_sessions: Some(&mut side_session_state),
                                     },
@@ -12781,6 +12812,7 @@ async fn run_with_presence(
                                         persistent_diff_tracker =
                                             ExternalDiffDeltaTracker::default();
                                         persistent_pending_runtime_steers.clear();
+                                        persistent_handled_steer_ids.clear();
                                         persistent_open_side_threads.clear();
                                         persistent_side_rounds.clear();
                                         persistent_side_turn_revisions.clear();
@@ -12792,6 +12824,7 @@ async fn run_with_presence(
                                         persistent_diff_tracker =
                                             ExternalDiffDeltaTracker::default();
                                         persistent_pending_runtime_steers.clear();
+                                        persistent_handled_steer_ids.clear();
                                         persistent_open_side_threads.clear();
                                         persistent_side_rounds.clear();
                                         persistent_side_turn_revisions.clear();
@@ -13055,6 +13088,7 @@ async fn run_with_presence(
                                 &mut cumulative_stats,
                                 &mut persistent_diff_tracker,
                                 &mut persistent_pending_runtime_steers,
+                                &mut persistent_handled_steer_ids,
                                 &mut codex_thread_action_dedupe,
                                 child_thread_id,
                                 "side",
@@ -13371,6 +13405,7 @@ async fn run_with_presence(
             persistent_gemini_config = None;
             persistent_diff_tracker = ExternalDiffDeltaTracker::default();
             persistent_pending_runtime_steers.clear();
+            persistent_handled_steer_ids.clear();
             persistent_open_side_threads.clear();
             persistent_side_rounds.clear();
             persistent_side_turn_revisions.clear();
@@ -13454,6 +13489,7 @@ async fn run_with_presence(
                 persistent_event_rx = Some(event_rx);
                 persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                 persistent_pending_runtime_steers.clear();
+                persistent_handled_steer_ids.clear();
                 persistent_open_side_threads.clear();
                 persistent_side_rounds.clear();
                 persistent_side_turn_revisions.clear();
@@ -13579,6 +13615,7 @@ async fn run_with_presence(
                 &mut cumulative_stats,
                 &mut persistent_diff_tracker,
                 &mut persistent_pending_runtime_steers,
+                &mut persistent_handled_steer_ids,
                 &mut codex_thread_action_dedupe,
                 Some(&mut side_session_state),
             )
@@ -13647,6 +13684,7 @@ async fn run_with_presence(
                                     stats: &mut cumulative_stats,
                                     diff_tracker: &mut persistent_diff_tracker,
                                     pending_runtime_steers: &mut persistent_pending_runtime_steers,
+                                    handled_steer_ids: &mut persistent_handled_steer_ids,
                                     codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
                                     side_sessions: Some(&mut resume_side_state),
                                 },
@@ -13721,6 +13759,7 @@ async fn run_with_presence(
                                     persistent_event_rx = None;
                                     persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                                     persistent_pending_runtime_steers.clear();
+                                    persistent_handled_steer_ids.clear();
                                     persistent_open_side_threads.clear();
                                     persistent_side_rounds.clear();
                                     persistent_side_turn_revisions.clear();
@@ -13731,6 +13770,7 @@ async fn run_with_presence(
                                     persistent_event_rx = None;
                                     persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                                     persistent_pending_runtime_steers.clear();
+                                    persistent_handled_steer_ids.clear();
                                     persistent_open_side_threads.clear();
                                     persistent_side_rounds.clear();
                                     persistent_side_turn_revisions.clear();
@@ -13787,6 +13827,7 @@ async fn run_with_presence(
                     persistent_event_rx = None;
                     persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                     persistent_pending_runtime_steers.clear();
+                    persistent_handled_steer_ids.clear();
                     persistent_open_side_threads.clear();
                     persistent_side_rounds.clear();
                     persistent_side_turn_revisions.clear();
@@ -13798,6 +13839,7 @@ async fn run_with_presence(
                     persistent_event_rx = None;
                     persistent_diff_tracker = ExternalDiffDeltaTracker::default();
                     persistent_pending_runtime_steers.clear();
+                    persistent_handled_steer_ids.clear();
                     persistent_open_side_threads.clear();
                     persistent_side_rounds.clear();
                     persistent_side_turn_revisions.clear();
@@ -14545,6 +14587,7 @@ async fn run_external_agent_mode(
     let mut diff_tracker = ExternalDiffDeltaTracker::default();
     let mut pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
         std::collections::VecDeque::new();
+    let mut handled_steer_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut open_side_threads: HashMap<String, String> = HashMap::new();
     let mut side_rounds: HashMap<String, usize> = HashMap::new();
     let mut side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
@@ -14601,7 +14644,21 @@ async fn run_external_agent_mode(
                 tokio::select! {
                     maybe_followup = follow_up_rx.recv() => {
                         match maybe_followup {
-                            Some(followup) => break followup,
+                            Some(followup) => {
+                                if let Some(id) = followup.steer_id.as_deref() {
+                                    if steer_id_has_been_handled(&handled_steer_ids, id) {
+                                        slog(&session_log, |l| {
+                                            l.debug(&format!(
+                                                "Ignoring duplicate queued steer {} already consumed by another delivery path",
+                                                id
+                                            ))
+                                        });
+                                        continue;
+                                    }
+                                    mark_steer_id_handled(&mut handled_steer_ids, id);
+                                }
+                                break followup;
+                            }
                             None => {
                                 slog(&session_log, |l| {
                                     l.info("Follow-up channel closed, exiting")
@@ -14688,6 +14745,16 @@ async fn run_external_agent_mode(
                                 &drain_config.alias_session_id,
                                 &open_side_threads,
                             ) => {
+                                if steer_id_has_been_handled(&handled_steer_ids, &id) {
+                                    slog(&session_log, |l| {
+                                        l.debug(&format!(
+                                            "Ignoring duplicate steer {} already consumed by another delivery path",
+                                            id
+                                        ))
+                                    });
+                                    continue;
+                                }
+                                mark_steer_id_handled(&mut handled_steer_ids, &id);
                                 if maybe_handle_codex_fast_slash_steer(
                                     &mut agent,
                                     &text,
@@ -14861,6 +14928,7 @@ async fn run_external_agent_mode(
                                         &mut stats,
                                         &mut diff_tracker,
                                         &mut pending_runtime_steers,
+                                        &mut handled_steer_ids,
                                         &mut codex_thread_action_dedupe,
                                         child_thread_id,
                                         "side",
@@ -15041,6 +15109,7 @@ async fn run_external_agent_mode(
                 &mut stats,
                 &mut diff_tracker,
                 &mut pending_runtime_steers,
+                &mut handled_steer_ids,
                 &mut codex_thread_action_dedupe,
                 side_thread_id,
                 "side",
@@ -15156,6 +15225,7 @@ async fn run_external_agent_mode(
                 &mut stats,
                 &mut diff_tracker,
                 &mut pending_runtime_steers,
+                &mut handled_steer_ids,
                 &mut codex_thread_action_dedupe,
                 subagent_thread_id,
                 "subagent",
@@ -15365,6 +15435,7 @@ async fn run_external_agent_mode(
                         &mut stats,
                         &mut diff_tracker,
                         &mut pending_runtime_steers,
+                        &mut handled_steer_ids,
                         &mut codex_thread_action_dedupe,
                         Some(&mut side_session_state),
                     )
@@ -15627,6 +15698,7 @@ async fn run_external_agent_mode(
             &mut stats,
             &mut diff_tracker,
             &mut pending_runtime_steers,
+            &mut handled_steer_ids,
             &mut codex_thread_action_dedupe,
             Some(&mut side_session_state),
         )
