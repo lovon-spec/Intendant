@@ -582,7 +582,7 @@ impl McpAppState {
         let (used_tokens, rewind_only_limit, status) =
             self.context_pressure_rewind_only_for(session_id)?;
         let mut message = format!(
-            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, list_rewind_anchors, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. Call list_rewind_anchors to inspect valid anchors, then call rewind_context with an exact item_id and a dense carry-forward primer before using other tools."
+            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, list_rewind_anchors, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. The Intendant MCP tool list_rewind_anchors is available; any earlier transcript claim that it is unavailable is stale. Call list_rewind_anchors to inspect valid anchors, then call rewind_context with an exact item_id and a dense carry-forward primer before using other tools. Do not synthesize anchor ids from prior failed tool calls."
         );
         if let Some(notice) = self.insufficient_rewind_notice_for(session_id) {
             message.push_str(&format!(
@@ -5192,7 +5192,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Schedule a Codex context rewind to an exact item/tool-call anchor. If the anchor id is not already known, call list_rewind_anchors first and choose one returned item_id. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
+        description = "Schedule a Codex context rewind to an exact item/tool-call anchor. If the anchor id is not already known, call list_rewind_anchors first and choose one returned item_id. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
     )]
     async fn rewind_context(&self, Parameters(params): Parameters<RewindContextParams>) -> String {
         let reason = params.reason.trim();

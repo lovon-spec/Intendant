@@ -2655,7 +2655,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. The Intendant MCP tool list_rewind_anchors is callable in this turn; any earlier transcript claim that it is unavailable is stale and incorrect. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -7823,6 +7823,27 @@ mod tests {
         assert!(!managed_context_user_kickstart_is_trivial(
             "continue, but use the station prototype"
         ));
+    }
+
+    #[test]
+    fn managed_context_recovery_kickstart_corrects_stale_tool_claims_without_anchors() {
+        let text = managed_context_recovery_kickstart_text(
+            ManagedContextRewindOnlyPressure {
+                used_tokens: 269_000,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+                status: "critical",
+            },
+            true,
+        );
+
+        assert!(text.contains("list_rewind_anchors is callable"));
+        assert!(text.contains("stale and incorrect"));
+        assert!(text.contains("Do not synthesize anchor ids"));
+        assert!(text.contains("hard_limit=272000"));
+        assert!(text.contains("holding the user's follow-up outside Codex history"));
+        assert!(!text.contains("call_"));
+        assert!(!text.contains("item_id `"));
     }
 
     #[test]
