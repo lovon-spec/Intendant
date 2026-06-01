@@ -1624,6 +1624,36 @@ impl ExternalContextRewindRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedContextRewindAnchor {
+    item_id: String,
+    requested_item_id: Option<String>,
+}
+
+impl ResolvedContextRewindAnchor {
+    fn requested(item_id: &str) -> Self {
+        Self {
+            item_id: item_id.to_string(),
+            requested_item_id: None,
+        }
+    }
+
+    fn resolved(item_id: String, requested_item_id: &str) -> Self {
+        Self {
+            item_id,
+            requested_item_id: Some(requested_item_id.to_string()),
+        }
+    }
+
+    fn target_label(&self, position: external_agent::RollbackAnchorPosition) -> String {
+        let mut label = format!("{} item {}", position.as_str(), self.item_id);
+        if let Some(requested) = self.requested_item_id.as_deref() {
+            label.push_str(&format!(" (resolved from {requested})"));
+        }
+        label
+    }
+}
+
 fn push_context_rewind_text_section(out: &mut String, label: &str, value: &str) {
     let value = value.trim();
     if value.is_empty() {
@@ -1805,6 +1835,160 @@ fn recovery_required_message(message: &str, recovery_hint: Option<&str>) -> Stri
     out
 }
 
+fn resolve_context_rewind_anchor(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+) -> Result<ResolvedContextRewindAnchor, String> {
+    let requested_item_id = requested_item_id.trim();
+    if requested_item_id.is_empty() {
+        return Err("rewind anchor item id is required".to_string());
+    }
+
+    let scan = scan_context_rewind_rollout_anchors(source_rollout_path, requested_item_id)
+        .map_err(|err| {
+            format!(
+                "failed to inspect rollout anchors in {}: {err}",
+                source_rollout_path.display()
+            )
+        })?;
+    if scan.requested_anchor_exists {
+        return Ok(ResolvedContextRewindAnchor::requested(requested_item_id));
+    }
+
+    if !context_rewind_anchor_allows_auto_resolution(requested_item_id) {
+        return Ok(ResolvedContextRewindAnchor::requested(requested_item_id));
+    }
+
+    let Some(anchor) = scan.latest_anchor_before_rewind_primer else {
+        return Err(format!(
+            "rollback anchor item_id `{requested_item_id}` was not found, and no prior model_context_rewind_primer boundary was available for automatic resolution"
+        ));
+    };
+    Ok(ResolvedContextRewindAnchor::resolved(
+        anchor,
+        requested_item_id,
+    ))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ContextRewindRolloutAnchorScan {
+    requested_anchor_exists: bool,
+    latest_anchor_before_rewind_primer: Option<String>,
+}
+
+fn scan_context_rewind_rollout_anchors(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+) -> io::Result<ContextRewindRolloutAnchorScan> {
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut scan = ContextRewindRolloutAnchorScan::default();
+    let mut latest_anchor: Option<String> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+
+        if response_item_contains_model_context_rewind_primer(payload) {
+            if let Some(anchor) = latest_anchor.as_ref() {
+                scan.latest_anchor_before_rewind_primer = Some(anchor.clone());
+            }
+        }
+
+        for anchor_id in response_item_anchor_ids(payload) {
+            if anchor_id == requested_item_id {
+                scan.requested_anchor_exists = true;
+            }
+            latest_anchor = Some(anchor_id);
+        }
+    }
+
+    Ok(scan)
+}
+
+fn context_rewind_anchor_allows_auto_resolution(item_id: &str) -> bool {
+    let item_id = item_id.trim();
+    item_id.eq_ignore_ascii_case("auto")
+        || item_id.eq_ignore_ascii_case("latest_rewind_primer")
+        || item_id.eq_ignore_ascii_case("latest_context_primer")
+        || looks_like_model_visible_synthetic_tool_anchor(item_id)
+}
+
+fn looks_like_model_visible_synthetic_tool_anchor(item_id: &str) -> bool {
+    let Some((prefix, suffix)) = item_id.rsplit_once("-call_") else {
+        return false;
+    };
+    !prefix.trim().is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn response_item_contains_model_context_rewind_primer(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(|value| value.as_str()) == Some("message")
+        && item.get("role").and_then(|value| value.as_str()) == Some("developer")
+        && response_item_content_text(item)
+            .any(|text| text.contains("<model_context_rewind_primer>"))
+}
+
+fn response_item_content_text(item: &serde_json::Value) -> impl Iterator<Item = &str> {
+    item.get("content")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|content| {
+            content
+                .get("text")
+                .or_else(|| content.get("input_text"))
+                .or_else(|| content.get("output_text"))
+                .and_then(|value| value.as_str())
+        })
+}
+
+fn response_item_anchor_ids(item: &serde_json::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    match item.get("type").and_then(|value| value.as_str()) {
+        Some("message")
+        | Some("reasoning")
+        | Some("web_search_call")
+        | Some("image_generation_call") => {
+            push_json_string_id(item, &mut ids, "id");
+        }
+        Some("local_shell_call")
+        | Some("function_call")
+        | Some("tool_search_call")
+        | Some("custom_tool_call") => {
+            push_json_string_id(item, &mut ids, "id");
+            push_json_string_id(item, &mut ids, "call_id");
+            push_json_string_id(item, &mut ids, "callId");
+        }
+        Some("function_call_output")
+        | Some("tool_search_output")
+        | Some("custom_tool_call_output") => {
+            push_json_string_id(item, &mut ids, "call_id");
+            push_json_string_id(item, &mut ids, "callId");
+        }
+        _ => {}
+    }
+    ids
+}
+
+fn push_json_string_id(item: &serde_json::Value, ids: &mut Vec<String>, key: &str) {
+    if let Some(id) = item
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        ids.push(id.to_string());
+    }
+}
+
 async fn apply_external_context_rewind(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     thread_id: &str,
@@ -1827,6 +2011,15 @@ async fn apply_external_context_rewind(
         .rollout_path
         .clone()
         .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
+    let resolved_anchor = resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
+    if let Some(requested) = resolved_anchor.requested_item_id.as_deref() {
+        slog(config.session_log, |log| {
+            log.info(&format!(
+                "Resolved managed-context rewind anchor {requested} -> {}",
+                resolved_anchor.item_id
+            ))
+        });
+    }
     let recovery_rollout_path =
         context_rewind::copy_recovery_rollout(config.log_dir, &record_id, &source_rollout_path)
             .map_err(|e| format!("failed to copy pre-rewind rollout: {}", e))?;
@@ -1873,7 +2066,7 @@ async fn apply_external_context_rewind(
             .clone()
             .or_else(|| config.session_id.clone()),
         thread_id: snapshot.thread_id,
-        item_id: request.item_id.clone(),
+        item_id: resolved_anchor.item_id.clone(),
         position: request.position.as_str().to_string(),
         reason: request.reason.clone(),
         primer: request.primer.clone(),
@@ -1893,7 +2086,7 @@ async fn apply_external_context_rewind(
     // the backend rejects as a normal tool error) never leaves a success-looking
     // orphan record on disk. On failure, delete the orphaned recovery-rollout copy.
     if let Err(e) = agent
-        .rollback_thread_to_item_anchor(thread_id, &request.item_id, request.position)
+        .rollback_thread_to_item_anchor(thread_id, &resolved_anchor.item_id, request.position)
         .await
     {
         if let Err(cleanup) = context_rewind::remove_recovery_rollout(config.log_dir, &record_id) {
@@ -1919,13 +2112,13 @@ async fn apply_external_context_rewind(
     let message = if request.primer.is_some() {
         format!(
             "context rewound to {}; primer injected; record {}",
-            request.target_label(),
+            resolved_anchor.target_label(request.position),
             record_id
         )
     } else {
         format!(
             "rewound to {}; record {}",
-            request.target_label(),
+            resolved_anchor.target_label(request.position),
             record_id
         )
     };
@@ -2208,7 +2401,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. Call rewind_context now with an exact item/tool-call anchor and a dense carry-forward primer, then stop.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. Call rewind_context now with anchor.item_id=\"auto\", anchor.position=\"after\", and a dense carry-forward primer, then stop. Intendant will resolve auto to the latest durable rewind-primer boundary; use a real call_/item anchor only when explicitly known.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -7531,6 +7724,129 @@ mod tests {
         assert!(primer.contains("- bad assumption"));
         assert!(!primer.contains("- \n"));
         assert!(request.resume_followup().is_some());
+    }
+
+    #[test]
+    fn context_rewind_auto_anchor_resolves_to_latest_primer_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "rewind_context",
+                        "call_id": "call_prior_rewind",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_prior_rewind",
+                        "output": "ok"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<model_context_rewind_primer>dense state</model_context_rewind_primer>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "rewind_context",
+                        "call_id": "call_latest_rewind",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 1
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_latest_rewind",
+                        "output": "ok"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<model_context_rewind_primer>newer dense state</model_context_rewind_primer>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let auto = resolve_context_rewind_anchor(&path, "auto").expect("auto anchor");
+        assert_eq!(auto.item_id, "call_latest_rewind");
+        assert_eq!(auto.requested_item_id.as_deref(), Some("auto"));
+
+        let synthetic =
+            resolve_context_rewind_anchor(&path, "rewind_context-call_7").expect("synthetic");
+        assert_eq!(synthetic.item_id, "call_latest_rewind");
+        assert_eq!(
+            synthetic.requested_item_id.as_deref(),
+            Some("rewind_context-call_7")
+        );
+    }
+
+    #[test]
+    fn context_rewind_anchor_keeps_exact_rollout_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_exact",
+                    "arguments": "{}"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let exact = resolve_context_rewind_anchor(&path, "call_exact").expect("exact anchor");
+        assert_eq!(exact.item_id, "call_exact");
+        assert_eq!(exact.requested_item_id, None);
     }
 
     #[test]

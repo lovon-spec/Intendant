@@ -484,7 +484,7 @@ impl McpAppState {
                     "used_tokens": notice.used_tokens,
                     "rewind_only_limit": notice.rewind_only_limit,
                     "context_window": notice.context_window,
-                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Choose an earlier or larger exact item anchor and include a denser carry-forward primer before using ordinary tools.",
+                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Use anchor.item_id=\"auto\" for the latest durable rewind-primer boundary, or choose an earlier real call_/item anchor with a denser carry-forward primer before using ordinary tools.",
                 })
             }),
         })
@@ -582,11 +582,11 @@ impl McpAppState {
         let (used_tokens, rewind_only_limit, status) =
             self.context_pressure_rewind_only_for(session_id)?;
         let mut message = format!(
-            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. Call rewind_context with an exact item anchor and a dense carry-forward primer before using other tools."
+            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. Call rewind_context with anchor.item_id=\"auto\", anchor.position=\"after\", and a dense carry-forward primer before using other tools; use a real call_/item anchor only when it is explicitly known."
         );
         if let Some(notice) = self.insufficient_rewind_notice_for(session_id) {
             message.push_str(&format!(
-                " Previous managed-context record {} was insufficient; choose an earlier or larger exact item anchor and include a denser carry-forward primer.",
+                " Previous managed-context record {} was insufficient; keep anchor.item_id=\"auto\" if targeting the latest durable rewind-primer boundary, or choose an earlier real call_/item anchor with a denser carry-forward primer.",
                 notice.record_id
             ));
         }
@@ -3838,7 +3838,7 @@ pub struct StartTaskParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RewindContextAnchorParams {
-    /// Exact Codex thread item or tool-call id to roll back to.
+    /// Codex thread item/tool-call id to roll back to. Use "auto" during managed pressure recovery; Intendant resolves it to the latest durable rewind-primer boundary.
     pub item_id: String,
     /// Whether the anchored item itself should survive rollback: "before" or "after".
     pub position: String,
@@ -5161,7 +5161,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Schedule a Codex context rewind to an exact item anchor. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
+        description = "Schedule a Codex context rewind. Use anchor.item_id=\"auto\" during managed pressure recovery so Intendant resolves the exact rollback anchor from Codex rollout history; use a real call_/item anchor only when explicitly known. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
     )]
     async fn rewind_context(&self, Parameters(params): Parameters<RewindContextParams>) -> String {
         let reason = params.reason.trim();
