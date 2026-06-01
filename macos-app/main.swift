@@ -82,12 +82,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     var backendProcess: Process?
     var healthTimer: Timer?
     var port: Int = 8765
+    let portSearchLimit = 20
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if !isPortAvailable(port) {
-            NSLog("Port \(port) in use — finding a free port")
-            port = findFreePort() ?? port
-            NSLog("Using port \(port)")
+        let preferredPort = port
+        if let availablePort = findAvailablePort(startingAt: preferredPort) {
+            port = availablePort
+            if port != preferredPort {
+                NSLog("Port \(preferredPort) in use — using port \(port)")
+            }
+        } else {
+            let lastPort = preferredPort + portSearchLimit - 1
+            NSLog("No available port found in range \(preferredPort)-\(lastPort)")
         }
         // Check permissions BEFORE creating the window so system prompts
         // aren't hidden behind it. AXIsProcessTrustedWithOptions is the
@@ -161,25 +167,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         return result == 0
     }
 
-    func findFreePort() -> Int? {
-        let sock = socket(AF_INET, SOCK_STREAM, 0)
-        guard sock >= 0 else { return nil }
-        defer { close(sock) }
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        addr.sin_port = 0
-        var addrCopy = addr
-        let bindResult = withUnsafePointer(to: &addrCopy) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+    func findAvailablePort(startingAt preferred: Int) -> Int? {
+        let lastPort = min(Int(UInt16.max), preferred + portSearchLimit - 1)
+        guard preferred > 0 && preferred <= lastPort else { return nil }
+        for candidate in preferred...lastPort {
+            if isPortAvailable(candidate) {
+                return candidate
+            }
         }
-        guard bindResult == 0 else { return nil }
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &addrCopy) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &len) }
-        }
-        guard nameResult == 0 else { return nil }
-        return Int(UInt16(bigEndian: addrCopy.sin_port))
+        return nil
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
