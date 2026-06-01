@@ -20,6 +20,7 @@ Start with:
 Useful groups:
 
 - `"${INTENDANT:-intendant}" ctl display --help` for displays, frames, screenshots, and display claims.
+- `"${INTENDANT:-intendant}" ctl browser --help` for browser workspaces, including local CDP-backed browsers and lease management.
 - `"${INTENDANT:-intendant}" ctl cu --help` for computer-use actions.
 - `"${INTENDANT:-intendant}" ctl shared --help` for shared display collaboration.
 - `"${INTENDANT:-intendant}" ctl approval --help` and `"${INTENDANT:-intendant}" ctl input --help` for pending approval/input flows.

@@ -297,6 +297,15 @@ pub enum OutboundEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    BrowserWorkspaceChanged {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<crate::browser_workspace::BrowserWorkspace>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     RecordingStarted {
         stream_name: String,
     },

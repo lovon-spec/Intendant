@@ -124,7 +124,8 @@ restart or page refresh does not fall back to the current global Settings pane.
 
 A raw view of internal state — the same data as the `GET /debug` endpoint
 (agent state, voice connection, active browser), useful when diagnosing the
-gateway or presence wiring.
+gateway or presence wiring. It also includes a browser-workspace panel for
+manual smoke testing of local CDP-backed browser workspaces and their leases.
 
 ### Settings
 
@@ -141,7 +142,8 @@ messages:
 2. **Cached `usage_update`** — latest token usage
 3. **Cached `status`** — latest autonomy / session id / task
 4. **Cached `display_ready`** — latest display info for WebRTC sessions
-5. **`log_replay`** — historical session events parsed from `session.jsonl`
+5. **`browser_workspace_snapshot`** — active browser workspaces and lease state
+6. **`log_replay`** — historical session events parsed from `session.jsonl`
 
 So refreshing the page, or opening a second browser mid-run, replays the
 session rather than starting from blank.

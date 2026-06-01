@@ -648,6 +648,12 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                 name,
                 "get_status"
                     | "list_displays"
+                    | "list_browser_workspaces"
+                    | "browser_workspace_providers"
+                    | "create_browser_workspace"
+                    | "close_browser_workspace"
+                    | "acquire_browser_workspace"
+                    | "release_browser_workspace"
                     | "take_screenshot"
                     | "execute_cu_actions"
                     | "list_frames"
@@ -2692,6 +2698,15 @@ async fn handle_control_command_mcp(
             // caller here. Ignored.
             None
         }
+        ControlMsg::CreateBrowserWorkspace { .. }
+        | ControlMsg::CloseBrowserWorkspace { .. }
+        | ControlMsg::AcquireBrowserWorkspace { .. }
+        | ControlMsg::ReleaseBrowserWorkspace { .. } => {
+            // Browser workspace commands are handled by the control plane and
+            // by dedicated MCP tools. Replaying ControlCommand events here
+            // would duplicate launch/lease side effects.
+            None
+        }
         ControlMsg::SetDiagnosticsVisualMarker { .. } => {
             // Phase 0 visual-freshness diagnostic toggle (task #83).
             // Handled inline by the web gateway's `/ws` dispatcher,
@@ -2789,7 +2804,8 @@ pub fn spawn_event_listener(
                     | AppEvent::GeminiConfigChanged { .. }
                     | AppEvent::GeminiThreadActionRequested { .. }
                     | AppEvent::GeminiThreadActionResult { .. }
-                    | AppEvent::SharedView { .. } => {} // Derived events — handled by outbound broadcaster
+                    | AppEvent::SharedView { .. }
+                    | AppEvent::BrowserWorkspaceChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..
                     } => {
@@ -3979,6 +3995,56 @@ pub struct TakeScreenshotParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateBrowserWorkspaceParams {
+    /// URL to open in the browser workspace. Omit for about:blank.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Human label shown in the dashboard.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Provider: auto, cdp, playwright, agent_browser, or stream. The first executable backend is cdp.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Optional federation peer id. Remote placement is part of the contract but not wired yet.
+    #[serde(default)]
+    pub peer_id: Option<String>,
+    /// Session or agent that owns this workspace.
+    #[serde(default)]
+    pub owner_session_id: Option<String>,
+    /// Explicit browser profile directory. If omitted, Intendant creates one under its data dir.
+    #[serde(default)]
+    pub profile_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CloseBrowserWorkspaceParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AcquireBrowserWorkspaceParams {
+    pub workspace_id: String,
+    pub holder_id: String,
+    #[serde(default)]
+    pub holder_kind: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReleaseBrowserWorkspaceParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub holder_id: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExecuteCuActionsParams {
     /// Array of computer-use actions to execute. Each action is a tagged object
     /// with "type" (click, double_click, type, key, scroll, move_mouse, drag,
@@ -4426,6 +4492,32 @@ impl IntendantServer {
             }
             "get_controller_loop_status" => {
                 Ok(text_tool_result(self.get_controller_loop_status().await))
+            }
+            "browser_workspace_providers" => {
+                Ok(text_tool_result(self.browser_workspace_providers().await))
+            }
+            "list_browser_workspaces" => Ok(text_tool_result(self.list_browser_workspaces().await)),
+            "create_browser_workspace" => {
+                let params = parse_params::<CreateBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(
+                    self.create_browser_workspace(params).await,
+                ))
+            }
+            "close_browser_workspace" => {
+                let params = parse_params::<CloseBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(self.close_browser_workspace(params).await))
+            }
+            "acquire_browser_workspace" => {
+                let params = parse_params::<AcquireBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(
+                    self.acquire_browser_workspace(params).await,
+                ))
+            }
+            "release_browser_workspace" => {
+                let params = parse_params::<ReleaseBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(
+                    self.release_browser_workspace(params).await,
+                ))
             }
             "list_displays" => Ok(text_tool_result(self.list_displays().await)),
             "take_display" => {
@@ -5465,6 +5557,142 @@ impl IntendantServer {
     )]
     async fn get_controller_loop_status(&self) -> String {
         collect_controller_loop_status(&controller_loop_dir()).to_string()
+    }
+
+    #[tool(
+        description = "List browser workspace provider availability for local semantic browser control and streamed fallback."
+    )]
+    async fn browser_workspace_providers(&self) -> String {
+        let providers = crate::browser_workspace::provider_statuses().await;
+        serde_json::to_string_pretty(&providers).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    #[tool(
+        description = "List active browser workspaces. Browser workspaces are addressable CDP/Playwright/Agent Browser surfaces with per-workspace leases."
+    )]
+    async fn list_browser_workspaces(&self) -> String {
+        let workspaces = crate::browser_workspace::list_workspaces().await;
+        serde_json::to_string_pretty(&workspaces).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    #[tool(
+        description = "Create a browser workspace. The first executable backend is provider=cdp, which launches local Chrome/Chromium with an isolated profile and CDP endpoint."
+    )]
+    async fn create_browser_workspace(
+        &self,
+        Parameters(params): Parameters<CreateBrowserWorkspaceParams>,
+    ) -> String {
+        let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
+            url: params.url,
+            label: params.label,
+            provider: params.provider,
+            peer_id: params.peer_id,
+            owner_session_id: params.owner_session_id,
+            profile_dir: params.profile_dir,
+        };
+        match crate::browser_workspace::create_workspace(request).await {
+            Ok(workspace) => {
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "created".to_string(),
+                    workspace: Some(workspace.clone()),
+                    workspace_id: Some(workspace.id.clone()),
+                    message: None,
+                });
+                serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: None,
+                    message: Some(message.clone()),
+                });
+                serde_json::json!({ "ok": false, "error": message }).to_string()
+            }
+        }
+    }
+
+    #[tool(
+        description = "Close a browser workspace and terminate its owned browser process tree when Intendant launched it."
+    )]
+    async fn close_browser_workspace(
+        &self,
+        Parameters(params): Parameters<CloseBrowserWorkspaceParams>,
+    ) -> String {
+        match crate::browser_workspace::close_workspace(&params.workspace_id, params.reason).await {
+            Ok(workspace) => {
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "closed".to_string(),
+                    workspace_id: Some(workspace.id.clone()),
+                    workspace: Some(workspace.clone()),
+                    message: None,
+                });
+                serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: Some(params.workspace_id),
+                    message: Some(message.clone()),
+                });
+                serde_json::json!({ "ok": false, "error": message }).to_string()
+            }
+        }
+    }
+
+    #[tool(
+        description = "Acquire the exclusive control lease for a browser workspace. Use force=true only when intentionally taking over from another holder."
+    )]
+    async fn acquire_browser_workspace(
+        &self,
+        Parameters(params): Parameters<AcquireBrowserWorkspaceParams>,
+    ) -> String {
+        let request = crate::browser_workspace::AcquireBrowserWorkspaceRequest {
+            workspace_id: params.workspace_id,
+            holder_id: params.holder_id,
+            holder_kind: params.holder_kind,
+            note: params.note,
+            force: params.force,
+        };
+        match crate::browser_workspace::acquire_workspace(request).await {
+            Ok(workspace) => {
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "lease_acquired".to_string(),
+                    workspace_id: Some(workspace.id.clone()),
+                    workspace: Some(workspace.clone()),
+                    message: None,
+                });
+                serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),
+        }
+    }
+
+    #[tool(description = "Release a browser workspace control lease.")]
+    async fn release_browser_workspace(
+        &self,
+        Parameters(params): Parameters<ReleaseBrowserWorkspaceParams>,
+    ) -> String {
+        let request = crate::browser_workspace::ReleaseBrowserWorkspaceRequest {
+            workspace_id: params.workspace_id,
+            holder_id: params.holder_id,
+            note: params.note,
+        };
+        match crate::browser_workspace::release_workspace(request).await {
+            Ok(workspace) => {
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "lease_released".to_string(),
+                    workspace_id: Some(workspace.id.clone()),
+                    workspace: Some(workspace.clone()),
+                    message: None,
+                });
+                serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),
+        }
     }
 
     #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]

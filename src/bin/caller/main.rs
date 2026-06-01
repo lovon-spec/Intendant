@@ -3,6 +3,7 @@ mod app_state_pricing;
 mod approval;
 mod audio_routing;
 mod autonomy;
+mod browser_workspace;
 mod computer_use;
 mod context_rewind;
 mod control;

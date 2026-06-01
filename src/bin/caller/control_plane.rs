@@ -597,6 +597,108 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // Routed by the daemon loop because it persists per-session files
             // and external-session overlays.
         }
+        ControlMsg::CreateBrowserWorkspace {
+            url,
+            label,
+            provider,
+            peer_id,
+            owner_session_id,
+            profile_dir,
+        } => {
+            let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
+                url: url.clone(),
+                label: label.clone(),
+                provider: provider.clone(),
+                peer_id: peer_id.clone(),
+                owner_session_id: owner_session_id.clone(),
+                profile_dir: profile_dir.clone(),
+            };
+            match crate::browser_workspace::create_workspace(request).await {
+                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "created".to_string(),
+                    workspace: Some(workspace),
+                    workspace_id: None,
+                    message: None,
+                }),
+                Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: None,
+                    message: Some(err.to_string()),
+                }),
+            }
+        }
+        ControlMsg::CloseBrowserWorkspace {
+            workspace_id,
+            reason,
+        } => match crate::browser_workspace::close_workspace(workspace_id, reason.clone()).await {
+            Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                kind: "closed".to_string(),
+                workspace_id: Some(workspace.id.clone()),
+                workspace: Some(workspace),
+                message: None,
+            }),
+            Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                kind: "error".to_string(),
+                workspace: None,
+                workspace_id: Some(workspace_id.clone()),
+                message: Some(err.to_string()),
+            }),
+        },
+        ControlMsg::AcquireBrowserWorkspace {
+            workspace_id,
+            holder_id,
+            holder_kind,
+            note,
+            force,
+        } => {
+            let request = crate::browser_workspace::AcquireBrowserWorkspaceRequest {
+                workspace_id: workspace_id.clone(),
+                holder_id: holder_id.clone(),
+                holder_kind: holder_kind.clone(),
+                note: note.clone(),
+                force: *force,
+            };
+            match crate::browser_workspace::acquire_workspace(request).await {
+                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "lease_acquired".to_string(),
+                    workspace: Some(workspace),
+                    workspace_id: Some(workspace_id.clone()),
+                    message: None,
+                }),
+                Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: Some(workspace_id.clone()),
+                    message: Some(err.to_string()),
+                }),
+            }
+        }
+        ControlMsg::ReleaseBrowserWorkspace {
+            workspace_id,
+            holder_id,
+            note,
+        } => {
+            let request = crate::browser_workspace::ReleaseBrowserWorkspaceRequest {
+                workspace_id: workspace_id.clone(),
+                holder_id: holder_id.clone(),
+                note: note.clone(),
+            };
+            match crate::browser_workspace::release_workspace(request).await {
+                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "lease_released".to_string(),
+                    workspace: Some(workspace),
+                    workspace_id: Some(workspace_id.clone()),
+                    message: None,
+                }),
+                Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: Some(workspace_id.clone()),
+                    message: Some(err.to_string()),
+                }),
+            }
+        }
         ControlMsg::GrantUserDisplay { display_id } => {
             // Moved out of `tui/app.rs::handle_control_command` — the TUI is
             // now display-only and the display-control path shouldn't depend

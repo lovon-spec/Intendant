@@ -11827,6 +11827,13 @@ pub fn spawn_web_gateway(
                         }
                     }
 
+                    let browser_workspaces = crate::browser_workspace::list_workspaces().await;
+                    let browser_snapshot = serde_json::json!({
+                        "t": "browser_workspace_snapshot",
+                        "workspaces": browser_workspaces,
+                    });
+                    let _ = direct_tx.send(browser_snapshot.to_string());
+
                     // Replay display_ready for every active display session so
                     // late-connecting browsers (including refreshes) recreate
                     // their DisplaySlots and initiate WebRTC.  Prefer the

@@ -283,6 +283,7 @@ impl AppEventUpcaster {
             | AppEvent::SessionGoal { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }
+            | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::FileChanged { .. }
             | AppEvent::UploadReady { .. }
@@ -1379,6 +1380,7 @@ impl WireEventUpcaster {
             | OutboundEvent::SessionGoal { .. }
             | OutboundEvent::FollowUpStatus { .. }
             | OutboundEvent::SharedView { .. }
+            | OutboundEvent::BrowserWorkspaceChanged { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }

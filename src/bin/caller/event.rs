@@ -419,6 +419,20 @@ pub enum AppEvent {
         note: Option<String>,
     },
 
+    /// Browser workspace lifecycle/lease update. Browser workspaces are
+    /// addressable browser-control surfaces (CDP/Playwright/Agent Browser now,
+    /// federated peers later) and are intentionally separate from global
+    /// desktop display input.
+    BrowserWorkspaceChanged {
+        kind: String,
+        #[allow(dead_code)]
+        workspace: Option<crate::browser_workspace::BrowserWorkspace>,
+        #[allow(dead_code)]
+        workspace_id: Option<String>,
+        #[allow(dead_code)]
+        message: Option<String>,
+    },
+
     // Recording lifecycle
     RecordingStarted {
         stream_name: String,
@@ -1372,6 +1386,42 @@ pub enum ControlMsg {
     ReleaseDisplayInputAuthority {
         display_id: u32,
     },
+    CreateBrowserWorkspace {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_dir: Option<String>,
+    },
+    CloseBrowserWorkspace {
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    AcquireBrowserWorkspace {
+        workspace_id: String,
+        holder_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default)]
+        force: bool,
+    },
+    ReleaseBrowserWorkspace {
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     ListDisplays,
     QueryDetail {
         scope: String,
@@ -2090,6 +2140,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             reason: reason.clone(),
             region: region.clone(),
             note: note.clone(),
+        }),
+        AppEvent::BrowserWorkspaceChanged {
+            kind,
+            workspace,
+            workspace_id,
+            message,
+        } => Some(OutboundEvent::BrowserWorkspaceChanged {
+            kind: kind.clone(),
+            workspace: workspace.clone(),
+            workspace_id: workspace_id.clone(),
+            message: message.clone(),
         }),
         AppEvent::UploadReady { descriptor } => Some(OutboundEvent::UploadReady {
             descriptor: descriptor.clone(),
@@ -2981,6 +3042,30 @@ mod tests {
             ControlMsg::RevokeUserDisplay {
                 display_id: None,
                 note: Some("done with user display".to_string()),
+            },
+            ControlMsg::CreateBrowserWorkspace {
+                url: Some("http://localhost:8765".to_string()),
+                label: Some("debug dashboard".to_string()),
+                provider: Some("cdp".to_string()),
+                peer_id: None,
+                owner_session_id: Some("session-1".to_string()),
+                profile_dir: None,
+            },
+            ControlMsg::CloseBrowserWorkspace {
+                workspace_id: "bw-test".to_string(),
+                reason: Some("done".to_string()),
+            },
+            ControlMsg::AcquireBrowserWorkspace {
+                workspace_id: "bw-test".to_string(),
+                holder_id: "agent-a".to_string(),
+                holder_kind: Some("agent".to_string()),
+                note: Some("visual check".to_string()),
+                force: false,
+            },
+            ControlMsg::ReleaseBrowserWorkspace {
+                workspace_id: "bw-test".to_string(),
+                holder_id: Some("agent-a".to_string()),
+                note: None,
             },
             ControlMsg::InvokeSkill {
                 skill_name: "deploy".to_string(),

@@ -110,6 +110,25 @@ Full MCP tool groups:
 | `list_frames`        | List captured video frames. | filter params |
 | `read_frame`         | Read a specific frame. | `frame_id` |
 
+### Browser workspaces
+
+Browser workspaces are addressable browser-control surfaces for agent/human
+collaboration and headed UI testing. The first executable backend launches a
+local Chromium-family browser with an isolated profile and Chrome DevTools
+Protocol metadata; the wire contract already carries `provider` and `peer_id`
+fields so Playwright/Agent Browser adapters and federated peer-hosted browsers
+can slot in later. Each workspace has a lease, so concurrent agents must
+explicitly acquire it and use `force` to take over an active holder.
+
+| Tool                          | Description | Params |
+|-------------------------------|-------------|--------|
+| `browser_workspace_providers` | Report available workspace providers. | — |
+| `list_browser_workspaces`     | List active browser workspaces and leases. | — |
+| `create_browser_workspace`    | Launch/register a workspace. | `url?`, `label?`, `provider?`, `peer_id?`, `owner_session_id?`, `profile_dir?` |
+| `acquire_browser_workspace`   | Acquire a workspace lease. | `workspace_id`, `holder_id`, `holder_kind?`, `note?`, `force?` |
+| `release_browser_workspace`   | Release a workspace lease. | `workspace_id`, `holder_id?`, `note?` |
+| `close_browser_workspace`     | Close a workspace and terminate its local browser process when owned here. | `workspace_id`, `reason?` |
+
 ### Live audio
 
 | Tool               | Description | Params |

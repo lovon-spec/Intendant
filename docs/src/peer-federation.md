@@ -221,6 +221,25 @@ The **browser is the offerer** — mirroring the local browser→daemon flow:
 don't collide and a stale tab can't interfere with a fresh one. Unknown signal
 kinds parse to an ignored `Unknown` variant for forward compatibility.
 
+### Federated Browser Workspaces
+
+Browser workspaces are the browser-specific sibling of shared displays: they
+represent a concrete browser surface that an agent can control through CDP,
+Playwright, Agent Browser, or a streamed-display fallback. The local registry
+models `placement = local | peer` and carries the target `peer_id`, but remote
+peer placement intentionally fails closed until the federation transport has a
+first-class browser-workspace operation.
+
+The intended federation rule is the same one used for display input authority:
+the peer that owns the browser process is the source of truth for leases. If two
+agents on one primary try to access a browser workspace hosted by another peer,
+or if agents on multiple peers race for the same remote browser, the owning peer
+serializes `acquire_browser_workspace` and rejects the second holder unless the
+caller uses an explicit force-takeover. Local same-machine workspaces can use
+CDP/Playwright semantics for low-latency automation; cross-machine users can
+fall back to the display/shared-view streaming path when local browser control is
+not possible.
+
 ### Direct media and the TCP-relay fallback
 
 Once signaled, the browser forms a **direct** WebRTC media path to the peer,

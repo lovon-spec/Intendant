@@ -8843,6 +8843,26 @@ body.display-fullscreen-open {
         <div id="debug-info" class="hidden" style="padding:8px 12px;background:var(--mantle);border-radius:4px;font-size:12px;color:var(--subtext1);margin-bottom:8px">
           <p style="margin:4px 0">Display: <code style="color:var(--blue)">:<span id="debug-display-id"></span></code></p>
         </div>
+        <h3 style="margin:20px 0 12px;color:var(--text);font-size:16px">Browser Workspaces</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;align-items:end;margin-bottom:12px">
+          <label style="display:flex;flex-direction:column;gap:4px;color:var(--overlay1);font-size:11px">URL
+            <input id="browser-workspace-url" type="text" placeholder="http://localhost:8765" autocomplete="off" style="padding:7px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text)">
+          </label>
+          <label style="display:flex;flex-direction:column;gap:4px;color:var(--overlay1);font-size:11px">Provider
+            <select id="browser-workspace-provider" style="padding:7px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text)">
+              <option value="auto">auto</option>
+              <option value="cdp">cdp</option>
+              <option value="playwright">playwright</option>
+              <option value="agent_browser">agent_browser</option>
+            </select>
+          </label>
+          <label style="display:flex;flex-direction:column;gap:4px;color:var(--overlay1);font-size:11px">Label
+            <input id="browser-workspace-label" type="text" placeholder="Dashboard" autocomplete="off" style="padding:7px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text)">
+          </label>
+          <button type="button" onclick="createBrowserWorkspaceFromDebug()" style="padding:8px 16px;border:1px solid var(--surface1);border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Create</button>
+        </div>
+        <div id="browser-workspace-status" style="color:var(--subtext0);font-size:12px;margin-bottom:8px"></div>
+        <div id="browser-workspace-list" style="display:grid;gap:8px"></div>
       </div>
     </div>
 
@@ -10177,6 +10197,10 @@ async function main() {
       }
       if (d.event === 'shared_view') {
         handleSharedViewEvent(d);
+        return;
+      }
+      if (d.t === 'browser_workspace_snapshot' || d.event === 'browser_workspace_changed') {
+        handleBrowserWorkspaceMessage(d);
         return;
       }
       if (d.t === 'log_replay' && Array.isArray(d.entries)) {
@@ -32667,6 +32691,7 @@ window.startNewSession = startNewSession;
 // ── Debug Screen ──
 let debugScreenActive = false;
 let debugRecording = false;
+const browserWorkspaces = new Map();
 
 function toggleDebugScreen() {
   if (debugScreenActive) {
@@ -32685,6 +32710,102 @@ function toggleDebugRecording() {
 }
 window.toggleDebugScreen = toggleDebugScreen;
 window.toggleDebugRecording = toggleDebugRecording;
+
+function renderBrowserWorkspaces() {
+  const list = document.getElementById('browser-workspace-list');
+  const status = document.getElementById('browser-workspace-status');
+  if (!list) return;
+  const rows = Array.from(browserWorkspaces.values())
+    .filter(w => (w.status || '') !== 'closed')
+    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+  if (status) status.textContent = rows.length ? `${rows.length} active workspace${rows.length === 1 ? '' : 's'}` : 'No active browser workspaces';
+  if (!rows.length) {
+    list.innerHTML = '<div style="color:var(--subtext0);font-size:12px;padding:10px;border:1px solid var(--surface0);border-radius:4px;background:var(--mantle)">No browser workspace yet</div>';
+    return;
+  }
+  list.innerHTML = '';
+  for (const w of rows) {
+    const card = document.createElement('div');
+    card.style.cssText = 'border:1px solid var(--surface0);border-radius:6px;background:var(--mantle);padding:10px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:start';
+    const meta = document.createElement('div');
+    meta.style.minWidth = '0';
+    const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
+    const url = w.url || 'about:blank';
+    meta.innerHTML =
+      `<div style="font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(w.label || w.id)}</div>` +
+      `<div style="color:var(--subtext0);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(url)}</div>` +
+      `<div style="color:var(--overlay1);font-size:11px;margin-top:4px">${escapeHtml(w.id || '')} · ${escapeHtml(w.provider || '')} · ${escapeHtml(w.status || '')} · ${escapeHtml(lease)}</div>`;
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end';
+    const take = document.createElement('button');
+    take.textContent = w.lease ? 'Take' : 'Acquire';
+    take.title = 'Acquire this browser workspace lease';
+    take.style.cssText = 'padding:5px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);cursor:pointer';
+    take.onclick = () => acquireBrowserWorkspace(w.id, true);
+    const close = document.createElement('button');
+    close.textContent = 'Close';
+    close.title = 'Close this browser workspace';
+    close.style.cssText = 'padding:5px 9px;border:1px solid var(--red);border-radius:4px;background:transparent;color:var(--red);cursor:pointer';
+    close.onclick = () => closeBrowserWorkspace(w.id);
+    actions.appendChild(take);
+    actions.appendChild(close);
+    card.appendChild(meta);
+    card.appendChild(actions);
+    list.appendChild(card);
+  }
+}
+
+function handleBrowserWorkspaceMessage(d) {
+  if (d.t === 'browser_workspace_snapshot' && Array.isArray(d.workspaces)) {
+    browserWorkspaces.clear();
+    for (const w of d.workspaces) if (w && w.id) browserWorkspaces.set(String(w.id), w);
+    renderBrowserWorkspaces();
+    return;
+  }
+  if (d.event !== 'browser_workspace_changed') return;
+  if (d.workspace && d.workspace.id) {
+    browserWorkspaces.set(String(d.workspace.id), d.workspace);
+  } else if (d.workspace_id && d.kind === 'closed') {
+    browserWorkspaces.delete(String(d.workspace_id));
+  }
+  const status = document.getElementById('browser-workspace-status');
+  if (status && d.kind === 'error') status.textContent = d.message || 'Browser workspace error';
+  renderBrowserWorkspaces();
+}
+
+function createBrowserWorkspaceFromDebug() {
+  if (!app) return;
+  const g = id => document.getElementById(id);
+  app.send_server_action({
+    action: 'create_browser_workspace',
+    url: (g('browser-workspace-url')?.value || '').trim() || undefined,
+    provider: g('browser-workspace-provider')?.value || 'auto',
+    label: (g('browser-workspace-label')?.value || '').trim() || undefined,
+    owner_session_id: currentSessionId || undefined,
+  });
+}
+
+function acquireBrowserWorkspace(workspaceId, force = false) {
+  if (!app || !workspaceId) return;
+  app.send_server_action({
+    action: 'acquire_browser_workspace',
+    workspace_id: workspaceId,
+    holder_id: currentSessionId || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
+    holder_kind: 'human',
+    force: !!force,
+  });
+}
+
+function closeBrowserWorkspace(workspaceId) {
+  if (!app || !workspaceId) return;
+  app.send_server_action({
+    action: 'close_browser_workspace',
+    workspace_id: workspaceId,
+    reason: 'closed from dashboard',
+  });
+}
+
+window.createBrowserWorkspaceFromDebug = createBrowserWorkspaceFromDebug;
 
 function onDebugScreenReady(displayId) {
   debugScreenActive = true;

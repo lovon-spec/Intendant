@@ -45,6 +45,7 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
         "logs" => run_logs(&client, &config, &command[1..]).await?,
         "tools" | "tool" => run_tools(&client, &config, &command[1..]).await?,
         "display" => run_display(&client, &config, &command[1..]).await?,
+        "browser" | "browsers" => run_browser(&client, &config, &command[1..]).await?,
         "cu" => run_cu(&client, &config, &command[1..]).await?,
         "shared" | "shared-view" => run_shared(&client, &config, &command[1..]).await?,
         "approval" | "approvals" => run_approval(&client, &config, &command[1..]).await?,
@@ -392,6 +393,141 @@ async fn run_display(
             print_tool_response(response, config, None)?;
         }
         other => return Err(format!("unknown display command '{other}'")),
+    }
+    Ok(())
+}
+
+async fn run_browser(
+    client: &reqwest::Client,
+    config: &Config,
+    raw: &[String],
+) -> Result<(), String> {
+    if raw.is_empty() || is_help(raw) {
+        help_browser();
+        return Ok(());
+    }
+    match raw[0].as_str() {
+        "providers" => {
+            let response = call_tool(
+                client,
+                config,
+                "browser_workspace_providers",
+                Value::Object(Map::new()),
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        "list" | "ls" => {
+            let response = call_tool(
+                client,
+                config,
+                "list_browser_workspaces",
+                Value::Object(Map::new()),
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        "create" | "open" => {
+            let args = parse_command_args(
+                &raw[1..],
+                &[
+                    "--url",
+                    "--label",
+                    "--provider",
+                    "--peer",
+                    "--session",
+                    "--profile-dir",
+                ],
+                &[],
+            )?;
+            let mut map = Map::new();
+            let url = args
+                .one("--url")
+                .or_else(|| args.positional.first().map(String::as_str));
+            insert_string(&mut map, "url", url);
+            insert_string(&mut map, "label", args.one("--label"));
+            insert_string(&mut map, "provider", args.one("--provider"));
+            insert_string(&mut map, "peer_id", args.one("--peer"));
+            insert_string(&mut map, "owner_session_id", args.one("--session"));
+            insert_string(&mut map, "profile_dir", args.one("--profile-dir"));
+            let response = call_tool(
+                client,
+                config,
+                "create_browser_workspace",
+                Value::Object(map),
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        "close" => {
+            let args = parse_command_args(&raw[1..], &["--reason"], &[])?;
+            let id = args
+                .positional
+                .first()
+                .ok_or_else(|| "browser close requires a workspace id".to_string())?;
+            let mut map = Map::new();
+            map.insert("workspace_id".to_string(), Value::String(id.clone()));
+            insert_string(&mut map, "reason", args.one("--reason"));
+            let response = call_tool(
+                client,
+                config,
+                "close_browser_workspace",
+                Value::Object(map),
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        "acquire" | "take" => {
+            let args = parse_command_args(
+                &raw[1..],
+                &["--holder", "--holder-kind", "--note"],
+                &["--force"],
+            )?;
+            let id = args
+                .positional
+                .first()
+                .ok_or_else(|| "browser acquire requires a workspace id".to_string())?;
+            let holder = args
+                .one("--holder")
+                .or(config.session_id.as_deref())
+                .unwrap_or("intendant-ctl");
+            let mut map = Map::new();
+            map.insert("workspace_id".to_string(), Value::String(id.clone()));
+            map.insert("holder_id".to_string(), Value::String(holder.to_string()));
+            insert_string(&mut map, "holder_kind", args.one("--holder-kind"));
+            insert_string(&mut map, "note", args.one("--note"));
+            if args.has("--force") {
+                map.insert("force".to_string(), Value::Bool(true));
+            }
+            let response = call_tool(
+                client,
+                config,
+                "acquire_browser_workspace",
+                Value::Object(map),
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        "release" => {
+            let args = parse_command_args(&raw[1..], &["--holder", "--note"], &[])?;
+            let id = args
+                .positional
+                .first()
+                .ok_or_else(|| "browser release requires a workspace id".to_string())?;
+            let mut map = Map::new();
+            map.insert("workspace_id".to_string(), Value::String(id.clone()));
+            insert_string(&mut map, "holder_id", args.one("--holder"));
+            insert_string(&mut map, "note", args.one("--note"));
+            let response = call_tool(
+                client,
+                config,
+                "release_browser_workspace",
+                Value::Object(map),
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
+        other => return Err(format!("unknown browser command '{other}'")),
     }
     Ok(())
 }
@@ -1338,6 +1474,7 @@ Commands:\n\
   logs                      Read log entries\n\
   tools                     Lazy MCP tool discovery and generic calls\n\
   display                   Displays, frames, screenshots, display claims\n\
+  browser                   Browser workspaces and leases\n\
   cu                        Computer-use actions\n\
   shared                    Shared display collaboration\n\
   approval                  Pending approvals and approval responses\n\
@@ -1403,6 +1540,18 @@ fn help_display_screenshot() {
     println!(
         "Usage: intendant ctl display screenshot [--target TARGET] [--output out.png]\n\
 Targets include user_session, display_99, 99, and legacy :99."
+    );
+}
+
+fn help_browser() {
+    println!(
+        "Usage:\n\
+  intendant ctl browser providers\n\
+  intendant ctl browser list\n\
+  intendant ctl browser create [URL] [--label TEXT] [--provider auto|cdp|playwright|agent_browser] [--peer PEER_ID] [--session ID] [--profile-dir PATH]\n\
+  intendant ctl browser acquire WORKSPACE_ID [--holder ID] [--holder-kind agent|human] [--note TEXT] [--force]\n\
+  intendant ctl browser release WORKSPACE_ID [--holder ID] [--note TEXT]\n\
+  intendant ctl browser close WORKSPACE_ID [--reason TEXT]"
     );
 }
 

@@ -1787,6 +1787,13 @@ impl App {
                 // connection id as the authority holder). The TUI
                 // has no analogous notion; no-op.
             }
+            ControlMsg::CreateBrowserWorkspace { .. }
+            | ControlMsg::CloseBrowserWorkspace { .. }
+            | ControlMsg::AcquireBrowserWorkspace { .. }
+            | ControlMsg::ReleaseBrowserWorkspace { .. } => {
+                // Browser workspaces are owned by the control plane / MCP
+                // tool path; the TUI observes the resulting outbound events.
+            }
             ControlMsg::SetDiagnosticsVisualMarker { .. } => {
                 // Phase 0 visual-freshness diagnostic toggle (task #83).
                 // Handled inline by the web gateway's `/ws` dispatcher
@@ -2463,6 +2470,7 @@ impl App {
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionResult { .. }
             | AppEvent::SharedView { .. }
+            | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::FileChanged { .. }
             | AppEvent::UploadReady { .. }
             | AppEvent::UploadDeleted { .. }

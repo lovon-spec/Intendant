@@ -984,6 +984,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::UserDisplayGranted { .. }
         | AppEvent::UserDisplayRevoked { .. }
         | AppEvent::SharedView { .. }
+        | AppEvent::BrowserWorkspaceChanged { .. }
 
         // Pull-only events — not pushed to presence
         | AppEvent::AgentOutput { .. }
