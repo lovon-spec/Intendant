@@ -616,6 +616,31 @@ fn managed_context_tool(name: &str) -> bool {
     matches!(name, "rewind_context" | "rewind_backout")
 }
 
+fn with_default_mcp_session_id(
+    mut args: serde_json::Value,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return args;
+    };
+    let Some(obj) = args.as_object_mut() else {
+        return args;
+    };
+    let has_session_id = obj
+        .get("session_id")
+        .or_else(|| obj.get("sessionId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_session_id {
+        obj.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id.to_string()),
+        );
+    }
+    args
+}
+
 fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&str>) -> bool {
     if !managed_context && managed_context_tool(name) {
         return false;
@@ -3822,7 +3847,7 @@ pub struct RewindContextAnchorParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RewindContextParams {
     /// Optional Intendant or backend session id. Omit for the active Codex session.
-    #[serde(default)]
+    #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
     /// Exact item anchor for the rollback target.
     pub anchor: RewindContextAnchorParams,
@@ -3847,7 +3872,7 @@ pub struct RewindContextParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RewindBackoutParams {
     /// Optional Intendant or backend session id. Omit for the active Codex session.
-    #[serde(default)]
+    #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
     /// Context rewind record id returned by rewind_context.
     pub record_id: String,
@@ -4445,11 +4470,15 @@ impl IntendantServer {
                 Ok(text_tool_result(self.start_task(params).await))
             }
             "rewind_context" => {
-                let params = parse_params::<RewindContextParams>(args)?;
+                let params = parse_params::<RewindContextParams>(with_default_mcp_session_id(
+                    args, session_id,
+                ))?;
                 Ok(text_tool_result(self.rewind_context(params).await))
             }
             "rewind_backout" => {
-                let params = parse_params::<RewindBackoutParams>(args)?;
+                let params = parse_params::<RewindBackoutParams>(with_default_mcp_session_id(
+                    args, session_id,
+                ))?;
                 Ok(text_tool_result(self.rewind_backout(params).await))
             }
             "claim_fission_canonical" => {
@@ -7318,6 +7347,55 @@ mod tests {
                 .unwrap();
             let rendered = format!("{result:?}");
             assert!(rendered.contains("managed context is disabled"));
+        });
+    }
+
+    #[test]
+    fn rewind_context_defaults_to_http_session_id() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus.clone());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "rewind_context",
+                    serde_json::json!({
+                        "anchor": {"item_id": "call-1", "position": "after"},
+                        "reason": "trim noisy branch",
+                        "primer": "carry forward the durable facts"
+                    }),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false));
+
+            let event = timeout(Duration::from_secs(1), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            params,
+                        })) => break (session_id, op, params),
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            })
+            .await
+            .expect("expected CodexThreadAction control command");
+
+            assert_eq!(event.0.as_deref(), Some("backend-session-1"));
+            assert_eq!(event.1, "rewind_context");
+            assert_eq!(event.2["anchor"]["item_id"], "call-1");
         });
     }
 
