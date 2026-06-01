@@ -990,6 +990,7 @@ async fn run_context(
                 &[
                     "--session",
                     "--item-id",
+                    "--proof",
                     "--position",
                     "--reason",
                     "--primer",
@@ -1005,11 +1006,24 @@ async fn run_context(
             let item_id = args
                 .one("--item-id")
                 .ok_or_else(|| "context rewind requires --item-id".to_string())?;
+            let proof = match args.one("--proof").map(str::trim).filter(|v| !v.is_empty()) {
+                Some(proof) => proof.to_string(),
+                None => {
+                    resolve_context_rewind_anchor_proof(
+                        client,
+                        config,
+                        args.one("--session"),
+                        item_id,
+                    )
+                    .await?
+                }
+            };
             let position = args.one("--position").unwrap_or("before");
             map.insert(
                 "anchor".to_string(),
                 json_object([
                     ("item_id", Value::String(item_id.to_string())),
+                    ("proof", Value::String(proof)),
                     ("position", Value::String(position.to_string())),
                 ]),
             );
@@ -1120,6 +1134,43 @@ async fn call_tool(
     .await
 }
 
+async fn resolve_context_rewind_anchor_proof(
+    client: &reqwest::Client,
+    config: &Config,
+    session_id: Option<&str>,
+    item_id: &str,
+) -> Result<String, String> {
+    let mut args = Map::new();
+    insert_string(&mut args, "session_id", session_id);
+    args.insert("query".to_string(), Value::String(item_id.to_string()));
+    args.insert("limit".to_string(), Value::Number(10.into()));
+    let response = call_tool(client, config, "list_rewind_anchors", Value::Object(args)).await?;
+    let text = tool_response_text(&response)?;
+    let payload = serde_json::from_str::<Value>(&text)
+        .map_err(|e| format!("invalid list_rewind_anchors JSON while resolving proof: {e}"))?;
+    let anchors = payload
+        .get("anchors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "list_rewind_anchors response missing anchors".to_string())?;
+    anchors
+        .iter()
+        .find(|anchor| {
+            anchor
+                .get("item_id")
+                .and_then(Value::as_str)
+                .is_some_and(|candidate| candidate == item_id)
+        })
+        .and_then(|anchor| anchor.get("proof").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|proof| !proof.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "could not resolve catalog proof for anchor `{item_id}`; run list_rewind_anchors and retry with --proof"
+            )
+        })
+}
+
 async fn rpc(
     client: &reqwest::Client,
     config: &Config,
@@ -1163,6 +1214,28 @@ fn mcp_url(config: &Config) -> Result<reqwest::Url, String> {
         }
     }
     Ok(url)
+}
+
+fn tool_response_text(response: &Value) -> Result<String, String> {
+    if let Some(error) = response.get("error") {
+        return Err(format!("MCP tool call failed: {error}"));
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "JSON-RPC response missing result".to_string())?;
+    let text = text_contents(result).collect::<Vec<_>>().join("\n");
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(if text.trim().is_empty() {
+            "tool returned isError=true".to_string()
+        } else {
+            text
+        });
+    }
+    Ok(text)
 }
 
 fn print_tool_response(
@@ -1641,6 +1714,7 @@ fn help_context() {
     println!(
         "Usage:\n\
   intendant ctl --managed-context managed context rewind --item-id ID --position before|after --reason TEXT --primer TEXT\n\
+      [--proof PROOF]\n\
   intendant ctl --managed-context managed context backout --record-id ID [--mode inspect|restore|fork|backout]\n\
   intendant ctl context claim-fission --group-id ID --branch-session-id ID"
     );

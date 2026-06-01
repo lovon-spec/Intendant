@@ -7898,6 +7898,10 @@ body.display-fullscreen-open {
                       <span>Exact item anchor</span>
                       <input id="managed-context-anchor" type="text" autocomplete="off" spellcheck="false" placeholder="call_id or response item id">
                     </label>
+                    <label class="managed-context-field full" for="managed-context-anchor-proof">
+                      <span>Catalog proof</span>
+                      <input id="managed-context-anchor-proof" type="text" autocomplete="off" spellcheck="false" placeholder="auto-filled from list_rewind_anchors">
+                    </label>
                     <label class="managed-context-field full" for="managed-context-reason">
                       <span>Reason</span>
                       <input id="managed-context-reason" type="text" autocomplete="off" spellcheck="true" placeholder="why this branch should be crystallized">
@@ -13350,6 +13354,7 @@ function renderManagedContextAnchors() {
   for (const anchor of managedContextAnchors || []) {
     rows.push({
       itemId: anchor.item_id || anchor.itemId,
+      proof: anchor.proof || anchor.catalog_proof || anchor.catalogProof || '',
       sessionId: anchor.session_id || anchor.sessionId || anchor.intendant_session_id || anchor.intendantSessionId || sid,
       content: compactSessionText([
         anchor.tool_name || anchor.toolName || 'tool',
@@ -13374,7 +13379,7 @@ function renderManagedContextAnchors() {
     btn.type = 'button';
     btn.className = 'managed-context-btn';
     btn.textContent = 'Use';
-    btn.addEventListener('click', () => fillManagedContextAnchor(itemId, rowInfo.sessionId || sid));
+    btn.addEventListener('click', () => fillManagedContextAnchor(itemId, rowInfo.sessionId || sid, rowInfo.proof || ''));
     row.appendChild(btn);
     host.appendChild(row);
   }
@@ -13385,7 +13390,7 @@ function renderManagedContextAnchors() {
   }
 }
 
-function fillManagedContextAnchor(itemId, sessionId = '') {
+function fillManagedContextAnchor(itemId, sessionId = '', proof = '') {
   const sid = String(sessionId || '').trim();
   if (sid) {
     renderManagedContextSessionSelect();
@@ -13395,6 +13400,8 @@ function fillManagedContextAnchor(itemId, sessionId = '') {
   }
   const anchor = managedContextEl('managed-context-anchor');
   if (anchor) anchor.value = itemId || '';
+  const proofInput = managedContextEl('managed-context-anchor-proof');
+  if (proofInput) proofInput.value = proof || '';
   showControlToast('info', 'Managed context anchor selected');
 }
 window.fillManagedContextAnchor = fillManagedContextAnchor;
@@ -13451,6 +13458,26 @@ async function fetchManagedContextAnchors() {
   const payload = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(payload.error || `anchors HTTP ${resp.status}`);
   return Array.isArray(payload.anchors) ? payload.anchors : [];
+}
+
+async function resolveManagedContextAnchorProof(itemId) {
+  const text = await managedContextMcpTool('list_rewind_anchors', {
+    query: itemId,
+    limit: 10,
+  });
+  let payload = {};
+  try {
+    payload = JSON.parse(text || '{}');
+  } catch (err) {
+    throw new Error('Could not parse list_rewind_anchors response while resolving anchor proof');
+  }
+  const anchors = Array.isArray(payload.anchors) ? payload.anchors : [];
+  const exact = anchors.find(anchor => String(anchor.item_id || anchor.itemId || '').trim() === itemId);
+  const proof = String(exact?.proof || exact?.catalog_proof || exact?.catalogProof || '').trim();
+  if (!proof) {
+    throw new Error('Could not resolve catalog proof for that anchor; refresh Managed or choose a live catalog anchor.');
+  }
+  return proof;
 }
 
 function settleManagedContextPromise(promise) {
@@ -13647,16 +13674,31 @@ function renderManagedContextPane() {
 async function submitManagedContextRewind() {
   const sessionId = managedContextCurrentSessionId();
   const itemId = String(managedContextEl('managed-context-anchor')?.value || '').trim();
+  let proof = String(managedContextEl('managed-context-anchor-proof')?.value || '').trim();
   const reason = String(managedContextEl('managed-context-reason')?.value || '').trim();
   const primer = String(managedContextEl('managed-context-primer')?.value || '').trim();
   if (!sessionId || !itemId || !reason || !primer) {
     showControlToast('error', 'Rewind needs session, anchor, reason, and primer');
     return;
   }
+  const result = managedContextEl('managed-context-action-result');
+  try {
+    if (!proof) {
+      if (result) result.textContent = 'Resolving anchor proof...';
+      proof = await resolveManagedContextAnchorProof(itemId);
+      const proofInput = managedContextEl('managed-context-anchor-proof');
+      if (proofInput) proofInput.value = proof;
+    }
+  } catch (err) {
+    if (result) result.textContent = err?.message || String(err);
+    showControlToast('error', err?.message || 'Could not resolve anchor proof');
+    return;
+  }
   const args = {
     session_id: sessionId,
     anchor: {
       item_id: itemId,
+      proof,
       position: managedContextEl('managed-context-position')?.value === 'before' ? 'before' : 'after',
     },
     reason,
@@ -13666,7 +13708,6 @@ async function submitManagedContextRewind() {
     artifacts: managedContextSplitLines('managed-context-artifacts'),
     next_steps: managedContextSplitLines('managed-context-next-steps'),
   };
-  const result = managedContextEl('managed-context-action-result');
   if (result) result.textContent = 'Dispatching rewind...';
   try {
     const text = await managedContextMcpTool('rewind_context', args);
@@ -13745,6 +13786,8 @@ function wireManagedContextListeners() {
   managedContextEl('managed-context-clear-anchor')?.addEventListener('click', () => {
     const anchor = managedContextEl('managed-context-anchor');
     if (anchor) anchor.value = '';
+    const proof = managedContextEl('managed-context-anchor-proof');
+    if (proof) proof.value = '';
   });
   managedContextEl('managed-context-submit-rewind')?.addEventListener('click', submitManagedContextRewind);
   managedContextEl('managed-context-submit-backout')?.addEventListener('click', submitManagedContextBackout);
