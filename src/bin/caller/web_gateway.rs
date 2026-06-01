@@ -98,6 +98,7 @@ const DELETED_EXTERNAL_SESSIONS_FILE: &str = "deleted_external_sessions.json";
 const MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT: usize = 64;
 const MANAGED_CONTEXT_ANCHOR_LIMIT: usize = 40;
 const EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT: usize = 16;
+const CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES: u64 = 512 * 1024;
 const FS_LIST_LIMIT: usize = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1519,7 +1520,9 @@ fn replay_jsonl_to_outbound_entries_inner(
             && entry_json.get("event").and_then(|v| v.as_str()) == Some("context_snapshot")
         {
             let file = entry_json.get("file").and_then(|v| v.as_str());
-            if !file.is_some_and(|file| context_files_to_load.contains(file)) {
+            if !file.is_some_and(|file| context_files_to_load.contains(file))
+                || context_snapshot_raw_file_too_large_for_replay(&entry_json, log_dir)
+            {
                 let Some(mut value) = context_snapshot_replay_entry_without_raw(
                     &entry_json,
                     replay_session_id.as_deref(),
@@ -1645,6 +1648,64 @@ fn latest_context_snapshot_files_by_session(
         latest_by_session.insert(session_id.to_string(), file.to_string());
     }
     latest_by_session.into_values().collect()
+}
+
+fn context_snapshot_raw_file_size(entry_json: &serde_json::Value, log_dir: &Path) -> Option<u64> {
+    let file = entry_json.get("file").and_then(|v| v.as_str())?;
+    if file.trim().is_empty() {
+        return None;
+    }
+    let relative = Path::new(file);
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    std::fs::metadata(log_dir.join(relative))
+        .ok()
+        .map(|m| m.len())
+}
+
+fn context_snapshot_raw_file_too_large_for_replay(
+    entry_json: &serde_json::Value,
+    log_dir: &Path,
+) -> bool {
+    context_snapshot_raw_file_size(entry_json, log_dir)
+        .is_some_and(|bytes| bytes > CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES)
+}
+
+fn context_snapshot_replay_entry_from_log_entry(
+    entry_json: &serde_json::Value,
+    log_dir: &Path,
+    replay_session_id: Option<&str>,
+    external_replay_session_id: Option<&str>,
+    wrapper_replay_session_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    if context_snapshot_raw_file_too_large_for_replay(entry_json, log_dir) {
+        let mut value = context_snapshot_replay_entry_without_raw(entry_json, replay_session_id)?;
+        inject_replay_entry_metadata(
+            &mut value,
+            entry_json,
+            replay_session_id,
+            external_replay_session_id,
+            wrapper_replay_session_id,
+        );
+        return Some(value);
+    }
+
+    let app_event = crate::session_log::session_log_entry_to_app_event(entry_json, log_dir)?;
+    let outbound = crate::event::app_event_to_outbound(&app_event)?;
+    let mut value = serde_json::to_value(&outbound).ok()?;
+    compact_context_snapshot_raw_for_replay(&mut value);
+    inject_replay_entry_metadata(
+        &mut value,
+        entry_json,
+        replay_session_id,
+        external_replay_session_id,
+        wrapper_replay_session_id,
+    );
+    Some(value)
 }
 
 fn context_snapshot_replay_entry_without_raw(
@@ -6126,15 +6187,41 @@ fn append_external_context_snapshot_replay_entries(
     let mut snapshot_entries = Vec::new();
     for dir in external_context_snapshot_replay_log_dirs(home, source, session_id) {
         let Ok(contents) = std::fs::read_to_string(dir.join("session.jsonl")) else {
-            append_external_context_trace_replay_entries(
-                &dir,
-                session_id,
-                &mut seen,
-                &mut snapshot_entries,
-            );
+            if seen.is_empty() {
+                append_external_context_trace_replay_entries(
+                    &dir,
+                    session_id,
+                    &mut seen,
+                    &mut snapshot_entries,
+                );
+            }
             continue;
         };
-        for entry in replay_jsonl_to_outbound_entries(&contents, &dir) {
+        let external_replay_session_id = external_backend_session_id_from_replay(&contents);
+        let wrapper_replay_session_id = replay_session_id_from_dir(&dir);
+        let replay_session_id = external_replay_session_id
+            .clone()
+            .or_else(|| wrapper_replay_session_id.clone());
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if entry_json.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+                continue;
+            }
+            let Some(entry) = context_snapshot_replay_entry_from_log_entry(
+                &entry_json,
+                &dir,
+                replay_session_id.as_deref(),
+                external_replay_session_id.as_deref(),
+                wrapper_replay_session_id.as_deref(),
+            ) else {
+                continue;
+            };
             if entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
                 continue;
             }
@@ -6146,12 +6233,14 @@ fn append_external_context_snapshot_replay_entries(
                 snapshot_entries.push(entry);
             }
         }
-        append_external_context_trace_replay_entries(
-            &dir,
-            session_id,
-            &mut seen,
-            &mut snapshot_entries,
-        );
+        if seen.is_empty() {
+            append_external_context_trace_replay_entries(
+                &dir,
+                session_id,
+                &mut seen,
+                &mut snapshot_entries,
+            );
+        }
     }
     snapshot_entries.sort_by_key(context_snapshot_replay_entry_sort_key);
     entries.extend(snapshot_entries);
@@ -6241,7 +6330,7 @@ fn append_external_context_trace_replay_entries(
     let Ok(snapshots) = crate::external_agent::codex::context_snapshots_from_trace_archive(
         &trace_root,
         session_id,
-        true,
+        false,
     ) else {
         return;
     };
@@ -23934,6 +24023,54 @@ mod tests {
     }
 
     #[test]
+    fn session_detail_omits_oversized_latest_context_snapshot_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("oversized-detail-session");
+        let oversized = "z".repeat(CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES as usize + 16_384);
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(1_000),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "instructions": oversized,
+                "input": [{"role": "user", "content": "open session detail"}]
+            }),
+        );
+        drop(log);
+
+        let detail = get_session_detail_from_home(dir.path(), "oversized-detail-session");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let context = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("context snapshot should be present");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/raw_omitted"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            context.pointer("/raw/summary/raw_omitted"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(context
+            .get("snapshot_file")
+            .and_then(|v| v.as_str())
+            .is_some_and(|file| file.contains("_context_")));
+    }
+
+    #[test]
     fn session_context_snapshot_endpoint_loads_exact_raw_on_demand() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir
@@ -24214,6 +24351,95 @@ mod tests {
                 .get("preview")
                 .and_then(|v| v.as_str())
                 .is_some_and(|preview| preview.contains("show context")))));
+    }
+
+    #[test]
+    fn external_activity_replay_omits_oversized_persisted_context_snapshot_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-context-replay-large";
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "show large context" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let oversized = "large-context-sentinel "
+            .repeat((CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES as usize / 23) + 4096);
+        let wrapper_log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-session");
+        let mut log = crate::session_log::SessionLog::open(wrapper_log_dir).unwrap();
+        log.context_snapshot_for_session(
+            Some(session_id),
+            "codex",
+            "Codex resolved request payload",
+            Some("req-context-large"),
+            Some(1),
+            Some(4),
+            "openai.responses.resolved_request.v1",
+            Some(1200),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "_intendant_context": {
+                    "thread_id": session_id,
+                    "request_id": "req-context-large",
+                    "request_index": 1
+                },
+                "input": [{"role": "user", "content": oversized}]
+            }),
+        );
+        drop(log);
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        assert!(
+            !replay.contains("large-context-sentinel large-context-sentinel"),
+            "external attach replay should not inline oversized raw context"
+        );
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let context = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("persisted context snapshot should replay with external transcript");
+        assert_eq!(context["session_id"], session_id);
+        assert_eq!(context["request_id"], "req-context-large");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/raw_omitted"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(context["exact_replay_available"], true);
+        assert!(context
+            .get("snapshot_file")
+            .and_then(|v| v.as_str())
+            .is_some_and(|file| file.contains("_context_")));
     }
 
     #[test]
