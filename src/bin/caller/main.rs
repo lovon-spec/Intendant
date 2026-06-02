@@ -2760,6 +2760,18 @@ fn managed_context_user_kickstart_is_trivial(text: &str) -> bool {
     )
 }
 
+fn managed_context_drop_original_for_recovery(
+    text: &str,
+    has_attachments: bool,
+    has_steer_id: bool,
+    is_user_turn_edit: bool,
+) -> bool {
+    !has_attachments
+        && !has_steer_id
+        && !is_user_turn_edit
+        && managed_context_user_kickstart_is_trivial(text)
+}
+
 const MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND: u8 = 2;
 
 fn managed_context_recovery_kickstart_text(
@@ -8052,6 +8064,18 @@ mod tests {
         assert!(!managed_context_user_kickstart_is_trivial(""));
         assert!(!managed_context_user_kickstart_is_trivial(
             "continue, but use the station prototype"
+        ));
+        assert!(managed_context_drop_original_for_recovery(
+            "continue", false, false, false
+        ));
+        assert!(!managed_context_drop_original_for_recovery(
+            "continue", false, false, true
+        ));
+        assert!(!managed_context_drop_original_for_recovery(
+            "continue", true, false, false
+        ));
+        assert!(!managed_context_drop_original_for_recovery(
+            "continue", false, true, false
         ));
     }
 
@@ -15327,14 +15351,16 @@ async fn run_external_agent_mode(
         if backend == external_agent::AgentBackend::Codex
             && project::codex_managed_context_enabled(&project.config.agent.codex.managed_context)
             && !managed_context_recovery_kickstart
-            && edit_user_turn_index.is_none()
         {
             match agent.context_snapshot().await {
                 Ok(Some(snapshot)) => {
                     if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot) {
-                        let drop_original = attachments.is_empty()
-                            && steer_id.is_none()
-                            && managed_context_user_kickstart_is_trivial(&turn_text);
+                        let drop_original = managed_context_drop_original_for_recovery(
+                            &turn_text,
+                            !attachments.is_empty(),
+                            steer_id.is_some(),
+                            edit_user_turn_index.is_some(),
+                        );
                         let held_user_input = !drop_original;
                         if held_user_input {
                             pending_managed_context_replays.push_back(FollowUpMessage {
@@ -15794,25 +15820,6 @@ async fn run_external_agent_mode(
                 turns_in_round,
             } => {
                 stats.rounds = round;
-
-                record_external_done_and_round_inline(
-                    &session_log,
-                    persist_model_responses_inline,
-                    live_session_id.as_deref(),
-                    message.as_deref(),
-                    round,
-                    turns_in_round,
-                );
-                bus.send(AppEvent::DoneSignal {
-                    session_id: live_session_id.clone(),
-                    message: message.clone(),
-                });
-                bus.send(AppEvent::RoundComplete {
-                    session_id: live_session_id.clone(),
-                    round,
-                    turns_in_round,
-                    native_message_count: None,
-                });
                 if backend == external_agent::AgentBackend::Codex
                     && project::codex_managed_context_enabled(
                         &project.config.agent.codex.managed_context,
@@ -15857,10 +15864,23 @@ async fn run_external_agent_mode(
                                         ),
                                         turn: None,
                                     });
+                                    record_external_round_inline(
+                                        &session_log,
+                                        persist_model_responses_inline,
+                                        round,
+                                        turns_in_round,
+                                    );
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: live_session_id.clone(),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
                                     next_turn = Some(
                                         FollowUpMessage::text(recovery_text)
                                             .managed_context_recovery_kickstart(),
                                     );
+                                    continue 'outer;
                                 } else {
                                     let message = format!(
                                         "Managed-context recovery completed without rewind_context while context remains above the rewind-only threshold ({}/{} tokens); refusing to send normal follow-ups.",
@@ -15868,7 +15888,20 @@ async fn run_external_agent_mode(
                                         pressure.rewind_only_limit
                                     );
                                     slog(&session_log, |l| l.warn(&message));
+                                    record_external_round_inline(
+                                        &session_log,
+                                        persist_model_responses_inline,
+                                        round,
+                                        turns_in_round,
+                                    );
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: live_session_id.clone(),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
                                     bus.send(AppEvent::LoopError(message));
+                                    break;
                                 }
                             } else {
                                 managed_context_recovery_kickstarts_without_rewind = 0;
@@ -15878,7 +15911,20 @@ async fn run_external_agent_mode(
                                             "Managed-context pressure cleared without a context rewind; replaying held follow-up",
                                         )
                                     });
+                                    record_external_round_inline(
+                                        &session_log,
+                                        persist_model_responses_inline,
+                                        round,
+                                        turns_in_round,
+                                    );
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: live_session_id.clone(),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
                                     next_turn = Some(replay);
+                                    continue 'outer;
                                 }
                             }
                         }
@@ -15888,7 +15934,20 @@ async fn run_external_agent_mode(
                             {
                                 let message = "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read; refusing to send normal follow-ups.".to_string();
                                 slog(&session_log, |l| l.warn(&message));
+                                record_external_round_inline(
+                                    &session_log,
+                                    persist_model_responses_inline,
+                                    round,
+                                    turns_in_round,
+                                );
+                                bus.send(AppEvent::RoundComplete {
+                                    session_id: live_session_id.clone(),
+                                    round,
+                                    turns_in_round,
+                                    native_message_count: None,
+                                });
                                 bus.send(AppEvent::LoopError(message));
+                                break;
                             }
                         }
                         Err(e) => {
@@ -15900,7 +15959,20 @@ async fn run_external_agent_mode(
                                     e
                                 );
                                 slog(&session_log, |l| l.warn(&message));
+                                record_external_round_inline(
+                                    &session_log,
+                                    persist_model_responses_inline,
+                                    round,
+                                    turns_in_round,
+                                );
+                                bus.send(AppEvent::RoundComplete {
+                                    session_id: live_session_id.clone(),
+                                    round,
+                                    turns_in_round,
+                                    native_message_count: None,
+                                });
                                 bus.send(AppEvent::LoopError(message));
+                                break;
                             } else {
                                 slog(&session_log, |l| {
                                     l.debug(&format!(
@@ -15912,6 +15984,25 @@ async fn run_external_agent_mode(
                         }
                     }
                 }
+
+                record_external_done_and_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    live_session_id.as_deref(),
+                    message.as_deref(),
+                    round,
+                    turns_in_round,
+                );
+                bus.send(AppEvent::DoneSignal {
+                    session_id: live_session_id.clone(),
+                    message: message.clone(),
+                });
+                bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
+                    round,
+                    turns_in_round,
+                    native_message_count: None,
+                });
             }
             DrainOutcome::ContextRewindRequested {
                 request,
