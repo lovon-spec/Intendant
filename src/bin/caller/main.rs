@@ -2721,16 +2721,28 @@ fn external_context_snapshot_usage(
 fn managed_context_rewind_only_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
+    let pressure = managed_context_recovery_pressure(snapshot)?;
+    if pressure.used_tokens < pressure.rewind_only_limit {
+        return None;
+    }
+    Some(pressure)
+}
+
+fn managed_context_recovery_pressure(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<ManagedContextRewindOnlyPressure> {
     let used_tokens = snapshot.token_count?;
     let rewind_only_limit = snapshot.context_window?;
-    if rewind_only_limit == 0 || used_tokens < rewind_only_limit {
+    if rewind_only_limit == 0 {
         return None;
     }
     let hard_context_window = snapshot.hard_context_window;
     let status = if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
         "critical"
-    } else {
+    } else if used_tokens >= rewind_only_limit {
         "high"
+    } else {
+        "recovery_required"
     };
     Some(ManagedContextRewindOnlyPressure {
         used_tokens,
@@ -2770,6 +2782,20 @@ fn managed_context_recovery_kickstart_text(
         limit = pressure.rewind_only_limit,
         hard = hard,
         held = held,
+    )
+}
+
+fn managed_context_backend_recovery_kickstart_text(
+    message: &str,
+    recovery_hint: Option<&str>,
+) -> String {
+    let hint = recovery_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(|hint| format!(" Codex recovery hint: {hint}"))
+        .unwrap_or_default();
+    format!(
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors, using pagination/query as needed to inspect any valid anchor in the rollout. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
 }
 
@@ -7961,6 +7987,34 @@ mod tests {
     }
 
     #[test]
+    fn managed_context_recovery_pressure_includes_below_soft_recovery_required() {
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(253_741),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+
+        assert_eq!(
+            managed_context_recovery_pressure(&snapshot),
+            Some(ManagedContextRewindOnlyPressure {
+                used_tokens: 253_741,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+                status: "recovery_required",
+            })
+        );
+        assert_eq!(managed_context_rewind_only_pressure(&snapshot), None);
+    }
+
+    #[test]
     fn context_rewind_thread_id_candidates_prefers_session_then_alias() {
         assert_eq!(
             context_rewind_thread_id_candidates(Some("backend-thread"), Some("wrapper-session")),
@@ -8005,6 +8059,22 @@ mod tests {
         assert!(text.contains("holding the user's follow-up outside Codex history"));
         assert!(!text.contains("call_"));
         assert!(!text.contains("item_id `"));
+    }
+
+    #[test]
+    fn managed_context_backend_recovery_kickstart_requires_exact_rewind() {
+        let text = managed_context_backend_recovery_kickstart_text(
+            "Codex ran out of room",
+            Some("rewind context first"),
+        );
+
+        assert!(text.contains("backend recovery required"));
+        assert!(text.contains("Codex recovery hint: rewind context first"));
+        assert!(text.contains("list_rewind_anchors"));
+        assert!(text.contains("inspect_rewind_anchor"));
+        assert!(text.contains("rewind_context with one exact returned item_id"));
+        assert!(text.contains("Do not synthesize anchor ids"));
+        assert!(!text.contains("call_"));
     }
 
     #[test]
@@ -15894,6 +15964,70 @@ async fn run_external_agent_mode(
                 turns_in_round,
             } => {
                 stats.rounds = round;
+                if backend == external_agent::AgentBackend::Codex
+                    && project::codex_managed_context_enabled(
+                        &project.config.agent.codex.managed_context,
+                    )
+                {
+                    managed_context_recovery_kickstarts_without_rewind =
+                        managed_context_recovery_kickstarts_without_rewind.saturating_add(1);
+                    if managed_context_recovery_kickstarts_without_rewind
+                        < MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND
+                    {
+                        let pressure = match agent.context_snapshot().await {
+                            Ok(Some(snapshot)) => managed_context_recovery_pressure(&snapshot),
+                            Ok(None) => None,
+                            Err(e) => {
+                                slog(&session_log, |l| {
+                                    l.debug(&format!(
+                                        "Could not read Codex context snapshot after recovery-required outcome: {}",
+                                        e
+                                    ))
+                                });
+                                None
+                            }
+                        };
+                        let recovery_text = pressure
+                            .map(|pressure| {
+                                managed_context_recovery_kickstart_text(pressure, false)
+                            })
+                            .unwrap_or_else(|| {
+                                managed_context_backend_recovery_kickstart_text(
+                                    &message,
+                                    recovery_hint.as_deref(),
+                                )
+                            });
+                        slog(&session_log, |l| {
+                            l.warn(&format!(
+                                "Managed Codex reported recovery required; sending managed-context recovery kickstart instead of ending the session"
+                            ))
+                        });
+                        record_external_round_inline(
+                            &session_log,
+                            persist_model_responses_inline,
+                            round,
+                            turns_in_round,
+                        );
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: live_session_id.clone(),
+                            round,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "warn".to_string(),
+                            source: "Intendant".to_string(),
+                            content: "Managed Codex reported recovery required; sending a managed-context rewind kickstart instead of ending the session.".to_string(),
+                            turn: None,
+                        });
+                        next_turn = Some(
+                            FollowUpMessage::text(recovery_text)
+                                .managed_context_recovery_kickstart(),
+                        );
+                        continue 'outer;
+                    }
+                }
                 slog(&session_log, |l| {
                     l.warn(&recovery_required_message(
                         &message,
