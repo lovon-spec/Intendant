@@ -5044,6 +5044,7 @@ body.context-focus-active {
   z-index: 1000;
 }
 .modal-dialog {
+  position: relative;
   background: var(--base);
   border: 1px solid var(--surface1);
   border-radius: 8px;
@@ -5059,7 +5060,22 @@ body.context-focus-active {
 .modal-dialog h3 {
   margin: 0 0 12px;
   color: var(--text);
+  padding-right: 32px;
 }
+.modal-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  cursor: pointer;
+  line-height: 1;
+}
+.modal-close:hover { color: var(--text); border-color: var(--overlay0); }
 .modal-description { color: var(--subtext0); margin-bottom: 12px; }
 .modal-checkbox {
   display: block;
@@ -5130,9 +5146,10 @@ body.context-focus-active {
 }
 .modal-cancel { background: var(--surface1); color: var(--text); }
 .modal-confirm { background: var(--blue); color: var(--base); }
+.modal-confirm.secondary { background: var(--green); color: var(--base); }
 .modal-confirm.danger { background: var(--red); color: var(--base); }
 .modal-confirm.hidden { display: none; }
-.modal-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
+.modal-cancel:disabled, .modal-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
 .fs-picker-dialog {
   width: min(720px, calc(100vw - 32px));
   max-width: 720px;
@@ -9276,6 +9293,7 @@ body.display-fullscreen-open {
 
 <div id="session-config-modal" class="modal-backdrop" style="display:none">
   <div class="modal-dialog session-config-dialog">
+    <button class="modal-close" type="button" title="Close" onclick="closeSessionConfigModal()">x</button>
     <h3 id="session-config-title">Session launch config</h3>
     <p class="modal-description" id="session-config-description">
       These settings are stored on this session and are used when it is next attached or resumed.
@@ -9313,7 +9331,8 @@ body.display-fullscreen-open {
     <div class="session-config-status" id="session-config-status"></div>
     <div class="modal-actions">
       <button class="modal-cancel" type="button" onclick="closeSessionConfigModal()">Cancel</button>
-      <button class="modal-confirm" type="button" id="session-config-save" onclick="saveSessionConfigModal()">Save config</button>
+      <button class="modal-confirm secondary" type="button" id="session-config-save-restart" onclick="saveSessionConfigModal({ restart: true })">Save & restart</button>
+      <button class="modal-confirm" type="button" id="session-config-save" onclick="saveSessionConfigModal()">Save</button>
     </div>
   </div>
 </div>
@@ -10260,6 +10279,9 @@ async function main() {
       }
       if (d.event === 'session_goal') {
         applySessionGoal(d);
+      }
+      if (d.event === 'session_agent_config_result') {
+        handleSessionConfigResult(d);
       }
       if (d.event === 'follow_up_status') {
         handleFollowUpStatusUpdate(d);
@@ -11745,6 +11767,7 @@ let newSessionSpawnRecent = null;
 let newSessionSpawnRecentTimeout = null;
 let sessionRenameEditing = null;
 let sessionConfigEditing = null;
+let sessionConfigSavePending = null;
 let sessionDeletePending = null;
 const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
 const NEW_SESSION_LAUNCH_FAILURE_GRACE_MS = 15000;
@@ -16387,8 +16410,13 @@ function openSessionConfigModal(sessionOrId) {
     backendSessionId: String(meta.backendSessionId || meta.backend_session_id || '').trim(),
     intendantSessionId: String(meta.intendantSessionId || meta.intendant_session_id || '').trim(),
   };
+  setSessionConfigSaving(false);
   const title = document.getElementById('session-config-title');
   if (title) title.textContent = `${prettyAgentName(source)} launch config`;
+  const description = document.getElementById('session-config-description');
+  if (description) {
+    description.textContent = 'Save changes for future attaches, or save and immediately restart this external backend with the new binary and mode.';
+  }
   const sessionInput = document.getElementById('session-config-session');
   if (sessionInput) {
     sessionInput.value = sid;
@@ -16415,8 +16443,8 @@ function openSessionConfigModal(sessionOrId) {
   if (status) {
     status.className = 'session-config-status';
     status.textContent = source === 'codex'
-      ? 'Managed requires a patched Codex binary. Changes apply the next time this session is attached or resumed.'
-      : 'Changes apply the next time this session is attached or resumed.';
+      ? 'Managed requires a patched Codex binary. Save & restart applies changes now.'
+      : 'Save & restart applies changes now.';
   }
   const modal = document.getElementById('session-config-modal');
   if (modal) modal.style.display = 'flex';
@@ -16424,9 +16452,73 @@ function openSessionConfigModal(sessionOrId) {
 }
 
 function closeSessionConfigModal() {
+  if (sessionConfigSavePending?.timeoutHandle) {
+    clearTimeout(sessionConfigSavePending.timeoutHandle);
+  }
+  sessionConfigSavePending = null;
+  setSessionConfigSaving(false);
   const modal = document.getElementById('session-config-modal');
   if (modal) modal.style.display = 'none';
   sessionConfigEditing = null;
+}
+
+function setSessionConfigSaving(saving) {
+  for (const id of ['session-config-save', 'session-config-save-restart']) {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = !!saving;
+  }
+}
+
+function sessionConfigResultMatchesPending(result, pending) {
+  if (!result || !pending) return false;
+  const resultIds = new Set([
+    result.session_id,
+    result.sessionId,
+    result.backend_session_id,
+    result.backendSessionId,
+    result.intendant_session_id,
+    result.intendantSessionId,
+    ...(Array.isArray(result.persisted_session_ids) ? result.persisted_session_ids : []),
+  ].map(id => String(id || '').trim()).filter(Boolean));
+  return pending.ids.some(id => resultIds.has(id));
+}
+
+function handleSessionConfigResult(result) {
+  const pending = sessionConfigSavePending;
+  if (!sessionConfigResultMatchesPending(result, pending)) return;
+  if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
+  sessionConfigSavePending = null;
+  setSessionConfigSaving(false);
+  const status = document.getElementById('session-config-status');
+  const ok = result.success !== false;
+  const message = String(result.message || (ok ? 'Session launch config saved' : 'Session launch config failed'));
+  if (!ok) {
+    if (status) {
+      status.className = 'session-config-status error';
+      status.textContent = message;
+    }
+    showControlToast('error', message);
+    return;
+  }
+
+  const persisted = Array.isArray(result.persisted_session_ids) ? result.persisted_session_ids : [];
+  const expectedBackend = String(pending.backendSessionId || '').trim();
+  const missingBackend = expectedBackend && !persisted.some(id => String(id || '').trim() === expectedBackend);
+  if (missingBackend && status) {
+    status.className = 'session-config-status error';
+    status.textContent = `Saved, but the backend thread id ${shortSessionId(expectedBackend)} was not confirmed.`;
+  }
+  if (missingBackend) {
+    showControlToast('error', `Launch config saved without backend id ${shortSessionId(expectedBackend)}`);
+    return;
+  }
+
+  applySessionConfigLocal(pending.meta, pending.command, pending.mode, pending.archiveMode);
+  scheduleSessionsMetadataRefresh(200);
+  showControlToast('success', pending.restart ? 'Launch config saved; restarting session' : 'Launch config saved');
+  const restartSessionId = pending.meta.sessionId;
+  closeSessionConfigModal();
+  if (pending.restart) restartSessionWindowAction(restartSessionId);
 }
 
 function applySessionConfigLocal(meta, command, mode, archiveMode) {
@@ -16476,7 +16568,7 @@ function applySessionConfigLocal(meta, command, mode, archiveMode) {
   persistSessionWindowState();
 }
 
-function saveSessionConfigModal() {
+function saveSessionConfigModal(options = {}) {
   if (!sessionConfigEditing || !app) return;
   const command = document.getElementById('session-config-command')?.value.trim() || '';
   const mode = document.getElementById('session-config-managed-context')?.value === 'managed'
@@ -16498,16 +16590,50 @@ function saveSessionConfigModal() {
     } : {}),
   };
   try {
-    dispatchControlMsg(payload);
-    applySessionConfigLocal(sessionConfigEditing, command, mode, archiveMode);
-    scheduleSessionsMetadataRefresh(200);
+    if (sessionConfigSavePending?.timeoutHandle) {
+      clearTimeout(sessionConfigSavePending.timeoutHandle);
+    }
+    const ids = Array.from(new Set([
+      sessionConfigEditing.sessionId,
+      sessionConfigEditing.backendSessionId,
+      sessionConfigEditing.intendantSessionId,
+    ].map(id => String(id || '').trim()).filter(Boolean)));
+    sessionConfigSavePending = {
+      ids,
+      sessionId: sessionConfigEditing.sessionId,
+      backendSessionId: sessionConfigEditing.backendSessionId,
+      intendantSessionId: sessionConfigEditing.intendantSessionId,
+      meta: { ...sessionConfigEditing },
+      command,
+      mode,
+      archiveMode,
+      restart: options.restart === true,
+      timeoutHandle: setTimeout(() => {
+        const pending = sessionConfigSavePending;
+        if (!pending || pending.sessionId !== sessionConfigEditing?.sessionId) return;
+        sessionConfigSavePending = null;
+        setSessionConfigSaving(false);
+        const status = document.getElementById('session-config-status');
+        if (status) {
+          status.className = 'session-config-status error';
+          status.textContent = 'Save timed out before the daemon confirmed the launch config.';
+        }
+        showControlToast('error', 'Launch config save timed out');
+      }, 15000),
+    };
+    setSessionConfigSaving(true);
     const status = document.getElementById('session-config-status');
     if (status) {
-      status.className = 'session-config-status ok';
-      status.textContent = 'Saved for the next launch. Restart the live session to apply it now.';
+      status.className = 'session-config-status';
+      status.textContent = options.restart === true ? 'Saving launch config before restart...' : 'Saving launch config...';
     }
-    showControlToast('success', 'Session launch config saved');
+    dispatchControlMsg(payload);
   } catch (e) {
+    if (sessionConfigSavePending?.timeoutHandle) {
+      clearTimeout(sessionConfigSavePending.timeoutHandle);
+    }
+    sessionConfigSavePending = null;
+    setSessionConfigSaving(false);
     const status = document.getElementById('session-config-status');
     if (status) {
       status.className = 'session-config-status error';

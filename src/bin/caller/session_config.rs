@@ -340,8 +340,8 @@ pub fn load_for_resume(
 ) -> Option<SessionAgentConfig> {
     let source = crate::session_names::normalize_source(source);
     let ids = [
-        Some(session_id.trim()).filter(|id| !id.is_empty()),
         resume_id.map(str::trim).filter(|id| !id.is_empty()),
+        Some(session_id.trim()).filter(|id| !id.is_empty()),
     ];
 
     let mut found = SessionAgentConfig::default();
@@ -586,6 +586,36 @@ mod tests {
         write_external_overlay(home.path(), "codex", "thread-1", &cfg).unwrap();
         let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
         assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn resume_prefers_backend_overlay_over_stale_wrapper_overlay() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_wrapper = from_wire(
+            Some("codex"),
+            Some("/tmp/stale-wrapper-codex"),
+            Some("managed"),
+            Some("summary"),
+            None,
+        );
+        let backend = from_wire(
+            Some("codex"),
+            Some("/tmp/backend-codex"),
+            Some("managed"),
+            Some("summary"),
+            None,
+        );
+        write_external_overlay(home.path(), "codex", "wrapper-id", &stale_wrapper).unwrap();
+        write_external_overlay(home.path(), "codex", "backend-thread", &backend).unwrap();
+
+        let loaded = load_for_resume(
+            home.path(),
+            "codex",
+            "wrapper-id",
+            Some("backend-thread"),
+        )
+        .unwrap();
+        assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/backend-codex"));
     }
 
     #[test]

@@ -354,6 +354,18 @@ pub enum OutboundEvent {
         success: bool,
         message: String,
     },
+    SessionAgentConfigResult {
+        session_id: String,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intendant_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        persisted_session_ids: Vec<String>,
+        success: bool,
+        message: String,
+    },
     CodexConfigChanged {
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<String>,

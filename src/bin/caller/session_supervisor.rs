@@ -2410,7 +2410,17 @@ impl SessionSupervisor {
             .map(|source| crate::session_names::normalize_source(&source))
             .unwrap_or_default();
         let Some(backend) = external_agent::AgentBackend::from_str_loose(&normalized_source) else {
-            self.loop_error("Session config failed: choose an external agent session".to_string());
+            let message = "Session config failed: choose an external agent session".to_string();
+            self.config.bus.send(AppEvent::SessionAgentConfigResult {
+                session_id,
+                source: normalized_source,
+                backend_session_id,
+                intendant_session_id,
+                persisted_session_ids: Vec::new(),
+                success: false,
+                message: message.clone(),
+            });
+            self.loop_error(message);
             return;
         };
         let config = crate::session_config::from_wire(
@@ -2421,14 +2431,33 @@ impl SessionSupervisor {
             None,
         );
         if config.is_empty() {
-            self.loop_error("Session config failed: no launch settings supplied".to_string());
+            let message = "Session config failed: no launch settings supplied".to_string();
+            self.config.bus.send(AppEvent::SessionAgentConfigResult {
+                session_id,
+                source: backend.as_short_str().to_string(),
+                backend_session_id,
+                intendant_session_id,
+                persisted_session_ids: Vec::new(),
+                success: false,
+                message: message.clone(),
+            });
+            self.loop_error(message);
             return;
         }
 
         let mut errors = Vec::new();
-        if let Some((_, _, session_dir)) = managed.as_ref() {
+        let mut persisted_session_ids = Vec::new();
+        let mut note_persisted = |id: &str| {
+            let id = id.trim();
+            if !id.is_empty() && !persisted_session_ids.iter().any(|existing| existing == id) {
+                persisted_session_ids.push(id.to_string());
+            }
+        };
+        if let Some((managed_id, _, session_dir)) = managed.as_ref() {
             if let Err(e) = crate::session_config::write_log_dir_config(session_dir, &config) {
                 errors.push(e);
+            } else {
+                note_persisted(managed_id);
             }
         }
         let intendant_id = intendant_session_id
@@ -2439,6 +2468,8 @@ impl SessionSupervisor {
             if let Some(dir) = session_log::SessionLog::find_session_by_id(intendant_id) {
                 if let Err(e) = crate::session_config::write_log_dir_config(&dir, &config) {
                     errors.push(e);
+                } else {
+                    note_persisted(intendant_id);
                 }
             }
         }
@@ -2470,24 +2501,56 @@ impl SessionSupervisor {
                 &config,
             ) {
                 errors.push(e);
+            } else {
+                note_persisted(external_id);
             }
         }
 
         if !wrote_external && managed.is_none() && intendant_id.is_none() {
-            self.loop_error("Session config failed: no persistable session id".to_string());
+            let message = "Session config failed: no persistable session id".to_string();
+            self.config.bus.send(AppEvent::SessionAgentConfigResult {
+                session_id,
+                source: backend.as_short_str().to_string(),
+                backend_session_id,
+                intendant_session_id,
+                persisted_session_ids,
+                success: false,
+                message: message.clone(),
+            });
+            self.loop_error(message);
             return;
         }
         if errors.is_empty() {
-            self.info(&format!(
+            let message = format!(
                 "Session {} launch config saved for {} (takes effect on next attach/resume)",
                 short_session(&session_id),
                 backend.as_short_str()
-            ));
+            );
+            self.info(&message);
+            self.config.bus.send(AppEvent::SessionAgentConfigResult {
+                session_id,
+                source: backend.as_short_str().to_string(),
+                backend_session_id,
+                intendant_session_id,
+                persisted_session_ids,
+                success: true,
+                message,
+            });
         } else {
-            self.loop_error(format!(
+            let message = format!(
                 "Session config partially failed: {}",
                 errors.join("; ")
-            ));
+            );
+            self.config.bus.send(AppEvent::SessionAgentConfigResult {
+                session_id,
+                source: backend.as_short_str().to_string(),
+                backend_session_id,
+                intendant_session_id,
+                persisted_session_ids,
+                success: false,
+                message: message.clone(),
+            });
+            self.loop_error(message);
         }
     }
 

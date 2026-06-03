@@ -115,10 +115,14 @@ A browser of past and current sessions. Four subtabs:
   `managed_context` mode (`vanilla` or `managed`) for that session.
 
 External-agent session cards and Activity windows also expose **Launch config**
-for per-session binary and managed-context settings. These settings are stored
-with the Intendant wrapper session and, for canonical backend session IDs, in an
+for per-session binary and managed-context settings. Use **Save** to update the
+next attach/resume, or **Save & restart** to apply the new binary/mode
+immediately to that external backend. These settings are stored with the
+Intendant wrapper session and, for canonical backend session IDs, in an
 external-session overlay. They are used on the next attach/resume so a daemon
 restart or page refresh does not fall back to the current global Settings pane.
+The separate **Restart with saved config** action is a power-user shortcut for
+reapplying settings that were already persisted elsewhere.
 The Managed activity view exposes rewind anchors, saved records, restore, and
 fork/backout actions. With the patched managed Codex binary, fork/backout starts
 a new Codex thread while inheriting the saved rollout's lineage prompt-cache key;

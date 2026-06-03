@@ -651,6 +651,19 @@ pub enum AppEvent {
         message: String,
     },
 
+    /// Emitted after a per-session external-agent launch config save is
+    /// persisted or rejected. The dashboard waits for this before closing the
+    /// launch-config modal so a failed/partial write cannot look successful.
+    SessionAgentConfigResult {
+        session_id: String,
+        source: String,
+        backend_session_id: Option<String>,
+        intendant_session_id: Option<String>,
+        persisted_session_ids: Vec<String>,
+        success: bool,
+        message: String,
+    },
+
     /// Emitted when one or more fields of the Codex runtime configuration
     /// change. Fields not included in the event are unchanged from the
     /// previous state. Broadcast by the control plane; consumed by the
@@ -2044,6 +2057,23 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             source: source.clone(),
             name: name.clone(),
+            success: *success,
+            message: message.clone(),
+        }),
+        AppEvent::SessionAgentConfigResult {
+            session_id,
+            source,
+            backend_session_id,
+            intendant_session_id,
+            persisted_session_ids,
+            success,
+            message,
+        } => Some(OutboundEvent::SessionAgentConfigResult {
+            session_id: session_id.clone(),
+            source: source.clone(),
+            backend_session_id: backend_session_id.clone(),
+            intendant_session_id: intendant_session_id.clone(),
+            persisted_session_ids: persisted_session_ids.clone(),
             success: *success,
             message: message.clone(),
         }),

@@ -2838,6 +2838,7 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionRenameResult { .. }
+                    | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::GeminiConfigChanged { .. }
                     | AppEvent::GeminiThreadActionRequested { .. }
                     | AppEvent::GeminiThreadActionResult { .. }
