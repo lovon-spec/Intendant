@@ -3218,6 +3218,7 @@ fn context_rewind_backout_mode(op: &str, params: &serde_json::Value) -> String {
     }
 }
 
+#[cfg(test)]
 fn context_rewind_allows_cache_reset(params: &serde_json::Value) -> bool {
     [
         "allowCacheReset",
@@ -3369,7 +3370,7 @@ async fn apply_context_rewind_backout_action(
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
         return Ok(format!(
-            "context rewind record {record_id}: pre-rewind rollout copied from {source} to {}; restore uses same-thread Codex thread/restore when available; fork/backout still requires allow_cache_reset=true",
+            "context rewind record {record_id}: pre-rewind rollout copied from {source} to {}; restore uses same-thread Codex thread/restore when available; fork/backout creates a new Codex thread that inherits the lineage prompt-cache key when using the patched managed Codex binary",
             recovery_rollout_path.display()
         ));
     }
@@ -3408,11 +3409,6 @@ async fn apply_context_rewind_backout_action(
         return Ok(format!(
             "restored context rewind record {} into existing Codex thread {}",
             record_id, target_thread_id
-        ));
-    }
-    if !context_rewind_allows_cache_reset(params) {
-        return Err(format!(
-            "context rewind {mode} for record {record_id} would fork the saved rollout into a new Codex thread, which changes the prompt cache key. Use mode=restore for same-thread recovery, mode=inspect for a cache-safe record lookup, or retry with allow_cache_reset=true if a cache-reset fork is acceptable"
         ));
     }
     let default_name = if restore {
@@ -3464,7 +3460,7 @@ async fn apply_context_rewind_backout_action(
         }));
 
     Ok(format!(
-        "forked context rewind record {} with cache reset into thread {}",
+        "forked context rewind record {} with inherited lineage prompt-cache key into thread {}",
         record_id, child.thread_id
     ))
 }
@@ -8815,7 +8811,7 @@ mod tests {
     }
 
     #[test]
-    fn context_rewind_backout_cache_reset_requires_explicit_opt_in() {
+    fn context_rewind_backout_parses_legacy_cache_reset_aliases() {
         assert!(!context_rewind_allows_cache_reset(&serde_json::json!({})));
         assert!(!context_rewind_allows_cache_reset(&serde_json::json!({
             "allowCacheReset": false,

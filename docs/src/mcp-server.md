@@ -62,6 +62,10 @@ HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
 CLI for lazy discovery. `tool_profile=core` advertises only status, shared-view
 collaboration, and managed-context rewind/backout tools when managed context is
 enabled; omitting `tool_profile` keeps the historical full tool list.
+With the patched managed Codex binary, `rewind_backout mode="fork"` creates a
+new Codex thread while inheriting the lineage prompt-cache key from the saved
+rollout; same-thread `restore` remains available when the current thread should
+be rewritten in place.
 
 The CLI mirrors the broad surface without loading every schema into model
 context:

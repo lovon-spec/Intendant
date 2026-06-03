@@ -717,9 +717,9 @@ pub trait ExternalAgent: Send + Sync {
         ))
     }
 
-    /// Fork a backend thread from a persisted rollout path. For Codex this
-    /// creates a new thread id and therefore a new Responses prompt cache key;
-    /// callers must keep this behind an explicit cache-reset opt-in.
+    /// Fork a backend thread from a persisted rollout path. Patched managed
+    /// Codex creates a new thread id while inheriting the rollout's lineage
+    /// prompt-cache key.
     async fn fork_thread_from_rollout_path(
         &mut self,
         rollout_path: &Path,

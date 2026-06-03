@@ -230,7 +230,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 | `web_search` | bool | `false` | Enable the Responses-API `web_search` tool (`codex --search`) |
 | `network_access` | bool | `false` | Allow outbound network in `workspace-write` sandbox (ignored for `read-only` / `danger-full-access`) |
 | `writable_roots` | array | `[]` | Extra writable roots, each passed as `--add-dir` (absolute, or resolved against project root) |
-| `managed_context` | string | `vanilla` | `vanilla` for upstream/original-fork Codex; `managed` enables proactive Intendant context densification, rewind/backout tools, disables Codex auto-compaction, and requires the patched Codex app-server protocol |
+| `managed_context` | string | `vanilla` | `vanilla` for upstream/original-fork Codex; `managed` enables proactive Intendant context densification, rewind/backout tools, disables Codex auto-compaction, and requires the patched Codex app-server protocol with lineage prompt-cache-key support |
 
 `[agent.claude_code]`:
 

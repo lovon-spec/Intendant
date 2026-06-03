@@ -3921,13 +3921,13 @@ pub struct RewindBackoutParams {
     pub session_id: Option<String>,
     /// Context rewind record id returned by rewind_context.
     pub record_id: String,
-    /// Backout mode: "inspect" (default) returns the saved rollout path; "restore" restores the active Codex thread in place; "fork"/"backout" require allow_cache_reset=true because they create a new thread/cache key.
+    /// Backout mode: "inspect" (default) returns the saved rollout path; "restore" restores the active Codex thread in place; "fork"/"backout" create a new Codex thread that inherits the lineage prompt-cache key when the patched Codex binary is used.
     #[serde(default)]
     pub mode: Option<String>,
     /// Optional display name for the recovery fork.
     #[serde(default)]
     pub name: Option<String>,
-    /// Explicitly permit creating a new Codex thread from the saved rollout. This changes the Codex prompt cache key.
+    /// Legacy compatibility flag. Fork/backout no longer require this with the patched Codex lineage-cache-key support.
     #[serde(default)]
     pub allow_cache_reset: bool,
 }
@@ -5335,7 +5335,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Recover a prior context rewind record. mode=\"inspect\" reports the saved pre-rewind rollout path. mode=\"restore\" restores the active Codex thread in place. mode=\"fork\"/\"backout\" requires allow_cache_reset=true because it creates a new Codex thread and prompt cache key."
+        description = "Recover a prior context rewind record. mode=\"inspect\" reports the saved pre-rewind rollout path. mode=\"restore\" restores the active Codex thread in place. mode=\"fork\"/\"backout\" creates a new Codex thread that inherits the lineage prompt-cache key when using the patched managed Codex binary."
     )]
     async fn rewind_backout(&self, Parameters(params): Parameters<RewindBackoutParams>) -> String {
         let record_id = params.record_id.trim();
@@ -5351,9 +5351,6 @@ impl IntendantServer {
         if !matches!(mode, "inspect" | "fork" | "backout" | "restore") {
             return "rewind_backout mode must be `inspect`, `fork`, `backout`, or `restore`"
                 .to_string();
-        }
-        if matches!(mode, "fork" | "backout") && !params.allow_cache_reset {
-            return "rewind_backout would create a new Codex thread and prompt cache key; use mode=\"restore\" for same-thread recovery, mode=\"inspect\" for cache-safe lookup, or pass allow_cache_reset=true to permit the cache-reset fork".to_string();
         }
         let name = params
             .name
@@ -5379,7 +5376,7 @@ impl IntendantServer {
         } else if mode == "restore" {
             "ok (same-thread managed-context restore dispatched)".to_string()
         } else {
-            "ok (cache-reset managed-context fork dispatched)".to_string()
+            "ok (managed-context lineage fork dispatched)".to_string()
         };
         self.dispatch_codex_thread_action_and_wait(
             params.session_id.clone(),
@@ -8331,7 +8328,7 @@ mod tests {
     }
 
     #[test]
-    fn rewind_backout_fork_requires_cache_reset_opt_in_but_restore_does_not() {
+    fn rewind_backout_fork_dispatches_without_cache_reset_opt_in() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8339,7 +8336,12 @@ mod tests {
         rt.block_on(async {
             let bus = EventBus::new();
             let server = IntendantServer::new(test_state(), bus.clone());
-            let blocked = server
+            let result_task = spawn_codex_thread_action_result(
+                bus,
+                "rewind_backout",
+                "forked context rewind record rewind-1 with inherited lineage prompt-cache key into thread thread-2",
+            );
+            let forked = server
                 .rewind_backout(Parameters(RewindBackoutParams {
                     session_id: None,
                     record_id: "rewind-1".to_string(),
@@ -8348,25 +8350,9 @@ mod tests {
                     allow_cache_reset: false,
                 }))
                 .await;
-            assert!(blocked.contains("new Codex thread and prompt cache key"));
-
-            let result_task = spawn_codex_thread_action_result(
-                bus,
-                "rewind_backout",
-                "restored context rewind record rewind-1 into existing Codex thread thread-1",
-            );
-            let allowed = server
-                .rewind_backout(Parameters(RewindBackoutParams {
-                    session_id: None,
-                    record_id: "rewind-1".to_string(),
-                    mode: Some("restore".to_string()),
-                    name: None,
-                    allow_cache_reset: false,
-                }))
-                .await;
             assert_eq!(
-                allowed,
-                "restored context rewind record rewind-1 into existing Codex thread thread-1"
+                forked,
+                "forked context rewind record rewind-1 with inherited lineage prompt-cache key into thread thread-2"
             );
             result_task.await.unwrap();
         });

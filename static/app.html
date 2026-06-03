@@ -7967,10 +7967,6 @@ body.display-fullscreen-open {
                       <span>Fork name</span>
                       <input id="managed-context-backout-name" type="text" autocomplete="off" spellcheck="false">
                     </label>
-                    <label class="managed-context-inline full">
-                      <input id="managed-context-allow-cache-reset" type="checkbox">
-                      <span class="managed-context-muted">allow cache-reset fork</span>
-                    </label>
                   </div>
                   <pre class="managed-context-raw" id="managed-context-action-result">No action yet</pre>
                 </div>
@@ -13195,8 +13191,6 @@ function resetManagedContextSessionDraft() {
     const el = managedContextEl(id);
     if (el) el.value = '';
   });
-  const allowCacheReset = managedContextEl('managed-context-allow-cache-reset');
-  if (allowCacheReset) allowCacheReset.checked = false;
   const result = managedContextEl('managed-context-action-result');
   if (result) result.textContent = 'No action yet';
 }
@@ -13725,7 +13719,6 @@ async function submitManagedContextBackout() {
     session_id: sessionId,
     record_id: recordId,
     mode,
-    allow_cache_reset: !!managedContextEl('managed-context-allow-cache-reset')?.checked,
   };
   if (name) args.name = name;
   const result = managedContextEl('managed-context-action-result');

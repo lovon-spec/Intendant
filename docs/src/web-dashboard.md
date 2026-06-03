@@ -119,6 +119,10 @@ for per-session binary and managed-context settings. These settings are stored
 with the Intendant wrapper session and, for canonical backend session IDs, in an
 external-session overlay. They are used on the next attach/resume so a daemon
 restart or page refresh does not fall back to the current global Settings pane.
+The Managed activity view exposes rewind anchors, saved records, restore, and
+fork/backout actions. With the patched managed Codex binary, fork/backout starts
+a new Codex thread while inheriting the saved rollout's lineage prompt-cache key;
+there is no separate cache-reset opt-in in the dashboard.
 
 ### Debug
 

@@ -161,6 +161,13 @@ features they lack.
   candidate. `rewind_context` still validates the exact `item_id` against the
   current rollout before mutating the Codex thread.
 
+  Managed Codex relies on the minimal lineage patch separating Codex's thread id
+  from the Responses `prompt_cache_key`. Same-thread restore keeps the active
+  thread id. Fork/backout creates a new Codex thread id but inherits the rollout's
+  lineage prompt-cache key, so branch recovery is git-style without deliberately
+  resetting cache routing. The old `allow_cache_reset` flag is accepted only for
+  compatibility with older clients; it is not required for managed forks.
+
 - **Rich `thread_action` ops** (`codex.rs`): `compact`, `fast`, `fork`,
   `side`/`btw` (open a side conversation) and `side-close`, `review`,
   `goal`/`goal-set`/`goal-clear`/`goal-pause`/`goal-resume`/`goal-complete`, and
