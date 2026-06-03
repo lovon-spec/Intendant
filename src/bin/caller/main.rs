@@ -2206,6 +2206,12 @@ struct ContextRewindAnchorCatalogEntry {
     names: Vec<String>,
     roles: Vec<String>,
     summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_usage_at_or_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rewind_only_limit_at_or_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_eligible: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2218,6 +2224,7 @@ struct ContextRewindAnchorCatalog {
     next_offset: Option<usize>,
     query: Option<String>,
     include_management_tools: bool,
+    recovery_candidates_only: bool,
     anchors: Vec<ContextRewindAnchorCatalogEntry>,
     usage: &'static str,
 }
@@ -2249,6 +2256,13 @@ const CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS: usize = 5;
 const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
 const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
 
+#[derive(Debug, Clone, Copy)]
+struct ContextRewindBackendUsageAtLine {
+    line: usize,
+    used_tokens: u64,
+    rewind_only_limit: u64,
+}
+
 fn list_context_rewind_anchors_from_rollout(
     source_rollout_path: &Path,
     params: &serde_json::Value,
@@ -2276,6 +2290,16 @@ fn list_context_rewind_anchors_from_rollout(
         .or_else(|| params.get("includeManagementTools"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let recovery_candidates_only = params
+        .get("recovery_candidates_only")
+        .or_else(|| params.get("recoveryCandidatesOnly"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let include_non_recovery = params
+        .get("include_non_recovery")
+        .or_else(|| params.get("includeNonRecovery"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let reverse = params
         .get("reverse")
         .and_then(|value| value.as_bool())
@@ -2296,6 +2320,9 @@ fn list_context_rewind_anchors_from_rollout(
     let total = anchors.len();
     if !include_management_tools {
         anchors.retain(|anchor| !context_rewind_anchor_is_management_tool(anchor));
+    }
+    if recovery_candidates_only && !include_non_recovery {
+        anchors.retain(|anchor| anchor.recovery_eligible != Some(false));
     }
     if reverse {
         anchors.reverse();
@@ -2321,8 +2348,9 @@ fn list_context_rewind_anchors_from_rollout(
         next_offset,
         query,
         include_management_tools,
+        recovery_candidates_only: recovery_candidates_only && !include_non_recovery,
         anchors: page,
-        usage: "Choose any returned item_id exactly in rewind_context.anchor.item_id. By default this catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout; pass include_management_tools=true only when intentionally targeting those internal calls. Use inspect_rewind_anchor to inspect nearby context before mutating the thread when the compact summary is ambiguous. Use position=\"after\" to keep the matching item/group and drop later context, or position=\"before\" to drop the matching item/group too.",
+        usage: "Use item_id exactly in rewind_context.anchor.item_id. Management calls are hidden by default; set include_management_tools=true only for internals. During recovery, anchors known at/above the rewind-only limit are hidden unless include_non_recovery=true; absent recovery_eligible means no nearby backend usage sample. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too.",
     };
     serde_json::to_string(&catalog).map_err(|err| err.to_string())
 }
@@ -2423,12 +2451,17 @@ fn scan_context_rewind_anchor_catalog(
     let reader = io::BufReader::new(file);
     let mut anchors = Vec::<ContextRewindAnchorCatalogEntry>::new();
     let mut by_item_id = HashMap::<String, usize>::new();
+    let mut backend_usage = Vec::<ContextRewindBackendUsageAtLine>::new();
 
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        let line_number = line_index.saturating_add(1);
+        if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry) {
+            backend_usage.push(usage);
+        }
         if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
             continue;
         }
@@ -2443,7 +2476,6 @@ fn scan_context_rewind_anchor_catalog(
         let names = context_rewind_anchor_names(payload);
         let roles = context_rewind_anchor_roles(payload);
         let summary = context_rewind_anchor_summary(payload);
-        let line_number = line_index.saturating_add(1);
         for item_id in response_item_anchor_ids(payload) {
             if let Some(index) = by_item_id.get(&item_id).copied() {
                 let anchor = &mut anchors[index];
@@ -2477,11 +2509,60 @@ fn scan_context_rewind_anchor_catalog(
                 names: names.clone(),
                 roles: roles.clone(),
                 summary: summary.clone(),
+                backend_usage_at_or_after_anchor: None,
+                rewind_only_limit_at_or_after_anchor: None,
+                recovery_eligible: None,
             });
         }
     }
 
+    for anchor in &mut anchors {
+        let Some(usage) = backend_usage
+            .iter()
+            .find(|usage| usage.line >= anchor.last_line)
+            .copied()
+        else {
+            continue;
+        };
+        anchor.backend_usage_at_or_after_anchor = Some(usage.used_tokens);
+        anchor.rewind_only_limit_at_or_after_anchor = Some(usage.rewind_only_limit);
+        anchor.recovery_eligible = Some(usage.used_tokens < usage.rewind_only_limit);
+    }
+
     Ok(anchors)
+}
+
+fn context_rewind_backend_usage_from_rollout_entry(
+    line: usize,
+    entry: &serde_json::Value,
+) -> Option<ContextRewindBackendUsageAtLine> {
+    if entry.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+        return None;
+    }
+    let payload = entry.get("payload")?;
+    if payload.get("type").and_then(|value| value.as_str()) != Some("token_count") {
+        return None;
+    }
+    let info = payload.get("info")?;
+    let rewind_only_limit = info
+        .get("model_context_window")
+        .or_else(|| info.get("modelContextWindow"))?
+        .as_u64()?;
+    if rewind_only_limit == 0 {
+        return None;
+    }
+    let last = info
+        .get("last_token_usage")
+        .or_else(|| info.get("lastTokenUsage"))?;
+    let used_tokens = last
+        .get("total_tokens")
+        .or_else(|| last.get("totalTokens"))?
+        .as_u64()?;
+    Some(ContextRewindBackendUsageAtLine {
+        line,
+        used_tokens,
+        rewind_only_limit,
+    })
 }
 
 fn context_rewind_anchor_matches_query(
@@ -3080,7 +3161,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management anchor catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -3099,7 +3180,7 @@ fn managed_context_backend_recovery_kickstart_text(
         .map(|hint| format!(" Codex recovery hint: {hint}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management anchor catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
 }
 
@@ -9003,6 +9084,128 @@ mod tests {
             .filter_map(|anchor| anchor["item_id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["call_recovery_list", "call_launch_dashboard"]);
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_filters_known_non_recovery_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_below_soft",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": { "total_tokens": 900 },
+                            "model_context_window": 1000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_above_soft",
+                        "arguments": "{\"cmd\":\"rg noisy\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "lastTokenUsage": { "totalTokens": 1050 },
+                            "modelContextWindow": 1000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+            }),
+        )
+        .expect("full catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchors = catalog["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 2);
+        let below = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_below_soft")
+            .expect("below-soft anchor");
+        assert_eq!(
+            below["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(900)
+        );
+        assert_eq!(
+            below["rewind_only_limit_at_or_after_anchor"].as_u64(),
+            Some(1000)
+        );
+        assert_eq!(below["recovery_eligible"].as_bool(), Some(true));
+        let above = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_above_soft")
+            .expect("above-soft anchor");
+        assert_eq!(
+            above["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(1050)
+        );
+        assert_eq!(above["recovery_eligible"].as_bool(), Some(false));
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_below_soft"]);
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(1));
+        assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(true));
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["anchors"].as_array().unwrap().len(), 2);
+        assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(false));
     }
 
     #[test]

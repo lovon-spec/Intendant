@@ -484,7 +484,7 @@ impl McpAppState {
                     "used_tokens": notice.used_tokens,
                     "rewind_only_limit": notice.rewind_only_limit,
                     "context_window": notice.context_window,
-                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Call list_rewind_anchors to inspect the full valid anchor catalog, use inspect_rewind_anchor when the compact row is ambiguous, then choose an earlier exact item_id with a denser carry-forward primer before using ordinary tools.",
+                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Call list_rewind_anchors to inspect recovery candidates; pass include_non_recovery=true only to audit anchors known not to clear recovery. Use inspect_rewind_anchor when the compact row is ambiguous, then choose an earlier exact item_id with a denser carry-forward primer before using ordinary tools.",
                 })
             }),
         })
@@ -582,7 +582,7 @@ impl McpAppState {
         let (used_tokens, rewind_only_limit, status) =
             self.context_pressure_rewind_only_for(session_id)?;
         let mut message = format!(
-            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are available; any earlier transcript claim that either is unavailable is stale. Call list_rewind_anchors to inspect valid anchors, inspect a candidate if the compact row is ambiguous, then call rewind_context with an exact returned item_id and a dense carry-forward primer before using other tools. Do not synthesize anchor ids from prior failed tool calls."
+            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are available; any earlier transcript claim that either is unavailable is stale. Call list_rewind_anchors to inspect valid recovery candidates; pass include_non_recovery=true only to audit anchors known not to clear recovery. Inspect a candidate if the compact row is ambiguous, then call rewind_context with an exact returned item_id and a dense carry-forward primer before using other tools. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls."
         );
         if let Some(notice) = self.insufficient_rewind_notice_for(session_id) {
             message.push_str(&format!(
@@ -3902,6 +3902,13 @@ pub struct ListRewindAnchorsParams {
     /// Omit this during ordinary recovery so discovery does not target its own tool calls.
     #[serde(default, alias = "includeManagementTools")]
     pub include_management_tools: bool,
+    /// During recovery, prefer anchors whose nearby backend usage is below the rewind-only limit.
+    /// Omit to let Intendant enable this automatically while the session is in rewind-only pressure.
+    #[serde(default, alias = "recoveryCandidatesOnly")]
+    pub recovery_candidates_only: Option<bool>,
+    /// Include anchors known to still be at/above the rewind-only limit.
+    #[serde(default, alias = "includeNonRecovery")]
+    pub include_non_recovery: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -5263,17 +5270,28 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
+        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. During rewind-only recovery, Intendant defaults recovery_candidates_only=true, hiding anchors known to remain at/above the rewind-only limit unless include_non_recovery=true. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
     )]
     async fn list_rewind_anchors(
         &self,
         Parameters(params): Parameters<ListRewindAnchorsParams>,
     ) -> String {
+        let recovery_candidates_only = params.recovery_candidates_only.unwrap_or_else(|| {
+            self.state
+                .try_read()
+                .ok()
+                .and_then(|state| {
+                    state.context_pressure_rewind_only_for(params.session_id.as_deref())
+                })
+                .is_some()
+        });
         let mut payload = serde_json::json!({
             "offset": params.offset.unwrap_or(0),
             "limit": params.limit.unwrap_or(100),
             "reverse": params.reverse,
             "include_management_tools": params.include_management_tools,
+            "recovery_candidates_only": recovery_candidates_only,
+            "include_non_recovery": params.include_non_recovery,
         });
         if let Some(query) = params
             .query

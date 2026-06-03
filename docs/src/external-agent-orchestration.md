@@ -160,6 +160,13 @@ features they lack.
   ambiguous, `inspect_rewind_anchor` returns a small before/after window for the
   candidate. `rewind_context` still validates the exact `item_id` against the
   current rollout before mutating the Codex thread.
+  When backend-reported pressure is at or above the rewind-only threshold,
+  `list_rewind_anchors` defaults to recovery candidates: anchors whose nearest
+  following backend token report is below that threshold. Passing
+  `include_non_recovery=true` is an audit escape hatch, not the normal recovery
+  path. A successful `rewind_context` only proves the lineage mutation was
+  applied; Intendant and Codex keep normal tools hidden until a later backend
+  token report confirms the active thread is below the rewind-only limit.
 
   Managed Codex relies on the minimal lineage patch separating Codex's thread id
   from the Responses `prompt_cache_key`. Same-thread restore keeps the active
