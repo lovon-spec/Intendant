@@ -39,6 +39,11 @@ const SESSION_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from
 const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 const EXTERNAL_ATTACH_DEDUPE_WINDOW: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
 #[cfg(not(test))]
+const EDIT_ATTACH_ROUTE_TIMEOUT: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
+#[cfg(test)]
+const EDIT_ATTACH_ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+const EDIT_ATTACH_ROUTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(not(test))]
 const TEXT_STEER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
 const TEXT_STEER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
@@ -101,6 +106,16 @@ struct EditAttachRequest {
     resume_id: Option<String>,
     project_root: Option<String>,
     direct: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct EditUserMessageRequest {
+    requested_id: String,
+    user_turn_index: u32,
+    user_turn_revision: Option<u32>,
+    original_text: Option<String>,
+    text: String,
+    attachments: Vec<String>,
 }
 
 impl SupervisorState {
@@ -1720,8 +1735,16 @@ impl SessionSupervisor {
             requested_id
         };
 
-        let (mut target_id, mut entry, mut relation) =
-            self.lookup_edit_route_target(&requested_id).await;
+        let request = EditUserMessageRequest {
+            requested_id: requested_id.clone(),
+            user_turn_index,
+            user_turn_revision,
+            original_text,
+            text,
+            attachments,
+        };
+
+        let (target_id, entry, relation) = self.lookup_edit_route_target(&requested_id).await;
         if entry.is_none() {
             if let Some(attach) = edit_attach_request(source, resume_id, project_root, direct) {
                 let lookup_id = attach
@@ -1744,11 +1767,8 @@ impl SessionSupervisor {
                     false,
                 )
                 .await;
-                (target_id, entry, relation) = self.lookup_edit_route_target(&lookup_id).await;
-                if entry.is_none() && lookup_id != requested_id {
-                    (target_id, entry, relation) =
-                        self.lookup_edit_route_target(&requested_id).await;
-                }
+                self.queue_edit_user_message_after_attach(lookup_id, request);
+                return;
             }
         }
 
@@ -1759,6 +1779,64 @@ impl SessionSupervisor {
             ));
             return;
         };
+        self.deliver_edit_user_message(request, target, relation).await;
+    }
+
+    fn queue_edit_user_message_after_attach(
+        &self,
+        lookup_id: String,
+        request: EditUserMessageRequest,
+    ) {
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            let (target_id, entry, relation) = supervisor
+                .wait_for_edit_route_target(&lookup_id, Some(&request.requested_id))
+                .await;
+            let Some(target) = entry else {
+                supervisor.warn(&format!(
+                    "Edit dropped: session {} was not routable after attach",
+                    short_session(&target_id)
+                ));
+                return;
+            };
+            supervisor
+                .deliver_edit_user_message(request, target, relation)
+                .await;
+        });
+    }
+
+    async fn wait_for_edit_route_target(
+        &self,
+        primary_id: &str,
+        fallback_id: Option<&str>,
+    ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
+        let started_at = std::time::Instant::now();
+        loop {
+            let primary = self.lookup_edit_route_target(primary_id).await;
+            if primary.1.is_some() {
+                return primary;
+            }
+
+            if let Some(fallback_id) = fallback_id.filter(|id| *id != primary_id) {
+                let fallback = self.lookup_edit_route_target(fallback_id).await;
+                if fallback.1.is_some() {
+                    return fallback;
+                }
+            }
+
+            if started_at.elapsed() >= EDIT_ATTACH_ROUTE_TIMEOUT {
+                return primary;
+            }
+            tokio::time::sleep(EDIT_ATTACH_ROUTE_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn deliver_edit_user_message(
+        &self,
+        request: EditUserMessageRequest,
+        target: EditRouteTarget,
+        relation: Option<RelatedSession>,
+    ) {
         let Some(backend) = external_agent::AgentBackend::from_str_loose(&target.source) else {
             self.warn(&format!(
                 "Edit dropped: unknown external-agent source {} for session {}",
@@ -1775,7 +1853,7 @@ impl SessionSupervisor {
             ));
             return;
         }
-        if user_turn_index == 0 {
+        if request.user_turn_index == 0 {
             self.warn(&format!(
                 "Edit dropped: invalid user turn index 0 for {} session {}",
                 backend,
@@ -1783,24 +1861,28 @@ impl SessionSupervisor {
             ));
             return;
         }
-        let Some(user_turn_revision) = user_turn_revision else {
+        let Some(user_turn_revision) = request.user_turn_revision else {
             self.warn(&format!(
                 "Edit dropped: missing active-message revision for {} session {} user turn {}",
                 backend,
                 short_session(&target.managed_id),
-                user_turn_index
+                request.user_turn_index
             ));
             return;
         };
 
         let resolved_attachments = self
-            .resolve_session_attachments(&attachments, &target.session_dir, &target.project_root)
+            .resolve_session_attachments(
+                &request.attachments,
+                &target.session_dir,
+                &target.project_root,
+            )
             .await;
-        if resolved_attachments.len() < attachments.len() {
+        if resolved_attachments.len() < request.attachments.len() {
             self.warn(&format!(
                 "Only resolved {} of {} edit attachment(s) for {} session {}",
                 resolved_attachments.len(),
-                attachments.len(),
+                request.attachments.len(),
                 backend,
                 short_session(&target.managed_id)
             ));
@@ -1808,14 +1890,14 @@ impl SessionSupervisor {
         let target_session_id = relation
             .as_ref()
             .filter(|rel| matches!(rel.relationship.as_str(), "side" | "subagent"))
-            .map(|_| requested_id.clone());
+            .map(|_| request.requested_id.clone());
         let msg = FollowUpMessage::edit_user_message(
-            text,
+            request.text,
             UserAttachments::from_items(resolved_attachments),
-            user_turn_index,
+            request.user_turn_index,
             user_turn_revision,
-            original_text,
-            attachments,
+            request.original_text,
+            request.attachments,
         )
         .for_target(target_session_id);
         if target.follow_up_tx.send(msg).await.is_err() {
@@ -3951,6 +4033,58 @@ mod tests {
         assert_eq!(msg.edit_user_turn_index, Some(1));
         assert_eq!(msg.edit_user_turn_revision, Some(1));
         assert_eq!(msg.target_session_id.as_deref(), Some("side-thread"));
+    }
+
+    #[tokio::test]
+    async fn edit_queued_before_attach_delivers_after_session_identity() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        let (tx, mut rx) = mpsc::channel(1);
+
+        supervisor.queue_edit_user_message_after_attach(
+            "codex-thread".to_string(),
+            EditUserMessageRequest {
+                requested_id: "codex-thread".to_string(),
+                user_turn_index: 2,
+                user_turn_revision: Some(5),
+                original_text: Some("continue".to_string()),
+                text: "edited continue".to_string(),
+                attachments: Vec::new(),
+            },
+        );
+
+        tokio::time::sleep(EDIT_ATTACH_ROUTE_POLL_INTERVAL * 2).await;
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "wrapper-session".to_string(),
+                ManagedSession {
+                    session_id: "wrapper-session".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                },
+            );
+            state
+                .session_aliases
+                .insert("codex-thread".to_string(), "wrapper-session".to_string());
+        }
+
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+            .await
+            .expect("queued edit should be delivered after alias registration")
+            .expect("follow-up channel should stay open");
+        assert_eq!(msg.text, "edited continue");
+        assert_eq!(msg.edit_user_turn_index, Some(2));
+        assert_eq!(msg.edit_user_turn_revision, Some(5));
+        assert_eq!(msg.edit_original_text.as_deref(), Some("continue"));
+        assert_eq!(msg.target_session_id, None);
     }
 
     #[tokio::test]
