@@ -2768,6 +2768,37 @@ fn codex_usage_hard_context_window(value: &serde_json::Value) -> Option<u64> {
     )
 }
 
+fn codex_usage_preserving_hard_context_window(
+    mut usage: serde_json::Value,
+    previous: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(previous_hard) = previous.and_then(codex_usage_hard_context_window) else {
+        return usage;
+    };
+    if previous_hard == 0 {
+        return usage;
+    }
+
+    let context_window = codex_usage_context_window(&usage);
+    let should_preserve = match codex_usage_hard_context_window(&usage) {
+        Some(current_hard) if current_hard > 0 => context_window.is_some_and(|context_window| {
+            current_hard <= context_window && previous_hard > current_hard
+        }),
+        _ => true,
+    };
+    if !should_preserve {
+        return usage;
+    }
+
+    if let Some(object) = usage.as_object_mut() {
+        object.insert(
+            "model_hard_context_window".to_string(),
+            serde_json::Value::from(previous_hard),
+        );
+    }
+    usage
+}
+
 fn codex_usage_input_tokens(value: &serde_json::Value) -> Option<u64> {
     first_u64_at(value, &["/inputTokens", "/input_tokens"])
 }
@@ -3052,13 +3083,18 @@ async fn reader_task(
                 .get("tokenUsage")
                 .cloned()
                 .unwrap_or_else(|| params.clone());
-            let snapshot = codex_usage_snapshot(&usage, model.as_deref().unwrap_or("codex"));
             let usage_targets_active_thread = thread_id.as_deref().map_or(true, |thread_id| {
                 active_thread_snapshot.as_deref() == Some(thread_id)
             });
-            if usage_targets_active_thread {
-                *latest_token_usage.lock().await = Some(usage);
-            }
+            let usage = if usage_targets_active_thread {
+                let mut latest = latest_token_usage.lock().await;
+                let usage = codex_usage_preserving_hard_context_window(usage, latest.as_ref());
+                *latest = Some(usage.clone());
+                usage
+            } else {
+                usage
+            };
+            let snapshot = codex_usage_snapshot(&usage, model.as_deref().unwrap_or("codex"));
             if let Some(snapshot) = snapshot {
                 notification_state.latest_usage = Some(snapshot.clone());
                 send_scoped_agent_event(
@@ -4514,7 +4550,10 @@ impl ExternalAgent for CodexAgent {
             if let Some(rollout_path) = rollout_path {
                 match latest_codex_token_usage_from_rollout(&rollout_path).await {
                     Ok(Some(usage)) => {
-                        *self.latest_token_usage.lock().await = Some(usage);
+                        let mut latest = self.latest_token_usage.lock().await;
+                        let usage =
+                            codex_usage_preserving_hard_context_window(usage, latest.as_ref());
+                        *latest = Some(usage);
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -5612,6 +5651,49 @@ mod tests {
         assert_eq!(snapshot.completion_tokens, 200);
         assert_eq!(snapshot.cached_tokens, 300);
         assert!((snapshot.usage_pct - (125.0 / 128000.0 * 100.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn codex_usage_preserves_known_hard_context_window_when_new_usage_collapses_to_soft() {
+        let previous = serde_json::json!({
+            "last_token_usage": {
+                "input_tokens": 194000,
+                "output_tokens": 275,
+                "total_tokens": 194275
+            },
+            "model_context_window": 258400,
+            "model_hard_context_window": 272000
+        });
+        let collapsed = serde_json::json!({
+            "last_token_usage": {
+                "input_tokens": 258000,
+                "output_tokens": 400,
+                "total_tokens": 258400
+            },
+            "model_context_window": 258400,
+            "model_hard_context_window": 258400
+        });
+
+        let merged = codex_usage_preserving_hard_context_window(collapsed, Some(&previous));
+        assert_eq!(codex_usage_context_window(&merged), Some(258400));
+        assert_eq!(codex_usage_hard_context_window(&merged), Some(272000));
+    }
+
+    #[test]
+    fn codex_usage_keeps_new_larger_hard_context_window() {
+        let previous = serde_json::json!({
+            "last_token_usage": {"total_tokens": 10},
+            "model_context_window": 100,
+            "model_hard_context_window": 120
+        });
+        let expanded = serde_json::json!({
+            "last_token_usage": {"total_tokens": 10},
+            "model_context_window": 100,
+            "model_hard_context_window": 200
+        });
+
+        let merged = codex_usage_preserving_hard_context_window(expanded, Some(&previous));
+        assert_eq!(codex_usage_hard_context_window(&merged), Some(200));
     }
 
     #[tokio::test]

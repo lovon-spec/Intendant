@@ -2255,6 +2255,7 @@ const CONTEXT_REWIND_ANCHOR_INSPECT_DEFAULT_RADIUS: usize = 2;
 const CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS: usize = 5;
 const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
 const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
+const CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS: u64 = 4_096;
 
 #[derive(Debug, Clone, Copy)]
 struct ContextRewindBackendUsageAtLine {
@@ -2350,7 +2351,7 @@ fn list_context_rewind_anchors_from_rollout(
         include_management_tools,
         recovery_candidates_only: recovery_candidates_only && !include_non_recovery,
         anchors: page,
-        usage: "Use item_id exactly in rewind_context.anchor.item_id. Management calls are hidden by default; set include_management_tools=true only for internals. During recovery, anchors known at/above the rewind-only limit are hidden unless include_non_recovery=true; absent recovery_eligible means no nearby backend usage sample. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too.",
+        usage: "Use item_id exactly in rewind_context.anchor.item_id. Management calls are hidden by default; set include_management_tools=true only for internals. During recovery, anchors known at/above the rewind-only limit or without enough resume headroom are hidden unless include_non_recovery=true; absent recovery_eligible means no nearby backend usage sample. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too.",
     };
     serde_json::to_string(&catalog).map_err(|err| err.to_string())
 }
@@ -2526,10 +2527,19 @@ fn scan_context_rewind_anchor_catalog(
         };
         anchor.backend_usage_at_or_after_anchor = Some(usage.used_tokens);
         anchor.rewind_only_limit_at_or_after_anchor = Some(usage.rewind_only_limit);
-        anchor.recovery_eligible = Some(usage.used_tokens < usage.rewind_only_limit);
+        anchor.recovery_eligible = Some(context_rewind_anchor_has_recovery_headroom(
+            usage.used_tokens,
+            usage.rewind_only_limit,
+        ));
     }
 
     Ok(anchors)
+}
+
+fn context_rewind_anchor_has_recovery_headroom(used_tokens: u64, rewind_only_limit: u64) -> bool {
+    used_tokens < rewind_only_limit
+        && rewind_only_limit.saturating_sub(used_tokens)
+            >= CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS
 }
 
 fn context_rewind_backend_usage_from_rollout_entry(
@@ -9107,8 +9117,37 @@ mod tests {
                     "payload": {
                         "type": "token_count",
                         "info": {
-                            "last_token_usage": { "total_tokens": 900 },
-                            "model_context_window": 1000
+                            "last_token_usage": {
+                                "input_tokens": 5000,
+                                "cached_input_tokens": 4000,
+                                "output_tokens": 0,
+                                "total_tokens": 5000
+                            },
+                            "model_context_window": 10000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "get_status",
+                        "call_id": "call_near_soft",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 9700,
+                                "cached_input_tokens": 9000,
+                                "output_tokens": 0,
+                                "total_tokens": 9700
+                            },
+                            "model_context_window": 10000
                         }
                     }
                 }),
@@ -9126,8 +9165,13 @@ mod tests {
                     "payload": {
                         "type": "token_count",
                         "info": {
-                            "lastTokenUsage": { "totalTokens": 1050 },
-                            "modelContextWindow": 1000
+                            "lastTokenUsage": {
+                                "inputTokens": 10500,
+                                "cachedInputTokens": 10000,
+                                "outputTokens": 0,
+                                "totalTokens": 10500
+                            },
+                            "modelContextWindow": 10000
                         }
                     }
                 }),
@@ -9149,27 +9193,36 @@ mod tests {
         .expect("full catalog");
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let anchors = catalog["anchors"].as_array().unwrap();
-        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors.len(), 3);
         let below = anchors
             .iter()
             .find(|anchor| anchor["item_id"] == "call_below_soft")
             .expect("below-soft anchor");
         assert_eq!(
             below["backend_usage_at_or_after_anchor"].as_u64(),
-            Some(900)
+            Some(5000)
         );
         assert_eq!(
             below["rewind_only_limit_at_or_after_anchor"].as_u64(),
-            Some(1000)
+            Some(10000)
         );
         assert_eq!(below["recovery_eligible"].as_bool(), Some(true));
+        let near = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_near_soft")
+            .expect("near-soft anchor");
+        assert_eq!(
+            near["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(9700)
+        );
+        assert_eq!(near["recovery_eligible"].as_bool(), Some(false));
         let above = anchors
             .iter()
             .find(|anchor| anchor["item_id"] == "call_above_soft")
             .expect("above-soft anchor");
         assert_eq!(
             above["backend_usage_at_or_after_anchor"].as_u64(),
-            Some(1050)
+            Some(10500)
         );
         assert_eq!(above["recovery_eligible"].as_bool(), Some(false));
 
@@ -9204,7 +9257,7 @@ mod tests {
         )
         .expect("audit catalog");
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(catalog["anchors"].as_array().unwrap().len(), 2);
+        assert_eq!(catalog["anchors"].as_array().unwrap().len(), 3);
         assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(false));
     }
 
@@ -17180,6 +17233,33 @@ async fn run_external_agent_mode(
                                 .managed_context_recovery_kickstart(),
                         );
                         continue 'outer;
+                    } else {
+                        let failure = format!(
+                            "Managed Codex still reports backend recovery required after {} recovery kickstarts without another successful rewind; refusing to mark the session complete.",
+                            managed_context_recovery_kickstarts_without_rewind
+                        );
+                        slog(&session_log, |l| l.warn(&failure));
+                        record_external_round_inline(
+                            &session_log,
+                            persist_model_responses_inline,
+                            round,
+                            turns_in_round,
+                        );
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: live_session_id.clone(),
+                            round,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "error".to_string(),
+                            source: "Intendant".to_string(),
+                            content: failure.clone(),
+                            turn: None,
+                        });
+                        bus.send(AppEvent::LoopError(failure));
+                        break;
                     }
                 }
                 slog(&session_log, |l| {
