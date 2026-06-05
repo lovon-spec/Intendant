@@ -4,7 +4,7 @@ use std::f32::consts::PI;
 use std::rc::Rc;
 
 use bytemuck::{Pod, Zeroable};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
@@ -309,18 +309,28 @@ impl StationInner {
                 return;
             };
             e.prevent_default();
-            let mut s = up_inner.borrow_mut();
-            let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
-            if s.drag_slider.take().is_some() {
-                return;
-            }
-            if let Some(drag) = s.pointer_down.take() {
-                if let Some(action) = drag.pending_action {
-                    s.dispatch_hit(action, x, y);
-                } else if !drag.moved {
-                    s.selected_id = s.pick_node(x, y);
-                    s.panel_scroll = 0.0;
+            let outbound = {
+                let mut s = up_inner.borrow_mut();
+                let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+                if s.drag_slider.take().is_some() {
+                    None
+                } else if let Some(drag) = s.pointer_down.take() {
+                    if let Some(action) = drag.pending_action {
+                        s.dispatch_hit(action, x, y)
+                    } else if !drag.moved {
+                        s.selected_id = s.pick_node(x, y);
+                        s.panel_scroll = 0.0;
+                        None
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
+            };
+            if let Some(action) = outbound {
+                let callback = up_inner.borrow().action_callback.clone();
+                StationInner::emit_action(callback, action);
             }
         }) as Box<dyn FnMut(_)>);
         target.add_event_listener_with_callback("pointerup", up.as_ref().unchecked_ref())?;
@@ -482,6 +492,15 @@ impl StationInner {
 
     fn node_exists(&self, id: &str) -> bool {
         id == "op"
+            || matches!(
+                id,
+                "system:activity"
+                    | "system:context"
+                    | "system:managed"
+                    | "system:sessions"
+                    | "system:peers"
+                    | "system:controls"
+            )
             || self
                 .snapshot
                 .hosts
@@ -815,6 +834,7 @@ impl StationInner {
         self.draw_display_thumbnails(frame);
         self.draw_toolbar(w);
         self.draw_tweaks_panel();
+        self.draw_systems_panel();
         self.draw_corners(w, h);
         self.draw_readout(h);
         self.draw_compass(w, h);
@@ -1066,6 +1086,278 @@ impl StationInner {
         );
     }
 
+    fn draw_systems_panel(&mut self) {
+        let compact_grid = self.css_height() < 620.0 && self.css_width() > 760.0;
+        let x = if compact_grid { 246.0 } else { 12.0 };
+        let y = if compact_grid { 52.0 } else { 242.0 };
+        let w = if compact_grid { 390.0 } else { 222.0 };
+        let rows = if compact_grid { 3.0 } else { 6.0 };
+        let card_gap = if compact_grid { 6.0 } else { 4.0 };
+        let card_col_gap = if compact_grid { 6.0 } else { 0.0 };
+        let inner_w = w - 20.0;
+        let card_w = if compact_grid {
+            (inner_w - card_col_gap) / 2.0
+        } else {
+            inner_w
+        };
+        let card_h = if compact_grid {
+            44.0
+        } else {
+            let available_h = (self.css_height() - y - 14.0).max(0.0);
+            ((available_h - 45.0 - (card_gap * 5.0)) / 6.0).clamp(38.0, 47.0)
+        };
+        let panel_h = 45.0 + (card_h * rows) + (card_gap * (rows - 1.0));
+        self.round_rect(
+            x,
+            y,
+            w,
+            panel_h,
+            6.0,
+            "rgba(24,24,37,0.78)",
+            "rgba(69,71,90,0.74)",
+        );
+        self.text(
+            "CONTROL CENTER",
+            x + 11.0,
+            y + 19.0,
+            10.0,
+            C_OVERLAY1_CSS,
+            "bold",
+        );
+
+        let mut card_idx = 0usize;
+        let card_slot = |idx: usize| -> (f32, f32) {
+            if compact_grid {
+                let col = (idx % 2) as f32;
+                let row = (idx / 2) as f32;
+                (
+                    x + 10.0 + col * (card_w + card_col_gap),
+                    y + 34.0 + row * (card_h + card_gap),
+                )
+            } else {
+                (x + 10.0, y + 34.0 + idx as f32 * (card_h + card_gap))
+            }
+        };
+        let latest_event = self.snapshot.events.last();
+        let activity_value = format!("{} events", self.snapshot.events.len());
+        let activity_detail = latest_event
+            .map(|ev| truncate(&format!("{} {}", ev.level, ev.msg), 34))
+            .unwrap_or_else(|| "waiting for activity".to_string());
+        let (card_x, card_y) = card_slot(card_idx);
+        card_idx += 1;
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "Activity",
+            &activity_value,
+            &activity_detail,
+            latest_event
+                .map(|ev| level_color_css(&ev.level))
+                .unwrap_or(C_OVERLAY1_CSS),
+            "system:activity",
+        );
+
+        let ctx_pct = percent(
+            self.snapshot.context.tokens,
+            self.snapshot.context.effective_window,
+        );
+        let context_value = if self.snapshot.context.available {
+            format!(
+                "{} · {} items",
+                pct_label(ctx_pct),
+                self.snapshot.context.item_count
+            )
+        } else {
+            "waiting".to_string()
+        };
+        let context_detail = if self.snapshot.context.available {
+            truncate(
+                &format!(
+                    "{} {}",
+                    self.snapshot.context.source, self.snapshot.context.turn
+                ),
+                34,
+            )
+        } else {
+            "no context snapshot".to_string()
+        };
+        let (card_x, card_y) = card_slot(card_idx);
+        card_idx += 1;
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "Context",
+            &context_value,
+            &context_detail,
+            pressure_color(ctx_pct),
+            "system:context",
+        );
+
+        let managed_pct = percent(
+            self.snapshot.managed.used_tokens,
+            self.snapshot.managed.effective_window,
+        );
+        let managed_value = format!(
+            "{} · {}",
+            self.snapshot.managed.mode, self.snapshot.managed.status
+        );
+        let managed_detail = format!(
+            "{} records · {} anchors",
+            self.snapshot.managed.records, self.snapshot.managed.anchors
+        );
+        let (card_x, card_y) = card_slot(card_idx);
+        card_idx += 1;
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "Managed",
+            &truncate(&managed_value, 28),
+            &managed_detail,
+            pressure_color(managed_pct),
+            "system:managed",
+        );
+
+        let session_value = format!(
+            "{} total · {} active",
+            self.snapshot.sessions.total, self.snapshot.sessions.active
+        );
+        let session_detail = if self.snapshot.sessions.latest_task.is_empty() {
+            format!("{} external", self.snapshot.sessions.external)
+        } else {
+            truncate(&self.snapshot.sessions.latest_task, 34)
+        };
+        let (card_x, card_y) = card_slot(card_idx);
+        card_idx += 1;
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "Sessions",
+            &session_value,
+            &session_detail,
+            if self.snapshot.sessions.active > 0 {
+                C_TEAL_CSS
+            } else {
+                C_BLUE_CSS
+            },
+            "system:sessions",
+        );
+
+        let peer_count = self.snapshot.hosts.len().saturating_sub(1);
+        let display_count = self.display_sources.len();
+        let peer_value = format!("{peer_count} peers · {display_count} displays");
+        let peer_detail = self
+            .display_sources
+            .values()
+            .next()
+            .map(|source| truncate(&source.label, 34))
+            .unwrap_or_else(|| "local and federated displays".to_string());
+        let (card_x, card_y) = card_slot(card_idx);
+        card_idx += 1;
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "Peers",
+            &peer_value,
+            &peer_detail,
+            if display_count > 0 {
+                C_PEACH_CSS
+            } else {
+                C_BLUE_CSS
+            },
+            "system:peers",
+        );
+
+        let controls = &self.snapshot.controls;
+        let control_value = truncate(
+            &format!(
+                "{} · {}",
+                nonempty(&controls.backend, "agent"),
+                nonempty(&controls.sandbox, "sandbox")
+            ),
+            30,
+        );
+        let control_detail = truncate(
+            &format!(
+                "{} · managed {}",
+                nonempty(&controls.approval_policy, "approval"),
+                nonempty(&controls.managed_context, "unknown")
+            ),
+            34,
+        );
+        let (card_x, card_y) = card_slot(card_idx);
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "Control",
+            &control_value,
+            &control_detail,
+            C_MAUVE_CSS,
+            "system:controls",
+        );
+    }
+
+    fn summary_card(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        title: &str,
+        value: &str,
+        detail: &str,
+        color: &str,
+        select_id: &str,
+    ) {
+        self.round_rect(
+            x,
+            y,
+            w,
+            h,
+            4.0,
+            "rgba(17,17,27,0.72)",
+            "rgba(49,50,68,0.78)",
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 7.0) as f64, (y + 7.0) as f64, 3.0, (h - 14.0) as f64);
+        self.text(title, x + 15.0, y + 14.0, 9.0, C_OVERLAY1_CSS, "bold");
+        self.text(
+            &truncate(value, 30),
+            x + 15.0,
+            y + 28.0,
+            10.0,
+            C_TEXT_CSS,
+            "normal",
+        );
+        self.text(
+            &truncate(detail, 38),
+            x + 15.0,
+            y + h - 8.0,
+            8.5,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        self.hit_zones.push(HitZone::new(
+            x,
+            y,
+            w,
+            h,
+            HitAction::Select(select_id.to_string()),
+        ));
+    }
+
     fn draw_corners(&self, w: f32, h: f32) {
         let c = "rgba(69,71,90,0.8)";
         self.ctx.set_stroke_style(&JsValue::from_str(c));
@@ -1261,6 +1553,31 @@ impl StationInner {
             self.text("you", x + 86.0, y + 25.0, 13.0, C_TEXT_CSS, "bold");
             self.panel_row(x, y + 54.0, "mode", "station origin");
             self.panel_row(x, y + 76.0, "camera", "orbit / parallax");
+            return;
+        }
+
+        if id == "system:activity" {
+            self.draw_activity_info(x, y, panel_w);
+            return;
+        }
+        if id == "system:context" {
+            self.draw_context_info(x, y, panel_w);
+            return;
+        }
+        if id == "system:managed" {
+            self.draw_managed_info(x, y, panel_w);
+            return;
+        }
+        if id == "system:sessions" {
+            self.draw_sessions_info(x, y, panel_w);
+            return;
+        }
+        if id == "system:peers" {
+            self.draw_peers_info(x, y, panel_w);
+            return;
+        }
+        if id == "system:controls" {
+            self.draw_controls_info(x, y, panel_w);
             return;
         }
 
@@ -1575,6 +1892,532 @@ impl StationInner {
         }
     }
 
+    fn draw_activity_info(&mut self, x: f32, y: f32, panel_w: f32) {
+        let events = self.snapshot.events.clone();
+        self.text("activity", x + 12.0, y + 25.0, 10.0, C_TEAL_CSS, "bold");
+        self.text(
+            &format!("{} events", events.len()),
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.nav_button(
+            x + panel_w - 124.0,
+            y + 10.0,
+            86.0,
+            "open log",
+            "activity",
+            Some("log"),
+            C_TEAL_CSS,
+        );
+        let mut yy = y + 54.0 - self.panel_scroll;
+        self.panel_row(x, yy, "retained", &events.len().to_string());
+        yy += 22.0;
+        let latest = events.last();
+        self.panel_row_color(
+            x,
+            yy,
+            "latest",
+            latest.map(|ev| ev.level.as_str()).unwrap_or("--"),
+            latest
+                .map(|ev| level_color_css(&ev.level))
+                .unwrap_or(C_OVERLAY1_CSS),
+        );
+        yy += 30.0;
+        self.section_title(x, yy, "Recent activity");
+        yy += 18.0;
+        self.round_rect(
+            x + 12.0,
+            yy - 8.0,
+            panel_w - 24.0,
+            150.0,
+            4.0,
+            "rgba(17,17,27,0.88)",
+            "rgba(49,50,68,0.88)",
+        );
+        let mut ey = yy + 10.0;
+        if events.is_empty() {
+            self.text(
+                "Waiting for dashboard events",
+                x + 20.0,
+                ey,
+                10.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+        } else {
+            for ev in events
+                .iter()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                self.text(&ev.ts, x + 20.0, ey, 9.0, C_OVERLAY1_CSS, "normal");
+                self.text(
+                    &truncate(&ev.level, 8),
+                    x + 76.0,
+                    ey,
+                    9.0,
+                    level_color_css(&ev.level),
+                    "bold",
+                );
+                self.text(
+                    &truncate(&ev.msg, 44),
+                    x + 132.0,
+                    ey,
+                    9.0,
+                    C_SUBTEXT0_CSS,
+                    "normal",
+                );
+                ey += 16.0;
+            }
+        }
+    }
+
+    fn draw_context_info(&mut self, x: f32, y: f32, panel_w: f32) {
+        let ctx = self.snapshot.context.clone();
+        self.text("context", x + 12.0, y + 25.0, 10.0, C_BLUE_CSS, "bold");
+        self.text(
+            if ctx.available {
+                "model window"
+            } else {
+                "waiting for snapshot"
+            },
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.nav_button(
+            x + panel_w - 132.0,
+            y + 10.0,
+            94.0,
+            "open context",
+            "activity",
+            Some("context"),
+            C_BLUE_CSS,
+        );
+        let mut yy = y + 54.0 - self.panel_scroll;
+        self.panel_row(x, yy, "source", &nonempty(&ctx.source, "--"));
+        yy += 22.0;
+        self.panel_row(x, yy, "session", &truncate(&ctx.session_id, 42));
+        yy += 22.0;
+        self.panel_row(x, yy, "turn", &nonempty(&ctx.turn, "--"));
+        yy += 22.0;
+        self.panel_row(x, yy, "format", &nonempty(&ctx.format, "--"));
+        yy += 28.0;
+        self.section_title(x, yy, "Token pressure");
+        yy += 18.0;
+        self.meter(
+            x + 12.0,
+            yy,
+            panel_w - 24.0,
+            percent(ctx.tokens, ctx.effective_window),
+            pressure_color(percent(ctx.tokens, ctx.effective_window)),
+        );
+        yy += 24.0;
+        self.panel_row(
+            x,
+            yy,
+            "effective",
+            &format!(
+                "{} / {}",
+                compact_number(ctx.tokens as f64),
+                compact_number(ctx.effective_window as f64)
+            ),
+        );
+        yy += 20.0;
+        self.panel_row(
+            x,
+            yy,
+            "hard",
+            &format!(
+                "{} / {}",
+                compact_number(ctx.tokens as f64),
+                compact_number(ctx.hard_window as f64)
+            ),
+        );
+        yy += 24.0;
+        self.panel_row(
+            x,
+            yy,
+            "shape",
+            &format!(
+                "{} items · {} categories",
+                ctx.item_count, ctx.category_count
+            ),
+        );
+        yy += 30.0;
+        self.section_title(x, yy, "Top context lanes");
+        yy += 18.0;
+        if ctx.top_categories.is_empty() {
+            self.panel_row(x, yy, "lanes", "--");
+        } else {
+            for item in ctx.top_categories.iter().take(5) {
+                self.panel_row(
+                    x,
+                    yy,
+                    &truncate(&item.label, 13),
+                    &format!("{} tokens", compact_number(item.value as f64)),
+                );
+                yy += 19.0;
+            }
+        }
+    }
+
+    fn draw_managed_info(&mut self, x: f32, y: f32, panel_w: f32) {
+        let managed = self.snapshot.managed.clone();
+        self.text("managed", x + 12.0, y + 25.0, 10.0, C_MAUVE_CSS, "bold");
+        self.text(
+            &nonempty(&managed.mode, "unknown"),
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.nav_button(
+            x + panel_w - 132.0,
+            y + 10.0,
+            94.0,
+            "open managed",
+            "activity",
+            Some("managed"),
+            C_MAUVE_CSS,
+        );
+        let mut yy = y + 54.0 - self.panel_scroll;
+        self.panel_row(x, yy, "session", &truncate(&managed.session_id, 42));
+        yy += 22.0;
+        self.panel_row_color(
+            x,
+            yy,
+            "pressure",
+            &nonempty(&managed.status, "unknown"),
+            pressure_color(percent(managed.used_tokens, managed.effective_window)),
+        );
+        yy += 28.0;
+        self.meter(
+            x + 12.0,
+            yy,
+            panel_w - 24.0,
+            percent(managed.used_tokens, managed.effective_window),
+            pressure_color(percent(managed.used_tokens, managed.effective_window)),
+        );
+        yy += 24.0;
+        self.panel_row(
+            x,
+            yy,
+            "effective",
+            &format!(
+                "{} / {}",
+                compact_number(managed.used_tokens as f64),
+                compact_number(managed.effective_window as f64)
+            ),
+        );
+        yy += 20.0;
+        self.panel_row(
+            x,
+            yy,
+            "hard",
+            &format!(
+                "{} / {}",
+                compact_number(managed.used_tokens as f64),
+                compact_number(managed.hard_window as f64)
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "rewind-only",
+            if managed.rewind_only { "on" } else { "off" },
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "history",
+            &format!("{} records · {} anchors", managed.records, managed.anchors),
+        );
+        yy += 30.0;
+        self.section_title_color(
+            x,
+            yy,
+            if managed.error.is_empty() {
+                "Status"
+            } else {
+                "Warning"
+            },
+            if managed.error.is_empty() {
+                C_GREEN_CSS
+            } else {
+                C_YELLOW_CSS
+            },
+        );
+        yy += 18.0;
+        self.text(
+            &truncate(
+                if managed.error.is_empty() {
+                    "Managed context data is flowing from the existing dashboard/MCP state."
+                } else {
+                    &managed.error
+                },
+                68,
+            ),
+            x + 12.0,
+            yy,
+            10.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+    }
+
+    fn draw_sessions_info(&mut self, x: f32, y: f32, panel_w: f32) {
+        let sessions = self.snapshot.sessions.clone();
+        self.text("sessions", x + 12.0, y + 25.0, 10.0, C_TEAL_CSS, "bold");
+        self.text(
+            &format!("{} indexed", sessions.total),
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.nav_button(
+            x + panel_w - 134.0,
+            y + 10.0,
+            96.0,
+            "open sessions",
+            "sessions",
+            Some("recent"),
+            C_TEAL_CSS,
+        );
+        let mut yy = y + 54.0 - self.panel_scroll;
+        self.panel_row(x, yy, "active", &sessions.active.to_string());
+        yy += 22.0;
+        self.panel_row(x, yy, "external", &sessions.external.to_string());
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "tokens",
+            &compact_number(sessions.total_tokens as f64),
+        );
+        yy += 22.0;
+        self.panel_row(x, yy, "disk", &format_bytes(sessions.disk_bytes));
+        yy += 30.0;
+        self.section_title(x, yy, "Latest session");
+        yy += 18.0;
+        self.round_rect(
+            x + 12.0,
+            yy - 7.0,
+            panel_w - 24.0,
+            86.0,
+            4.0,
+            "rgba(17,17,27,0.88)",
+            "rgba(49,50,68,0.86)",
+        );
+        self.text(
+            &truncate(
+                &nonempty(&sessions.latest_task, "No cached sessions yet"),
+                56,
+            ),
+            x + 20.0,
+            yy + 11.0,
+            10.0,
+            C_TEXT_CSS,
+            "normal",
+        );
+        self.text(
+            &truncate(
+                &format!(
+                    "{} · {}",
+                    nonempty(&sessions.latest_source, "source"),
+                    nonempty(&sessions.latest_updated, "updated --")
+                ),
+                58,
+            ),
+            x + 20.0,
+            yy + 34.0,
+            10.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+    }
+
+    fn draw_peers_info(&mut self, x: f32, y: f32, panel_w: f32) {
+        let hosts = self.snapshot.hosts.clone();
+        let displays = self
+            .display_sources
+            .values()
+            .map(|source| {
+                (
+                    source.host_id.clone(),
+                    source.display_id.clone(),
+                    source.label.clone(),
+                    source.video.video_width() > 0,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.text("peers", x + 12.0, y + 25.0, 10.0, C_PEACH_CSS, "bold");
+        self.text(
+            &format!("{} hosts · {} displays", hosts.len(), displays.len()),
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.nav_button(
+            x + panel_w - 118.0,
+            y + 10.0,
+            80.0,
+            "open video",
+            "displays",
+            None,
+            C_PEACH_CSS,
+        );
+        let mut yy = y + 54.0 - self.panel_scroll;
+        self.panel_row(x, yy, "peers", &hosts.len().saturating_sub(1).to_string());
+        yy += 22.0;
+        self.panel_row(x, yy, "streams", &displays.len().to_string());
+        yy += 30.0;
+        self.section_title(x, yy, "Hosts");
+        yy += 18.0;
+        for host in hosts.iter().take(7) {
+            self.panel_row_color(
+                x,
+                yy,
+                &truncate(&host.name, 13),
+                if host.connected {
+                    "connected"
+                } else {
+                    "offline"
+                },
+                if host.connected {
+                    C_GREEN_CSS
+                } else {
+                    C_RED_CSS
+                },
+            );
+            self.hit_zones.push(HitZone::new(
+                x + 12.0,
+                yy - 13.0,
+                panel_w - 24.0,
+                18.0,
+                HitAction::Select(format!("host:{}", host.id)),
+            ));
+            yy += 20.0;
+        }
+        yy += 10.0;
+        self.section_title_color(x, yy, "Displays", C_PEACH_CSS);
+        yy += 18.0;
+        if displays.is_empty() {
+            self.panel_row(x, yy, "streams", "--");
+        } else {
+            for (host_id, display_id, label, ready) in displays.iter().take(5) {
+                self.panel_row_color(
+                    x,
+                    yy,
+                    &truncate(&self.host_name(host_id), 13),
+                    &format!(
+                        "{} · {}",
+                        truncate(&nonempty(label, display_id), 24),
+                        if *ready { "live" } else { "linking" }
+                    ),
+                    if *ready { C_GREEN_CSS } else { C_YELLOW_CSS },
+                );
+                self.hit_zones.push(HitZone::new(
+                    x + 12.0,
+                    yy - 13.0,
+                    panel_w - 24.0,
+                    18.0,
+                    HitAction::OpenDisplay(host_id.clone()),
+                ));
+                yy += 20.0;
+            }
+        }
+    }
+
+    fn draw_controls_info(&mut self, x: f32, y: f32, panel_w: f32) {
+        let controls = self.snapshot.controls.clone();
+        self.text("control", x + 12.0, y + 25.0, 10.0, C_MAUVE_CSS, "bold");
+        self.text(
+            &nonempty(&controls.backend, "agent"),
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.nav_button(
+            x + panel_w - 132.0,
+            y + 10.0,
+            94.0,
+            "open control",
+            "activity",
+            Some("control"),
+            C_MAUVE_CSS,
+        );
+        let mut yy = y + 54.0 - self.panel_scroll;
+        self.panel_row(x, yy, "model", &truncate(&controls.model, 42));
+        yy += 22.0;
+        self.panel_row(x, yy, "sandbox", &nonempty(&controls.sandbox, "--"));
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "approval",
+            &nonempty(&controls.approval_policy, "--"),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "reasoning",
+            &nonempty(&controls.reasoning_effort, "--"),
+        );
+        yy += 22.0;
+        self.panel_row(x, yy, "service", &nonempty(&controls.service_tier, "--"));
+        yy += 22.0;
+        self.panel_row(x, yy, "managed", &nonempty(&controls.managed_context, "--"));
+        yy += 22.0;
+        self.panel_row(x, yy, "archive", &nonempty(&controls.context_archive, "--"));
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "web/net",
+            &format!(
+                "{} / {}",
+                if controls.web_search {
+                    "web on"
+                } else {
+                    "web off"
+                },
+                if controls.network_access {
+                    "net on"
+                } else {
+                    "net off"
+                }
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(x, yy, "roots", &controls.writable_roots.to_string());
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "new task",
+            &nonempty(&controls.new_session_agent, "--"),
+        );
+    }
+
     fn panel_row(&self, x: f32, y: f32, k: &str, v: &str) {
         self.panel_row_color(x, y, k, v, C_TEXT_CSS);
     }
@@ -1590,6 +2433,44 @@ impl StationInner {
 
     fn section_title_color(&self, x: f32, y: f32, title: &str, color: &str) {
         self.text(title, x + 14.0, y, 10.0, color, "bold");
+    }
+
+    fn meter(&self, x: f32, y: f32, w: f32, pct: f32, color: &str) {
+        let pct = pct.clamp(0.0, 1.0);
+        self.ctx
+            .set_fill_style(&JsValue::from_str("rgba(49,50,68,0.92)"));
+        self.ctx
+            .fill_rect(x as f64, (y - 6.0) as f64, w as f64, 5.0);
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect(x as f64, (y - 6.0) as f64, (w * pct) as f64, 5.0);
+        self.ctx
+            .set_stroke_style(&JsValue::from_str("rgba(127,132,156,0.5)"));
+        self.ctx
+            .stroke_rect(x as f64, (y - 6.0) as f64, w as f64, 5.0);
+    }
+
+    fn nav_button(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        label: &str,
+        tab: &str,
+        subtab: Option<&str>,
+        color: &str,
+    ) {
+        self.pill_at(x, y, w, 22.0, label, color);
+        self.hit_zones.push(HitZone::new(
+            x,
+            y,
+            w,
+            22.0,
+            HitAction::Navigate {
+                tab: tab.to_string(),
+                subtab: subtab.map(ToString::to_string),
+            },
+        ));
     }
 
     fn approval_button(
@@ -1838,41 +2719,65 @@ impl StationInner {
             .map(|(_, id)| id)
     }
 
-    fn dispatch_hit(&mut self, action: HitAction, x: f32, _y: f32) {
+    fn dispatch_hit(&mut self, action: HitAction, x: f32, _y: f32) -> Option<serde_json::Value> {
         match action {
-            HitAction::Layout(layout) => self.layout = layout,
-            HitAction::Mood(mood) => self.mood = mood,
-            HitAction::ClosePanel => self.selected_id = None,
+            HitAction::Layout(layout) => {
+                self.layout = layout;
+                None
+            }
+            HitAction::Mood(mood) => {
+                self.mood = mood;
+                None
+            }
+            HitAction::ClosePanel => {
+                self.selected_id = None;
+                None
+            }
             HitAction::Select(id) => {
                 self.selected_id = Some(id);
                 self.panel_scroll = 0.0;
+                None
             }
-            HitAction::Slider(kind) => self.apply_slider_at(kind, x),
+            HitAction::Slider(kind) => {
+                self.apply_slider_at(kind, x);
+                None
+            }
             HitAction::Approval {
                 host_id,
                 approval_id,
                 decision,
-            } => {
-                self.emit_action(serde_json::json!({
+            } => Some(serde_json::json!({
                     "type": "approval",
                     "host_id": host_id,
                     "approval_id": approval_id,
                     "decision": decision,
-                }));
-            }
-            HitAction::OpenDisplay(host_id) => {
-                self.emit_action(serde_json::json!({
+            })),
+            HitAction::OpenDisplay(host_id) => Some(serde_json::json!({
                     "type": "open_display",
                     "host_id": host_id,
-                }));
-            }
+            })),
+            HitAction::Navigate { tab, subtab } => Some(serde_json::json!({
+                    "type": "navigate",
+                    "tab": tab,
+                    "subtab": subtab,
+            })),
         }
     }
 
-    fn emit_action(&self, action: serde_json::Value) {
-        if let Some(cb) = &self.action_callback {
-            if let Ok(value) = serde_wasm_bindgen::to_value(&action) {
-                let _ = cb.call1(&JsValue::NULL, &value);
+    fn emit_action(callback: Option<js_sys::Function>, action: serde_json::Value) {
+        if let Some(cb) = callback {
+            if let Ok(value) = action
+                .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            {
+                let callback = Closure::once_into_js(move || {
+                    let _ = cb.call1(&JsValue::NULL, &value);
+                });
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        callback.as_ref().unchecked_ref(),
+                        0,
+                    );
+                }
             }
         }
     }
@@ -2426,6 +3331,10 @@ struct StationSnapshot {
     hosts: Vec<StationHost>,
     agents: Vec<StationAgent>,
     events: Vec<StationEvent>,
+    context: StationContextSummary,
+    managed: StationManagedSummary,
+    sessions: StationSessionsSummary,
+    controls: StationControlsSummary,
 }
 
 #[derive(Clone, Deserialize)]
@@ -2536,6 +3445,154 @@ impl Default for StationEvent {
     }
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StationContextSummary {
+    available: bool,
+    label: String,
+    source: String,
+    session_id: String,
+    format: String,
+    turn: String,
+    tokens: f32,
+    effective_window: f32,
+    hard_window: f32,
+    item_count: u32,
+    category_count: u32,
+    top_categories: Vec<StationBreakdown>,
+}
+
+impl Default for StationContextSummary {
+    fn default() -> Self {
+        Self {
+            available: false,
+            label: String::new(),
+            source: String::new(),
+            session_id: String::new(),
+            format: String::new(),
+            turn: String::new(),
+            tokens: 0.0,
+            effective_window: 0.0,
+            hard_window: 0.0,
+            item_count: 0,
+            category_count: 0,
+            top_categories: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StationManagedSummary {
+    session_id: String,
+    mode: String,
+    status: String,
+    used_tokens: f32,
+    effective_window: f32,
+    hard_window: f32,
+    rewind_only: bool,
+    records: u32,
+    anchors: u32,
+    error: String,
+}
+
+impl Default for StationManagedSummary {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            mode: "unknown".into(),
+            status: "unknown".into(),
+            used_tokens: 0.0,
+            effective_window: 0.0,
+            hard_window: 0.0,
+            rewind_only: false,
+            records: 0,
+            anchors: 0,
+            error: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StationSessionsSummary {
+    total: u32,
+    active: u32,
+    external: u32,
+    total_tokens: f32,
+    disk_bytes: f64,
+    latest_task: String,
+    latest_source: String,
+    latest_updated: String,
+}
+
+impl Default for StationSessionsSummary {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            active: 0,
+            external: 0,
+            total_tokens: 0.0,
+            disk_bytes: 0.0,
+            latest_task: String::new(),
+            latest_source: String::new(),
+            latest_updated: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StationControlsSummary {
+    backend: String,
+    sandbox: String,
+    approval_policy: String,
+    model: String,
+    reasoning_effort: String,
+    service_tier: String,
+    managed_context: String,
+    context_archive: String,
+    web_search: bool,
+    network_access: bool,
+    writable_roots: u32,
+    new_session_agent: String,
+}
+
+impl Default for StationControlsSummary {
+    fn default() -> Self {
+        Self {
+            backend: String::new(),
+            sandbox: String::new(),
+            approval_policy: String::new(),
+            model: String::new(),
+            reasoning_effort: String::new(),
+            service_tier: String::new(),
+            managed_context: String::new(),
+            context_archive: String::new(),
+            web_search: false,
+            network_access: false,
+            writable_roots: 0,
+            new_session_agent: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StationBreakdown {
+    label: String,
+    value: f32,
+}
+
+impl Default for StationBreakdown {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            value: 0.0,
+        }
+    }
+}
+
 struct DisplaySource {
     host_id: String,
     display_id: String,
@@ -2586,6 +3643,10 @@ enum HitAction {
         decision: String,
     },
     OpenDisplay(String),
+    Navigate {
+        tab: String,
+        subtab: Option<String>,
+    },
 }
 
 struct HitZone {
@@ -2918,6 +3979,69 @@ fn css_rgba(color: [f32; 4]) -> String {
         color[2] * 255.0,
         color[3]
     )
+}
+
+fn percent(value: f32, max: f32) -> f32 {
+    if max <= 0.0 {
+        0.0
+    } else {
+        (value / max).clamp(0.0, 1.0)
+    }
+}
+
+fn pct_label(pct: f32) -> String {
+    format!("{:.0}%", pct.clamp(0.0, 1.0) * 100.0)
+}
+
+fn nonempty(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn compact_number(value: f64) -> String {
+    let abs = value.abs();
+    if abs >= 1_000_000_000.0 {
+        format!("{:.1}b", value / 1_000_000_000.0)
+    } else if abs >= 1_000_000.0 {
+        format!("{:.1}m", value / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.1}k", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn format_bytes(bytes: f64) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes.max(0.0);
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < units.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0} {}", units[unit])
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", units[unit])
+    } else {
+        format!("{value:.1} {}", units[unit])
+    }
+}
+
+fn pressure_color(pct: f32) -> &'static str {
+    if pct >= 0.9 {
+        C_RED_CSS
+    } else if pct >= 0.72 {
+        C_YELLOW_CSS
+    } else if pct >= 0.5 {
+        C_BLUE_CSS
+    } else {
+        C_GREEN_CSS
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

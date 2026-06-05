@@ -9925,6 +9925,7 @@ function stationSetActive(active) {
     station.set_active(active);
     station.resize();
     if (active) {
+      stationRefreshSharedCaches();
       stationUpdateSnapshot();
       stationRegisterExistingSources();
     }
@@ -9934,6 +9935,22 @@ function stationSetActive(active) {
       stationStatus('Station failed: ' + (err && err.message ? err.message : err));
     });
   }
+}
+
+function stationRefreshSharedCaches() {
+  if (!station) return;
+  if (!sessionsLoaded) {
+    fetchSessionsForHost(selfPeerId, { force: false })
+      .then(sessions => applyLoadedSessions(sessions, document.getElementById('sessions-aggregate')))
+      .catch(err => console.warn('Station sessions refresh failed:', err))
+      .finally(stationScheduleUpdate);
+  }
+  refreshControlPane()
+    .then(stationScheduleUpdate)
+    .catch(err => console.warn('Station control refresh failed:', err));
+  refreshManagedContextPane({ force: false })
+    .then(stationScheduleUpdate)
+    .catch(err => console.warn('Station managed-context refresh failed:', err));
 }
 
 function stationScheduleUpdate() {
@@ -9970,6 +9987,15 @@ function handleStationAction(action) {
     }
   } else if (action.type === 'open_display') {
     stationOpenDisplay(action.host_id);
+  } else if (action.type === 'navigate') {
+    const tab = String(action.tab || '').trim();
+    const subtab = action.subtab ? String(action.subtab).trim() : undefined;
+    if (!VALID_TABS.includes(tab)) return;
+    if (tab === 'activity' && subtab && !VALID_ACTIVITY_SUBTABS.includes(subtab)) return;
+    if (tab === 'terminal' && subtab && !VALID_TERM_SUBTABS.includes(subtab)) return;
+    if (tab === 'settings' && subtab && !VALID_SETTINGS_SUBTABS.includes(subtab)) return;
+    if (tab === 'sessions' && subtab && !VALID_SESSIONS_SUBTABS.includes(subtab)) return;
+    routeTo(tab, subtab);
   }
 }
 
@@ -9987,6 +10013,223 @@ function stationOpenDisplay(hostId) {
     console.error('Station openPeerDisplay failed:', err);
     stationStatus('Display open failed: ' + (err && err.message ? err.message : err));
   });
+}
+
+function stationSnapshotForContext() {
+  if (typeof contextSnapshotForForegroundSession === 'function') {
+    return contextSnapshotForForegroundSession();
+  }
+  return latestContextSnapshot || null;
+}
+
+function stationBuildContextSummary() {
+  const snapshot = stationSnapshotForContext();
+  if (!snapshot) {
+    return {
+      available: false,
+      label: '',
+      source: '',
+      sessionId: '',
+      format: '',
+      turn: '',
+      tokens: 0,
+      effectiveWindow: 0,
+      hardWindow: 0,
+      itemCount: 0,
+      categoryCount: 0,
+      topCategories: [],
+    };
+  }
+  const analysis = analyzeContextSnapshot(snapshot);
+  const effectiveWindow = Number(snapshot.effective_context_window || snapshot.context_window || analysis.effectiveWindow || 0);
+  const hardWindow = Number(snapshot.hard_context_window || snapshot.hardContextWindow || analysis.hardWindow || effectiveWindow || 0);
+  const categories = Array.from(analysis.byCategory.entries())
+    .map(([category, stats]) => ({
+      label: (CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other).label,
+      value: stationNum(stats.tokens),
+    }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 6);
+  return {
+    available: true,
+    label: snapshot.label || snapshot.source || 'model',
+    source: snapshot.label || snapshot.source || 'model',
+    sessionId: contextSessionKey(snapshot) === CONTEXT_GLOBAL_SESSION ? '' : contextSessionKey(snapshot),
+    format: snapshot.format || '',
+    turn: contextSnapshotRequestLabel(snapshot),
+    tokens: stationNum(analysis.totalTokens || snapshot.token_count),
+    effectiveWindow,
+    hardWindow,
+    itemCount: stationNum(snapshot.item_count || analysis.parts.length),
+    categoryCount: categories.length,
+    topCategories: categories,
+  };
+}
+
+function stationManagedSessionCandidate() {
+  const selected = managedContextCurrentSessionId();
+  if (selected) return selected;
+  const options = managedContextSessionOptions();
+  if (options.length) return options[0][0];
+  return resolvePromptTargetSessionId();
+}
+
+function stationManagedAnchorCount(sessionId) {
+  const seen = new Set();
+  for (const anchor of managedContextAnchors || []) {
+    const id = anchor?.item_id || anchor?.itemId;
+    if (id) seen.add(String(id));
+  }
+  document.querySelectorAll('.log-entry[data-item-id]').forEach(entry => {
+    const sid = entry.dataset.sessionId || '';
+    if (
+      !sessionId ||
+      sid === sessionId ||
+      sessionWindowTargetForLogSession(sid) === sessionId
+    ) {
+      seen.add(entry.dataset.itemId);
+    }
+  });
+  return seen.size;
+}
+
+function stationBuildManagedSummary(contextSummary) {
+  const sessionId = stationManagedSessionCandidate();
+  const meta = managedContextSessionMeta(sessionId);
+  const live = managedContextSessionIsLive(sessionId, meta);
+  const pressure = live ? (managedContextStatus?.context_pressure || {}) : {};
+  const effectiveWindow = stationNum(
+    pressure.effective_context_window ||
+    pressure.context_window ||
+    contextSummary.effectiveWindow
+  );
+  const hardWindow = stationNum(
+    pressure.hard_limit ||
+    pressure.hard_context_window ||
+    contextSummary.hardWindow ||
+    effectiveWindow
+  );
+  const mode = sessionId
+    ? managedContextEffectiveMode(sessionId, meta)
+    : (controlCodexConfig.managed_context || 'vanilla');
+  return {
+    sessionId: sessionId || '',
+    mode,
+    status: live ? (pressure.status || 'unknown') : (sessionId ? 'historical' : 'unknown'),
+    usedTokens: stationNum(pressure.used_tokens || contextSummary.tokens),
+    effectiveWindow,
+    hardWindow,
+    rewindOnly: !!pressure.rewind_only,
+    records: Array.isArray(managedContextRecords) ? managedContextRecords.length : 0,
+    anchors: stationManagedAnchorCount(sessionId),
+    error: managedContextLastError || '',
+  };
+}
+
+function stationSessionUpdatedMs(session) {
+  const raw = session && (session.updated_at || session.updatedAt || session.changed_at || session.changedAt || session.created_at || session.createdAt);
+  const ms = Date.parse(raw || '');
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function stationSessionTask(session) {
+  return compactSessionText(
+    session?.name ||
+    session?.display_name ||
+    session?.thread_name ||
+    session?.task ||
+    session?.initial_message ||
+    session?.initialMessage
+  );
+}
+
+function stationSessionSource(session) {
+  return String(
+    session?.backend_source_label ||
+    session?.backendSourceLabel ||
+    session?.source_label ||
+    session?.sourceLabel ||
+    session?.backend_source ||
+    session?.backendSource ||
+    session?.source ||
+    ''
+  ).trim();
+}
+
+function stationSessionBytes(session) {
+  return stationNum(
+    session?.disk_bytes ??
+    session?.diskBytes ??
+    session?.storage_bytes ??
+    session?.storageBytes ??
+    session?.log_bytes ??
+    session?.logBytes ??
+    session?.total_bytes ??
+    session?.totalBytes ??
+    session?.bytes ??
+    0
+  );
+}
+
+function stationBuildSessionsSummary() {
+  const sessions = Array.isArray(_cachedSessions) && _cachedSessions.length
+    ? _cachedSessions
+    : (sessionsListCache.get(selfPeerId) || []);
+  const externalIds = new Set();
+  for (const session of sessions) {
+    const source = normalizeAgentId(session?.backend_source || session?.backendSource || session?.source || '');
+    if (source && source !== 'intendant') {
+      const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
+      externalIds.add(String(id));
+    }
+  }
+  for (const [sid, win] of sessionWindows) {
+    if (externalSourceForSessionWindow(sid, win)) externalIds.add(sid);
+  }
+  let active = 0;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || win.ended || sessionWindowIsDetached(sid)) continue;
+    if (hasPendingActiveSessionWindow(sid) || isAgentActivePhase(win.phase)) active += 1;
+  }
+  if (!active && isAgentActivePhase(currentPhase)) active = 1;
+  const latest = [...sessions].sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))[0] || null;
+  return {
+    total: sessions.length,
+    active,
+    external: externalIds.size,
+    totalTokens: sessions.reduce((sum, session) => sum + stationNum(session?.total_tokens), 0),
+    diskBytes: sessions.reduce((sum, session) => sum + stationSessionBytes(session), 0),
+    latestTask: stationSessionTask(latest),
+    latestSource: stationSessionSource(latest),
+    latestUpdated: latest ? formatContextTimestamp(latest.updated_at || latest.updatedAt || latest.changed_at || latest.changedAt || latest.created_at || latest.createdAt) : '',
+  };
+}
+
+function stationBuildControlsSummary() {
+  const backend = controlCurrentBackend || currentExternalAgent || newSessionConfiguredAgent || '';
+  const isGemini = backend === 'gemini';
+  return {
+    backend: backend || 'none',
+    sandbox: isGemini
+      ? (controlGeminiConfig.sandbox ? 'on' : 'off')
+      : (controlCodexConfig.sandbox || 'workspace-write'),
+    approvalPolicy: isGemini
+      ? (controlGeminiConfig.approval_mode || 'default')
+      : (controlCodexConfig.approval_policy || 'on-request'),
+    model: isGemini
+      ? (controlGeminiConfig.model || '')
+      : (controlCodexConfig.model || ''),
+    reasoningEffort: controlCodexConfig.reasoning_effort || '',
+    serviceTier: controlCodexConfig.service_tier || '',
+    managedContext: controlCodexConfig.managed_context || 'vanilla',
+    contextArchive: controlCodexConfig.context_archive || 'summary',
+    webSearch: !!controlCodexConfig.web_search,
+    networkAccess: !!controlCodexConfig.network_access,
+    writableRoots: Array.isArray(controlCodexConfig.writable_roots)
+      ? controlCodexConfig.writable_roots.length
+      : 0,
+    newSessionAgent: newSessionConfiguredAgent || backend || '',
+  };
 }
 
 function buildStationSnapshot() {
@@ -10029,10 +10272,15 @@ function buildStationSnapshot() {
     agents.push(stationApprovalAgent(selfPeerId, stationCurrentApproval.id, stationCurrentApproval));
   }
 
+  const context = stationBuildContextSummary();
   return {
     hosts,
     agents,
     events: stationLogEvents.slice(-80),
+    context,
+    managed: stationBuildManagedSummary(context),
+    sessions: stationBuildSessionsSummary(),
+    controls: stationBuildControlsSummary(),
   };
 }
 
