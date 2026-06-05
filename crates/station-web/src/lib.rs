@@ -2404,6 +2404,27 @@ impl StationInner {
         yy += 22.0;
         self.panel_row(x, yy, "index", &nonempty(&sessions.index_status, "cold"));
         yy += 30.0;
+        self.section_title_color(x, yy, "Shortcuts", C_TEAL_CSS);
+        yy += 22.0;
+        self.nav_button(
+            x + 14.0,
+            yy - 14.0,
+            98.0,
+            "new session",
+            "sessions",
+            Some("new"),
+            C_TEAL_CSS,
+        );
+        self.nav_button(
+            x + 122.0,
+            yy - 14.0,
+            98.0,
+            "deep search",
+            "sessions",
+            Some("deep"),
+            C_MAUVE_CSS,
+        );
+        yy += 28.0;
         self.section_title(x, yy, "Latest session");
         yy += 18.0;
         self.round_rect(
@@ -2476,6 +2497,15 @@ impl StationInner {
             13.0,
             C_TEXT_CSS,
             "bold",
+        );
+        self.nav_button(
+            x + panel_w - 202.0,
+            y + 10.0,
+            78.0,
+            "network",
+            "settings",
+            Some("network"),
+            C_PEACH_CSS,
         );
         self.nav_button(
             x + panel_w - 118.0,
