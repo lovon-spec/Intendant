@@ -9887,6 +9887,8 @@ let stationCurrentTask = '';
 let stationCurrentApproval = null;
 const stationLogEvents = [];
 const stationRegisteredSources = new Set();
+let stationSessionsIndexLoading = false;
+let stationSessionsIndexError = '';
 
 function stationStatus(text) {
   const el = document.getElementById('station-status');
@@ -9907,10 +9909,12 @@ async function ensureStation() {
     if (!scene || !hud) return null;
     station = new StationWeb(scene, hud);
     station.set_action_callback((action) => handleStationAction(action));
-    station.set_active(activeTab === 'station');
+    const active = activeTab === 'station';
+    station.set_active(active);
     stationStatus('Station online');
     stationUpdateSnapshot();
     stationRegisterExistingSources();
+    if (active) stationRefreshSharedCaches();
     return station;
   })().catch(err => {
     stationInitPromise = null;
@@ -9940,10 +9944,18 @@ function stationSetActive(active) {
 function stationRefreshSharedCaches() {
   if (!station) return;
   if (!sessionsLoaded) {
+    stationSessionsIndexLoading = true;
+    stationSessionsIndexError = '';
     fetchSessionsForHost(selfPeerId, { force: false })
       .then(sessions => applyLoadedSessions(sessions, document.getElementById('sessions-aggregate')))
-      .catch(err => console.warn('Station sessions refresh failed:', err))
-      .finally(stationScheduleUpdate);
+      .catch(err => {
+        stationSessionsIndexError = err && err.message ? err.message : String(err || 'session index failed');
+        console.warn('Station sessions refresh failed:', err);
+      })
+      .finally(() => {
+        stationSessionsIndexLoading = false;
+        stationScheduleUpdate();
+      });
   }
   refreshControlPane()
     .then(stationScheduleUpdate)
@@ -10038,6 +10050,7 @@ function stationBuildContextSummary() {
       itemCount: 0,
       categoryCount: 0,
       topCategories: [],
+      topItems: [],
     };
   }
   const analysis = analyzeContextSnapshot(snapshot);
@@ -10050,6 +10063,18 @@ function stationBuildContextSummary() {
     }))
     .sort((a, b) => b.value - a.value)
     .slice(0, 6);
+  const topItems = [...analysis.parts]
+    .sort((a, b) => (b.tokens || 0) - (a.tokens || 0))
+    .slice(0, 6)
+    .map(part => {
+      const def = CONTEXT_CATEGORY_DEFS[part.category] || CONTEXT_CATEGORY_DEFS.other;
+      return {
+        label: def.label,
+        value: `${stationCompactNumber(part.tokens || part.estimatedTokens || 0)} tok`,
+        detail: compactSessionText(part.title || part.subtitle || part.path || ''),
+        tone: 'context',
+      };
+    });
   return {
     available: true,
     label: snapshot.label || snapshot.source || 'model',
@@ -10063,6 +10088,7 @@ function stationBuildContextSummary() {
     itemCount: stationNum(snapshot.item_count || analysis.parts.length),
     categoryCount: categories.length,
     topCategories: categories,
+    topItems,
   };
 }
 
@@ -10091,6 +10117,56 @@ function stationManagedAnchorCount(sessionId) {
     }
   });
   return seen.size;
+}
+
+function stationManagedAnchorRows(sessionId) {
+  const seen = new Set();
+  const rows = [];
+  const add = (itemId, detail, value = 'anchor') => {
+    const id = String(itemId || '').trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    rows.push({
+      label: id,
+      value,
+      detail: compactSessionText(detail || ''),
+      tone: 'peer',
+    });
+  };
+  document.querySelectorAll('.log-entry[data-item-id]').forEach(entry => {
+    const sid = entry.dataset.sessionId || '';
+    if (
+      !sessionId ||
+      sid === sessionId ||
+      sessionWindowTargetForLogSession(sid) === sessionId
+    ) {
+      add(entry.dataset.itemId, entry.querySelector('.log-content')?.textContent || entry.textContent || '', 'log');
+    }
+  });
+  for (const anchor of managedContextAnchors || []) {
+    add(
+      anchor.item_id || anchor.itemId,
+      [
+        anchor.tool_name || anchor.toolName || 'tool',
+        anchor.status ? `(${anchor.status})` : '',
+        anchor.preview || '',
+      ].filter(Boolean).join(' '),
+      anchor.status || 'tool',
+    );
+  }
+  return rows.slice(0, 8);
+}
+
+function stationManagedRecordRows() {
+  return [...(managedContextRecords || [])]
+    .sort((a, b) => stationTimestampMs(b.created_at) - stationTimestampMs(a.created_at))
+    .slice(0, 8)
+    .map(record => ({
+      label: record.record_id || 'record',
+      value: `${record.position || 'after'} ${record.item_id || ''}`.trim(),
+      detail: compactSessionText(record.reason || record.primer || ''),
+      tone: 'managed',
+    }));
 }
 
 function stationBuildManagedSummary(contextSummary) {
@@ -10123,6 +10199,8 @@ function stationBuildManagedSummary(contextSummary) {
     records: Array.isArray(managedContextRecords) ? managedContextRecords.length : 0,
     anchors: stationManagedAnchorCount(sessionId),
     error: managedContextLastError || '',
+    recentRecords: stationManagedRecordRows(),
+    recentAnchors: stationManagedAnchorRows(sessionId),
   };
 }
 
@@ -10171,10 +10249,88 @@ function stationSessionBytes(session) {
   );
 }
 
+function stationSessionWindowSummaries() {
+  const rows = [];
+  for (const [sid, win] of sessionWindows) {
+    if (!sid || !win || win.ended || sessionWindowIsDetached(sid)) continue;
+    const meta = sessionMetadataById.get(sid) || {};
+    const source = externalSourceForSessionWindow(sid, win) || meta.source || meta.backendSource || win.source || 'intendant';
+    const phase = normalizeSessionPhase(win.phase || meta.phase || '');
+    rows.push({
+      session_id: sid,
+      name: meta.name || meta.displayName || win.name || win.title || '',
+      task: meta.task || meta.initialMessage || win.task || win.title || 'Live session',
+      status: phase || 'idle',
+      source,
+      source_label: meta.sourceLabel || meta.source || source,
+      backend_source: meta.backendSource || source,
+      updated_at: meta.updatedAt || meta.updated_at || win.updatedAt || win.updated_at || new Date().toISOString(),
+      provider: meta.provider || win.provider || '',
+      model: meta.model || win.model || '',
+      turns: stationNum(meta.turns || win.turns),
+      total_tokens: stationNum(meta.totalTokens || meta.total_tokens || win.totalTokens || win.total_tokens),
+      prompt_tokens: stationNum(meta.promptTokens || meta.prompt_tokens || win.promptTokens || win.prompt_tokens),
+      completion_tokens: stationNum(meta.completionTokens || meta.completion_tokens || win.completionTokens || win.completion_tokens),
+      cached_tokens: stationNum(meta.cachedTokens || meta.cached_tokens || win.cachedTokens || win.cached_tokens),
+      total_bytes: stationNum(meta.totalBytes || meta.total_bytes || win.totalBytes || win.total_bytes),
+    });
+  }
+  return rows;
+}
+
+function stationCurrentDaemonSessionSummary() {
+  const sid = String(daemonSessionFullId || currentSessionFullId || foregroundSessionFullId || '').trim();
+  if (!sid) return null;
+  const meta = sessionMetadataById.get(sid) || {};
+  const backendSource = normalizeAgentId(
+    meta.backendSource ||
+    meta.backend_source ||
+    meta.source ||
+    controlCurrentBackend ||
+    currentExternalAgent ||
+    newSessionConfiguredAgent ||
+    ''
+  );
+  const phase = normalizeSessionPhase(currentPhase || meta.phase || '');
+  return {
+    session_id: sid,
+    name: meta.name || meta.displayName || '',
+    task: meta.task || meta.initialMessage || stationCurrentTask || 'Current daemon session',
+    status: phase || 'idle',
+    source: backendSource || 'intendant',
+    source_label: meta.sourceLabel || meta.source || backendSource || 'intendant',
+    backend_source: backendSource || '',
+    updated_at: meta.updatedAt || meta.updated_at || new Date().toISOString(),
+    provider: meta.provider || '',
+    model: meta.model || '',
+    turns: stationNum(meta.turns),
+    total_tokens: stationNum(meta.totalTokens || meta.total_tokens),
+    prompt_tokens: stationNum(meta.promptTokens || meta.prompt_tokens),
+    completion_tokens: stationNum(meta.completionTokens || meta.completion_tokens),
+    cached_tokens: stationNum(meta.cachedTokens || meta.cached_tokens),
+    total_bytes: stationNum(meta.totalBytes || meta.total_bytes),
+  };
+}
+
 function stationBuildSessionsSummary() {
-  const sessions = Array.isArray(_cachedSessions) && _cachedSessions.length
+  const indexedSessions = Array.isArray(_cachedSessions) && _cachedSessions.length
     ? _cachedSessions
     : (sessionsListCache.get(selfPeerId) || []);
+  const byId = new Map();
+  for (const session of indexedSessions) {
+    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
+    byId.set(String(id), session);
+  }
+  for (const session of stationSessionWindowSummaries()) {
+    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
+    if (!byId.has(String(id))) byId.set(String(id), session);
+  }
+  const currentDaemonSession = stationCurrentDaemonSessionSummary();
+  if (currentDaemonSession) {
+    const id = currentDaemonSession.session_id || JSON.stringify(currentDaemonSession);
+    if (!byId.has(String(id))) byId.set(String(id), currentDaemonSession);
+  }
+  const sessions = [...byId.values()];
   const externalIds = new Set();
   for (const session of sessions) {
     const source = normalizeAgentId(session?.backend_source || session?.backendSource || session?.source || '');
@@ -10184,6 +10340,7 @@ function stationBuildSessionsSummary() {
     }
   }
   for (const [sid, win] of sessionWindows) {
+    if (!win || win.ended || sessionWindowIsDetached(sid)) continue;
     if (externalSourceForSessionWindow(sid, win)) externalIds.add(sid);
   }
   let active = 0;
@@ -10193,6 +10350,20 @@ function stationBuildSessionsSummary() {
   }
   if (!active && isAgentActivePhase(currentPhase)) active = 1;
   const latest = [...sessions].sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))[0] || null;
+  const recent = [...sessions]
+    .sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))
+    .slice(0, 6)
+    .map(session => {
+      const id = session?.session_id || session?.resume_id || session?.backend_session_id || '';
+      const status = session?.status || 'session';
+      const source = stationSessionSource(session) || session?.source || '';
+      return {
+        label: stationSessionTask(session) || 'Untitled session',
+        value: [status, source].filter(Boolean).join(' · '),
+        detail: [String(id).slice(0, 8), formatContextTimestamp(session?.updated_at || session?.updatedAt || session?.changed_at || session?.changedAt || session?.created_at || session?.createdAt)].filter(Boolean).join(' · '),
+        tone: 'session',
+      };
+    });
   return {
     total: sessions.length,
     active,
@@ -10202,6 +10373,10 @@ function stationBuildSessionsSummary() {
     latestTask: stationSessionTask(latest),
     latestSource: stationSessionSource(latest),
     latestUpdated: latest ? formatContextTimestamp(latest.updated_at || latest.updatedAt || latest.changed_at || latest.changedAt || latest.created_at || latest.createdAt) : '',
+    indexStatus: sessionsLoaded
+      ? 'loaded'
+      : (stationSessionsIndexLoading ? 'indexing' : (stationSessionsIndexError ? 'error' : 'cold')),
+    recent,
   };
 }
 
@@ -10416,6 +10591,19 @@ function sanitizeStationId(s) {
 function stationNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+function stationTimestampMs(value) {
+  const ms = Date.parse(value || '');
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function stationCompactNumber(value) {
+  const n = stationNum(value);
+  const abs = Math.abs(n);
+  if (abs >= 1000000) return `${(n / 1000000).toFixed(abs >= 10000000 ? 0 : 1)}m`;
+  if (abs >= 1000) return `${(n / 1000).toFixed(abs >= 10000 ? 0 : 1)}k`;
+  return Math.round(n).toString();
 }
 
 function stableStationMetric(seed, base, span) {
@@ -11102,6 +11290,12 @@ async function main() {
     const cmds = app.handle_server_message(msg);
     if (cmds) processCommands(cmds);
   });
+
+  // Apply deep links as soon as the WASM app exists. Peer/settings/session
+  // hydration happens later and can be slow or fail independently; it should
+  // not leave a refreshed dashboard showing the default Activity pane while
+  // the URL says `#station`, `#sessions`, etc.
+  applyCurrentRoute();
 
   if (app.set_on_terminal_output) {
     app.set_on_terminal_output((hostId, terminalId, data) => {
@@ -25544,6 +25738,18 @@ function parseRoute() {
   return { tab, subtab: subtab || null };
 }
 
+function tabDomMatches(tab) {
+  const pane = document.getElementById('tab-' + tab);
+  const activeButton = document.querySelector('.tab-btn.active');
+  const activePane = document.querySelector('.tab-pane.active');
+  return Boolean(
+    pane &&
+    pane.classList.contains('active') &&
+    activeButton?.dataset?.tab === tab &&
+    activePane === pane
+  );
+}
+
 // Navigate the dashboard. Updates the URL via history.pushState (so
 // back/forward works) and calls the existing switch* functions.
 // `subtab` is optional; when omitted, the target tab's default sub-tab
@@ -25555,7 +25761,7 @@ function routeTo(tab, subtab) {
     history.pushState(null, '', nextHash);
   }
   // Main tab first so sub-tab logic runs in the correct pane.
-  const switched = tab !== activeTab;
+  const switched = tab !== activeTab || !tabDomMatches(tab);
   if (switched) {
     switchTab(tab);
   }
@@ -25586,7 +25792,8 @@ function applyCurrentRoute() {
     history.replaceState(null, '', normalized);
   }
   const switched = tab !== activeTab;
-  if (switched) {
+  const needsDomApply = !tabDomMatches(tab);
+  if (switched || needsDomApply) {
     switchTab(tab);
   }
   if (tab === 'activity' && subtab) {

@@ -2068,6 +2068,17 @@ impl StationInner {
                 yy += 19.0;
             }
         }
+        yy += 12.0;
+        self.section_title_color(x, yy, "Largest context items", C_MAUVE_CSS);
+        yy += 18.0;
+        self.detail_rows(
+            x,
+            yy,
+            panel_w,
+            &ctx.top_items,
+            "No item details in this snapshot",
+            5,
+        );
     }
 
     fn draw_managed_info(&mut self, x: f32, y: f32, panel_w: f32) {
@@ -2175,13 +2186,35 @@ impl StationInner {
             C_SUBTEXT0_CSS,
             "normal",
         );
+        yy += 38.0;
+        self.section_title_color(x, yy, "Recent rewinds", C_MAUVE_CSS);
+        yy += 18.0;
+        yy = self.detail_rows(
+            x,
+            yy,
+            panel_w,
+            &managed.recent_records,
+            "No rewind records for this session",
+            4,
+        );
+        yy += 10.0;
+        self.section_title_color(x, yy, "Anchor catalog", C_PEACH_CSS);
+        yy += 18.0;
+        self.detail_rows(
+            x,
+            yy,
+            panel_w,
+            &managed.recent_anchors,
+            "No anchors discovered for this session",
+            5,
+        );
     }
 
     fn draw_sessions_info(&mut self, x: f32, y: f32, panel_w: f32) {
         let sessions = self.snapshot.sessions.clone();
         self.text("sessions", x + 12.0, y + 25.0, 10.0, C_TEAL_CSS, "bold");
         self.text(
-            &format!("{} indexed", sessions.total),
+            &format!("{} known", sessions.total),
             x + 92.0,
             y + 25.0,
             13.0,
@@ -2210,6 +2243,8 @@ impl StationInner {
         );
         yy += 22.0;
         self.panel_row(x, yy, "disk", &format_bytes(sessions.disk_bytes));
+        yy += 22.0;
+        self.panel_row(x, yy, "index", &nonempty(&sessions.index_status, "cold"));
         yy += 30.0;
         self.section_title(x, yy, "Latest session");
         yy += 18.0;
@@ -2247,6 +2282,17 @@ impl StationInner {
             10.0,
             C_SUBTEXT0_CSS,
             "normal",
+        );
+        yy += 78.0;
+        self.section_title_color(x, yy, "Recent sessions", C_MAUVE_CSS);
+        yy += 18.0;
+        self.detail_rows(
+            x,
+            yy,
+            panel_w,
+            &sessions.recent,
+            "No cached sessions yet",
+            5,
         );
     }
 
@@ -2425,6 +2471,59 @@ impl StationInner {
     fn panel_row_color(&self, x: f32, y: f32, k: &str, v: &str, color: &str) {
         self.text(k, x + 14.0, y, 10.0, C_OVERLAY1_CSS, "bold");
         self.text(&truncate(v, 46), x + 94.0, y, 11.0, color, "normal");
+    }
+
+    fn detail_rows(
+        &self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        rows: &[StationDetailRow],
+        empty: &str,
+        max_rows: usize,
+    ) -> f32 {
+        let mut yy = y;
+        if rows.is_empty() {
+            self.panel_row(x, yy, "items", empty);
+            return yy + 20.0;
+        }
+        for row in rows.iter().take(max_rows) {
+            self.round_rect(
+                x + 12.0,
+                yy - 11.0,
+                panel_w - 24.0,
+                35.0,
+                4.0,
+                "rgba(17,17,27,0.76)",
+                "rgba(49,50,68,0.72)",
+            );
+            self.text(
+                &truncate(&row.label, 26),
+                x + 20.0,
+                yy + 1.0,
+                9.5,
+                tone_color_css(&row.tone),
+                "bold",
+            );
+            self.text(
+                &truncate(&row.value, 23),
+                x + panel_w - 120.0,
+                yy + 1.0,
+                9.5,
+                C_TEXT_CSS,
+                "normal",
+            );
+            self.text(
+                &truncate(&row.detail, 54),
+                x + 20.0,
+                yy + 17.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            yy += 39.0;
+        }
+        yy
     }
 
     fn section_title(&self, x: f32, y: f32, title: &str) {
@@ -3460,6 +3559,7 @@ struct StationContextSummary {
     item_count: u32,
     category_count: u32,
     top_categories: Vec<StationBreakdown>,
+    top_items: Vec<StationDetailRow>,
 }
 
 impl Default for StationContextSummary {
@@ -3477,6 +3577,7 @@ impl Default for StationContextSummary {
             item_count: 0,
             category_count: 0,
             top_categories: Vec::new(),
+            top_items: Vec::new(),
         }
     }
 }
@@ -3494,6 +3595,8 @@ struct StationManagedSummary {
     records: u32,
     anchors: u32,
     error: String,
+    recent_records: Vec<StationDetailRow>,
+    recent_anchors: Vec<StationDetailRow>,
 }
 
 impl Default for StationManagedSummary {
@@ -3509,6 +3612,8 @@ impl Default for StationManagedSummary {
             records: 0,
             anchors: 0,
             error: String::new(),
+            recent_records: Vec::new(),
+            recent_anchors: Vec::new(),
         }
     }
 }
@@ -3524,6 +3629,8 @@ struct StationSessionsSummary {
     latest_task: String,
     latest_source: String,
     latest_updated: String,
+    index_status: String,
+    recent: Vec<StationDetailRow>,
 }
 
 impl Default for StationSessionsSummary {
@@ -3537,6 +3644,8 @@ impl Default for StationSessionsSummary {
             latest_task: String::new(),
             latest_source: String::new(),
             latest_updated: String::new(),
+            index_status: String::new(),
+            recent: Vec::new(),
         }
     }
 }
@@ -3589,6 +3698,26 @@ impl Default for StationBreakdown {
         Self {
             label: String::new(),
             value: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StationDetailRow {
+    label: String,
+    value: String,
+    detail: String,
+    tone: String,
+}
+
+impl Default for StationDetailRow {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            value: String::new(),
+            detail: String::new(),
+            tone: String::new(),
         }
     }
 }
@@ -3950,6 +4079,19 @@ fn level_color_css(level: &str) -> &'static str {
         "agent" => C_TEAL_CSS,
         "subagent" => C_MAUVE_CSS,
         "presence" => C_GREEN_CSS,
+        _ => C_OVERLAY1_CSS,
+    }
+}
+
+fn tone_color_css(tone: &str) -> &'static str {
+    match tone {
+        "error" | "red" => C_RED_CSS,
+        "warn" | "warning" | "yellow" => C_YELLOW_CSS,
+        "managed" | "mauve" => C_MAUVE_CSS,
+        "context" | "blue" => C_BLUE_CSS,
+        "session" | "teal" => C_TEAL_CSS,
+        "ok" | "green" => C_GREEN_CSS,
+        "peer" | "peach" => C_PEACH_CSS,
         _ => C_OVERLAY1_CSS,
     }
 }
