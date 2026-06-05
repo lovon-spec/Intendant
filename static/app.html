@@ -10643,6 +10643,7 @@ function stationBuildControlsSummary() {
     : (sessionSource === 'intendant' ? 'internal' : (rawSessionCommand || 'global default'));
   const sessionManagedContext = sessionSource === 'codex' ? sessionConfigManagedMode(sessionMeta) : '';
   const sessionContextArchive = sessionSource === 'codex' ? sessionConfigArchiveMode(sessionMeta) : '';
+  const sessionCanConfig = !!sessionId && !!rawSessionSource && rawSessionSource !== 'intendant';
   return {
     backend: backend || 'none',
     sandbox: isGemini
@@ -10669,6 +10670,7 @@ function stationBuildControlsSummary() {
     sessionCommand,
     sessionManagedContext,
     sessionContextArchive,
+    sessionCanConfig,
   };
 }
 

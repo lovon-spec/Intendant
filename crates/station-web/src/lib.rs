@@ -2501,6 +2501,37 @@ impl StationInner {
             "archive",
             &nonempty(&controls.session_context_archive, "--"),
         );
+        yy += 30.0;
+        if controls.session_can_config && !controls.session_id.is_empty() {
+            self.section_title_color(x, yy, "Session actions", C_MAUVE_CSS);
+            yy += 22.0;
+            self.pill_at(
+                x + 14.0,
+                yy - 14.0,
+                112.0,
+                21.0,
+                "launch config",
+                C_MAUVE_CSS,
+            );
+            self.hit_zones.push(HitZone::new(
+                x + 14.0,
+                yy - 14.0,
+                112.0,
+                21.0,
+                HitAction::SessionAction {
+                    action: "config".to_string(),
+                    session_id: controls.session_id.clone(),
+                },
+            ));
+            self.text(
+                "per-session binary and managed mode",
+                x + 136.0,
+                yy + 2.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+        }
     }
 
     fn panel_row(&self, x: f32, y: f32, k: &str, v: &str) {
@@ -3959,6 +3990,7 @@ struct StationControlsSummary {
     session_command: String,
     session_managed_context: String,
     session_context_archive: String,
+    session_can_config: bool,
 }
 
 impl Default for StationControlsSummary {
@@ -3981,6 +4013,7 @@ impl Default for StationControlsSummary {
             session_command: String::new(),
             session_managed_context: String::new(),
             session_context_archive: String::new(),
+            session_can_config: false,
         }
     }
 }
