@@ -2190,22 +2190,14 @@ impl StationInner {
             x,
             yy,
             "effective",
-            &format!(
-                "{} / {}",
-                compact_number(managed.used_tokens as f64),
-                compact_number(managed.effective_window as f64)
-            ),
+            &format_token_ratio(managed.used_tokens, managed.effective_window),
         );
         yy += 20.0;
         self.panel_row(
             x,
             yy,
             "hard",
-            &format!(
-                "{} / {}",
-                compact_number(managed.used_tokens as f64),
-                compact_number(managed.hard_window as f64)
-            ),
+            &format_token_ratio(managed.used_tokens, managed.hard_window),
         );
         yy += 22.0;
         self.panel_row(
@@ -4827,6 +4819,18 @@ fn compact_number(value: f64) -> String {
         format!("{:.1}k", value / 1_000.0)
     } else {
         format!("{value:.0}")
+    }
+}
+
+fn format_token_ratio(used: f32, window: f32) -> String {
+    if window <= 0.0 {
+        "-- / --".to_string()
+    } else {
+        format!(
+            "{} / {}",
+            compact_number(used as f64),
+            compact_number(window as f64)
+        )
     }
 }
 
