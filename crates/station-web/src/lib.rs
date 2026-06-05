@@ -318,9 +318,13 @@ impl StationInner {
                     if let Some(action) = drag.pending_action {
                         s.dispatch_hit(action, x, y)
                     } else if !drag.moved {
-                        s.selected_id = s.pick_node(x, y);
-                        s.panel_scroll = 0.0;
-                        None
+                        if s.info_panel_hit(x, y) {
+                            None
+                        } else {
+                            s.selected_id = s.pick_node(x, y);
+                            s.panel_scroll = 0.0;
+                            None
+                        }
                     } else {
                         None
                     }
@@ -345,7 +349,8 @@ impl StationInner {
             e.prevent_default();
             let mut s = wheel_inner.borrow_mut();
             s.mark_input();
-            if s.panel_hit(e.client_x() as f64, e.client_y() as f64) {
+            let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+            if s.info_panel_hit(x, y) {
                 s.panel_scroll = (s.panel_scroll + e.delta_y() as f32).max(0.0);
             } else {
                 s.distance = (s.distance + e.delta_y() as f32 * 0.014).clamp(4.2, 25.0);
@@ -1575,6 +1580,8 @@ impl StationInner {
             "rgba(24,24,37,0.94)",
             "rgba(69,71,90,0.92)",
         );
+        self.hit_zones
+            .push(HitZone::new(x, y, panel_w, panel_h, HitAction::Noop));
         self.hit_zones.push(HitZone::new(
             x + panel_w - 31.0,
             y + 8.0,
@@ -3448,10 +3455,17 @@ impl StationInner {
             .map(|z| z.action.clone())
     }
 
-    fn panel_hit(&self, client_x: f64, client_y: f64) -> bool {
-        let (x, y) = self.event_xy(client_x, client_y);
+    fn info_panel_hit(&self, x: f32, y: f32) -> bool {
+        if self.selected_id.is_none() {
+            return false;
+        }
         let w = self.css_width();
-        x > w - 380.0 && y > 48.0
+        let h = self.css_height();
+        let panel_w = 350.0_f32.min(w - 28.0).max(280.0);
+        let panel_x = w - panel_w - 14.0;
+        let panel_y = 52.0;
+        let panel_h = (h - 76.0).min(560.0);
+        x >= panel_x && x <= panel_x + panel_w && y >= panel_y && y <= panel_y + panel_h
     }
 
     fn event_xy(&self, client_x: f64, client_y: f64) -> (f32, f32) {
