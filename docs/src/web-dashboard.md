@@ -121,13 +121,15 @@ item, and the Context panel can jump into live/replay mode, focus view, raw
 rendering, or reset view through the canonical **Activity → Context** toolbar.
 Managed rows select rewind anchors or saved rewind records, and the Managed
 panel can jump straight into the rewind, backout/restore, or refresh workflows.
-Session rows can resume or open Launch config, and the Sessions panel links
-straight to New Session and Deep Search. The Peers panel links to both the
-Network settings and the Video display surface, while the Control panel exposes
-the full Codex thread, goal, setup, and memory action groups through the same
-dispatcher, prompts, and confirmations used by **Activity → Control**, plus the
-active external session's per-session binary and managed-context launch
-configuration when that backend supports it.
+Changed-file rows open the canonical diff viewer, and the Changes panel exposes
+refresh, redo, and prune through **Activity → Changes**, including the existing
+prune confirmation. Session rows can resume or open Launch config, and the
+Sessions panel links straight to New Session and Deep Search. The Peers panel
+links to both the Network settings and the Video display surface, while the
+Control panel exposes the full Codex thread, goal, setup, and memory action
+groups through the same dispatcher, prompts, and confirmations used by
+**Activity → Control**, plus the active external session's per-session binary
+and managed-context launch configuration when that backend supports it.
 
 ### Sessions
 

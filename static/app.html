@@ -10398,6 +10398,19 @@ function stationHandleChangesAction(action) {
   const op = String(action.action || 'file').trim();
   const path = String(action.path || action.id || '').trim();
   stationForceRouteTo('activity', 'changes', () => {
+    if (op === 'refresh') {
+      if (typeof refreshHistory === 'function') refreshHistory();
+      refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
+      return;
+    }
+    if (op === 'redo') {
+      document.getElementById('redo-btn')?.click();
+      return;
+    }
+    if (op === 'prune') {
+      document.getElementById('prune-btn')?.click();
+      return;
+    }
     if (op !== 'file' || !path) {
       refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
       return;

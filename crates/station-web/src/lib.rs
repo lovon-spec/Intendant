@@ -2423,6 +2423,29 @@ impl StationInner {
             ),
         );
         yy += 30.0;
+        self.section_title_color(x, yy, "Change controls", C_YELLOW_CSS);
+        yy += 22.0;
+        let change_actions = [
+            ("refresh", "refresh", 68.0),
+            ("redo", "redo", 54.0),
+            ("prune", "prune", 62.0),
+        ];
+        let mut ax = x + 14.0;
+        for (action, label, width) in change_actions {
+            self.pill_at(ax, yy - 14.0, width, 21.0, label, C_YELLOW_CSS);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                yy - 14.0,
+                width,
+                21.0,
+                HitAction::ChangesAction {
+                    action: action.to_string(),
+                    path: String::new(),
+                },
+            ));
+            ax += width + 8.0;
+        }
+        yy += 30.0;
         self.section_title_color(x, yy, "Changed files", C_YELLOW_CSS);
         yy += 18.0;
         self.changes_detail_rows(
