@@ -10355,8 +10355,43 @@ function stationCssEscape(value) {
 function stationHandleActivityAction(action) {
   const op = String(action.action || '').trim();
   const id = String(action.id || '').trim();
+  if (op.startsWith('verbosity:')) {
+    stationSetActivityVerbosity(op.slice('verbosity:'.length));
+    return;
+  }
+  if (op === 'host:all') {
+    stationClearActivityHostFilter();
+    return;
+  }
+  if (op === 'bottom') {
+    stationForceRouteTo('activity', 'log', () => document.getElementById('scroll-bottom')?.click());
+    return;
+  }
   if (op !== 'log' || !id) return;
   stationForceRouteTo('activity', 'log', () => focusActivityLogEvent(id));
+}
+
+function stationSetActivityVerbosity(level) {
+  const next = String(level || '').trim();
+  if (!['normal', 'verbose', 'debug'].includes(next)) return;
+  const select = document.getElementById('verbosity-select');
+  if (select) select.value = next;
+  if (app) processCommands(app.set_verbosity(next));
+  localStorage.setItem(VERBOSITY_KEY, next);
+  if (typeof showControlToast === 'function') {
+    showControlToast('success', `Activity log verbosity: ${next}`);
+  }
+}
+
+function stationClearActivityHostFilter() {
+  activeHostFilter = '';
+  const select = document.getElementById('host-filter-select');
+  if (select) select.value = '';
+  localStorage.setItem(HOST_FILTER_KEY, activeHostFilter);
+  applyHostFilter();
+  if (typeof showControlToast === 'function') {
+    showControlToast('success', 'Activity host filter cleared');
+  }
 }
 
 function stationHandleChangesAction(action) {

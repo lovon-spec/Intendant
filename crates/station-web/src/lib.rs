@@ -1980,6 +1980,36 @@ impl StationInner {
                 .unwrap_or(C_OVERLAY1_CSS),
         );
         yy += 30.0;
+        self.section_title_color(x, yy, "Log controls", C_TEAL_CSS);
+        yy += 22.0;
+        let log_actions = [
+            ("verbosity:normal", "normal", 66.0),
+            ("verbosity:verbose", "verbose", 74.0),
+            ("verbosity:debug", "debug", 58.0),
+            ("host:all", "all hosts", 76.0),
+            ("bottom", "bottom", 62.0),
+        ];
+        let mut ax = x + 14.0;
+        let mut ay = yy - 14.0;
+        for (action, label, width) in log_actions {
+            if ax + width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, width, 21.0, label, C_TEAL_CSS);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                width,
+                21.0,
+                HitAction::ActivityAction {
+                    action: action.to_string(),
+                    id: String::new(),
+                },
+            ));
+            ax += width + 8.0;
+        }
+        yy = ay + 35.0;
         self.section_title(x, yy, "Recent activity");
         yy += 18.0;
         self.round_rect(

@@ -114,13 +114,15 @@ canonical dashboard surface, such as a changed file row opening
 **Activity → Changes** with that file's diff selected.
 
 The Station detail panels are also direct launch points for common operations:
-Activity rows focus the matching log entry, context rows open the selected
-context item, and the Context panel can jump into live/replay mode, focus view,
-raw rendering, or reset view through the canonical **Activity → Context**
-toolbar. Managed rows select rewind anchors or saved rewind records, and the
-Managed panel can jump straight into the rewind, backout/restore, or refresh
-workflows. Session rows can resume or open Launch config, and the Sessions panel
-links straight to New Session and Deep Search. The Peers panel links to both the
+Activity rows focus the matching log entry, and the Activity panel can set log
+verbosity, clear the host filter, or jump to the live log bottom through the
+same state used by **Activity → Log**. Context rows open the selected context
+item, and the Context panel can jump into live/replay mode, focus view, raw
+rendering, or reset view through the canonical **Activity → Context** toolbar.
+Managed rows select rewind anchors or saved rewind records, and the Managed
+panel can jump straight into the rewind, backout/restore, or refresh workflows.
+Session rows can resume or open Launch config, and the Sessions panel links
+straight to New Session and Deep Search. The Peers panel links to both the
 Network settings and the Video display surface, while the Control panel exposes
 the full Codex thread, goal, setup, and memory action groups through the same
 dispatcher, prompts, and confirmations used by **Activity → Control**, plus the
