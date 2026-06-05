@@ -357,7 +357,39 @@ impl McpAppState {
         None
     }
 
+    fn normalize_main_usage_snapshot(
+        &self,
+        session_id: Option<&str>,
+        mut usage: frontend::ModelUsageSnapshot,
+    ) -> frontend::ModelUsageSnapshot {
+        let previous_hard = session_id
+            .and_then(|id| {
+                self.session_usage_for_id(id)
+                    .and_then(|previous| previous.hard_context_window)
+            })
+            .or(self.hard_context_window)
+            .filter(|hard| *hard > 0);
+        let Some(previous_hard) = previous_hard else {
+            return usage;
+        };
+        if usage.context_window == 0 {
+            return usage;
+        }
+
+        let should_preserve = match usage.hard_context_window {
+            Some(current_hard) if current_hard > 0 => {
+                current_hard <= usage.context_window && previous_hard > current_hard
+            }
+            _ => previous_hard > usage.context_window,
+        };
+        if should_preserve {
+            usage.hard_context_window = Some(previous_hard);
+        }
+        usage
+    }
+
     fn apply_main_usage_snapshot(&mut self, usage: frontend::ModelUsageSnapshot) {
+        let usage = self.normalize_main_usage_snapshot(None, usage);
         if !usage.provider.is_empty() {
             self.provider_name = usage.provider.clone();
         }
@@ -3042,6 +3074,8 @@ pub fn spawn_event_listener(
                         main,
                         presence,
                     } => {
+                        let main =
+                            s.normalize_main_usage_snapshot(session_id.as_deref(), main.clone());
                         if let Some(id) = session_id
                             .as_deref()
                             .map(str::trim)
@@ -3798,6 +3832,7 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             main,
             presence,
         } => {
+            let main = s.normalize_main_usage_snapshot(session_id.as_deref(), main.clone());
             if let Some(id) = session_id
                 .as_deref()
                 .map(str::trim)
@@ -7314,6 +7349,50 @@ mod tests {
             assert_eq!(pressure["rewind_only_limit"], 100_000);
             assert_eq!(pressure["rewind_only"], false);
             assert_eq!(pressure["managed_context"], "vanilla");
+        });
+    }
+
+    #[test]
+    fn usage_snapshot_preserves_known_hard_limit_when_backend_collapses_to_soft_limit() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "codex".to_string(),
+                tokens_used: 245_915,
+                context_window: 258_400,
+                hard_context_window: Some(272_000),
+                usage_pct: 95.2,
+                prompt_tokens: 245_915,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            });
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "codex".to_string(),
+                tokens_used: 258_400,
+                context_window: 258_400,
+                hard_context_window: Some(258_400),
+                usage_pct: 100.0,
+                prompt_tokens: 258_400,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            });
+
+            let pressure = s.context_pressure_snapshot();
+            assert_eq!(pressure["status"], "high");
+            assert_eq!(pressure["used_tokens"], 258_400);
+            assert_eq!(pressure["context_window"], 258_400);
+            assert_eq!(pressure["hard_limit"], 272_000);
+            assert_eq!(pressure["remaining_hard_tokens"], 13_600);
+            assert_eq!(pressure["rewind_only"], true);
         });
     }
 

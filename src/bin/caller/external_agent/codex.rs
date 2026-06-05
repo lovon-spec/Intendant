@@ -2836,6 +2836,10 @@ fn codex_usage_cached_tokens(value: &serde_json::Value) -> Option<u64> {
 }
 
 fn codex_usage_snapshot(value: &serde_json::Value, model: &str) -> Option<AgentUsageSnapshot> {
+    if codex_usage_token_count_kind(value) != Some(AgentContextTokenCountKind::BackendReported) {
+        return None;
+    }
+
     let total = codex_usage_bucket(value, &["total", "total_token_usage"]).unwrap_or(value);
     let last = codex_usage_bucket(value, &["last", "last_token_usage"]);
 
@@ -5693,6 +5697,23 @@ mod tests {
 
         let merged = codex_usage_preserving_hard_context_window(expanded, Some(&previous));
         assert_eq!(codex_usage_hard_context_window(&merged), Some(200));
+    }
+
+    #[test]
+    fn codex_usage_snapshot_ignores_local_estimates() {
+        let usage = serde_json::json!({
+            "last_token_usage": {
+                "total_tokens": 314358
+            },
+            "model_context_window": 258400,
+            "model_hard_context_window": 272000
+        });
+
+        assert_eq!(
+            codex_usage_token_count_kind(&usage),
+            Some(AgentContextTokenCountKind::LocalEstimate)
+        );
+        assert!(codex_usage_snapshot(&usage, "codex").is_none());
     }
 
     #[tokio::test]
