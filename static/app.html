@@ -10006,8 +10006,9 @@ function stationLogEventId(c, fallbackIndex = '') {
   return parts.length ? parts.join(':') : `event:${Date.now()}`;
 }
 
-function stationLogEntryEvent(entry, index) {
-  if (!entry || entry.closest('.session-window-log, .session-detail-logs')) return null;
+function stationLogEntryEvent(entry, index, options = {}) {
+  if (!entry || entry.closest('.session-detail-logs')) return null;
+  if (!options.includeSessionWindow && entry.closest('.session-window-log')) return null;
   const hostId = entry.dataset.hostId || selfPeerId;
   const sessionId = entry.dataset.sessionId || '';
   const ts = entry.querySelector('.log-ts')?.textContent?.trim() || '';
@@ -10040,12 +10041,86 @@ function stationLogEntryEvent(entry, index) {
 }
 
 function stationDomLogEvents(limit = 80) {
-  const stream = document.getElementById('log-stream');
-  if (!stream) return [];
-  return Array.from(stream.querySelectorAll('.log-entry'))
+  const containers = stationLogScanContainers();
+  if (containers.length === 0) return [];
+  const entries = [];
+  containers.forEach((container, containerIndex) => {
+    const includeSessionWindow = container.classList?.contains('session-window-log');
+    Array.from(container.querySelectorAll('.log-entry')).forEach((entry, entryIndex) => {
+      entries.push({
+        entry,
+        index: `${containerIndex}:${entryIndex}`,
+        includeSessionWindow,
+      });
+    });
+  });
+  return entries
     .slice(-limit)
-    .map((entry, index) => stationLogEntryEvent(entry, index))
+    .map(item => stationLogEntryEvent(item.entry, item.index, {
+      includeSessionWindow: item.includeSessionWindow,
+    }))
     .filter(Boolean);
+}
+
+function stationSessionWindowHistoryEvent(item, win, index) {
+  const node = sessionWindowHistoryNode(item);
+  if (node) {
+    return stationLogEntryEvent(node, index, { includeSessionWindow: true });
+  }
+  const record = sessionWindowHistoryRecord(item);
+  if (!record) return null;
+  const hostId = record.host_id || record.hostId || selfPeerId;
+  const sessionId = record.session_id || record.sessionId || win?.sessionId || '';
+  const source = record.source || record.level || 'info';
+  const content = record.content || record.summary || record.message || '';
+  const eventId = stationLogEventId({
+    ...record,
+    host_id: hostId,
+    session_id: sessionId,
+    source,
+    content,
+  }, index);
+  const msg = compactSessionText(content).replace(/\s+/g, ' ').trim();
+  return {
+    id: eventId,
+    action: 'log',
+    hostId,
+    agentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
+    ts: formatLogTimestampLabel(record.ts || record.timestamp || ''),
+    level: record.level || 'info',
+    msg: msg || source,
+  };
+}
+
+function stationSessionWindowHistoryEvents(limit = 80) {
+  const events = [];
+  for (const win of sessionWindows.values()) {
+    const history = ensureSessionWindowHistory(win);
+    history.forEach((item, index) => {
+      events.push(stationSessionWindowHistoryEvent(item, win, `${win.sessionId || 'session'}:${index}`));
+    });
+  }
+  return events.filter(Boolean).slice(-limit);
+}
+
+function stationLogScanContainers() {
+  const seen = new Set();
+  const containers = [];
+  const add = container => {
+    if (!container || seen.has(container)) return;
+    seen.add(container);
+    containers.push(container);
+  };
+  if (typeof mainLogContainers === 'function') {
+    for (const container of mainLogContainers()) add(container);
+  } else {
+    add(document.getElementById('log-stream'));
+  }
+  for (const win of sessionWindows.values()) {
+    add(win?.log);
+  }
+  document.querySelectorAll('.session-window-log').forEach(add);
+  return containers;
 }
 
 function stationActivityEvents() {
@@ -10059,6 +10134,7 @@ function stationActivityEvents() {
     events.push(event);
   };
   for (const event of stationDomLogEvents()) add(event);
+  for (const event of stationSessionWindowHistoryEvents()) add(event);
   for (const event of stationLogEvents) add(event);
   return events.slice(-80);
 }
@@ -12218,6 +12294,7 @@ function processCommands(cmds) {
     if (createdLogReplayBatch) {
       flushLogReplayAppendBatch();
       logReplayAppendBatch = previousLogReplayBatch;
+      stationScheduleUpdate();
     }
   }
 }
@@ -16779,6 +16856,7 @@ async function restorePersistedSessionWindows() {
   } finally {
     restoringPersistedSessionWindows = false;
     persistSessionWindowState();
+    stationScheduleUpdate();
   }
 }
 
@@ -16835,6 +16913,7 @@ async function restorePersistedSessionWindow(record) {
       phase: 'idle',
       ended: false,
     });
+    stationScheduleUpdate();
   } catch (err) {
     console.warn('Failed to restore session window', sid, err);
   } finally {
