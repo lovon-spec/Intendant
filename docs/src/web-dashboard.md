@@ -40,13 +40,13 @@ terminal — then the TUI takes the foreground. See [TUI & Autonomy](./tui.md).
 
 ## Tabs
 
-The top tab bar has seven tabs: **Activity**, **Stats**, **Terminal**,
-**Video**, **Sessions**, **Debug**, **Settings**. New events arriving while you
-are on another tab raise a notification badge.
+The top tab bar has eight tabs: **Activity**, **Stats**, **Terminal**,
+**Video**, **Station**, **Sessions**, **Debug**, **Settings**. New events
+arriving while you are on another tab raise a notification badge.
 
 ### Activity
 
-The default tab. Four subtabs:
+The default tab. Five subtabs:
 
 - **Log** — a scrollable, color-coded event stream of everything in the system,
   grouped by turn with visual separators, with a verbosity selector
@@ -61,6 +61,8 @@ The default tab. Four subtabs:
   / Deny) and a follow-up text input for sending a message after a round
   completes.
 - **Context** — the agent's current working context (what it is operating on).
+- **Managed** — managed-context anchors, rewind records, and recovery actions for
+  managed Codex sessions.
 - **Changes** — file changes / diffs produced during the session (with its own
   badge when new changes land).
 - **Control** — direct controls for steering the run.
@@ -101,6 +103,15 @@ Displays appear automatically when the agent's first command triggers Xvfb
 auto-launch, or when access to the user's real session display is granted.
 WebRTC negotiation (SDP offer/answer + ICE candidates) is multiplexed over the
 existing dashboard WebSocket.
+
+### Station
+
+An immersive WASM/WGPU-style control center for the same operational surfaces as
+the rest of the dashboard. The left control-center cards summarize Activity,
+Context, Managed context, Changes, Sessions, Peers/displays, and Control. Each
+card opens a power-user detail panel; actionable rows jump back into the
+canonical dashboard surface, such as a changed file row opening
+**Activity → Changes** with that file's diff selected.
 
 ### Sessions
 

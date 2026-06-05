@@ -1091,7 +1091,12 @@ impl StationInner {
         let x = if compact_grid { 246.0 } else { 12.0 };
         let y = if compact_grid { 52.0 } else { 242.0 };
         let w = if compact_grid { 390.0 } else { 222.0 };
-        let rows = if compact_grid { 3.0 } else { 6.0 };
+        let card_count = 7.0;
+        let rows = if compact_grid {
+            (card_count / 2.0_f32).ceil()
+        } else {
+            card_count
+        };
         let card_gap = if compact_grid { 6.0 } else { 4.0 };
         let card_col_gap = if compact_grid { 6.0 } else { 0.0 };
         let inner_w = w - 20.0;
@@ -1104,7 +1109,7 @@ impl StationInner {
             44.0
         } else {
             let available_h = (self.css_height() - y - 14.0).max(0.0);
-            ((available_h - 45.0 - (card_gap * 5.0)) / 6.0).clamp(38.0, 47.0)
+            ((available_h - 45.0 - (card_gap * (card_count - 1.0))) / card_count).clamp(38.0, 47.0)
         };
         let panel_h = 45.0 + (card_h * rows) + (card_gap * (rows - 1.0));
         self.round_rect(
@@ -1221,6 +1226,44 @@ impl StationInner {
             &managed_detail,
             pressure_color(managed_pct),
             "system:managed",
+        );
+
+        let changes = &self.snapshot.changes;
+        let changes_value = if changes.count > 0 {
+            format!(
+                "{} files · +{} -{}",
+                changes.count,
+                compact_number(changes.total_added as f64),
+                compact_number(changes.total_removed as f64)
+            )
+        } else {
+            nonempty(&changes.status, "clean")
+        };
+        let changes_detail = if changes.latest_path.is_empty() {
+            if changes.count > 0 {
+                "tracked changes".to_string()
+            } else {
+                "working tree clean".to_string()
+            }
+        } else {
+            truncate(&changes.latest_path, 34)
+        };
+        let (card_x, card_y) = card_slot(card_idx);
+        card_idx += 1;
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "Changes",
+            &changes_value,
+            &changes_detail,
+            if changes.count > 0 || changes.status == "mismatch" {
+                C_YELLOW_CSS
+            } else {
+                C_GREEN_CSS
+            },
+            "system:changes",
         );
 
         let session_value = format!(
@@ -1566,6 +1609,10 @@ impl StationInner {
         }
         if id == "system:managed" {
             self.draw_managed_info(x, y, panel_w);
+            return;
+        }
+        if id == "system:changes" {
+            self.draw_changes_info(x, y, panel_w);
             return;
         }
         if id == "system:sessions" {
@@ -2222,6 +2269,98 @@ impl StationInner {
         );
     }
 
+    fn draw_changes_info(&mut self, x: f32, y: f32, panel_w: f32) {
+        let changes = self.snapshot.changes.clone();
+        self.text("changes", x + 12.0, y + 25.0, 10.0, C_YELLOW_CSS, "bold");
+        self.text(
+            &format!("{} files", changes.count),
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.nav_button(
+            x + panel_w - 132.0,
+            y + 10.0,
+            94.0,
+            "open changes",
+            "activity",
+            Some("changes"),
+            C_YELLOW_CSS,
+        );
+        let mut yy = y + 54.0 - self.panel_scroll;
+        self.panel_row_color(
+            x,
+            yy,
+            "state",
+            &nonempty(&changes.status, "clean"),
+            if changes.count > 0 || changes.status == "mismatch" {
+                C_YELLOW_CSS
+            } else {
+                C_GREEN_CSS
+            },
+        );
+        yy += 22.0;
+        self.panel_row(x, yy, "files", &changes.count.to_string());
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "kinds",
+            &format!(
+                "{} add · {} mod · {} del",
+                changes.added, changes.modified, changes.deleted
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(x, yy, "external", &changes.external.to_string());
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "lines",
+            &format!(
+                "+{} / -{}",
+                compact_number(changes.total_added as f64),
+                compact_number(changes.total_removed as f64)
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "latest",
+            &truncate(
+                &if changes.latest_path.is_empty() {
+                    "--".to_string()
+                } else {
+                    format!(
+                        "{} · {}",
+                        nonempty(&changes.latest_kind, "file"),
+                        changes.latest_path
+                    )
+                },
+                42,
+            ),
+        );
+        yy += 30.0;
+        self.section_title_color(x, yy, "Changed files", C_YELLOW_CSS);
+        yy += 18.0;
+        self.changes_detail_rows(
+            x,
+            yy,
+            panel_w,
+            &changes.recent,
+            if changes.status == "mismatch" {
+                "Change tracking is pointed at another root"
+            } else {
+                "No file changes yet"
+            },
+            7,
+        );
+    }
+
     fn draw_sessions_info(&mut self, x: f32, y: f32, panel_w: f32) {
         let sessions = self.snapshot.sessions.clone();
         self.text("sessions", x + 12.0, y + 25.0, 10.0, C_TEAL_CSS, "bold");
@@ -2818,6 +2957,91 @@ impl StationInner {
         yy
     }
 
+    fn changes_detail_rows(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        rows: &[StationDetailRow],
+        empty: &str,
+        max_rows: usize,
+    ) -> f32 {
+        let mut yy = y;
+        if rows.is_empty() {
+            self.panel_row(x, yy, "items", empty);
+            return yy + 20.0;
+        }
+        for row in rows.iter().take(max_rows) {
+            self.round_rect(
+                x + 12.0,
+                yy - 11.0,
+                panel_w - 24.0,
+                43.0,
+                4.0,
+                "rgba(17,17,27,0.76)",
+                "rgba(49,50,68,0.72)",
+            );
+            if !row.id.is_empty() && !row.action.is_empty() {
+                self.hit_zones.push(HitZone::new(
+                    x + 12.0,
+                    yy - 11.0,
+                    panel_w - 24.0,
+                    43.0,
+                    HitAction::ChangesAction {
+                        action: row.action.clone(),
+                        path: row.id.clone(),
+                    },
+                ));
+            }
+            self.text(
+                &truncate(&row.label, 28),
+                x + 20.0,
+                yy + 1.0,
+                9.5,
+                tone_color_css(&row.tone),
+                "bold",
+            );
+            self.text(
+                &truncate(&row.value, 20),
+                x + panel_w - 126.0,
+                yy + 1.0,
+                9.5,
+                C_TEXT_CSS,
+                "normal",
+            );
+            self.text(
+                &truncate(&row.detail, 36),
+                x + 20.0,
+                yy + 18.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            if !row.id.is_empty() && row.action == "file" {
+                self.pill_at(
+                    x + panel_w - 78.0,
+                    yy + 15.0,
+                    50.0,
+                    19.0,
+                    "open",
+                    C_YELLOW_CSS,
+                );
+                self.hit_zones.push(HitZone::new(
+                    x + panel_w - 78.0,
+                    yy + 15.0,
+                    50.0,
+                    19.0,
+                    HitAction::ChangesAction {
+                        action: row.action.clone(),
+                        path: row.id.clone(),
+                    },
+                ));
+            }
+            yy += 47.0;
+        }
+        yy
+    }
+
     fn section_title(&self, x: f32, y: f32, title: &str) {
         self.section_title_color(x, y, title, C_BLUE_CSS);
     }
@@ -3172,6 +3396,11 @@ impl StationInner {
                     "action": action,
                     "id": id,
                     "session_id": session_id,
+            })),
+            HitAction::ChangesAction { action, path } => Some(serde_json::json!({
+                    "type": "changes_action",
+                    "action": action,
+                    "path": path,
             })),
             HitAction::SessionAction { action, session_id } => Some(serde_json::json!({
                     "type": "session_action",
@@ -3750,6 +3979,7 @@ struct StationSnapshot {
     events: Vec<StationEvent>,
     context: StationContextSummary,
     managed: StationManagedSummary,
+    changes: StationChangesSummary,
     sessions: StationSessionsSummary,
     controls: StationControlsSummary,
 }
@@ -3934,6 +4164,40 @@ impl Default for StationManagedSummary {
             error: String::new(),
             recent_records: Vec::new(),
             recent_anchors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StationChangesSummary {
+    status: String,
+    count: u32,
+    added: u32,
+    modified: u32,
+    deleted: u32,
+    external: u32,
+    total_added: u32,
+    total_removed: u32,
+    latest_path: String,
+    latest_kind: String,
+    recent: Vec<StationDetailRow>,
+}
+
+impl Default for StationChangesSummary {
+    fn default() -> Self {
+        Self {
+            status: "clean".into(),
+            count: 0,
+            added: 0,
+            modified: 0,
+            deleted: 0,
+            external: 0,
+            total_added: 0,
+            total_removed: 0,
+            latest_path: String::new(),
+            latest_kind: String::new(),
+            recent: Vec::new(),
         }
     }
 }
@@ -4131,6 +4395,10 @@ enum HitAction {
         action: String,
         id: String,
         session_id: String,
+    },
+    ChangesAction {
+        action: String,
+        path: String,
     },
     SessionAction {
         action: String,
@@ -4451,6 +4719,7 @@ fn tone_color_css(tone: &str) -> &'static str {
         "context" | "blue" => C_BLUE_CSS,
         "session" | "teal" => C_TEAL_CSS,
         "ok" | "green" => C_GREEN_CSS,
+        "changes" => C_YELLOW_CSS,
         "peer" | "peach" => C_PEACH_CSS,
         _ => C_OVERLAY1_CSS,
     }
