@@ -2071,7 +2071,7 @@ impl StationInner {
         yy += 12.0;
         self.section_title_color(x, yy, "Largest context items", C_MAUVE_CSS);
         yy += 18.0;
-        self.detail_rows(
+        self.context_detail_rows(
             x,
             yy,
             panel_w,
@@ -2500,59 +2500,6 @@ impl StationInner {
         self.text(&truncate(v, 46), x + 94.0, y, 11.0, color, "normal");
     }
 
-    fn detail_rows(
-        &self,
-        x: f32,
-        y: f32,
-        panel_w: f32,
-        rows: &[StationDetailRow],
-        empty: &str,
-        max_rows: usize,
-    ) -> f32 {
-        let mut yy = y;
-        if rows.is_empty() {
-            self.panel_row(x, yy, "items", empty);
-            return yy + 20.0;
-        }
-        for row in rows.iter().take(max_rows) {
-            self.round_rect(
-                x + 12.0,
-                yy - 11.0,
-                panel_w - 24.0,
-                35.0,
-                4.0,
-                "rgba(17,17,27,0.76)",
-                "rgba(49,50,68,0.72)",
-            );
-            self.text(
-                &truncate(&row.label, 26),
-                x + 20.0,
-                yy + 1.0,
-                9.5,
-                tone_color_css(&row.tone),
-                "bold",
-            );
-            self.text(
-                &truncate(&row.value, 23),
-                x + panel_w - 120.0,
-                yy + 1.0,
-                9.5,
-                C_TEXT_CSS,
-                "normal",
-            );
-            self.text(
-                &truncate(&row.detail, 54),
-                x + 20.0,
-                yy + 17.0,
-                9.0,
-                C_SUBTEXT0_CSS,
-                "normal",
-            );
-            yy += 39.0;
-        }
-        yy
-    }
-
     fn session_detail_rows(
         &mut self,
         x: f32,
@@ -2735,6 +2682,91 @@ impl StationInner {
                         action: row.action.clone(),
                         id: row.id.clone(),
                         session_id: row.session_id.clone(),
+                    },
+                ));
+            }
+            yy += 47.0;
+        }
+        yy
+    }
+
+    fn context_detail_rows(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        rows: &[StationDetailRow],
+        empty: &str,
+        max_rows: usize,
+    ) -> f32 {
+        let mut yy = y;
+        if rows.is_empty() {
+            self.panel_row(x, yy, "items", empty);
+            return yy + 20.0;
+        }
+        for row in rows.iter().take(max_rows) {
+            self.round_rect(
+                x + 12.0,
+                yy - 11.0,
+                panel_w - 24.0,
+                43.0,
+                4.0,
+                "rgba(17,17,27,0.76)",
+                "rgba(49,50,68,0.72)",
+            );
+            if !row.id.is_empty() && !row.action.is_empty() {
+                self.hit_zones.push(HitZone::new(
+                    x + 12.0,
+                    yy - 11.0,
+                    panel_w - 24.0,
+                    43.0,
+                    HitAction::ContextAction {
+                        action: row.action.clone(),
+                        id: row.id.clone(),
+                    },
+                ));
+            }
+            self.text(
+                &truncate(&row.label, 28),
+                x + 20.0,
+                yy + 1.0,
+                9.5,
+                tone_color_css(&row.tone),
+                "bold",
+            );
+            self.text(
+                &truncate(&row.value, 20),
+                x + panel_w - 126.0,
+                yy + 1.0,
+                9.5,
+                C_TEXT_CSS,
+                "normal",
+            );
+            self.text(
+                &truncate(&row.detail, 36),
+                x + 20.0,
+                yy + 18.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            if !row.id.is_empty() && row.action == "part" {
+                self.pill_at(
+                    x + panel_w - 78.0,
+                    yy + 15.0,
+                    50.0,
+                    19.0,
+                    "open",
+                    C_BLUE_CSS,
+                );
+                self.hit_zones.push(HitZone::new(
+                    x + panel_w - 78.0,
+                    yy + 15.0,
+                    50.0,
+                    19.0,
+                    HitAction::ContextAction {
+                        action: row.action.clone(),
+                        id: row.id.clone(),
                     },
                 ));
             }
@@ -3077,6 +3109,11 @@ impl StationInner {
                     "type": "navigate",
                     "tab": tab,
                     "subtab": subtab,
+            })),
+            HitAction::ContextAction { action, id } => Some(serde_json::json!({
+                    "type": "context_action",
+                    "action": action,
+                    "id": id,
             })),
             HitAction::ManagedAction {
                 action,
@@ -4029,6 +4066,10 @@ enum HitAction {
     Navigate {
         tab: String,
         subtab: Option<String>,
+    },
+    ContextAction {
+        action: String,
+        id: String,
     },
     ManagedAction {
         action: String,

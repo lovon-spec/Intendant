@@ -10049,6 +10049,8 @@ function handleStationAction(action) {
     stationHandleSessionAction(action);
   } else if (action.type === 'managed_action') {
     stationHandleManagedAction(action);
+  } else if (action.type === 'context_action') {
+    stationHandleContextAction(action);
   } else if (action.type === 'navigate') {
     const tab = String(action.tab || '').trim();
     const subtab = action.subtab ? String(action.subtab).trim() : undefined;
@@ -10057,7 +10059,29 @@ function handleStationAction(action) {
     if (tab === 'terminal' && subtab && !VALID_TERM_SUBTABS.includes(subtab)) return;
     if (tab === 'settings' && subtab && !VALID_SETTINGS_SUBTABS.includes(subtab)) return;
     if (tab === 'sessions' && subtab && !VALID_SESSIONS_SUBTABS.includes(subtab)) return;
-    routeTo(tab, subtab);
+    stationForceRouteTo(tab, subtab);
+  }
+}
+
+function stationForceRouteTo(tab, subtab, after) {
+  const target = subtab ? `${tab}/${subtab}` : tab;
+  const nextHash = `#${target}`;
+  if (window.location.hash !== nextHash) {
+    history.pushState(null, '', nextHash);
+  }
+  switchTab(tab);
+  if (tab === 'activity' && subtab) {
+    if (activeActivitySubtab === subtab) activeActivitySubtab = '';
+    switchActivitySubtab(subtab);
+  } else if (tab === 'terminal' && subtab) {
+    switchTerminalSubtab(subtab);
+  } else if (tab === 'settings' && subtab) {
+    switchSettingsSubtab(subtab);
+  } else if (tab === 'sessions') {
+    switchSessionsSubtab(subtab || 'recent');
+  }
+  if (typeof after === 'function') {
+    setTimeout(after, 0);
   }
 }
 
@@ -10106,8 +10130,7 @@ function stationHandleSessionAction(action) {
     openSessionConfigModal(session);
     return;
   }
-  routeTo('sessions', 'recent');
-  setTimeout(() => openSessionDetail(session), 0);
+  stationForceRouteTo('sessions', 'recent', () => openSessionDetail(session));
 }
 
 function stationHandleManagedAction(action) {
@@ -10115,8 +10138,7 @@ function stationHandleManagedAction(action) {
   const id = String(action.id || '').trim();
   const sessionId = String(action.session_id || '').trim();
   if (!id) return;
-  routeTo('activity', 'managed');
-  setTimeout(() => {
+  stationForceRouteTo('activity', 'managed', () => {
     if (sessionId) {
       renderManagedContextSessionSelect();
       const sel = managedContextEl('managed-context-session');
@@ -10143,7 +10165,17 @@ function stationHandleManagedAction(action) {
       }
       managedContextEl('managed-context-record-id')?.focus();
     }
-  }, 0);
+  });
+}
+
+function stationHandleContextAction(action) {
+  const op = String(action.action || '').trim();
+  const id = String(action.id || '').trim();
+  if (op !== 'part' || !id) return;
+  stationForceRouteTo('activity', 'context', () => {
+    if (typeof renderContextPane === 'function') renderContextPane();
+    if (typeof focusContextPart === 'function') focusContextPart(id);
+  });
 }
 
 function stationOpenDisplay(hostId) {
@@ -10204,6 +10236,8 @@ function stationBuildContextSummary() {
     .map(part => {
       const def = CONTEXT_CATEGORY_DEFS[part.category] || CONTEXT_CATEGORY_DEFS.other;
       return {
+        id: part.id || '',
+        action: 'part',
         label: def.label,
         value: `${stationCompactNumber(part.tokens || part.estimatedTokens || 0)} tok`,
         detail: compactSessionText(part.title || part.subtitle || part.path || ''),
