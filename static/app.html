@@ -10047,6 +10047,8 @@ function handleStationAction(action) {
     stationOpenDisplay(action.host_id);
   } else if (action.type === 'session_action') {
     stationHandleSessionAction(action);
+  } else if (action.type === 'managed_action') {
+    stationHandleManagedAction(action);
   } else if (action.type === 'navigate') {
     const tab = String(action.tab || '').trim();
     const subtab = action.subtab ? String(action.subtab).trim() : undefined;
@@ -10106,6 +10108,42 @@ function stationHandleSessionAction(action) {
   }
   routeTo('sessions', 'recent');
   setTimeout(() => openSessionDetail(session), 0);
+}
+
+function stationHandleManagedAction(action) {
+  const op = String(action.action || '').trim();
+  const id = String(action.id || '').trim();
+  const sessionId = String(action.session_id || '').trim();
+  if (!id) return;
+  routeTo('activity', 'managed');
+  setTimeout(() => {
+    if (sessionId) {
+      renderManagedContextSessionSelect();
+      const sel = managedContextEl('managed-context-session');
+      if (sel && Array.from(sel.options).some(option => option.value === sessionId)) {
+        sel.value = sessionId;
+        managedContextSessionManuallySelected = true;
+        syncManagedContextActiveSession();
+      }
+    }
+    if (op === 'anchor') {
+      fillManagedContextAnchor(id, sessionId);
+      managedContextEl('managed-context-anchor')?.focus();
+      return;
+    }
+    if (op === 'record') {
+      const record = (managedContextRecords || []).find(candidate => candidate && candidate.record_id === id);
+      if (record) {
+        selectManagedContextRecord(record);
+      } else {
+        const input = managedContextEl('managed-context-record-id');
+        if (input) input.value = id;
+        const result = managedContextEl('managed-context-action-result');
+        if (result) result.textContent = `Selected record ${id}`;
+      }
+      managedContextEl('managed-context-record-id')?.focus();
+    }
+  }, 0);
 }
 
 function stationOpenDisplay(hostId) {
@@ -10219,11 +10257,15 @@ function stationManagedAnchorCount(sessionId) {
 function stationManagedAnchorRows(sessionId) {
   const seen = new Set();
   const rows = [];
-  const add = (itemId, detail, value = 'anchor') => {
+  const add = (itemId, detail, value = 'anchor', rowSessionId = '') => {
     const id = String(itemId || '').trim();
     if (!id || seen.has(id)) return;
+    const sid = String(rowSessionId || sessionId || '').trim();
     seen.add(id);
     rows.push({
+      id,
+      sessionId: sid,
+      action: 'anchor',
       label: id,
       value,
       detail: compactSessionText(detail || ''),
@@ -10237,7 +10279,7 @@ function stationManagedAnchorRows(sessionId) {
       sid === sessionId ||
       sessionWindowTargetForLogSession(sid) === sessionId
     ) {
-      add(entry.dataset.itemId, entry.querySelector('.log-content')?.textContent || entry.textContent || '', 'log');
+      add(entry.dataset.itemId, entry.querySelector('.log-content')?.textContent || entry.textContent || '', 'log', sid);
     }
   });
   for (const anchor of managedContextAnchors || []) {
@@ -10249,6 +10291,7 @@ function stationManagedAnchorRows(sessionId) {
         anchor.preview || '',
       ].filter(Boolean).join(' '),
       anchor.status || 'tool',
+      anchor.session_id || anchor.sessionId || anchor.intendant_session_id || anchor.intendantSessionId || sessionId,
     );
   }
   return rows.slice(0, 8);
@@ -10259,6 +10302,9 @@ function stationManagedRecordRows() {
     .sort((a, b) => stationTimestampMs(b.created_at) - stationTimestampMs(a.created_at))
     .slice(0, 8)
     .map(record => ({
+      id: record.record_id || '',
+      sessionId: record.session_id || record.sessionId || record.intendant_session_id || record.intendantSessionId || stationManagedSessionCandidate() || '',
+      action: 'record',
       label: record.record_id || 'record',
       value: `${record.position || 'after'} ${record.item_id || ''}`.trim(),
       detail: compactSessionText(record.reason || record.primer || ''),
